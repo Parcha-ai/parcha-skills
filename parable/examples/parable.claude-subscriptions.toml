@@ -1,0 +1,33 @@
+# Subscription-backed models in one stock Claude Code session through a local
+# Claude-compatible proxy. This file contains no OAuth/provider credentials:
+# only the NAME of the environment variable holding the proxy's localhost
+# client token. Configure and authenticate the local proxy separately.
+
+[parable]
+version = 1
+default_executor = "kimi"
+default_reviewer = "opus"
+
+[claude]
+base_url = "http://127.0.0.1:8317"
+auth_token_env = "CLIPROXY_API_KEY"
+brain_model = "gpt-5.6-sol"
+
+[providers.claude]
+type = "subagent"
+
+[executors.kimi]
+provider = "claude"
+model = "kimi-k3"
+tags = ["implementer", "third-party", "subscription"]
+use_for = "Independent implementation through the Kimi Code subscription."
+avoid_for = "Reviewing its own diff."
+
+[routing]
+mechanical    = ["kimi", "sonnet"]
+feature       = ["kimi", "sonnet"]
+refactor_wide = ["kimi", "sonnet"]
+gnarly        = ["opus"]
+review        = ["opus", "sonnet"]
+smoke_test    = ["opus"]
+escalation    = ["kimi", "sonnet", "opus"]

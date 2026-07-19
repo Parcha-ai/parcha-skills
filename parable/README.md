@@ -132,6 +132,13 @@ provider sends the same `plan.md` through [Cursor CLI](https://cursor.com/docs/c
 [reference](skills/parable/references/providers.md), the complete
 [Cursor example](examples/parable.cursor.toml), and the other configs in `examples/`.
 
+There is also a single-harness, subscription-only path for a localhost Claude-compatible proxy:
+`parable claude` can run stock Claude Code with Sol as the brain while exact third-party model
+ids become project-local named subagents. Parable handles only declarative routing and
+per-process environment wiring; the local proxy handles each user's OAuth. No provider token is
+stored in TOML or written by Parable. See
+[`examples/parable.claude-subscriptions.toml`](examples/parable.claude-subscriptions.toml).
+
 Minimal Cursor configuration:
 
 ```toml
@@ -216,6 +223,9 @@ export CURSOR_API_KEY="..."
 # standalone Claude/manual installer (adds the skill + a starter config)
 npx @parcha/parable install
 npx @parcha/parable doctor
+# after configuring [claude] and starting/authenticating your localhost proxy:
+npx @parcha/parable agents sync
+npx @parcha/parable claude
 
 # manual
 git clone https://github.com/miguelrios/unc-skills && cd unc-skills/parable && ./install.sh
@@ -235,13 +245,15 @@ runtime difference.
 - `skills/parable/SKILL.md`: what the brain reads — the strategy, the house rules, and the
   environment facts it can't derive on its own. Deliberately small; the method is the model's.
 - `skills/parable/scripts/parable.py`: the dispatcher, stdlib only, with `config`, `list`,
-  `run`, `resume`, `status`, `verify`, and `review` subcommands. It runs codex and pi headlessly
+  `claude`, `agents sync`, `run`, `resume`, `status`, `verify`, and `review` subcommands. It
+  launches stock Claude Code through a configured localhost proxy, runs codex and pi headlessly
   with per-invocation provider injection, drives Cursor through `cursor-agent`, and reports
-  compact run summaries the brain can read for pennies. Your `~/.codex/config.toml` and `~/.pi`
-  are never touched.
+  compact run summaries the brain can read for pennies. Global Claude settings,
+  `~/.codex/config.toml`, and `~/.pi` are never modified.
 - `skills/parable/references/`: config schema, provider recipes, routing playbook, reviewer
   rubric, and a commented example config. `examples/` holds minimal Fireworks, OpenRouter,
-  LiteLLM, pi-Fireworks, and [Cursor](examples/parable.cursor.toml) casts.
+  LiteLLM, pi-Fireworks, [Claude subscriptions](examples/parable.claude-subscriptions.toml),
+  and [Cursor](examples/parable.cursor.toml) casts.
 
 ## Credits
 

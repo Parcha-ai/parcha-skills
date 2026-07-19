@@ -157,6 +157,28 @@ tool — no API keys and no CLI subprocess. `parable.py run` refuses them by des
 owns subagent dispatch directly. If the current harness has no native agent-spawn tool, this
 provider is unavailable.
 
+When the session itself is launched with `parable claude`, this same provider can carry exact
+third-party model ids exposed by a localhost Claude-compatible proxy:
+
+```toml
+[claude]
+base_url = "http://127.0.0.1:8317"
+auth_token_env = "CLIPROXY_API_KEY"
+brain_model = "gpt-5.6-sol"
+
+[executors.kimi]
+provider = "claude"
+model = "kimi-k3"
+use_for = "Independent implementation through the Kimi Code subscription."
+```
+
+`parable agents sync` materializes that executor as project agent `parable-kimi`; stock Claude
+Code sends its child requests to `kimi-k3` through the same endpoint. The launcher strips
+`CLAUDE_CODE_SUBAGENT_MODEL`, because Claude Code gives that environment variable priority over
+every agent's own `model:` field and would otherwise silently route all children to the parent.
+The proxy owns provider OAuth. Parable stores no provider credential and does not implement an
+OAuth flow.
+
 ## Reading subscription headroom (parable-usage.sh)
 
 Each subscription pool publishes its own remaining headroom over an authenticated endpoint the

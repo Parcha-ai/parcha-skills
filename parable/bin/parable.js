@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/* parable installer/doctor. Node 18+, no dependencies. */
+/* parable installer/doctor/launcher. Node 18+, no dependencies. */
 "use strict";
 
 const fs = require("fs");
@@ -9,6 +9,7 @@ const { execSync, spawnSync } = require("child_process");
 
 const PKG_ROOT = path.resolve(__dirname, "..");
 const SKILL_SRC = path.join(PKG_ROOT, "skills", "parable");
+const PARABLE_PY = path.join(SKILL_SRC, "scripts", "parable.py");
 
 function log(msg) { process.stdout.write(msg + "\n"); }
 function fail(msg) { process.stderr.write("error: " + msg + "\n"); process.exit(1); }
@@ -109,13 +110,25 @@ function cmdDoctor() {
   process.exit(ok ? 0 : 1);
 }
 
+function runPython(args) {
+  const result = spawnSync("python3", [PARABLE_PY, ...args], { stdio: "inherit", env: process.env });
+  if (result.error) fail("could not start python3: " + result.error.message);
+  process.exit(result.status === null ? 1 : result.status);
+}
+
+const raw = process.argv.slice(2);
+if (raw[0] === "claude") runPython(["claude", "--", ...raw.slice(1)]);
+if (raw[0] === "agents" && raw[1] === "sync") runPython(["agents", "sync", ...raw.slice(2)]);
+
 const args = parseArgs(process.argv.slice(2));
 const cmd = args._[0];
 if (cmd === "install") cmdInstall(args);
 else if (cmd === "doctor") cmdDoctor();
 else {
-  log("usage: npx @parcha/parable <install|doctor> [--project] [--target DIR]");
+  log("usage: npx @parcha/parable <install|doctor|claude|agents sync> [options]");
   log("  install            copy the skill to ~/.claude/skills (or ./.claude/skills with --project)");
   log("  doctor             check python/codex/config health");
+  log("  claude [ARGS...]    launch Claude Code through the configured local proxy");
+  log("  agents sync        synchronize project-local parable-* custom agents");
   process.exit(cmd ? 1 : 0);
 }

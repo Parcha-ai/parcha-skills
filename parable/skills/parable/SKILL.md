@@ -28,6 +28,12 @@ or `cursor` executor before dispatching. Installation is portable; a missing exe
 fake runtime parity. With no configured checks, `parable-verify.sh` passes vacuously until the
 user declares some.
 
+When the config contains `[claude]`, the session should have been entered through
+`parable claude`. Arbitrary-model Claude executors are synchronized as project-local native
+agents named `parable-<normalized-executor-id>`; `parable-config.sh` prints the exact
+`agent=` name beside each one. Invoke that named agent through the Agent tool. Claude Code's
+built-in model aliases remain normal model-selected subagents.
+
 ## Load-balancing across subscriptions (the point of a multi-pool cast)
 
 The reason to configure more than one pool is that each subscription is a separate,
@@ -65,9 +71,14 @@ this tool exists to prevent. The per-pool selection detail lives in `references/
 - `scripts/parable-run.sh <executor> <plan.md> [workdir] [--effort <level>]` — dispatch a
   codex-, pi-, or cursor-backed executor headlessly; prints status, session id, turns, tokens
   and cost, last message, and the run dir. Subagent executors (`sonnet`, `opus`, …) dispatch via
-  the harness's native agent-spawn tool with the plan as the prompt — use a general-purpose
-  agent with the executor's model; custom agent-type names are install-specific. If there is no
-  native agent-spawn tool, that executor is unavailable; choose a CLI-backed executor.
+  the harness's native agent-spawn tool with the plan as the prompt. For a custom model in a
+  `parable claude` session, use the exact `agent=parable-*` name printed by
+  `parable-config.sh`; for a bare Claude alias, use a general-purpose agent with the executor's
+  model. If there is no native agent-spawn tool, that executor is unavailable; choose a
+  CLI-backed executor.
+- `parable agents sync` — idempotently synchronize Parable-owned project agents from TOML.
+  `parable claude [ARGS...]` does this automatically after checking the local model catalog,
+  then launches the configured brain model. These are package CLI commands, not skill scripts.
 - `scripts/parable-resume.sh <run-dir> "<message>"` — continue an executor's existing session
   (caching economics: facts below). Sessions do not transfer between executors.
 - `scripts/parable-status.sh <run-dir>` — live run state in ~7 lines for zero model tokens;

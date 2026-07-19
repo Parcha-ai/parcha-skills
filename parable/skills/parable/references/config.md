@@ -13,6 +13,7 @@ Files load lowest-precedence first; later files win:
 `[executors.*]`, `[providers.*]`, `[checks.*]` merge **per id, per field** (a repo file can
 override just `effort` on your personal `kimi`). `[parable]` and `[routing]` merge per key,
 whole-value (a repo redefining `routing.feature` replaces that chain, not the whole table).
+`[claude]` also merges per key.
 
 Built-in Tier-0 defaults (providers.claude + executors sonnet/opus + all-subagent routing) sit
 below everything. They are runnable only when the orchestrating harness exposes a native agent-
@@ -33,11 +34,36 @@ Schema is versioned: `[parable] version = 1`. Unknown versions refuse to load.
 | `default_reviewer` | `opus` | fallback reviewer |
 | `repo_notes` | `""` | prose copied into every plan; repo conventions live here |
 
+## `[claude]`
+
+Optional stock-Claude-Code launcher configuration. It is required by `parable claude` and
+`parable agents sync`; ordinary Parable dispatch remains unchanged when the table is absent.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `base_url` | required | Local Claude-compatible endpoint. Parable accepts only `http(s)` loopback hosts (`localhost`, `127.0.0.1`, or `::1`) so the local client token cannot be sent off-machine. |
+| `auth_token_env` | required | Name of the environment variable holding the proxy's local client token. The token itself never belongs in TOML. |
+| `brain_model` | required | Exact model id for the main Claude Code session, such as `gpt-5.6-sol`. |
+| `binary` | `claude` | Optional Claude Code command name or path. |
+
+`parable claude` checks `/v1/models` before launch and requires the brain model plus every
+configured arbitrary-model Claude executor to be present. It then synchronizes project-local
+`.claude/agents/parable-*.md` files and launches Claude Code with per-process
+`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`; it does not write global Claude settings.
+The source token variable, `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, and
+`CLAUDE_CODE_SUBAGENT_MODEL` are removed from the child environment. A forwarded `--model`
+is rejected because `brain_model` is the declarative source of truth.
+
+For a custom executor id such as `kimi`, `parable agents sync` creates the native Claude agent
+name `parable-kimi` with the exact configured model id. Only files carrying Parable's generated
+marker are updated or removed; unrelated user agents, including files that happen to begin with
+`parable-`, are preserved. See `examples/parable.claude-subscriptions.toml`.
+
 ## `[providers.<id>]`
 
 | Field | Applies to | Meaning |
 |---|---|---|
-| `type` | all | `codex` (custom provider via codex CLI) · `codex-native` (codex's own auth/models) · `pi` (any chat-completions/anthropic/responses endpoint via the pi coding agent CLI) · `cursor` (Cursor CLI `cursor-agent`; Composer + Grok + mirrors, subscription auth) · `subagent` (Claude Agent tool) |
+| `type` | all | `codex` (custom provider via codex CLI) · `codex-native` (codex's own auth/models) · `pi` (any chat-completions/anthropic/responses endpoint via the pi coding agent CLI) · `cursor` (Cursor CLI `cursor-agent`; Composer + Grok + mirrors, subscription auth) · `subagent` (Claude Agent tool; arbitrary model ids become namespaced agents when `[claude]` is configured) |
 | `base_url` | codex, pi | API root (codex: must serve `/responses`; pi: whatever `api` says). `cursor` rejects it — the CLI owns its endpoint. |
 | `env_key` | codex, pi, cursor | NAME of the env var holding the API key — never the key itself. `cursor` defaults to `CURSOR_API_KEY`. |
 | `wire_api` | codex | must be `"responses"` (validation enforces it) |

@@ -37,6 +37,13 @@ class TestMerge(unittest.TestCase):
         self.assertEqual(out["parable"]["default_executor"], "kimi")
         self.assertIn("sonnet", out["executors"])
 
+    def test_claude_session_merges_per_field(self):
+        base = {"claude": {"base_url": "http://127.0.0.1:1", "brain_model": "old"}}
+        overlay = {"claude": {"brain_model": "gpt-5.6-sol"}}
+        out = parable.merge_configs(base, overlay)
+        self.assertEqual(out["claude"]["base_url"], "http://127.0.0.1:1")
+        self.assertEqual(out["claude"]["brain_model"], "gpt-5.6-sol")
+
 
 class TestValidation(unittest.TestCase):
     def cfg(self, **kw):
@@ -103,6 +110,109 @@ class TestValidation(unittest.TestCase):
         cfg["executors"]["x"] = {"provider": "nope", "model": "m"}
         problems = parable.validate_config(cfg)
         self.assertTrue(any("unknown provider 'nope'" in p for p in problems))
+
+    def test_claude_session_requires_loopback_and_env_name_not_secret(self):
+        cfg = self.cfg(claude={
+            "base_url": "https://proxy.example.com",
+            "auth_token_env": "not-valid-name!",
+            "brain_model": "gpt-5.6-sol",
+            "auth_token": "must-never-be-configured",
+        })
+        problems = parable.validate_config(cfg)
+        self.assertTrue(any("must be an http(s) loopback URL" in p for p in problems))
+        self.assertTrue(any("auth_token_env must name" in p for p in problems))
+        self.assertTrue(any("unknown field(s): auth_token" in p for p in problems))
+
+    def test_valid_claude_session_and_ipv6_loopback(self):
+        for url in ("http://127.0.0.1:8317", "http://localhost:8317/v1",
+                    "http://[::1]:8317"):
+            with self.subTest(url=url):
+                cfg = self.cfg(claude={
+                    "base_url": url,
+                    "auth_token_env": "CLIPROXY_API_KEY",
+                    "brain_model": "gpt-5.6-sol",
+                })
+                self.assertEqual(parable.validate_config(cfg), [])
+
+
+class TestClaudeLaunch(unittest.TestCase):
+    def cfg(self):
+        cfg = json.loads(json.dumps(parable.BUILTIN_DEFAULTS))
+        cfg["claude"] = {
+            "base_url": "http://127.0.0.1:8317",
+            "auth_token_env": "CLIPROXY_API_KEY",
+            "brain_model": "gpt-5.6-sol",
+        }
+        cfg["executors"]["kimi"] = {
+            "provider": "claude",
+            "model": "kimi-k3",
+            "use_for": "Independent implementation.",
+        }
+        return cfg
+
+    def test_launch_env_is_per_process_and_scrubs_heterogeneous_override(self):
+        source = {
+            "PATH": "/bin",
+            "CLIPROXY_API_KEY": "local-token",
+            "ANTHROPIC_API_KEY": "direct-key",
+            "CLAUDE_CODE_OAUTH_TOKEN": "native-token",
+            "CLAUDE_CODE_SUBAGENT_MODEL": "gpt-5.6-sol",
+        }
+        argv, env = parable.build_claude_launch(
+            self.cfg(), ["--", "--print", "hello"], source
+        )
+        self.assertEqual(
+            argv, ["claude", "--model", "gpt-5.6-sol", "--print", "hello"]
+        )
+        self.assertEqual(env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8317")
+        self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "local-token")
+        self.assertNotIn("CLIPROXY_API_KEY", env)
+        self.assertNotIn("ANTHROPIC_API_KEY", env)
+        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", env)
+        self.assertNotIn("CLAUDE_CODE_SUBAGENT_MODEL", env)
+        self.assertIn("CLAUDE_CODE_SUBAGENT_MODEL", source)
+
+    def test_forwarded_model_override_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "parable.toml owns"):
+            parable.build_claude_launch(
+                self.cfg(), ["--model", "opus"], {"CLIPROXY_API_KEY": "x"}
+            )
+
+    def test_custom_model_agent_is_namespaced_and_exact(self):
+        cfg = self.cfg()
+        self.assertEqual(list(parable.custom_claude_executors(cfg)), ["kimi"])
+        rendered = parable.render_claude_agent("kimi", cfg["executors"]["kimi"])
+        self.assertIn("name: parable-kimi", rendered)
+        self.assertIn('model: "kimi-k3"', rendered)
+        self.assertNotIn("CLIPROXY_API_KEY", rendered)
+        self.assertEqual(
+            parable.claude_required_models(cfg), ["gpt-5.6-sol", "kimi-k3"]
+        )
+
+    def test_builtin_aliases_do_not_generate_agents(self):
+        cfg = self.cfg()
+        del cfg["executors"]["kimi"]
+        for index, model in enumerate((
+            "inherit", "sonnet", "opus", "haiku", "best",
+            "sonnet[1m]", "opus[1m]", "opusplan",
+        )):
+            cfg["executors"][f"native-{index}"] = {
+                "provider": "claude", "model": model
+            }
+        self.assertEqual(parable.custom_claude_executors(cfg), {})
+
+    def test_slug_collisions_fail_closed(self):
+        cfg = self.cfg()
+        cfg["executors"]["ki_mi"] = {
+            "provider": "claude", "model": "other-model"
+        }
+        cfg["executors"]["ki-mi"] = {
+            "provider": "claude", "model": "another-model"
+        }
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, "both map"):
+                parable.sync_claude_agents(Path(tmp), cfg)
 
 
 class TestArgv(unittest.TestCase):

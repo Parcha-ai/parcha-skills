@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "loop": "L2",
+  "captured_at_utc": "2026-07-19T04:24:46Z",
+  "baseline_head": "504b5be00369d467c4eb542d75fad418db0ae831",
+  "package_version": "0.1.9",
+  "hermetic_proof": {
+    "tests_total": 81,
+    "tests_passed": 81,
+    "fake_proxy_loopback_only": true,
+    "brain_model": "gpt-5.6-sol",
+    "named_agent": "parable-kimi",
+    "named_agent_model": "kimi-k3",
+    "forwarded_arguments_verified": true,
+    "global_claude_settings_mutated": false,
+    "inherited_subagent_override_seeded": true,
+    "inherited_subagent_override_reached_child": false,
+    "agent_sync_idempotent": true,
+    "stale_managed_agent_removed": true,
+    "unrelated_agents_preserved": true,
+    "generated_secret_material": false
+  },
+  "live_smoke": {
+    "started_at_utc": "2026-07-19T04:22:59Z",
+    "finished_at_utc": "2026-07-19T04:23:01Z",
+    "claude_code_version": "2.1.215",
+    "cliproxyapi_release": "v7.2.88",
+    "cliproxyapi_commit": "93d74a890a44802f656d7f39a573916b2611896e",
+    "isolated_proxy": true,
+    "listen_address": "127.0.0.1",
+    "authenticated_catalog_models": 10,
+    "requested_model": "gpt-5.6-sol",
+    "provider_channel": "openai-codex",
+    "auth_kind": "oauth",
+    "http_200_requests": 2,
+    "launcher_exit_code": 0,
+    "synthetic_output_sha256": "9e7e7c48d34a1f8fc79d9ae64623d6f5594b8a5bb979daff86d4c8b014a3db69"
+  },
+  "safety": {
+    "provider_credential_in_toml": false,
+    "provider_credential_written_by_parable": false,
+    "direct_provider_api_key_used": false,
+    "raw_prompt_or_response_committed": false,
+    "raw_proxy_log_committed": false
+  }
+}
