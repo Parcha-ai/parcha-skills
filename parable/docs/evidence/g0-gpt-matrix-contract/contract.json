@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "loop": "G0",
+  "captured_at_utc": "2026-07-20T03:29:10Z",
+  "baseline_head": "11249c32306ceb94ae5bc1875ec18cc58a31ff09",
+  "runtime": {
+    "parable_version": "0.1.9",
+    "claude_code_version": "2.1.215",
+    "cliproxyapi_release": "v7.2.88",
+    "cliproxyapi_commit": "93d74a890a44802f656d7f39a573916b2611896e",
+    "loopback_only": true,
+    "embedded_model_catalog": true
+  },
+  "authenticated_catalog": {
+    "total_models": 10,
+    "target_counts": {
+      "gpt-5.6-sol": 1,
+      "gpt-5.6-terra": 1,
+      "gpt-5.6-luna": 1
+    },
+    "target_owner": "openai"
+  },
+  "matrix_contract": {
+    "models": [
+      "gpt-5.6-sol",
+      "gpt-5.6-terra",
+      "gpt-5.6-luna"
+    ],
+    "cli_advertised_efforts": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ],
+    "cells": 15,
+    "tool_canaries": 3,
+    "inbound_evidence_field": "output_config.effort",
+    "translated_evidence_field": "reasoning.effort",
+    "background_request_controls": [
+      "--safe-mode",
+      "--no-session-persistence"
+    ]
+  },
+  "source_binary_drift_hazard": {
+    "local_source_efforts": [
+      "low",
+      "medium",
+      "high",
+      "max"
+    ],
+    "installed_cli_additionally_advertises": [
+      "xhigh"
+    ],
+    "source_documents_max_clamping": true,
+    "resolution": "Runtime wire evidence decides every G1 cell."
+  },
+  "baseline_tests": {
+    "total": 81,
+    "passed": 81
+  },
+  "safety": {
+    "auth_kind": "oauth",
+    "direct_provider_api_key_used": false,
+    "credential_material_committed": false,
+    "raw_content_committed": false
+  }
+}
