@@ -179,6 +179,24 @@ every agent's own `model:` field and would otherwise silently route all children
 The proxy owns provider OAuth. Parable stores no provider credential and does not implement an
 OAuth flow.
 
+### Verified GPT effort caveat
+
+With stock Claude Code `2.1.215` and CLIProxyAPI `v7.2.88`, Sol, Terra, and
+Luna all complete text and tool-using requests through ChatGPT subscription
+OAuth. However, only `medium` is currently effective upstream. Claude Code
+sends every explicit `--effort` as `output_config.effort` for these exact
+third-party model ids but omits the `thinking` object; CLIProxyAPI's
+Claude-to-Codex translator therefore defaults every request to
+`reasoning.effort=medium`. Setting
+`CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1` does not change that wire shape.
+
+Treat `low`, `high`, `xhigh`, and `max` as accepted-but-not-effective for this
+version pair. Do not infer GPT effort from the Claude CLI flag. See the
+[sanitized live receipt](../../../docs/evidence/g1-gpt-model-effort-live/receipt.json)
+and [mechanism diagnosis](../../../docs/evidence/g1-gpt-model-effort-live/mechanism.md).
+Exact non-medium control requires a CLIProxyAPI translator fix followed by a
+repeat of the live matrix.
+
 ## Reading subscription headroom (parable-usage.sh)
 
 Each subscription pool publishes its own remaining headroom over an authenticated endpoint the

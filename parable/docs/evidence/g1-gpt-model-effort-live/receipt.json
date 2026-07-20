@@ -1,0 +1,317 @@
+{
+  "schema_version": 1,
+  "loop": "G1",
+  "captured_interval_utc": {
+    "started": "2026-07-20T03:38:23Z",
+    "finished": "2026-07-20T03:39:31Z"
+  },
+  "baseline_head": "b292d38b4e4d47c44e4b40460688dad8f71cbe3c",
+  "runtime": {
+    "parable_version": "0.1.9",
+    "claude_code_version": "2.1.215",
+    "cliproxyapi_release": "v7.2.88",
+    "cliproxyapi_commit": "93d74a890a44802f656d7f39a573916b2611896e",
+    "cliproxyapi_binary_sha256": "8d1bce338662629e51e81a5cdbb8cd61f7755d5bc5a3c087b8fda9a3c9791238",
+    "loopback_only": true
+  },
+  "summary": {
+    "models": 3,
+    "requested_efforts": 5,
+    "text_cells": 15,
+    "successful_text_cells": 15,
+    "requested_to_inbound_exact": 15,
+    "requested_to_upstream_exact": 3,
+    "upstream_effort_counts": {
+      "medium": 15
+    },
+    "successful_tool_canaries": 3,
+    "tool_canaries": 3
+  },
+  "invocation_contract": {
+    "harness": "stock Claude Code launched by parable claude",
+    "flags": [
+      "--safe-mode",
+      "--no-session-persistence",
+      "--name <unique-cell-id>",
+      "-p",
+      "--effort <requested>",
+      "--tools="
+    ],
+    "text_requests_per_cell": 1,
+    "direct_provider_api_keys_unset": [
+      "OPENAI_API_KEY",
+      "ANTHROPIC_API_KEY"
+    ],
+    "matrix_inherited_claude_code_always_enable_effort": false
+  },
+  "effort_mapping": {
+    "low": "medium",
+    "medium": "medium",
+    "high": "medium",
+    "xhigh": "medium",
+    "max": "medium"
+  },
+  "cells": [
+    {
+      "model": "gpt-5.6-sol",
+      "requested_effort": "low",
+      "inbound_effort": "low",
+      "upstream_effort": "medium",
+      "upstream_exact": false,
+      "exit_code": 0,
+      "http_statuses": [200, 200],
+      "request_count": 1,
+      "stream_completed": true,
+      "deterministic_check": true,
+      "synthetic_marker_sha256": "4942da4dc0d36e12787f1d824328c1783fce1d332a3b3f2601c59870fe89a9b7"
+    },
+    {
+      "model": "gpt-5.6-sol",
+      "requested_effort": "medium",
+      "inbound_effort": "medium",
+      "upstream_effort": "medium",
+      "upstream_exact": true,
+      "exit_code": 0,
+      "http_statuses": [200, 200],
+      "request_count": 1,
+      "stream_completed": true,
+      "deterministic_check": true,
+      "synthetic_marker_sha256": "affe3b846e425c3e325b4ab1b8aa4b1020696aab3f6c019eefddc4fd1777f142"
+    },
+    {
+      "model": "gpt-5.6-sol",
+      "requested_effort": "high",
+      "inbound_effort": "high",
+      "upstream_effort": "medium",
+      "upstream_exact": false,
+      "exit_code": 0,
+      "http_statuses": [200, 200],
+      "request_count": 1,
+      "stream_completed": true,
+      "deterministic_check": true,
+      "synthetic_marker_sha256": "c2a46432605ff9795cded8c06bbeaade9b57996104e980338f3eac8ea61f1b17"
+    },
+    {
+      "model": "gpt-5.6-sol",
+      "requested_effort": "xhigh",
+      "inbound_effort": "xhigh",
+      "upstream_effort": "medium",
+      "upstream_exact": false,
+      "exit_code": 0,
+      "http_statuses": [200, 200],
+      "request_count": 1,
+      "stream_completed": true,
+      "deterministic_check": true,
+      "synthetic_marker_sha256": "354f50c5fbca52ceee003a42515da21d6cdb79ede73ddfbe71b22f2d17e02ff6"
+    },
+    {
+      "model": "gpt-5.6-sol",
+      "requested_effort": "max",
+      "inbound_effort": "max",
+      "upstream_effort": "medium",
+      "upstream_exact": false,
+      "exit_code": 0,
+      "http_statuses": [200, 200],
+      "request_count": 1,
+      "stream_completed": true,
+      "deterministic_check": true,
+      "synthetic_marker_sha256": "1e84a7994bb2f0f89e33a1b73aad6a6797833a6b5509141cd9d82748944e5445"
+    },
+    {
+      "model": "gpt-5.6-terra",
+      "requested_effort": "low",
+      "inbound_effort": "low",
+      "upstream_effort": "medium",
+      "upstream_exact": false,
+      "exit_code": 0,
+      "http_statuses": [200, 200],
+      "request_count": 1,
+      "stream_completed": true,
+      "deterministic_check": true,
+      "synthetic_marker_sha256": "bd3aa18de0bab791e888c9033ecf87b1906fafba2010f9f66c794db1d29478c3"
+    },
+    {
+      "model": "gpt-5.6-terra",
+      "requested_effort": "medium",
+      "inbound_effort": "medium",
+      "upstream_effort": "medium",
+      "upstream_exact": true,
+      "exit_code": 0,
+      "http_statuses": [200, 200],
+      "request_count": 1,
+      "stream_completed": true,
+      "deterministic_check": true,
+      "synthetic_marker_sha256": "f12b576e3974bab5da44db19bd36a29f43840601c3323b78ac198be6be08c725"
+    },
+    {
+      "model": "gpt-5.6-terra",
+      "requested_effort": "high",
+      "inbound_effort": "high",
+      "upstream_effort": "medium",
+      "upstream_exact": false,
+      "exit_code": 0,
+      "http_statuses": [200, 200],
+      "request_count": 1,
+      "stream_completed": true,
+      "deterministic_check": true,
+      "synthetic_marker_sha256": "b6fda5551faf221f02a436346333958203f9458be610106a1ce6c28ede25a2a5"
+    },
+    {
+      "model": "gpt-5.6-terra",
+      "requested_effort": "xhigh",
+      "inbound_effort": "xhigh",
+      "upstream_effort": "medium",
+      "upstream_exact": false,
+      "exit_code": 0,
+      "http_statuses": [200, 200],
+      "request_count": 1,
+      "stream_completed": true,
+      "deterministic_check": true,
+      "synthetic_marker_sha256": "57dd936b5231da92a10e4d90668876534b38088002fde8238988466a11f9d2e5"
+    },
+    {
+      "model": "gpt-5.6-terra",
+      "requested_effort": "max",
+      "inbound_effort": "max",
+      "upstream_effort": "medium",
+      "upstream_exact": false,
+      "exit_code": 0,
+      "http_statuses": [200, 200],
+      "request_count": 1,
+      "stream_completed": true,
+      "deterministic_check": true,
+      "synthetic_marker_sha256": "77d1cc385387b5f7c3c8154ed9b1417f755112211b8fa58d16bd562ec8ca56a6"
+    },
+    {
+      "model": "gpt-5.6-luna",
+      "requested_effort": "low",
+      "inbound_effort": "low",
+      "upstream_effort": "medium",
+      "upstream_exact": false,
+      "exit_code": 0,
+      "http_statuses": [200, 200],
+      "request_count": 1,
+      "stream_completed": true,
+      "deterministic_check": true,
+      "synthetic_marker_sha256": "867dce3f334258bc92fbfc67843342e3f4e36c8473f7c2d8d436a1619532c03a"
+    },
+    {
+      "model": "gpt-5.6-luna",
+      "requested_effort": "medium",
+      "inbound_effort": "medium",
+      "upstream_effort": "medium",
+      "upstream_exact": true,
+      "exit_code": 0,
+      "http_statuses": [200, 200],
+      "request_count": 1,
+      "stream_completed": true,
+      "deterministic_check": true,
+      "synthetic_marker_sha256": "cff1c9645b2d8055597ded13c25e86ea0a9041863a7938dd67c908b6735a5c11"
+    },
+    {
+      "model": "gpt-5.6-luna",
+      "requested_effort": "high",
+      "inbound_effort": "high",
+      "upstream_effort": "medium",
+      "upstream_exact": false,
+      "exit_code": 0,
+      "http_statuses": [200, 200],
+      "request_count": 1,
+      "stream_completed": true,
+      "deterministic_check": true,
+      "synthetic_marker_sha256": "ccee16281454bffa48cc08dda1fe2944fa1993cf567d1f6680da04a88f823bc3"
+    },
+    {
+      "model": "gpt-5.6-luna",
+      "requested_effort": "xhigh",
+      "inbound_effort": "xhigh",
+      "upstream_effort": "medium",
+      "upstream_exact": false,
+      "exit_code": 0,
+      "http_statuses": [200, 200],
+      "request_count": 1,
+      "stream_completed": true,
+      "deterministic_check": true,
+      "synthetic_marker_sha256": "88f7d94f1f17f42607dbc9984e0c3ac5d3e1bdea665d2d9227be13e5a55959dc"
+    },
+    {
+      "model": "gpt-5.6-luna",
+      "requested_effort": "max",
+      "inbound_effort": "max",
+      "upstream_effort": "medium",
+      "upstream_exact": false,
+      "exit_code": 0,
+      "http_statuses": [200, 200],
+      "request_count": 1,
+      "stream_completed": true,
+      "deterministic_check": true,
+      "synthetic_marker_sha256": "7ac01532632334ae84f9282b544fe2dae6bf47815cf30e213dfbbbf594c68f2b"
+    }
+  ],
+  "tool_canaries": [
+    {
+      "model": "gpt-5.6-sol",
+      "requested_effort": "medium",
+      "inbound_efforts": ["medium", "medium"],
+      "upstream_efforts": ["medium", "medium"],
+      "request_count": 2,
+      "exit_code": 0,
+      "http_statuses": [200, 200, 200, 200],
+      "codex_oauth_route": true,
+      "deterministic_check": true,
+      "artifact_sha256": "0087fb9607a21f2026ec3c21bc2e2b98cda2744f82cf8567e0c8474d7ae006da"
+    },
+    {
+      "model": "gpt-5.6-terra",
+      "requested_effort": "medium",
+      "inbound_efforts": ["medium", "medium"],
+      "upstream_efforts": ["medium", "medium"],
+      "request_count": 2,
+      "exit_code": 0,
+      "http_statuses": [200, 200, 200, 200],
+      "codex_oauth_route": true,
+      "deterministic_check": true,
+      "artifact_sha256": "ca14bfb26c4953346d597036a9f13d6f79e0a83ae8343b0d3478177142ab51c8"
+    },
+    {
+      "model": "gpt-5.6-luna",
+      "requested_effort": "medium",
+      "inbound_efforts": ["medium", "medium"],
+      "upstream_efforts": ["medium", "medium"],
+      "request_count": 2,
+      "exit_code": 0,
+      "http_statuses": [200, 200, 200, 200],
+      "codex_oauth_route": true,
+      "deterministic_check": true,
+      "artifact_sha256": "82354ccc6fa6b22d89d4080b99769b86afb21d888a56148eef45351543312876"
+    }
+  ],
+  "mechanism_diagnostics": {
+    "matrix_inbound_thinking_object_present_count": 0,
+    "matrix_inbound_output_config_effort_present_count": 15,
+    "always_enable_effort_pilot": {
+      "model": "gpt-5.6-sol",
+      "requested_effort": "low",
+      "environment_value": "1",
+      "inbound_effort": "low",
+      "inbound_thinking_object_present": false,
+      "upstream_effort": "medium",
+      "exit_code": 0,
+      "http_statuses": [200, 200],
+      "deterministic_check": true
+    },
+    "pinned_translator_source": {
+      "url": "https://github.com/router-for-me/CLIProxyAPI/blob/93d74a890a44802f656d7f39a573916b2611896e/internal/translator/codex/claude/codex_claude_request.go#L312-L341",
+      "sha256": "85559604a0da1bd57f537baf007d46ab223e32392111763f2cf81cda341a8a74",
+      "observed_contract": "reasoning.effort defaults to medium; output_config.effort is read only inside thinking.type adaptive or auto"
+    }
+  },
+  "safety": {
+    "auth_kind": "ChatGPT subscription OAuth via CLIProxyAPI",
+    "all_model_requests_used_codex_oauth_route": true,
+    "direct_provider_api_key_used": false,
+    "credential_material_committed": false,
+    "raw_prompt_or_response_committed": false,
+    "raw_proxy_log_committed": false
+  }
+}
