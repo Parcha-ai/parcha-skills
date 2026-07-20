@@ -172,3 +172,30 @@ comes after live fidelity, so OSS instructions never promise an unproved patch.
 9. Public evidence is synthetic or content-free. Raw logs, prompts, responses,
    credentials, tokens, customer data, and private paths stay out of Git.
 10. Kimi remains paused until the operator explicitly resumes it.
+
+## E0 re-plan note — canonical thinking boundary (2026-07-20)
+
+The required permission check reported no `WRITE`, `MAINTAIN`, or `ADMIN`
+access to `router-for-me/CLIProxyAPI`. Its repository instructions forbid a
+standalone `internal/translator` edit in that state.
+
+Read-only inspection then found the same gate in the canonical thinking
+pipeline: `internal/thinking/extractClaudeConfig` reads
+`output_config.effort` only when `thinking.type` is `adaptive` or `auto`.
+Stock Claude Code's exact third-party GPT model ids send the effort but omit
+`thinking`, so both the canonical extractor and the direct Claude-to-Codex
+translator lose the setting.
+
+E0/E1 are therefore broadened at the genuine architecture boundary:
+
+1. pin one canonical conversion regression and one direct translator
+   regression;
+2. make top-level effort a valid canonical Claude input while preserving
+   explicit disabled/budget/adaptive precedence;
+3. consume that same semantics in the Claude-to-Codex translator;
+4. review the resulting cross-module change, not a standalone translator shim.
+
+The source commit can be made and live-proved locally. Opening an upstream
+issue or PR remains externally blocked because the mandated GitHub App is not
+installed on that repository; no personal-account fallback is permitted. E3
+must report that state honestly unless authorization changes.
