@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "loop": "E0",
+  "captured_at_utc": "2026-07-20T04:14:08Z",
+  "parable_baseline_head": "d5190ff068732aaf0a7240539b58c2bcb0684af3",
+  "upstream_source": {
+    "repository": "router-for-me/CLIProxyAPI",
+    "release": "v7.2.88",
+    "commit": "93d74a890a44802f656d7f39a573916b2611896e",
+    "archive_sha256": "47c91832a4f09501ed0638191b18d74ffc8eef2ec9de53fd53423ad09d695129",
+    "translator_sha256": "85559604a0da1bd57f537baf007d46ab223e32392111763f2cf81cda341a8a74",
+    "isolated_source_import_clean": true,
+    "local_regression_commit": "6db675c2e884f1cb9db97409f5c1bfc36f76a2b2"
+  },
+  "toolchain": {
+    "go_version": "go1.26.5 linux/amd64",
+    "official_archive": "go1.26.5.linux-amd64.tar.gz",
+    "archive_sha256": "5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053"
+  },
+  "regressions": [
+    {
+      "layer": "direct Claude-to-Codex translator",
+      "test": "TestConvertClaudeRequestToCodex_TopLevelEffortWithoutThinking",
+      "input_shape": {
+        "output_config_effort": "low",
+        "thinking_object_present": false
+      },
+      "expected_reasoning_effort": "low",
+      "observed_reasoning_effort": "medium",
+      "exit_code": 1,
+      "semantic_failure_confirmed": true
+    },
+    {
+      "layer": "canonical thinking conversion",
+      "test": "TestThinkingE2EClaudeAdaptive_Body/CaseC14-top-level-effort-without-thinking_claude->codex_level-model",
+      "input_shape": {
+        "output_config_effort": "low",
+        "thinking_object_present": false
+      },
+      "expected_reasoning_effort": "low",
+      "observed_reasoning_effort": "medium",
+      "exit_code": 1,
+      "semantic_failure_confirmed": true
+    }
+  ],
+  "contribution_route": {
+    "required_actor": "Claudio Michel GitHub App",
+    "viewer_permission": null,
+    "repository_permissions": {
+      "pull": false,
+      "push": false,
+      "maintain": false,
+      "admin": false,
+      "triage": false
+    },
+    "upstream_issue_or_pr_authorized": false,
+    "fallback_personal_account_used": false,
+    "disposition": "Build and prove an upstream-ready local cross-module commit; report the external authorization blocker."
+  },
+  "architecture_finding": {
+    "translator_gate": "output_config.effort is read only when thinking.type is adaptive or auto",
+    "canonical_gate": "extractClaudeConfig has the same adaptive-or-auto condition",
+    "repair_scope": "canonical thinking extraction plus Claude-to-Codex translation and their tests",
+    "standalone_translator_change": false
+  },
+  "safety": {
+    "credential_material_committed": false,
+    "raw_prompt_or_response_committed": false,
+    "raw_proxy_log_committed": false,
+    "private_path_committed": false
+  }
+}
