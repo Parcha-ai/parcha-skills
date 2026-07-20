@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "loop": "E1",
+  "captured_at_utc": "2026-07-20T04:22:31Z",
+  "parable_baseline_head": "f9fc5c05d139de72a42bdcc0704573e016d9bb30",
+  "source": {
+    "repository": "router-for-me/CLIProxyAPI",
+    "upstream_base_commit": "93d74a890a44802f656d7f39a573916b2611896e",
+    "local_regression_commit": "6db675c2e884f1cb9db97409f5c1bfc36f76a2b2",
+    "local_fix_commit": "ad20a87efbbd41a9d4f24c83ca8bdd934bf34ab7",
+    "two_commit_patch_sha256": "2d6c5371b79ffabc027f93cdedd817d83f9554c81c6df294f064395134163582",
+    "working_tree_clean": true
+  },
+  "mechanism": {
+    "scope": [
+      "internal/thinking",
+      "internal/translator/codex/claude"
+    ],
+    "top_level_effort_normalized_once": true,
+    "canonical_fallback_requires_missing_thinking_object": true,
+    "translator_fallback_requires_missing_thinking_object": true,
+    "preserved_precedence": [
+      "thinking.type=disabled",
+      "thinking.type=enabled with budget_tokens",
+      "thinking.type=enabled without budget_tokens",
+      "thinking.type=adaptive or auto"
+    ],
+    "model_name_condition_added": false,
+    "credential_handling_added": false
+  },
+  "tests": {
+    "canonical_precedence_subcases": 12,
+    "translator_effort_subcases": 11,
+    "cross_protocol_regressions": 1,
+    "focused_commands": [
+      {
+        "target": "internal/thinking",
+        "exit_code": 0
+      },
+      {
+        "target": "internal/translator/codex/claude",
+        "exit_code": 0
+      },
+      {
+        "target": "test/Claude-to-Codex top-level effort",
+        "exit_code": 0
+      }
+    ],
+    "go_vet_focused_exit_code": 0,
+    "go_test_all_exit_code": 0,
+    "server_build_exit_code": 0
+  },
+  "build": {
+    "go_version": "go1.26.5 linux/amd64",
+    "binary_version": "dev",
+    "binary_sha256": "139e1305a878e08026dd0fb6d85a3817801f32e40a40c1954ea1973c5bb9d697"
+  },
+  "review": {
+    "style": "Claudio-Michel",
+    "rounds": 1,
+    "critical_findings": 0,
+    "warnings": 0,
+    "verdict_out_of_5": 5
+  },
+  "upstream_status": {
+    "issue_url": null,
+    "pull_request_url": null,
+    "authorization_blocker": "The required Claudio Michel GitHub App has no permission on router-for-me/CLIProxyAPI.",
+    "external_merge_claimed": false
+  },
+  "safety": {
+    "credential_material_committed": false,
+    "raw_prompt_or_response_committed": false,
+    "raw_proxy_log_committed": false,
+    "private_path_committed": false
+  }
+}
