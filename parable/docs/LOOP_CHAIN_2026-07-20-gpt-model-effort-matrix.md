@@ -66,8 +66,10 @@ Runtime protocol:
 - The existing user-owned ChatGPT subscription OAuth record; no OpenAI API key.
 - `parable claude` from current merged `main`, using a temporary clean repository
   and a credential-free TOML per model.
-- `--safe-mode --no-session-persistence` for text cells so background title
-  generation cannot masquerade as the requested cell.
+- `--safe-mode --no-session-persistence --name <unique-cell-id>` for text
+  cells. Runtime instrumentation proved that `--no-session-persistence` alone
+  still generates a title request; an explicit `--name` suppresses it so one
+  invocation produces one attributable model request.
 - One deterministic tool-using canary per model at `medium`, separate from the
   text matrix, to preserve harness/tool coverage without multiplying tool calls
   across all fifteen effort cells.

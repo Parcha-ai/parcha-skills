@@ -39,7 +39,8 @@
     "translated_evidence_field": "reasoning.effort",
     "background_request_controls": [
       "--safe-mode",
-      "--no-session-persistence"
+      "--no-session-persistence",
+      "--name <unique-cell-id>"
     ]
   },
   "source_binary_drift_hazard": {
@@ -54,6 +55,12 @@
     ],
     "source_documents_max_clamping": true,
     "resolution": "Runtime wire evidence decides every G1 cell."
+  },
+  "post_exit_instrument_correction": {
+    "observed": "--no-session-persistence still emitted a separate title request.",
+    "repair": "Add an explicit unique --name to suppress title generation.",
+    "pilot_without_name_request_logs": 2,
+    "pilot_with_name_request_logs": 1
   },
   "baseline_tests": {
     "total": 81,

@@ -44,8 +44,10 @@ mapping, or credential handling to Parable.
 2. Five installed-CLI effort inputs plus required wire fields — ✅
    `contract.json` records `low`, `medium`, `high`, `xhigh`, `max`,
    `output_config.effort`, and `reasoning.effort`.
-3. Background/title requests cannot masquerade as cells — ✅ the chain runtime
-   protocol requires `--safe-mode --no-session-persistence` and a fresh
+3. Background/title requests cannot masquerade as cells — ✅ corrected after
+   the first G1 instrument pilot: `--no-session-persistence` alone still emitted
+   a title request, while adding a unique `--name` yielded exactly one request.
+   The chain and `contract.json` now require all three flags plus a fresh
    invocation per cell.
 4. Existing tests pass — ✅ 81/81 with an isolated temporary HOME at baseline
    `11249c32306ceb94ae5bc1875ec18cc58a31ff09`.
@@ -67,3 +69,11 @@ or reliability claim is made.
 After PR #140 is merged and verified at `main`, run all fifteen live text cells
 and three representative medium-effort tool canaries. Record every clamp,
 mapping, omission, or failure honestly.
+
+### Post-exit instrument correction (2026-07-20)
+
+The first G1 pilot falsified the original assumption that
+`--no-session-persistence` suppresses AI title generation. It does not. A
+second pilot with an explicit unique `--name` produced one attributable request
+instead of two. The contract was corrected before any pilot was admitted as a
+matrix result; neither pilot consumed a G1 evidence attempt.
