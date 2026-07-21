@@ -784,7 +784,8 @@ function claudeClientEnvironment() {
 
 function authUsage() {
   return [
-    "usage: parable auth add chatgpt [--device]",
+    "usage: parable auth login",
+    "       parable auth add chatgpt [--device]",
     "       parable auth add claude",
     "       parable auth add xai",
     "       parable auth status [--json]",
@@ -979,6 +980,32 @@ async function runAuthStatus(argv, log) {
   const context = loadSetupContext({ requireAuthMode: false, requireProxy: false });
   const status = scanAuthStatus(context.authDir);
   log(options.json ? JSON.stringify(status, null, 2) : renderAuthStatus(status));
+}
+
+async function runAuthLogin(argv, log) {
+  const options = parseOptions(argv, new Set(), new Set(["--help"]));
+  if (options._.length) {
+    throw new OnboardingError(`unexpected auth login argument: ${options._[0]}`);
+  }
+  if (options.help) {
+    log(authUsage());
+    return;
+  }
+  const context = loadSetupContext();
+  let status = scanAuthStatus(context.authDir);
+  for (const vendor of context.vendors) {
+    if (status.providers[vendor].present) {
+      log(`${vendor}: already authorized`);
+      continue;
+    }
+    runNativeAuth(context, vendor, false, log);
+    status = scanAuthStatus(context.authDir);
+  }
+  log("authorization complete");
+  log("");
+  log("In a new terminal, open your project and run:");
+  log("");
+  log("  parable claude --brain auto -- --effort high");
 }
 
 function forwardSignals(children, onSignal = () => {}) {
@@ -1423,6 +1450,7 @@ module.exports = {
   proxyStartUsage,
   claudeClientEnvironment,
   runAuthAdd,
+  runAuthLogin,
   runAuthStatus,
   runClaude,
   runFinalize,

@@ -9,6 +9,7 @@ const { execSync, spawnSync } = require("child_process");
 const {
   OnboardingError,
   runAuthAdd,
+  runAuthLogin,
   runAuthStatus,
   runClaude,
   runFinalize,
@@ -176,6 +177,10 @@ async function main() {
     await runAuthAdd(raw.slice(2), log);
     return;
   }
+  if (raw[0] === "auth" && raw[1] === "login") {
+    await runAuthLogin(raw.slice(2), log);
+    return;
+  }
   if (raw[0] === "auth" && raw[1] === "status") {
     await runAuthStatus(raw.slice(2), log);
     return;
@@ -191,6 +196,7 @@ async function main() {
     log("  setup              configure subscriptions and offer a pinned proxy build");
     log("  setup finalize     diagnostic exact-catalog check and agent synchronization");
     log("  doctor             check python/codex/config health");
+    log("  auth login         interactively authorize every selected missing vendor");
     log("  auth add VENDOR    authorize chatgpt, claude, or xai through CLIProxyAPI");
     log("  auth status        show credential-safe provider presence and record counts");
     log("  proxy build        build the pinned, patched CLIProxyAPI source");

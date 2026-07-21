@@ -132,8 +132,10 @@ done
 
 if [[ "$no_auth" == true ]]; then
   printf '\nSetup is staged but subscriptions are not authorized.\n'
-  printf 'Run `parable auth add` for each selected vendor; the final launch command is:\n\n'
-  printf '  parable claude --brain auto -- --effort high\n'
+  printf 'Authorize every selected missing provider in one interactive flow.\n'
+  printf 'In Claude Code, type this into the input box:\n\n'
+  printf '  ! parable auth login\n\n'
+  printf 'From a normal terminal, omit the leading `!`. The login command prints the final handoff.\n'
   exit 0
 fi
 

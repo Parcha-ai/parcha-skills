@@ -27,6 +27,9 @@ npx skills add miguelrios/unc-skills --skill parable --global --agent claude-cod
 Claude is always the baseline subscription. The onboarding questions make ChatGPT
 (Sol/Terra/Luna and optional Sol fallback) and xAI (Grok 4.5) opt-in. If no compatible proxy is
 installed, onboarding separately asks permission to build Parable's pinned patched proxy.
+Claude Code then asks for one interactive shell handoff—`! parable auth login`—because its Bash
+tool cannot inject later OAuth callbacks into a running process. That single command connects every
+selected missing provider; users should never be handed three separate provider commands.
 
 It is Tuesday. You ask Fable to extract a helper and add a test. Three hundred lines later, the
 helper has its own module and two new dependencies. The model is pleased with itself. You open

@@ -32,7 +32,10 @@ keep any Parable-owned data root at mode `0700`; request separate approval befor
 system change. Stop cleanly if consent is denied.
 
 Build the canonical vendor list with `claude` always present and optional `chatgpt`/`xai` from
-those answers, then run exactly one foreground bootstrap:
+those answers.
+
+If the harness can keep a foreground process alive and write later user input to its stdin, run
+exactly one foreground bootstrap:
 
 ```bash
 bash /resolved/skill/directory/parable.sh \
@@ -41,11 +44,24 @@ bash /resolved/skill/directory/parable.sh \
   [--proxy-bin /resolved/existing/proxy | --build-proxy]
 ```
 
-Do not pass `--no-auth` during ordinary onboarding. The script installs an immutable versioned
-runtime, creates the durable `parable` command, updates the new-terminal PATH when necessary,
-and runs each selected provider's native authorization in order. Keep it in the foreground until
-authorization completes. Use `--no-auth` only when the user explicitly asks to stage setup without
-authorizing; that mode is not a successful first-run handoff.
+Claude Code's `Bash` tool is the exception: it cannot send a pasted OAuth callback to a command's
+stdin after that command starts. In Claude Code, stage setup through `Bash` with the same command
+plus `--no-auth`. After staging succeeds, tell the user to type exactly this into Claude Code's
+input so its interactive shell owns the terminal:
+
+```text
+! parable auth login
+```
+
+This is one intentional interactive handoff, not a blocker. `auth login` walks every selected
+missing provider in order, skips providers already connected, and prints the final launch command.
+Do not give the user three separate `auth add` commands, do not ask them to run `setup finalize`,
+and do not claim onboarding is complete before `auth login` succeeds. Outside this Claude Code
+exception, do not pass `--no-auth` during ordinary onboarding; reserve it for explicit staged setup.
+
+The bootstrap installs an immutable versioned runtime, creates the durable `parable` command,
+updates the new-terminal PATH when necessary, and either runs authorization or prepares the one
+Claude Code interactive handoff above.
 
 Never print the final handoff yourself after a failed or unauthenticated script. The script prints
 it only after setup and all selected authorization flows succeed:

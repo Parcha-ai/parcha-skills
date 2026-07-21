@@ -45,6 +45,18 @@ available, it asks once for consent to install missing build prerequisites and b
 patched proxy. It then passes those decisions to one non-interactive `parable.sh` invocation, so
 the user never answers the same question again in a terminal prompt.
 
+Claude Code's Bash tool cannot write a later callback into a running command's stdin. In that
+harness only, the skill stages setup with `--no-auth`, then asks the user for one interactive shell
+handoff:
+
+```text
+! parable auth login
+```
+
+That command authorizes every selected missing provider in order and prints the final launch
+command. It replaces, rather than precedes, three separate `auth add` commands. Harnesses with a
+controllable foreground PTY run the bundled bootstrap and authorization as one process instead.
+
 A published npm install can seed the same standalone skill:
 
 ```bash
@@ -173,6 +185,7 @@ Parable adds no OAuth implementation. Its commands become exactly:
 
 | Parable command | CLIProxyAPI flags |
 |---|---|
+| `auth login` | each selected missing vendor's native flag below, in order |
 | `auth add chatgpt` | `--config … --codex-login` |
 | `auth add chatgpt --device` | `--config … --codex-device-login` |
 | `auth add claude` | `--config … --claude-login --no-browser` |

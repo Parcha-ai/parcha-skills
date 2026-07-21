@@ -420,7 +420,11 @@ exit 0
         self.assertIn("--non-interactive", skill)
         self.assertIn("--vendors claude[,chatgpt][,xai]", skill)
         self.assertIn("--build-proxy", skill)
-        self.assertIn("Do not pass `--no-auth` during ordinary onboarding", skill)
+        self.assertIn("Claude Code's `Bash` tool is the exception", skill)
+        self.assertIn("! parable auth login", skill)
+        self.assertIn("one intentional interactive handoff", skill)
+        self.assertIn("Do not give the user three separate `auth add` commands", skill)
+        self.assertIn("users should never be handed three separate provider commands", readme)
 
         self.assertIn('chmod +x "$DEST"/parable.sh', installer)
         self.assertIn('exec "$DEST/parable.sh" "$@"', installer)
@@ -434,6 +438,7 @@ exit 0
         self.assertEqual(help_proc.returncode, 0, help_proc.stdout + help_proc.stderr)
         self.assertIn("supervise the proxy", help_proc.stdout)
         self.assertIn("diagnostic foreground", help_proc.stdout)
+        self.assertIn("auth login", help_proc.stdout)
 
     def test_install_and_error_path(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -480,7 +485,7 @@ exit 0
             self.assertEqual(first.stdout.count(handoff), 1)
             self.assertIn(launch, first.stdout)
 
-            installed = home / ".local" / "share" / "parable" / "0.1.11"
+            installed = home / ".local" / "share" / "parable" / "0.1.12"
             durable = home / ".local" / "bin" / "parable"
             self.assertTrue((installed / "bin" / "parable.js").is_file())
             self.assertTrue((installed / "lib" / "onboarding.js").is_file())
@@ -597,6 +602,8 @@ exit 0
             )
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertIn("subscriptions are not authorized", proc.stdout)
+            self.assertIn("! parable auth login", proc.stdout)
+            self.assertNotIn("Run `parable auth add` for each selected vendor", proc.stdout)
             self.assertNotIn("In a new terminal", proc.stdout)
 
     def test_bundled_runtime_version_and_patch_match_package(self):
@@ -1346,6 +1353,38 @@ raise SystemExit(int(os.environ.get("FAKE_PROXY_EXIT", "0")))
                 ["--config", str(config), "--xai-login", "--no-browser"],
             ])
             self.assertIn("authorization complete", proc.stdout)
+
+    def test_auth_login_walks_only_selected_missing_vendors_and_hands_off_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            proxy, capture = self.make_proxy(home / "tools")
+            setup = self.setup(home, proxy, capture)
+            self.assertEqual(setup.returncode, 0, setup.stdout + setup.stderr)
+            claude_record = home / ".cli-proxy-api" / "existing-claude.json"
+            claude_record.write_text('{"type":"claude"}')
+            claude_record.chmod(0o600)
+            proc = self.run_cli(home, proxy, capture, "auth", "login")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            config = home / ".config" / "parable" / "cliproxy.yaml"
+            self.assertEqual(self.calls(capture), [
+                ["--config", str(config), "--codex-login"],
+                ["--config", str(config), "--xai-login", "--no-browser"],
+            ])
+            self.assertIn("claude: already authorized", proc.stdout)
+            self.assertEqual(proc.stdout.count(
+                "In a new terminal, open your project and run:"
+            ), 1)
+            self.assertIn("parable claude --brain auto -- --effort high", proc.stdout)
+
+            before = capture.read_bytes()
+            again = self.run_cli(home, proxy, capture, "auth", "login")
+            self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+            self.assertEqual(capture.read_bytes(), before)
+            for vendor in ("claude", "chatgpt", "xai"):
+                self.assertIn(f"{vendor}: already authorized", again.stdout)
+            self.assertEqual(again.stdout.count(
+                "In a new terminal, open your project and run:"
+            ), 1)
 
     def test_auth_rejects_zero_exit_without_a_provider_record(self):
         with tempfile.TemporaryDirectory() as tmp:

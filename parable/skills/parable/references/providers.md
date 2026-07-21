@@ -183,6 +183,11 @@ operators can pass `--no-auth`, then use
 `parable auth add xai` for the vendors they selected. See the
 [complete first-run guide](../../../docs/CLIPROXYAPI_GPT_SUBSCRIPTION.md).
 
+Claude Code first-run uses `--no-auth` only because its Bash tool cannot write a later OAuth
+callback to child stdin. It hands the user's terminal to one `! parable auth login` command, which
+authorizes every selected missing provider. Do not expand that ordinary flow into per-provider
+commands; those remain troubleshooting and headless-operator escape hatches.
+
 The generated TOML has this shape:
 
 ```toml

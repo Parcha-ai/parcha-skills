@@ -11,7 +11,7 @@
     {
       "name": "parable",
       "source": "./",
-      "version": "0.1.11",
+      "version": "0.1.12",
       "description": "Multi-model coding orchestration: plan, route to the cheapest capable executor model, verify with code, review with fresh eyes.",
       "author": {
         "name": "Parcha Labs",
