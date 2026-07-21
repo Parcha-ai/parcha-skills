@@ -109,6 +109,19 @@ class PortablePackagingTest(unittest.TestCase):
             self.assertIn(f"https://skills.sh/miguelrios/unc-skills/{name}", package_readme)
             self.assertIn(f"npx skills add miguelrios/unc-skills --skill {name}", package_readme)
 
+    def test_effective_comms_is_a_complete_managed_snippet(self):
+        snippet = (ROOT / "snippets/effective-comms/AGENTS.md").read_text()
+        readme = (ROOT / "snippets/effective-comms/README.md").read_text()
+
+        self.assertTrue(snippet.startswith("<!-- effective-comms:start -->"))
+        self.assertTrue(snippet.rstrip().endswith("<!-- effective-comms:end -->"))
+        self.assertIn("Lead with the answer, result, or next action", snippet)
+        self.assertIn("Default to brief, not incomplete", snippet)
+        self.assertIn("Accuracy, safety, security, privacy", snippet)
+        self.assertIn("After three failed iterations", snippet)
+        self.assertIn("does not claim certification or", readme)
+        self.assertIn("[`effective-comms`](snippets/effective-comms/)", (ROOT / "README.md").read_text())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -17,7 +17,7 @@
     {
       "name": "parable",
       "source": "./parable",
-      "version": "0.1.9",
+      "version": "0.1.10",
       "description": "Multi-model coding orchestration: plan, route to the cheapest capable executor model, verify with code, review with fresh eyes."
     },
     {

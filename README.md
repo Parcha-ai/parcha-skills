@@ -17,6 +17,16 @@ Miguel's collection of portable Agent Skills for Claude Code, Codex, and pi.
 The skill payloads are canonical `skills/<name>/SKILL.md` directories. Harness-specific
 manifests package those same files; there are no Claude/Codex/pi forks to drift apart.
 
+## Instruction snippets
+
+[`snippets/`](snippets/) contains small, harness-neutral blocks for always-loaded
+agent instruction files. Unlike skills, snippets do not depend on discovery or
+explicit invocation.
+
+- [`effective-comms`](snippets/effective-comms/) makes responses answer-first,
+  concrete, structured, and brief by default while preserving safety and
+  completeness exceptions.
+
 ## Install with skills.sh
 
 Browse all seven skills at [skills.sh/miguelrios/unc-skills](https://skills.sh/miguelrios/unc-skills),
