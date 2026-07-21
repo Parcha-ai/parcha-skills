@@ -1,25 +1,54 @@
 ---
 name: parable
-description: Orchestrator and installer for multi-model implementation batches. Invoke when the user asks to install, set up, onboard, or connect subscriptions to Parable; names Parable; hands over a backlog; or asks to route work across models. For first-time install intent, run the bundled parable.sh before ordinary session guidance. Not for a single isolated bugfix or a standalone code review.
+description: Install, onboard, and run multi-model coding orchestration. Invoke when the user says install Parable, install parable.sh, set up or onboard Parable, connect coding subscriptions, names Parable, hands over a backlog, or asks to route work across models. For first-time install intent, collect subscription choices with the harness's native structured-question tool and then run the bundled parable.sh. Not for a single isolated bugfix or standalone code review.
 ---
 
 # parable — divide and conquer
 
 ## First-time install and subscription onboarding
 
-When the user asks to install, set up, or onboard Parable, run `parable.sh` from the directory
-that contains this `SKILL.md`. Resolve that installed skill directory directly; plugin caches
-and standalone skill installs live in different roots. Do not replace this with `curl`, `npx`,
-or a repository clone: the skill carries the pinned runtime it needs.
+When the user asks to install, set up, or onboard Parable, resolve `parable.sh` beside this
+`SKILL.md`. Plugin caches and standalone skill installs live in different roots. Do not replace
+it with `curl`, `npx`, or a repository clone: the skill carries the pinned runtime it needs.
 
-The script installs an immutable versioned runtime, creates the durable user command
-`parable`, ensures its user bin directory loads in a new terminal, and enters the existing
-interactive setup and native vendor authorization flow. Run it in the foreground. Forward
-setup flags only when the user supplied them; for example, a headless selection can use
-`parable.sh --non-interactive --vendors chatgpt,claude,xai --no-auth`. That staged mode stops
-before the ready handoff and tells the user to run `parable auth add` for each vendor. Never
-print the final handoff yourself after a failed or unauthenticated script—the script prints it
-only after ordinary setup and authorization succeed:
+Before running the script, state that Claude is the baseline subscription because the harness is
+Claude Code, then collect the optional subscriptions with the harness's native structured-question UI:
+
+1. Ask whether to connect a ChatGPT subscription for Sol, Terra, and Luna. Explain that Sol becomes
+   an automatic fallback only when ChatGPT is connected; without it, `auto` remains on Fable.
+2. Ask whether to connect an xAI subscription for Grok 4.5. Recommend yes when the user has one.
+
+In Claude Code use `AskUserQuestion`; in Codex use `request_user_input` when the active mode
+permits it (normally Plan mode); in another harness use its equivalent structured-choice tool.
+Ask both questions in one tool call when possible. Use two-choice yes/no answers and explain that
+the credentials stay user-owned in CLIProxyAPI. If the structured-question tool is absent or
+unavailable in the active mode, ask the same two choices in one concise message and wait for the
+answer. Do not attempt a known-unavailable tool and do not silently infer paid subscriptions.
+
+Inspect `PARABLE_CLIPROXY_BIN` and `PATH` for an existing CLIProxyAPI executable. If none exists,
+ask one more native yes/no question for consent to download source, install any missing build
+prerequisite, and build Parable's pinned patched proxy. Prefer a user-local prerequisite install;
+keep any Parable-owned data root at mode `0700`; request separate approval before any privileged
+system change. Stop cleanly if consent is denied.
+
+Build the canonical vendor list with `claude` always present and optional `chatgpt`/`xai` from
+those answers, then run exactly one foreground bootstrap:
+
+```bash
+bash /resolved/skill/directory/parable.sh \
+  --non-interactive \
+  --vendors claude[,chatgpt][,xai] \
+  [--proxy-bin /resolved/existing/proxy | --build-proxy]
+```
+
+Do not pass `--no-auth` during ordinary onboarding. The script installs an immutable versioned
+runtime, creates the durable `parable` command, updates the new-terminal PATH when necessary,
+and runs each selected provider's native authorization in order. Keep it in the foreground until
+authorization completes. Use `--no-auth` only when the user explicitly asks to stage setup without
+authorizing; that mode is not a successful first-run handoff.
+
+Never print the final handoff yourself after a failed or unauthenticated script. The script prints
+it only after setup and all selected authorization flows succeed:
 
 ```text
 In a new terminal, open your project and run:

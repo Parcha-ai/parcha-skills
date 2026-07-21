@@ -1,6 +1,6 @@
 {
   "name": "parable",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "description": "Multi-model coding orchestration: plan, route, verify, and review implementation batches.",
   "author": {
     "name": "Parcha Labs",

@@ -215,8 +215,15 @@ skills.sh:
 
 ```bash
 npx skills add miguelrios/unc-skills --skill parable
-# Then, in Claude Code: ask "Set up Parable" (or invoke `/parable install`).
+# Then ask the harness: "Install Parable" or "Install parable.sh".
 ```
+
+The skill uses Claude Code's `AskUserQuestion`, Codex's `request_user_input` when the active mode
+permits it, or the current harness's equivalent structured UI to choose optional ChatGPT and xAI
+subscriptions; it falls back to one concise question when structured input is unavailable.
+Claude is the baseline pool because the harness is Claude Code. ChatGPT adds Sol/Terra/Luna and
+enables Sol as an automatic fallback; without ChatGPT, `auto` stays on Fable. After those choices,
+the skill runs its bundled installer once and delegates each selected provider's native OAuth flow.
 
 ```bash
 # Claude Code plugin marketplace
@@ -235,7 +242,11 @@ pi install git:github.com/miguelrios/unc-skills
 curl https://cursor.com/install -fsS | bash
 export CURSOR_API_KEY="..."
 
-# standalone skill/runtime from source (npm remains 0.1.7 until the 0.1.10 release gate)
+# published npm CLI + standalone Claude skill
+npm install -g @parcha/parable@latest
+parable install
+
+# standalone skill/runtime from source
 git clone https://github.com/miguelrios/unc-skills.git
 cd unc-skills/parable
 ./install.sh
@@ -250,7 +261,7 @@ parable claude --brain auto -- --effort high
 
 Interactive setup offers the pinned proxy build when no executable is installed. For a headless
 ChatGPT device flow, use
-`parable.sh --non-interactive --vendors chatgpt,claude,xai --build-proxy --no-auth`, then run
+`parable.sh --non-interactive --vendors claude,chatgpt,xai --build-proxy --no-auth`, then run
 `parable auth add chatgpt --device` plus the selected Claude/xAI auth commands. The
 [subscription guide](docs/CLIPROXYAPI_GPT_SUBSCRIPTION.md) covers every command, generated file,
 exact model, and failure rule.

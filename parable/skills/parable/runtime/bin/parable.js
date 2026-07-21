@@ -11,6 +11,7 @@ const {
   runAuthAdd,
   runAuthStatus,
   runClaude,
+  runFinalize,
   runProxyBuild,
   runProxyStart,
   runSetup,
@@ -156,7 +157,8 @@ async function main() {
     runPython(["agents", "sync", ...raw.slice(2)]);
   }
   if (raw[0] === "setup" && raw[1] === "finalize") {
-    runPython(["finalize", ...raw.slice(2)], setupClientEnvironment());
+    process.exitCode = await runFinalize(raw.slice(2));
+    return;
   }
   if (raw[0] === "setup") {
     await runSetup(raw.slice(1), log);

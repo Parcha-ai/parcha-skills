@@ -36,8 +36,23 @@ immutable versioned runtime, creates `~/.local/bin/parable`, adds that directory
 to the appropriate shell startup file when necessary, and enters setup/auth.
 It does not download CLI code.
 
-Until the verified `0.1.10` package is explicitly published to npm, a source
-checkout uses the exact same entrypoint:
+Before running the shell bootstrap, the skill uses the harness's native structured-question
+UI—`AskUserQuestion` in Claude Code, `request_user_input` when the active Codex mode permits it,
+or the equivalent elsewhere—to ask whether to add ChatGPT and xAI. It falls back to one concise
+question when structured input is unavailable. Claude is the baseline pool. ChatGPT optionally
+adds Sol/Terra/Luna and enables Sol as an automatic fallback; without it, `auto` stays on Fable. If no proxy is
+available, it asks once for consent to install missing build prerequisites and build the pinned,
+patched proxy. It then passes those decisions to one non-interactive `parable.sh` invocation, so
+the user never answers the same question again in a terminal prompt.
+
+A published npm install can seed the same standalone skill:
+
+```bash
+npm install -g @parcha/parable@latest
+parable install
+```
+
+A source checkout uses the same bundled entrypoint:
 
 ```bash
 git clone https://github.com/miguelrios/unc-skills.git
@@ -45,12 +60,10 @@ cd unc-skills/parable
 ./install.sh
 ```
 
-Setup always selects ChatGPT because Sol is the fallback parent. In interactive mode it
-asks whether to add Claude and xAI, then starts each selected provider's native
-authorization flow. Parable first discovers an existing proxy from
-`--proxy-bin`, `PARABLE_CLIPROXY_BIN`, or `PATH`; when none exists, setup asks
-once for permission to download and build the pinned source. Answering no
-performs no network or build work.
+Setup always selects Claude because Claude Code is the harness, then starts each selected
+provider's native authorization flow. Parable first discovers an existing proxy from
+`--proxy-bin`, `PARABLE_CLIPROXY_BIN`, or `PATH`; when none exists, the skill passes explicit
+consent through `--build-proxy`. Declining that consent performs no network or build work.
 
 After successful setup, enter the repository where Claude should work in a new
 terminal and launch it:
@@ -69,7 +82,7 @@ used pool. Unknown Claude usage keeps the preferred Fable parent. Use
 `parable claude` authenticates a readiness
 probe to the configured loopback `/v1/models`. It reuses a healthy endpoint
 without owning or stopping it; otherwise it starts the configured proxy,
-waits for readiness, requires the exact Sol parent and every selected child,
+waits for readiness, requires the exact configured parent and every selected child,
 writes or confirms only Parable-owned project agents, launches stock Claude,
 and stops only the proxy process it owns when Claude exits. When it owns both
 children, signals reach both and the meaningful Claude or proxy exit status is
@@ -81,7 +94,7 @@ and connect each selected vendor explicitly:
 ```bash
 bash /path/to/installed/parable/parable.sh \
   --non-interactive \
-  --vendors chatgpt,claude,xai \
+  --vendors claude,chatgpt,xai \
   --build-proxy \
   --no-auth
 parable auth add chatgpt --device
@@ -105,8 +118,9 @@ parable setup finalize
 ```
 
 `proxy start` exposes foreground logs for troubleshooting and is never required
-beside the normal launcher. `setup finalize` checks the already-running proxy
-without launching Claude. Neither command is part of ordinary onboarding.
+beside the normal launcher. `setup finalize` starts and cleans up the managed proxy when needed,
+checks the exact catalog, and synchronizes agents without launching Claude.
+Neither command is part of ordinary onboarding.
 
 You do not need to source `cliproxy.env`: the CLI passes the generated local
 client token only to the catalog/Claude child process, converts it to
@@ -114,12 +128,12 @@ client token only to the catalog/Claude child process, converts it to
 
 ## Non-interactive setup
 
-Automation must state its vendor selection and include ChatGPT:
+Automation must state its vendor selection and include Claude:
 
 ```bash
 bash /path/to/installed/parable/parable.sh \
   --non-interactive \
-  --vendors chatgpt,claude,xai \
+  --vendors claude,chatgpt,xai \
   --build-proxy \
   --no-auth
 ```
@@ -128,11 +142,12 @@ Supported selections are:
 
 | Selection | Parent and named children |
 |---|---|
-| `chatgpt` | exact Sol, Terra, and Luna (Sol is fallback parent and a peer under Fable) |
-| `claude` | exact Fable 5, Sonnet 5, Opus 4.8, and Haiku 4.5 agents |
-| `xai` | exact Grok 4.5 agent |
+| `claude` | Fable parent plus exact Fable 5, Sonnet 5, Opus 4.8, and Haiku 4.5 agents |
+| `claude,chatgpt` | Claude cast plus exact Sol, Terra, and Luna; Sol becomes an eligible fallback parent |
+| `claude,xai` | Claude cast plus exact Grok 4.5 |
+| `claude,chatgpt,xai` | all eight exact models |
 
-Unknown vendors, a selection without ChatGPT, missing executables, partial
+Unknown vendors, a selection without Claude, missing executables, partial
 state, changed generated content, unsafe modes, or symlinks all fail without
 overwriting anything. There is deliberately no `--force` path.
 
@@ -210,13 +225,9 @@ The authenticated catalog is entitlement truth. A similarly named id, display
 alias, different case, or `-latest` suffix never substitutes for a missing
 exact id. Subscription plan limits and provider terms still apply.
 
-## npm release boundary
+## npm release verification
 
-GitHub source is currently `0.1.10`; the npm registry is still `0.1.7`. The
-source package passes its complete suite and `npm pack --dry-run`, but this
-repository work does not authorize publication.
-
-After a human explicitly approves the release:
+Before publishing a new version:
 
 ```bash
 cd parable
@@ -225,8 +236,8 @@ npm run pack:check
 npm publish --access public
 ```
 
-After publication, `npx @parcha/parable@0.1.10 …` can replace the source
-installer above.
+After publication, `npm install -g @parcha/parable@latest` installs the released CLI and
+`parable install` seeds its bundled skill.
 
 ## Evidence
 

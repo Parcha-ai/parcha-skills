@@ -170,10 +170,11 @@ bash /path/to/installed/parable/parable.sh
 parable claude --brain auto -- --effort high
 ```
 
-ChatGPT is mandatory for the Sol fallback parent; interactive setup asks whether
-to add Claude and xAI and offers the pinned build when no proxy is installed.
-`parable claude --brain auto` prefers Fable while its pool has room and moves to
-Sol when it is tight. The launcher owns proxy start, authenticated readiness, exact catalog sync,
+Claude is the baseline pool for the Claude Code harness; interactive setup asks whether
+to add ChatGPT and xAI and offers the pinned build when no proxy is installed.
+`parable claude --brain auto` stays on Fable without ChatGPT. When ChatGPT is selected, it
+prefers Fable while its pool has room and can move to Sol when it is tight. The launcher owns
+proxy start, authenticated readiness, exact catalog sync,
 stock-Claude launch, signal forwarding, and cleanup. It reuses but never stops
 a healthy pre-existing endpoint. `parable proxy start` and
 `parable setup finalize` remain explicit troubleshooting commands. Headless
@@ -188,7 +189,7 @@ The generated TOML has this shape:
 [claude]
 base_url = "http://127.0.0.1:8317"
 auth_token_env = "CLIPROXY_API_KEY"
-brain_model = "gpt-5.6-sol"
+brain_model = "claude-fable-5"
 
 [executors.terra]
 provider = "claude"

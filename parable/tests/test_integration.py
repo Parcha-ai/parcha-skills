@@ -370,6 +370,19 @@ class TestClaudeSubscriptionLauncher(unittest.TestCase):
 
 
 class TestInstallerSmoke(unittest.TestCase):
+    def make_auth_proxy(self, target: Path) -> Path:
+        target.write_text("""#!/usr/bin/env sh
+case " $* " in
+  *" --claude-login "*)
+    umask 077
+    printf '%s\n' '{"type":"claude"}' > "$HOME/.cli-proxy-api/claude-test.json"
+    ;;
+esac
+exit 0
+""")
+        target.chmod(0o755)
+        return target
+
     def test_public_onboarding_surfaces_use_skill_bootstrap_and_auto_handoff(self):
         readme = (REPO / "README.md").read_text()
         guide = (REPO / "docs" / "CLIPROXYAPI_GPT_SUBSCRIPTION.md").read_text()
@@ -393,6 +406,15 @@ class TestInstallerSmoke(unittest.TestCase):
             self.assertIn("parable claude --brain auto", surface)
             self.assertIn("setup finalize", surface)
             self.assertIn("proxy start", surface)
+
+        self.assertIn("install parable.sh", skill)
+        self.assertIn("AskUserQuestion", skill)
+        self.assertIn("request_user_input", skill)
+        self.assertIn("do not silently infer paid subscriptions", skill)
+        self.assertIn("--non-interactive", skill)
+        self.assertIn("--vendors claude[,chatgpt][,xai]", skill)
+        self.assertIn("--build-proxy", skill)
+        self.assertIn("Do not pass `--no-auth` during ordinary onboarding", skill)
 
         self.assertIn('chmod +x "$DEST"/parable.sh', installer)
         self.assertIn('exec "$DEST/parable.sh" "$@"', installer)
@@ -433,15 +455,13 @@ class TestInstallerSmoke(unittest.TestCase):
             (home / ".bashrc").write_text("# user config\n")
             standalone = root / "installed-skill"
             shutil.copytree(REPO / "skills" / "parable", standalone)
-            proxy = root / "fake-proxy"
-            proxy.write_text("#!/usr/bin/env sh\nexit 0\n")
-            proxy.chmod(0o755)
+            proxy = self.make_auth_proxy(root / "fake-proxy")
             env = os.environ | {"HOME": str(home), "SHELL": "/bin/bash"}
             for name in ("PARABLE_CONFIG", "PARABLE_CLIPROXY_BIN", "CLIPROXY_API_KEY"):
                 env.pop(name, None)
             command = [
                 "bash", str(standalone / "parable.sh"),
-                "--non-interactive", "--vendors", "chatgpt",
+                "--non-interactive", "--vendors", "claude",
                 "--proxy-bin", str(proxy),
             ]
 
@@ -454,7 +474,7 @@ class TestInstallerSmoke(unittest.TestCase):
             self.assertEqual(first.stdout.count(handoff), 1)
             self.assertIn(launch, first.stdout)
 
-            installed = home / ".local" / "share" / "parable" / "0.1.10"
+            installed = home / ".local" / "share" / "parable" / "0.1.11"
             durable = home / ".local" / "bin" / "parable"
             self.assertTrue((installed / "bin" / "parable.js").is_file())
             self.assertTrue((installed / "lib" / "onboarding.js").is_file())
@@ -560,7 +580,7 @@ class TestInstallerSmoke(unittest.TestCase):
             proc = subprocess.run(
                 [
                     "bash", str(standalone / "parable.sh"),
-                    "--non-interactive", "--vendors", "chatgpt",
+                    "--non-interactive", "--vendors", "claude",
                     "--proxy-bin", str(proxy), "--no-auth",
                 ],
                 cwd=root,
@@ -603,13 +623,11 @@ class TestInstallerSmoke(unittest.TestCase):
     def test_source_installer_enters_the_same_skill_bootstrap(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
-            proxy = home / "fake-proxy"
-            proxy.write_text("#!/usr/bin/env sh\nexit 0\n")
-            proxy.chmod(0o755)
+            proxy = self.make_auth_proxy(home / "fake-proxy")
             proc = subprocess.run(
                 [
                     "bash", str(REPO / "install.sh"),
-                    "--non-interactive", "--vendors", "chatgpt",
+                    "--non-interactive", "--vendors", "claude",
                     "--proxy-bin", str(proxy),
                 ],
                 cwd=home,
@@ -660,7 +678,7 @@ class TestFirstRunSetup(unittest.TestCase):
         self.assertEqual(target.stat().st_mode & 0o777, mode, target)
         self.assertFalse(target.is_symlink(), target)
 
-    def test_chatgpt_setup_is_private_token_safe_valid_and_idempotent(self):
+    def test_claude_baseline_setup_is_private_token_safe_valid_and_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             proxy = self.make_proxy(home / "tools", "custom-proxy")
@@ -668,7 +686,7 @@ class TestFirstRunSetup(unittest.TestCase):
                 home,
                 "setup",
                 "--non-interactive",
-                "--vendors", "chatgpt",
+                "--vendors", "claude",
                 "--proxy-bin", str(proxy),
                 "--no-auth",
             )
@@ -696,22 +714,26 @@ class TestFirstRunSetup(unittest.TestCase):
             self.assertIn(f'auth-dir: "{auth_dir}"', yaml)
             self.assertIn(token, yaml)
             config = (config_dir / "parable.toml").read_text()
-            self.assertIn('brain_model = "gpt-5.6-sol"', config)
-            self.assertIn('model = "gpt-5.6-terra"', config)
-            self.assertIn('model = "gpt-5.6-luna"', config)
-            for absent in (
-                "grok-4.5",
+            self.assertIn('brain_model = "claude-fable-5"', config)
+            for present in (
                 "claude-fable-5",
                 "claude-sonnet-5",
                 "claude-opus-4-8",
                 "claude-haiku-4-5-20251001",
+            ):
+                self.assertIn(present, config)
+            for absent in (
+                "grok-4.5",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
                 "kimi",
             ):
                 self.assertNotIn(absent, config)
             self.assertNotIn(token, config)
             manifest_text = (config_dir / "setup.json").read_text()
             manifest = json.loads(manifest_text)
-            self.assertEqual(manifest["vendors"], ["chatgpt"])
+            self.assertEqual(manifest["vendors"], ["claude"])
             self.assertEqual(manifest["proxyBinary"], str(proxy.resolve()))
             self.assertNotIn(token, manifest_text)
 
@@ -723,7 +745,7 @@ class TestFirstRunSetup(unittest.TestCase):
                 home,
                 "setup",
                 "--non-interactive",
-                "--vendors", "chatgpt",
+                "--vendors", "claude",
                 "--no-auth",
             )
             self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
@@ -744,13 +766,32 @@ class TestFirstRunSetup(unittest.TestCase):
             interactive = self.run_cli(
                 interactive_home,
                 "setup", "--proxy-bin", str(proxy), "--no-auth",
-                input_text="y\nn\n",
+                input_text="n\nn\n",
             )
             self.assertEqual(interactive.returncode, 0, interactive.stdout + interactive.stderr)
             interactive_manifest = json.loads(
                 (interactive_home / ".config" / "parable" / "setup.json").read_text()
             )
-            self.assertEqual(interactive_manifest["vendors"], ["chatgpt", "claude"])
+            self.assertEqual(interactive_manifest["vendors"], ["claude"])
+
+            claude_xai_home = root / "claude-xai"
+            claude_xai_home.mkdir()
+            claude_xai = self.run_cli(
+                claude_xai_home,
+                "setup", "--non-interactive", "--vendors", "xai,claude",
+                "--proxy-bin", str(proxy), "--no-auth",
+            )
+            self.assertEqual(claude_xai.returncode, 0, claude_xai.stdout + claude_xai.stderr)
+            claude_xai_manifest = json.loads(
+                (claude_xai_home / ".config" / "parable" / "setup.json").read_text()
+            )
+            self.assertEqual(claude_xai_manifest["vendors"], ["claude", "xai"])
+            claude_xai_config = (
+                claude_xai_home / ".config" / "parable" / "parable.toml"
+            ).read_text()
+            self.assertIn('brain_model = "claude-fable-5"', claude_xai_config)
+            self.assertIn('model = "grok-4.5"', claude_xai_config)
+            self.assertNotIn("gpt-5.6-", claude_xai_config)
 
             all_home = root / "all"
             all_home.mkdir()
@@ -763,7 +804,7 @@ class TestFirstRunSetup(unittest.TestCase):
             self.assertEqual(all_vendors.returncode, 0, all_vendors.stdout + all_vendors.stderr)
             config_dir = all_home / ".config" / "parable"
             manifest = json.loads((config_dir / "setup.json").read_text())
-            self.assertEqual(manifest["vendors"], ["chatgpt", "claude", "xai"])
+            self.assertEqual(manifest["vendors"], ["claude", "chatgpt", "xai"])
             self.assertEqual(manifest["port"], 9123)
             config = (config_dir / "parable.toml").read_text()
             for model in (
@@ -799,7 +840,7 @@ class TestFirstRunSetup(unittest.TestCase):
             missing_home.mkdir()
             missing = self.run_cli(
                 missing_home,
-                "setup", "--non-interactive", "--vendors", "chatgpt", "--no-auth",
+                "setup", "--non-interactive", "--vendors", "claude", "--no-auth",
                 env_extra={"PATH": str(empty_path)},
             )
             self.assertNotEqual(missing.returncode, 0)
@@ -808,8 +849,8 @@ class TestFirstRunSetup(unittest.TestCase):
             self.assertFalse((missing_home / ".cli-proxy-api").exists())
 
             proxy = self.make_proxy(root / "tools")
-            for vendors, message in (("claude", "must include chatgpt"),
-                                     ("chatgpt,kimi", "unsupported vendor")):
+            for vendors, message in (("chatgpt", "must include claude"),
+                                     ("claude,kimi", "unsupported vendor")):
                 home = root / vendors.replace(",", "-")
                 home.mkdir()
                 rejected = self.run_cli(
@@ -840,7 +881,7 @@ class TestFirstRunSetup(unittest.TestCase):
             (config_dir / "cliproxy.yaml").symlink_to(outside)
             partial = self.run_cli(
                 partial_home,
-                "setup", "--non-interactive", "--vendors", "chatgpt",
+                "setup", "--non-interactive", "--vendors", "claude",
                 "--proxy-bin", str(proxy), "--no-auth",
             )
             self.assertNotEqual(partial.returncode, 0)
@@ -853,7 +894,7 @@ class TestFirstRunSetup(unittest.TestCase):
             proxy = self.make_proxy(home / "tools")
             created = self.run_cli(
                 home,
-                "setup", "--non-interactive", "--vendors", "chatgpt",
+                "setup", "--non-interactive", "--vendors", "claude",
                 "--proxy-bin", str(proxy), "--no-auth",
             )
             self.assertEqual(created.returncode, 0, created.stdout + created.stderr)
@@ -863,7 +904,7 @@ class TestFirstRunSetup(unittest.TestCase):
             env_file.chmod(0o644)
             bad_mode = self.run_cli(
                 home,
-                "setup", "--non-interactive", "--vendors", "chatgpt", "--no-auth",
+                "setup", "--non-interactive", "--vendors", "claude", "--no-auth",
             )
             self.assertNotEqual(bad_mode.returncode, 0)
             self.assertIn("mode 0600", bad_mode.stderr)
@@ -872,7 +913,7 @@ class TestFirstRunSetup(unittest.TestCase):
 
             drift = self.run_cli(
                 home,
-                "setup", "--non-interactive", "--vendors", "chatgpt,xai",
+                "setup", "--non-interactive", "--vendors", "claude,xai",
                 "--port", "9000", "--no-auth",
             )
             self.assertNotEqual(drift.returncode, 0)
@@ -884,7 +925,7 @@ class TestFirstRunSetup(unittest.TestCase):
             changed = env_file.read_bytes()
             content_drift = self.run_cli(
                 home,
-                "setup", "--non-interactive", "--vendors", "chatgpt", "--no-auth",
+                "setup", "--non-interactive", "--vendors", "claude", "--no-auth",
             )
             self.assertNotEqual(content_drift.returncode, 0)
             self.assertIn("generated setup file has changed", content_drift.stderr)
@@ -907,7 +948,7 @@ class TestFirstRunSetup(unittest.TestCase):
             explicit_home.mkdir()
             result = self.run_cli(
                 explicit_home,
-                "setup", "--non-interactive", "--vendors", "chatgpt",
+                "setup", "--non-interactive", "--vendors", "claude",
                 "--proxy-bin", str(explicit), "--no-auth",
                 env_extra=common_env,
             )
@@ -921,7 +962,7 @@ class TestFirstRunSetup(unittest.TestCase):
             env_home.mkdir()
             result = self.run_cli(
                 env_home,
-                "setup", "--non-interactive", "--vendors", "chatgpt", "--no-auth",
+                "setup", "--non-interactive", "--vendors", "claude", "--no-auth",
                 env_extra=common_env,
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -932,7 +973,7 @@ class TestFirstRunSetup(unittest.TestCase):
             path_home.mkdir()
             result = self.run_cli(
                 path_home,
-                "setup", "--non-interactive", "--vendors", "chatgpt", "--no-auth",
+                "setup", "--non-interactive", "--vendors", "claude", "--no-auth",
                 env_extra={"PATH": f"{bindir}:{os.environ['PATH']}"},
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -1155,7 +1196,7 @@ if args and args[0] == "build":
             env["XDG_DATA_HOME"] = str(data_home)
             setup = subprocess.run(
                 [NODE, str(REPO / "bin" / "parable.js"),
-                 "setup", "--non-interactive", "--vendors", "chatgpt",
+                 "setup", "--non-interactive", "--vendors", "claude",
                  "--build-proxy", "--no-auth"],
                 cwd=setup_home,
                 env=env,
@@ -1180,9 +1221,21 @@ class TestVendorAuthAndProxyLifecycle(unittest.TestCase):
         proxy.write_text("""#!/usr/bin/env python3
 import json
 import os
+from pathlib import Path
 import sys
 with open(os.environ["FAKE_PROXY_CAPTURE"], "a") as handle:
     handle.write(json.dumps(sys.argv[1:]) + "\\n")
+mapping = {
+    "--codex-login": ("chatgpt", "codex"),
+    "--codex-device-login": ("chatgpt", "codex"),
+    "--claude-login": ("claude", "claude"),
+    "--xai-login": ("xai", "xai"),
+}
+for flag, (vendor, record_type) in mapping.items():
+    if flag in sys.argv and os.environ.get("FAKE_PROXY_SKIP_AUTH") != vendor:
+        target = Path.home() / ".cli-proxy-api" / f"fake-{vendor}.json"
+        target.write_text(json.dumps({"type": record_type}))
+        target.chmod(0o600)
 if os.environ.get("FAKE_PROXY_STDOUT"):
     print(os.environ["FAKE_PROXY_STDOUT"])
 raise SystemExit(int(os.environ.get("FAKE_PROXY_EXIT", "0")))
@@ -1282,11 +1335,25 @@ raise SystemExit(int(os.environ.get("FAKE_PROXY_EXIT", "0")))
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             config = home / ".config" / "parable" / "cliproxy.yaml"
             self.assertEqual(self.calls(capture), [
-                ["--config", str(config), "--codex-login"],
                 ["--config", str(config), "--claude-login", "--no-browser"],
+                ["--config", str(config), "--codex-login"],
                 ["--config", str(config), "--xai-login", "--no-browser"],
             ])
             self.assertIn("authorization complete", proc.stdout)
+
+    def test_auth_rejects_zero_exit_without_a_provider_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            proxy, capture = self.make_proxy(home / "tools")
+            setup = self.setup(home, proxy, capture, vendors="claude")
+            self.assertEqual(setup.returncode, 0, setup.stdout + setup.stderr)
+            proc = self.run_cli(
+                home, proxy, capture, "auth", "add", "claude",
+                extra_env={"FAKE_PROXY_SKIP_AUTH": "claude"},
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("exited without creating a private credential record", proc.stderr)
+            self.assertIn("parable auth add claude", proc.stderr)
 
     def test_auth_rejects_missing_unselected_unsupported_and_bad_device_before_spawn(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1294,7 +1361,7 @@ raise SystemExit(int(os.environ.get("FAKE_PROXY_EXIT", "0")))
             home = root / "home"
             home.mkdir()
             proxy, capture = self.make_proxy(root / "tools")
-            setup = self.setup(home, proxy, capture, vendors="chatgpt")
+            setup = self.setup(home, proxy, capture, vendors="claude")
             self.assertEqual(setup.returncode, 0, setup.stdout + setup.stderr)
             rejected = (
                 (("auth", "add", "xai"), "not selected"),
@@ -1317,7 +1384,7 @@ raise SystemExit(int(os.environ.get("FAKE_PROXY_EXIT", "0")))
             self.assertEqual(self.calls(capture), [])
 
             proxy.unlink()
-            missing_binary = self.run_cli(home, proxy, capture, "auth", "add", "chatgpt")
+            missing_binary = self.run_cli(home, proxy, capture, "auth", "add", "claude")
             self.assertNotEqual(missing_binary.returncode, 0)
             self.assertIn("configured proxy binary", missing_binary.stderr)
             self.assertEqual(self.calls(capture), [])
@@ -1429,9 +1496,20 @@ class TestOnboardingFinalizeEndToEnd(unittest.TestCase):
         proxy.write_text("""#!/usr/bin/env python3
 import json
 import os
+from pathlib import Path
 import sys
 with open(os.environ["FAKE_PROXY_CAPTURE"], "a") as handle:
     handle.write(json.dumps(sys.argv[1:]) + "\\n")
+mapping = {
+    "--codex-login": ("chatgpt", "codex"),
+    "--claude-login": ("claude", "claude"),
+    "--xai-login": ("xai", "xai"),
+}
+for flag, (vendor, record_type) in mapping.items():
+    if flag in sys.argv:
+        target = Path.home() / ".cli-proxy-api" / f"fake-{vendor}.json"
+        target.write_text(json.dumps({"type": record_type}))
+        target.chmod(0o600)
 """)
         proxy.chmod(0o755)
         return proxy
@@ -1542,8 +1620,8 @@ with open(os.environ["FAKE_PROXY_CAPTURE"], "a") as handle:
             proxy_calls = [json.loads(line) for line in proxy_capture.read_text().splitlines()]
             config_path = home / ".config" / "parable" / "cliproxy.yaml"
             self.assertEqual(proxy_calls, [
-                ["--config", str(config_path), "--codex-login"],
                 ["--config", str(config_path), "--claude-login", "--no-browser"],
+                ["--config", str(config_path), "--codex-login"],
                 ["--config", str(config_path), "--xai-login", "--no-browser"],
             ])
 
@@ -1553,7 +1631,7 @@ with open(os.environ["FAKE_PROXY_CAPTURE"], "a") as handle:
             self.assertNotIn(token, finalized.stdout + finalized.stderr)
             report = json.loads(finalized.stdout)
             self.assertTrue(report["ready"])
-            self.assertEqual(report["parentModel"], "gpt-5.6-sol")
+            self.assertEqual(report["parentModel"], "claude-fable-5")
             self.assertEqual(
                 {item["name"]: item["model"] for item in report["agents"]},
                 expected_agents,
@@ -1600,7 +1678,7 @@ with open(os.environ["FAKE_PROXY_CAPTURE"], "a") as handle:
             captured = json.loads(captured_text)
             self.assertEqual(
                 captured["argv"],
-                ["--model", "gpt-5.6-sol", "--print", "hello"],
+                ["--model", "claude-fable-5", "--print", "hello"],
             )
             self.assertTrue(captured["auth_token_present"])
             self.assertFalse(captured["source_token_present"])
@@ -1618,7 +1696,8 @@ with open(os.environ["FAKE_PROXY_CAPTURE"], "a") as handle:
 
     def test_finalize_subset_and_missing_exact_id_fail_closed_without_aliases(self):
         with tempfile.TemporaryDirectory() as tmp, model_server([
-            "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"
+            "claude-fable-5", "claude-sonnet-5", "claude-opus-4-8",
+            "claude-haiku-4-5-20251001",
         ]) as (server, _base_url, _initial_token):
             root = Path(tmp)
             home = root / "subset-home"
@@ -1632,7 +1711,7 @@ with open(os.environ["FAKE_PROXY_CAPTURE"], "a") as handle:
             setup = self.run_cli(
                 repo,
                 env,
-                "setup", "--non-interactive", "--vendors", "chatgpt",
+                "setup", "--non-interactive", "--vendors", "claude",
                 "--proxy-bin", str(proxy), "--port", str(server.server_address[1]),
                 "--no-auth",
             )
@@ -1644,11 +1723,26 @@ with open(os.environ["FAKE_PROXY_CAPTURE"], "a") as handle:
             self.assertEqual(
                 {item["name"]: item["model"] for item in report["agents"]},
                 {
-                    "parable-luna": "gpt-5.6-luna",
-                    "parable-sol-exact": "gpt-5.6-sol",
-                    "parable-terra": "gpt-5.6-terra",
+                    "parable-fable-exact": "claude-fable-5",
+                    "parable-haiku-exact": "claude-haiku-4-5-20251001",
+                    "parable-opus-exact": "claude-opus-4-8",
+                    "parable-sonnet-exact": "claude-sonnet-5",
                 },
             )
+            self.assertEqual(report["parentModel"], "claude-fable-5")
+            auto = self.run_cli(
+                repo, env, "claude", "--brain", "auto", "--", "--print", "claude-only"
+            )
+            self.assertEqual(auto.returncode, 0, auto.stdout + auto.stderr)
+            self.assertIn("brain: claude-fable-5 (Sol is not configured; using Fable)", auto.stdout)
+            captured = json.loads(claude_capture.read_text())
+            self.assertEqual(
+                captured["argv"],
+                ["--model", "claude-fable-5", "--print", "claude-only"],
+            )
+            explicit_sol = self.run_cli(repo, env, "claude", "--brain", "sol")
+            self.assertNotEqual(explicit_sol.returncode, 0)
+            self.assertIn("requires configured catalog model 'gpt-5.6-sol'", explicit_sol.stderr)
 
         misleading = [
             "gpt-5.6-sol",
@@ -1889,6 +1983,28 @@ finally:
             self.assert_pid_gone(events[0]["pid"])
             evidence = proc.stdout + proc.stderr + json.dumps(events)
             self.assertNotIn(case["token"], evidence)
+
+    def test_finalize_starts_and_cleans_managed_proxy_when_stopped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            case = self.setup_case(tmp)
+            proc = subprocess.run(
+                [NODE, str(REPO / "bin" / "parable.js"),
+                 "setup", "finalize", "--json"],
+                cwd=case["repo"],
+                env=case["env"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            report = json.loads(proc.stdout)
+            self.assertTrue(report["ready"])
+            self.assertEqual(report["catalog"]["requiredCount"], len(self.MODELS))
+            events = self.events(case)
+            self.assertEqual(events[0]["argv"][-1], "--local-model")
+            self.assertTrue(any(item["event"] == "signal" for item in events))
+            self.assert_pid_gone(events[0]["pid"])
+            self.assertNotIn(case["token"], proc.stdout + proc.stderr + json.dumps(events))
 
     def test_healthy_existing_proxy_is_reused_and_never_stopped(self):
         with tempfile.TemporaryDirectory() as tmp, model_server(self.MODELS) as (
