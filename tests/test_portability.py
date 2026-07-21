@@ -115,10 +115,15 @@ class PortablePackagingTest(unittest.TestCase):
 
         self.assertTrue(snippet.startswith("<!-- effective-comms:start -->"))
         self.assertTrue(snippet.rstrip().endswith("<!-- effective-comms:end -->"))
+        self.assertIn("ISO 24495-1:2023's relevant/findable/understandable/usable test", snippet)
+        self.assertIn("W3C COGA clear-content, focus-recovery, and no-memory patterns", snippet)
+        self.assertIn("JAN-style written instructions, checklists, and task separation", snippet)
         self.assertIn("Lead with the answer, result, or next action", snippet)
         self.assertIn("Default to brief, not incomplete", snippet)
         self.assertIn("Accuracy, safety, security, privacy", snippet)
         self.assertIn("After three failed iterations", snippet)
+        self.assertIn("Before sending, check:", snippet)
+        self.assertIn("without reconstructing prior turns", snippet)
         self.assertIn("does not claim certification or", readme)
         self.assertIn("[`effective-comms`](snippets/effective-comms/)", (ROOT / "README.md").read_text())
 
