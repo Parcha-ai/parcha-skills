@@ -394,6 +394,12 @@ exit 0
         self.assertIn("parable claude --brain auto -- --effort high", readme)
         self.assertNotIn("# terminal 1: foreground local proxy", readme)
         self.assertNotIn('"$PARABLE" setup finalize\n"$PARABLE" claude', readme)
+        self.assertLess(readme.index("## Install Parable"), readme.index("## Unscientific stats"))
+        self.assertIn("Read [`skills/parable/SKILL.md`](skills/parable/SKILL.md) now", readme)
+        self.assertIn("`AskUserQuestion` in Claude Code", readme)
+        self.assertIn("not a file-copy task", readme)
+        self.assertIn("Do not run `install.sh` as a generic skill copier", readme)
+        self.assertIn("First-run succeeds only after the selected native OAuth flows", readme)
 
         self.assertIn("./install.sh", guide)
         self.assertIn("parable claude --brain auto -- --effort high", guide)

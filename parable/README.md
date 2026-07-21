@@ -9,6 +9,25 @@
 
 **Multi-model coding orchestration for Claude Code, Codex, and pi.**
 
+## Install Parable
+
+```bash
+npx skills add miguelrios/unc-skills --skill parable --global --agent claude-code
+# Start a new Claude Code session and say: "Install Parable"
+```
+
+> **Coding agents:** A request to **Install Parable** or **Install Parable.sh** is subscription
+> onboarding, not a file-copy task. Read [`skills/parable/SKILL.md`](skills/parable/SKILL.md) now
+> and follow its **First-time install and subscription onboarding** section. Use the harness's
+> native structured-question UI (`AskUserQuestion` in Claude Code) before running shell commands.
+> Do not run `install.sh` as a generic skill copier, seed an example `parable.toml`, or stop after
+> reporting that the skill exists. First-run succeeds only after the selected native OAuth flows
+> complete and the bundled `parable.sh` prints the new-terminal `parable claude` command.
+
+Claude is always the baseline subscription. The onboarding questions make ChatGPT
+(Sol/Terra/Luna and optional Sol fallback) and xAI (Grok 4.5) opt-in. If no compatible proxy is
+installed, onboarding separately asks permission to build Parable's pinned patched proxy.
+
 It is Tuesday. You ask Fable to extract a helper and add a test. Three hundred lines later, the
 helper has its own module and two new dependencies. The model is pleased with itself. You open
 the billing console.
@@ -209,7 +228,7 @@ that configuration.
 
 *Moral: never let the author hold the pen during the final read.*
 
-## Install
+## Installation reference
 
 skills.sh:
 
