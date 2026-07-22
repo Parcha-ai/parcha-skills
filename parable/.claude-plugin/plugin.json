@@ -1,7 +1,7 @@
 {
   "name": "parable",
   "description": "Multi-model coding orchestration: your session model is the brain \u2014 it plans, routes each task to the cheapest capable executor (Claude subagents, GPT-5.5 via codex, or any Responses-API model like Kimi/GLM/DeepSeek), verifies with deterministic checks, and reviews with a different model than the author.",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "author": {
     "name": "Parcha Labs",
     "url": "https://parcha.com"

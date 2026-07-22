@@ -157,7 +157,7 @@ tool — no API keys and no CLI subprocess. `parable.py run` refuses them by des
 owns subagent dispatch directly. If the current harness has no native agent-spawn tool, this
 provider is unavailable.
 
-When the session itself is launched with `parable claude --brain auto`, this same provider can carry exact
+When the session itself is launched with bare `parable`, this same provider can carry exact
 catalog model ids exposed by a localhost Claude-compatible proxy:
 
 For a new subscription-only setup, use the CLI rather than hand-writing the
@@ -167,12 +167,12 @@ following reference config:
 # Run the parable.sh bundled beside SKILL.md; it installs the CLI and enters setup.
 bash /path/to/installed/parable/parable.sh
 # in the working repository
-parable claude --brain auto -- --effort high
+parable
 ```
 
 Claude is the baseline pool for the Claude Code harness; interactive setup asks whether
 to add ChatGPT and xAI and offers the pinned build when no proxy is installed.
-`parable claude --brain auto` stays on Fable without ChatGPT. When ChatGPT is selected, it
+Bare `parable` stays on Fable without ChatGPT. When ChatGPT is selected, it
 prefers Fable while its pool has room and can move to Sol when it is tight. The launcher owns
 proxy start, authenticated readiness, exact catalog sync,
 stock-Claude launch, signal forwarding, and cleanup. It reuses but never stops
@@ -213,7 +213,7 @@ model = "grok-4.5"
 use_for = "Third-family implementation or review through xAI subscription OAuth."
 ```
 
-`parable claude` checks the authenticated loopback catalog and then
+`parable` checks the authenticated loopback catalog and then
 materializes those executors as exact project agents; stock Claude Code sends child requests to
 each full model id through the same endpoint. Diagnostic `parable setup finalize` and ordinary
 launch obtain the private generated localhost client token without requiring a shell export,

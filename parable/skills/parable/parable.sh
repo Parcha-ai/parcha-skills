@@ -140,4 +140,4 @@ if [[ "$no_auth" == true ]]; then
 fi
 
 printf '\nIn a new terminal, open your project and run:\n\n'
-printf '  parable claude --brain auto -- --effort high\n'
+printf '  parable\n'

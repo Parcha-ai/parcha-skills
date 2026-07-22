@@ -650,7 +650,7 @@ def cmd_finalize(args: argparse.Namespace) -> int:
             "requiredCount": len(claude_required_models(cfg)),
         },
         "sync": {key: len(value) for key, value in result.items()},
-        "next": "parable claude --brain auto -- --effort high",
+        "next": "parable",
     }
     if args.json:
         print(json.dumps(report, indent=2))

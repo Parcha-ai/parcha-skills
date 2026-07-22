@@ -22,7 +22,7 @@ npx skills add miguelrios/unc-skills --skill parable --global --agent claude-cod
 > native structured-question UI (`AskUserQuestion` in Claude Code) before running shell commands.
 > Do not run `install.sh` as a generic skill copier, seed an example `parable.toml`, or stop after
 > reporting that the skill exists. First-run succeeds only after the selected native OAuth flows
-> complete and Parable prints the new-terminal `parable claude` command.
+> complete and Parable prints the new-terminal `parable` command.
 
 Claude is always the baseline subscription. The onboarding questions make ChatGPT
 (Sol/Terra/Luna and optional Sol fallback) and xAI (Grok 4.5) opt-in. If no compatible proxy is
@@ -157,15 +157,16 @@ provider sends the same `plan.md` through [Cursor CLI](https://cursor.com/docs/c
 
 There is also a single-harness, subscription-only path. `parable setup` builds or discovers a
 loopback CLIProxyAPI, delegates each selected user's native ChatGPT/Claude/xAI OAuth, and writes
-an exact Sol/Terra/Luna/Fable/Sonnet/Opus/Haiku/Grok cast. `parable claude` starts or safely reuses the
+an exact Sol/Terra/Luna/Fable/Sonnet/Opus/Haiku/Grok cast. Bare `parable` starts or safely reuses the
 configured loopback proxy, waits for its authenticated catalog, requires every exact id, creates
 the project-local agents, launches stock Claude Code, and stops only the proxy process it owns.
 No broker, shared deployment, provider API key, or copied OAuth credential is involved. See the
 [end-to-end setup guide](docs/CLIPROXYAPI_GPT_SUBSCRIPTION.md) and the generated-config
 [reference](examples/parable.claude-subscriptions.toml).
 
-`parable claude --brain auto` prefers Fable while the Claude pool has room and moves the parent
-to Sol when that pool becomes tight. `--brain fable` and `--brain sol` pin either parent.
+Bare `parable` uses the automatic brain policy: it prefers Fable while the Claude pool has room
+and moves the parent to Sol when that pool becomes tight. `parable --brain fable` and
+`parable --brain sol` pin either parent. `parable claude` remains a compatibility alias.
 
 The generated cast gives the parent evidence-informed stage directions: Fable for ambiguous
 planning and architecture; Sol for long implementation, difficult debugging, and high-recall
@@ -276,7 +277,7 @@ cd unc-skills/parable
 
 # after setup succeeds, in a new terminal and from the project Claude should work on
 cd /path/to/your/project
-parable claude --brain auto -- --effort high
+parable
 
 # project-local skill copy without global subscription onboarding
 ./install.sh --project

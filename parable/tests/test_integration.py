@@ -392,7 +392,7 @@ exit 0
         installer = (REPO / "install.sh").read_text()
 
         self.assertIn("./install.sh", readme)
-        self.assertIn("parable claude --brain auto -- --effort high", readme)
+        self.assertIn("new-terminal `parable` command", readme)
         self.assertNotIn("# terminal 1: foreground local proxy", readme)
         self.assertNotIn('"$PARABLE" setup finalize\n"$PARABLE" claude', readme)
         self.assertLess(readme.index("## Install Parable"), readme.index("## Unscientific stats"))
@@ -403,14 +403,14 @@ exit 0
         self.assertIn("First-run succeeds only after the selected native OAuth flows", readme)
 
         self.assertIn("./install.sh", guide)
-        self.assertIn("parable claude --brain auto -- --effort high", guide)
+        self.assertIn("\nparable\n", guide)
         self.assertIn("That is the whole ordinary path.", guide)
         self.assertIn("stops only the proxy process it owns", guide)
         self.assertIn("Neither command is part of ordinary onboarding.", guide)
 
         for surface in (skill, providers):
             self.assertIn("parable.sh", surface)
-            self.assertIn("parable claude --brain auto", surface)
+            self.assertIn("`parable`", surface)
             self.assertIn("setup finalize", surface)
             self.assertIn("proxy start", surface)
 
@@ -432,13 +432,14 @@ exit 0
         self.assertIn('exec "$DEST/parable.sh" "$@"', installer)
 
         help_proc = subprocess.run(
-            [NODE, str(REPO / "bin" / "parable.js")],
+            [NODE, str(REPO / "bin" / "parable.js"), "--help"],
             capture_output=True,
             text=True,
             timeout=60,
         )
         self.assertEqual(help_proc.returncode, 0, help_proc.stdout + help_proc.stderr)
-        self.assertIn("supervise the proxy", help_proc.stdout)
+        self.assertIn("auto-brain Claude Code session", help_proc.stdout)
+        self.assertIn("backward-compatible explicit launcher alias", help_proc.stdout)
         self.assertIn("diagnostic foreground", help_proc.stdout)
         self.assertIn("auth login", help_proc.stdout)
 
@@ -483,11 +484,11 @@ exit 0
             )
             self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
             handoff = "In a new terminal, open your project and run:"
-            launch = "parable claude --brain auto -- --effort high"
+            launch = "  parable\n"
             self.assertEqual(first.stdout.count(handoff), 1)
             self.assertIn(launch, first.stdout)
 
-            installed = home / ".local" / "share" / "parable" / "0.1.14"
+            installed = home / ".local" / "share" / "parable" / "0.1.15"
             durable = home / ".local" / "bin" / "parable"
             self.assertTrue((installed / "bin" / "parable.js").is_file())
             self.assertTrue((installed / "lib" / "onboarding.js").is_file())
@@ -1131,7 +1132,7 @@ if args and args[0] == "build":
             )
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertIn("Build pinned commit", proc.stdout)
-            self.assertIn("next: authorize each selected subscription, then run parable claude", proc.stdout)
+            self.assertIn("next: authorize each selected subscription, then run parable", proc.stdout)
             manifest = json.loads((home / ".config" / "parable" / "setup.json").read_text())
             expected = data_home / "parable" / "cliproxyapi" / PROXY_COMMIT / "parable-cliproxy-api"
             self.assertEqual(manifest["proxyBinary"], str(expected))
@@ -1408,7 +1409,7 @@ raise SystemExit(int(os.environ.get("FAKE_PROXY_EXIT", "0")))
             self.assertEqual(proc.stdout.count(
                 "In a new terminal, open your project and run:"
             ), 1)
-            self.assertIn("parable claude --brain auto -- --effort high", proc.stdout)
+            self.assertIn("  parable\n", proc.stdout)
 
             before = capture.read_bytes()
             again = self.run_cli(home, proxy, capture, "auth", "login")
@@ -1719,7 +1720,7 @@ for flag, (vendor, record_type) in mapping.items():
             self.assertEqual(report["catalog"]["requiredCount"], 8)
             self.assertEqual(
                 report["next"],
-                "parable claude --brain auto -- --effort high",
+                "parable",
             )
 
             agents_dir = repo / ".claude" / "agents"
@@ -1762,6 +1763,25 @@ for flag, (vendor, record_type) in mapping.items():
             )
             self.assertTrue(captured["auth_token_present"])
             self.assertFalse(captured["source_token_present"])
+
+            bare = self.run_cli(repo, env)
+            self.assertEqual(bare.returncode, 0, bare.stdout + bare.stderr)
+            self.assertIn("brain: claude-fable-5", bare.stdout)
+            captured = json.loads(claude_capture.read_text())
+            self.assertEqual(
+                captured["argv"],
+                ["--model", "claude-fable-5", "--effort", "high"],
+            )
+
+            pinned = self.run_cli(
+                repo, env, "--brain", "fable", "--", "--print", "root"
+            )
+            self.assertEqual(pinned.returncode, 0, pinned.stdout + pinned.stderr)
+            captured = json.loads(claude_capture.read_text())
+            self.assertEqual(
+                captured["argv"],
+                ["--model", "claude-fable-5", "--effort", "high", "--print", "root"],
+            )
 
             auto = self.run_cli(
                 repo, env, "claude", "--brain", "auto", "--", "--print", "auto"

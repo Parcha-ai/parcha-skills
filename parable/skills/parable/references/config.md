@@ -36,7 +36,7 @@ Schema is versioned: `[parable] version = 1`. Unknown versions refuse to load.
 
 ## `[claude]`
 
-Optional stock-Claude-Code launcher configuration. It is required by `parable claude` and
+Optional stock-Claude-Code launcher configuration. It is required by bare `parable` and
 `parable agents sync`; ordinary Parable dispatch remains unchanged when the table is absent.
 
 | Field | Default | Meaning |
@@ -46,7 +46,7 @@ Optional stock-Claude-Code launcher configuration. It is required by `parable cl
 | `brain_model` | required | Exact model id for the main Claude Code session, such as `gpt-5.6-sol`. |
 | `binary` | `claude` | Optional Claude Code command name or path. |
 
-`parable claude` checks `/v1/models` before launch and requires the brain model plus every
+`parable` checks `/v1/models` before launch and requires the brain model plus every
 configured arbitrary-model Claude executor to be present. It then synchronizes project-local
 `.claude/agents/parable-*.md` files and launches Claude Code with per-process
 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`; it does not write global Claude settings.
@@ -58,8 +58,9 @@ The launcher-level `--brain` policy can be `config`, `fable`, `sol`, or `auto`. 
 `brain_model` verbatim. `auto` prefers configured Fable while its live Claude usage is below
 80%, probes ChatGPT only when that pool is tight, and then selects Sol when it has more or
 unknown headroom. Explicit `fable` or `sol` fails unless that exact model is configured and
-present in the authenticated catalog. Put the option before the Claude argument separator:
-`parable claude --brain auto -- --effort high`.
+present in the authenticated catalog. Bare `parable` means `--brain auto` with high effort.
+To override it, put the brain option before the Claude argument separator:
+`parable --brain fable -- --effort high`.
 
 For a custom executor id such as `kimi`, `parable agents sync` creates the native Claude agent
 name `parable-kimi` with the exact configured model id. Only files carrying Parable's generated

@@ -83,16 +83,16 @@ terminal and launch it:
 
 ```bash
 cd /path/to/your/project
-parable claude --brain auto -- --effort high
+parable
 ```
 
-That is the whole ordinary path. `auto` prefers Fable when it is configured and
+That is the whole ordinary path. Bare `parable` selects `auto` and high effort. `auto` prefers Fable when it is configured and
 its Claude usage is below 80%. When that pool is tight it selects Sol if the
 ChatGPT pool has more or unknown headroom; if both are tight, it takes the less
 used pool. Unknown Claude usage keeps the preferred Fable parent. Use
-`--brain fable` or `--brain sol` to pin one explicitly.
+`parable --brain fable` or `parable --brain sol` to pin one explicitly.
 
-`parable claude` authenticates a readiness
+`parable` authenticates a readiness
 probe to the configured loopback `/v1/models`. It reuses a healthy endpoint
 without owning or stopping it; otherwise it starts the configured proxy,
 waits for readiness, requires the exact configured parent and every selected child,
@@ -115,7 +115,7 @@ parable auth add claude
 parable auth add xai
 parable auth status
 cd /path/to/your/project
-parable claude --brain auto -- --effort high
+parable
 ```
 
 Only run the Claude/xAI commands if you selected those vendors. Claude auth

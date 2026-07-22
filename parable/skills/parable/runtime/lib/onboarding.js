@@ -213,7 +213,7 @@ function setupUsage() {
     "Claude is the baseline subscription for the Claude Code harness.",
     "ChatGPT adds optional Sol/Terra/Luna models and the Sol fallback parent.",
     "Interactive setup offers the pinned managed build when no proxy is installed.",
-    "Ordinary next step: run `parable claude` in the working repository.",
+    "Ordinary next step: run `parable` in the working repository.",
   ].join("\n");
 }
 
@@ -1082,7 +1082,7 @@ async function runAuthLogin(argv, log) {
   log("");
   log("In a new terminal, open your project and run:");
   log("");
-  log("  parable claude --brain auto -- --effort high");
+  log("  parable");
 }
 
 function forwardSignals(children, onSignal = () => {}) {
@@ -1511,9 +1511,9 @@ async function runSetup(argv, log) {
   }
   if (!options.no_auth) {
     for (const vendor of context.vendors) runNativeAuth(context, vendor, false, log);
-    log("authorization complete; next: parable claude --brain auto -- --effort high");
+    log("authorization complete; next: parable");
   } else {
-    log("next: authorize each selected subscription, then run parable claude --brain auto -- --effort high");
+    log("next: authorize each selected subscription, then run parable");
   }
   return context;
 }

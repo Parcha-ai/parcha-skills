@@ -95,7 +95,7 @@ function cmdInstall(args) {
   } catch (e) {
     fail("install failed at " + dest + ": " + e.message);
   }
-  log("done. Run `parable setup`, then `parable claude --brain auto -- --effort high` in your project.");
+  log("done. Run `parable setup`, then `parable` in your project.");
 }
 
 function cmdDoctor() {
@@ -148,10 +148,55 @@ function runPython(args, env = process.env) {
   process.exit(result.status === null ? 1 : result.status);
 }
 
+function rootLaunchArgs(raw) {
+  let args;
+  if (!raw.length) args = ["--brain", "auto", "--"];
+  else if (raw[0] === "--") args = ["--brain", "auto", ...raw];
+  else if (raw[0] === "--brain" || raw[0].startsWith("--brain=")) args = [...raw];
+  else return null;
+
+  let separator = args.indexOf("--");
+  if (separator === -1) {
+    args.push("--");
+    separator = args.length - 1;
+  }
+  const forwarded = args.slice(separator + 1);
+  const hasEffort = forwarded.some(
+    (argument) => argument === "--effort" || argument.startsWith("--effort="),
+  );
+  if (!hasEffort) args.splice(separator + 1, 0, "--effort", "high");
+  return args;
+}
+
+function printUsage() {
+  log("usage: parable [--brain auto|fable|sol|config] [-- CLAUDE_ARGS...]");
+  log("       parable <install|setup|doctor|auth|proxy|claude|agents sync> [options]");
+  log("  (no command)       start the normal auto-brain Claude Code session");
+  log("  install            copy the skill to ~/.claude/skills (or ./.claude/skills with --project)");
+  log("  setup              configure subscriptions and offer a pinned proxy build");
+  log("  setup finalize     diagnostic exact-catalog check and agent synchronization");
+  log("  doctor             check python/codex/config health");
+  log("  auth login         interactively authorize every selected missing vendor");
+  log("  auth add VENDOR    authorize chatgpt, claude, or xai through CLIProxyAPI");
+  log("  auth status        show credential-safe provider presence and record counts");
+  log("  proxy build        build the pinned, patched CLIProxyAPI source");
+  log("  proxy start        diagnostic foreground CLIProxyAPI process");
+  log("  claude [...]       backward-compatible explicit launcher alias");
+  log("  agents sync        synchronize project-local parable-* custom agents");
+}
+
 async function main() {
   const raw = process.argv.slice(2);
+  const rootArgs = rootLaunchArgs(raw);
+  if (rootArgs) {
+    process.exitCode = await runClaude(rootArgs, log);
+    return;
+  }
   if (raw[0] === "claude") {
-    process.exitCode = await runClaude(raw.slice(1), log);
+    const legacyArgs = raw.slice(1);
+    process.exitCode = await runClaude(
+      legacyArgs.length ? legacyArgs : rootLaunchArgs([]), log,
+    );
     return;
   }
   if (raw[0] === "agents" && raw[1] === "sync") {
@@ -191,19 +236,8 @@ async function main() {
   if (cmd === "install") cmdInstall(args);
   else if (cmd === "doctor") cmdDoctor();
   else {
-    log("usage: parable <install|setup|doctor|auth|proxy|claude|agents sync> [options]");
-    log("  install            copy the skill to ~/.claude/skills (or ./.claude/skills with --project)");
-    log("  setup              configure subscriptions and offer a pinned proxy build");
-    log("  setup finalize     diagnostic exact-catalog check and agent synchronization");
-    log("  doctor             check python/codex/config health");
-    log("  auth login         interactively authorize every selected missing vendor");
-    log("  auth add VENDOR    authorize chatgpt, claude, or xai through CLIProxyAPI");
-    log("  auth status        show credential-safe provider presence and record counts");
-    log("  proxy build        build the pinned, patched CLIProxyAPI source");
-    log("  proxy start        diagnostic foreground CLIProxyAPI process");
-    log("  claude [--brain auto|fable|sol|config] [-- ARGS...]  supervise the proxy and launch Claude Code");
-    log("  agents sync        synchronize project-local parable-* custom agents");
-    process.exit(cmd ? 1 : 0);
+    printUsage();
+    process.exit(cmd === "--help" || cmd === "-h" ? 0 : 1);
   }
 }
 

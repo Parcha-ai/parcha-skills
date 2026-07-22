@@ -70,7 +70,7 @@ it only after setup and all selected authorization flows succeed:
 ```text
 In a new terminal, open your project and run:
 
-  parable claude --brain auto -- --effort high
+  parable
 ```
 
 You are the **brain**: the most capable model in the room, and the most expensive. The strategy
@@ -97,7 +97,7 @@ fake runtime parity. With no configured checks, `parable-verify.sh` passes vacuo
 user declares some.
 
 When the config contains `[claude]`, the session should have been entered through
-`parable claude --brain auto`. Ordinary skill-first subscription onboarding is one
+bare `parable`, which selects the automatic brain policy at high effort. Ordinary skill-first subscription onboarding is one
 `parable.sh` run followed by that fresh-terminal launch command. Setup delegates
 native vendor authorization; the launcher starts or reuses the loopback proxy,
 checks the exact catalog, synchronizes agents, and cleans up only a proxy it owns.
@@ -148,15 +148,16 @@ this tool exists to prevent. The per-pool selection detail lives in `references/
   codex-, pi-, or cursor-backed executor headlessly; prints status, session id, turns, tokens
   and cost, last message, and the run dir. Subagent executors (`sonnet`, `opus`, …) dispatch via
   the harness's native agent-spawn tool with the plan as the prompt. For a custom model in a
-  `parable claude` session, use the exact `agent=parable-*` name printed by
+  `parable` session, use the exact `agent=parable-*` name printed by
   `parable-config.sh`; for a bare Claude alias, use a general-purpose agent with the executor's
   model. If there is no native agent-spawn tool, that executor is unavailable; choose a
   CLI-backed executor.
-- `parable claude [--brain auto|fable|sol|config] [-- ARGS...]` — safely reuse a healthy configured loopback proxy or own its
+- `parable [--brain auto|fable|sol|config] [-- CLAUDE_ARGS...]` — safely reuse a healthy configured loopback proxy or own its
   start/readiness/cleanup lifecycle, require every exact configured id, idempotently synchronize
   Parable-owned project agents, and launch the selected brain model. `auto` prefers Fable while
   its pool is below the tight threshold, then falls back to Sol by live usage; `fable` and `sol`
-  pin either parent, and `config` uses `brain_model`. `parable setup finalize`
+  pin either parent, and `config` uses `brain_model`. With no arguments, Parable uses `auto` and
+  forwards `--effort high`. `parable claude` remains a backward-compatible explicit alias. `parable setup finalize`
   performs only the catalog/sync diagnostic against an already-running proxy. These are package
   CLI commands, not skill scripts.
 - `scripts/parable-resume.sh <run-dir> "<message>"` — continue an executor's existing session
