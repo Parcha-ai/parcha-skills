@@ -43,7 +43,9 @@ your agent    -> read the winning window and get back to work
   session without dragging along its one-off data.
 
 The transcripts remain the source of truth. The SQLite index is disposable and
-fully rebuildable.
+fully rebuildable — and you never wait for it: before the first index build
+finishes, the skill answers immediately by scanning the raw JSONL transcripts
+with `rg` while the index builds in the background.
 
 The honest limit: no-answer detection is still lexical. A query about work that
 never happened can return a nearby session with similar words. That is why every
