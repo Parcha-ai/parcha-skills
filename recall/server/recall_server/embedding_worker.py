@@ -5,8 +5,10 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from .canonical_retrieval import CanonicalRetrieval
-
+from .canonical_retrieval import (
+    MAX_CANONICAL_EMBEDDING_BATCH,
+    CanonicalRetrieval,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -23,8 +25,11 @@ def run_canonical_embedding_worker(
 ) -> dict[str, int | str]:
     """Drain canonical embedding lag outside latency-sensitive ingest requests."""
 
-    if not 1 <= batch_size <= 500:
-        raise ValueError("embedding worker batch size must be between 1 and 500")
+    if not 1 <= batch_size <= MAX_CANONICAL_EMBEDDING_BATCH:
+        raise ValueError(
+            "embedding worker batch size must be between 1 and "
+            f"{MAX_CANONICAL_EMBEDDING_BATCH}"
+        )
     if not 1 <= max_batches_per_cycle <= 100:
         raise ValueError(
             "embedding worker max batches per cycle must be between 1 and 100"

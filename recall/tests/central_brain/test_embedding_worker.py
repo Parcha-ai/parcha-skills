@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import sys
 import inspect
+import sys
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import TestCase
-
 
 ROOT = Path(__file__).resolve().parents[2]
 SERVER = ROOT / "server"
@@ -12,8 +13,9 @@ for candidate in (str(ROOT), str(SERVER)):
     if candidate not in sys.path:
         sys.path.insert(0, candidate)
 
-from recall_server.embedding_worker import run_canonical_embedding_worker  # noqa: E402
 from recall_server.app import Handler  # noqa: E402
+from recall_server.canonical_retrieval import CanonicalRetrieval  # noqa: E402
+from recall_server.embedding_worker import run_canonical_embedding_worker  # noqa: E402
 
 
 class FakeRetrieval:
@@ -39,6 +41,43 @@ class FakeRetrieval:
 
 
 class EmbeddingWorkerTests(TestCase):
+    def test_canonical_retrieval_uses_the_bounded_bulk_limit(self) -> None:
+        class EmptyResult:
+            @staticmethod
+            def fetchall() -> list:
+                return []
+
+        class Connection:
+            def __init__(self) -> None:
+                self.values = None
+
+            def execute(self, _sql, values):
+                self.values = values
+                return EmptyResult()
+
+        class Store:
+            semantic_runtime = SimpleNamespace(
+                dimensions=512,
+                fingerprint="synthetic-fingerprint",
+            )
+
+            def __init__(self) -> None:
+                self.connection = Connection()
+
+            @contextmanager
+            def connect(self):
+                yield self.connection
+
+        store = Store()
+        retrieval = CanonicalRetrieval(store)  # type: ignore[arg-type]
+
+        result = retrieval.embed_pending(batch_size=5000, max_batches=1)
+
+        self.assertEqual(result, {"status": "complete", "processed": 0, "batches": 0})
+        self.assertEqual(store.connection.values[-1], 5000)
+        with self.assertRaisesRegex(ValueError, "invalid canonical embedding batch"):
+            retrieval.embed_pending(batch_size=5001, max_batches=1)
+
     def test_canonical_ingest_does_not_call_the_embedding_provider(self) -> None:
         source = inspect.getsource(Handler.do_POST)
         canonical_route = source[source.index('if path == "/v2/ingest/canonical":') :]
@@ -51,25 +90,25 @@ class EmbeddingWorkerTests(TestCase):
 
     def test_once_runs_one_bounded_restart_safe_cycle(self) -> None:
         retrieval = FakeRetrieval(
-            [{"status": "complete", "processed": 128, "batches": 1}]
+            [{"status": "complete", "processed": 5000, "batches": 1}]
         )
 
         result = run_canonical_embedding_worker(
             retrieval,  # type: ignore[arg-type]
             tenant_id="tenant:company:example",
-            batch_size=128,
+            batch_size=5000,
             max_batches_per_cycle=10,
             interval_seconds=5,
             once=True,
         )
 
-        self.assertEqual(result["processed"], 128)
+        self.assertEqual(result["processed"], 5000)
         self.assertEqual(
             retrieval.calls,
             [
                 {
                     "tenant_id": "tenant:company:example",
-                    "batch_size": 128,
+                    "batch_size": 5000,
                     "max_batches": 10,
                 }
             ],
@@ -111,7 +150,7 @@ class EmbeddingWorkerTests(TestCase):
             run_canonical_embedding_worker(
                 retrieval,  # type: ignore[arg-type]
                 tenant_id=None,
-                batch_size=501,
+                batch_size=5001,
                 max_batches_per_cycle=1,
                 interval_seconds=1,
                 once=True,

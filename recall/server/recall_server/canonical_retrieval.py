@@ -9,17 +9,17 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
-from .canonical import CanonicalPlane
 from .authorization import decide
+from .canonical import CanonicalPlane
 from .db import BrainStore, SearchDeadlineExceeded, bounded_search_text
 from .federation import SOURCE_FAMILIES
 from .projectors import legacy_engine
-
 
 AUTHORITY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._/@+-]{1,255}\Z")
 ALLOWED_FILTERS = frozenset(
     {"since", "until", "source_id", "source_family", "source_alias"}
 )
+MAX_CANONICAL_EMBEDDING_BATCH = 5000
 
 
 def _timestamp(value: Any) -> str:
@@ -76,7 +76,10 @@ class CanonicalRetrieval:
             return {"status": "disabled", "processed": 0, "batches": 0}
         if runtime.dimensions != 512:
             raise ValueError("canonical embeddings require 512 dimensions")
-        if not 1 <= batch_size <= 500 or not 1 <= max_batches <= 100:
+        if (
+            not 1 <= batch_size <= MAX_CANONICAL_EMBEDDING_BATCH
+            or not 1 <= max_batches <= 100
+        ):
             raise ValueError("invalid canonical embedding batch")
         processed = batches = 0
         for _ in range(max_batches):
