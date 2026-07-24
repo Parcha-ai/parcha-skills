@@ -130,6 +130,66 @@ class ArchiveRuntimeTest(unittest.TestCase):
                 client_factory=lambda **_: object(),
             )
 
+    def test_aws_environment_builds_native_versioned_s3_client(self):
+        calls = []
+        environment = {
+            "RECALL_ARCHIVE_BACKEND": "s3",
+            "RECALL_ARCHIVE_BUCKET": "recall-archil-test-synthetic",
+            "RECALL_ARCHIVE_ENDPOINT_URL": "https://s3.us-west-2.amazonaws.com",
+            "RECALL_ARCHIVE_REGION": "us-west-2",
+            "RECALL_ARCHIVE_ACCESS_KEY_ID": "synthetic-access-id",
+            "RECALL_ARCHIVE_SECRET_ACCESS_KEY": "synthetic-secret",
+            "RECALL_ARCHIVE_NAMESPACE_KEY": base64.b64encode(b"s" * 32).decode(),
+        }
+
+        store = build_archive_store(
+            environment,
+            client_factory=lambda **kwargs: calls.append(kwargs) or object(),
+        )
+
+        self.assertEqual(store.compatibility_profile, "aws")
+        self.assertEqual(store.bucket, "recall-archil-test-synthetic")
+        self.assertEqual(calls[0]["region_name"], "us-west-2")
+        self.assertEqual(
+            calls[0]["endpoint_url"],
+            "https://s3.us-west-2.amazonaws.com",
+        )
+
+    def test_aws_environment_rejects_cross_region_endpoint(self):
+        environment = {
+            "RECALL_ARCHIVE_BACKEND": "s3",
+            "RECALL_ARCHIVE_BUCKET": "recall-archil-test-synthetic",
+            "RECALL_ARCHIVE_ENDPOINT_URL": "https://s3.us-east-1.amazonaws.com",
+            "RECALL_ARCHIVE_REGION": "us-west-2",
+            "RECALL_ARCHIVE_ACCESS_KEY_ID": "synthetic-access-id",
+            "RECALL_ARCHIVE_SECRET_ACCESS_KEY": "synthetic-secret",
+            "RECALL_ARCHIVE_NAMESPACE_KEY": base64.b64encode(b"s" * 32).decode(),
+        }
+
+        with self.assertRaisesRegex(ValueError, "S3 endpoint"):
+            build_archive_store(
+                environment,
+                client_factory=lambda **_: object(),
+            )
+
+    def test_unversioned_aws_environment_is_explicit(self):
+        environment = {
+            "RECALL_ARCHIVE_BACKEND": "s3-unversioned",
+            "RECALL_ARCHIVE_BUCKET": "recall-archil-test-synthetic",
+            "RECALL_ARCHIVE_ENDPOINT_URL": "https://s3.us-west-2.amazonaws.com",
+            "RECALL_ARCHIVE_REGION": "us-west-2",
+            "RECALL_ARCHIVE_ACCESS_KEY_ID": "synthetic-access-id",
+            "RECALL_ARCHIVE_SECRET_ACCESS_KEY": "synthetic-secret",
+            "RECALL_ARCHIVE_NAMESPACE_KEY": base64.b64encode(b"s" * 32).decode(),
+        }
+
+        store = build_archive_store(
+            environment,
+            client_factory=lambda **_: object(),
+        )
+
+        self.assertEqual(store.compatibility_profile, "aws-unversioned")
+
     def test_evidence_archive_uses_only_its_separate_configuration(self):
         calls = []
         environment = {

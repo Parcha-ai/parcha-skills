@@ -16,7 +16,6 @@ from server.recall_server.archive import (
     S3ArchiveStore,
 )
 
-
 PAYLOAD = b'{"kind":"synthetic","text":"private source bytes"}'
 TENANT = "tenant:synthetic"
 SOURCE = "source:synthetic"
@@ -337,6 +336,35 @@ class ArchiveStoreParityTest(unittest.TestCase):
                 client=client,
                 compatibility_profile="r2",
             )
+
+    def test_unversioned_aws_uses_conditional_encrypted_immutable_objects(self):
+        client = FakeR2()
+        store = S3ArchiveStore(
+            bucket="recall-synthetic",
+            endpoint_url="https://s3.us-west-2.amazonaws.com",
+            namespace_key=self.key,
+            client=client,
+            compatibility_profile="aws-unversioned",
+        )
+
+        first = store.put(request())
+        replay = store.put(request())
+        self.assertEqual(first, replay)
+        self.assertEqual(
+            first.version_id,
+            "s3-sha256-" + hashlib.sha256(PAYLOAD).hexdigest(),
+        )
+        call = client.put_calls[-1]
+        self.assertEqual(call["IfNoneMatch"], "*")
+        self.assertEqual(call["ServerSideEncryption"], "AES256")
+        self.assertIn("ChecksumSHA256", call)
+        self.assertEqual(
+            store.read(first, tenant_id=TENANT, source_id=SOURCE),
+            PAYLOAD,
+        )
+        self.assertNotIn("VersionId", client.get_calls[-1])
+        self.assertTrue(store.delete(first, tenant_id=TENANT, source_id=SOURCE))
+        self.assertNotIn("VersionId", client.delete_calls[-1])
 
     def test_bounds_are_enforced_before_storage_io(self):
         oversized = b"x" * 1025

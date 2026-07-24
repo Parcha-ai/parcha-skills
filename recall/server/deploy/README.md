@@ -200,6 +200,14 @@ bucket only, then attach only that bucket to the tenant's read-only Archil disk.
 Do not reuse a bucket or disk across personal and company brains. Validate and
 populate it before enabling the MCP tool:
 
+AWS S3 is also supported. Use `RECALL_EVIDENCE_ARCHIVE_BACKEND=s3` for a
+versioned bucket or `s3-unversioned` for a bucket without versioning, an exact
+regional endpoint such as `https://s3.us-west-2.amazonaws.com`, and the same
+bucket-scoped access-key variables. The unversioned profile preserves
+immutability with content-addressed keys and conditional writes. Archil
+serverless execution requires an Archil disk in a supported AWS region; that
+disk may mount the same S3 bucket.
+
 ```bash
 python -m recall_server.cli evidence-archive-check
 python -m recall_server.cli backfill-canonical-evidence \
