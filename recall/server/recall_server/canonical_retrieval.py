@@ -5,7 +5,7 @@ import json
 import re
 import time
 import urllib.error
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -227,8 +227,12 @@ class BoundCanonicalRetrieval:
         return {
             "source_id": row["source_id"],
             "native_id": row["native_id"],
+            "native_parent_id": row.get("native_parent_id"),
             "revision": row["revision"],
             "occurred_at": _timestamp(row["occurred_at"]),
+            "observed_at": _timestamp(row["observed_at"]),
+            "ingested_at": _timestamp(row["created_at"]),
+            "time_basis": "occurred_at",
             "text": text,
             "text_clipped": clipped,
             "receipt": row["receipt"],
@@ -288,7 +292,8 @@ class BoundCanonicalRetrieval:
             rows = self.store._execute_bounded(
                 connection,
                 """SELECT chunk.source_id,document.native_id,document.revision,
-                          event.occurred_at,chunk.text_redacted,chunk.receipt,
+                          event.native_parent_id,event.occurred_at,event.observed_at,
+                          event.created_at,chunk.text_redacted,chunk.receipt,
                           ts_rank_cd(
                             chunk.search_vector,
                             websearch_to_tsquery('simple',%s),
@@ -375,7 +380,8 @@ class BoundCanonicalRetrieval:
                 with self.store.connect() as connection:
                     semantic = connection.execute(
                         """SELECT chunk.source_id,document.native_id,document.revision,
-                              event.occurred_at,chunk.text_redacted,chunk.receipt,
+                              event.native_parent_id,event.occurred_at,event.observed_at,
+                              event.created_at,chunk.text_redacted,chunk.receipt,
                               1-(embedding.embedding <=> %s::halfvec) AS score
                        FROM canonical_chunk_embeddings embedding
                        JOIN canonical_chunks chunk
@@ -433,6 +439,408 @@ class BoundCanonicalRetrieval:
             },
         }
 
+    def _receipt_event(
+        self,
+        connection: Any,
+        target: str,
+    ) -> dict[str, Any] | None:
+        redirect = connection.execute(
+            """SELECT new_receipt FROM receipt_redirects
+               WHERE tenant_id=%s AND old_receipt=%s""",
+            (self.tenant_id, target),
+        ).fetchone()
+        if redirect:
+            target = redirect["new_receipt"]
+        row = connection.execute(
+            """SELECT chunk.source_id,chunk.document_id,chunk.ordinal AS anchor_ordinal,
+                      document.native_id,
+                      document.revision,event.event_id,event.native_parent_id,
+                      event.kind,event.occurred_at,event.observed_at,event.created_at,
+                      event.canonical_redacted
+               FROM canonical_chunks chunk
+               JOIN canonical_documents document
+                 USING(tenant_id,source_id,document_id)
+               JOIN canonical_events event
+                 USING(tenant_id,source_id,event_id)
+               WHERE chunk.tenant_id=%s
+                 AND chunk.source_id=ANY(%s)
+                 AND chunk.receipt=%s
+                 AND chunk.deleted_at IS NULL
+                 AND document.is_current
+                 AND document.deleted_at IS NULL
+                 AND NOT EXISTS (
+                   SELECT 1 FROM canonical_events later
+                   WHERE later.tenant_id=document.tenant_id
+                     AND later.source_id=document.source_id
+                     AND later.native_id=document.native_id
+                     AND later.revision>document.revision
+                     AND later.is_tombstone
+                 )""",
+            (self.tenant_id, list(self.authorized_sources), target),
+        ).fetchone()
+        if row is not None:
+            row["resolved_receipt"] = target
+        return row
+
+    @staticmethod
+    def _context_event(row: dict[str, Any]) -> dict[str, Any]:
+        chunks = []
+        for chunk in row["chunks"]:
+            text, clipped = bounded_search_text(chunk["text"])
+            chunks.append({
+                "ordinal": chunk["ordinal"],
+                "text": text,
+                "text_clipped": clipped,
+                "receipt": chunk["receipt"],
+            })
+        return {
+            "source_id": row["source_id"],
+            "native_id": row["native_id"],
+            "native_parent_id": row["native_parent_id"],
+            "revision": row["revision"],
+            "kind": row["kind"],
+            "occurred_at": _timestamp(row["occurred_at"]),
+            "observed_at": _timestamp(row["observed_at"]),
+            "ingested_at": _timestamp(row["created_at"]),
+            "time_basis": "occurred_at",
+            "chunks": chunks,
+        }
+
+    def session_context(
+        self,
+        target: str,
+        *,
+        before: int = 4,
+        after: int = 4,
+        authorized_source: Any = None,
+    ) -> dict[str, Any] | None:
+        """Expand one receipt inside its source session without crossing grants."""
+        if (
+            not isinstance(target, str)
+            or not target.startswith("recall://")
+            or isinstance(before, bool)
+            or not isinstance(before, int)
+            or not 0 <= before <= 20
+            or isinstance(after, bool)
+            or not isinstance(after, int)
+            or not 0 <= after <= 20
+        ):
+            raise ValueError("invalid canonical session context request")
+        if not self.authorized_sources:
+            return None
+        with self.store.connect() as connection:
+            anchor = self._receipt_event(connection, target)
+            if anchor is None:
+                return None
+            parent = anchor["native_parent_id"] or anchor["native_id"]
+
+            def neighbors(direction: str, limit: int) -> list[dict[str, Any]]:
+                if limit == 0:
+                    return []
+                comparator = "<" if direction == "before" else ">"
+                ordering = "DESC" if direction == "before" else "ASC"
+                return connection.execute(
+                    f"""SELECT event.source_id,event.native_id,
+                               event.native_parent_id,document.revision,event.kind,
+                               event.occurred_at,event.observed_at,event.created_at,
+                               jsonb_agg(
+                                 jsonb_build_object(
+                                   'ordinal',chunk.ordinal,
+                                   'text',chunk.text_redacted,
+                                   'receipt',chunk.receipt
+                                 ) ORDER BY chunk.ordinal
+                               ) AS chunks
+                        FROM canonical_events event
+                        JOIN canonical_documents document
+                          USING(tenant_id,source_id,event_id)
+                        JOIN LATERAL (
+                          SELECT bounded.ordinal,bounded.text_redacted,bounded.receipt
+                          FROM canonical_chunks bounded
+                          WHERE bounded.tenant_id=document.tenant_id
+                            AND bounded.source_id=document.source_id
+                            AND bounded.document_id=document.document_id
+                            AND bounded.deleted_at IS NULL
+                          ORDER BY bounded.ordinal
+                          LIMIT 2
+                        ) chunk ON true
+                        WHERE event.tenant_id=%s
+                          AND event.source_id=%s
+                          AND COALESCE(event.native_parent_id,event.native_id)=%s
+                          AND (event.occurred_at,event.native_id)
+                              {comparator} (%s,%s)
+                          AND document.is_current
+                          AND document.deleted_at IS NULL
+                        GROUP BY event.source_id,event.native_id,
+                                 event.native_parent_id,document.revision,event.kind,
+                                 event.occurred_at,event.observed_at,event.created_at
+                        ORDER BY event.occurred_at {ordering},
+                                 event.native_id {ordering}
+                        LIMIT %s""",
+                    (
+                        self.tenant_id,
+                        anchor["source_id"],
+                        parent,
+                        anchor["occurred_at"],
+                        anchor["native_id"],
+                        limit,
+                    ),
+                ).fetchall()
+
+            previous = list(reversed(neighbors("before", before)))
+            following = neighbors("after", after)
+            anchor_chunks = connection.execute(
+                """SELECT ordinal,text,receipt
+                   FROM (
+                     SELECT ordinal,text_redacted AS text,receipt
+                     FROM canonical_chunks
+                     WHERE tenant_id=%s AND source_id=%s AND document_id=%s
+                       AND deleted_at IS NULL
+                     ORDER BY abs(ordinal-%s),ordinal
+                     LIMIT 3
+                   ) bounded
+                   ORDER BY ordinal""",
+                (
+                    self.tenant_id,
+                    anchor["source_id"],
+                    anchor["document_id"],
+                    anchor["anchor_ordinal"],
+                ),
+            ).fetchall()
+            anchor["chunks"] = anchor_chunks
+        return {
+            "session": {
+                "source_id": anchor["source_id"],
+                "native_parent_id": parent,
+                "time_basis": "occurred_at",
+            },
+            "events": [
+                self._context_event(row)
+                for row in previous + [anchor] + following
+            ],
+            "anchor_receipt": anchor["resolved_receipt"],
+            "bounds": {"before": before, "after": after},
+        }
+
+    @staticmethod
+    def _question_time_window(
+        question: str,
+        *,
+        now: datetime | None = None,
+    ) -> tuple[str | None, str | None, str]:
+        """Interpret only common relative windows; never use ingestion time."""
+        current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        lowered = question.casefold()
+        if re.search(r"\btoday\b", lowered):
+            since = current.replace(hour=0, minute=0, second=0, microsecond=0)
+            return since.isoformat(), current.isoformat(), "question:today"
+        if re.search(r"\byesterday\b", lowered):
+            until = current.replace(hour=0, minute=0, second=0, microsecond=0)
+            return (
+                (until - timedelta(days=1)).isoformat(),
+                until.isoformat(),
+                "question:yesterday",
+            )
+        match = re.search(
+            r"\b(?:past|last)\s+(\d{1,3})\s+(hour|day|week)s?\b",
+            lowered,
+        )
+        if match:
+            amount = min(int(match.group(1)), 365)
+            unit = match.group(2)
+            delta = {
+                "hour": timedelta(hours=amount),
+                "day": timedelta(days=amount),
+                "week": timedelta(weeks=amount),
+            }[unit]
+            return (
+                (current - delta).isoformat(),
+                current.isoformat(),
+                f"question:last-{amount}-{unit}s",
+            )
+        return None, None, "unbounded"
+
+    def investigate(
+        self,
+        question: str,
+        *,
+        filters: dict[str, Any] | None = None,
+        depth: str = "normal",
+        authorized_source: Any = None,
+    ) -> dict[str, Any]:
+        """Return an answer-ready, receipt-backed multi-session evidence packet."""
+        if not isinstance(question, str) or not question.strip() or len(question) > 8192:
+            raise ValueError("invalid canonical investigation question")
+        budgets = {
+            "quick": {"families": 1, "sessions": 2, "context": 2},
+            "normal": {"families": 4, "sessions": 4, "context": 4},
+            "deep": {"families": 8, "sessions": 6, "context": 6},
+        }
+        if depth not in budgets:
+            raise ValueError("invalid canonical investigation depth")
+        budget = budgets[depth]
+        effective_filters = dict(filters or {})
+        self._filters(effective_filters)
+        time_reason = "explicit"
+        if "since" not in effective_filters and "until" not in effective_filters:
+            since, until, time_reason = self._question_time_window(question)
+            if since is not None:
+                effective_filters["since"] = since
+                effective_filters["until"] = until
+
+        probes: list[dict[str, Any]] = []
+        first = self.search(question, effective_filters, 20)
+        probes.append(first)
+        if not any(
+            name in effective_filters
+            for name in ("source_id", "source_family", "source_alias")
+        ):
+            with self.store.connect() as connection:
+                rows = connection.execute(
+                    """SELECT family,count(*) AS source_count
+                       FROM source_profiles
+                       WHERE source_id=ANY(%s)
+                       GROUP BY family
+                       ORDER BY source_count DESC,family
+                       LIMIT %s""",
+                    (list(self.authorized_sources), budget["families"]),
+                ).fetchall()
+            for row in rows:
+                family_filters = {
+                    **effective_filters,
+                    "source_family": row["family"],
+                }
+                probes.append(self.search(question, family_filters, 8))
+
+        combined: dict[str, dict[str, Any]] = {}
+        for probe_index, probe in enumerate(probes):
+            for rank, result in enumerate(probe["results"], start=1):
+                receipt = result["receipt"]
+                prior = combined.get(receipt)
+                aggregate = 1.0 / (30 + rank) + 1.0 / (60 + probe_index)
+                if prior is None:
+                    combined[receipt] = {**result, "_score": aggregate}
+                else:
+                    prior["_score"] += aggregate
+        ranked = sorted(
+            combined.values(),
+            key=lambda item: (
+                item["_score"],
+                item["occurred_at"],
+                item["receipt"],
+            ),
+            reverse=True,
+        )
+        selected: list[dict[str, Any]] = []
+        seen_sessions: set[tuple[str, str]] = set()
+        for result in ranked:
+            session_id = result.get("native_parent_id") or result["native_id"]
+            session_key = (result["source_id"], session_id)
+            if session_key in seen_sessions:
+                continue
+            seen_sessions.add(session_key)
+            selected.append(result)
+            if len(selected) >= budget["sessions"]:
+                break
+
+        investigations = []
+        since_bound = (
+            datetime.fromisoformat(effective_filters["since"].replace("Z", "+00:00"))
+            if effective_filters.get("since")
+            else None
+        )
+        until_bound = (
+            datetime.fromisoformat(effective_filters["until"].replace("Z", "+00:00"))
+            if effective_filters.get("until")
+            else None
+        )
+        for result in selected:
+            context = self.session_context(
+                result["receipt"],
+                before=budget["context"],
+                after=budget["context"],
+            )
+            if context is not None:
+                context["events"] = [
+                    event
+                    for event in context["events"]
+                    if (
+                        since_bound is None
+                        or datetime.fromisoformat(
+                            event["occurred_at"].replace("Z", "+00:00")
+                        ) >= since_bound
+                    )
+                    and (
+                        until_bound is None
+                        or datetime.fromisoformat(
+                            event["occurred_at"].replace("Z", "+00:00")
+                        ) <= until_bound
+                    )
+                ]
+                investigations.append({
+                    "match": {
+                        key: value
+                        for key, value in result.items()
+                        if key != "_score"
+                    },
+                    "context": context,
+                })
+
+        source_ids = sorted({
+            item["match"]["source_id"] for item in investigations
+        })
+        source_families: list[str] = []
+        if source_ids:
+            with self.store.connect() as connection:
+                rows = connection.execute(
+                    """SELECT DISTINCT family FROM source_profiles
+                       WHERE source_id=ANY(%s) ORDER BY family""",
+                    (source_ids,),
+                ).fetchall()
+            source_families = [row["family"] for row in rows]
+        occurred = [
+            event["occurred_at"]
+            for item in investigations
+            for event in item["context"]["events"]
+        ]
+        uncertainty = []
+        if not investigations:
+            uncertainty.append("No authorized evidence matched the question.")
+        if len(source_ids) < 2:
+            uncertainty.append(
+                "Evidence is concentrated in fewer than two authorized sources."
+            )
+        if time_reason == "unbounded":
+            uncertainty.append(
+                "The question had no explicit or recognized relative time window."
+            )
+        return {
+            "question_interpretation": {
+                "time_basis": "occurred_at",
+                "time_window": {
+                    "since": effective_filters.get("since"),
+                    "until": effective_filters.get("until"),
+                    "reason": time_reason,
+                },
+                "depth": depth,
+            },
+            "investigations": investigations,
+            "coverage": {
+                "sources": source_ids,
+                "source_families": source_families,
+                "sessions": len(investigations),
+                "earliest_occurred_at": min(occurred) if occurred else None,
+                "latest_occurred_at": max(occurred) if occurred else None,
+            },
+            "uncertainty": uncertainty,
+            "diagnostics": {
+                "engine": "canonical-investigator-v1",
+                "search_probes": len(probes),
+                "unique_candidates": len(combined),
+                "expanded_sessions": len(investigations),
+                "bounds": budget,
+            },
+        }
+
     def show(
         self,
         target: str,
@@ -453,37 +861,7 @@ class BoundCanonicalRetrieval:
         if not self.authorized_sources:
             return None
         with self.store.connect() as connection:
-            redirect = connection.execute(
-                """SELECT new_receipt FROM receipt_redirects
-                   WHERE tenant_id=%s AND old_receipt=%s""",
-                (self.tenant_id, target),
-            ).fetchone()
-            if redirect:
-                target = redirect["new_receipt"]
-            row = connection.execute(
-                """SELECT chunk.source_id,chunk.document_id,document.native_id,
-                          document.revision,event.kind,event.occurred_at,
-                          event.observed_at,event.canonical_redacted
-                   FROM canonical_chunks chunk
-                   JOIN canonical_documents document
-                     USING(tenant_id,source_id,document_id)
-                   JOIN canonical_events event
-                     USING(tenant_id,source_id,event_id)
-                   WHERE chunk.tenant_id=%s
-                     AND chunk.source_id=ANY(%s)
-                     AND chunk.receipt=%s
-                     AND chunk.deleted_at IS NULL
-                     AND document.deleted_at IS NULL
-                     AND NOT EXISTS (
-                       SELECT 1 FROM canonical_events later
-                       WHERE later.tenant_id=document.tenant_id
-                         AND later.source_id=document.source_id
-                         AND later.native_id=document.native_id
-                         AND later.revision>document.revision
-                         AND later.is_tombstone
-                     )""",
-                (self.tenant_id, list(self.authorized_sources), target),
-            ).fetchone()
+            row = self._receipt_event(connection, target)
             if row is None:
                 return None
             chunks = connection.execute(
@@ -531,7 +909,8 @@ class BoundCanonicalRetrieval:
         with self.store.connect() as connection:
             rows = connection.execute(
                 """SELECT chunk.source_id,document.native_id,document.revision,
-                          event.occurred_at,chunk.text_redacted,chunk.receipt,
+                          event.native_parent_id,event.occurred_at,event.observed_at,
+                          event.created_at,chunk.text_redacted,chunk.receipt,
                           event.canonical_redacted #>> '{provenance,cwd}' AS path,
                           event.canonical_redacted #>> '{provenance,branch}' AS branch
                    FROM canonical_chunks chunk

@@ -356,7 +356,11 @@ class RemoteMcpContractTest(unittest.TestCase):
                     tool["name"] for tool in json.loads(raw)["result"]["tools"]
                 }
                 self.assertEqual(names, {
-                    "recall_search", "recall_show", "recall_related"
+                    "recall_search",
+                    "recall_investigate",
+                    "recall_session_context",
+                    "recall_show",
+                    "recall_related",
                 })
 
                 status, _, raw = server.request(

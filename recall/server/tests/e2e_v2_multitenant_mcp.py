@@ -172,6 +172,8 @@ def ingest(
     source_id: str,
     native_id: str,
     text: str,
+    parent: str | None = None,
+    occurred_at: str = OCCURRED,
     tombstone: bool = False,
 ) -> str:
     raw = json.dumps(
@@ -190,7 +192,7 @@ def ingest(
         native_id=native_id,
         payload=raw,
         media_type="application/json",
-        created_at=OCCURRED,
+        created_at=occurred_at,
     )
     content = {"target_native_id": native_id} if tombstone else {"text": text}
     event = canonical_envelope(
@@ -200,7 +202,8 @@ def ingest(
         content=content,
         principal_id=principal_id,
         visibility="private",
-        occurred_at=OCCURRED,
+        occurred_at=occurred_at,
+        parent=parent,
         provenance={
             "uri": f"connector://synthetic/{hashlib.sha256(source_id.encode()).hexdigest()[:8]}",
             "cwd": "/synthetic/unified-brain",
@@ -278,6 +281,55 @@ def main() -> None:
             native_id="native:company:e2e",
             text="shared launch marker company semantic roadmap",
         )
+        atlas_receipts = [
+            ingest(
+                store,
+                archive,
+                tenant_id=COMPANY,
+                principal_id=OWNER,
+                source_id=COMPANY_SOURCE,
+                native_id=f"native:atlas:alpha:{index}",
+                parent="session:atlas:alpha",
+                occurred_at=occurred_at,
+                text=text,
+            )
+            for index, (occurred_at, text) in enumerate((
+                (
+                    "2026-07-23T08:00:00Z",
+                    "synthetic atlas harness preview started with the legacy runner",
+                ),
+                (
+                    "2026-07-23T09:00:00Z",
+                    "synthetic atlas harness decision changed the default runner",
+                ),
+                (
+                    "2026-07-23T10:00:00Z",
+                    "synthetic atlas harness preview passed after the runner fix",
+                ),
+            ))
+        ]
+        late_receipt = ingest(
+            store,
+            archive,
+            tenant_id=COMPANY,
+            principal_id=OWNER,
+            source_id=COMPANY_LATE_SOURCE,
+            native_id="native:atlas:beta:recent",
+            parent="session:atlas:beta",
+            occurred_at="2026-07-24T06:00:00Z",
+            text="synthetic atlas harness deployment verification completed",
+        )
+        ingest(
+            store,
+            archive,
+            tenant_id=COMPANY,
+            principal_id=OWNER,
+            source_id=COMPANY_LATE_SOURCE,
+            native_id="native:atlas:beta:old",
+            parent="session:atlas:beta",
+            occurred_at="2026-06-01T06:00:00Z",
+            text="synthetic atlas harness old imported history",
+        )
         ingest(
             store,
             archive,
@@ -300,6 +352,7 @@ def main() -> None:
             for source_id, principal_id in (
                 (PERSONAL_SOURCE, OWNER),
                 (COMPANY_SOURCE, OWNER),
+                (COMPANY_LATE_SOURCE, OWNER),
                 (OUTSIDER_SOURCE, OUTSIDER),
             ):
                 connection.execute(
@@ -310,9 +363,17 @@ def main() -> None:
                 connection.execute(
                     """INSERT INTO source_profiles(
                            source_id,family,quality,freshness_half_life_days
-                       ) VALUES (%s,'coding_history','trusted',30)
+                       ) VALUES (
+                           %s,
+                           CASE WHEN %s=%s
+                                THEN 'work_activity'
+                                ELSE 'coding_history'
+                           END,
+                           'trusted',
+                           30
+                       )
                        ON CONFLICT(source_id) DO UPDATE SET family=excluded.family""",
-                    (source_id,),
+                    (source_id, source_id, COMPANY_LATE_SOURCE),
                 )
             connection.execute(
                 """INSERT INTO source_aliases(alias,source_id)
@@ -376,7 +437,7 @@ def main() -> None:
         )
         retrieval = CanonicalRetrieval(store, archive)
         embedding = retrieval.embed_pending()
-        assert embedding["processed"] == 4
+        assert embedding["processed"] == 9
         control = ControlPlane(store, SecretBox(b"i" * 32), {})
         invitation = control.create_brain_invitation(
             principal_id=OWNER,
@@ -456,9 +517,79 @@ def main() -> None:
                 {"query": "shared launch marker"},
             )
             company_results = company["result"]["structuredContent"]["results"]
-            assert {row["source_id"] for row in company_results} == {COMPANY_SOURCE}
+            assert COMPANY_SOURCE in {
+                row["source_id"] for row in company_results
+            }
             assert PERSONAL_SOURCE not in json.dumps(company)
             assert OUTSIDER_SOURCE not in json.dumps(company)
+
+            investigated = rpc(
+                server,
+                company_token["token"],
+                "recall_investigate",
+                {
+                    "question": "What changed in the synthetic atlas harness?",
+                    "filters": {
+                        "since": "2026-07-22T00:00:00Z",
+                        "until": "2026-07-24T23:59:59Z",
+                    },
+                    "depth": "deep",
+                },
+            )["result"]["structuredContent"]
+            assert investigated["question_interpretation"]["time_basis"] == "occurred_at"
+            assert investigated["coverage"]["sessions"] >= 2
+            assert set(investigated["coverage"]["sources"]) == {
+                COMPANY_SOURCE,
+                COMPANY_LATE_SOURCE,
+            }
+            rendered_investigation = json.dumps(investigated)
+            assert PERSONAL_SOURCE not in rendered_investigation
+            assert OUTSIDER_SOURCE not in rendered_investigation
+            assert "old imported history" not in rendered_investigation
+            returned_receipts = {
+                chunk["receipt"]
+                for item in investigated["investigations"]
+                for event in item["context"]["events"]
+                for chunk in event["chunks"]
+            }
+            assert set(atlas_receipts).issubset(returned_receipts)
+            assert late_receipt in returned_receipts
+            occurrence_order = [
+                event["occurred_at"]
+                for item in investigated["investigations"]
+                for event in item["context"]["events"]
+            ]
+            assert all(
+                event["time_basis"] == "occurred_at"
+                for item in investigated["investigations"]
+                for event in item["context"]["events"]
+            )
+            assert occurrence_order
+
+            context = rpc(
+                server,
+                company_token["token"],
+                "recall_session_context",
+                {
+                    "target": atlas_receipts[1],
+                    "before": 2,
+                    "after": 2,
+                },
+            )["result"]["structuredContent"]
+            assert [
+                event["native_id"] for event in context["events"]
+            ] == [
+                "native:atlas:alpha:0",
+                "native:atlas:alpha:1",
+                "native:atlas:alpha:2",
+            ]
+            denied_context = rpc(
+                server,
+                personal_token["token"],
+                "recall_session_context",
+                {"target": atlas_receipts[1]},
+            )
+            assert denied_context["error"]["message"] == "receipt not found"
 
             conversational = rpc(
                 server,
@@ -566,10 +697,10 @@ def main() -> None:
                 "recall_search",
                 {"query": "shared launch marker"},
             )
-            assert {
+            assert COMPANY_SOURCE in {
                 row["source_id"]
                 for row in human["result"]["structuredContent"]["results"]
-            } == {COMPANY_SOURCE}
+            }
 
             status, denied = raw_rpc(
                 server,
@@ -603,10 +734,10 @@ def main() -> None:
                 {"query": "shared launch marker"},
                 path=f"/mcp/brains/{COMPANY}",
             )
-            assert {
+            assert COMPANY_SOURCE in {
                 row["source_id"]
                 for row in invited["result"]["structuredContent"]["results"]
-            } == {COMPANY_SOURCE}
+            }
             with store.connect() as connection:
                 accepted = connection.execute(
                     """SELECT accepted_principal_id,accepted_at,encrypted_email
@@ -868,6 +999,14 @@ def main() -> None:
                 "plaintext_credential_rows": 0,
                 "empty_grant_hits": 0,
                 "legacy_reads": 0,
+                "investigate_tool_calls": 1,
+                "investigate_sessions": investigated["coverage"]["sessions"],
+                "investigate_sources": len(investigated["coverage"]["sources"]),
+                "investigate_exact_receipts": len(returned_receipts),
+                "investigate_old_source_time_hits": 0,
+                "investigate_response_bytes": len(
+                    json.dumps(investigated).encode()
+                ),
                 "lexical_candidates": 2,
                 "semantic_candidates": semantic["diagnostics"][
                     "semantic_candidates"
