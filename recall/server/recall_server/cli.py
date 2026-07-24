@@ -10,13 +10,22 @@ from pathlib import Path
 from . import SCHEMA_VERSION
 from .app import serve, serve_unix
 from .archive import ArchiveError
-from .archive_runtime import build_archive_store, probe_archive
-from .capabilities import CapabilityError, probe_database
+from .archive_runtime import (
+    build_archive_store,
+    build_evidence_archive_store,
+    probe_archive,
+)
 from .canonical_retrieval import CanonicalRetrieval
+from .capabilities import CapabilityError, probe_database
 from .control import ControlPlane, SecretBox
 from .db import BrainStore
 from .deployment import DeploymentManifestError, load_manifest, preview
 from .embedding_worker import run_canonical_embedding_worker
+from .evidence_projection import (
+    CanonicalEvidenceProjector,
+    EvidenceProjectionStore,
+)
+from .evidence_worker import run_canonical_evidence_worker
 from .federation import QUALITY_SCORES, SOURCE_FAMILIES
 from .live_providers import (
     LiveProviderError,
@@ -46,6 +55,7 @@ def main() -> None:
     sub = ap.add_subparsers(dest="command", required=True)
     sub.add_parser("migrate")
     sub.add_parser("archive-check")
+    sub.add_parser("evidence-archive-check")
     capability = sub.add_parser("capability-check")
     capability.add_argument(
         "--profile", choices=("production", "local-fixture"), default="production"
@@ -99,6 +109,20 @@ def main() -> None:
         "--interval-seconds", type=float, default=5
     )
     canonical_embedding_worker.add_argument("--once", action="store_true")
+    canonical_evidence = sub.add_parser("backfill-canonical-evidence")
+    canonical_evidence.add_argument("--tenant", required=True)
+    canonical_evidence.add_argument("--batch-size", type=int, default=100)
+    canonical_evidence.add_argument("--max-batches", type=int, default=10)
+    canonical_evidence_worker = sub.add_parser("canonical-evidence-worker")
+    canonical_evidence_worker.add_argument("--tenant", required=True)
+    canonical_evidence_worker.add_argument("--batch-size", type=int, default=100)
+    canonical_evidence_worker.add_argument(
+        "--max-batches-per-cycle", type=int, default=10
+    )
+    canonical_evidence_worker.add_argument(
+        "--interval-seconds", type=float, default=5
+    )
+    canonical_evidence_worker.add_argument("--once", action="store_true")
     sub.add_parser("export")
     conformance = sub.add_parser("mcp-conformance")
     conformance.add_argument("--config", type=Path, required=True)
@@ -286,6 +310,24 @@ def main() -> None:
             )
             raise SystemExit(2) from None
         return
+    if args.command == "evidence-archive-check":
+        try:
+            print(
+                json.dumps(
+                    probe_archive(build_evidence_archive_store()),
+                    sort_keys=True,
+                )
+            )
+        except (ArchiveError, ValueError):
+            print(
+                json.dumps(
+                    {"status": "rejected", "code": "evidence_archive_check_failed"},
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            )
+            raise SystemExit(2) from None
+        return
     if not args.dsn:
         ap.error("--dsn or RECALL_DATABASE_URL is required")
     if args.command == "capability-check":
@@ -399,6 +441,31 @@ def main() -> None:
                 sort_keys=True,
             )
         )
+    elif args.command in {
+        "backfill-canonical-evidence",
+        "canonical-evidence-worker",
+    }:
+        projector = CanonicalEvidenceProjector(
+            store,
+            EvidenceProjectionStore(build_evidence_archive_store()),
+            bound_tenant_id=args.tenant,
+        )
+        if args.command == "backfill-canonical-evidence":
+            result = projector.project_pending(
+                tenant_id=args.tenant,
+                batch_size=args.batch_size,
+                max_batches=args.max_batches,
+            )
+        else:
+            result = run_canonical_evidence_worker(
+                projector,
+                tenant_id=args.tenant,
+                batch_size=args.batch_size,
+                max_batches_per_cycle=args.max_batches_per_cycle,
+                interval_seconds=args.interval_seconds,
+                once=args.once,
+            )
+        print(json.dumps(result, sort_keys=True))
     elif args.command == "export":
         for envelope in store.export_raw():
             print(json.dumps(envelope, sort_keys=True))

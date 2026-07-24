@@ -15,15 +15,21 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 
-from .archive_runtime import build_archive_store
-from .authorization import ExternalIdentityVerifier, OidcJwtVerifier, decide
 from .admin_web import (
     CSRF_COOKIE,
     SESSION_COOKIE,
+)
+from .admin_web import (
     asset as admin_asset,
+)
+from .admin_web import (
     cookies as admin_cookies,
+)
+from .admin_web import (
     session_headers as admin_session_headers,
 )
+from .archive_runtime import build_archive_store, build_evidence_archive_store
+from .authorization import ExternalIdentityVerifier, OidcJwtVerifier, decide
 from .canonical import (
     CanonicalArchiveGateway,
     CanonicalLifecycleError,
@@ -32,12 +38,23 @@ from .canonical import (
 from .canonical_retrieval import CanonicalRetrieval
 from .control import ControlError, ControlPlane
 from .db import BrainStore, IdempotencyConflict
+from .deep_inspection_runtime import build_deep_inspector
+from .evidence_projection import (
+    CanonicalEvidenceProjector,
+    EvidenceProjectionStore,
+)
 from .invitation_email import onboarding_page
 from .mcp import (
     SUPPORTED_PROTOCOL_VERSIONS,
     McpProtocolError,
+)
+from .mcp import (
     bound_response as bound_mcp_response,
+)
+from .mcp import (
     dispatch as dispatch_mcp,
+)
+from .mcp import (
     error_response as mcp_error_response,
 )
 from .semantic import SemanticRuntime
@@ -75,6 +92,9 @@ COUNTER_LOCK = threading.Lock()
 class Handler(BaseHTTPRequestHandler):
     store: BrainStore
     archive_store = None
+    evidence_archive_store = None
+    evidence_projector = None
+    deep_inspector = None
     canonical_plane: CanonicalPlane | None = None
     canonical_retrieval: CanonicalRetrieval | None = None
     control_plane: ControlPlane | None = None
@@ -1386,17 +1406,44 @@ def configure_runtime(dsn: str) -> None:
     Handler.external_identity_verifier = OidcJwtVerifier.from_env()
     if os.environ.get("RECALL_CANONICAL_V2_ENABLED") == "1":
         Handler.archive_store = build_archive_store()
+        if os.environ.get("RECALL_EVIDENCE_ENABLED") == "1":
+            evidence_tenant_id = os.environ.get("RECALL_EVIDENCE_TENANT_ID", "").strip()
+            if not evidence_tenant_id:
+                raise RuntimeError(
+                    "RECALL_EVIDENCE_TENANT_ID is required when evidence is enabled"
+                )
+            Handler.evidence_archive_store = build_evidence_archive_store()
+            projection = EvidenceProjectionStore(Handler.evidence_archive_store)
+            Handler.evidence_projector = CanonicalEvidenceProjector(
+                Handler.store,
+                projection,
+                bound_tenant_id=evidence_tenant_id,
+            )
+            Handler.deep_inspector = build_deep_inspector(projection)
+        else:
+            Handler.evidence_archive_store = None
+            Handler.evidence_projector = None
+            Handler.deep_inspector = None
         Handler.canonical_plane = CanonicalPlane(
             Handler.store,
             Handler.archive_store,
+            Handler.evidence_projector,
         )
         Handler.canonical_retrieval = (
-            CanonicalRetrieval(Handler.store, Handler.archive_store)
+            CanonicalRetrieval(
+                Handler.store,
+                Handler.archive_store,
+                evidence_projector=Handler.evidence_projector,
+                deep_inspector=Handler.deep_inspector,
+            )
             if os.environ.get("RECALL_CANONICAL_MCP_ENABLED") == "1"
             else None
         )
     else:
         Handler.archive_store = None
+        Handler.evidence_archive_store = None
+        Handler.evidence_projector = None
+        Handler.deep_inspector = None
         Handler.canonical_plane = None
         Handler.canonical_retrieval = None
     Handler.control_plane = (

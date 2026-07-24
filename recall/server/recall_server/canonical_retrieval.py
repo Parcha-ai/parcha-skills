@@ -12,6 +12,10 @@ from urllib.parse import urlsplit
 from .authorization import decide
 from .canonical import CanonicalPlane
 from .db import BrainStore, SearchDeadlineExceeded, bounded_search_text
+from .deep_inspection import (
+    DeepInspectionBudget,
+    EvidenceTarget,
+)
 from .federation import SOURCE_FAMILIES
 from .projectors import legacy_engine
 
@@ -31,9 +35,18 @@ def _timestamp(value: Any) -> str:
 class CanonicalRetrieval:
     """Tenant-keyed hybrid retrieval over only the canonical v2 projection."""
 
-    def __init__(self, store: BrainStore, archive: Any = None):
+    def __init__(
+        self,
+        store: BrainStore,
+        archive: Any = None,
+        *,
+        evidence_projector: Any = None,
+        deep_inspector: Any = None,
+    ):
         self.store = store
         self.archive = archive
+        self.evidence_projector = evidence_projector
+        self.deep_inspector = deep_inspector
 
     def bind(self, principal: dict[str, Any]) -> BoundCanonicalRetrieval:
         tenant_id = principal.get("tenant_id")
@@ -62,6 +75,8 @@ class CanonicalRetrieval:
             principal_id=principal_id,
             authorized_sources=sources,
             archive=self.archive,
+            evidence_projector=self.evidence_projector,
+            deep_inspector=self.deep_inspector,
         )
 
     def embed_pending(
@@ -154,12 +169,16 @@ class BoundCanonicalRetrieval:
         principal_id: str,
         authorized_sources: tuple[str, ...],
         archive: Any = None,
+        evidence_projector: Any = None,
+        deep_inspector: Any = None,
     ):
         self.store = store
         self.tenant_id = tenant_id
         self.principal_id = principal_id
         self.authorized_sources = authorized_sources
         self.archive = archive
+        self.evidence_projector = evidence_projector
+        self.deep_inspector = deep_inspector
 
     @staticmethod
     def _filters(
@@ -925,6 +944,148 @@ class BoundCanonicalRetrieval:
             },
         }
 
+    def deep_search(
+        self,
+        question: str,
+        *,
+        filters: dict[str, Any] | None = None,
+        depth: str = "normal",
+        authorized_source: Any = None,
+    ) -> dict[str, Any]:
+        """Deepen authorized Recall candidates in full evidence objects."""
+        budgets = {
+            "quick": DeepInspectionBudget(
+                max_files=6,
+                max_matches=12,
+                max_output_bytes=32_000,
+                timeout_seconds=8,
+                concurrency=4,
+            ),
+            "normal": DeepInspectionBudget(
+                max_files=20,
+                max_matches=50,
+                max_output_bytes=96_000,
+                timeout_seconds=20,
+                concurrency=8,
+            ),
+            "deep": DeepInspectionBudget(
+                max_files=60,
+                max_matches=150,
+                max_output_bytes=128_000,
+                timeout_seconds=30,
+                concurrency=16,
+            ),
+        }
+        if depth not in budgets:
+            raise ValueError("invalid canonical deep-search depth")
+        configured_tenant = getattr(
+            self.evidence_projector,
+            "bound_tenant_id",
+            None,
+        )
+        if (
+            self.evidence_projector is None
+            or self.deep_inspector is None
+            or (
+                configured_tenant is not None
+                and configured_tenant != self.tenant_id
+            )
+        ):
+            return {
+                "status": "unavailable",
+                "question": question,
+                "findings": [],
+                "coverage": {
+                    "candidate_files": 0,
+                    "files_scanned": 0,
+                    "complete": False,
+                    "reason": (
+                        "deep_inspector_not_configured"
+                        if configured_tenant in {None, self.tenant_id}
+                        else "deep_inspector_not_configured_for_brain"
+                    ),
+                },
+                "uncertainty": [
+                    "Deep inspection is not configured for this Recall deployment."
+                ],
+            }
+        investigation = self.investigate(
+            question,
+            filters=filters,
+            depth=depth,
+            authorized_source=authorized_source,
+        )
+        receipts = tuple(
+            dict.fromkeys(
+                chunk["receipt"]
+                for item in investigation["investigations"]
+                for event in item["context"]["events"]
+                for chunk in event["chunks"]
+            )
+        )
+        budget = budgets[depth]
+        selected = self.evidence_projector.targets_for_receipts(
+            tenant_id=self.tenant_id,
+            source_ids=self.authorized_sources,
+            receipts=receipts,
+            limit=budget.max_files,
+        )
+        targets = tuple(
+            EvidenceTarget.from_reference(
+                item["reference"],
+                receipts=item["receipts"],
+            )
+            for item in selected
+        )
+        deep = self.deep_inspector.inspect(
+            tenant_id=self.tenant_id,
+            question=question,
+            targets=targets,
+            budget=budget,
+        )
+        verified = []
+        with self.store.connect() as connection:
+            for finding in deep["findings"]:
+                row = self._receipt_event(connection, finding["receipt"])
+                if (
+                    row is not None
+                    and row["source_id"] in self.authorized_sources
+                ):
+                    verified.append(finding)
+        uncertainty = list(investigation["uncertainty"])
+        if len(verified) != len(deep["findings"]):
+            uncertainty.append(
+                "One or more deep findings became unavailable during verification."
+            )
+        if not deep["complete"]:
+            uncertainty.append("Deep inspection returned partial coverage.")
+        return {
+            "status": "complete",
+            "question": question,
+            "findings": verified,
+            "coverage": {
+                "candidate_receipts": len(receipts),
+                "candidate_files": len(targets),
+                "files_scanned": deep["files_scanned"],
+                "complete": bool(deep["complete"]),
+                "stopped_reason": deep["stopped_reason"],
+                "provider": deep["provider"],
+                "recall": investigation["coverage"],
+            },
+            "uncertainty": uncertainty,
+            "diagnostics": {
+                "engine": "canonical-deep-search-v1",
+                "depth": depth,
+                "budget": {
+                    "max_files": budget.max_files,
+                    "max_matches": budget.max_matches,
+                    "max_output_bytes": budget.max_output_bytes,
+                    "timeout_seconds": budget.timeout_seconds,
+                },
+                "provider_timing": deep["timing"],
+            },
+        }
+
     def show(
         self,
         target: str,
@@ -1056,7 +1217,11 @@ class BoundCanonicalRetrieval:
         if not owner:
             raise ValueError("canonical forget receipt not found")
         now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        return CanonicalPlane(self.store, self.archive).forget(
+        return CanonicalPlane(
+            self.store,
+            self.archive,
+            self.evidence_projector,
+        ).forget(
             {
                 "contract": "recall.forget-request.v1",
                 "schema_version": 1,

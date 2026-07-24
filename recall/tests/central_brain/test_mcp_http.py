@@ -357,6 +357,7 @@ class RemoteMcpContractTest(unittest.TestCase):
                 }
                 self.assertEqual(names, {
                     "recall_search",
+                    "recall_deep_search",
                     "recall_investigate",
                     "recall_session_context",
                     "recall_show",

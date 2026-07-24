@@ -4,7 +4,11 @@ import base64
 import unittest
 
 from server.recall_server.archive import ArchiveNotFound, S3ArchiveStore
-from server.recall_server.archive_runtime import build_archive_store, probe_archive
+from server.recall_server.archive_runtime import (
+    build_archive_store,
+    build_evidence_archive_store,
+    probe_archive,
+)
 
 
 class FakeBody:
@@ -125,6 +129,33 @@ class ArchiveRuntimeTest(unittest.TestCase):
                 invalid_namespace,
                 client_factory=lambda **_: object(),
             )
+
+    def test_evidence_archive_uses_only_its_separate_configuration(self):
+        calls = []
+        environment = {
+            "RECALL_EVIDENCE_ARCHIVE_BACKEND": "r2",
+            "RECALL_EVIDENCE_ARCHIVE_BUCKET": "recall-evidence-synthetic",
+            "RECALL_EVIDENCE_ARCHIVE_ENDPOINT_URL": (
+                "https://0123456789abcdef0123456789abcdef."
+                "r2.cloudflarestorage.com"
+            ),
+            "RECALL_EVIDENCE_ARCHIVE_REGION": "auto",
+            "RECALL_EVIDENCE_ARCHIVE_ACCESS_KEY_ID": "evidence-access-id",
+            "RECALL_EVIDENCE_ARCHIVE_SECRET_ACCESS_KEY": "evidence-secret",
+            "RECALL_EVIDENCE_ARCHIVE_NAMESPACE_KEY": base64.b64encode(
+                b"e" * 32
+            ).decode(),
+            "RECALL_ARCHIVE_BUCKET": "recall-raw-must-not-be-used",
+        }
+
+        store = build_evidence_archive_store(
+            environment,
+            client_factory=lambda **kwargs: calls.append(kwargs) or object(),
+        )
+
+        self.assertEqual(store.bucket, "recall-evidence-synthetic")
+        self.assertEqual(calls[0]["aws_access_key_id"], "evidence-access-id")
+        self.assertNotIn("recall-raw-must-not-be-used", repr(calls))
 
     def test_probe_proves_write_replay_read_delete_and_absence(self):
         client = FakeR2()

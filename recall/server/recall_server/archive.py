@@ -251,6 +251,31 @@ class _ArchiveStore:
 
     def delete_raw(self, value: dict[str, Any]) -> bool:
         """Delete one contract reference without exposing archive namespace material."""
+        reference = self._from_contract(value)
+        try:
+            self.read(
+                reference,
+                tenant_id=value["tenant_id"],
+                source_id=value["source_id"],
+            )
+        except ArchiveNotFound:
+            return False
+        return self.delete(
+            reference,
+            tenant_id=value["tenant_id"],
+            source_id=value["source_id"],
+        )
+
+    def read_raw(self, value: dict[str, Any]) -> bytes:
+        """Resolve one closed reference without exposing namespace-key material."""
+        reference = self._from_contract(value)
+        return self.read(
+            reference,
+            tenant_id=value["tenant_id"],
+            source_id=value["source_id"],
+        )
+
+    def _from_contract(self, value: dict[str, Any]) -> ArtifactReference:
         try:
             reference = validate_contract(value, expected="recall.artifact-ref.v1")
         except ContractError:
@@ -273,19 +298,7 @@ class _ArchiveStore:
             encryption=reference["encryption"],
             version_id=reference["version_id"],
         )
-        try:
-            self.read(
-                internal,
-                tenant_id=reference["tenant_id"],
-                source_id=reference["source_id"],
-            )
-        except ArchiveNotFound:
-            return False
-        return self.delete(
-            internal,
-            tenant_id=reference["tenant_id"],
-            source_id=reference["source_id"],
-        )
+        return internal
 
 
 class _BytesReader:

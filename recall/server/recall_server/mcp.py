@@ -184,6 +184,41 @@ ALL_READ_TOOLS = (
         "annotations": {"readOnlyHint": True},
     },
     {
+        "name": "recall_deep_search",
+        "description": (
+            "Deep-search full privacy-processed evidence files in one bounded "
+            "call. Recall selects and authorizes files; optional serverless "
+            "compute returns exact recall:// receipts and completeness."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "maxLength": 8192},
+                "filters": {
+                    "type": "object",
+                    "default": {},
+                    "properties": {
+                        "since": {"type": "string", "format": "date-time"},
+                        "until": {"type": "string", "format": "date-time"},
+                        "source_id": {"type": "string"},
+                        "source_family": {"type": "string"},
+                        "source_alias": {"type": "string"},
+                    },
+                    "additionalProperties": False,
+                },
+                "depth": {
+                    "type": "string",
+                    "enum": ["quick", "normal", "deep"],
+                    "default": "normal",
+                },
+            },
+            "required": ["question"],
+            "additionalProperties": False,
+        },
+        "outputSchema": {"type": "object"},
+        "annotations": {"readOnlyHint": True},
+    },
+    {
         "name": "recall_session_context",
         "description": (
             "Expand one recall:// receipt inside its authorized source session "
@@ -241,6 +276,7 @@ ALL_READ_TOOLS = (
     },
 )
 CANONICAL_ONLY_READ_TOOLS = frozenset({
+    "recall_deep_search",
     "recall_investigate",
     "recall_session_context",
 })
@@ -404,6 +440,24 @@ def _call_tool(store, principal: dict, name: str, arguments: dict) -> dict:
                 "depth must be quick, normal, or deep",
             )
         return store.investigate(
+            question,
+            filters=filters,
+            depth=depth,
+            authorized_source=authorized_source,
+        )
+    if name == "recall_deep_search":
+        _reject_extra(arguments, frozenset({"question", "filters", "depth"}))
+        question = _string(arguments.get("question"), "question")
+        if len(question) > 8192:
+            raise McpProtocolError(-32602, "question must be at most 8192 characters")
+        filters = _object(arguments.get("filters", {}), "filters")
+        depth = _string(arguments.get("depth", "normal"), "depth")
+        if depth not in {"quick", "normal", "deep"}:
+            raise McpProtocolError(
+                -32602,
+                "depth must be quick, normal, or deep",
+            )
+        return store.deep_search(
             question,
             filters=filters,
             depth=depth,

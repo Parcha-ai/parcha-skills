@@ -64,7 +64,7 @@ infrastructure. The example is synthetic; a live manifest belongs in a private m
 location and contains references, never credential values.
 
 The production database gate requires a standard PostgreSQL URL with
-`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 34,
+`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 35,
 pgvector 0.8.0 or newer, and a runtime role without superuser, database/role creation,
 replication, or RLS-bypass privilege:
 
@@ -167,6 +167,54 @@ Recall does not read a Cloudflare management API token. Validate the configured
 archive with `python -m recall_server.cli archive-check`; the probe writes,
 replays, reads, deletes, and verifies absence using synthetic bytes, then emits
 only a content-free status.
+
+Operational raw-object and bulk-ingest manifests intentionally contain digests,
+counts, cursors, and status only. They prove replay and integrity without
+copying transcripts, secrets, or PII into logs and deployment evidence. Full
+deep-search content lives in a different projection: the canonical
+privacy-processed chunk text plus exact Recall receipts, stored in a separate
+private evidence bucket. Never mount the raw archive into an external compute
+provider.
+
+Deep inspection is hard-bound to exactly one brain tenant per service instance,
+evidence bucket credential, and Archil disk:
+
+```text
+RECALL_EVIDENCE_ENABLED=1
+RECALL_EVIDENCE_TENANT_ID=tenant:company:example
+RECALL_EVIDENCE_ARCHIVE_BACKEND=r2
+RECALL_EVIDENCE_ARCHIVE_BUCKET=recall-evidence-company-example
+RECALL_EVIDENCE_ARCHIVE_ENDPOINT_URL=https://ACCOUNT_ID.r2.cloudflarestorage.com
+RECALL_EVIDENCE_ARCHIVE_REGION=auto
+RECALL_EVIDENCE_ARCHIVE_ACCESS_KEY_ID=<injected secret>
+RECALL_EVIDENCE_ARCHIVE_SECRET_ACCESS_KEY=<injected secret>
+RECALL_EVIDENCE_ARCHIVE_NAMESPACE_KEY=<independent base64 32-byte secret>
+RECALL_DEEP_INSPECTOR=archil
+ARCHIL_API_KEY=<injected secret>
+RECALL_ARCHIL_DISK_ID=dsk_replace_me
+RECALL_ARCHIL_REGION=aws-us-west-2
+```
+
+Give the evidence R2 credential Object Read & Write access to that evidence
+bucket only, then attach only that bucket to the tenant's read-only Archil disk.
+Do not reuse a bucket or disk across personal and company brains. Validate and
+populate it before enabling the MCP tool:
+
+```bash
+python -m recall_server.cli evidence-archive-check
+python -m recall_server.cli backfill-canonical-evidence \
+  --tenant tenant:company:example --batch-size 100 --max-batches 10
+python -m recall_server.cli canonical-evidence-worker \
+  --tenant tenant:company:example
+```
+
+`recall_deep_search` first uses canonical retrieval to select authorized
+candidates, passes only opaque evidence keys and exact allowed receipts to a
+fixed server-owned inspection program, mounts the Archil disk read-only, and
+revalidates every returned receipt. The question is encoded as data and can
+never become a shell command or object path. Interactive executions are bounded
+by file, match, output-byte, and time limits. Use
+`RECALL_DEEP_INSPECTOR=local` for the same contract without third-party compute.
 
 Enable the canonical v2 write plane only after the archive probe and database
 migrations pass:

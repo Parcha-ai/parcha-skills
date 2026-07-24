@@ -14,7 +14,6 @@ from .archive import (
     S3ArchiveStore,
 )
 
-
 R2_REQUIRED_ENV = (
     "RECALL_ARCHIVE_BUCKET",
     "RECALL_ARCHIVE_ENDPOINT_URL",
@@ -110,6 +109,39 @@ def build_archive_store(
         client=BotoS3Client(client),
         compatibility_profile="r2",
     )
+
+
+def build_evidence_archive_store(
+    environment: Mapping[str, str] | None = None,
+    *,
+    client_factory: Callable[..., Any] | None = None,
+) -> S3ArchiveStore:
+    """Build the separately credentialed, privacy-processed evidence bucket."""
+    values = os.environ if environment is None else environment
+    translated = {
+        "RECALL_ARCHIVE_BACKEND": _required(
+            values, "RECALL_EVIDENCE_ARCHIVE_BACKEND"
+        ),
+        "RECALL_ARCHIVE_BUCKET": _required(
+            values, "RECALL_EVIDENCE_ARCHIVE_BUCKET"
+        ),
+        "RECALL_ARCHIVE_ENDPOINT_URL": _required(
+            values, "RECALL_EVIDENCE_ARCHIVE_ENDPOINT_URL"
+        ),
+        "RECALL_ARCHIVE_REGION": _required(
+            values, "RECALL_EVIDENCE_ARCHIVE_REGION"
+        ),
+        "RECALL_ARCHIVE_ACCESS_KEY_ID": _required(
+            values, "RECALL_EVIDENCE_ARCHIVE_ACCESS_KEY_ID"
+        ),
+        "RECALL_ARCHIVE_SECRET_ACCESS_KEY": _required(
+            values, "RECALL_EVIDENCE_ARCHIVE_SECRET_ACCESS_KEY"
+        ),
+        "RECALL_ARCHIVE_NAMESPACE_KEY": _required(
+            values, "RECALL_EVIDENCE_ARCHIVE_NAMESPACE_KEY"
+        ),
+    }
+    return build_archive_store(translated, client_factory=client_factory)
 
 
 def probe_archive(store: S3ArchiveStore) -> dict[str, Any]:

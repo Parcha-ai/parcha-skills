@@ -206,9 +206,15 @@ class CanonicalArchiveGateway:
 class CanonicalPlane:
     """Tenant-aware v2 canonical ingest and crash-resumable authoritative forget."""
 
-    def __init__(self, store: BrainStore, archive: ArchiveLifecycle):
+    def __init__(
+        self,
+        store: BrainStore,
+        archive: ArchiveLifecycle,
+        evidence_projector: Any = None,
+    ):
         self.store = store
         self.archive = archive
+        self.evidence_projector = evidence_projector
 
     @staticmethod
     def _validate_host_identity(
@@ -1151,6 +1157,7 @@ class CanonicalPlane:
                         "replay": True,
                         "raw_deleted": 0,
                         "projections_deleted": 0,
+                        "evidence_deleted": 0,
                     }
                 target = conn.execute(
                     """SELECT document.native_id
@@ -1254,9 +1261,16 @@ class CanonicalPlane:
                     (tenant_id, source_id, native_ids, native_ids),
                 )
 
+        evidence_deleted = 0
         try:
             for reference in references:
                 self.archive.delete_raw(reference)
+            if self.evidence_projector is not None:
+                evidence_deleted = self.evidence_projector.delete_native_ids(
+                    tenant_id=tenant_id,
+                    source_id=source_id,
+                    native_ids=native_ids,
+                )
         except Exception:
             with self.store.connect() as conn:
                 conn.execute(
@@ -1333,4 +1347,5 @@ class CanonicalPlane:
             "replay": False,
             "raw_deleted": len(references),
             "projections_deleted": projection_count,
+            "evidence_deleted": evidence_deleted,
         }

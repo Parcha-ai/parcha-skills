@@ -26,6 +26,11 @@ from recall_server.canonical import CanonicalArchiveGateway, CanonicalPlane
 from recall_server.canonical_retrieval import CanonicalRetrieval
 from recall_server.control import ControlPlane, SecretBox
 from recall_server.db import BrainStore
+from recall_server.deep_inspection import LocalDeepInspector
+from recall_server.evidence_projection import (
+    CanonicalEvidenceProjector,
+    EvidenceProjectionStore,
+)
 
 
 OWNER = "principal:owner:e2e"
@@ -233,7 +238,7 @@ def main() -> None:
         "canonical_chunk_embeddings,canonical_source_grants,"
         "brain_access_grants,brain_memberships,brain_spaces,brain_organizations,"
         "forget_tombstones,receipt_redirects,canonical_audit_events,"
-        "canonical_chunks,canonical_documents,canonical_events,"
+        "canonical_evidence_objects,canonical_chunks,canonical_documents,canonical_events,"
         "canonical_ingest_jobs,raw_artifacts,canonical_sources,"
         "brain_principals,brain_tenants,collector_credentials,"
         "source_aliases,source_profiles,sources"
@@ -262,6 +267,15 @@ def main() -> None:
         archive = FilesystemArchiveStore(
             Path(temporary) / "archive",
             namespace_key=b"m" * 32,
+        )
+        evidence_archive = FilesystemArchiveStore(
+            Path(temporary) / "evidence",
+            namespace_key=b"e" * 32,
+        )
+        evidence_projection = EvidenceProjectionStore(evidence_archive)
+        evidence_projector = CanonicalEvidenceProjector(
+            store,
+            evidence_projection,
         )
         personal_receipt = ingest(
             store,
@@ -449,7 +463,14 @@ def main() -> None:
             principal_id=VIEWER,
             principal_kind="human",
         )
-        retrieval = CanonicalRetrieval(store, archive)
+        projected = evidence_projector.project_pending()
+        assert projected["processed"] == 10
+        retrieval = CanonicalRetrieval(
+            store,
+            archive,
+            evidence_projector=evidence_projector,
+            deep_inspector=LocalDeepInspector(evidence_projection),
+        )
         embedding = retrieval.embed_pending()
         assert embedding["processed"] == 10
         control = ControlPlane(store, SecretBox(b"i" * 32), {})
@@ -505,7 +526,14 @@ def main() -> None:
         )
         Handler.store = store
         Handler.archive_store = archive
-        Handler.canonical_plane = CanonicalPlane(store, archive)
+        Handler.evidence_archive_store = evidence_archive
+        Handler.evidence_projector = evidence_projector
+        Handler.deep_inspector = retrieval.deep_inspector
+        Handler.canonical_plane = CanonicalPlane(
+            store,
+            archive,
+            evidence_projector,
+        )
         Handler.canonical_retrieval = retrieval
         Handler.control_plane = control
         Handler.external_identity_verifier = SyntheticExternalVerifier()
@@ -600,6 +628,45 @@ def main() -> None:
                 for event in item["context"]["events"]
             )
             assert occurrence_order
+
+            deep = rpc(
+                server,
+                company_token["token"],
+                "recall_deep_search",
+                {
+                    "question": (
+                        "Deep-search full synthetic atlas harness evidence"
+                    ),
+                    "filters": {
+                        "since": "2026-07-22T00:00:00Z",
+                        "until": "2026-07-24T23:59:59Z",
+                    },
+                    "depth": "deep",
+                },
+            )["result"]["structuredContent"]
+            assert deep["status"] == "complete"
+            assert deep["coverage"]["provider"] == "local"
+            assert deep["coverage"]["files_scanned"] >= 2
+            assert deep["findings"]
+            deep_rendered = json.dumps(deep)
+            assert "synthetic atlas harness" in deep_rendered
+            assert PERSONAL_SOURCE not in deep_rendered
+            assert "strongest-match canary" not in deep_rendered
+            assert OUTSIDER_SOURCE not in deep_rendered
+            assert "old imported history" not in deep_rendered
+            deep_receipts = {item["receipt"] for item in deep["findings"]}
+            with store.connect() as connection:
+                assert connection.execute(
+                    """SELECT count(DISTINCT receipt) AS n
+                       FROM canonical_chunks
+                       WHERE tenant_id=%s AND source_id=ANY(%s)
+                         AND receipt=ANY(%s) AND deleted_at IS NULL""",
+                    (
+                        COMPANY,
+                        [COMPANY_SOURCE, COMPANY_LATE_SOURCE],
+                        list(deep_receipts),
+                    ),
+                ).fetchone()["n"] == len(deep_receipts)
 
             context = rpc(
                 server,
@@ -942,6 +1009,7 @@ def main() -> None:
                 {"receipt": forget_receipt},
             )["result"]["structuredContent"]
             assert forgotten["raw_deleted"] == 1
+            assert forgotten["evidence_deleted"] == 1
             forgotten_show = rpc(
                 server,
                 personal_token["token"],
@@ -1053,6 +1121,12 @@ def main() -> None:
                 "investigate_response_bytes": len(
                     json.dumps(investigated).encode()
                 ),
+                "deep_search_tool_calls": 1,
+                "deep_search_provider": deep["coverage"]["provider"],
+                "deep_search_files": deep["coverage"]["files_scanned"],
+                "deep_search_exact_receipts": len(deep_receipts),
+                "deep_search_cross_tenant_hits": 0,
+                "deep_search_old_source_time_hits": 0,
                 "lexical_candidates": 2,
                 "semantic_candidates": semantic["diagnostics"][
                     "semantic_candidates"
