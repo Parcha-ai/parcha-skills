@@ -45,17 +45,6 @@ your agent    -> read the winning window and get back to work
 The transcripts remain the source of truth. The SQLite index is disposable and
 fully rebuildable.
 
-When a private Recall Brain service is available, set `RECALL_URL` to use the same read commands
-remotely. An explicit `/mcp` suffix selects the scoped MCP tools; a URL without it preserves the
-legacy REST transport. `RECALL_MODE=shadow` compares central receipts while returning local behavior;
-`RECALL_MODE=local` is an instant read rollback that does not rewrite either store. Remote failures do
-not silently fall back to stale local results.
-
-The `index` command only maintains the disposable local SQLite fallback; it never repairs or
-refreshes the central brain. When a central profile is configured, local index maintenance fails
-closed unless the operator also passes `--allow-local-index`. This second acknowledgement prevents
-an accidental local rebuild from consuming CPU and disk while leaving hosted Recall unchanged.
-
 The honest limit: no-answer detection is still lexical. A query about work that
 never happened can return a nearby session with similar words. That is why every
 result includes a `WHY` line and the skill tells the agent to inspect the
@@ -132,6 +121,17 @@ Codex transcripts; pi can run the search, but pi's own transcript format is not 
 Everything stays on your machine. Secret-shaped lines are redacted during
 indexing, thinking blocks are not indexed, and the index directory is created
 with user-only permissions.
+
+## Optional upgrade: Recall Brain
+
+recall is fully local by default. A separate, self-hosted **Recall Brain**
+service adds deliberate memory writes, cross-device search over the tailnet,
+consented ChatGPT-export import, a Cowork collector, pull connectors, and MCP
+capture. Nothing contacts a network until you explicitly configure
+`RECALL_URL` or `~/.config/recall-brain/client.json`; `RECALL_MODE=local` is
+the instant rollback. Agent-facing details live in
+`skills/recall/references/central-brain.md`; operator docs in `client/`,
+`connectors/`, and `server/deploy/`.
 
 ## Requirements
 

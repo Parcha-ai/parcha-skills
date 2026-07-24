@@ -1175,7 +1175,11 @@ def search(args) -> int:
         return 2
     _, _, db = paths()
     if not db.exists():
-        if not args.paths: print("Recall index does not exist; run `recall index` first.", file=sys.stderr)
+        if not args.paths:
+            print("Recall index does not exist yet.", file=sys.stderr)
+            print("Answer now by scanning transcripts directly, e.g.:", file=sys.stderr)
+            print('  rg -l -i "<terms>" ~/.claude/projects ~/.codex/sessions', file=sys.stderr)
+            print("and start the index in the background: setsid nohup python3 scripts/recall.py index &", file=sys.stderr)
         return 0
     conn = connect_ro(db)
 
@@ -1766,6 +1770,11 @@ def related(args) -> int:
 
 
 def doctor(args) -> int:
+    mode = recall_mode()
+    if mode == "local":
+        print("OK mode=local — central Recall Brain available as an upgrade; see references/central-brain.md")
+    else:
+        print(f"OK mode={mode}")
     claude, codex, db = paths()
     conn = None
     try:
