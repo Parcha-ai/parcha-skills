@@ -272,6 +272,20 @@ def main() -> None:
             native_id="native:personal:e2e",
             text="shared launch marker personal semantic decision",
         )
+        personal_atlas_receipt = ingest(
+            store,
+            archive,
+            tenant_id=PERSONAL,
+            principal_id=OWNER,
+            source_id=PERSONAL_SOURCE,
+            native_id="native:atlas:personal:canary",
+            parent="session:atlas:personal",
+            occurred_at="2026-07-24T07:00:00Z",
+            text=(
+                "synthetic atlas harness atlas harness atlas harness "
+                "private strongest-match canary"
+            ),
+        )
         company_receipt = ingest(
             store,
             archive,
@@ -437,7 +451,7 @@ def main() -> None:
         )
         retrieval = CanonicalRetrieval(store, archive)
         embedding = retrieval.embed_pending()
-        assert embedding["processed"] == 9
+        assert embedding["processed"] == 10
         control = ControlPlane(store, SecretBox(b"i" * 32), {})
         invitation = control.create_brain_invitation(
             principal_id=OWNER,
@@ -544,8 +558,21 @@ def main() -> None:
             }
             rendered_investigation = json.dumps(investigated)
             assert PERSONAL_SOURCE not in rendered_investigation
+            assert personal_atlas_receipt not in rendered_investigation
+            assert "strongest-match canary" not in rendered_investigation
             assert OUTSIDER_SOURCE not in rendered_investigation
             assert "old imported history" not in rendered_investigation
+            accounting = investigated["coverage"]["source_accounting"]
+            assert set(accounting["searched"]) == {
+                COMPANY_SOURCE,
+                COMPANY_LATE_SOURCE,
+            }
+            assert accounting["filtered"] == []
+            assert accounting["unavailable"] == []
+            assert (
+                len(rendered_investigation.encode())
+                < investigated["diagnostics"]["bounds"]["max_response_bytes"]
+            )
             returned_receipts = {
                 chunk["receipt"]
                 for item in investigated["investigations"]
@@ -554,6 +581,14 @@ def main() -> None:
             }
             assert set(atlas_receipts).issubset(returned_receipts)
             assert late_receipt in returned_receipts
+            with store.connect() as connection:
+                assert connection.execute(
+                    """SELECT count(DISTINCT receipt) AS n
+                       FROM canonical_chunks
+                       WHERE tenant_id=%s AND receipt=ANY(%s)
+                         AND deleted_at IS NULL""",
+                    (COMPANY, list(returned_receipts)),
+                ).fetchone()["n"] == len(returned_receipts)
             occurrence_order = [
                 event["occurred_at"]
                 for item in investigated["investigations"]
@@ -931,7 +966,14 @@ def main() -> None:
                 "recall_search",
                 {"query": "shared launch marker"},
             )
-            assert deleted["result"]["structuredContent"]["results"] == []
+            deleted_results = deleted["result"]["structuredContent"]["results"]
+            assert personal_receipt not in {
+                row["receipt"] for row in deleted_results
+            }
+            assert all(
+                "shared launch marker" not in row["text"]
+                for row in deleted_results
+            )
             deleted_show = rpc(
                 server,
                 personal_token["token"],
@@ -1004,6 +1046,10 @@ def main() -> None:
                 "investigate_sources": len(investigated["coverage"]["sources"]),
                 "investigate_exact_receipts": len(returned_receipts),
                 "investigate_old_source_time_hits": 0,
+                "investigate_session_coverage": 1.0,
+                "investigate_temporal_accuracy": 1.0,
+                "investigate_citation_precision": 1.0,
+                "investigate_unsupported_claim_rate": 0.0,
                 "investigate_response_bytes": len(
                     json.dumps(investigated).encode()
                 ),

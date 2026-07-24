@@ -673,22 +673,48 @@ class BoundCanonicalRetrieval:
         """Return an answer-ready, receipt-backed multi-session evidence packet."""
         if not isinstance(question, str) or not question.strip() or len(question) > 8192:
             raise ValueError("invalid canonical investigation question")
+        started_at = time.monotonic()
         budgets = {
-            "quick": {"families": 1, "sessions": 2, "context": 2},
-            "normal": {"families": 4, "sessions": 4, "context": 4},
-            "deep": {"families": 8, "sessions": 6, "context": 6},
+            "quick": {
+                "families": 1,
+                "sessions": 2,
+                "context": 2,
+                "deadline_seconds": 5,
+                "max_response_bytes": 900_000,
+            },
+            "normal": {
+                "families": 4,
+                "sessions": 4,
+                "context": 4,
+                "deadline_seconds": 15,
+                "max_response_bytes": 900_000,
+            },
+            "deep": {
+                "families": 8,
+                "sessions": 6,
+                "context": 6,
+                "deadline_seconds": 30,
+                "max_response_bytes": 900_000,
+            },
         }
         if depth not in budgets:
             raise ValueError("invalid canonical investigation depth")
         budget = budgets[depth]
         effective_filters = dict(filters or {})
-        self._filters(effective_filters)
+        source_id, source_family, source_alias, _, _ = self._filters(
+            effective_filters
+        )
         time_reason = "explicit"
         if "since" not in effective_filters and "until" not in effective_filters:
             since, until, time_reason = self._question_time_window(question)
             if since is not None:
                 effective_filters["since"] = since
                 effective_filters["until"] = until
+        eligible_sources = self._sources(
+            source_id=source_id,
+            source_family=source_family,
+            source_alias=source_alias,
+        )
 
         probes: list[dict[str, Any]] = []
         first = self.search(question, effective_filters, 20)
@@ -705,9 +731,11 @@ class BoundCanonicalRetrieval:
                        GROUP BY family
                        ORDER BY source_count DESC,family
                        LIMIT %s""",
-                    (list(self.authorized_sources), budget["families"]),
+                    (eligible_sources, budget["families"]),
                 ).fetchall()
             for row in rows:
+                if time.monotonic() - started_at >= budget["deadline_seconds"]:
+                    break
                 family_filters = {
                     **effective_filters,
                     "source_family": row["family"],
@@ -757,6 +785,8 @@ class BoundCanonicalRetrieval:
             else None
         )
         for result in selected:
+            if time.monotonic() - started_at >= budget["deadline_seconds"]:
+                break
             context = self.session_context(
                 result["receipt"],
                 before=budget["context"],
@@ -787,6 +817,12 @@ class BoundCanonicalRetrieval:
                     },
                     "context": context,
                 })
+        while (
+            len(json.dumps(investigations, default=str).encode())
+            > budget["max_response_bytes"] - 100_000
+            and investigations
+        ):
+            investigations.pop()
 
         source_ids = sorted({
             item["match"]["source_id"] for item in investigations
@@ -800,6 +836,32 @@ class BoundCanonicalRetrieval:
                     (source_ids,),
                 ).fetchall()
             source_families = [row["family"] for row in rows]
+        with self.store.connect() as connection:
+            configured_rows = connection.execute(
+                """SELECT source.source_id,max(job.updated_at) AS last_activity_at
+                   FROM canonical_sources source
+                   LEFT JOIN canonical_ingest_jobs job
+                     USING(tenant_id,source_id)
+                   WHERE source.tenant_id=%s
+                     AND source.source_id=ANY(%s)
+                   GROUP BY source.source_id
+                   ORDER BY source.source_id""",
+                (self.tenant_id, list(self.authorized_sources)),
+            ).fetchall()
+        configured = {
+            row["source_id"]: row["last_activity_at"]
+            for row in configured_rows
+        }
+        stale_cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+        stale_sources = sorted(
+            source
+            for source in eligible_sources
+            if source in configured
+            and (
+                configured[source] is None
+                or configured[source].astimezone(timezone.utc) < stale_cutoff
+            )
+        )
         occurred = [
             event["occurred_at"]
             for item in investigations
@@ -833,6 +895,17 @@ class BoundCanonicalRetrieval:
                 "sessions": len(investigations),
                 "earliest_occurred_at": min(occurred) if occurred else None,
                 "latest_occurred_at": max(occurred) if occurred else None,
+                "source_accounting": {
+                    "searched": eligible_sources,
+                    "stale": stale_sources,
+                    "filtered": sorted(
+                        set(self.authorized_sources) - set(eligible_sources)
+                    ),
+                    "unavailable": sorted(
+                        set(self.authorized_sources) - set(configured)
+                    ),
+                    "stale_after_seconds": 7 * 24 * 60 * 60,
+                },
             },
             "uncertainty": uncertainty,
             "diagnostics": {
@@ -841,6 +914,14 @@ class BoundCanonicalRetrieval:
                 "unique_candidates": len(combined),
                 "expanded_sessions": len(investigations),
                 "bounds": budget,
+                "elapsed_ms": round(
+                    (time.monotonic() - started_at) * 1000,
+                    3,
+                ),
+                "deadline_reached": (
+                    time.monotonic() - started_at
+                    >= budget["deadline_seconds"]
+                ),
             },
         }
 
