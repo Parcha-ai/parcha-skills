@@ -165,39 +165,32 @@ class CanonicalRetrieval:
                     ).fetchone()
                     connection.commit()
                     select_started = time.monotonic()
-                    rows = connection.execute(
-                        """SELECT chunk.tenant_id,chunk.source_id,chunk.chunk_id,
-                                  chunk.text_redacted,chunk.text_sha256
-                           FROM canonical_chunks chunk
-                           JOIN canonical_documents document
-                             USING(tenant_id,source_id,document_id)
-                           LEFT JOIN canonical_chunk_embeddings embedding
-                             ON embedding.tenant_id=chunk.tenant_id
-                            AND embedding.source_id=chunk.source_id
-                            AND embedding.chunk_id=chunk.chunk_id
-                            AND embedding.runtime_fingerprint=%s
-                           WHERE chunk.deleted_at IS NULL
-                             AND document.is_current
-                             AND document.deleted_at IS NULL
-                             AND embedding.chunk_id IS NULL
-                             AND (%s::text IS NULL OR chunk.tenant_id=%s)
-                             AND (chunk.tenant_id,chunk.source_id,chunk.chunk_id)
-                                 > (%s,%s,%s)
-                           ORDER BY chunk.tenant_id,chunk.source_id,chunk.chunk_id
-                           LIMIT %s""",
+                    scope_clause = (
+                        "AND tenant_id=%s" if tenant_id is not None else ""
+                    )
+                    window_values: list[Any] = []
+                    if tenant_id is not None:
+                        window_values.append(tenant_id)
+                    window_values.extend(
                         (
-                            runtime.fingerprint,
-                            tenant_id,
-                            tenant_id,
                             watermark["last_tenant_id"],
                             watermark["last_source_id"],
                             watermark["last_chunk_id"],
                             batch_size,
-                        ),
+                        )
+                    )
+                    window = connection.execute(
+                        f"""SELECT tenant_id,source_id,chunk_id
+                            FROM canonical_chunks
+                            WHERE deleted_at IS NULL
+                              {scope_clause}
+                              AND (tenant_id,source_id,chunk_id) > (%s,%s,%s)
+                            ORDER BY tenant_id,source_id,chunk_id
+                            LIMIT %s""",
+                        tuple(window_values),
                     ).fetchall()
                     connection.commit()
-                    selected_seconds = time.monotonic() - select_started
-                    if not rows:
+                    if not window:
                         cursor_is_set = any(
                             watermark[key]
                             for key in (
@@ -219,13 +212,79 @@ class CanonicalRetrieval:
                             wrapped = True
                             continue
                         break
+                    window_end = window[-1]
+                    eligibility_scope_clause = (
+                        "AND chunk.tenant_id=%s" if tenant_id is not None else ""
+                    )
+                    eligibility_values: list[Any] = [runtime.fingerprint]
+                    if tenant_id is not None:
+                        eligibility_values.append(tenant_id)
+                    eligibility_values.extend(
+                        (
+                            watermark["last_tenant_id"],
+                            watermark["last_source_id"],
+                            watermark["last_chunk_id"],
+                            window_end["tenant_id"],
+                            window_end["source_id"],
+                            window_end["chunk_id"],
+                        )
+                    )
+                    rows = connection.execute(
+                        f"""SELECT chunk.tenant_id,chunk.source_id,chunk.chunk_id,
+                                  chunk.text_redacted,chunk.text_sha256
+                           FROM canonical_chunks chunk
+                           JOIN canonical_documents document
+                             USING(tenant_id,source_id,document_id)
+                           LEFT JOIN canonical_chunk_embeddings embedding
+                             ON embedding.tenant_id=chunk.tenant_id
+                            AND embedding.source_id=chunk.source_id
+                            AND embedding.chunk_id=chunk.chunk_id
+                            AND embedding.runtime_fingerprint=%s
+                           WHERE chunk.deleted_at IS NULL
+                             AND document.is_current
+                             AND document.deleted_at IS NULL
+                             AND embedding.chunk_id IS NULL
+                             {eligibility_scope_clause}
+                             AND (chunk.tenant_id,chunk.source_id,chunk.chunk_id)
+                                 > (%s,%s,%s)
+                             AND (chunk.tenant_id,chunk.source_id,chunk.chunk_id)
+                                 <= (%s,%s,%s)
+                           ORDER BY chunk.tenant_id,chunk.source_id,chunk.chunk_id
+                        """,
+                        tuple(eligibility_values),
+                    ).fetchall()
+                    connection.commit()
+                    selected_seconds = time.monotonic() - select_started
+                    if not rows:
+                        with connection.transaction():
+                            connection.execute(
+                                """UPDATE canonical_embedding_projection_watermarks
+                                   SET last_tenant_id=%s,last_source_id=%s,
+                                       last_chunk_id=%s,updated_at=now()
+                                   WHERE runtime_fingerprint=%s
+                                     AND tenant_scope=%s""",
+                                (
+                                    window_end["tenant_id"],
+                                    window_end["source_id"],
+                                    window_end["chunk_id"],
+                                    runtime.fingerprint,
+                                    tenant_scope,
+                                ),
+                            )
+                        batches += 1
+                        LOG.info(
+                            "canonical embedding batch scanned=%s eligible=0 "
+                            "select_ms=%s embed_ms=0 persist_ms=0",
+                            len(window),
+                            round(selected_seconds * 1000),
+                        )
+                        continue
                     embedding_started = time.monotonic()
                     vectors = runtime.embed_documents(
                         [row["text_redacted"] for row in rows]
                     )
                     embedded_seconds = time.monotonic() - embedding_started
                     persistence_started = time.monotonic()
-                    last = rows[-1]
                     with connection.transaction():
                         with connection.cursor() as cursor:
                             cursor.executemany(
@@ -263,9 +322,9 @@ class CanonicalRetrieval:
                                    WHERE runtime_fingerprint=%s
                                      AND tenant_scope=%s""",
                                 (
-                                    last["tenant_id"],
-                                    last["source_id"],
-                                    last["chunk_id"],
+                                    window_end["tenant_id"],
+                                    window_end["source_id"],
+                                    window_end["chunk_id"],
                                     runtime.fingerprint,
                                     tenant_scope,
                                 ),
@@ -274,8 +333,9 @@ class CanonicalRetrieval:
                     processed += len(rows)
                     batches += 1
                     LOG.info(
-                        "canonical embedding batch rows=%s select_ms=%s "
-                        "embed_ms=%s persist_ms=%s",
+                        "canonical embedding batch scanned=%s eligible=%s "
+                        "select_ms=%s embed_ms=%s persist_ms=%s",
+                        len(window),
                         len(rows),
                         round(selected_seconds * 1000),
                         round(embedded_seconds * 1000),

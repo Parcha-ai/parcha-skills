@@ -66,7 +66,7 @@ class EmbeddingWorkerTests(TestCase):
                             "last_chunk_id": "",
                         }
                     )
-                if "FROM canonical_chunks chunk" in sql:
+                if "FROM canonical_chunks" in sql:
                     self.batch_limit = values[-1]
                 return EmptyResult()
 
@@ -96,6 +96,91 @@ class EmbeddingWorkerTests(TestCase):
         self.assertEqual(store.connection.batch_limit, 5000)
         with self.assertRaisesRegex(ValueError, "invalid canonical embedding batch"):
             retrieval.embed_pending(batch_size=5001, max_batches=1)
+
+    def test_canonical_retrieval_advances_over_an_ineligible_key_window(
+        self,
+    ) -> None:
+        class EmptyResult:
+            @staticmethod
+            def fetchall() -> list:
+                return []
+
+            @staticmethod
+            def fetchone() -> dict:
+                return {"value": True}
+
+        class Connection:
+            def __init__(self) -> None:
+                self.eligibility_sql = ""
+                self.watermark_update = None
+
+            def execute(self, sql, values):
+                if "FROM canonical_chunk_embeddings" in sql:
+                    return SimpleNamespace(fetchone=lambda: None)
+                if "FROM canonical_embedding_projection_watermarks" in sql:
+                    return SimpleNamespace(
+                        fetchone=lambda: {
+                            "last_tenant_id": "",
+                            "last_source_id": "",
+                            "last_chunk_id": "",
+                        }
+                    )
+                if (
+                    "FROM canonical_chunks" in sql
+                    and "JOIN canonical_documents" not in sql
+                ):
+                    return SimpleNamespace(
+                        fetchall=lambda: [
+                            {
+                                "tenant_id": "tenant:company:example",
+                                "source_id": "source:one",
+                                "chunk_id": "chunk:one",
+                            }
+                        ]
+                    )
+                if "JOIN canonical_documents" in sql:
+                    self.eligibility_sql = sql
+                    return SimpleNamespace(fetchall=lambda: [])
+                if (
+                    "UPDATE canonical_embedding_projection_watermarks" in sql
+                    and values[0] == "tenant:company:example"
+                ):
+                    self.watermark_update = values
+                return EmptyResult()
+
+            @staticmethod
+            def commit() -> None:
+                pass
+
+            @staticmethod
+            @contextmanager
+            def transaction():
+                yield
+
+        class Store:
+            semantic_runtime = SimpleNamespace(
+                dimensions=512,
+                fingerprint="synthetic-fingerprint",
+            )
+
+            def __init__(self) -> None:
+                self.connection = Connection()
+
+            @contextmanager
+            def connect(self):
+                yield self.connection
+
+        store = Store()
+        retrieval = CanonicalRetrieval(store)  # type: ignore[arg-type]
+
+        result = retrieval.embed_pending(batch_size=2000, max_batches=1)
+
+        self.assertEqual(result, {"status": "complete", "processed": 0, "batches": 1})
+        self.assertIn("<= (%s,%s,%s)", store.connection.eligibility_sql)
+        self.assertEqual(
+            store.connection.watermark_update[:3],
+            ("tenant:company:example", "source:one", "chunk:one"),
+        )
 
     def test_canonical_ingest_does_not_call_the_embedding_provider(self) -> None:
         source = inspect.getsource(Handler.do_POST)
