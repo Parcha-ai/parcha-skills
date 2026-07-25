@@ -708,12 +708,23 @@ class RecallEngineTest(unittest.TestCase):
         self.assertIn("Please inspect", shown)
         doctor = self.cli("doctor")
         self.assertIn("OK FTS5 available", doctor)
+        self.assertIn("mode=local", doctor)
 
     def test_doctor_missing_db_is_read_only(self):
         self.assertFalse(self.db.exists())
         doctor = self.cli("doctor")
         self.assertIn("WARN db exists=False", doctor)
         self.assertFalse(self.db.exists())
+
+    def test_search_without_index_suggests_raw_transcript_scan(self):
+        self.assertFalse(self.db.exists())
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = engine.main(["search", "anything"])
+        self.assertEqual(code, 0)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn("scanning transcripts directly", err.getvalue())
+        self.assertIn("rg -l -i", err.getvalue())
 
 
 class RemoteHandler(BaseHTTPRequestHandler):

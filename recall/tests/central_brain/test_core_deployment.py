@@ -355,7 +355,11 @@ class ContainerContractTest(unittest.TestCase):
         self.assertIn("file: recall/Dockerfile", workflow)
         self.assertIn("push: true", workflow)
         self.assertIn(
-            "ghcr.io/${{ github.repository_owner }}/recall-core:${{ github.sha }}",
+            'echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/recall-core"',
+            workflow,
+        )
+        self.assertIn(
+            "tags: ${{ steps.image.outputs.name }}:${{ github.sha }}",
             workflow,
         )
         self.assertNotIn("context: .", workflow)
