@@ -104,6 +104,19 @@ def fixtures() -> tuple[dict, dict, dict, list[dict], dict]:
 
 
 class AgentContractTest(unittest.TestCase):
+    def test_cancelled_run_is_terminal_content_free_and_has_no_result(self) -> None:
+        _, _, run, _, _ = fixtures()
+        run["status"] = "cancelled"
+        run["error_code"] = "cancelled_by_caller"
+        validate_agent_contract(run, expected="recall.agent-run.v1")
+        unfinished = copy.deepcopy(run)
+        unfinished.pop("completed_at")
+        with self.assertRaisesRegex(ContractError, "completion time"):
+            validate_agent_contract(
+                unfinished,
+                expected="recall.agent-run.v1",
+            )
+
     def test_catalog_is_closed_and_matches_runtime(self) -> None:
         catalog = json.loads(CATALOG.read_text())
         names = {

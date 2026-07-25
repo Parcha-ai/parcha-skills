@@ -376,6 +376,10 @@ MCP_POLICY: dict[str, Rule] = {
     "mcp.ping": Rule(frozenset({"read"}), READ_ROLES, REMOTE_PRINCIPALS),
     "mcp.tools.list": Rule(frozenset({"read"}), READ_ROLES, REMOTE_PRINCIPALS),
     "mcp.use_recall": Rule(frozenset({"read"}), READ_ROLES, REMOTE_PRINCIPALS),
+    "mcp.recall_agent_start": Rule(frozenset({"read"}), READ_ROLES, REMOTE_PRINCIPALS),
+    "mcp.recall_agent_status": Rule(frozenset({"read"}), READ_ROLES, REMOTE_PRINCIPALS),
+    "mcp.recall_agent_result": Rule(frozenset({"read"}), READ_ROLES, REMOTE_PRINCIPALS),
+    "mcp.recall_agent_cancel": Rule(frozenset({"read"}), READ_ROLES, REMOTE_PRINCIPALS),
     "mcp.recall_search": Rule(frozenset({"read"}), READ_ROLES, REMOTE_PRINCIPALS),
     "mcp.recall_deep_search": Rule(frozenset({"read"}), READ_ROLES, REMOTE_PRINCIPALS),
     "mcp.recall_investigate": Rule(frozenset({"read"}), READ_ROLES, REMOTE_PRINCIPALS),
@@ -414,6 +418,10 @@ def allowed_tools(principal: dict[str, Any]) -> frozenset[str]:
         tool
         for tool in (
             "use_recall",
+            "recall_agent_start",
+            "recall_agent_status",
+            "recall_agent_result",
+            "recall_agent_cancel",
             "recall_search",
             "recall_deep_search",
             "recall_investigate",

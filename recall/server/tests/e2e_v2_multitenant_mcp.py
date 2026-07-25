@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import http.client
 import json
+import multiprocessing
 import os
 import sys
 import tempfile
@@ -19,7 +20,17 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path[:0] = [str(ROOT / "recall"), str(ROOT / "recall/server")]
 
 from client.mac import canonical_envelope
-from recall_server.agent import RecallAgentService, ScriptedAgentRunner
+from recall_server.agent import (
+    DelegationContext,
+    RecallAgentService,
+    ScriptedAgentRunner,
+)
+from recall_server.agent_runs import (
+    AgentRunCoordinator,
+    AgentRunNotFound,
+    AgentRunUnavailable,
+    PostgresAgentRunBackend,
+)
 from recall_server.app import Handler
 from recall_server.authorization import VerifiedExternalIdentity
 from recall_server.archive import FilesystemArchiveStore
@@ -45,6 +56,35 @@ COMPANY_LATE_SOURCE = "source:company:late:e2e"
 OUTSIDER_SOURCE = "source:company:outsider:e2e"
 OCCURRED = "2026-07-20T07:00:00Z"
 RESOURCE = "https://recall.synthetic.invalid/mcp"
+
+
+def crash_agent_worker(
+    database_url: str,
+    principal: dict,
+    run_id: str,
+) -> None:
+    child_store = BrainStore(database_url)
+    child_backend = PostgresAgentRunBackend(
+        child_store.connect,
+        lease_seconds=15,
+        retention_seconds=3600,
+    )
+    context = DelegationContext.from_principal(principal)
+    claimed = child_backend.claim(
+        context,
+        run_id,
+        lease_owner="synthetic-crashed-worker",
+        now=datetime.now(timezone.utc),
+    )
+    if claimed is None:
+        os._exit(91)
+    with child_store.connect() as connection:
+        connection.execute(
+            """INSERT INTO agent_run_effects_e2e(run_id,effect)
+               VALUES (%s,'canonical_retrieval_started')""",
+            (run_id,),
+        )
+    os._exit(17)
 
 
 class FakeSemanticRuntime:
@@ -120,6 +160,34 @@ def rpc(
     return payload
 
 
+def raw_mcp_message(
+    server: ThreadingHTTPServer,
+    token: str,
+    payload: dict,
+    *,
+    path: str,
+    task_name: str | None = None,
+) -> tuple[int, dict]:
+    body = json.dumps(payload).encode()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+        "Content-Length": str(len(body)),
+        "MCP-Protocol-Version": "2026-06-30",
+    }
+    if task_name is not None:
+        headers["Mcp-Name"] = task_name
+    connection = http.client.HTTPConnection(
+        "127.0.0.1", server.server_port, timeout=10
+    )
+    connection.request("POST", path, body=body, headers=headers)
+    response = connection.getresponse()
+    result = json.loads(response.read())
+    connection.close()
+    return response.status, result
+
+
 def agent_http(
     server: ThreadingHTTPServer,
     token: str,
@@ -140,6 +208,30 @@ def agent_http(
             "Content-Length": str(len(body)),
         },
     )
+    response = connection.getresponse()
+    payload = json.loads(response.read())
+    connection.close()
+    return response.status, payload
+
+
+def agent_lifecycle_http(
+    server: ThreadingHTTPServer,
+    token: str,
+    method: str,
+    path: str,
+    body: dict | None = None,
+) -> tuple[int, dict]:
+    encoded = json.dumps(body).encode() if body is not None else None
+    headers = {"Authorization": f"Bearer {token}"}
+    if encoded is not None:
+        headers.update({
+            "Content-Type": "application/json",
+            "Content-Length": str(len(encoded)),
+        })
+    connection = http.client.HTTPConnection(
+        "127.0.0.1", server.server_port, timeout=10
+    )
+    connection.request(method, path, body=encoded, headers=headers)
     response = connection.getresponse()
     payload = json.loads(response.read())
     connection.close()
@@ -570,6 +662,18 @@ def main() -> None:
             clock=lambda: fixed_agent_time,
             monotonic=lambda: 10.0,
         )
+        agent_backend = PostgresAgentRunBackend(
+            store.connect,
+            max_active_per_principal=8,
+            lease_seconds=15,
+            retention_seconds=3600,
+        )
+        Handler.agent_coordinator = AgentRunCoordinator(
+            Handler.agent_service,
+            agent_backend,
+            workers=1,
+            abandon_after_seconds=15,
+        )
         Handler.control_plane = control
         Handler.external_identity_verifier = SyntheticExternalVerifier()
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -713,6 +817,349 @@ def main() -> None:
             )
             assert denied_agent_status == 401
             assert denied_agent == {"error": "unauthorized"}
+
+            detached_request = {
+                **agent_request,
+                "request_id": "req_abcdef0123456789",
+                "idempotency_key": "synthetic-company-agent-detached",
+            }
+            detached_path = f"/v1/agent/brains/{COMPANY}/runs"
+            detached_status, detached = agent_lifecycle_http(
+                server,
+                company_token["token"],
+                "POST",
+                detached_path,
+                detached_request,
+            )
+            assert detached_status == 202
+            detached_run_id = detached["run"]["run_id"]
+            for _attempt in range(100):
+                status_code, detached_state = agent_lifecycle_http(
+                    server,
+                    company_token["token"],
+                    "GET",
+                    f"{detached_path}/{detached_run_id}",
+                )
+                assert status_code == 200
+                if detached_state["run"]["status"] not in {"queued", "running"}:
+                    break
+                time.sleep(0.01)
+            assert detached_state["run"]["status"] == "partial"
+            result_code, detached_result = agent_lifecycle_http(
+                server,
+                company_token["token"],
+                "GET",
+                f"{detached_path}/{detached_run_id}/result",
+            )
+            assert result_code == 200
+            assert detached_result["result"]["citations"]
+            replay_code, detached_replay = agent_lifecycle_http(
+                server,
+                company_token["token"],
+                "POST",
+                detached_path,
+                detached_request,
+            )
+            assert replay_code == 202
+            assert detached_replay["run"]["run_id"] == detached_run_id
+            denied_status_code, _denied_status = agent_lifecycle_http(
+                server,
+                personal_token["token"],
+                "GET",
+                f"{detached_path}/{detached_run_id}",
+            )
+            assert denied_status_code == 401
+
+            mcp_detached_request = {
+                **agent_request,
+                "request_id": "req_fedcba9876543210",
+                "idempotency_key": "synthetic-company-agent-mcp-detached",
+            }
+            mcp_started = rpc(
+                server,
+                company_token["token"],
+                "recall_agent_start",
+                mcp_detached_request,
+                path=f"/mcp/brains/{COMPANY}",
+            )["result"]["structuredContent"]
+            mcp_run_id = mcp_started["run"]["run_id"]
+            for _attempt in range(100):
+                mcp_state = rpc(
+                    server,
+                    company_token["token"],
+                    "recall_agent_status",
+                    {"run_id": mcp_run_id},
+                    path=f"/mcp/brains/{COMPANY}",
+                )["result"]["structuredContent"]
+                if mcp_state["run"]["status"] not in {"queued", "running"}:
+                    break
+                time.sleep(0.01)
+            assert mcp_state["run"]["status"] == "partial"
+            mcp_result = rpc(
+                server,
+                company_token["token"],
+                "recall_agent_result",
+                {"run_id": mcp_run_id},
+                path=f"/mcp/brains/{COMPANY}",
+            )["result"]["structuredContent"]
+            assert mcp_result["result"]["citations"]
+
+            native_request = {
+                **agent_request,
+                "request_id": "req_9999999999999999",
+                "idempotency_key": "synthetic-company-agent-native-task",
+            }
+            native_status, native_created = raw_mcp_message(
+                server,
+                company_token["token"],
+                {
+                    "jsonrpc": "2.0",
+                    "id": 9,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "use_recall",
+                        "arguments": native_request,
+                        "_meta": {
+                            "io.modelcontextprotocol/clientCapabilities": {
+                                "extensions": {
+                                    "io.modelcontextprotocol/tasks": {},
+                                },
+                            },
+                        },
+                    },
+                },
+                path=f"/mcp/brains/{COMPANY}",
+            )
+            assert native_status == 200
+            assert native_created["result"]["resultType"] == "task"
+            native_task_id = native_created["result"]["taskId"]
+            for _attempt in range(100):
+                native_get_status, native_state = raw_mcp_message(
+                    server,
+                    company_token["token"],
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 10,
+                        "method": "tasks/get",
+                        "params": {"taskId": native_task_id},
+                    },
+                    path=f"/mcp/brains/{COMPANY}",
+                    task_name=native_task_id,
+                )
+                assert native_get_status == 200
+                if native_state["result"]["status"] != "working":
+                    break
+                time.sleep(0.01)
+            assert native_state["result"]["status"] == "completed"
+            assert native_state["result"]["result"]["structuredContent"][
+                "result"
+            ]["citations"]
+
+            hold = threading.Event()
+            Handler.agent_coordinator._executor.submit(hold.wait)
+            cancel_http_request = {
+                **agent_request,
+                "request_id": "req_1111111111111111",
+                "idempotency_key": "synthetic-company-agent-http-cancel",
+            }
+            cancel_mcp_request = {
+                **agent_request,
+                "request_id": "req_2222222222222222",
+                "idempotency_key": "synthetic-company-agent-mcp-cancel",
+            }
+            _, cancel_http_started = agent_lifecycle_http(
+                server,
+                company_token["token"],
+                "POST",
+                detached_path,
+                cancel_http_request,
+            )
+            cancel_http_run = cancel_http_started["run"]["run_id"]
+            cancel_http_code, cancel_http = agent_lifecycle_http(
+                server,
+                company_token["token"],
+                "POST",
+                f"{detached_path}/{cancel_http_run}/cancel",
+                {},
+            )
+            assert cancel_http_code == 200
+            assert cancel_http["run"]["status"] == "cancelled"
+            cancel_mcp_started = rpc(
+                server,
+                company_token["token"],
+                "recall_agent_start",
+                cancel_mcp_request,
+                path=f"/mcp/brains/{COMPANY}",
+            )["result"]["structuredContent"]
+            cancel_mcp = rpc(
+                server,
+                company_token["token"],
+                "recall_agent_cancel",
+                {"run_id": cancel_mcp_started["run"]["run_id"]},
+                path=f"/mcp/brains/{COMPANY}",
+            )["result"]["structuredContent"]
+            assert cancel_mcp["run"]["status"] == "cancelled"
+            hold.set()
+
+            with store.connect() as connection:
+                durable_runs = connection.execute(
+                    "SELECT count(*) AS value FROM agent_runs WHERE tenant_id=%s",
+                    (COMPANY,),
+                ).fetchone()["value"]
+                stored_traces = connection.execute(
+                    """SELECT trace_events::text AS value
+                         FROM agent_runs WHERE tenant_id=%s""",
+                    (COMPANY,),
+                ).fetchall()
+                agent_columns = {
+                    row["column_name"]
+                    for row in connection.execute(
+                        """SELECT column_name
+                             FROM information_schema.columns
+                            WHERE table_schema='public'
+                              AND table_name='agent_runs'"""
+                    ).fetchall()
+                }
+            assert durable_runs == 6
+            assert "question" not in agent_columns
+            assert "credential" not in agent_columns
+            for row in stored_traces:
+                rendered_trace = row["value"]
+                assert agent_request["question"] not in rendered_trace
+                for forbidden in ('"prompt"', '"answer"', '"payload"', '"token"'):
+                    assert forbidden not in rendered_trace
+
+            company_principal = store.authenticate_bearer(
+                company_token["token"],
+                "read",
+            )
+            assert company_principal is not None
+            company_principal["authorized_sources"] = (
+                store.authorized_canonical_source_ids(
+                    company_principal["tenant_id"],
+                    company_principal["principal_id"],
+                )
+            )
+            crash_context = DelegationContext.from_principal(company_principal)
+            crash_request = {
+                **agent_request,
+                "request_id": "req_3333333333333333",
+                "idempotency_key": "synthetic-company-agent-worker-crash",
+            }
+            with store.connect() as connection:
+                connection.execute(
+                    """CREATE UNLOGGED TABLE IF NOT EXISTS agent_run_effects_e2e(
+                           run_id text NOT NULL,
+                           effect text NOT NULL
+                       )"""
+                )
+                connection.execute("TRUNCATE agent_run_effects_e2e")
+            crash_created = agent_backend.create(
+                crash_context,
+                crash_request,
+                now=datetime.now(timezone.utc),
+            )
+            process = multiprocessing.get_context("spawn").Process(
+                target=crash_agent_worker,
+                args=(
+                    os.environ["RECALL_DATABASE_URL"],
+                    company_principal,
+                    crash_created.run["run_id"],
+                ),
+            )
+            process.start()
+            process.join(timeout=10)
+            assert process.exitcode == 17
+            with store.connect() as connection:
+                connection.execute(
+                    """UPDATE agent_runs
+                          SET lease_expires_at=now()-interval '1 second'
+                        WHERE tenant_id=%s AND run_id=%s""",
+                    (COMPANY, crash_created.run["run_id"]),
+                )
+            recovered_runs = agent_backend.recover_abandoned(
+                before=datetime.now(timezone.utc),
+                now=datetime.now(timezone.utc),
+            )
+            assert recovered_runs == 1
+            crash_replay = agent_backend.create(
+                crash_context,
+                crash_request,
+                now=datetime.now(timezone.utc),
+            )
+            assert not crash_replay.created
+            assert crash_replay.run["status"] == "failed"
+            assert crash_replay.run["error_code"] == "worker_lost_retryable"
+            with store.connect() as connection:
+                crash_effects = connection.execute(
+                    """SELECT count(*) AS value
+                         FROM agent_run_effects_e2e
+                        WHERE run_id=%s""",
+                    (crash_created.run["run_id"],),
+                ).fetchone()["value"]
+            assert crash_effects == 1
+            other_principal = {
+                **company_principal,
+                "principal_id": "principal:synthetic:other",
+            }
+            try:
+                agent_backend.get(
+                    DelegationContext.from_principal(other_principal),
+                    crash_created.run["run_id"],
+                    now=datetime.now(timezone.utc),
+                )
+                raise AssertionError("cross-principal agent run was visible")
+            except AgentRunNotFound:
+                pass
+
+            bounded_backend = PostgresAgentRunBackend(
+                store.connect,
+                max_active_per_principal=1,
+                lease_seconds=15,
+                retention_seconds=3600,
+            )
+            bounded_request = {
+                **agent_request,
+                "request_id": "req_4444444444444444",
+                "idempotency_key": "synthetic-company-agent-bound-one",
+            }
+            bounded = bounded_backend.create(
+                crash_context,
+                bounded_request,
+                now=datetime.now(timezone.utc),
+            )
+            try:
+                bounded_backend.create(
+                    crash_context,
+                    {
+                        **agent_request,
+                        "request_id": "req_5555555555555555",
+                        "idempotency_key": "synthetic-company-agent-bound-two",
+                    },
+                    now=datetime.now(timezone.utc),
+                )
+                raise AssertionError("agent concurrency bound was bypassed")
+            except AgentRunUnavailable:
+                pass
+            bounded_backend.cancel(
+                crash_context,
+                bounded.run["run_id"],
+                now=datetime.now(timezone.utc),
+            )
+
+            with store.connect() as connection:
+                connection.execute(
+                    """UPDATE agent_runs
+                          SET completed_at=now()-interval '2 hours'
+                        WHERE tenant_id=%s AND run_id=%s""",
+                    (COMPANY, crash_created.run["run_id"]),
+                )
+            pruned_runs = agent_backend.prune(
+                before=datetime.now(timezone.utc) - timedelta(hours=1),
+            )
+            assert pruned_runs == 1
+            with store.connect() as connection:
+                connection.execute("DROP TABLE agent_run_effects_e2e")
 
             deep = rpc(
                 server,
@@ -1168,6 +1615,9 @@ def main() -> None:
             Handler.external_identity_verifier = None
             Handler.control_plane = None
             Handler.agent_service = None
+            if Handler.agent_coordinator is not None:
+                Handler.agent_coordinator.close()
+            Handler.agent_coordinator = None
             for name, value in previous.items():
                 if value is None:
                     os.environ.pop(name, None)
@@ -1213,6 +1663,18 @@ def main() -> None:
                 "agent_exact_receipts": len(agent_receipts),
                 "agent_cross_brain_accepts": 0,
                 "agent_trace_content_leaks": 0,
+                "agent_stored_question_columns": 0,
+                "agent_durable_runs": durable_runs,
+                "agent_idempotent_replays": 1,
+                "agent_http_lifecycle": 1.0,
+                "agent_mcp_lifecycle": 1.0,
+                "agent_native_task_lifecycle": 1.0,
+                "agent_cancellations": 2,
+                "agent_worker_loss_recovered": recovered_runs,
+                "agent_worker_loss_duplicate_effects": crash_effects - 1,
+                "agent_cross_principal_run_hits": 0,
+                "agent_concurrency_overflows": 0,
+                "agent_pruned_runs": pruned_runs,
                 "deep_search_tool_calls": 1,
                 "deep_search_provider": deep["coverage"]["provider"],
                 "deep_search_files": deep["coverage"]["files_scanned"],

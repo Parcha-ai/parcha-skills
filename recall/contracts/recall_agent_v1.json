@@ -59,7 +59,7 @@
         "tenant_id": {"$ref": "#/$defs/identity"},
         "principal_id": {"$ref": "#/$defs/identity"},
         "trace_id": {"$ref": "#/$defs/opaque_id"},
-        "status": {"enum": ["queued", "running", "complete", "partial", "no_answer", "failed"]},
+        "status": {"enum": ["queued", "running", "complete", "partial", "no_answer", "failed", "cancelled"]},
         "attempt": {"type": "integer", "minimum": 1, "maximum": 100},
         "created_at": {"type": "string", "format": "date-time"},
         "updated_at": {"type": "string", "format": "date-time"},
