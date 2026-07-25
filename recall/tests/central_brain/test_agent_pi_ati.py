@@ -20,6 +20,7 @@ from recall_server.agent import (  # noqa: E402
     service_from_env,
 )
 from recall_server.agent_pi_ati import (  # noqa: E402
+    MODEL_PROXY_PLACEHOLDER_KEY,
     PiAtiRunner,
     SubprocessBrainTurnTransport,
     VirtualKey,
@@ -427,6 +428,59 @@ class PiAtiGroundingTest(unittest.TestCase):
 
 
 class PiAtiSubprocessBoundaryTest(unittest.TestCase):
+    def test_credentialless_broker_passes_only_non_secret_placeholder(self):
+        child = r"""
+import json,os,sys
+assert os.environ["LITELLM_API_KEY"]=="not-a-secret"
+assert os.environ["LITELLM_BASE_URL"]=="http://10.255.252.1:9420"
+start=json.loads(sys.stdin.readline())
+print(json.dumps({"v":"ati.brain.turn.v1","turn_id":start["turn_id"],"seq":0,"type":"terminal.complete","at":"2026-07-25T10:00:00Z","data":{"status":"complete","unresolved_call_ids":[],"model_attestation":{"model_alias":"gemma-4-31b","thinking":"low","router_identity":"10.255.252.1","credential_kind":"greppy_llm_proxy"}}}),flush=True)
+"""
+        transport = SubprocessBrainTurnTransport(
+            (sys.executable, "-c", child),
+            litellm_base_url="http://10.255.252.1:9420",
+            credentialless_broker=True,
+            expected_router_identity="10.255.252.1",
+            environment={"PATH": os.environ["PATH"], "FORBIDDEN_SECRET": "no"},
+        )
+        outcome = transport.run(
+            {
+                "turn_id": "turn_broker",
+                "data": {"model": {"alias": "gemma-4-31b"}},
+            },
+            lambda *_args: {},
+            timeout_seconds=3,
+        )
+        self.assertEqual(
+            outcome["terminal"]["model_attestation"]["router_identity"],
+            "10.255.252.1",
+        )
+        self.assertTrue(transport.credentialless_broker)
+        self.assertNotIn("FORBIDDEN_SECRET", transport.child_environment)
+        self.assertEqual(MODEL_PROXY_PLACEHOLDER_KEY, "not-a-secret")
+
+    def test_credentialless_broker_rejects_public_url_and_key_sources(self):
+        with self.assertRaisesRegex(RuntimeError, "must be private"):
+            SubprocessBrainTurnTransport(
+                (sys.executable, "-c", "pass"),
+                litellm_base_url="https://litellm.example",
+                credentialless_broker=True,
+                expected_router_identity="litellm.example",
+            )
+        with self.assertRaisesRegex(RuntimeError, "credential mode"):
+            SubprocessBrainTurnTransport(
+                (sys.executable, "-c", "pass"),
+                litellm_base_url="http://10.255.252.1:9420",
+                virtual_key=VirtualKey(
+                    value="synthetic-virtual-key-value",
+                    scope="recall-agent",
+                    expires_at=datetime.now(timezone.utc)
+                    + timedelta(minutes=10),
+                ),
+                credentialless_broker=True,
+                expected_router_identity="10.255.252.1",
+            )
+
     def test_bidirectional_ndjson_transport_and_attestation(self):
         child = r"""
 import json,os,sys
@@ -576,7 +630,7 @@ time.sleep(2)
             )
         self.assertEqual(caught.exception.code, "agent_model_timeout")
 
-    def test_configuration_requires_approved_url_and_private_scoped_key(self):
+    def test_configuration_requires_approved_url_and_explicit_credentials(self):
         with tempfile.TemporaryDirectory() as directory:
             key_path = Path(directory) / "key.json"
             key_path.write_text(json.dumps({
@@ -641,6 +695,26 @@ time.sleep(2)
             key_path.chmod(0o644)
             with self.assertRaisesRegex(RuntimeError, "not private"):
                 service_from_env(environment)
+
+            broker_environment = {
+                **environment,
+                "RECALL_LITELLM_CREDENTIAL_MODE": "credentialless-broker",
+                "RECALL_LITELLM_BASE_URL": "http://10.255.252.1:9420",
+                "RECALL_LITELLM_APPROVED_URL": "http://10.255.252.1:9420",
+            }
+            broker_environment.pop("RECALL_LITELLM_VIRTUAL_KEY_FILE")
+            self.assertIsInstance(
+                service_from_env(broker_environment).runner,
+                PiAtiRunner,
+            )
+            broker_environment["RECALL_LITELLM_BASE_URL"] = (
+                "https://litellm.example"
+            )
+            broker_environment["RECALL_LITELLM_APPROVED_URL"] = (
+                "https://litellm.example"
+            )
+            with self.assertRaisesRegex(RuntimeError, "must be private"):
+                service_from_env(broker_environment)
 
 
 if __name__ == "__main__":

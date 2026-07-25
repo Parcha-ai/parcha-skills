@@ -2,12 +2,14 @@
 
 Recall owns authorization, evidence access, Archil credentials, and the final
 grounding decision. The child owns semantic planning only and receives a
-short-lived LiteLLM virtual key plus a closed native-tool catalog.
+closed native-tool catalog plus either a short-lived LiteLLM virtual key or
+the non-secret placeholder for a private credential-owning broker.
 """
 
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import select
@@ -53,6 +55,7 @@ SAFE_CHILD_ENV = (
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
 )
+MODEL_PROXY_PLACEHOLDER_KEY = "not-a-secret"
 
 
 class BrainTurnTransport(Protocol):
@@ -137,6 +140,7 @@ class SubprocessBrainTurnTransport:
         litellm_base_url: str,
         virtual_key: VirtualKey | None = None,
         virtual_key_file: str | None = None,
+        credentialless_broker: bool = False,
         expected_router_identity: str,
         artifact_path: str | None = None,
         expected_artifact_sha256: str | None = None,
@@ -144,24 +148,67 @@ class SubprocessBrainTurnTransport:
         environment: dict[str, str] | None = None,
     ):
         parsed = urlsplit(litellm_base_url)
-        if (
-            parsed.scheme != "https"
-            or not parsed.hostname
-            or parsed.username
-            or parsed.password
-            or parsed.query
-            or parsed.fragment
-        ):
+        clean_url = (
+            parsed.scheme in {"http", "https"}
+            and bool(parsed.hostname)
+            and not parsed.username
+            and not parsed.password
+            and not parsed.query
+            and not parsed.fragment
+        )
+        if not clean_url:
             raise RuntimeError("Recall agent LiteLLM URL is invalid")
+        if credentialless_broker:
+            try:
+                address = ipaddress.ip_address(parsed.hostname)
+                private_broker = (
+                    address.is_loopback
+                    or address.is_link_local
+                    or (
+                        isinstance(address, ipaddress.IPv4Address)
+                        and any(
+                            address in network
+                            for network in (
+                                ipaddress.ip_network("10.0.0.0/8"),
+                                ipaddress.ip_network("100.64.0.0/10"),
+                                ipaddress.ip_network("172.16.0.0/12"),
+                                ipaddress.ip_network("192.168.0.0/16"),
+                            )
+                        )
+                    )
+                    or (
+                        isinstance(address, ipaddress.IPv6Address)
+                        and address in ipaddress.ip_network("fc00::/7")
+                    )
+                )
+            except ValueError:
+                private_broker = parsed.hostname in {
+                    "localhost",
+                    "host.docker.internal",
+                }
+            if not private_broker:
+                raise RuntimeError(
+                    "Recall credentialless broker URL must be private"
+                )
+        elif parsed.scheme != "https":
+            raise RuntimeError(
+                "Recall virtual-key LiteLLM URL must use HTTPS"
+            )
         if (
             not command
             or any(not isinstance(part, str) or not part for part in command)
             or not 64_000 <= max_frame_bytes <= 1_000_000
         ):
             raise RuntimeError("Recall ATI process configuration is invalid")
-        if (virtual_key is None) == (virtual_key_file is None):
+        key_source_count = sum(
+            source is not None for source in (virtual_key, virtual_key_file)
+        )
+        if (
+            (credentialless_broker and key_source_count != 0)
+            or (not credentialless_broker and key_source_count != 1)
+        ):
             raise RuntimeError(
-                "Recall agent needs exactly one virtual-key source"
+                "Recall agent model credential mode is invalid"
             )
         if (artifact_path is None) != (expected_artifact_sha256 is None):
             raise RuntimeError("Recall ATI artifact pin is incomplete")
@@ -179,6 +226,7 @@ class SubprocessBrainTurnTransport:
         self.litellm_base_url = litellm_base_url.rstrip("/")
         self.virtual_key = virtual_key
         self.virtual_key_file = virtual_key_file
+        self.credentialless_broker = credentialless_broker
         self.expected_router_identity = expected_router_identity
         self.artifact_path = artifact_path
         self.expected_artifact_sha256 = expected_artifact_sha256
@@ -360,11 +408,15 @@ class SubprocessBrainTurnTransport:
     ) -> dict[str, Any]:
         turn_id = start["turn_id"]
         self._verify_artifact()
-        key = self._current_key()
+        api_key = (
+            MODEL_PROXY_PLACEHOLDER_KEY
+            if self.credentialless_broker
+            else self._current_key().value
+        )
         child_environment = {
             **self.child_environment,
             "LITELLM_BASE_URL": self.litellm_base_url,
-            "LITELLM_API_KEY": key.value,
+            "LITELLM_API_KEY": api_key,
             "GREP_DISABLE_STATUS_PUBLISH": "1",
         }
         # The operator-supplied command is a closed JSON argv array. It never
@@ -1135,11 +1187,30 @@ def runner_from_env(environment: dict[str, str]) -> PiAtiRunner:
         approved_url = environment["RECALL_LITELLM_APPROVED_URL"].rstrip("/")
         if base_url != approved_url:
             raise RuntimeError("Recall agent LiteLLM URL is not approved")
-        key_file = environment["RECALL_LITELLM_VIRTUAL_KEY_FILE"]
-        _load_virtual_key(
-            key_file,
-            now=datetime.now(timezone.utc),
+        credential_mode = environment.get(
+            "RECALL_LITELLM_CREDENTIAL_MODE",
+            "virtual-key",
         )
+        if credential_mode not in {"virtual-key", "credentialless-broker"}:
+            raise RuntimeError(
+                "Recall agent LiteLLM credential mode is invalid"
+            )
+        credentialless_broker = credential_mode == "credentialless-broker"
+        key_file = environment.get("RECALL_LITELLM_VIRTUAL_KEY_FILE")
+        if credentialless_broker:
+            if key_file:
+                raise RuntimeError(
+                    "Recall credentialless broker cannot receive a virtual key"
+                )
+        else:
+            if not key_file:
+                raise RuntimeError(
+                    "Recall virtual-key file is required"
+                )
+            _load_virtual_key(
+                key_file,
+                now=datetime.now(timezone.utc),
+            )
         expected_router = environment.get(
             "RECALL_LITELLM_ROUTER_IDENTITY",
             urlsplit(base_url).hostname or "",
@@ -1149,7 +1220,8 @@ def runner_from_env(environment: dict[str, str]) -> PiAtiRunner:
         transport = SubprocessBrainTurnTransport(
             command,
             litellm_base_url=base_url,
-            virtual_key_file=key_file,
+            virtual_key_file=key_file if not credentialless_broker else None,
+            credentialless_broker=credentialless_broker,
             expected_router_identity=expected_router,
             artifact_path=artifact_path,
             expected_artifact_sha256=artifact_sha256,
