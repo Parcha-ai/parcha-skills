@@ -98,9 +98,12 @@ def _load_virtual_key(path: str, *, now: datetime) -> VirtualKey:
             or set(value) != {"virtual_key", "scope", "expires_at"}
         ):
             raise RuntimeError("Recall agent virtual-key file is invalid")
-        expires = datetime.fromisoformat(
+        parsed_expiry = datetime.fromisoformat(
             value["expires_at"].replace("Z", "+00:00")
-        ).astimezone(timezone.utc)
+        )
+        if parsed_expiry.tzinfo is None:
+            raise RuntimeError("Recall agent virtual-key file is invalid")
+        expires = parsed_expiry.astimezone(timezone.utc)
         key = VirtualKey(
             value=value["virtual_key"],
             scope=value["scope"],

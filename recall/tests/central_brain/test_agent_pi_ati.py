@@ -546,6 +546,20 @@ print(json.dumps({"v":"ati.brain.turn.v1","turn_id":s["turn_id"],"seq":0,"type":
             with self.assertRaisesRegex(RuntimeError, "does not match"):
                 service_from_env(environment)
             environment["RECALL_ATI_ARTIFACT_SHA256"] = artifact_sha256
+            key_path.write_text(json.dumps({
+                "virtual_key": "synthetic-virtual-key-value",
+                "scope": "recall-agent",
+                "expires_at": "2026-07-25T16:30:00",
+            }))
+            with self.assertRaisesRegex(RuntimeError, "invalid"):
+                service_from_env(environment)
+            key_path.write_text(json.dumps({
+                "virtual_key": "synthetic-virtual-key-value",
+                "scope": "recall-agent",
+                "expires_at": (
+                    datetime.now(timezone.utc) + timedelta(minutes=10)
+                ).isoformat(),
+            }))
             key_path.chmod(0o644)
             with self.assertRaisesRegex(RuntimeError, "not private"):
                 service_from_env(environment)
