@@ -107,16 +107,20 @@ def build_archive_store(
         raise ValueError("S3 endpoint must match its AWS region")
     namespace_key = _namespace_key(configured["RECALL_ARCHIVE_NAMESPACE_KEY"])
 
+    client_options: dict[str, Any] = {}
     if client_factory is None:
         import boto3
+        from botocore.config import Config
 
         client_factory = boto3.client
+        client_options["config"] = Config(max_pool_connections=64)
     client = client_factory(
         service_name="s3",
         endpoint_url=endpoint_url,
         region_name=region,
         aws_access_key_id=configured["RECALL_ARCHIVE_ACCESS_KEY_ID"],
         aws_secret_access_key=configured["RECALL_ARCHIVE_SECRET_ACCESS_KEY"],
+        **client_options,
     )
     return S3ArchiveStore(
         bucket=configured["RECALL_ARCHIVE_BUCKET"],
@@ -139,18 +143,12 @@ def build_evidence_archive_store(
     """Build the separately credentialed, privacy-processed evidence bucket."""
     values = os.environ if environment is None else environment
     translated = {
-        "RECALL_ARCHIVE_BACKEND": _required(
-            values, "RECALL_EVIDENCE_ARCHIVE_BACKEND"
-        ),
-        "RECALL_ARCHIVE_BUCKET": _required(
-            values, "RECALL_EVIDENCE_ARCHIVE_BUCKET"
-        ),
+        "RECALL_ARCHIVE_BACKEND": _required(values, "RECALL_EVIDENCE_ARCHIVE_BACKEND"),
+        "RECALL_ARCHIVE_BUCKET": _required(values, "RECALL_EVIDENCE_ARCHIVE_BUCKET"),
         "RECALL_ARCHIVE_ENDPOINT_URL": _required(
             values, "RECALL_EVIDENCE_ARCHIVE_ENDPOINT_URL"
         ),
-        "RECALL_ARCHIVE_REGION": _required(
-            values, "RECALL_EVIDENCE_ARCHIVE_REGION"
-        ),
+        "RECALL_ARCHIVE_REGION": _required(values, "RECALL_EVIDENCE_ARCHIVE_REGION"),
         "RECALL_ARCHIVE_ACCESS_KEY_ID": _required(
             values, "RECALL_EVIDENCE_ARCHIVE_ACCESS_KEY_ID"
         ),
