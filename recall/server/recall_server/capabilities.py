@@ -27,6 +27,7 @@ WITH expected_tables(name) AS (
         ('raw_artifacts'), ('canonical_events'), ('canonical_documents'),
         ('canonical_chunks'), ('canonical_ingest_jobs'), ('receipt_redirects'),
         ('forget_tombstones'), ('canonical_audit_events'),
+        ('canonical_evidence_objects'),
         ('brain_organizations'), ('brain_spaces'), ('brain_memberships'),
         ('brain_access_grants'), ('canonical_source_grants'),
         ('mcp_credentials'), ('canonical_chunk_embeddings'),
@@ -57,13 +58,13 @@ SELECT
     role.rolbypassrls AS bypass_rls,
     pg_catalog.has_database_privilege(current_database(), 'CONNECT') AS can_connect,
     pg_catalog.has_schema_privilege(current_user, 'public', 'USAGE') AS can_use_schema,
-    (SELECT count(*) = 48 AND COALESCE(bool_and(
+    (SELECT count(*) = 49 AND COALESCE(bool_and(
         pg_catalog.to_regclass(pg_catalog.format('public.%I', name)) IS NOT NULL
         AND pg_catalog.has_table_privilege(
             current_user, pg_catalog.to_regclass(pg_catalog.format('public.%I', name)), 'SELECT'
         )
     ), false) FROM expected_tables) AS can_read_runtime_tables,
-    (SELECT count(*) = 47 AND COALESCE(bool_and(
+    (SELECT count(*) = 48 AND COALESCE(bool_and(
         pg_catalog.to_regclass(pg_catalog.format('public.%I', name)) IS NOT NULL
         AND pg_catalog.has_table_privilege(
             current_user, pg_catalog.to_regclass(pg_catalog.format('public.%I', name)),
