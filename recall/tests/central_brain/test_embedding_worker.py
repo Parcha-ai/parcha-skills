@@ -67,7 +67,7 @@ class EmbeddingWorkerTests(TestCase):
                         }
                     )
                 if "FROM canonical_chunks" in sql:
-                    self.batch_limit = values[-1]
+                    self.batch_limit = values[-2]
                 return EmptyResult()
 
             @staticmethod
@@ -111,7 +111,7 @@ class EmbeddingWorkerTests(TestCase):
 
         class Connection:
             def __init__(self) -> None:
-                self.eligibility_sql = ""
+                self.scan_sql = ""
                 self.watermark_update = None
 
             def execute(self, sql, values):
@@ -125,22 +125,20 @@ class EmbeddingWorkerTests(TestCase):
                             "last_chunk_id": "",
                         }
                     )
-                if (
-                    "FROM canonical_chunks" in sql
-                    and "JOIN canonical_documents" not in sql
-                ):
+                if "WITH scan_window AS MATERIALIZED" in sql:
+                    self.scan_sql = sql
                     return SimpleNamespace(
                         fetchall=lambda: [
                             {
                                 "tenant_id": "tenant:company:example",
                                 "source_id": "source:one",
                                 "chunk_id": "chunk:one",
+                                "text_redacted": "already embedded",
+                                "text_sha256": "content-sha",
+                                "eligible": False,
                             }
                         ]
                     )
-                if "JOIN canonical_documents" in sql:
-                    self.eligibility_sql = sql
-                    return SimpleNamespace(fetchall=lambda: [])
                 if (
                     "UPDATE canonical_embedding_projection_watermarks" in sql
                     and values[0] == "tenant:company:example"
@@ -176,7 +174,7 @@ class EmbeddingWorkerTests(TestCase):
         result = retrieval.embed_pending(batch_size=2000, max_batches=1)
 
         self.assertEqual(result, {"status": "complete", "processed": 0, "batches": 1})
-        self.assertIn("<= (%s,%s,%s)", store.connection.eligibility_sql)
+        self.assertIn("WITH scan_window AS MATERIALIZED", store.connection.scan_sql)
         self.assertEqual(
             store.connection.watermark_update[:3],
             ("tenant:company:example", "source:one", "chunk:one"),
