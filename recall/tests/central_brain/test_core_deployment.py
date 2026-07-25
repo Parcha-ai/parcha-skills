@@ -198,6 +198,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
             "receipt_redirects",
             "forget_tombstones",
             "canonical_audit_events",
+            "canonical_evidence_objects",
         ):
             self.assertIn(f"('{table}')", lowered)
         for provider in ("planetscale", "render", "supabase", "neon"):
