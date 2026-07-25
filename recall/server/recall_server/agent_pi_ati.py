@@ -7,8 +7,8 @@ short-lived LiteLLM virtual key plus a closed native-tool catalog.
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import os
 import select
 import signal
@@ -232,8 +232,13 @@ class SubprocessBrainTurnTransport:
             )
         return key
 
-    @staticmethod
-    def _write(process: subprocess.Popen[bytes], frame: dict[str, Any]) -> None:
+    def _write(
+        self,
+        process: subprocess.Popen[bytes],
+        frame: dict[str, Any],
+        *,
+        deadline: float,
+    ) -> None:
         if process.stdin is None:
             raise AgentExecutionError(
                 "ATI input stream is unavailable",
@@ -245,8 +250,106 @@ class SubprocessBrainTurnTransport:
             allow_nan=False,
             separators=(",", ":"),
         ).encode() + b"\n"
-        process.stdin.write(payload)
-        process.stdin.flush()
+        if len(payload) > self.max_frame_bytes:
+            raise AgentExecutionError(
+                "ATI input frame exceeds its bound",
+                code="agent_transport_frame_invalid",
+            )
+        descriptor = process.stdin.fileno()
+        offset = 0
+        while offset < len(payload):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AgentExecutionError(
+                    "ATI turn timed out",
+                    code="agent_model_timeout",
+                )
+            _, ready, _ = select.select([], [descriptor], [], remaining)
+            if not ready:
+                raise AgentExecutionError(
+                    "ATI turn timed out",
+                    code="agent_model_timeout",
+                )
+            try:
+                written = os.write(descriptor, payload[offset:offset + 65_536])
+            except BlockingIOError:
+                continue
+            except (BrokenPipeError, OSError) as error:
+                raise AgentExecutionError(
+                    "ATI input stream is unavailable",
+                    code="agent_transport_unavailable",
+                ) from error
+            if written <= 0:
+                raise AgentExecutionError(
+                    "ATI input stream is unavailable",
+                    code="agent_transport_unavailable",
+                )
+            offset += written
+
+    def _read(
+        self,
+        process: subprocess.Popen[bytes],
+        buffer: bytearray,
+        *,
+        deadline: float,
+    ) -> bytes:
+        if process.stdout is None:
+            raise AgentExecutionError(
+                "ATI output stream is unavailable",
+                code="agent_transport_unavailable",
+            )
+        descriptor = process.stdout.fileno()
+        while True:
+            newline = buffer.find(b"\n")
+            if newline >= 0:
+                if newline + 1 > self.max_frame_bytes:
+                    raise AgentExecutionError(
+                        "ATI output frame is invalid",
+                        code="agent_transport_frame_invalid",
+                    )
+                line = bytes(buffer[:newline + 1])
+                del buffer[:newline + 1]
+                return line
+            if len(buffer) >= self.max_frame_bytes:
+                raise AgentExecutionError(
+                    "ATI output frame is invalid",
+                    code="agent_transport_frame_invalid",
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AgentExecutionError(
+                    "ATI turn timed out",
+                    code="agent_model_timeout",
+                )
+            ready, _, _ = select.select([descriptor], [], [], remaining)
+            if not ready:
+                raise AgentExecutionError(
+                    "ATI turn timed out",
+                    code="agent_model_timeout",
+                )
+            try:
+                chunk = os.read(
+                    descriptor,
+                    min(65_536, self.max_frame_bytes - len(buffer)),
+                )
+            except BlockingIOError:
+                continue
+            except OSError as error:
+                raise AgentExecutionError(
+                    "ATI output stream is unavailable",
+                    code="agent_transport_unavailable",
+                ) from error
+            if not chunk:
+                if buffer:
+                    raise AgentExecutionError(
+                        "ATI output frame is invalid",
+                        code="agent_transport_frame_invalid",
+                    )
+                raise AgentExecutionError(
+                    "ATI process ended without a terminal",
+                    code="agent_transport_eof",
+                )
+            buffer.extend(chunk)
 
     def run(
         self,
@@ -266,22 +369,37 @@ class SubprocessBrainTurnTransport:
         }
         # The operator-supplied command is a closed JSON argv array. It never
         # crosses a shell, and the child receives a minimal allowlisted env.
-        process = subprocess.Popen(  # nosec B603
-            self.command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            env=child_environment,
-            shell=False,
-            start_new_session=True,
-            bufsize=0,
-        )
+        try:
+            process = subprocess.Popen(  # nosec B603
+                self.command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=child_environment,
+                shell=False,
+                start_new_session=True,
+                bufsize=0,
+            )
+        except OSError as error:
+            raise AgentExecutionError(
+                "ATI process is unavailable",
+                code="agent_transport_unavailable",
+            ) from error
         input_sequence = 0
         output_sequence = 0
         deadline = time.monotonic() + timeout_seconds
         terminal: dict[str, Any] | None = None
         usage: dict[str, Any] | None = None
+        output_buffer = bytearray()
+        seen_call_ids: set[str] = set()
         try:
+            if process.stdin is None or process.stdout is None:
+                raise AgentExecutionError(
+                    "ATI process streams are unavailable",
+                    code="agent_transport_unavailable",
+                )
+            os.set_blocking(process.stdin.fileno(), False)
+            os.set_blocking(process.stdout.fileno(), False)
             self._write(process, {
                 "v": PROTOCOL,
                 "turn_id": turn_id,
@@ -289,42 +407,10 @@ class SubprocessBrainTurnTransport:
                 "type": "turn.start",
                 "at": datetime.now(timezone.utc).isoformat(),
                 "data": start["data"],
-            })
+            }, deadline=deadline)
             input_sequence += 1
-            if process.stdout is None:
-                raise AgentExecutionError(
-                    "ATI output stream is unavailable",
-                    code="agent_transport_unavailable",
-                )
             while terminal is None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise AgentExecutionError(
-                        "ATI turn timed out",
-                        code="agent_model_timeout",
-                    )
-                ready, _, _ = select.select(
-                    [process.stdout.fileno()],
-                    [],
-                    [],
-                    remaining,
-                )
-                if not ready:
-                    raise AgentExecutionError(
-                        "ATI turn timed out",
-                        code="agent_model_timeout",
-                    )
-                line = process.stdout.readline(self.max_frame_bytes + 2)
-                if not line:
-                    raise AgentExecutionError(
-                        "ATI process ended without a terminal",
-                        code="agent_transport_eof",
-                    )
-                if len(line) > self.max_frame_bytes or not line.endswith(b"\n"):
-                    raise AgentExecutionError(
-                        "ATI output frame is invalid",
-                        code="agent_transport_frame_invalid",
-                    )
+                line = self._read(process, output_buffer, deadline=deadline)
                 try:
                     frame = json.loads(line)
                 except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -366,6 +452,8 @@ class SubprocessBrainTurnTransport:
                             "readback",
                         }
                         or not isinstance(data["call_id"], str)
+                        or not 1 <= len(data["call_id"]) <= 160
+                        or data["call_id"] in seen_call_ids
                         or not isinstance(data["name"], str)
                         or not isinstance(data["arguments"], dict)
                         or data["effect"] != "read"
@@ -375,8 +463,14 @@ class SubprocessBrainTurnTransport:
                             "ATI tool invocation violated the protocol",
                             code="agent_transport_protocol_violation",
                         )
+                    seen_call_ids.add(data["call_id"])
                     try:
                         value = invoke(data["name"], data["arguments"])
+                        if time.monotonic() > deadline:
+                            raise AgentExecutionError(
+                                "ATI turn timed out",
+                                code="agent_model_timeout",
+                            )
                         result = {
                             "call_id": data["call_id"],
                             "status": "ok",
@@ -399,7 +493,7 @@ class SubprocessBrainTurnTransport:
                         "type": "tool.result",
                         "at": datetime.now(timezone.utc).isoformat(),
                         "data": result,
-                    })
+                    }, deadline=deadline)
                     input_sequence += 1
                     continue
                 if frame_type in TERMINAL_TYPES:
@@ -423,7 +517,7 @@ class SubprocessBrainTurnTransport:
             attestation = data.get("model_attestation")
             if (
                 data.get("status") != "complete"
-                or data.get("unresolved_call_ids", []) != []
+                or data.get("unresolved_call_ids") != []
                 or not isinstance(attestation, dict)
                 or attestation.get("credential_kind") != "greppy_llm_proxy"
                 or attestation.get("router_identity")
@@ -713,6 +807,9 @@ class PiAtiRunner:
                                 **request_constraints,
                                 "max_tool_calls": context.budget.max_tool_calls,
                                 "max_receipts": context.budget.max_receipts,
+                                "max_tool_output_bytes": (
+                                    context.budget.max_tool_output_bytes
+                                ),
                             },
                             separators=(",", ":"),
                         ),
@@ -856,11 +953,22 @@ class PiAtiRunner:
         if (
             status not in {"complete", "partial", "no_answer"}
             or not isinstance(answer, str)
+            or len(answer) > 64_000
             or not isinstance(claims, list)
+            or len(claims) > 128
             or not isinstance(citations, list)
+            or len(citations) > 256
             or not isinstance(gaps, list)
-            or any(not isinstance(item, str) for item in citations + gaps)
+            or len(gaps) > 64
+            or any(
+                not isinstance(item, str)
+                or not item
+                or len(item) > limit
+                for values, limit in ((citations, 2048), (gaps, 1024))
+                for item in values
+            )
             or len(citations) != len(set(citations))
+            or len(gaps) != len(set(gaps))
         ):
             raise AgentExecutionError(
                 "agent finish payload is invalid",
@@ -882,20 +990,47 @@ class PiAtiRunner:
                 or set(claim) != {"statement", "receipts"}
                 or not isinstance(claim["statement"], str)
                 or not claim["statement"]
+                or len(claim["statement"]) > 4096
                 or not isinstance(claim["receipts"], list)
                 or not claim["receipts"]
+                or len(claim["receipts"]) > 32
+                or any(
+                    not isinstance(receipt, str)
+                    or not receipt
+                    or len(receipt) > 2048
+                    for receipt in claim["receipts"]
+                )
+                or len(claim["receipts"]) != len(set(claim["receipts"]))
                 or not set(claim["receipts"]) <= set(citations)
             ):
                 raise AgentExecutionError(
                     "agent claim is not grounded",
                     code="agent_claim_not_grounded",
                 )
+        claimed_receipts = {
+            receipt
+            for claim in claims
+            for receipt in claim["receipts"]
+        }
+        if claimed_receipts != set(citations):
+            raise AgentExecutionError(
+                "agent citations are disconnected from its claims",
+                code="agent_claim_not_grounded",
+            )
         if status in {"complete", "partial"} and (
             not answer or not claims or not citations
         ):
             raise AgentExecutionError(
                 "agent answer is not grounded",
                 code="agent_claim_not_grounded",
+            )
+        if (
+            (status == "complete" and gaps)
+            or (status == "partial" and not gaps)
+        ):
+            raise AgentExecutionError(
+                "agent answer status disagrees with its gaps",
+                code="agent_finish_invalid",
             )
         if status == "no_answer" and (
             answer or claims or citations or not gaps
@@ -923,9 +1058,9 @@ class PiAtiRunner:
         citations: list[str],
         status: str,
     ) -> list[dict[str, Any]]:
-        events: list[tuple[str, str, list[str], int, int, str]] = [
-            ("authorize", "recall.authorization", [], 0, 0, "ok"),
-            ("plan", "ati.pi", [], 0, 0, "ok"),
+        events: list[tuple[str, str, list[str], int, int, str, float]] = [
+            ("authorize", "recall.authorization", [], 0, 0, "ok", 0.0),
+            ("plan", "ati.pi", [], 0, 0, "ok", 0.0),
         ]
         for observation in observations:
             tool = observation["tool"]
@@ -940,22 +1075,24 @@ class PiAtiRunner:
                 list(observation["receipts"]),
                 int(observation["source_count"]),
                 int(observation["session_count"]),
-                "ok",
+                str(observation["outcome"]),
+                float(observation["elapsed_ms"]),
             ))
         events.extend([
             ("synthesize", "ati.pi", citations, len({
                 urlsplit(item).netloc for item in citations
-            }), 0, "ok"),
+            }), 0, "ok" if status == "complete" else "degraded", 0.0),
             ("verify", "recall.grounding", citations, len({
                 urlsplit(item).netloc for item in citations
-            }), 0, "ok"),
+            }), 0, "ok" if status == "complete" else "degraded", 0.0),
             (
                 "complete",
                 "recall.agent",
                 citations,
                 len({urlsplit(item).netloc for item in citations}),
                 0,
-                "degraded" if status == "partial" else "ok",
+                "ok" if status == "complete" else "degraded",
+                elapsed_ms,
             ),
         ])
         trace = []
@@ -966,6 +1103,7 @@ class PiAtiRunner:
             sources,
             sessions,
             outcome,
+            event_elapsed_ms,
         ) in enumerate(events):
             bounded = list(dict.fromkeys(receipts))[:256]
             trace.append({
@@ -977,7 +1115,7 @@ class PiAtiRunner:
                 "occurred_at": _timestamp(now),
                 "stage": stage,
                 "outcome": outcome,
-                "elapsed_ms": elapsed_ms,
+                "elapsed_ms": event_elapsed_ms,
                 "receipts": bounded,
                 "receipt_count": len(bounded),
                 "source_count": sources,

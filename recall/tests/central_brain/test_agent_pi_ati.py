@@ -224,6 +224,10 @@ class PiAtiGroundingTest(unittest.TestCase):
         self.assertIn("retrieve", stages)
         self.assertIn("inspect", stages)
         self.assertEqual(stages[-3:], ["synthesize", "verify", "complete"])
+        self.assertEqual(bundle["trace"][-1]["elapsed_ms"], 250.0)
+        self.assertEqual(bundle["trace"][0]["elapsed_ms"], 0.0)
+        self.assertEqual(bundle["trace"][1]["elapsed_ms"], 0.0)
+        self.assertEqual(bundle["trace"][-2]["elapsed_ms"], 0.0)
         rendered_trace = json.dumps(bundle["trace"])
         self.assertNotIn(REQUEST["question"], rendered_trace)
         self.assertNotIn(bundle["result"]["answer"], rendered_trace)
@@ -318,6 +322,26 @@ class PiAtiGroundingTest(unittest.TestCase):
                 principal(), REQUEST, SyntheticRetrieval()
             )
         self.assertEqual(post.exception.code, "agent_post_finish_tool_call")
+
+    def test_finish_status_and_claim_receipt_set_must_be_truthful(self):
+        cases = {
+            "complete_with_gap": lambda finish: finish["gaps"].append(
+                "Material evidence is missing."
+            ),
+            "unclaimed_citation": lambda finish: finish["claims"].pop(),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(label=label):
+                script = success_script()
+                mutate(script[-1][1])
+                with self.assertRaises(AgentExecutionError) as caught:
+                    service(ScriptedTransport(script)).use_recall(
+                        principal(), REQUEST, SyntheticRetrieval()
+                    )
+                self.assertIn(
+                    caught.exception.code,
+                    {"agent_finish_invalid", "agent_claim_not_grounded"},
+                )
 
     def test_archil_failure_cannot_turn_into_an_unsupported_answer(self):
         script = success_script()
@@ -414,7 +438,7 @@ def send(seq,kind,data):
 send(0,"tool.invoke",{"call_id":"call-1","name":"recall_show","arguments":{"target":"recall://source:synthetic:company/item?rev=1#item=0"},"parent_event_id":"event-1","effect":"read","approval":"never","timeout_hint_ms":1000,"idempotency":"none","readback":"result"})
 result=json.loads(sys.stdin.readline())
 assert result["data"]["status"]=="ok"
-send(1,"terminal.complete",{"status":"complete","model_attestation":{"model_alias":"gemma-4-31b","thinking":"low","router_identity":"litellm.synthetic","credential_kind":"greppy_llm_proxy"}})
+send(1,"terminal.complete",{"status":"complete","unresolved_call_ids":[],"model_attestation":{"model_alias":"gemma-4-31b","thinking":"low","router_identity":"litellm.synthetic","credential_kind":"greppy_llm_proxy"}})
 """
         key = VirtualKey(
             value="synthetic-virtual-key-value",
@@ -467,12 +491,20 @@ send(1,"terminal.complete",{"status":"complete","model_attestation":{"model_alia
                 """
 import json,sys
 s=json.loads(sys.stdin.readline())
-print(json.dumps({"v":"ati.brain.turn.v1","turn_id":s["turn_id"],"seq":0,"type":"terminal.complete","at":"2026-07-25T10:00:00Z","data":{"status":"complete","model_attestation":{"model_alias":"gemma-4-31b","router_identity":"wrong","credential_kind":"greppy_llm_proxy"}}}),flush=True)
+print(json.dumps({"v":"ati.brain.turn.v1","turn_id":s["turn_id"],"seq":0,"type":"terminal.complete","at":"2026-07-25T10:00:00Z","data":{"status":"complete","unresolved_call_ids":[],"model_attestation":{"model_alias":"gemma-4-31b","router_identity":"wrong","credential_kind":"greppy_llm_proxy"}}}),flush=True)
 """,
                 "agent_model_attestation_invalid",
             ),
             "timeout": (
                 "import time; time.sleep(2)",
+                "agent_model_timeout",
+            ),
+            "partial-frame-timeout": (
+                (
+                    "import sys,time; "
+                    "sys.stdout.write('{\"v\":'); sys.stdout.flush(); "
+                    "time.sleep(2)"
+                ),
                 "agent_model_timeout",
             ),
         }
@@ -497,6 +529,52 @@ print(json.dumps({"v":"ati.brain.turn.v1","turn_id":s["turn_id"],"seq":0,"type":
                         timeout_seconds=0.1,
                     )
                 self.assertEqual(caught.exception.code, expected)
+
+    def test_transport_write_is_bounded_when_child_stops_reading(self):
+        child = r"""
+import json,sys,time
+start=json.loads(sys.stdin.readline())
+print(json.dumps({
+  "v":"ati.brain.turn.v1",
+  "turn_id":start["turn_id"],
+  "seq":0,
+  "type":"tool.invoke",
+  "at":"2026-07-25T10:00:00Z",
+  "data":{
+    "call_id":"call-1",
+    "name":"recall_show",
+    "arguments":{"target":"recall://source:synthetic:company/item?rev=1#item=0"},
+    "parent_event_id":"event-1",
+    "effect":"read",
+    "approval":"never",
+    "timeout_hint_ms":1000,
+    "idempotency":"none",
+    "readback":"result"
+  }
+}),flush=True)
+time.sleep(2)
+"""
+        transport = SubprocessBrainTurnTransport(
+            (sys.executable, "-c", child),
+            litellm_base_url="https://litellm.synthetic",
+            virtual_key=VirtualKey(
+                value="synthetic-virtual-key-value",
+                scope="recall-agent",
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+            ),
+            expected_router_identity="litellm.synthetic",
+            environment={"PATH": os.environ["PATH"]},
+        )
+        with self.assertRaises(AgentExecutionError) as caught:
+            transport.run(
+                {
+                    "turn_id": "turn_synthetic",
+                    "data": {"model": {"alias": "gemma-4-31b"}},
+                },
+                lambda *_args: {"text": "x" * 200_000},
+                timeout_seconds=0.1,
+            )
+        self.assertEqual(caught.exception.code, "agent_model_timeout")
 
     def test_configuration_requires_approved_url_and_private_scoped_key(self):
         with tempfile.TemporaryDirectory() as directory:

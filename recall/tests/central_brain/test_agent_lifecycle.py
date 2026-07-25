@@ -319,6 +319,13 @@ class DurableConfigurationTest(unittest.TestCase):
         )
         self.assertEqual(backend.failure["trace"], [])
 
+    def test_execution_error_normalizes_unsafe_failure_code(self) -> None:
+        error = AgentExecutionError(
+            "provider body is not durable",
+            code="unsafe value from provider",
+        )
+        self.assertEqual(error.code, "agent_execution_failed")
+
 
 if __name__ == "__main__":
     unittest.main()

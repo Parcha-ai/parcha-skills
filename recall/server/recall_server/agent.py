@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -39,7 +40,12 @@ class AgentExecutionError(RuntimeError):
         trace: list[dict[str, Any]] | None = None,
     ):
         super().__init__(message)
-        self.code = code
+        self.code = (
+            code
+            if isinstance(code, str)
+            and re.fullmatch(r"[a-z][a-z0-9_.-]{1,63}", code)
+            else "agent_execution_failed"
+        )
         self.trace = list(trace or [])
 
 
@@ -47,6 +53,7 @@ class AgentExecutionError(RuntimeError):
 class AgentBudget:
     max_tool_calls: int = 12
     max_receipts: int = 256
+    max_tool_output_bytes: int = 2_000_000
     max_trace_events: int = 64
     deadline_seconds: int = 60
 
@@ -126,6 +133,7 @@ class ConstrainedAgentTools:
         self._opened_receipts: list[str] = []
         self._citable_receipts: list[str] = []
         self._observations: list[dict[str, Any]] = []
+        self._output_bytes = 0
 
     @property
     def opened_receipts(self) -> tuple[str, ...]:
@@ -159,6 +167,7 @@ class ConstrainedAgentTools:
         if not isinstance(arguments, dict):
             raise AgentExecutionError("agent tool arguments are invalid")
         self._calls += 1
+        started_at = time.monotonic()
         try:
             if name == "recall.investigate":
                 if set(arguments) != {"question", "filters", "depth"}:
@@ -205,6 +214,14 @@ class ConstrainedAgentTools:
                     "agent tool result exceeds its bound",
                     code="agent_tool_result_too_large",
                 )
+            if (
+                self._output_bytes + len(encoded)
+                > self._context.budget.max_tool_output_bytes
+            ):
+                raise AgentExecutionError(
+                    "agent cumulative tool output exceeds its bound",
+                    code="agent_tool_output_budget_exhausted",
+                )
             receipts = _receipts(result)
             granted = set(self._context.authorized_sources)
             if any(urlsplit(receipt).netloc not in granted for receipt in receipts):
@@ -233,9 +250,15 @@ class ConstrainedAgentTools:
                     and receipt not in self._citable_receipts
                 ):
                     self._citable_receipts.append(receipt)
+            self._output_bytes += len(encoded)
             coverage = result.get("coverage", {}) if isinstance(result, dict) else {}
             self._observations.append({
                 "tool": name,
+                "outcome": "ok",
+                "elapsed_ms": round(
+                    max(0.0, time.monotonic() - started_at) * 1000,
+                    3,
+                ),
                 "receipts": receipts,
                 "source_count": len({
                     urlsplit(receipt).netloc for receipt in receipts
@@ -249,18 +272,34 @@ class ConstrainedAgentTools:
             })
             return result
         except AgentExecutionError:
+            self._record_failed_observation(name, started_at)
             raise
         except (TypeError, ValueError) as error:
+            self._record_failed_observation(name, started_at)
             raise AgentExecutionError(
                 "agent evidence tool rejected the call",
                 code="agent_evidence_tool_rejected",
             ) from error
         except Exception as error:
+            self._record_failed_observation(name, started_at)
             raise AgentExecutionError(
                 "agent evidence tool failed",
                 code="agent_evidence_tool_failed",
             ) from error
         raise AgentExecutionError("agent tool is not authorized")
+
+    def _record_failed_observation(self, name: str, started_at: float) -> None:
+        self._observations.append({
+            "tool": name,
+            "outcome": "failed",
+            "elapsed_ms": round(
+                max(0.0, time.monotonic() - started_at) * 1000,
+                3,
+            ),
+            "receipts": [],
+            "source_count": 0,
+            "session_count": 0,
+        })
 
 
 def _stable_id(prefix: str, value: str) -> str:

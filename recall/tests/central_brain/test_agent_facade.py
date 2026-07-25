@@ -279,6 +279,28 @@ class AgentFacadeUnitTest(unittest.TestCase):
             "agent_receipt_budget_exhausted",
         )
 
+    def test_cumulative_tool_output_budget_is_enforced(self) -> None:
+        class LargeResult(FakeBoundRetrieval):
+            def show(self, target):
+                return {
+                    "resolved_receipt": target,
+                    "text": "x" * 200,
+                }
+
+        context = dataclasses.replace(
+            DelegationContext.from_principal(principal()),
+            budget=AgentBudget(max_tool_output_bytes=400),
+        )
+        tools = ConstrainedAgentTools(LargeResult(), context)
+        tools.call("recall.show", {"target": RECEIPT})
+        with self.assertRaises(AgentExecutionError) as caught:
+            tools.call("recall.show", {"target": RECEIPT})
+        self.assertEqual(
+            caught.exception.code,
+            "agent_tool_output_budget_exhausted",
+        )
+        self.assertEqual(tools.observations[-1]["outcome"], "failed")
+
     def test_scripted_result_is_receipt_backed_and_trace_is_content_free(self) -> None:
         result = service().use_recall(
             principal(),
