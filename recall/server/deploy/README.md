@@ -64,7 +64,7 @@ infrastructure. The example is synthetic; a live manifest belongs in a private m
 location and contains references, never credential values.
 
 The production database gate requires a standard PostgreSQL URL with
-`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 35,
+`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 36,
 pgvector 0.8.0 or newer, and a runtime role without superuser, database/role creation,
 replication, or RLS-bypass privilege:
 
@@ -413,15 +413,17 @@ Run canonical embeddings as a separate worker from that same immutable image:
 ```bash
 python -m recall_server.cli canonical-embedding-worker \
   --tenant tenant:company:example \
-  --batch-size 128 --max-batches-per-cycle 10 --interval-seconds 5
+  --batch-size 2000 --max-batches-per-cycle 10 --interval-seconds 5
 ```
 
 Canonical ingest commits do not call an embedding provider. The worker drains
 unembedded current chunks in bounded, idempotent cycles, so provider latency or
 an outage cannot delay or fail source ingestion. Restarting the worker is safe:
-the durable canonical chunk table is the queue and the unique embedding key is
-the acknowledgement. Give this worker the same database and embedding settings
-as the API service, but no collector or MCP credentials.
+the durable canonical chunk table is the queue, the unique embedding key is the
+acknowledgement, and a runtime-scoped keyset watermark avoids rescanning the
+already-embedded prefix. The watermark wraps at the end so late-arriving chunks
+that sort before it are still repaired. Give this worker the same database and
+embedding settings as the API service, but no collector or MCP credentials.
 
 Managed providers can parallelize document batches with
 `RECALL_EMBEDDING_WORKERS=2` through `8`; the default is `1`, and the local TEI

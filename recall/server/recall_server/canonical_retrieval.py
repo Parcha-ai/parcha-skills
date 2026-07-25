@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import time
 import urllib.error
@@ -24,6 +25,7 @@ ALLOWED_FILTERS = frozenset(
     {"since", "until", "source_id", "source_family", "source_alias"}
 )
 MAX_CANONICAL_EMBEDDING_BATCH = 5000
+LOG = logging.getLogger(__name__)
 
 
 def _timestamp(value: Any) -> str:
@@ -97,65 +99,210 @@ class CanonicalRetrieval:
         ):
             raise ValueError("invalid canonical embedding batch")
         processed = batches = 0
-        for _ in range(max_batches):
-            with self.store.connect() as connection:
-                rows = connection.execute(
-                    """SELECT chunk.tenant_id,chunk.source_id,chunk.chunk_id,
-                              chunk.text_redacted,chunk.text_sha256
-                       FROM canonical_chunks chunk
-                       JOIN canonical_documents document
-                         USING(tenant_id,source_id,document_id)
-                       LEFT JOIN canonical_chunk_embeddings embedding
-                         ON embedding.tenant_id=chunk.tenant_id
-                        AND embedding.source_id=chunk.source_id
-                        AND embedding.chunk_id=chunk.chunk_id
-                        AND embedding.runtime_fingerprint=%s
-                       WHERE chunk.deleted_at IS NULL
-                         AND document.is_current
-                         AND document.deleted_at IS NULL
-                         AND embedding.chunk_id IS NULL
-                         AND (%s::text IS NULL OR chunk.tenant_id=%s)
-                       ORDER BY chunk.tenant_id,chunk.source_id,chunk.chunk_id
-                       LIMIT %s""",
-                    (runtime.fingerprint, tenant_id, tenant_id, batch_size),
-                ).fetchall()
-            if not rows:
-                break
-            vectors = runtime.embed_documents(
-                [row["text_redacted"] for row in rows]
-            )
-            with self.store.connect() as connection:
-                with connection.transaction():
-                    with connection.cursor() as cursor:
-                        cursor.executemany(
-                            """INSERT INTO canonical_chunk_embeddings(
-                                   tenant_id,source_id,chunk_id,model,dimensions,
-                                   content_sha256,runtime_fingerprint,embedding
-                               ) VALUES (%s,%s,%s,%s,512,%s,%s,%s::halfvec)
-                               ON CONFLICT(tenant_id,source_id,chunk_id)
-                               DO UPDATE SET
-                                 model=excluded.model,
-                                 dimensions=excluded.dimensions,
-                                 content_sha256=excluded.content_sha256,
-                                 runtime_fingerprint=excluded.runtime_fingerprint,
-                                 embedding=excluded.embedding,
-                                 embedded_at=now()""",
-                            [
-                                (
-                                    row["tenant_id"],
-                                    row["source_id"],
-                                    row["chunk_id"],
-                                    runtime.model,
-                                    row["text_sha256"],
-                                    runtime.fingerprint,
-                                    vector,
-                                )
-                                for row, vector in zip(rows, vectors, strict=True)
-                            ],
+        tenant_scope = tenant_id or ""
+        global_lock = "recall:canonical-embeddings"
+        tenant_lock = f"{global_lock}:{tenant_scope}"
+        with self.store.connect() as connection:
+            shared_global = tenant_id is not None
+            global_locked = connection.execute(
+                (
+                    "SELECT pg_try_advisory_lock_shared("
+                    "hashtextextended(%s,0)) AS value"
+                    if shared_global
+                    else "SELECT pg_try_advisory_lock("
+                    "hashtextextended(%s,0)) AS value"
+                ),
+                (global_lock,),
+            ).fetchone()["value"]
+            tenant_locked = False
+            if global_locked and shared_global:
+                tenant_locked = connection.execute(
+                    "SELECT pg_try_advisory_lock(hashtextextended(%s,0)) AS value",
+                    (tenant_lock,),
+                ).fetchone()["value"]
+            connection.commit()
+            if not global_locked or (shared_global and not tenant_locked):
+                if global_locked:
+                    connection.execute(
+                        "SELECT pg_advisory_unlock_shared(hashtextextended(%s,0))",
+                        (global_lock,),
+                    )
+                    connection.commit()
+                return {"status": "busy", "processed": 0, "batches": 0}
+            try:
+                seed = connection.execute(
+                    """SELECT tenant_id,source_id,chunk_id
+                       FROM canonical_chunk_embeddings
+                       WHERE runtime_fingerprint=%s
+                         AND (%s::text='' OR tenant_id=%s)
+                       ORDER BY tenant_id DESC,source_id DESC,chunk_id DESC
+                       LIMIT 1""",
+                    (runtime.fingerprint, tenant_scope, tenant_scope),
+                ).fetchone()
+                connection.commit()
+                connection.execute(
+                    """INSERT INTO canonical_embedding_projection_watermarks(
+                           runtime_fingerprint,tenant_scope,last_tenant_id,
+                           last_source_id,last_chunk_id
+                       ) VALUES (%s,%s,%s,%s,%s)
+                       ON CONFLICT(runtime_fingerprint,tenant_scope) DO NOTHING""",
+                    (
+                        runtime.fingerprint,
+                        tenant_scope,
+                        seed["tenant_id"] if seed else "",
+                        seed["source_id"] if seed else "",
+                        seed["chunk_id"] if seed else "",
+                    ),
+                )
+                connection.commit()
+                wrapped = False
+                while batches < max_batches:
+                    watermark = connection.execute(
+                        """SELECT last_tenant_id,last_source_id,last_chunk_id
+                           FROM canonical_embedding_projection_watermarks
+                           WHERE runtime_fingerprint=%s AND tenant_scope=%s""",
+                        (runtime.fingerprint, tenant_scope),
+                    ).fetchone()
+                    connection.commit()
+                    select_started = time.monotonic()
+                    rows = connection.execute(
+                        """SELECT chunk.tenant_id,chunk.source_id,chunk.chunk_id,
+                                  chunk.text_redacted,chunk.text_sha256
+                           FROM canonical_chunks chunk
+                           JOIN canonical_documents document
+                             USING(tenant_id,source_id,document_id)
+                           LEFT JOIN canonical_chunk_embeddings embedding
+                             ON embedding.tenant_id=chunk.tenant_id
+                            AND embedding.source_id=chunk.source_id
+                            AND embedding.chunk_id=chunk.chunk_id
+                            AND embedding.runtime_fingerprint=%s
+                           WHERE chunk.deleted_at IS NULL
+                             AND document.is_current
+                             AND document.deleted_at IS NULL
+                             AND embedding.chunk_id IS NULL
+                             AND (%s::text IS NULL OR chunk.tenant_id=%s)
+                             AND (chunk.tenant_id,chunk.source_id,chunk.chunk_id)
+                                 > (%s,%s,%s)
+                           ORDER BY chunk.tenant_id,chunk.source_id,chunk.chunk_id
+                           LIMIT %s""",
+                        (
+                            runtime.fingerprint,
+                            tenant_id,
+                            tenant_id,
+                            watermark["last_tenant_id"],
+                            watermark["last_source_id"],
+                            watermark["last_chunk_id"],
+                            batch_size,
+                        ),
+                    ).fetchall()
+                    connection.commit()
+                    selected_seconds = time.monotonic() - select_started
+                    if not rows:
+                        cursor_is_set = any(
+                            watermark[key]
+                            for key in (
+                                "last_tenant_id",
+                                "last_source_id",
+                                "last_chunk_id",
+                            )
                         )
-            processed += len(rows)
-            batches += 1
-        return {"status": "complete", "processed": processed, "batches": batches}
+                        if cursor_is_set and not wrapped:
+                            connection.execute(
+                                """UPDATE canonical_embedding_projection_watermarks
+                                   SET last_tenant_id='',last_source_id='',
+                                       last_chunk_id='',updated_at=now()
+                                   WHERE runtime_fingerprint=%s
+                                     AND tenant_scope=%s""",
+                                (runtime.fingerprint, tenant_scope),
+                            )
+                            connection.commit()
+                            wrapped = True
+                            continue
+                        break
+                    embedding_started = time.monotonic()
+                    vectors = runtime.embed_documents(
+                        [row["text_redacted"] for row in rows]
+                    )
+                    embedded_seconds = time.monotonic() - embedding_started
+                    persistence_started = time.monotonic()
+                    last = rows[-1]
+                    with connection.transaction():
+                        with connection.cursor() as cursor:
+                            cursor.executemany(
+                                """INSERT INTO canonical_chunk_embeddings(
+                                       tenant_id,source_id,chunk_id,model,dimensions,
+                                       content_sha256,runtime_fingerprint,embedding
+                                   ) VALUES (%s,%s,%s,%s,512,%s,%s,%s::halfvec)
+                                   ON CONFLICT(tenant_id,source_id,chunk_id)
+                                   DO UPDATE SET
+                                       model=excluded.model,
+                                       dimensions=excluded.dimensions,
+                                       content_sha256=excluded.content_sha256,
+                                       runtime_fingerprint=excluded.runtime_fingerprint,
+                                       embedding=excluded.embedding,
+                                       embedded_at=now()""",
+                                [
+                                    (
+                                        row["tenant_id"],
+                                        row["source_id"],
+                                        row["chunk_id"],
+                                        runtime.model,
+                                        row["text_sha256"],
+                                        runtime.fingerprint,
+                                        vector,
+                                    )
+                                    for row, vector in zip(
+                                        rows, vectors, strict=True
+                                    )
+                                ],
+                            )
+                            cursor.execute(
+                                """UPDATE canonical_embedding_projection_watermarks
+                                   SET last_tenant_id=%s,last_source_id=%s,
+                                       last_chunk_id=%s,updated_at=now()
+                                   WHERE runtime_fingerprint=%s
+                                     AND tenant_scope=%s""",
+                                (
+                                    last["tenant_id"],
+                                    last["source_id"],
+                                    last["chunk_id"],
+                                    runtime.fingerprint,
+                                    tenant_scope,
+                                ),
+                            )
+                    persisted_seconds = time.monotonic() - persistence_started
+                    processed += len(rows)
+                    batches += 1
+                    LOG.info(
+                        "canonical embedding batch rows=%s select_ms=%s "
+                        "embed_ms=%s persist_ms=%s",
+                        len(rows),
+                        round(selected_seconds * 1000),
+                        round(embedded_seconds * 1000),
+                        round(persisted_seconds * 1000),
+                    )
+                return {
+                    "status": "complete",
+                    "processed": processed,
+                    "batches": batches,
+                }
+            finally:
+                if tenant_locked:
+                    connection.execute(
+                        "SELECT pg_advisory_unlock(hashtextextended(%s,0))",
+                        (tenant_lock,),
+                    )
+                connection.execute(
+                    (
+                        "SELECT pg_advisory_unlock_shared("
+                        "hashtextextended(%s,0))"
+                        if shared_global
+                        else "SELECT pg_advisory_unlock("
+                        "hashtextextended(%s,0))"
+                    ),
+                    (global_lock,),
+                )
+                connection.commit()
 
 
 class BoundCanonicalRetrieval:

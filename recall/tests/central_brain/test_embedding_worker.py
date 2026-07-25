@@ -47,13 +47,32 @@ class EmbeddingWorkerTests(TestCase):
             def fetchall() -> list:
                 return []
 
+            @staticmethod
+            def fetchone() -> dict:
+                return {"value": True}
+
         class Connection:
             def __init__(self) -> None:
-                self.values = None
+                self.batch_limit = None
 
-            def execute(self, _sql, values):
-                self.values = values
+            def execute(self, sql, values):
+                if "FROM canonical_chunk_embeddings" in sql:
+                    return SimpleNamespace(fetchone=lambda: None)
+                if "FROM canonical_embedding_projection_watermarks" in sql:
+                    return SimpleNamespace(
+                        fetchone=lambda: {
+                            "last_tenant_id": "",
+                            "last_source_id": "",
+                            "last_chunk_id": "",
+                        }
+                    )
+                if "FROM canonical_chunks chunk" in sql:
+                    self.batch_limit = values[-1]
                 return EmptyResult()
+
+            @staticmethod
+            def commit() -> None:
+                pass
 
         class Store:
             semantic_runtime = SimpleNamespace(
@@ -74,7 +93,7 @@ class EmbeddingWorkerTests(TestCase):
         result = retrieval.embed_pending(batch_size=5000, max_batches=1)
 
         self.assertEqual(result, {"status": "complete", "processed": 0, "batches": 0})
-        self.assertEqual(store.connection.values[-1], 5000)
+        self.assertEqual(store.connection.batch_limit, 5000)
         with self.assertRaisesRegex(ValueError, "invalid canonical embedding batch"):
             retrieval.embed_pending(batch_size=5001, max_batches=1)
 
