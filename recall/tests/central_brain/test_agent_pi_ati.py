@@ -432,15 +432,15 @@ class PiAtiSubprocessBoundaryTest(unittest.TestCase):
         child = r"""
 import json,os,sys
 assert os.environ["LITELLM_API_KEY"]=="not-a-secret"
-assert os.environ["LITELLM_BASE_URL"]=="http://10.255.252.1:9420"
+assert os.environ["LITELLM_BASE_URL"]=="http://10.23.45.67:9420"
 start=json.loads(sys.stdin.readline())
-print(json.dumps({"v":"ati.brain.turn.v1","turn_id":start["turn_id"],"seq":0,"type":"terminal.complete","at":"2026-07-25T10:00:00Z","data":{"status":"complete","unresolved_call_ids":[],"model_attestation":{"model_alias":"gemma-4-31b","thinking":"low","router_identity":"10.255.252.1","credential_kind":"greppy_llm_proxy"}}}),flush=True)
+print(json.dumps({"v":"ati.brain.turn.v1","turn_id":start["turn_id"],"seq":0,"type":"terminal.complete","at":"2026-07-25T10:00:00Z","data":{"status":"complete","unresolved_call_ids":[],"model_attestation":{"model_alias":"gemma-4-31b","thinking":"low","router_identity":"10.23.45.67","credential_kind":"greppy_llm_proxy"}}}),flush=True)
 """
         transport = SubprocessBrainTurnTransport(
             (sys.executable, "-c", child),
-            litellm_base_url="http://10.255.252.1:9420",
+            litellm_base_url="http://10.23.45.67:9420",
             credentialless_broker=True,
-            expected_router_identity="10.255.252.1",
+            expected_router_identity="10.23.45.67",
             environment={"PATH": os.environ["PATH"], "FORBIDDEN_SECRET": "no"},
         )
         outcome = transport.run(
@@ -453,7 +453,7 @@ print(json.dumps({"v":"ati.brain.turn.v1","turn_id":start["turn_id"],"seq":0,"ty
         )
         self.assertEqual(
             outcome["terminal"]["model_attestation"]["router_identity"],
-            "10.255.252.1",
+            "10.23.45.67",
         )
         self.assertTrue(transport.credentialless_broker)
         self.assertNotIn("FORBIDDEN_SECRET", transport.child_environment)
@@ -470,7 +470,7 @@ print(json.dumps({"v":"ati.brain.turn.v1","turn_id":start["turn_id"],"seq":0,"ty
         with self.assertRaisesRegex(RuntimeError, "credential mode"):
             SubprocessBrainTurnTransport(
                 (sys.executable, "-c", "pass"),
-                litellm_base_url="http://10.255.252.1:9420",
+                litellm_base_url="http://10.23.45.67:9420",
                 virtual_key=VirtualKey(
                     value="synthetic-virtual-key-value",
                     scope="recall-agent",
@@ -478,7 +478,7 @@ print(json.dumps({"v":"ati.brain.turn.v1","turn_id":start["turn_id"],"seq":0,"ty
                     + timedelta(minutes=10),
                 ),
                 credentialless_broker=True,
-                expected_router_identity="10.255.252.1",
+                expected_router_identity="10.23.45.67",
             )
 
     def test_bidirectional_ndjson_transport_and_attestation(self):
@@ -699,8 +699,8 @@ time.sleep(2)
             broker_environment = {
                 **environment,
                 "RECALL_LITELLM_CREDENTIAL_MODE": "credentialless-broker",
-                "RECALL_LITELLM_BASE_URL": "http://10.255.252.1:9420",
-                "RECALL_LITELLM_APPROVED_URL": "http://10.255.252.1:9420",
+                "RECALL_LITELLM_BASE_URL": "http://10.23.45.67:9420",
+                "RECALL_LITELLM_APPROVED_URL": "http://10.23.45.67:9420",
             }
             broker_environment.pop("RECALL_LITELLM_VIRTUAL_KEY_FILE")
             self.assertIsInstance(
