@@ -409,6 +409,65 @@ class SemanticRuntimeContractTest(unittest.TestCase):
         self.assertEqual(vectors[0][0], 0.0)
         self.assertEqual(vectors[75][0], 0.0)
 
+    def test_voyage_document_400_splits_but_single_input_fails_closed(
+        self,
+    ) -> None:
+        runtime = SemanticRuntime(
+            embedding_protocol="voyage",
+            embedding_url="https://api.voyage.example",
+            embedding_approved_url="https://api.voyage.example",
+            embedding_key_env="VOYAGE_API_KEY",
+            model="voyage-synthetic",
+            revision="voyage-synthetic-v1",
+            dimensions=512,
+            embedding_batch_size=4,
+        )
+        batch_sizes: list[int] = []
+
+        def limited_upstream(url, payload, headers):
+            batch_sizes.append(len(payload["input"]))
+            if len(payload["input"]) > 2:
+                raise urllib.error.HTTPError(url, 400, "synthetic", {}, None)
+            return {
+                "data": [
+                    {"index": index, "embedding": [float(index)] * 512}
+                    for index in range(len(payload["input"]))
+                ]
+            }
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"VOYAGE_API_KEY": "short-lived-synthetic-embedding-key"},
+                clear=True,
+            ),
+            mock.patch.object(runtime, "_post", side_effect=limited_upstream),
+        ):
+            vectors = runtime.embed_documents(["one", "two", "three", "four"])
+        self.assertEqual(len(vectors), 4)
+        self.assertEqual(batch_sizes, [4, 2, 2])
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"VOYAGE_API_KEY": "short-lived-synthetic-embedding-key"},
+                clear=True,
+            ),
+            mock.patch.object(
+                runtime,
+                "_post",
+                side_effect=urllib.error.HTTPError(
+                    runtime.embedding_url,
+                    400,
+                    "synthetic",
+                    {},
+                    None,
+                ),
+            ),
+            self.assertRaises(urllib.error.HTTPError),
+        ):
+            runtime.embed_documents(["irreducible"])
+
     def test_managed_key_may_come_from_a_named_secret_environment_variable(
         self,
     ) -> None:
