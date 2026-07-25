@@ -43,3 +43,10 @@ jobs:
           tags: ${{ steps.image.outputs.name }}:${{ github.sha }}
           provenance: mode=max
           sbom: true
+      - name: Publish the OSS image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --method PATCH \
+            "/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/recall-core" \
+            -f visibility=public
