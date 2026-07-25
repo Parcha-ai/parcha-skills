@@ -267,6 +267,14 @@ credentials without gaining an implicit cross-brain view. Omit the optional
 `forget` scope for read-only agents; canonical forget also requires an owner
 grant on the exact source.
 
+The outcome-oriented answer façade is disabled by default. For a deterministic
+transport and grounding smoke test, set `RECALL_AGENT_RUNNER=scripted`. This
+exposes `use_recall` through MCP and
+`POST /v1/agent/brains/{tenant_id}/use-recall`. The scripted runner returns a
+deliberately partial receipt-backed summary; it does not call a model. Both
+transports share one domain operation, and the request cannot carry tenant,
+principal, role, source grants, credentials, budgets, or trace policy.
+
 ### Human OAuth and company-brain invitations
 
 Static MCP tokens remain the simplest machine-to-machine option. For people,

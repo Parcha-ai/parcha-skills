@@ -69,6 +69,7 @@ def fixtures() -> tuple[dict, dict, dict, list[dict], dict]:
             "stage": stage,
             "outcome": "ok",
             "elapsed_ms": index * 10,
+            "receipts": [RECEIPT] if index else [],
             "receipt_count": 1 if index else 0,
             "source_count": 1 if index else 0,
             "session_count": 1 if index else 0,
@@ -145,7 +146,9 @@ class AgentContractTest(unittest.TestCase):
         personal = "recall://source:synthetic:personal/item-1?rev=1#item=0"
         result["citations"] = [personal]
         result["claims"][0]["receipts"] = [personal]
-        with self.assertRaisesRegex(ContractError, "citation source scope mismatch"):
+        for event in trace[1:]:
+            event["receipts"] = [personal]
+        with self.assertRaisesRegex(ContractError, "trace receipt source scope mismatch"):
             validate_agent_exchange(authority, request, run, trace, result)
 
     def test_unsupported_answer_claim_is_denied(self) -> None:

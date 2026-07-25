@@ -125,6 +125,50 @@ paths:
         '200': {description: Ranked receipt-bearing results or an abstention reason}
         '400': {description: Invalid query or filter}
         '401': {description: Unauthorized}
+  /v1/agent/brains/{tenant_id}/use-recall:
+    post:
+      summary: Ask one authenticated Recall brain a natural-language question
+      description: >-
+        The URL selects a brain only when the bearer credential is already bound
+        to that exact tenant. Tenant, principal, role, source grants, tool catalog,
+        budgets, and trace policy are host-owned and cannot appear in the request.
+      operationId: useRecall
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: tenant_id
+          required: true
+          schema: {type: string, minLength: 2, maxLength: 256}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '../contracts/recall_agent_v1.json#/$defs/request'
+      responses:
+        '200':
+          description: Receipt-backed result, terminal run, and redacted trace
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [run, trace, result]
+                properties:
+                  run:
+                    $ref: '../contracts/recall_agent_v1.json#/$defs/run'
+                  trace:
+                    type: array
+                    maxItems: 64
+                    items:
+                      $ref: '../contracts/recall_agent_v1.json#/$defs/trace_event'
+                  result:
+                    $ref: '../contracts/recall_agent_v1.json#/$defs/result'
+        '400': {description: Invalid closed agent request}
+        '401': {description: Credential is absent or bound to another brain}
+        '403': {description: Principal is not authorized to use the agent}
+        '500': {description: Runner or evidence validation failed closed}
   /v1/show:
     post:
       summary: Read a bounded source-session window by path or receipt

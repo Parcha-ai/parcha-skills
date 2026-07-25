@@ -88,6 +88,62 @@ def _date_time(value: Any, name: str) -> str:
 
 ALL_READ_TOOLS = (
     {
+        "name": "use_recall",
+        "description": (
+            "Ask the authenticated Recall brain one natural-language question. "
+            "Recall owns investigation, grounding, citations, and the redacted trace."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "contract",
+                "schema_version",
+                "request_id",
+                "idempotency_key",
+                "question",
+                "depth",
+            ],
+            "properties": {
+                "contract": {"const": "recall.agent-request.v1"},
+                "schema_version": {"const": 1},
+                "request_id": {
+                    "type": "string",
+                    "pattern": "^[a-z][a-z0-9_]{2,31}_[A-Za-z0-9_-]{16,128}$",
+                },
+                "idempotency_key": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200,
+                },
+                "question": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 8192,
+                },
+                "depth": {
+                    "type": "string",
+                    "enum": ["quick", "normal", "deep"],
+                    "default": "normal",
+                },
+                "since": {"type": "string", "format": "date-time"},
+                "until": {"type": "string", "format": "date-time"},
+                "source_families": {
+                    "type": "array",
+                    "maxItems": 32,
+                    "uniqueItems": True,
+                    "items": {
+                        "type": "string",
+                        "minLength": 2,
+                        "maxLength": 160,
+                    },
+                },
+            },
+        },
+        "outputSchema": {"type": "object"},
+        "annotations": { "readOnlyHint": True },
+    },
+    {
         "name": "recall_related",
         "description": (
             "Find Recall evidence related to a working directory or branch. "
@@ -282,6 +338,7 @@ ALL_READ_TOOLS = (
     },
 )
 CANONICAL_ONLY_READ_TOOLS = frozenset({
+    "use_recall",
     "recall_deep_search",
     "recall_investigate",
     "recall_session_context",
@@ -400,6 +457,10 @@ def _tools_for(principal: dict) -> tuple[dict, ...]:
             CANONICAL_SHOW_TOOL if tool["name"] == "recall_show" else tool
             for tool in READ_TOOLS + CANONICAL_READ_TOOLS + WRITE_TOOLS
             if tool["name"] in permitted
+            and (
+                tool["name"] != "use_recall"
+                or principal.get("agent_enabled") is True
+            )
         )
     if _write_enabled(principal):
         return READ_TOOLS + WRITE_TOOLS
@@ -414,11 +475,22 @@ def _reject_extra(arguments: dict, allowed: frozenset[str]) -> None:
         raise McpProtocolError(-32602, f"unknown tool arguments: {', '.join(unknown)}")
 
 
-def _call_tool(store, principal: dict, name: str, arguments: dict) -> dict:
+def _call_tool(
+    store,
+    principal: dict,
+    name: str,
+    arguments: dict,
+    *,
+    agent=None,
+) -> dict:
     authorized_source = principal.get(
         "authorized_sources",
         principal.get("source_id"),
     )
+    if name == "use_recall":
+        if agent is None:
+            raise McpProtocolError(-32602, "unknown tool")
+        return agent(arguments)
     if name == "recall_search":
         _reject_extra(arguments, frozenset({"query", "filters", "limit"}))
         query = _string(arguments.get("query"), "query")
@@ -599,6 +671,7 @@ def dispatch(
     message: Any,
     *,
     authorize=None,
+    agent=None,
 ) -> dict | None:
     request = _object(message, "request")
     request_id = request.get("id")
@@ -657,7 +730,15 @@ def dispatch(
             raise McpProtocolError(-32602, "unknown tool")
         require_action(f"mcp.{name}", hide=True)
         arguments = _object(params.get("arguments", {}), "arguments")
-        result = _tool_result(_call_tool(store, principal, name, arguments))
+        result = _tool_result(
+            _call_tool(
+                store,
+                principal,
+                name,
+                arguments,
+                agent=agent,
+            )
+        )
     else:
         raise McpProtocolError(-32601, "method not found")
 
