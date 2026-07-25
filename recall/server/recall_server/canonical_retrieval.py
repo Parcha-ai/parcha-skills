@@ -168,26 +168,49 @@ class CanonicalRetrieval:
                     scope_clause = (
                         "AND tenant_id=%s" if tenant_id is not None else ""
                     )
-                    window_values: list[Any] = []
+                    scan_values: list[Any] = []
                     if tenant_id is not None:
-                        window_values.append(tenant_id)
-                    window_values.extend(
+                        scan_values.append(tenant_id)
+                    scan_values.extend(
                         (
                             watermark["last_tenant_id"],
                             watermark["last_source_id"],
                             watermark["last_chunk_id"],
                             batch_size,
+                            runtime.fingerprint,
                         )
                     )
                     window = connection.execute(
-                        f"""SELECT tenant_id,source_id,chunk_id
-                            FROM canonical_chunks
-                            WHERE deleted_at IS NULL
-                              {scope_clause}
-                              AND (tenant_id,source_id,chunk_id) > (%s,%s,%s)
-                            ORDER BY tenant_id,source_id,chunk_id
-                            LIMIT %s""",
-                        tuple(window_values),
+                        f"""WITH scan_window AS MATERIALIZED (
+                                SELECT tenant_id,source_id,document_id,chunk_id,
+                                       text_redacted,text_sha256
+                                FROM canonical_chunks
+                                WHERE deleted_at IS NULL
+                                  {scope_clause}
+                                  AND (tenant_id,source_id,chunk_id)
+                                      > (%s,%s,%s)
+                                ORDER BY tenant_id,source_id,chunk_id
+                                LIMIT %s
+                            )
+                            SELECT chunk.tenant_id,chunk.source_id,chunk.chunk_id,
+                                   chunk.text_redacted,chunk.text_sha256,
+                                   COALESCE(
+                                       document.is_current
+                                       AND document.deleted_at IS NULL
+                                       AND embedding.chunk_id IS NULL,
+                                       false
+                                   ) AS eligible
+                            FROM scan_window chunk
+                            LEFT JOIN canonical_documents document
+                              USING(tenant_id,source_id,document_id)
+                            LEFT JOIN canonical_chunk_embeddings embedding
+                              ON embedding.tenant_id=chunk.tenant_id
+                             AND embedding.source_id=chunk.source_id
+                             AND embedding.chunk_id=chunk.chunk_id
+                             AND embedding.runtime_fingerprint=%s
+                            ORDER BY chunk.tenant_id,chunk.source_id,chunk.chunk_id
+                         """,
+                        tuple(scan_values),
                     ).fetchall()
                     connection.commit()
                     if not window:
@@ -213,47 +236,7 @@ class CanonicalRetrieval:
                             continue
                         break
                     window_end = window[-1]
-                    eligibility_scope_clause = (
-                        "AND chunk.tenant_id=%s" if tenant_id is not None else ""
-                    )
-                    eligibility_values: list[Any] = [runtime.fingerprint]
-                    if tenant_id is not None:
-                        eligibility_values.append(tenant_id)
-                    eligibility_values.extend(
-                        (
-                            watermark["last_tenant_id"],
-                            watermark["last_source_id"],
-                            watermark["last_chunk_id"],
-                            window_end["tenant_id"],
-                            window_end["source_id"],
-                            window_end["chunk_id"],
-                        )
-                    )
-                    rows = connection.execute(
-                        f"""SELECT chunk.tenant_id,chunk.source_id,chunk.chunk_id,
-                                  chunk.text_redacted,chunk.text_sha256
-                           FROM canonical_chunks chunk
-                           JOIN canonical_documents document
-                             USING(tenant_id,source_id,document_id)
-                           LEFT JOIN canonical_chunk_embeddings embedding
-                             ON embedding.tenant_id=chunk.tenant_id
-                            AND embedding.source_id=chunk.source_id
-                            AND embedding.chunk_id=chunk.chunk_id
-                            AND embedding.runtime_fingerprint=%s
-                           WHERE chunk.deleted_at IS NULL
-                             AND document.is_current
-                             AND document.deleted_at IS NULL
-                             AND embedding.chunk_id IS NULL
-                             {eligibility_scope_clause}
-                             AND (chunk.tenant_id,chunk.source_id,chunk.chunk_id)
-                                 > (%s,%s,%s)
-                             AND (chunk.tenant_id,chunk.source_id,chunk.chunk_id)
-                                 <= (%s,%s,%s)
-                           ORDER BY chunk.tenant_id,chunk.source_id,chunk.chunk_id
-                        """,
-                        tuple(eligibility_values),
-                    ).fetchall()
-                    connection.commit()
+                    rows = [row for row in window if row["eligible"]]
                     selected_seconds = time.monotonic() - select_started
                     if not rows:
                         with connection.transaction():
