@@ -31,6 +31,14 @@ class DeadlineStore:
 
 
 class CanonicalRetrievalDeadlineTest(unittest.TestCase):
+    def test_date_only_filters_are_normalized_to_utc_boundaries(self) -> None:
+        self.assertEqual(
+            BoundCanonicalRetrieval._filters(
+                {"since": "2026-07-23", "until": "2026-07-25"}
+            )[3:],
+            ("2026-07-23T00:00:00Z", "2026-07-25T00:00:00Z"),
+        )
+
     def test_lexical_deadline_degrades_to_optional_semantic_path(self) -> None:
         store = DeadlineStore()
         started = time.monotonic()
