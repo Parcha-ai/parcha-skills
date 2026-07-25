@@ -310,6 +310,22 @@ class DeploymentPreviewContractTest(unittest.TestCase):
             load_manifest(self.write_manifest(value))["network"]["listen_port"], 10443
         )
 
+    def test_managed_embedding_manifest_accepts_the_runtime_batch_bound(self) -> None:
+        value = synthetic_manifest()
+        value["service"]["embedding"]["batch_size"] = 512
+        self.assertEqual(
+            load_manifest(self.write_manifest(value))["service"]["embedding"][
+                "batch_size"
+            ],
+            512,
+        )
+        value["service"]["embedding"]["batch_size"] = 513
+        with self.assertRaisesRegex(
+            DeploymentManifestError,
+            "invalid managed embedding batch size",
+        ):
+            load_manifest(self.write_manifest(value))
+
     def test_repository_profile_is_valid_and_safe_to_preview(self) -> None:
         profile = load_manifest(SERVER / "deploy" / "recall-core.plan.example.json")
         result = preview(profile)

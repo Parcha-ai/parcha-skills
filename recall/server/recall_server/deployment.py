@@ -157,7 +157,7 @@ def validate_manifest(value: object) -> dict[str, Any]:
         raise DeploymentManifestError("managed embedding dimensions must be 512")
     if (
         type(embedding["batch_size"]) is not int
-        or not 1 <= embedding["batch_size"] <= 128
+        or not 1 <= embedding["batch_size"] <= 512
     ):
         raise DeploymentManifestError("invalid managed embedding batch size")
     _approval(service["region_ref"], "provider-region")

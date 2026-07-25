@@ -26,6 +26,11 @@ from recall_server.canonical import CanonicalArchiveGateway, CanonicalPlane
 from recall_server.canonical_retrieval import CanonicalRetrieval
 from recall_server.control import ControlPlane, SecretBox
 from recall_server.db import BrainStore
+from recall_server.deep_inspection import LocalDeepInspector
+from recall_server.evidence_projection import (
+    CanonicalEvidenceProjector,
+    EvidenceProjectionStore,
+)
 
 
 OWNER = "principal:owner:e2e"
@@ -172,6 +177,8 @@ def ingest(
     source_id: str,
     native_id: str,
     text: str,
+    parent: str | None = None,
+    occurred_at: str = OCCURRED,
     tombstone: bool = False,
 ) -> str:
     raw = json.dumps(
@@ -190,7 +197,7 @@ def ingest(
         native_id=native_id,
         payload=raw,
         media_type="application/json",
-        created_at=OCCURRED,
+        created_at=occurred_at,
     )
     content = {"target_native_id": native_id} if tombstone else {"text": text}
     event = canonical_envelope(
@@ -200,7 +207,8 @@ def ingest(
         content=content,
         principal_id=principal_id,
         visibility="private",
-        occurred_at=OCCURRED,
+        occurred_at=occurred_at,
+        parent=parent,
         provenance={
             "uri": f"connector://synthetic/{hashlib.sha256(source_id.encode()).hexdigest()[:8]}",
             "cwd": "/synthetic/unified-brain",
@@ -230,7 +238,7 @@ def main() -> None:
         "canonical_chunk_embeddings,canonical_source_grants,"
         "brain_access_grants,brain_memberships,brain_spaces,brain_organizations,"
         "forget_tombstones,receipt_redirects,canonical_audit_events,"
-        "canonical_chunks,canonical_documents,canonical_events,"
+        "canonical_evidence_objects,canonical_chunks,canonical_documents,canonical_events,"
         "canonical_ingest_jobs,raw_artifacts,canonical_sources,"
         "brain_principals,brain_tenants,collector_credentials,"
         "source_aliases,source_profiles,sources"
@@ -260,6 +268,15 @@ def main() -> None:
             Path(temporary) / "archive",
             namespace_key=b"m" * 32,
         )
+        evidence_archive = FilesystemArchiveStore(
+            Path(temporary) / "evidence",
+            namespace_key=b"e" * 32,
+        )
+        evidence_projection = EvidenceProjectionStore(evidence_archive)
+        evidence_projector = CanonicalEvidenceProjector(
+            store,
+            evidence_projection,
+        )
         personal_receipt = ingest(
             store,
             archive,
@@ -269,6 +286,20 @@ def main() -> None:
             native_id="native:personal:e2e",
             text="shared launch marker personal semantic decision",
         )
+        personal_atlas_receipt = ingest(
+            store,
+            archive,
+            tenant_id=PERSONAL,
+            principal_id=OWNER,
+            source_id=PERSONAL_SOURCE,
+            native_id="native:atlas:personal:canary",
+            parent="session:atlas:personal",
+            occurred_at="2026-07-24T07:00:00Z",
+            text=(
+                "synthetic atlas harness atlas harness atlas harness "
+                "private strongest-match canary"
+            ),
+        )
         company_receipt = ingest(
             store,
             archive,
@@ -277,6 +308,55 @@ def main() -> None:
             source_id=COMPANY_SOURCE,
             native_id="native:company:e2e",
             text="shared launch marker company semantic roadmap",
+        )
+        atlas_receipts = [
+            ingest(
+                store,
+                archive,
+                tenant_id=COMPANY,
+                principal_id=OWNER,
+                source_id=COMPANY_SOURCE,
+                native_id=f"native:atlas:alpha:{index}",
+                parent="session:atlas:alpha",
+                occurred_at=occurred_at,
+                text=text,
+            )
+            for index, (occurred_at, text) in enumerate((
+                (
+                    "2026-07-23T08:00:00Z",
+                    "synthetic atlas harness preview started with the legacy runner",
+                ),
+                (
+                    "2026-07-23T09:00:00Z",
+                    "synthetic atlas harness decision changed the default runner",
+                ),
+                (
+                    "2026-07-23T10:00:00Z",
+                    "synthetic atlas harness preview passed after the runner fix",
+                ),
+            ))
+        ]
+        late_receipt = ingest(
+            store,
+            archive,
+            tenant_id=COMPANY,
+            principal_id=OWNER,
+            source_id=COMPANY_LATE_SOURCE,
+            native_id="native:atlas:beta:recent",
+            parent="session:atlas:beta",
+            occurred_at="2026-07-24T06:00:00Z",
+            text="synthetic atlas harness deployment verification completed",
+        )
+        ingest(
+            store,
+            archive,
+            tenant_id=COMPANY,
+            principal_id=OWNER,
+            source_id=COMPANY_LATE_SOURCE,
+            native_id="native:atlas:beta:old",
+            parent="session:atlas:beta",
+            occurred_at="2026-06-01T06:00:00Z",
+            text="synthetic atlas harness old imported history",
         )
         ingest(
             store,
@@ -300,6 +380,7 @@ def main() -> None:
             for source_id, principal_id in (
                 (PERSONAL_SOURCE, OWNER),
                 (COMPANY_SOURCE, OWNER),
+                (COMPANY_LATE_SOURCE, OWNER),
                 (OUTSIDER_SOURCE, OUTSIDER),
             ):
                 connection.execute(
@@ -310,9 +391,17 @@ def main() -> None:
                 connection.execute(
                     """INSERT INTO source_profiles(
                            source_id,family,quality,freshness_half_life_days
-                       ) VALUES (%s,'coding_history','trusted',30)
+                       ) VALUES (
+                           %s,
+                           CASE WHEN %s=%s
+                                THEN 'work_activity'
+                                ELSE 'coding_history'
+                           END,
+                           'trusted',
+                           30
+                       )
                        ON CONFLICT(source_id) DO UPDATE SET family=excluded.family""",
-                    (source_id,),
+                    (source_id, source_id, COMPANY_LATE_SOURCE),
                 )
             connection.execute(
                 """INSERT INTO source_aliases(alias,source_id)
@@ -374,9 +463,16 @@ def main() -> None:
             principal_id=VIEWER,
             principal_kind="human",
         )
-        retrieval = CanonicalRetrieval(store, archive)
+        projected = evidence_projector.project_pending()
+        assert projected["processed"] == 10
+        retrieval = CanonicalRetrieval(
+            store,
+            archive,
+            evidence_projector=evidence_projector,
+            deep_inspector=LocalDeepInspector(evidence_projection),
+        )
         embedding = retrieval.embed_pending()
-        assert embedding["processed"] == 4
+        assert embedding["processed"] == 10
         control = ControlPlane(store, SecretBox(b"i" * 32), {})
         invitation = control.create_brain_invitation(
             principal_id=OWNER,
@@ -430,7 +526,14 @@ def main() -> None:
         )
         Handler.store = store
         Handler.archive_store = archive
-        Handler.canonical_plane = CanonicalPlane(store, archive)
+        Handler.evidence_archive_store = evidence_archive
+        Handler.evidence_projector = evidence_projector
+        Handler.deep_inspector = retrieval.deep_inspector
+        Handler.canonical_plane = CanonicalPlane(
+            store,
+            archive,
+            evidence_projector,
+        )
         Handler.canonical_retrieval = retrieval
         Handler.control_plane = control
         Handler.external_identity_verifier = SyntheticExternalVerifier()
@@ -456,9 +559,139 @@ def main() -> None:
                 {"query": "shared launch marker"},
             )
             company_results = company["result"]["structuredContent"]["results"]
-            assert {row["source_id"] for row in company_results} == {COMPANY_SOURCE}
+            assert COMPANY_SOURCE in {
+                row["source_id"] for row in company_results
+            }
             assert PERSONAL_SOURCE not in json.dumps(company)
             assert OUTSIDER_SOURCE not in json.dumps(company)
+
+            investigated = rpc(
+                server,
+                company_token["token"],
+                "recall_investigate",
+                {
+                    "question": "What changed in the synthetic atlas harness?",
+                    "filters": {
+                        "since": "2026-07-22T00:00:00Z",
+                        "until": "2026-07-24T23:59:59Z",
+                    },
+                    "depth": "deep",
+                },
+            )["result"]["structuredContent"]
+            assert investigated["question_interpretation"]["time_basis"] == "occurred_at"
+            assert investigated["coverage"]["sessions"] >= 2
+            assert set(investigated["coverage"]["sources"]) == {
+                COMPANY_SOURCE,
+                COMPANY_LATE_SOURCE,
+            }
+            rendered_investigation = json.dumps(investigated)
+            assert PERSONAL_SOURCE not in rendered_investigation
+            assert personal_atlas_receipt not in rendered_investigation
+            assert "strongest-match canary" not in rendered_investigation
+            assert OUTSIDER_SOURCE not in rendered_investigation
+            assert "old imported history" not in rendered_investigation
+            accounting = investigated["coverage"]["source_accounting"]
+            assert set(accounting["searched"]) == {
+                COMPANY_SOURCE,
+                COMPANY_LATE_SOURCE,
+            }
+            assert accounting["filtered"] == []
+            assert accounting["unavailable"] == []
+            assert (
+                len(rendered_investigation.encode())
+                < investigated["diagnostics"]["bounds"]["max_response_bytes"]
+            )
+            returned_receipts = {
+                chunk["receipt"]
+                for item in investigated["investigations"]
+                for event in item["context"]["events"]
+                for chunk in event["chunks"]
+            }
+            assert set(atlas_receipts).issubset(returned_receipts)
+            assert late_receipt in returned_receipts
+            with store.connect() as connection:
+                assert connection.execute(
+                    """SELECT count(DISTINCT receipt) AS n
+                       FROM canonical_chunks
+                       WHERE tenant_id=%s AND receipt=ANY(%s)
+                         AND deleted_at IS NULL""",
+                    (COMPANY, list(returned_receipts)),
+                ).fetchone()["n"] == len(returned_receipts)
+            occurrence_order = [
+                event["occurred_at"]
+                for item in investigated["investigations"]
+                for event in item["context"]["events"]
+            ]
+            assert all(
+                event["time_basis"] == "occurred_at"
+                for item in investigated["investigations"]
+                for event in item["context"]["events"]
+            )
+            assert occurrence_order
+
+            deep = rpc(
+                server,
+                company_token["token"],
+                "recall_deep_search",
+                {
+                    "question": (
+                        "Deep-search full synthetic atlas harness evidence"
+                    ),
+                    "filters": {
+                        "since": "2026-07-22T00:00:00Z",
+                        "until": "2026-07-24T23:59:59Z",
+                    },
+                    "depth": "deep",
+                },
+            )["result"]["structuredContent"]
+            assert deep["status"] == "complete"
+            assert deep["coverage"]["provider"] == "local"
+            assert deep["coverage"]["files_scanned"] >= 2
+            assert deep["findings"]
+            deep_rendered = json.dumps(deep)
+            assert "synthetic atlas harness" in deep_rendered
+            assert PERSONAL_SOURCE not in deep_rendered
+            assert "strongest-match canary" not in deep_rendered
+            assert OUTSIDER_SOURCE not in deep_rendered
+            assert "old imported history" not in deep_rendered
+            deep_receipts = {item["receipt"] for item in deep["findings"]}
+            with store.connect() as connection:
+                assert connection.execute(
+                    """SELECT count(DISTINCT receipt) AS n
+                       FROM canonical_chunks
+                       WHERE tenant_id=%s AND source_id=ANY(%s)
+                         AND receipt=ANY(%s) AND deleted_at IS NULL""",
+                    (
+                        COMPANY,
+                        [COMPANY_SOURCE, COMPANY_LATE_SOURCE],
+                        list(deep_receipts),
+                    ),
+                ).fetchone()["n"] == len(deep_receipts)
+
+            context = rpc(
+                server,
+                company_token["token"],
+                "recall_session_context",
+                {
+                    "target": atlas_receipts[1],
+                    "before": 2,
+                    "after": 2,
+                },
+            )["result"]["structuredContent"]
+            assert [
+                event["native_id"] for event in context["events"]
+            ] == [
+                "native:atlas:alpha:0",
+                "native:atlas:alpha:1",
+                "native:atlas:alpha:2",
+            ]
+            denied_context = rpc(
+                server,
+                personal_token["token"],
+                "recall_session_context",
+                {"target": atlas_receipts[1]},
+            )
+            assert denied_context["error"]["message"] == "receipt not found"
 
             conversational = rpc(
                 server,
@@ -566,10 +799,10 @@ def main() -> None:
                 "recall_search",
                 {"query": "shared launch marker"},
             )
-            assert {
+            assert COMPANY_SOURCE in {
                 row["source_id"]
                 for row in human["result"]["structuredContent"]["results"]
-            } == {COMPANY_SOURCE}
+            }
 
             status, denied = raw_rpc(
                 server,
@@ -603,10 +836,10 @@ def main() -> None:
                 {"query": "shared launch marker"},
                 path=f"/mcp/brains/{COMPANY}",
             )
-            assert {
+            assert COMPANY_SOURCE in {
                 row["source_id"]
                 for row in invited["result"]["structuredContent"]["results"]
-            } == {COMPANY_SOURCE}
+            }
             with store.connect() as connection:
                 accepted = connection.execute(
                     """SELECT accepted_principal_id,accepted_at,encrypted_email
@@ -776,6 +1009,7 @@ def main() -> None:
                 {"receipt": forget_receipt},
             )["result"]["structuredContent"]
             assert forgotten["raw_deleted"] == 1
+            assert forgotten["evidence_deleted"] == 1
             forgotten_show = rpc(
                 server,
                 personal_token["token"],
@@ -800,7 +1034,14 @@ def main() -> None:
                 "recall_search",
                 {"query": "shared launch marker"},
             )
-            assert deleted["result"]["structuredContent"]["results"] == []
+            deleted_results = deleted["result"]["structuredContent"]["results"]
+            assert personal_receipt not in {
+                row["receipt"] for row in deleted_results
+            }
+            assert all(
+                "shared launch marker" not in row["text"]
+                for row in deleted_results
+            )
             deleted_show = rpc(
                 server,
                 personal_token["token"],
@@ -868,6 +1109,24 @@ def main() -> None:
                 "plaintext_credential_rows": 0,
                 "empty_grant_hits": 0,
                 "legacy_reads": 0,
+                "investigate_tool_calls": 1,
+                "investigate_sessions": investigated["coverage"]["sessions"],
+                "investigate_sources": len(investigated["coverage"]["sources"]),
+                "investigate_exact_receipts": len(returned_receipts),
+                "investigate_old_source_time_hits": 0,
+                "investigate_session_coverage": 1.0,
+                "investigate_temporal_accuracy": 1.0,
+                "investigate_citation_precision": 1.0,
+                "investigate_unsupported_claim_rate": 0.0,
+                "investigate_response_bytes": len(
+                    json.dumps(investigated).encode()
+                ),
+                "deep_search_tool_calls": 1,
+                "deep_search_provider": deep["coverage"]["provider"],
+                "deep_search_files": deep["coverage"]["files_scanned"],
+                "deep_search_exact_receipts": len(deep_receipts),
+                "deep_search_cross_tenant_hits": 0,
+                "deep_search_old_source_time_hits": 0,
                 "lexical_candidates": 2,
                 "semantic_candidates": semantic["diagnostics"][
                     "semantic_candidates"

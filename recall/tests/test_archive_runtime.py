@@ -4,7 +4,11 @@ import base64
 import unittest
 
 from server.recall_server.archive import ArchiveNotFound, S3ArchiveStore
-from server.recall_server.archive_runtime import build_archive_store, probe_archive
+from server.recall_server.archive_runtime import (
+    build_archive_store,
+    build_evidence_archive_store,
+    probe_archive,
+)
 
 
 class FakeBody:
@@ -125,6 +129,93 @@ class ArchiveRuntimeTest(unittest.TestCase):
                 invalid_namespace,
                 client_factory=lambda **_: object(),
             )
+
+    def test_aws_environment_builds_native_versioned_s3_client(self):
+        calls = []
+        environment = {
+            "RECALL_ARCHIVE_BACKEND": "s3",
+            "RECALL_ARCHIVE_BUCKET": "recall-archil-test-synthetic",
+            "RECALL_ARCHIVE_ENDPOINT_URL": "https://s3.us-west-2.amazonaws.com",
+            "RECALL_ARCHIVE_REGION": "us-west-2",
+            "RECALL_ARCHIVE_ACCESS_KEY_ID": "synthetic-access-id",
+            "RECALL_ARCHIVE_SECRET_ACCESS_KEY": "synthetic-secret",
+            "RECALL_ARCHIVE_NAMESPACE_KEY": base64.b64encode(b"s" * 32).decode(),
+        }
+
+        store = build_archive_store(
+            environment,
+            client_factory=lambda **kwargs: calls.append(kwargs) or object(),
+        )
+
+        self.assertEqual(store.compatibility_profile, "aws")
+        self.assertEqual(store.bucket, "recall-archil-test-synthetic")
+        self.assertEqual(calls[0]["region_name"], "us-west-2")
+        self.assertEqual(
+            calls[0]["endpoint_url"],
+            "https://s3.us-west-2.amazonaws.com",
+        )
+
+    def test_aws_environment_rejects_cross_region_endpoint(self):
+        environment = {
+            "RECALL_ARCHIVE_BACKEND": "s3",
+            "RECALL_ARCHIVE_BUCKET": "recall-archil-test-synthetic",
+            "RECALL_ARCHIVE_ENDPOINT_URL": "https://s3.us-east-1.amazonaws.com",
+            "RECALL_ARCHIVE_REGION": "us-west-2",
+            "RECALL_ARCHIVE_ACCESS_KEY_ID": "synthetic-access-id",
+            "RECALL_ARCHIVE_SECRET_ACCESS_KEY": "synthetic-secret",
+            "RECALL_ARCHIVE_NAMESPACE_KEY": base64.b64encode(b"s" * 32).decode(),
+        }
+
+        with self.assertRaisesRegex(ValueError, "S3 endpoint"):
+            build_archive_store(
+                environment,
+                client_factory=lambda **_: object(),
+            )
+
+    def test_unversioned_aws_environment_is_explicit(self):
+        environment = {
+            "RECALL_ARCHIVE_BACKEND": "s3-unversioned",
+            "RECALL_ARCHIVE_BUCKET": "recall-archil-test-synthetic",
+            "RECALL_ARCHIVE_ENDPOINT_URL": "https://s3.us-west-2.amazonaws.com",
+            "RECALL_ARCHIVE_REGION": "us-west-2",
+            "RECALL_ARCHIVE_ACCESS_KEY_ID": "synthetic-access-id",
+            "RECALL_ARCHIVE_SECRET_ACCESS_KEY": "synthetic-secret",
+            "RECALL_ARCHIVE_NAMESPACE_KEY": base64.b64encode(b"s" * 32).decode(),
+        }
+
+        store = build_archive_store(
+            environment,
+            client_factory=lambda **_: object(),
+        )
+
+        self.assertEqual(store.compatibility_profile, "aws-unversioned")
+
+    def test_evidence_archive_uses_only_its_separate_configuration(self):
+        calls = []
+        environment = {
+            "RECALL_EVIDENCE_ARCHIVE_BACKEND": "r2",
+            "RECALL_EVIDENCE_ARCHIVE_BUCKET": "recall-evidence-synthetic",
+            "RECALL_EVIDENCE_ARCHIVE_ENDPOINT_URL": (
+                "https://0123456789abcdef0123456789abcdef."
+                "r2.cloudflarestorage.com"
+            ),
+            "RECALL_EVIDENCE_ARCHIVE_REGION": "auto",
+            "RECALL_EVIDENCE_ARCHIVE_ACCESS_KEY_ID": "evidence-access-id",
+            "RECALL_EVIDENCE_ARCHIVE_SECRET_ACCESS_KEY": "evidence-secret",
+            "RECALL_EVIDENCE_ARCHIVE_NAMESPACE_KEY": base64.b64encode(
+                b"e" * 32
+            ).decode(),
+            "RECALL_ARCHIVE_BUCKET": "recall-raw-must-not-be-used",
+        }
+
+        store = build_evidence_archive_store(
+            environment,
+            client_factory=lambda **kwargs: calls.append(kwargs) or object(),
+        )
+
+        self.assertEqual(store.bucket, "recall-evidence-synthetic")
+        self.assertEqual(calls[0]["aws_access_key_id"], "evidence-access-id")
+        self.assertNotIn("recall-raw-must-not-be-used", repr(calls))
 
     def test_probe_proves_write_replay_read_delete_and_absence(self):
         client = FakeR2()

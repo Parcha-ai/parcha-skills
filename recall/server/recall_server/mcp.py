@@ -80,7 +80,7 @@ def _date_time(value: Any, name: str) -> str:
     return text
 
 
-READ_TOOLS = (
+ALL_READ_TOOLS = (
     {
         "name": "recall_related",
         "description": (
@@ -146,6 +146,108 @@ READ_TOOLS = (
         "annotations": {"readOnlyHint": True},
     },
     {
+        "name": "recall_investigate",
+        "description": (
+            "Investigate a natural-language question in one bounded call. "
+            "Uses source occurrence time, diversifies across sessions and sources, "
+            "and returns exact recall:// receipts with surrounding evidence."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "maxLength": 8192,
+                },
+                "filters": {
+                    "type": "object",
+                    "default": {},
+                    "properties": {
+                        "since": {"type": "string", "format": "date-time"},
+                        "until": {"type": "string", "format": "date-time"},
+                        "source_id": {"type": "string"},
+                        "source_family": {"type": "string"},
+                        "source_alias": {"type": "string"},
+                    },
+                    "additionalProperties": False,
+                },
+                "depth": {
+                    "type": "string",
+                    "enum": ["quick", "normal", "deep"],
+                    "default": "normal",
+                },
+            },
+            "required": ["question"],
+            "additionalProperties": False,
+        },
+        "outputSchema": {"type": "object"},
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "recall_deep_search",
+        "description": (
+            "Deep-search full privacy-processed evidence files in one bounded "
+            "call. Recall selects and authorizes files; optional serverless "
+            "compute returns exact recall:// receipts and completeness."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "maxLength": 8192},
+                "filters": {
+                    "type": "object",
+                    "default": {},
+                    "properties": {
+                        "since": {"type": "string", "format": "date-time"},
+                        "until": {"type": "string", "format": "date-time"},
+                        "source_id": {"type": "string"},
+                        "source_family": {"type": "string"},
+                        "source_alias": {"type": "string"},
+                    },
+                    "additionalProperties": False,
+                },
+                "depth": {
+                    "type": "string",
+                    "enum": ["quick", "normal", "deep"],
+                    "default": "normal",
+                },
+            },
+            "required": ["question"],
+            "additionalProperties": False,
+        },
+        "outputSchema": {"type": "object"},
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "recall_session_context",
+        "description": (
+            "Expand one recall:// receipt inside its authorized source session "
+            "in occurrence-time order."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string"},
+                "before": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 20,
+                    "default": 4,
+                },
+                "after": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 20,
+                    "default": 4,
+                },
+            },
+            "required": ["target"],
+            "additionalProperties": False,
+        },
+        "outputSchema": {"type": "object"},
+        "annotations": {"readOnlyHint": True},
+    },
+    {
         "name": "recall_show",
         "description": (
             "Resolve a recall:// receipt and return its authorized surrounding context."
@@ -173,6 +275,28 @@ READ_TOOLS = (
         "annotations": {"readOnlyHint": True},
     },
 )
+CANONICAL_ONLY_READ_TOOLS = frozenset({
+    "recall_deep_search",
+    "recall_investigate",
+    "recall_session_context",
+})
+CANONICAL_READ_TOOLS = tuple(
+    tool for tool in ALL_READ_TOOLS
+    if tool["name"] in CANONICAL_ONLY_READ_TOOLS
+)
+READ_TOOLS = tuple(
+    tool for tool in ALL_READ_TOOLS
+    if tool["name"] not in CANONICAL_ONLY_READ_TOOLS
+)
+CANONICAL_SHOW_TOOL = {
+    **next(tool for tool in READ_TOOLS if tool["name"] == "recall_show"),
+    "inputSchema": {
+        "type": "object",
+        "properties": {"target": {"type": "string"}},
+        "required": ["target"],
+        "additionalProperties": False,
+    },
+}
 WRITE_TOOLS = (
     {
         "name": "recall_capture",
@@ -267,7 +391,9 @@ def _tools_for(principal: dict) -> tuple[dict, ...]:
     if principal.get("credential_kind") == "mcp":
         permitted = allowed_tools(principal)
         return tuple(
-            tool for tool in READ_TOOLS + WRITE_TOOLS if tool["name"] in permitted
+            CANONICAL_SHOW_TOOL if tool["name"] == "recall_show" else tool
+            for tool in READ_TOOLS + CANONICAL_READ_TOOLS + WRITE_TOOLS
+            if tool["name"] in permitted
         )
     if _write_enabled(principal):
         return READ_TOOLS + WRITE_TOOLS
@@ -301,6 +427,68 @@ def _call_tool(store, principal: dict, name: str, arguments: dict) -> dict:
             maximum=20,
         )
         return store.search(query, filters, limit, authorized_source)
+    if name == "recall_investigate":
+        _reject_extra(arguments, frozenset({"question", "filters", "depth"}))
+        question = _string(arguments.get("question"), "question")
+        if len(question) > 8192:
+            raise McpProtocolError(-32602, "question must be at most 8192 characters")
+        filters = _object(arguments.get("filters", {}), "filters")
+        depth = _string(arguments.get("depth", "normal"), "depth")
+        if depth not in {"quick", "normal", "deep"}:
+            raise McpProtocolError(
+                -32602,
+                "depth must be quick, normal, or deep",
+            )
+        return store.investigate(
+            question,
+            filters=filters,
+            depth=depth,
+            authorized_source=authorized_source,
+        )
+    if name == "recall_deep_search":
+        _reject_extra(arguments, frozenset({"question", "filters", "depth"}))
+        question = _string(arguments.get("question"), "question")
+        if len(question) > 8192:
+            raise McpProtocolError(-32602, "question must be at most 8192 characters")
+        filters = _object(arguments.get("filters", {}), "filters")
+        depth = _string(arguments.get("depth", "normal"), "depth")
+        if depth not in {"quick", "normal", "deep"}:
+            raise McpProtocolError(
+                -32602,
+                "depth must be quick, normal, or deep",
+            )
+        return store.deep_search(
+            question,
+            filters=filters,
+            depth=depth,
+            authorized_source=authorized_source,
+        )
+    if name == "recall_session_context":
+        _reject_extra(arguments, frozenset({"target", "before", "after"}))
+        target = _string(arguments.get("target"), "target")
+        before = _integer(
+            arguments.get("before"),
+            "before",
+            default=4,
+            minimum=0,
+            maximum=20,
+        )
+        after = _integer(
+            arguments.get("after"),
+            "after",
+            default=4,
+            minimum=0,
+            maximum=20,
+        )
+        result = store.session_context(
+            target,
+            before=before,
+            after=after,
+            authorized_source=authorized_source,
+        )
+        if result is None:
+            raise McpProtocolError(-32602, "receipt not found")
+        return result
     if name == "recall_show":
         _reject_extra(arguments, frozenset({"target", "around", "tail", "prompts"}))
         target = _string(arguments.get("target"), "target")
