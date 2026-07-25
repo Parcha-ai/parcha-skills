@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -40,10 +42,7 @@ class RecordingTransport:
                                 "receipt": RECEIPT,
                                 "text": SAFE_TEXT,
                                 "line": 1,
-                                "object_key": (
-                                    "objects/aa/"
-                                    + "a" * 64
-                                ),
+                                "object_key": ("objects/aa/" + "a" * 64),
                             }
                         ],
                         "complete": True,
@@ -172,6 +171,175 @@ class DeepInspectionContractTests(unittest.TestCase):
                 limit=1,
             )
 
+    def test_projector_batches_chunk_reads_uploads_and_database_writes(self):
+        documents = []
+        chunks = []
+        for index, text in enumerate(("first synthetic body", "second synthetic body")):
+            source = f"source:company:batch-{index}"
+            document = "doc_" + str(index + 1) * 32
+            documents.append(
+                {
+                    "tenant_id": TENANT,
+                    "source_id": source,
+                    "document_id": document,
+                    "native_id": f"native:{index}",
+                    "revision": 1,
+                    "text_sha256": __import__("hashlib")
+                    .sha256(text.encode())
+                    .hexdigest(),
+                    "native_parent_id": None,
+                    "occurred_at": "2026-07-25T00:00:00Z",
+                }
+            )
+            chunks.append(
+                {
+                    "tenant_id": TENANT,
+                    "source_id": source,
+                    "document_id": document,
+                    "ordinal": 0,
+                    "receipt": f"recall://{source}/native:{index}?rev=1#item=0",
+                    "text_redacted": text,
+                }
+            )
+
+        class Rows:
+            def __init__(self, values):
+                self.values = values
+
+            def fetchall(self):
+                return self.values
+
+        class Cursor:
+            def __init__(self, store):
+                self.store = store
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def executemany(self, _sql, values):
+                self.store.bulk_writes += 1
+                for value in values:
+                    self.store.stored[(value[0], value[1], value[2])] = {
+                        "tenant_id": value[0],
+                        "source_id": value[1],
+                        "document_id": value[2],
+                        "artifact_id": (
+                            "art_conflict"
+                            if getattr(self.store, "conflict", False)
+                            else value[4]
+                        ),
+                        "text_sha256": value[12],
+                    }
+
+        class Connection:
+            def __init__(self, store):
+                self.store = store
+
+            def execute(self, sql, _params):
+                if "FROM canonical_documents document" in sql:
+                    self.store.pending_sql = sql
+                    self.store.pending_reads += 1
+                    return Rows(documents if self.store.pending_reads == 1 else [])
+                if "FROM canonical_chunks chunk" in sql:
+                    self.store.chunk_reads += 1
+                    return Rows(chunks)
+                if "FROM canonical_evidence_objects evidence" in sql:
+                    return Rows(list(self.store.stored.values()))
+                raise AssertionError("unexpected projector query")
+
+            def cursor(self):
+                return Cursor(self.store)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        class Store:
+            pending_reads = 0
+            chunk_reads = 0
+            bulk_writes = 0
+            pending_sql = ""
+            stored = {}
+
+            def connect(self):
+                return Connection(self)
+
+        class Projection:
+            def __init__(self):
+                self.lock = threading.Lock()
+                self.active = 0
+                self.max_active = 0
+                self.deleted = []
+
+            def put(self, *, tenant_id, source_id, document_id, bundle):
+                with self.lock:
+                    self.active += 1
+                    self.max_active = max(self.max_active, self.active)
+                time.sleep(0.02)
+                with self.lock:
+                    self.active -= 1
+                return {
+                    "artifact_id": "art_" + document_id.removeprefix("doc_"),
+                    "storage_backend": "s3",
+                    "object_key": "objects/aa/" + document_id.removeprefix("doc_"),
+                    "content_sha256": bundle.text_sha256,
+                    "size_bytes": len(bundle.encode()),
+                    "media_type": "application/vnd.recall.evidence+json",
+                    "encryption": "sse-s3",
+                    "version_id": "s3-sha256-" + bundle.text_sha256,
+                    "created_at": bundle.occurred_at,
+                }
+
+            def delete(self, reference):
+                self.deleted.append(reference["artifact_id"])
+                return True
+
+        store = Store()
+        projection = Projection()
+        result = CanonicalEvidenceProjector(
+            store,
+            projection,
+            bound_tenant_id=TENANT,
+        ).project_pending(
+            tenant_id=TENANT,
+            batch_size=100,
+            max_batches=2,
+            upload_concurrency=2,
+        )
+        self.assertEqual(result, {"status": "complete", "processed": 2, "batches": 1})
+        self.assertEqual(store.chunk_reads, 1)
+        self.assertEqual(store.bulk_writes, 1)
+        self.assertEqual(projection.max_active, 2)
+        self.assertIn("AND EXISTS", store.pending_sql)
+        self.assertIn("AND NOT EXISTS", store.pending_sql)
+        self.assertEqual(projection.deleted, [])
+
+        store.pending_reads = 0
+        store.chunk_reads = 0
+        store.bulk_writes = 0
+        store.stored = {}
+        store.conflict = True
+        with self.assertRaisesRegex(
+            EvidenceProjectionError,
+            "evidence_projection_conflict",
+        ):
+            CanonicalEvidenceProjector(
+                store,
+                projection,
+                bound_tenant_id=TENANT,
+            ).project_pending(
+                tenant_id=TENANT,
+                batch_size=100,
+                max_batches=1,
+                upload_concurrency=2,
+            )
+        self.assertEqual(len(projection.deleted), 2)
+
     def test_archil_adapter_uses_fixed_read_only_mount_and_encoded_payload(self):
         transport = RecordingTransport()
         inspector = ArchilDeepInspector(
@@ -219,7 +387,9 @@ class DeepInspectionContractTests(unittest.TestCase):
         self.assertNotIn("synthetic-key", json.dumps(call["body"]))
         self.assertEqual(call["headers"]["Authorization"], "synthetic-key")
 
-    def test_archil_rejects_untrusted_identifiers_and_oversized_or_foreign_results(self):
+    def test_archil_rejects_untrusted_identifiers_and_oversized_or_foreign_results(
+        self,
+    ):
         with self.assertRaises(DeepInspectionError):
             ArchilDeepInspector(
                 api_key="synthetic-key",

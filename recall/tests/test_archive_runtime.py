@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import unittest
+from unittest import mock
 
 from server.recall_server.archive import ArchiveNotFound, S3ArchiveStore
 from server.recall_server.archive_runtime import (
@@ -17,7 +18,7 @@ class FakeBody:
         self.offset = 0
 
     def read(self, size: int) -> bytes:
-        chunk = self.payload[self.offset:self.offset + size]
+        chunk = self.payload[self.offset : self.offset + size]
         self.offset += len(chunk)
         return chunk
 
@@ -62,8 +63,7 @@ class ArchiveRuntimeTest(unittest.TestCase):
             "RECALL_ARCHIVE_BACKEND": "r2",
             "RECALL_ARCHIVE_BUCKET": "recall-raw-synthetic",
             "RECALL_ARCHIVE_ENDPOINT_URL": (
-                "https://0123456789abcdef0123456789abcdef."
-                "r2.cloudflarestorage.com"
+                "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com"
             ),
             "RECALL_ARCHIVE_REGION": "auto",
             "RECALL_ARCHIVE_ACCESS_KEY_ID": "synthetic-access-id",
@@ -86,13 +86,15 @@ class ArchiveRuntimeTest(unittest.TestCase):
         self.assertIs(store.client.client, client)
         self.assertEqual(
             calls,
-            [{
-                "service_name": "s3",
-                "endpoint_url": environment["RECALL_ARCHIVE_ENDPOINT_URL"],
-                "region_name": "auto",
-                "aws_access_key_id": "synthetic-access-id",
-                "aws_secret_access_key": "synthetic-secret",
-            }],
+            [
+                {
+                    "service_name": "s3",
+                    "endpoint_url": environment["RECALL_ARCHIVE_ENDPOINT_URL"],
+                    "region_name": "auto",
+                    "aws_access_key_id": "synthetic-access-id",
+                    "aws_secret_access_key": "synthetic-secret",
+                }
+            ],
         )
         self.assertNotIn("CF_R2_API_TOKEN", calls[0])
 
@@ -101,8 +103,7 @@ class ArchiveRuntimeTest(unittest.TestCase):
             "RECALL_ARCHIVE_BACKEND": "r2",
             "RECALL_ARCHIVE_BUCKET": "recall-raw-synthetic",
             "RECALL_ARCHIVE_ENDPOINT_URL": (
-                "https://0123456789abcdef0123456789abcdef."
-                "r2.cloudflarestorage.com"
+                "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com"
             ),
             "RECALL_ARCHIVE_REGION": "auto",
             "RECALL_ARCHIVE_ACCESS_KEY_ID": "synthetic-access-id",
@@ -155,6 +156,33 @@ class ArchiveRuntimeTest(unittest.TestCase):
             "https://s3.us-west-2.amazonaws.com",
         )
 
+    def test_default_s3_client_pool_matches_projection_concurrency(self):
+        calls = []
+        config = object()
+        environment = {
+            "RECALL_ARCHIVE_BACKEND": "s3-unversioned",
+            "RECALL_ARCHIVE_BUCKET": "recall-archil-test-synthetic",
+            "RECALL_ARCHIVE_ENDPOINT_URL": "https://s3.us-west-2.amazonaws.com",
+            "RECALL_ARCHIVE_REGION": "us-west-2",
+            "RECALL_ARCHIVE_ACCESS_KEY_ID": "synthetic-access-id",
+            "RECALL_ARCHIVE_SECRET_ACCESS_KEY": "synthetic-secret",
+            "RECALL_ARCHIVE_NAMESPACE_KEY": base64.b64encode(b"s" * 32).decode(),
+        }
+        with (
+            mock.patch(
+                "botocore.config.Config",
+                return_value=config,
+            ) as config_factory,
+            mock.patch(
+                "boto3.client",
+                side_effect=lambda **kwargs: calls.append(kwargs) or object(),
+            ),
+        ):
+            build_archive_store(environment)
+
+        config_factory.assert_called_once_with(max_pool_connections=64)
+        self.assertIs(calls[0]["config"], config)
+
     def test_aws_environment_rejects_cross_region_endpoint(self):
         environment = {
             "RECALL_ARCHIVE_BACKEND": "s3",
@@ -196,8 +224,7 @@ class ArchiveRuntimeTest(unittest.TestCase):
             "RECALL_EVIDENCE_ARCHIVE_BACKEND": "r2",
             "RECALL_EVIDENCE_ARCHIVE_BUCKET": "recall-evidence-synthetic",
             "RECALL_EVIDENCE_ARCHIVE_ENDPOINT_URL": (
-                "https://0123456789abcdef0123456789abcdef."
-                "r2.cloudflarestorage.com"
+                "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com"
             ),
             "RECALL_EVIDENCE_ARCHIVE_REGION": "auto",
             "RECALL_EVIDENCE_ARCHIVE_ACCESS_KEY_ID": "evidence-access-id",
@@ -222,8 +249,7 @@ class ArchiveRuntimeTest(unittest.TestCase):
         store = S3ArchiveStore(
             bucket="recall-synthetic",
             endpoint_url=(
-                "https://0123456789abcdef0123456789abcdef."
-                "r2.cloudflarestorage.com"
+                "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com"
             ),
             namespace_key=b"k" * 32,
             client=client,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol
@@ -158,7 +159,10 @@ class EvidenceBundle:
 
     @classmethod
     def decode(cls, payload: bytes) -> EvidenceBundle:
-        if not isinstance(payload, bytes) or len(payload) > MAX_EVIDENCE_TEXT_BYTES + 1_000_000:
+        if (
+            not isinstance(payload, bytes)
+            or len(payload) > MAX_EVIDENCE_TEXT_BYTES + 1_000_000
+        ):
             raise EvidenceProjectionError("evidence_payload_invalid")
         try:
             value = json.loads(payload)
@@ -222,7 +226,9 @@ class EvidenceProjectionStore:
         document_id: str,
         bundle: EvidenceBundle,
     ) -> dict[str, Any]:
-        if not isinstance(document_id, str) or not DOCUMENT_ID_RE.fullmatch(document_id):
+        if not isinstance(document_id, str) or not DOCUMENT_ID_RE.fullmatch(
+            document_id
+        ):
             raise EvidenceProjectionError("evidence_document_invalid")
         bundle.validate()
         return self.archive.put_raw(
@@ -337,9 +343,7 @@ class CanonicalEvidenceProjector:
                 else str(row["occurred_at"])
             ),
             session_sha256=hashlib.sha256(
-                "\x1f".join(
-                    (row["tenant_id"], row["source_id"], session)
-                ).encode()
+                "\x1f".join((row["tenant_id"], row["source_id"], session)).encode()
             ).hexdigest(),
             text_sha256=row["text_sha256"],
             chunks=tuple(
@@ -360,6 +364,7 @@ class CanonicalEvidenceProjector:
         tenant_id: str | None = None,
         batch_size: int = 100,
         max_batches: int = 10,
+        upload_concurrency: int = 16,
     ) -> dict[str, int | str]:
         if (
             isinstance(batch_size, bool)
@@ -368,6 +373,9 @@ class CanonicalEvidenceProjector:
             or isinstance(max_batches, bool)
             or not isinstance(max_batches, int)
             or not 1 <= max_batches <= 100
+            or isinstance(upload_concurrency, bool)
+            or not isinstance(upload_concurrency, int)
+            or not 1 <= upload_concurrency <= 64
         ):
             raise EvidenceProjectionError("evidence_projection_budget_invalid")
         tenant_id = self._tenant(tenant_id)
@@ -382,12 +390,22 @@ class CanonicalEvidenceProjector:
                        FROM canonical_documents document
                        JOIN canonical_events event
                          USING(tenant_id,source_id,event_id)
-                       LEFT JOIN canonical_evidence_objects evidence
-                         USING(tenant_id,source_id,document_id)
                        WHERE document.is_current
                          AND document.deleted_at IS NULL
-                         AND evidence.document_id IS NULL
                          AND (%s::text IS NULL OR document.tenant_id=%s)
+                         AND EXISTS (
+                             SELECT 1 FROM canonical_chunks chunk
+                              WHERE chunk.tenant_id=document.tenant_id
+                                AND chunk.source_id=document.source_id
+                                AND chunk.document_id=document.document_id
+                                AND chunk.deleted_at IS NULL
+                         )
+                         AND NOT EXISTS (
+                             SELECT 1 FROM canonical_evidence_objects evidence
+                              WHERE evidence.tenant_id=document.tenant_id
+                                AND evidence.source_id=document.source_id
+                                AND evidence.document_id=document.document_id
+                         )
                        ORDER BY document.tenant_id,document.source_id,
                                 document.document_id
                        LIMIT %s""",
@@ -395,32 +413,104 @@ class CanonicalEvidenceProjector:
                 ).fetchall()
             if not rows:
                 break
+            tenant_ids = [row["tenant_id"] for row in rows]
+            source_ids = [row["source_id"] for row in rows]
+            document_ids = [row["document_id"] for row in rows]
+            with self.store.connect() as connection:
+                chunk_rows = connection.execute(
+                    """SELECT chunk.tenant_id,chunk.source_id,chunk.document_id,
+                              chunk.ordinal,chunk.receipt,chunk.text_redacted
+                         FROM canonical_chunks chunk
+                         JOIN unnest(%s::text[],%s::text[],%s::text[])
+                              AS target(tenant_id,source_id,document_id)
+                           ON target.tenant_id=chunk.tenant_id
+                          AND target.source_id=chunk.source_id
+                          AND target.document_id=chunk.document_id
+                        WHERE chunk.deleted_at IS NULL
+                        ORDER BY chunk.tenant_id,chunk.source_id,
+                                 chunk.document_id,chunk.ordinal""",
+                    (tenant_ids, source_ids, document_ids),
+                ).fetchall()
+            chunks_by_document: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+            for chunk in chunk_rows:
+                key = (
+                    chunk["tenant_id"],
+                    chunk["source_id"],
+                    chunk["document_id"],
+                )
+                chunks_by_document.setdefault(key, []).append(chunk)
+            entries: list[tuple[dict[str, Any], EvidenceBundle]] = []
             for row in rows:
-                with self.store.connect() as connection:
-                    chunks = connection.execute(
-                        """SELECT ordinal,receipt,text_redacted
-                           FROM canonical_chunks
-                           WHERE tenant_id=%s AND source_id=%s
-                             AND document_id=%s AND deleted_at IS NULL
-                           ORDER BY ordinal""",
-                        (
-                            row["tenant_id"],
-                            row["source_id"],
-                            row["document_id"],
-                        ),
-                    ).fetchall()
-                if not chunks:
-                    continue
-                bundle = self._bundle(row, chunks)
-                reference = self.projection.put(
+                chunks = chunks_by_document.get(
+                    (row["tenant_id"], row["source_id"], row["document_id"]),
+                    [],
+                )
+                if chunks:
+                    entries.append((row, self._bundle(row, chunks)))
+            if not entries:
+                break
+
+            def upload(entry: tuple[dict[str, Any], EvidenceBundle]) -> dict[str, Any]:
+                row, bundle = entry
+                return self.projection.put(
                     tenant_id=row["tenant_id"],
                     source_id=row["source_id"],
                     document_id=row["document_id"],
                     bundle=bundle,
                 )
-                try:
-                    with self.store.connect() as connection:
-                        connection.execute(
+
+            references: list[dict[str, Any]] = []
+            futures = []
+            try:
+                with ThreadPoolExecutor(
+                    max_workers=min(upload_concurrency, len(entries)),
+                    thread_name_prefix="recall-evidence",
+                ) as executor:
+                    futures = [executor.submit(upload, entry) for entry in entries]
+                    references = [future.result() for future in futures]
+            except Exception:
+                for future in futures:
+                    if not future.done():
+                        continue
+                    try:
+                        reference = future.result()
+                    except Exception:
+                        continue
+                    if reference not in references:
+                        references.append(reference)
+                for reference in references:
+                    try:
+                        self.projection.delete(reference)
+                    except Exception:
+                        pass
+                raise
+
+            values = []
+            for (row, bundle), reference in zip(entries, references, strict=True):
+                values.append(
+                    (
+                        row["tenant_id"],
+                        row["source_id"],
+                        row["document_id"],
+                        bundle.evidence_id,
+                        reference["artifact_id"],
+                        reference["storage_backend"],
+                        reference["object_key"],
+                        reference["content_sha256"],
+                        reference["size_bytes"],
+                        reference["media_type"],
+                        reference["encryption"],
+                        reference["version_id"],
+                        bundle.text_sha256,
+                        bundle.revision,
+                        len(bundle.chunks),
+                        reference["created_at"],
+                    )
+                )
+            try:
+                with self.store.connect() as connection:
+                    with connection.cursor() as cursor:
+                        cursor.executemany(
                             """INSERT INTO canonical_evidence_objects(
                                    tenant_id,source_id,document_id,evidence_id,
                                    artifact_id,storage_backend,object_key,
@@ -433,46 +523,56 @@ class CanonicalEvidenceProjector:
                                )
                                ON CONFLICT(tenant_id,source_id,document_id)
                                DO NOTHING""",
-                            (
-                                row["tenant_id"],
-                                row["source_id"],
-                                row["document_id"],
-                                bundle.evidence_id,
-                                reference["artifact_id"],
-                                reference["storage_backend"],
-                                reference["object_key"],
-                                reference["content_sha256"],
-                                reference["size_bytes"],
-                                reference["media_type"],
-                                reference["encryption"],
-                                reference["version_id"],
-                                bundle.text_sha256,
-                                bundle.revision,
-                                len(bundle.chunks),
-                                reference["created_at"],
-                            ),
+                            values,
                         )
-                        stored = connection.execute(
-                            """SELECT * FROM canonical_evidence_objects
-                               WHERE tenant_id=%s AND source_id=%s
-                                 AND document_id=%s""",
+                    stored_rows = connection.execute(
+                        """SELECT evidence.*
+                             FROM canonical_evidence_objects evidence
+                             JOIN unnest(%s::text[],%s::text[],%s::text[])
+                                  AS target(tenant_id,source_id,document_id)
+                               ON target.tenant_id=evidence.tenant_id
+                              AND target.source_id=evidence.source_id
+                              AND target.document_id=evidence.document_id""",
+                        (
+                            [row["tenant_id"] for row, _bundle in entries],
+                            [row["source_id"] for row, _bundle in entries],
+                            [row["document_id"] for row, _bundle in entries],
+                        ),
+                    ).fetchall()
+                    stored_by_document = {
+                        (
+                            stored["tenant_id"],
+                            stored["source_id"],
+                            stored["document_id"],
+                        ): stored
+                        for stored in stored_rows
+                    }
+                    for (row, bundle), reference in zip(
+                        entries, references, strict=True
+                    ):
+                        stored = stored_by_document.get(
                             (
                                 row["tenant_id"],
                                 row["source_id"],
                                 row["document_id"],
-                            ),
-                        ).fetchone()
-                except Exception:
-                    self.projection.delete(reference)
-                    raise
-                if (
-                    stored is None
-                    or stored["artifact_id"] != reference["artifact_id"]
-                    or stored["text_sha256"] != bundle.text_sha256
-                ):
-                    self.projection.delete(reference)
-                    raise EvidenceProjectionError("evidence_projection_conflict")
-                processed += 1
+                            )
+                        )
+                        if (
+                            stored is None
+                            or stored["artifact_id"] != reference["artifact_id"]
+                            or stored["text_sha256"] != bundle.text_sha256
+                        ):
+                            raise EvidenceProjectionError(
+                                "evidence_projection_conflict"
+                            )
+            except Exception:
+                for reference in references:
+                    try:
+                        self.projection.delete(reference)
+                    except Exception:
+                        pass
+                raise
+            processed += len(entries)
             batches += 1
         return {
             "status": "complete",
