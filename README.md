@@ -28,6 +28,9 @@ Use a snippet when a rule must hold even in sessions where no skill is loaded.
 | Snippet | Purpose |
 |---|---|
 | [`effective-comms`](snippets/effective-comms/) | Makes responses answer-first, concrete, structured, and brief by default, and bans marketing rhetoric in technical writing, while preserving safety and completeness exceptions. |
+| [`evidence`](snippets/evidence/) | Ties claims to witnessed evidence and keeps sensitive evidence out of public repositories. |
+| [`control`](snippets/control/) | Preserves user control over consequential actions and gives errors a bounded recovery path. |
+| [`systems-thinking`](snippets/systems-thinking/) | Prevents local fixes from making the larger system worse without blocking bounded work. |
 
 The install commands below cover skills only. To install a snippet, paste its
 `AGENTS.md` block near the top of your root instruction file and keep the
