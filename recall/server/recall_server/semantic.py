@@ -540,7 +540,15 @@ class SemanticRuntime:
                     self._managed_embedding_endpoint, payload, headers
                 )
         except urllib.error.HTTPError as error:
-            splittable = error.code == 413 or 500 <= error.code <= 504
+            splittable = (
+                error.code == 413
+                or 500 <= error.code <= 504
+                or (
+                    self.embedding_protocol == "voyage"
+                    and input_type == "document"
+                    and error.code == 400
+                )
+            )
             if not splittable or len(batch) == 1:
                 raise
             error.close()
