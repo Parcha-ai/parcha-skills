@@ -9,6 +9,7 @@ hands the runner only a closed evidence-tool catalog.
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -29,6 +30,17 @@ class AgentRequestError(ValueError):
 
 class AgentExecutionError(RuntimeError):
     """The internal runner or evidence boundary failed closed."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "agent_execution_failed",
+        trace: list[dict[str, Any]] | None = None,
+    ):
+        super().__init__(message)
+        self.code = code
+        self.trace = list(trace or [])
 
 
 @dataclass(frozen=True)
@@ -111,6 +123,21 @@ class ConstrainedAgentTools:
         self._retrieval = retrieval
         self._context = context
         self._calls = 0
+        self._opened_receipts: list[str] = []
+        self._citable_receipts: list[str] = []
+        self._observations: list[dict[str, Any]] = []
+
+    @property
+    def opened_receipts(self) -> tuple[str, ...]:
+        return tuple(self._opened_receipts)
+
+    @property
+    def citable_receipts(self) -> tuple[str, ...]:
+        return tuple(self._citable_receipts)
+
+    @property
+    def observations(self) -> tuple[dict[str, Any], ...]:
+        return tuple(dict(item) for item in self._observations)
 
     @property
     def catalog(self) -> tuple[dict[str, Any], ...]:
@@ -136,20 +163,20 @@ class ConstrainedAgentTools:
             if name == "recall.investigate":
                 if set(arguments) != {"question", "filters", "depth"}:
                     raise AgentExecutionError("agent tool arguments are invalid")
-                return self._retrieval.investigate(
+                result = self._retrieval.investigate(
                     arguments["question"],
                     filters=arguments["filters"],
                     depth=arguments["depth"],
                 )
-            if name == "recall.deep_search":
+            elif name == "recall.deep_search":
                 if set(arguments) != {"question", "filters", "depth"}:
                     raise AgentExecutionError("agent tool arguments are invalid")
-                return self._retrieval.deep_search(
+                result = self._retrieval.deep_search(
                     arguments["question"],
                     filters=arguments["filters"],
                     depth=arguments["depth"],
                 )
-            if name == "recall.session_context":
+            elif name == "recall.session_context":
                 if set(arguments) != {"target", "before", "after"}:
                     raise AgentExecutionError("agent tool arguments are invalid")
                 result = self._retrieval.session_context(
@@ -159,18 +186,80 @@ class ConstrainedAgentTools:
                 )
                 if result is None:
                     raise AgentExecutionError("agent receipt was not found")
-                return result
-            if name == "recall.show":
+            elif name == "recall.show":
                 if set(arguments) != {"target"}:
                     raise AgentExecutionError("agent tool arguments are invalid")
                 result = self._retrieval.show(arguments["target"])
                 if result is None:
                     raise AgentExecutionError("agent receipt was not found")
-                return result
+            else:
+                raise AgentExecutionError("agent tool is not authorized")
+            encoded = json.dumps(
+                result,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode()
+            if len(encoded) > 512_000:
+                raise AgentExecutionError(
+                    "agent tool result exceeds its bound",
+                    code="agent_tool_result_too_large",
+                )
+            receipts = _receipts(result)
+            granted = set(self._context.authorized_sources)
+            if any(urlsplit(receipt).netloc not in granted for receipt in receipts):
+                raise AgentExecutionError(
+                    "agent evidence escaped its source grant",
+                    code="agent_evidence_scope_violation",
+                )
+            new_receipts = [
+                receipt
+                for receipt in receipts
+                if receipt not in self._opened_receipts
+            ]
+            if (
+                len(self._opened_receipts) + len(new_receipts)
+                > self._context.budget.max_receipts
+            ):
+                raise AgentExecutionError(
+                    "agent receipt budget is exhausted",
+                    code="agent_receipt_budget_exhausted",
+                )
+            for receipt in receipts:
+                if receipt not in self._opened_receipts:
+                    self._opened_receipts.append(receipt)
+                if (
+                    name != "recall.investigate"
+                    and receipt not in self._citable_receipts
+                ):
+                    self._citable_receipts.append(receipt)
+            coverage = result.get("coverage", {}) if isinstance(result, dict) else {}
+            self._observations.append({
+                "tool": name,
+                "receipts": receipts,
+                "source_count": len({
+                    urlsplit(receipt).netloc for receipt in receipts
+                }),
+                "session_count": (
+                    int(coverage.get("sessions", 0))
+                    if isinstance(coverage, dict)
+                    and isinstance(coverage.get("sessions", 0), int)
+                    else 0
+                ),
+            })
+            return result
         except AgentExecutionError:
             raise
         except (TypeError, ValueError) as error:
-            raise AgentExecutionError("agent evidence tool rejected the call") from error
+            raise AgentExecutionError(
+                "agent evidence tool rejected the call",
+                code="agent_evidence_tool_rejected",
+            ) from error
+        except Exception as error:
+            raise AgentExecutionError(
+                "agent evidence tool failed",
+                code="agent_evidence_tool_failed",
+            ) from error
         raise AgentExecutionError("agent tool is not authorized")
 
 
@@ -487,4 +576,8 @@ def service_from_env(environment: dict[str, str]) -> RecallAgentService | None:
         return None
     if runner == "scripted":
         return RecallAgentService(ScriptedAgentRunner())
+    if runner == "pi-ati":
+        from .agent_pi_ati import runner_from_env
+
+        return RecallAgentService(runner_from_env(environment))
     raise RuntimeError("unsupported Recall agent runner")

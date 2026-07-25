@@ -1,0 +1,555 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import stat
+import sys
+import tempfile
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+SERVER = Path(__file__).resolve().parents[2] / "server"
+sys.path.insert(0, str(SERVER))
+
+from recall_server.agent import (  # noqa: E402
+    AgentExecutionError,
+    RecallAgentService,
+    ScriptedAgentRunner,
+    service_from_env,
+)
+from recall_server.agent_pi_ati import (  # noqa: E402
+    PiAtiRunner,
+    SubprocessBrainTurnTransport,
+    VirtualKey,
+)
+
+
+TENANT = "tenant:synthetic:company"
+PRINCIPAL = "principal:synthetic:member"
+SOURCE = "source:synthetic:company"
+OTHER_SOURCE = "source:synthetic:personal"
+HINT = f"recall://{SOURCE}/hint?rev=1#item=0"
+DECISION = f"recall://{SOURCE}/decision?rev=1#item=0"
+IMPLEMENTATION = f"recall://{SOURCE}/implementation?rev=1#item=0"
+REQUEST = {
+    "contract": "recall.agent-request.v1",
+    "schema_version": 1,
+    "request_id": "req_0123456789abcdef",
+    "idempotency_key": "synthetic-pi-ati-1",
+    "question": "What changed in Project Aurora during July 23?",
+    "depth": "deep",
+    "since": "2026-07-23T00:00:00Z",
+    "until": "2026-07-24T00:00:00Z",
+}
+
+
+def principal() -> dict:
+    return {
+        "credential_kind": "mcp",
+        "tenant_id": TENANT,
+        "principal_id": PRINCIPAL,
+        "role": "member",
+        "audience": "recall-mcp",
+        "authorized_sources": [SOURCE],
+    }
+
+
+class SyntheticRetrieval:
+    """Multi-document corpus with an ingest-time decoy."""
+
+    def __init__(self, *, fail_deep: bool = False):
+        self.calls: list[str] = []
+        self.filters: list[dict] = []
+        self.fail_deep = fail_deep
+
+    def investigate(self, question, *, filters, depth):
+        self.calls.append("recall_investigate")
+        self.filters.append(dict(filters))
+        return {
+            "question_interpretation": {"time_basis": "occurred_at"},
+            "investigations": [{
+                "match": {
+                    "receipt": HINT,
+                    "occurred_at": "2026-07-10T12:00:00Z",
+                    "ingested_at": "2026-07-23T18:00:00Z",
+                    "text": "Old decoy ingested inside the requested window.",
+                },
+                "context": {"events": []},
+            }],
+            "coverage": {"sessions": 3, "sources": [SOURCE]},
+        }
+
+    def deep_search(self, question, *, filters, depth):
+        self.calls.append("recall_deep_search")
+        self.filters.append(dict(filters))
+        if self.fail_deep:
+            raise RuntimeError("synthetic provider body must not escape")
+        return {
+            "findings": [
+                {
+                    "receipt": DECISION,
+                    "occurred_at": "2026-07-23T09:00:00Z",
+                    "text": "The team selected the bounded agent bridge.",
+                },
+                {
+                    "receipt": IMPLEMENTATION,
+                    "occurred_at": "2026-07-23T15:00:00Z",
+                    "text": "The bridge passed its receipt-grounding check.",
+                },
+            ],
+            "coverage": {
+                "sessions": 2,
+                "sources": [SOURCE],
+                "provider": "synthetic-archil",
+                "complete": True,
+            },
+        }
+
+    def show(self, target):
+        self.calls.append("recall_show")
+        return {
+            "resolved_receipt": target,
+            "occurred_at": "2026-07-23T15:00:00Z",
+            "text": "Exact evidence opened.",
+        }
+
+    def session_context(self, target, *, before, after):
+        self.calls.append("recall_session_context")
+        return {"anchor_receipt": target, "events": []}
+
+
+class ScriptedTransport:
+    def __init__(self, script):
+        self.script = script
+        self.start = None
+
+    def run(self, start, invoke, *, timeout_seconds):
+        self.start = start
+        for name, arguments in self.script:
+            invoke(name, arguments)
+        return {
+            "terminal": {
+                "status": "complete",
+                "model_attestation": {
+                    "model_alias": "gemma-4-31b",
+                    "router_identity": "litellm.synthetic",
+                    "credential_kind": "greppy_llm_proxy",
+                },
+            },
+            "usage": {},
+        }
+
+
+def success_script():
+    filters = {
+        "since": REQUEST["since"],
+        "until": REQUEST["until"],
+    }
+    return [
+        (
+            "recall_investigate",
+            {
+                "question": REQUEST["question"],
+                "filters": filters,
+                "depth": "deep",
+            },
+        ),
+        (
+            "recall_deep_search",
+            {
+                "question": REQUEST["question"],
+                "filters": filters,
+                "depth": "deep",
+            },
+        ),
+        ("recall_show", {"target": IMPLEMENTATION}),
+        (
+            "evidence_finish",
+            {
+                "status": "complete",
+                "answer": (
+                    "On July 23, Aurora selected the bounded agent bridge and "
+                    "then passed its receipt-grounding check."
+                ),
+                "claims": [
+                    {
+                        "statement": "The bounded bridge was selected on July 23.",
+                        "receipts": [DECISION],
+                    },
+                    {
+                        "statement": "Its grounding check passed later that day.",
+                        "receipts": [IMPLEMENTATION],
+                    },
+                ],
+                "citations": [DECISION, IMPLEMENTATION],
+                "gaps": [],
+            },
+        ),
+    ]
+
+
+def service(transport) -> RecallAgentService:
+    fixed = datetime(2026, 7, 25, 10, 0, tzinfo=timezone.utc)
+    ticks = iter([10.0, 10.25])
+    return RecallAgentService(
+        PiAtiRunner(transport),
+        clock=lambda: fixed,
+        monotonic=lambda: next(ticks),
+    )
+
+
+class PiAtiGroundingTest(unittest.TestCase):
+    def test_agent_uses_hint_deep_inspection_exact_open_and_grounded_finish(self):
+        transport = ScriptedTransport(success_script())
+        retrieval = SyntheticRetrieval()
+        bundle = service(transport).use_recall(
+            principal(),
+            REQUEST,
+            retrieval,
+        )
+        self.assertEqual(
+            retrieval.calls,
+            ["recall_investigate", "recall_deep_search", "recall_show"],
+        )
+        self.assertEqual(bundle["result"]["status"], "complete")
+        self.assertEqual(
+            bundle["result"]["citations"],
+            [DECISION, IMPLEMENTATION],
+        )
+        self.assertIn("July 23", bundle["result"]["answer"])
+        stages = [event["stage"] for event in bundle["trace"]]
+        self.assertEqual(stages[:2], ["authorize", "plan"])
+        self.assertIn("retrieve", stages)
+        self.assertIn("inspect", stages)
+        self.assertEqual(stages[-3:], ["synthesize", "verify", "complete"])
+        rendered_trace = json.dumps(bundle["trace"])
+        self.assertNotIn(REQUEST["question"], rendered_trace)
+        self.assertNotIn(bundle["result"]["answer"], rendered_trace)
+        self.assertNotIn("Exact evidence opened", rendered_trace)
+        self.assertEqual(
+            transport.start["data"]["model"],
+            {"alias": "gemma-4-31b", "thinking": "low"},
+        )
+        self.assertEqual(
+            {tool["name"] for tool in transport.start["data"]["tools"]},
+            {
+                "recall_investigate",
+                "recall_deep_search",
+                "recall_session_context",
+                "recall_show",
+                "evidence_finish",
+            },
+        )
+
+    def test_semantic_runner_beats_scripted_generic_baseline(self):
+        pi = service(ScriptedTransport(success_script())).use_recall(
+            principal(), REQUEST, SyntheticRetrieval()
+        )
+        baseline = RecallAgentService(
+            ScriptedAgentRunner(),
+            clock=lambda: datetime(
+                2026, 7, 25, 10, 0, tzinfo=timezone.utc
+            ),
+            monotonic=lambda: 10.0,
+        ).use_recall(principal(), REQUEST, SyntheticRetrieval())
+        def rubric(bundle):
+            return sum([
+                bundle["result"]["status"] == "complete",
+                "bounded agent bridge" in bundle["result"]["answer"],
+                "July 23" in bundle["result"]["answer"],
+                len(bundle["result"]["claims"]) >= 2,
+            ])
+        self.assertEqual(rubric(pi), 4)
+        self.assertEqual(rubric(baseline), 0)
+
+    def test_hint_only_receipt_cannot_be_cited_as_proof(self):
+        script = success_script()
+        del script[1:3]
+        script[-1] = (
+            "evidence_finish",
+            {
+                "status": "complete",
+                "answer": "The old hint proves the change.",
+                "claims": [{"statement": "Hint claim", "receipts": [HINT]}],
+                "citations": [HINT],
+                "gaps": [],
+            },
+        )
+        with self.assertRaisesRegex(
+            AgentExecutionError, "did not open"
+        ) as caught:
+            service(ScriptedTransport(script)).use_recall(
+                principal(), REQUEST, SyntheticRetrieval()
+            )
+        self.assertEqual(caught.exception.code, "agent_citation_not_opened")
+
+    def test_cross_brain_citation_fails_closed(self):
+        other = f"recall://{OTHER_SOURCE}/item?rev=1#item=0"
+        script = success_script()
+        script[-1] = (
+            "evidence_finish",
+            {
+                "status": "complete",
+                "answer": "Invented.",
+                "claims": [{"statement": "Invented", "receipts": [other]}],
+                "citations": [other],
+                "gaps": [],
+            },
+        )
+        with self.assertRaises(AgentExecutionError) as caught:
+            service(ScriptedTransport(script)).use_recall(
+                principal(), REQUEST, SyntheticRetrieval()
+            )
+        self.assertEqual(caught.exception.code, "agent_citation_not_opened")
+
+    def test_missing_finish_and_post_finish_tool_call_fail_closed(self):
+        with self.assertRaises(AgentExecutionError) as missing:
+            service(ScriptedTransport(success_script()[:-1])).use_recall(
+                principal(), REQUEST, SyntheticRetrieval()
+            )
+        self.assertEqual(missing.exception.code, "agent_finish_missing")
+        script = success_script() + [
+            ("recall_show", {"target": IMPLEMENTATION}),
+        ]
+        with self.assertRaises(AgentExecutionError) as post:
+            service(ScriptedTransport(script)).use_recall(
+                principal(), REQUEST, SyntheticRetrieval()
+            )
+        self.assertEqual(post.exception.code, "agent_post_finish_tool_call")
+
+    def test_archil_failure_cannot_turn_into_an_unsupported_answer(self):
+        script = success_script()
+        with self.assertRaises(AgentExecutionError) as caught:
+            service(ScriptedTransport(script)).use_recall(
+                principal(), REQUEST, SyntheticRetrieval(fail_deep=True)
+            )
+        self.assertEqual(caught.exception.code, "agent_evidence_tool_failed")
+        self.assertNotIn("synthetic provider body", str(caught.exception))
+
+    def test_transport_failure_codes_are_preserved(self):
+        class Failure:
+            def run(self, *_args, **_kwargs):
+                raise AgentExecutionError(
+                    "provider unavailable",
+                    code="agent_model_failed",
+                )
+
+        with self.assertRaises(AgentExecutionError) as caught:
+            service(Failure()).use_recall(
+                principal(), REQUEST, SyntheticRetrieval()
+            )
+        self.assertEqual(caught.exception.code, "agent_model_failed")
+
+    def test_source_family_and_explicit_time_scope_are_host_enforced(self):
+        family_request = {
+            **REQUEST,
+            "source_families": ["coding"],
+        }
+        script = success_script()
+        for _name, arguments in script[:2]:
+            arguments["filters"]["source_family"] = "coding"
+        retrieval = SyntheticRetrieval()
+        service(ScriptedTransport(script)).use_recall(
+            principal(),
+            family_request,
+            retrieval,
+        )
+        self.assertEqual(
+            retrieval.filters,
+            [
+                {
+                    "since": REQUEST["since"],
+                    "until": REQUEST["until"],
+                    "source_family": "coding",
+                },
+                {
+                    "since": REQUEST["since"],
+                    "until": REQUEST["until"],
+                    "source_family": "coding",
+                },
+            ],
+        )
+        for label, mutate in (
+            (
+                "family",
+                lambda arguments: arguments["filters"].update({
+                    "source_family": "gmail"
+                }),
+            ),
+            (
+                "time",
+                lambda arguments: arguments["filters"].update({
+                    "since": "2020-01-01T00:00:00Z"
+                }),
+            ),
+        ):
+            with self.subTest(label=label):
+                escaped = success_script()
+                for _name, arguments in escaped[:2]:
+                    arguments["filters"]["source_family"] = "coding"
+                mutate(escaped[0][1])
+                with self.assertRaises(AgentExecutionError) as caught:
+                    service(ScriptedTransport(escaped)).use_recall(
+                        principal(),
+                        family_request,
+                        SyntheticRetrieval(),
+                    )
+                self.assertEqual(
+                    caught.exception.code,
+                    "agent_query_scope_violation",
+                )
+
+
+class PiAtiSubprocessBoundaryTest(unittest.TestCase):
+    def test_bidirectional_ndjson_transport_and_attestation(self):
+        child = r"""
+import json,os,sys
+assert os.environ["LITELLM_API_KEY"]=="synthetic-virtual-key-value"
+start=json.loads(sys.stdin.readline())
+turn=start["turn_id"]
+def send(seq,kind,data):
+ print(json.dumps({"v":"ati.brain.turn.v1","turn_id":turn,"seq":seq,"type":kind,"at":"2026-07-25T10:00:00Z","data":data}),flush=True)
+send(0,"tool.invoke",{"call_id":"call-1","name":"recall_show","arguments":{"target":"recall://source:synthetic:company/item?rev=1#item=0"},"parent_event_id":"event-1","effect":"read","approval":"never","timeout_hint_ms":1000,"idempotency":"none","readback":"result"})
+result=json.loads(sys.stdin.readline())
+assert result["data"]["status"]=="ok"
+send(1,"terminal.complete",{"status":"complete","model_attestation":{"model_alias":"gemma-4-31b","thinking":"low","router_identity":"litellm.synthetic","credential_kind":"greppy_llm_proxy"}})
+"""
+        key = VirtualKey(
+            value="synthetic-virtual-key-value",
+            scope="recall-agent",
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+        )
+        transport = SubprocessBrainTurnTransport(
+            (sys.executable, "-c", child),
+            litellm_base_url="https://litellm.synthetic",
+            virtual_key=key,
+            expected_router_identity="litellm.synthetic",
+            environment={"PATH": os.environ["PATH"], "FORBIDDEN_SECRET": "no"},
+        )
+        seen = []
+        outcome = transport.run(
+            {
+                "turn_id": "turn_synthetic",
+                "data": {
+                    "session_id": "session",
+                    "run_id": "run",
+                    "model": {"alias": "gemma-4-31b"},
+                },
+            },
+            lambda name, arguments: seen.append((name, arguments)) or {
+                "resolved_receipt": arguments["target"]
+            },
+            timeout_seconds=3,
+        )
+        self.assertEqual(seen[0][0], "recall_show")
+        self.assertEqual(
+            outcome["terminal"]["model_attestation"]["credential_kind"],
+            "greppy_llm_proxy",
+        )
+        self.assertNotIn("FORBIDDEN_SECRET", transport.child_environment)
+        self.assertNotIn("LITELLM_API_KEY", transport.child_environment)
+        self.assertNotIn("synthetic-virtual-key-value", repr(key))
+
+    def test_transport_rejects_malformed_unattested_and_timed_out_children(self):
+        key = VirtualKey(
+            value="synthetic-virtual-key-value",
+            scope="recall-agent",
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+        )
+        cases = {
+            "malformed": (
+                "print('not-json',flush=True)",
+                "agent_transport_frame_invalid",
+            ),
+            "unattested": (
+                """
+import json,sys
+s=json.loads(sys.stdin.readline())
+print(json.dumps({"v":"ati.brain.turn.v1","turn_id":s["turn_id"],"seq":0,"type":"terminal.complete","at":"2026-07-25T10:00:00Z","data":{"status":"complete","model_attestation":{"model_alias":"gemma-4-31b","router_identity":"wrong","credential_kind":"greppy_llm_proxy"}}}),flush=True)
+""",
+                "agent_model_attestation_invalid",
+            ),
+            "timeout": (
+                "import time; time.sleep(2)",
+                "agent_model_timeout",
+            ),
+        }
+        for label, (child, expected) in cases.items():
+            with self.subTest(label=label):
+                transport = SubprocessBrainTurnTransport(
+                    (sys.executable, "-c", child),
+                    litellm_base_url="https://litellm.synthetic",
+                    virtual_key=key,
+                    expected_router_identity="litellm.synthetic",
+                    environment={"PATH": os.environ["PATH"]},
+                )
+                with self.assertRaises(AgentExecutionError) as caught:
+                    transport.run(
+                        {
+                            "turn_id": "turn_synthetic",
+                            "data": {
+                                "model": {"alias": "gemma-4-31b"},
+                            },
+                        },
+                        lambda *_args: {},
+                        timeout_seconds=0.1,
+                    )
+                self.assertEqual(caught.exception.code, expected)
+
+    def test_configuration_requires_approved_url_and_private_scoped_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            key_path = Path(directory) / "key.json"
+            key_path.write_text(json.dumps({
+                "virtual_key": "synthetic-virtual-key-value",
+                "scope": "recall-agent",
+                "expires_at": (
+                    datetime.now(timezone.utc) + timedelta(minutes=10)
+                ).isoformat(),
+            }))
+            key_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+            artifact_path = Path(directory) / "ati-runner.mjs"
+            artifact_path.write_text("export {};\n")
+            artifact_path.chmod(0o444)
+            artifact_sha256 = hashlib.sha256(
+                artifact_path.read_bytes()
+            ).hexdigest()
+            environment = {
+                "RECALL_AGENT_RUNNER": "pi-ati",
+                "RECALL_ATI_COMMAND_JSON": json.dumps([
+                    sys.executable, str(artifact_path)
+                ]),
+                "RECALL_ATI_ARTIFACT_PATH": str(artifact_path),
+                "RECALL_ATI_ARTIFACT_SHA256": artifact_sha256,
+                "RECALL_LITELLM_BASE_URL": "https://litellm.synthetic",
+                "RECALL_LITELLM_APPROVED_URL": "https://litellm.synthetic",
+                "RECALL_LITELLM_VIRTUAL_KEY_FILE": str(key_path),
+            }
+            self.assertIsInstance(
+                service_from_env(environment).runner,
+                PiAtiRunner,
+            )
+            self.assertNotIn(
+                "synthetic-virtual-key-value",
+                repr(service_from_env(environment).runner.transport.virtual_key),
+            )
+            environment["RECALL_LITELLM_APPROVED_URL"] = (
+                "https://other.synthetic"
+            )
+            with self.assertRaisesRegex(RuntimeError, "not approved"):
+                service_from_env(environment)
+            environment["RECALL_LITELLM_APPROVED_URL"] = (
+                "https://litellm.synthetic"
+            )
+            environment["RECALL_ATI_ARTIFACT_SHA256"] = "0" * 64
+            with self.assertRaisesRegex(RuntimeError, "does not match"):
+                service_from_env(environment)
+            environment["RECALL_ATI_ARTIFACT_SHA256"] = artifact_sha256
+            key_path.chmod(0o644)
+            with self.assertRaisesRegex(RuntimeError, "not private"):
+                service_from_env(environment)
+
+
+if __name__ == "__main__":
+    unittest.main()
