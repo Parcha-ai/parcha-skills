@@ -212,20 +212,28 @@ def _run(value: dict[str, Any]) -> None:
     _opaque(value["trace_id"], "trc")
     status = _enum(
         value["status"],
-        {"queued", "running", "complete", "partial", "no_answer", "failed"},
+        {
+            "queued",
+            "running",
+            "complete",
+            "partial",
+            "no_answer",
+            "failed",
+            "cancelled",
+        },
     )
     _integer(value["attempt"], minimum=1, maximum=100)
     _timestamp(value["created_at"])
     _timestamp(value["updated_at"])
     if "completed_at" in value:
         _timestamp(value["completed_at"])
-        if status not in {"complete", "partial", "no_answer", "failed"}:
+        if status not in {"complete", "partial", "no_answer", "failed", "cancelled"}:
             raise ContractError("unfinished agent run has completion time")
-    elif status in {"complete", "partial", "no_answer", "failed"}:
+    elif status in {"complete", "partial", "no_answer", "failed", "cancelled"}:
         raise ContractError("finished agent run has no completion time")
     if "error_code" in value:
         code = _string(value["error_code"], maximum=64)
-        if not SAFE_ERROR_RE.fullmatch(code) or status != "failed":
+        if not SAFE_ERROR_RE.fullmatch(code) or status not in {"failed", "cancelled"}:
             raise ContractError("agent run error code is invalid")
 
 

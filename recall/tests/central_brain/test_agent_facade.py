@@ -273,6 +273,7 @@ class AgentHttpServer:
         Handler.store = self.store
         Handler.canonical_retrieval = self.retrieval
         Handler.agent_service = service()
+        Handler.agent_coordinator = None
         Handler.external_identity_verifier = None
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -287,6 +288,7 @@ class AgentHttpServer:
         self.thread.join(timeout=2)
         Handler.canonical_retrieval = None
         Handler.agent_service = None
+        Handler.agent_coordinator = None
 
     def request(self, path, body, *, protocol=None):
         payload = json.dumps(body).encode()

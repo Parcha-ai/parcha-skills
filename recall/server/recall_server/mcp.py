@@ -7,11 +7,19 @@ from typing import Any
 
 from .authorization import allowed_tools, decide
 
-LATEST_PROTOCOL_VERSION = "2025-11-25"
+LATEST_PROTOCOL_VERSION = "2026-06-30"
 SUPPORTED_PROTOCOL_VERSIONS = frozenset(
-    {"2025-03-26", "2025-06-18", LATEST_PROTOCOL_VERSION}
+    {"2025-03-26", "2025-06-18", "2025-11-25", LATEST_PROTOCOL_VERSION}
 )
-REQUEST_METHODS = ("initialize", "ping", "tools/list", "tools/call")
+REQUEST_METHODS = (
+    "initialize",
+    "ping",
+    "tools/list",
+    "tools/call",
+    "tasks/get",
+    "tasks/update",
+    "tasks/cancel",
+)
 NOTIFICATION_METHODS = ("notifications/initialized",)
 MAX_MCP_RESPONSE_BYTES = 1024 * 1024
 TIME_BOUND_SCHEMA = {
@@ -142,6 +150,112 @@ ALL_READ_TOOLS = (
         },
         "outputSchema": {"type": "object"},
         "annotations": { "readOnlyHint": True },
+    },
+    {
+        "name": "recall_agent_start",
+        "description": (
+            "Durably start one Recall investigation and return immediately with "
+            "an authorization-bound run handle."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "contract",
+                "schema_version",
+                "request_id",
+                "idempotency_key",
+                "question",
+                "depth",
+            ],
+            "properties": {
+                "contract": {"const": "recall.agent-request.v1"},
+                "schema_version": {"const": 1},
+                "request_id": {
+                    "type": "string",
+                    "pattern": "^[a-z][a-z0-9_]{2,31}_[A-Za-z0-9_-]{16,128}$",
+                },
+                "idempotency_key": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200,
+                },
+                "question": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 8192,
+                },
+                "depth": {
+                    "type": "string",
+                    "enum": ["quick", "normal", "deep"],
+                },
+                "since": {"type": "string", "format": "date-time"},
+                "until": {"type": "string", "format": "date-time"},
+                "source_families": {
+                    "type": "array",
+                    "maxItems": 32,
+                    "uniqueItems": True,
+                    "items": {
+                        "type": "string",
+                        "minLength": 2,
+                        "maxLength": 160,
+                    },
+                },
+            },
+        },
+        "outputSchema": {"type": "object"},
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "recall_agent_status",
+        "description": "Read one authenticated Recall agent run status.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["run_id"],
+            "properties": {
+                "run_id": {
+                    "type": "string",
+                    "pattern": "^run_[0-9a-f]{32}$",
+                },
+            },
+        },
+        "outputSchema": {"type": "object"},
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "recall_agent_result",
+        "description": "Read one terminal Recall agent result and redacted trace.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["run_id"],
+            "properties": {
+                "run_id": {
+                    "type": "string",
+                    "pattern": "^run_[0-9a-f]{32}$",
+                },
+            },
+        },
+        "outputSchema": {"type": "object"},
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "recall_agent_cancel",
+        "description": "Cancel one queued or running authenticated Recall agent run.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["run_id"],
+            "properties": {
+                "run_id": {
+                    "type": "string",
+                    "pattern": "^run_[0-9a-f]{32}$",
+                },
+            },
+        },
+        "outputSchema": {"type": "object"},
+        "annotations": {"readOnlyHint": False, "destructiveHint": True},
     },
     {
         "name": "recall_related",
@@ -339,6 +453,10 @@ ALL_READ_TOOLS = (
 )
 CANONICAL_ONLY_READ_TOOLS = frozenset({
     "use_recall",
+    "recall_agent_start",
+    "recall_agent_status",
+    "recall_agent_result",
+    "recall_agent_cancel",
     "recall_deep_search",
     "recall_investigate",
     "recall_session_context",
@@ -458,7 +576,13 @@ def _tools_for(principal: dict) -> tuple[dict, ...]:
             for tool in READ_TOOLS + CANONICAL_READ_TOOLS + WRITE_TOOLS
             if tool["name"] in permitted
             and (
-                tool["name"] != "use_recall"
+                tool["name"] not in {
+                    "use_recall",
+                    "recall_agent_start",
+                    "recall_agent_status",
+                    "recall_agent_result",
+                    "recall_agent_cancel",
+                }
                 or principal.get("agent_enabled") is True
             )
         )
@@ -482,6 +606,7 @@ def _call_tool(
     arguments: dict,
     *,
     agent=None,
+    agent_lifecycle=None,
 ) -> dict:
     authorized_source = principal.get(
         "authorized_sources",
@@ -491,6 +616,23 @@ def _call_tool(
         if agent is None:
             raise McpProtocolError(-32602, "unknown tool")
         return agent(arguments)
+    if name in {
+        "recall_agent_start",
+        "recall_agent_status",
+        "recall_agent_result",
+        "recall_agent_cancel",
+    }:
+        if agent_lifecycle is None:
+            raise McpProtocolError(-32602, "unknown tool")
+        operation = name.removeprefix("recall_agent_")
+        callback = agent_lifecycle.get(operation)
+        if callback is None:
+            raise McpProtocolError(-32602, "unknown tool")
+        if operation == "start":
+            return callback(arguments)
+        _reject_extra(arguments, frozenset({"run_id"}))
+        run_id = _string(arguments.get("run_id"), "run_id")
+        return callback(run_id)
     if name == "recall_search":
         _reject_extra(arguments, frozenset({"query", "filters", "limit"}))
         query = _string(arguments.get("query"), "query")
@@ -665,6 +807,58 @@ def bound_response(response: dict, request_id: Any) -> dict:
     )
 
 
+def _tasks_extension_enabled(params: dict, protocol_version: str) -> bool:
+    if protocol_version != "2026-06-30":
+        return False
+    metadata = params.get("_meta")
+    if not isinstance(metadata, dict):
+        return False
+    capabilities = metadata.get("io.modelcontextprotocol/clientCapabilities")
+    if not isinstance(capabilities, dict):
+        return False
+    extensions = capabilities.get("extensions")
+    return (
+        isinstance(extensions, dict)
+        and isinstance(extensions.get("io.modelcontextprotocol/tasks"), dict)
+    )
+
+
+def _task_result(
+    run: dict,
+    task_id: str,
+    *,
+    creation: bool,
+    result: dict | None = None,
+    ttl_ms: int = 604_800_000,
+) -> dict:
+    status = {
+        "queued": "working",
+        "running": "working",
+        "complete": "completed",
+        "partial": "completed",
+        "no_answer": "completed",
+        "failed": "failed",
+        "cancelled": "cancelled",
+    }[run["status"]]
+    value = {
+        "resultType": "task" if creation else "complete",
+        "taskId": task_id,
+        "status": status,
+        "createdAt": run["created_at"],
+        "lastUpdatedAt": run["updated_at"],
+        "ttlMs": ttl_ms,
+        "pollIntervalMs": 1000,
+    }
+    if status == "completed" and result is not None:
+        value["result"] = _tool_result(result)
+    elif status == "failed":
+        value["error"] = {
+            "code": -32603,
+            "message": run.get("error_code", "agent run failed"),
+        }
+    return value
+
+
 def dispatch(
     store,
     principal: dict,
@@ -672,6 +866,9 @@ def dispatch(
     *,
     authorize=None,
     agent=None,
+    agent_lifecycle=None,
+    protocol_version: str = LATEST_PROTOCOL_VERSION,
+    task_name: str | None = None,
 ) -> dict | None:
     request = _object(message, "request")
     request_id = request.get("id")
@@ -716,6 +913,10 @@ def dispatch(
                 "description": "Private, tenant- and source-scoped evidence retrieval.",
             },
         }
+        if selected == "2026-06-30" and agent_lifecycle is not None:
+            result["capabilities"]["extensions"] = {
+                "io.modelcontextprotocol/tasks": {},
+            }
     elif method == "ping":
         require_action("mcp.ping")
         result = {}
@@ -730,15 +931,69 @@ def dispatch(
             raise McpProtocolError(-32602, "unknown tool")
         require_action(f"mcp.{name}", hide=True)
         arguments = _object(params.get("arguments", {}), "arguments")
-        result = _tool_result(
-            _call_tool(
-                store,
-                principal,
-                name,
-                arguments,
-                agent=agent,
+        if (
+            name == "use_recall"
+            and agent_lifecycle is not None
+            and _tasks_extension_enabled(params, protocol_version)
+        ):
+            started = agent_lifecycle["start"](arguments)
+            final = None
+            if started["run"]["status"] in {"complete", "partial", "no_answer"}:
+                final = agent_lifecycle["task_result"](started["task_id"])
+            result = _task_result(
+                started["run"],
+                started["task_id"],
+                creation=True,
+                result=final,
+                ttl_ms=started["ttl_ms"],
             )
+        else:
+            result = _tool_result(
+                _call_tool(
+                    store,
+                    principal,
+                    name,
+                    arguments,
+                    agent=agent,
+                    agent_lifecycle=agent_lifecycle,
+                )
+            )
+    elif method in {"tasks/get", "tasks/update", "tasks/cancel"}:
+        if protocol_version != "2026-06-30" or agent_lifecycle is None:
+            raise McpProtocolError(-32601, "method not found")
+        task_id = _string(params.get("taskId"), "taskId")
+        expected_params = (
+            {"taskId", "inputResponses"}
+            if method == "tasks/update"
+            else {"taskId"}
         )
+        if set(params) != expected_params or task_name != task_id:
+            raise McpProtocolError(-32602, "task routing header is invalid")
+        action = (
+            "mcp.recall_agent_cancel"
+            if method == "tasks/cancel"
+            else "mcp.recall_agent_status"
+        )
+        require_action(action, hide=True)
+        if method == "tasks/update":
+            _object(params["inputResponses"], "inputResponses")
+            agent_lifecycle["task_status"](task_id)
+            raise McpProtocolError(-32602, "task input is not supported")
+        if method == "tasks/cancel":
+            agent_lifecycle["task_cancel"](task_id)
+            result = {"resultType": "complete"}
+        else:
+            state = agent_lifecycle["task_status"](task_id)
+            final = None
+            if state["run"]["status"] in {"complete", "partial", "no_answer"}:
+                final = agent_lifecycle["task_result"](task_id)
+            result = _task_result(
+                state["run"],
+                task_id,
+                creation=False,
+                result=final,
+                ttl_ms=state["ttl_ms"],
+            )
     else:
         raise McpProtocolError(-32601, "method not found")
 

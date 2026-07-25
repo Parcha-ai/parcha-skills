@@ -64,7 +64,7 @@ infrastructure. The example is synthetic; a live manifest belongs in a private m
 location and contains references, never credential values.
 
 The production database gate requires a standard PostgreSQL URL with
-`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 37,
+`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 38,
 pgvector 0.8.0 or newer, and a runtime role without superuser, database/role creation,
 replication, or RLS-bypass privilege:
 
@@ -274,6 +274,23 @@ exposes `use_recall` through MCP and
 deliberately partial receipt-backed summary; it does not call a model. Both
 transports share one domain operation, and the request cannot carry tenant,
 principal, role, source grants, credentials, budgets, or trace policy.
+
+Schema 38 adds durable agent runs. `POST /v1/agent/brains/{tenant}/runs` starts
+detached work; the corresponding run, result, and cancel routes remain bound to
+the authenticated tenant, principal, and current source grants. MCP exposes the
+same compatibility lifecycle as `recall_agent_start`, `recall_agent_status`,
+`recall_agent_result`, and `recall_agent_cancel`. Under MCP `2026-06-30`, Recall
+also advertises `io.modelcontextprotocol/tasks` and returns a native task only
+when the individual `tools/call` opts into that extension. Older or
+non-negotiating clients keep the synchronous `use_recall` result.
+
+Lifecycle rows contain authority identifiers, a request hash, opaque handles,
+state, bounded redacted trace events, and terminal results. They never contain
+the original question, credentials, or source bodies. Expired worker leases become
+`worker_lost_retryable` terminal failures and are never silently rerun. Tune
+only within the validated bounds using `RECALL_AGENT_WORKERS`,
+`RECALL_AGENT_MAX_ACTIVE_PER_PRINCIPAL`, `RECALL_AGENT_LEASE_SECONDS`, and
+`RECALL_AGENT_RETENTION_SECONDS`.
 
 ### Human OAuth and company-brain invitations
 

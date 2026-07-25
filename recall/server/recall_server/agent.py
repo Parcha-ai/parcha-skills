@@ -418,6 +418,14 @@ class RecallAgentService:
         request: Any,
         retrieval: Any,
     ) -> dict[str, Any]:
+        query, context = self.prepare(principal, request)
+        return self.execute(query, context, retrieval)
+
+    def prepare(
+        self,
+        principal: dict[str, Any],
+        request: Any,
+    ) -> tuple[dict[str, Any], DelegationContext]:
         try:
             query = validate_agent_contract(
                 request,
@@ -426,6 +434,14 @@ class RecallAgentService:
         except ContractError as error:
             raise AgentRequestError("agent request is invalid") from error
         context = DelegationContext.from_principal(principal)
+        return query, context
+
+    def execute(
+        self,
+        query: dict[str, Any],
+        context: DelegationContext,
+        retrieval: Any,
+    ) -> dict[str, Any]:
         tools = ConstrainedAgentTools(retrieval, context)
         try:
             bundle = self.runner.run(
