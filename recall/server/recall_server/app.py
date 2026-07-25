@@ -19,6 +19,12 @@ from .admin_web import (
     CSRF_COOKIE,
     SESSION_COOKIE,
 )
+from .agent import (
+    AgentExecutionError,
+    AgentRequestError,
+    RecallAgentService,
+    service_from_env as agent_service_from_env,
+)
 from .admin_web import (
     asset as admin_asset,
 )
@@ -77,6 +83,9 @@ INVITATION_ONBOARDING = re.compile(r"/join/([0-9a-f-]{36})\Z")
 MCP_BRAIN_PATH = re.compile(
     r"/mcp/brains/([A-Za-z0-9][A-Za-z0-9:._@+-]{1,255})\Z"
 )
+AGENT_BRAIN_PATH = re.compile(
+    r"/v1/agent/brains/([A-Za-z0-9][A-Za-z0-9:._@+-]{1,255})/use-recall\Z"
+)
 COUNTERS = {
     "http_requests": 0,
     "http_errors": 0,
@@ -97,6 +106,7 @@ class Handler(BaseHTTPRequestHandler):
     deep_inspector = None
     canonical_plane: CanonicalPlane | None = None
     canonical_retrieval: CanonicalRetrieval | None = None
+    agent_service: RecallAgentService | None = None
     control_plane: ControlPlane | None = None
     external_identity_verifier: ExternalIdentityVerifier | None = None
 
@@ -577,9 +587,13 @@ class Handler(BaseHTTPRequestHandler):
         if not (self.public_mcp_profile() or self.public_edge_profile()):
             return False
         mcp_path = path == "/mcp" or MCP_BRAIN_PATH.fullmatch(path)
+        agent_path = AGENT_BRAIN_PATH.fullmatch(path)
         resource = os.environ.get("RECALL_MCP_RESOURCE_URI", "").rstrip("/")
         metadata_path = self.is_protected_resource_metadata_path(path, resource)
-        allowed = (method == "POST" and bool(mcp_path)) or (
+        allowed = (
+            method == "POST"
+            and (bool(mcp_path) or bool(agent_path))
+        ) or (
             method == "GET"
             and (
                 bool(mcp_path)
@@ -1125,6 +1139,47 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(500, {"error": "webhook failed"})
             return
         brain_match = MCP_BRAIN_PATH.fullmatch(path)
+        agent_match = AGENT_BRAIN_PATH.fullmatch(path)
+        if agent_match:
+            if self.agent_service is None or self.canonical_retrieval is None:
+                self.send_json(404, {"error": "not found"})
+                return
+            principal = self.require(
+                "read",
+                requested_tenant=agent_match.group(1),
+            )
+            if principal is None:
+                return
+            if not self.authorize_mcp(principal, "mcp.use_recall"):
+                self.send_json(403, {"error": "operation not authorized"})
+                return
+            content_type = (
+                self.headers.get("Content-Type", "").split(";", 1)[0].strip().casefold()
+            )
+            if content_type != "application/json":
+                self.send_json(415, {"error": "unsupported content type"})
+                return
+            length = self.body_length(64 * 1024)
+            if length is None:
+                return
+            try:
+                body = json.loads(self.rfile.read(length))
+                retrieval = self.canonical_retrieval.bind(principal)
+                result = self.agent_service.use_recall(
+                    principal,
+                    body,
+                    retrieval,
+                )
+                self.send_json(200, result)
+            except (json.JSONDecodeError, AgentRequestError):
+                self.send_json(400, {"error": "agent request invalid"})
+            except AgentExecutionError as error:
+                LOG.error("agent execution failed type=%s", type(error).__name__)
+                self.send_json(500, {"error": "agent execution failed"})
+            except Exception as error:
+                LOG.error("agent route failed type=%s", type(error).__name__)
+                self.send_json(500, {"error": "agent execution failed"})
+            return
         if path == "/mcp" or brain_match:
             if not self.valid_mcp_origin():
                 return
@@ -1138,6 +1193,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             if not principal:
                 return
+            principal["agent_enabled"] = self.agent_service is not None
             content_type = (
                 self.headers.get("Content-Type", "").split(";", 1)[0].strip().casefold()
             )
@@ -1169,6 +1225,15 @@ class Handler(BaseHTTPRequestHandler):
                     principal,
                     body,
                     authorize=lambda action: self.authorize_mcp(principal, action),
+                    agent=(
+                        lambda arguments: self.agent_service.use_recall(
+                            principal,
+                            arguments,
+                            mcp_store,
+                        )
+                        if self.agent_service is not None
+                        else None
+                    ),
                 )
             except json.JSONDecodeError:
                 self.send_json(
@@ -1439,6 +1504,9 @@ def configure_runtime(dsn: str) -> None:
             if os.environ.get("RECALL_CANONICAL_MCP_ENABLED") == "1"
             else None
         )
+        Handler.agent_service = agent_service_from_env(dict(os.environ))
+        if Handler.agent_service is not None and Handler.canonical_retrieval is None:
+            raise RuntimeError("Recall agent requires canonical MCP retrieval")
     else:
         Handler.archive_store = None
         Handler.evidence_archive_store = None
@@ -1446,6 +1514,7 @@ def configure_runtime(dsn: str) -> None:
         Handler.deep_inspector = None
         Handler.canonical_plane = None
         Handler.canonical_retrieval = None
+        Handler.agent_service = None
     Handler.control_plane = (
         ControlPlane.from_env(Handler.store)
         if os.environ.get("RECALL_ADMIN_WEB_ENABLED") == "1"

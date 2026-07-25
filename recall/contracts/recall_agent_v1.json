@@ -70,7 +70,7 @@
     "trace_event": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["contract", "schema_version", "trace_id", "run_id", "sequence", "occurred_at", "stage", "outcome", "elapsed_ms", "receipt_count", "source_count", "session_count"],
+      "required": ["contract", "schema_version", "trace_id", "run_id", "sequence", "occurred_at", "stage", "outcome", "elapsed_ms", "receipts", "receipt_count", "source_count", "session_count"],
       "properties": {
         "contract": {"const": "recall.agent-trace-event.v1"},
         "schema_version": {"const": 1},
@@ -81,6 +81,12 @@
         "stage": {"enum": ["authorize", "plan", "retrieve", "inspect", "synthesize", "verify", "complete"]},
         "outcome": {"enum": ["started", "ok", "degraded", "denied", "failed"]},
         "elapsed_ms": {"type": "number", "minimum": 0, "maximum": 120000},
+        "receipts": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/receipt"}
+        },
         "receipt_count": {"type": "integer", "minimum": 0, "maximum": 100000},
         "source_count": {"type": "integer", "minimum": 0, "maximum": 100000},
         "session_count": {"type": "integer", "minimum": 0, "maximum": 100000},

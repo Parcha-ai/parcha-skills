@@ -242,6 +242,7 @@ def _trace_event(value: dict[str, Any]) -> None:
             "stage",
             "outcome",
             "elapsed_ms",
+            "receipts",
             "receipt_count",
             "source_count",
             "session_count",
@@ -266,9 +267,17 @@ def _trace_event(value: dict[str, Any]) -> None:
     )
     _enum(value["outcome"], {"started", "ok", "degraded", "denied", "failed"})
     _number(value["elapsed_ms"])
+    receipts = value["receipts"]
+    if not isinstance(receipts, list) or len(receipts) > 256:
+        raise ContractError("agent trace receipts are invalid")
+    receipt_values = [_receipt(item) for item in receipts]
+    if len(receipt_values) != len(set(receipt_values)):
+        raise ContractError("agent trace receipts contain duplicates")
     _integer(value["receipt_count"], maximum=100_000)
     _integer(value["source_count"], maximum=100_000)
     _integer(value["session_count"], maximum=100_000)
+    if value["receipt_count"] != len(receipt_values):
+        raise ContractError("agent trace receipt count is inconsistent")
     if "tool" in value:
         _identity(value["tool"])
     if "error_code" in value:
@@ -396,6 +405,13 @@ def validate_agent_exchange(
         for item in trace
     ):
         raise ContractError("agent trace lineage mismatch")
+    trace_sources = {
+        urlsplit(receipt).netloc
+        for item in trace
+        for receipt in item["receipts"]
+    }
+    if not trace_sources <= set(auth["source_ids"]):
+        raise ContractError("agent trace receipt source scope mismatch")
     if trace[0]["stage"] != "authorize" or trace[-1]["stage"] != "complete":
         raise ContractError("agent trace has no closed lifecycle")
     expected_run_status = {
@@ -405,7 +421,12 @@ def validate_agent_exchange(
     }[answer["status"]]
     if execution["status"] != expected_run_status:
         raise ContractError("agent run and result status mismatch")
-    if max(item["receipt_count"] for item in trace) < len(answer["citations"]):
+    opened_receipts = {
+        receipt
+        for item in trace
+        for receipt in item["receipts"]
+    }
+    if not set(answer["citations"]) <= opened_receipts:
         raise ContractError("agent trace does not account for answer citations")
     granted_sources = set(auth["source_ids"])
     cited_sources = {urlsplit(receipt).netloc for receipt in answer["citations"]}

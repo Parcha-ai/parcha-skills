@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path[:0] = [str(ROOT / "recall"), str(ROOT / "recall/server")]
 
 from client.mac import canonical_envelope
+from recall_server.agent import RecallAgentService, ScriptedAgentRunner
 from recall_server.app import Handler
 from recall_server.authorization import VerifiedExternalIdentity
 from recall_server.archive import FilesystemArchiveStore
@@ -117,6 +118,32 @@ def rpc(
     status, payload = raw_rpc(server, token, name, arguments, path=path)
     assert status == 200, payload
     return payload
+
+
+def agent_http(
+    server: ThreadingHTTPServer,
+    token: str,
+    tenant_id: str,
+    request: dict,
+) -> tuple[int, dict]:
+    body = json.dumps(request).encode()
+    connection = http.client.HTTPConnection(
+        "127.0.0.1", server.server_port, timeout=10
+    )
+    connection.request(
+        "POST",
+        f"/v1/agent/brains/{tenant_id}/use-recall",
+        body=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Content-Length": str(len(body)),
+        },
+    )
+    response = connection.getresponse()
+    payload = json.loads(response.read())
+    connection.close()
+    return response.status, payload
 
 
 class SyntheticExternalVerifier:
@@ -535,6 +562,14 @@ def main() -> None:
             evidence_projector,
         )
         Handler.canonical_retrieval = retrieval
+        fixed_agent_time = datetime(
+            2026, 7, 25, 10, 0, tzinfo=timezone.utc
+        )
+        Handler.agent_service = RecallAgentService(
+            ScriptedAgentRunner(),
+            clock=lambda: fixed_agent_time,
+            monotonic=lambda: 10.0,
+        )
         Handler.control_plane = control
         Handler.external_identity_verifier = SyntheticExternalVerifier()
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -628,6 +663,56 @@ def main() -> None:
                 for event in item["context"]["events"]
             )
             assert occurrence_order
+
+            agent_request = {
+                "contract": "recall.agent-request.v1",
+                "schema_version": 1,
+                "request_id": "req_0123456789abcdef",
+                "idempotency_key": "synthetic-company-agent-e2e",
+                "question": "What changed in the synthetic atlas harness?",
+                "depth": "deep",
+                "since": "2026-07-22T00:00:00Z",
+                "until": "2026-07-24T23:59:59Z",
+            }
+            agent_http_status, agent_http_result = agent_http(
+                server,
+                company_token["token"],
+                COMPANY,
+                agent_request,
+            )
+            assert agent_http_status == 200
+            agent_mcp_result = rpc(
+                server,
+                company_token["token"],
+                "use_recall",
+                agent_request,
+                path=f"/mcp/brains/{COMPANY}",
+            )["result"]["structuredContent"]
+            assert agent_http_result == agent_mcp_result
+            assert agent_http_result["result"]["status"] == "partial"
+            agent_receipts = set(agent_http_result["result"]["citations"])
+            assert agent_receipts
+            assert agent_receipts <= returned_receipts
+            rendered_agent_trace = json.dumps(agent_http_result["trace"])
+            assert agent_request["question"] not in rendered_agent_trace
+            assert PERSONAL_SOURCE not in rendered_agent_trace
+            assert OUTSIDER_SOURCE not in rendered_agent_trace
+            for forbidden in (
+                '"prompt"',
+                '"answer"',
+                '"payload"',
+                '"token"',
+                '"transcript"',
+            ):
+                assert forbidden not in rendered_agent_trace
+            denied_agent_status, denied_agent = agent_http(
+                server,
+                company_token["token"],
+                PERSONAL,
+                agent_request,
+            )
+            assert denied_agent_status == 401
+            assert denied_agent == {"error": "unauthorized"}
 
             deep = rpc(
                 server,
@@ -1082,6 +1167,7 @@ def main() -> None:
             thread.join(timeout=5)
             Handler.external_identity_verifier = None
             Handler.control_plane = None
+            Handler.agent_service = None
             for name, value in previous.items():
                 if value is None:
                     os.environ.pop(name, None)
@@ -1121,6 +1207,12 @@ def main() -> None:
                 "investigate_response_bytes": len(
                     json.dumps(investigated).encode()
                 ),
+                "agent_http_calls": 1,
+                "agent_mcp_calls": 1,
+                "agent_transport_parity": 1.0,
+                "agent_exact_receipts": len(agent_receipts),
+                "agent_cross_brain_accepts": 0,
+                "agent_trace_content_leaks": 0,
                 "deep_search_tool_calls": 1,
                 "deep_search_provider": deep["coverage"]["provider"],
                 "deep_search_files": deep["coverage"]["files_scanned"],
