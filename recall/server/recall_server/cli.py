@@ -106,6 +106,9 @@ def main() -> None:
         "--max-batches-per-cycle", type=int, default=10
     )
     canonical_embedding_worker.add_argument(
+        "--parallel-tenants", type=int, default=1
+    )
+    canonical_embedding_worker.add_argument(
         "--interval-seconds", type=float, default=5
     )
     canonical_embedding_worker.add_argument("--once", action="store_true")
@@ -433,6 +436,7 @@ def main() -> None:
                 run_canonical_embedding_worker(
                     CanonicalRetrieval(store),
                     tenant_id=args.tenant,
+                    parallel_tenants=args.parallel_tenants,
                     batch_size=args.batch_size,
                     max_batches_per_cycle=args.max_batches_per_cycle,
                     interval_seconds=args.interval_seconds,
