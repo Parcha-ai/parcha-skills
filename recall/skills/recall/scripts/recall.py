@@ -229,6 +229,12 @@ def _read_remote_object(response) -> dict:
     return rendered
 
 
+def _mcp_time_bound(value):
+    if isinstance(value, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return value + "T00:00:00Z"
+    return value
+
+
 def _mcp_call(base: str, method: str, path: str, body: dict | None) -> dict:
     if path == "/v1/session-export":
         raise RemoteRecallError("session export is not available over MCP")
@@ -282,6 +288,12 @@ def _mcp_call(base: str, method: str, path: str, body: dict | None) -> dict:
         arguments = {
             key: value for key, value in arguments.items() if value is not None
         }
+        filters = arguments.get("filters")
+        if isinstance(filters, dict):
+            arguments["filters"] = {
+                key: _mcp_time_bound(value) if key in {"since", "until"} else value
+                for key, value in filters.items()
+            }
         message = {
             "jsonrpc": "2.0",
             "id": 1,

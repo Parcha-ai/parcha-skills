@@ -396,6 +396,8 @@ class BoundCanonicalRetrieval:
             if value is not None:
                 if not isinstance(value, str):
                     raise ValueError("invalid temporal filter")
+                if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                    value += "T00:00:00Z"
                 parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
                 if parsed.tzinfo is None:
                     raise ValueError("invalid temporal filter")

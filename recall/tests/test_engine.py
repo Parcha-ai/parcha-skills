@@ -1017,6 +1017,7 @@ class RemoteTransportTest(unittest.TestCase):
         try:
             code, output, error = self.call(
                 "search", "deadbeef", "--limit", "5",
+                "--since", "2026-01-01", "--until", "2026-02-01",
                 "--source-family", "coding_history",
             )
             self.assertEqual((code, error), (0, ""))
@@ -1031,7 +1032,11 @@ class RemoteTransportTest(unittest.TestCase):
                 "name": "recall_search",
                 "arguments": {
                     "query": "deadbeef",
-                    "filters": {"source_family": "coding_history"},
+                    "filters": {
+                        "since": "2026-01-01T00:00:00Z",
+                        "until": "2026-02-01T00:00:00Z",
+                        "source_family": "coding_history",
+                    },
                     "limit": 5,
                 },
             })

@@ -554,6 +554,15 @@ class RemoteMcpContractTest(unittest.TestCase):
             20,
         )
         self.assertEqual(
+            tools["recall_search"]["properties"]["filters"]["properties"]["since"],
+            {
+                "oneOf": [
+                    {"type": "string", "format": "date"},
+                    {"type": "string", "format": "date-time"},
+                ]
+            },
+        )
+        self.assertEqual(
             tools["recall_related"]["properties"]["limit"]["maximum"],
             20,
         )

@@ -14,6 +14,12 @@ SUPPORTED_PROTOCOL_VERSIONS = frozenset(
 REQUEST_METHODS = ("initialize", "ping", "tools/list", "tools/call")
 NOTIFICATION_METHODS = ("notifications/initialized",)
 MAX_MCP_RESPONSE_BYTES = 1024 * 1024
+TIME_BOUND_SCHEMA = {
+    "oneOf": [
+        {"type": "string", "format": "date"},
+        {"type": "string", "format": "date-time"},
+    ]
+}
 
 
 @dataclass(frozen=True)
@@ -124,8 +130,8 @@ ALL_READ_TOOLS = (
                     "type": "object",
                     "default": {},
                     "properties": {
-                        "since": {"type": "string", "format": "date-time"},
-                        "until": {"type": "string", "format": "date-time"},
+                        "since": TIME_BOUND_SCHEMA,
+                        "until": TIME_BOUND_SCHEMA,
                         "source_id": {"type": "string"},
                         "source_family": {"type": "string"},
                         "source_alias": {"type": "string"},
@@ -163,8 +169,8 @@ ALL_READ_TOOLS = (
                     "type": "object",
                     "default": {},
                     "properties": {
-                        "since": {"type": "string", "format": "date-time"},
-                        "until": {"type": "string", "format": "date-time"},
+                        "since": TIME_BOUND_SCHEMA,
+                        "until": TIME_BOUND_SCHEMA,
                         "source_id": {"type": "string"},
                         "source_family": {"type": "string"},
                         "source_alias": {"type": "string"},
@@ -198,8 +204,8 @@ ALL_READ_TOOLS = (
                     "type": "object",
                     "default": {},
                     "properties": {
-                        "since": {"type": "string", "format": "date-time"},
-                        "until": {"type": "string", "format": "date-time"},
+                        "since": TIME_BOUND_SCHEMA,
+                        "until": TIME_BOUND_SCHEMA,
                         "source_id": {"type": "string"},
                         "source_family": {"type": "string"},
                         "source_alias": {"type": "string"},
