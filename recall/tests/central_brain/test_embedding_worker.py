@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import sys
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -38,6 +39,39 @@ class FakeRetrieval:
             }
         )
         return self.results.pop(0)
+
+
+class ParallelRetrieval:
+    def __init__(self) -> None:
+        self.barrier = threading.Barrier(2)
+        self.calls: list[str] = []
+        self.store = self
+
+    @contextmanager
+    def connect(self):
+        yield self
+
+    def execute(self, sql):
+        if "FROM canonical_sources" not in sql:
+            raise AssertionError(sql)
+        return SimpleNamespace(
+            fetchall=lambda: [
+                {"tenant_id": "tenant:company:example"},
+                {"tenant_id": "tenant:personal:example"},
+            ]
+        )
+
+    def embed_pending(
+        self,
+        *,
+        tenant_id: str | None,
+        batch_size: int,
+        max_batches: int,
+    ) -> dict[str, int | str]:
+        assert tenant_id is not None
+        self.calls.append(tenant_id)
+        self.barrier.wait(timeout=1)
+        return {"status": "complete", "processed": 5000, "batches": 1}
 
 
 class EmbeddingWorkerTests(TestCase):
@@ -246,6 +280,26 @@ class EmbeddingWorkerTests(TestCase):
         self.assertEqual(len(retrieval.calls), 2)
         self.assertEqual(sleeps, [3])
 
+    def test_worker_drains_tenants_in_parallel_and_aggregates_results(self) -> None:
+        retrieval = ParallelRetrieval()
+
+        result = run_canonical_embedding_worker(
+            retrieval,  # type: ignore[arg-type]
+            tenant_id=None,
+            parallel_tenants=2,
+            batch_size=5000,
+            max_batches_per_cycle=10,
+            interval_seconds=5,
+            once=True,
+        )
+
+        self.assertEqual(result["processed"], 10_000)
+        self.assertEqual(result["batches"], 2)
+        self.assertEqual(
+            sorted(retrieval.calls),
+            ["tenant:company:example", "tenant:personal:example"],
+        )
+
     def test_worker_rejects_unbounded_configuration(self) -> None:
         retrieval = FakeRetrieval([])
         with self.assertRaisesRegex(ValueError, "batch size"):
@@ -253,6 +307,26 @@ class EmbeddingWorkerTests(TestCase):
                 retrieval,  # type: ignore[arg-type]
                 tenant_id=None,
                 batch_size=5001,
+                max_batches_per_cycle=1,
+                interval_seconds=1,
+                once=True,
+            )
+        with self.assertRaisesRegex(ValueError, "parallel tenants"):
+            run_canonical_embedding_worker(
+                retrieval,  # type: ignore[arg-type]
+                tenant_id=None,
+                parallel_tenants=9,
+                batch_size=5000,
+                max_batches_per_cycle=1,
+                interval_seconds=1,
+                once=True,
+            )
+        with self.assertRaisesRegex(ValueError, "combine one tenant"):
+            run_canonical_embedding_worker(
+                retrieval,  # type: ignore[arg-type]
+                tenant_id="tenant:company:example",
+                parallel_tenants=2,
+                batch_size=5000,
                 max_batches_per_cycle=1,
                 interval_seconds=1,
                 once=True,
