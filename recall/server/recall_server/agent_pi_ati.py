@@ -628,7 +628,7 @@ class SubprocessBrainTurnTransport:
             data = terminal["data"]
             attestation = data.get("model_attestation")
             if (
-                data.get("status") != "complete"
+                data.get("status") not in {"complete", "silent"}
                 or data.get("unresolved_call_ids") != []
                 or not isinstance(attestation, dict)
                 or attestation.get("route_kind") != self.route_kind
