@@ -627,10 +627,18 @@ class SubprocessBrainTurnTransport:
                 )
             data = terminal["data"]
             attestation = data.get("model_attestation")
+            if data.get("status") not in {"complete", "silent"}:
+                raise AgentExecutionError(
+                    "ATI completed with an invalid success status",
+                    code="agent_terminal_status_invalid",
+                )
+            if data.get("unresolved_call_ids") != []:
+                raise AgentExecutionError(
+                    "ATI completed with unresolved tool calls",
+                    code="agent_unresolved_tool_calls",
+                )
             if (
-                data.get("status") not in {"complete", "silent"}
-                or data.get("unresolved_call_ids") != []
-                or not isinstance(attestation, dict)
+                not isinstance(attestation, dict)
                 or attestation.get("route_kind") != self.route_kind
                 or attestation.get("provider") != self.provider
                 or attestation.get("route_identity")

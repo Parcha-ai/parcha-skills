@@ -648,6 +648,22 @@ print(json.dumps({"v":"ati.brain.turn.v1","turn_id":s["turn_id"],"seq":0,"type":
 """,
                 "agent_model_attestation_invalid",
             ),
+            "invalid-success-status": (
+                """
+import json,sys
+s=json.loads(sys.stdin.readline())
+print(json.dumps({"v":"ati.brain.turn.v1","turn_id":s["turn_id"],"seq":0,"type":"terminal.complete","at":"2026-07-25T10:00:00Z","data":{"status":"waiting","unresolved_call_ids":[],"model_attestation":{"model_alias":"gemma-4-31b","route_kind":"direct_provider","provider":"cerebras","route_identity":"api.cerebras.ai"}}}),flush=True)
+""",
+                "agent_terminal_status_invalid",
+            ),
+            "unresolved-tools": (
+                """
+import json,sys
+s=json.loads(sys.stdin.readline())
+print(json.dumps({"v":"ati.brain.turn.v1","turn_id":s["turn_id"],"seq":0,"type":"terminal.complete","at":"2026-07-25T10:00:00Z","data":{"status":"complete","unresolved_call_ids":["call-pending"],"model_attestation":{"model_alias":"gemma-4-31b","route_kind":"direct_provider","provider":"cerebras","route_identity":"api.cerebras.ai"}}}),flush=True)
+""",
+                "agent_unresolved_tool_calls",
+            ),
             "timeout": (
                 "import time; time.sleep(2)",
                 "agent_model_timeout",
