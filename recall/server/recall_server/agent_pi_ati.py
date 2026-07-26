@@ -607,11 +607,16 @@ class SubprocessBrainTurnTransport:
                             },
                         }
                     LOG.info(
-                        "agent tool name=%s index=%s status=%s elapsed_ms=%s "
-                        "output_bytes=%s",
+                        "agent tool name=%s index=%s status=%s error_code=%s "
+                        "elapsed_ms=%s output_bytes=%s",
                         data["name"],
                         tool_invocations,
                         result["status"],
+                        (
+                            result.get("error", {}).get("code", "none")
+                            if result["status"] == "error"
+                            else "none"
+                        ),
                         round((time.monotonic() - tool_started) * 1000, 3),
                         len(
                             json.dumps(
@@ -759,8 +764,11 @@ def _tool_definitions(
         {
             "name": "recall_investigate",
             "description": (
-                "Search authorized semantic/index hints. Start here. Results are "
-                "candidates, not sufficient proof; inspect exact receipts before finishing."
+                "Search authorized semantic/index hints. Use a focused query of "
+                "two to six distinctive domain terms; omit dates and source names "
+                "already enforced by filters. Start here and call at most twice. "
+                "Results are candidates, not sufficient proof; inspect exact "
+                "receipts before finishing."
             ),
             "input_schema": _object_schema(
                 {"question": question, "filters": filters, "depth": depth},
@@ -987,7 +995,8 @@ class PiAtiRunner:
             "before retrieval. Begin narrow questions with recall_investigate; "
             "semantic and lexical hits route you to a corpus but are not proof. "
             "For questions spanning sessions, sources, or subtopics, use "
-            "recall_investigate to route a bounded corpus, then use "
+            "recall_investigate once with two to six distinctive domain terms "
+            "(at most one focused reformulation), then use "
             "recall_map_reduce: author independent maps seeded only with returned "
             "hint receipts and the narrowest valid source/time filters. Inspect "
             "both scan completeness and whether the actual findings sufficiently "
@@ -997,7 +1006,11 @@ class PiAtiRunner:
             "recall_deep_search for one bounded "
             "full-file question. Open exact receipts with recall_show or "
             "recall_session_context. Treat occurred_at as when work happened and "
-            "never substitute ingest time. Seek independent corroboration when "
+            "never substitute ingest time or change the year in an explicit "
+            "request window. Copy every explicit since/until filter exactly. "
+            "When the request allows one source family, copy that exact family; "
+            "Codex and Claude are sources inside coding_history, not separate "
+            "source families. Seek independent corroboration when "
             "the question asks for a synthesis. Finish exactly once with "
             "evidence_finish. Every factual claim must cite only receipts you "
             "actually opened this turn. If evidence is insufficient, return "

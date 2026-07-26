@@ -20,6 +20,7 @@ class DeadlineStore:
 
     def __init__(self) -> None:
         self.deadline_at: float | None = None
+        self.deadlines: list[float] = []
 
     @contextmanager
     def connect(self):
@@ -27,6 +28,7 @@ class DeadlineStore:
 
     def _execute_bounded(self, _connection, _sql, _values, deadline_at):
         self.deadline_at = deadline_at
+        self.deadlines.append(deadline_at)
         raise SearchDeadlineExceeded("synthetic canonical deadline")
 
 
@@ -36,6 +38,28 @@ class SemanticRuntime:
     @staticmethod
     def embed_query_bounded(_query):
         return [0.0, 1.0]
+
+
+class EmptyRows:
+    @staticmethod
+    def fetchall():
+        return []
+
+
+class RecordingStore:
+    search_deadline_ms = 25
+    semantic_runtime = None
+
+    def __init__(self) -> None:
+        self.sql: list[str] = []
+
+    @contextmanager
+    def connect(self):
+        yield object()
+
+    def _execute_bounded(self, _connection, sql, _values, _deadline_at):
+        self.sql.append(" ".join(sql.split()))
+        return EmptyRows()
 
 
 class CanonicalRetrievalDeadlineTest(unittest.TestCase):
@@ -67,7 +91,7 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
         self.assertGreaterEqual(store.deadline_at, started)
         self.assertLessEqual(store.deadline_at, started + 0.1)
 
-    def test_semantic_database_query_uses_the_same_hard_deadline(self) -> None:
+    def test_semantic_database_query_gets_an_independent_hard_deadline(self) -> None:
         store = DeadlineStore()
         store.semantic_runtime = SemanticRuntime()
         retrieval = BoundCanonicalRetrieval(
@@ -85,6 +109,8 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
             result["diagnostics"]["semantic_status"],
             "deadline-exceeded",
         )
+        self.assertEqual(len(store.deadlines), 2)
+        self.assertGreaterEqual(store.deadlines[1], store.deadlines[0])
 
     def test_session_expansion_uses_the_caller_deadline(self) -> None:
         store = DeadlineStore()
@@ -101,6 +127,26 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
                 _deadline_at=time.monotonic() + 0.025,
             )
         self.assertIsNotNone(store.deadline_at)
+
+    def test_lexical_search_ranks_bounded_chunks_before_metadata_joins(self) -> None:
+        store = RecordingStore()
+        retrieval = BoundCanonicalRetrieval(
+            store,
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=("codex.jsonl:test",),
+        )
+
+        retrieval.search("ATI harness default runtime")
+
+        self.assertEqual(len(store.sql), 2)
+        for sql in store.sql:
+            self.assertIn("WITH candidates AS MATERIALIZED", sql)
+            self.assertIn("FROM candidates candidate", sql)
+            self.assertLess(
+                sql.index("LIMIT %s ) SELECT"),
+                sql.index("JOIN canonical_documents"),
+            )
 
 
 if __name__ == "__main__":

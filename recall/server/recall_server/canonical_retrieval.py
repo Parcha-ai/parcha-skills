@@ -497,6 +497,7 @@ class BoundCanonicalRetrieval:
                 },
             }
         candidate_limit = min(100, max(20, limit * 5))
+        lexical_candidate_limit = min(2_000, max(200, candidate_limit * 20))
         lexical_deadline_at = (
             time.monotonic() + self.store.search_deadline_ms / 1000
         )
@@ -509,42 +510,52 @@ class BoundCanonicalRetrieval:
         ) -> list[dict[str, Any]]:
             rows = self.store._execute_bounded(
                 connection,
-                """SELECT chunk.source_id,document.native_id,document.revision,
-                          event.native_parent_id,event.occurred_at,event.observed_at,
-                          event.created_at,chunk.text_redacted,chunk.receipt,
-                          ts_rank_cd(
+                """WITH candidates AS MATERIALIZED (
+                     SELECT chunk.tenant_id,chunk.source_id,chunk.document_id,
+                            chunk.chunk_id,chunk.text_redacted,chunk.receipt,
                             chunk.search_vector,
-                            websearch_to_tsquery('simple',%s),
-                            32
-                          ) AS score,
+                            ts_rank_cd(
+                              chunk.search_vector,
+                              websearch_to_tsquery('simple',%s),
+                              32
+                            ) AS score
+                     FROM canonical_chunks chunk
+                     WHERE chunk.tenant_id=%s
+                       AND chunk.source_id=ANY(%s)
+                       AND chunk.deleted_at IS NULL
+                       AND chunk.search_vector @@
+                           websearch_to_tsquery('simple',%s)
+                     ORDER BY score DESC,chunk.chunk_id
+                     LIMIT %s
+                   )
+                   SELECT candidate.source_id,document.native_id,document.revision,
+                          event.native_parent_id,event.occurred_at,event.observed_at,
+                          event.created_at,candidate.text_redacted,candidate.receipt,
+                          candidate.score,
                           (SELECT count(*)
                              FROM unnest(%s::text[]) AS query_term(value)
-                            WHERE chunk.search_vector @@
+                            WHERE candidate.search_vector @@
                                   plainto_tsquery('simple',query_term.value)
                           ) AS matched_term_count
-                   FROM canonical_chunks chunk
+                   FROM candidates candidate
                    JOIN canonical_documents document
                      USING(tenant_id,source_id,document_id)
                    JOIN canonical_events event
                      USING(tenant_id,source_id,event_id)
-                   WHERE chunk.tenant_id=%s
-                     AND chunk.source_id=ANY(%s)
-                     AND chunk.deleted_at IS NULL
-                     AND document.is_current
+                   WHERE document.is_current
                      AND document.deleted_at IS NULL
-                     AND chunk.search_vector @@
-                         websearch_to_tsquery('simple',%s)
                      AND (%s::timestamptz IS NULL OR event.occurred_at>=%s)
                      AND (%s::timestamptz IS NULL OR event.occurred_at<=%s)
                    ORDER BY matched_term_count DESC,score DESC,
-                            event.occurred_at DESC,chunk.chunk_id
+                            event.occurred_at DESC,candidate.chunk_id
                    LIMIT %s""",
                 (
                     search_query,
-                    informative,
                     self.tenant_id,
                     sources,
                     search_query,
+                    lexical_candidate_limit,
+                    informative,
                     since,
                     since,
                     until,
@@ -596,29 +607,46 @@ class BoundCanonicalRetrieval:
                 semantic_status = "unavailable"
             else:
                 try:
+                    semantic_candidate_limit = min(
+                        5_000,
+                        max(1_000, candidate_limit * 50),
+                    )
+                    semantic_deadline_at = (
+                        time.monotonic()
+                        + self.store.search_deadline_ms / 1000
+                    )
                     with self.store.connect() as connection:
                         semantic = self.store._execute_bounded(
                             connection,
-                            """SELECT chunk.source_id,document.native_id,document.revision,
+                            """WITH candidates AS MATERIALIZED (
+                                 SELECT embedding.tenant_id,embedding.source_id,
+                                        embedding.chunk_id,
+                                        embedding.embedding <=> %s::halfvec AS distance
+                                 FROM canonical_chunk_embeddings embedding
+                                 WHERE embedding.tenant_id=%s
+                                   AND embedding.source_id=ANY(%s)
+                                   AND embedding.runtime_fingerprint=%s
+                                 ORDER BY embedding.embedding <=> %s::halfvec
+                                 LIMIT %s
+                               )
+                               SELECT chunk.source_id,document.native_id,
+                                      document.revision,
                               event.native_parent_id,event.occurred_at,event.observed_at,
                               event.created_at,chunk.text_redacted,chunk.receipt,
-                              1-(embedding.embedding <=> %s::halfvec) AS score
-                       FROM canonical_chunk_embeddings embedding
+                              1-candidate.distance AS score
+                       FROM candidates candidate
                        JOIN canonical_chunks chunk
                          USING(tenant_id,source_id,chunk_id)
                        JOIN canonical_documents document
                          USING(tenant_id,source_id,document_id)
                        JOIN canonical_events event
                          USING(tenant_id,source_id,event_id)
-                       WHERE chunk.tenant_id=%s
-                         AND chunk.source_id=ANY(%s)
-                         AND embedding.runtime_fingerprint=%s
-                         AND chunk.deleted_at IS NULL
+                       WHERE chunk.deleted_at IS NULL
                          AND document.is_current
                          AND document.deleted_at IS NULL
                          AND (%s::timestamptz IS NULL OR event.occurred_at>=%s)
                          AND (%s::timestamptz IS NULL OR event.occurred_at<=%s)
-                       ORDER BY embedding.embedding <=> %s::halfvec,
+                       ORDER BY candidate.distance,
                                 event.occurred_at DESC,chunk.chunk_id
                        LIMIT %s""",
                             (
@@ -626,14 +654,15 @@ class BoundCanonicalRetrieval:
                                 self.tenant_id,
                                 sources,
                                 runtime.fingerprint,
-                                since,
-                                since,
-                                until,
-                                until,
                                 vector,
+                                semantic_candidate_limit,
+                                since,
+                                since,
+                                until,
+                                until,
                                 candidate_limit,
                             ),
-                            lexical_deadline_at,
+                            semantic_deadline_at,
                         ).fetchall()
                 except SearchDeadlineExceeded:
                     semantic_status = "deadline-exceeded"
@@ -1086,37 +1115,27 @@ class BoundCanonicalRetrieval:
             except SearchDeadlineExceeded:
                 rows = []
             source_families = [row["family"] for row in rows]
+        accounting_status = "ok"
         try:
             with self.store.connect() as connection:
                 configured_rows = self.store._execute_bounded(
                     connection,
-                    """SELECT source.source_id,max(job.updated_at) AS last_activity_at
-                       FROM canonical_sources source
-                       LEFT JOIN canonical_ingest_jobs job
-                         USING(tenant_id,source_id)
-                       WHERE source.tenant_id=%s
-                         AND source.source_id=ANY(%s)
-                       GROUP BY source.source_id
-                       ORDER BY source.source_id""",
+                    """SELECT source_id
+                       FROM canonical_sources
+                       WHERE tenant_id=%s
+                         AND source_id=ANY(%s)
+                       ORDER BY source_id""",
                     (self.tenant_id, list(self.authorized_sources)),
                     deadline_at,
                 ).fetchall()
         except SearchDeadlineExceeded:
             configured_rows = []
-        configured = {
-            row["source_id"]: row["last_activity_at"]
-            for row in configured_rows
-        }
-        stale_cutoff = datetime.now(timezone.utc) - timedelta(days=7)
-        stale_sources = sorted(
-            source
-            for source in eligible_sources
-            if source in configured
-            and (
-                configured[source] is None
-                or configured[source].astimezone(timezone.utc) < stale_cutoff
-            )
-        )
+            accounting_status = "deadline-exceeded"
+        configured = {row["source_id"] for row in configured_rows}
+        if accounting_status != "ok":
+            # Search evidence already proved these grants are live. Optional
+            # accounting must never turn a healthy source into a false outage.
+            configured.update(source_ids)
         occurred = [
             event["occurred_at"]
             for item in investigations
@@ -1152,13 +1171,15 @@ class BoundCanonicalRetrieval:
                 "latest_occurred_at": max(occurred) if occurred else None,
                 "source_accounting": {
                     "searched": eligible_sources,
-                    "stale": stale_sources,
+                    "stale": [],
                     "filtered": sorted(
                         set(self.authorized_sources) - set(eligible_sources)
                     ),
                     "unavailable": sorted(
                         set(self.authorized_sources) - set(configured)
                     ),
+                    "freshness_status": "not_evaluated",
+                    "accounting_status": accounting_status,
                     "stale_after_seconds": 7 * 24 * 60 * 60,
                 },
             },
