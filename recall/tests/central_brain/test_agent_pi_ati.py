@@ -604,6 +604,33 @@ send(1,"terminal.complete",{"status":"complete","unresolved_call_ids":[],"model_
         self.assertNotIn("LITELLM_API_KEY", transport.child_environment)
         self.assertNotIn("synthetic-provider-key-value", repr(key))
 
+    def test_direct_cerebras_accepts_silent_success_terminal(self):
+        child = r"""
+import json,sys
+start=json.loads(sys.stdin.readline())
+print(json.dumps({"v":"ati.brain.turn.v1","turn_id":start["turn_id"],"seq":0,"type":"terminal.complete","at":"2026-07-25T10:00:00Z","data":{"status":"silent","unresolved_call_ids":[],"model_attestation":{"model_alias":"gemma-4-31b","thinking":"low","route_kind":"direct_provider","provider":"cerebras","route_identity":"api.cerebras.ai"}}}),flush=True)
+"""
+        transport = SubprocessBrainTurnTransport(
+            (sys.executable, "-c", child),
+            model_base_url=CEREBRAS_API_BASE_URL,
+            route_kind="direct_provider",
+            provider="cerebras",
+            provider_key=ProviderKey(
+                value="synthetic-provider-key-value",
+            ),
+            expected_route_identity="api.cerebras.ai",
+            environment={"PATH": os.environ["PATH"]},
+        )
+        outcome = transport.run(
+            {
+                "turn_id": "turn_silent",
+                "data": {"model": {"alias": "gemma-4-31b"}},
+            },
+            lambda *_args: {},
+            timeout_seconds=3,
+        )
+        self.assertEqual(outcome["terminal"]["status"], "silent")
+
     def test_transport_rejects_malformed_unattested_and_timed_out_children(self):
         key = ProviderKey(
             value="synthetic-provider-key-value",
