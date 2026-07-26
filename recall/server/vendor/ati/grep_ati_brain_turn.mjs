@@ -86159,7 +86159,9 @@ var RemoteToolBridge = class {
         }
       });
     }
-    registerInteractionTools(this.runtime);
+    if (start.capabilities?.includes("interaction:question")) {
+      registerInteractionTools(this.runtime);
+    }
     new DeliveryTools().register(this.runtime);
   }
   start;
