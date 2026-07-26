@@ -66,6 +66,7 @@ class SyntheticRetrieval:
     def __init__(self, *, fail_deep: bool = False):
         self.calls: list[str] = []
         self.filters: list[dict] = []
+        self.map_batches: list[list[str]] = []
         self.fail_deep = fail_deep
 
     def investigate(self, question, *, filters, depth):
@@ -73,6 +74,10 @@ class SyntheticRetrieval:
         self.filters.append(dict(filters))
         return {
             "question_interpretation": {"time_basis": "occurred_at"},
+            "routing_hints": [
+                {"receipt": DECISION},
+                {"receipt": IMPLEMENTATION},
+            ],
             "investigations": [{
                 "match": {
                     "receipt": HINT,
@@ -108,6 +113,60 @@ class SyntheticRetrieval:
                 "sources": [SOURCE],
                 "provider": "synthetic-archil",
                 "complete": True,
+            },
+        }
+
+    def map_reduce_search(self, question, *, maps, depth):
+        self.calls.append("recall_map_reduce")
+        self.map_batches.append([item["map_id"] for item in maps])
+        self.filters.extend(dict(item["filters"]) for item in maps)
+        rendered_maps = []
+        for index, item in enumerate(maps):
+            implementation = (
+                "implementation" in item["map_id"]
+                or "verification" in item["map_id"]
+                or index > 0
+            )
+            rendered_maps.append({
+                "map_id": item["map_id"],
+                "objective": item["objective"],
+                "query": item["query"],
+                "filters": item["filters"],
+                "status": "complete",
+                "findings": [{
+                    "receipt": IMPLEMENTATION if implementation else DECISION,
+                    "occurred_at": (
+                        "2026-07-23T15:00:00Z"
+                        if implementation
+                        else "2026-07-23T09:00:00Z"
+                    ),
+                    "text": (
+                        "The bridge passed its receipt-grounding check."
+                        if implementation
+                        else "The team selected the bounded agent bridge."
+                    ),
+                }],
+                "coverage": {"complete": True},
+                "uncertainty": [],
+            })
+        return {
+            "contract": "recall.agentic-map-reduce.v1",
+            "question": question,
+            "maps": rendered_maps,
+            "coverage": {
+                "maps": len(maps),
+                "complete_maps": len(maps),
+                "complete": True,
+                "unique_receipts": len({
+                    finding["receipt"]
+                    for item in rendered_maps
+                    for finding in item["findings"]
+                }),
+            },
+            "diagnostics": {
+                "engine": "synthetic-agentic-map-reduce",
+                "parallelism": len(maps),
+                "reducer": "agent",
             },
         }
 
@@ -147,6 +206,26 @@ class ScriptedTransport:
         }
 
 
+class WaveRetrieval(SyntheticRetrieval):
+    def map_reduce_search(self, question, *, maps, depth):
+        result = super().map_reduce_search(
+            question,
+            maps=maps,
+            depth=depth,
+        )
+        if len(self.map_batches) == 1:
+            result["maps"] = result["maps"][:1]
+            result["maps"][0]["coverage"]["complete"] = False
+            result["maps"][0]["uncertainty"] = ["Implementation proof is missing."]
+            result["coverage"] = {
+                "maps": 2,
+                "complete_maps": 1,
+                "complete": False,
+                "unique_receipts": 1,
+            }
+        return result
+
+
 def success_script():
     filters = {
         "since": REQUEST["since"],
@@ -170,6 +249,68 @@ def success_script():
             },
         ),
         ("recall_show", {"target": IMPLEMENTATION}),
+        (
+            "evidence_finish",
+            {
+                "status": "complete",
+                "answer": (
+                    "On July 23, Aurora selected the bounded agent bridge and "
+                    "then passed its receipt-grounding check."
+                ),
+                "claims": [
+                    {
+                        "statement": "The bounded bridge was selected on July 23.",
+                        "receipts": [DECISION],
+                    },
+                    {
+                        "statement": "Its grounding check passed later that day.",
+                        "receipts": [IMPLEMENTATION],
+                    },
+                ],
+                "citations": [DECISION, IMPLEMENTATION],
+                "gaps": [],
+            },
+        ),
+    ]
+
+
+def map_reduce_script():
+    filters = {
+        "since": REQUEST["since"],
+        "until": REQUEST["until"],
+    }
+    return [
+        (
+            "recall_investigate",
+            {
+                "question": REQUEST["question"],
+                "filters": filters,
+                "depth": "deep",
+            },
+        ),
+        (
+            "recall_map_reduce",
+            {
+                "question": REQUEST["question"],
+                "maps": [
+                    {
+                        "map_id": "decision",
+                        "objective": "Find the decision and its rationale.",
+                        "query": "Project Aurora bounded bridge decision",
+                        "filters": filters,
+                        "seed_receipts": [DECISION],
+                    },
+                    {
+                        "map_id": "verification",
+                        "objective": "Find implementation and verification.",
+                        "query": "Project Aurora bridge grounding check",
+                        "filters": filters,
+                        "seed_receipts": [IMPLEMENTATION],
+                    },
+                ],
+                "depth": "deep",
+            },
+        ),
         (
             "evidence_finish",
             {
@@ -250,6 +391,7 @@ class PiAtiGroundingTest(unittest.TestCase):
             {
                 "recall_investigate",
                 "recall_deep_search",
+                "recall_map_reduce",
                 "recall_session_context",
                 "recall_show",
                 "evidence_finish",
@@ -261,6 +403,131 @@ class PiAtiGroundingTest(unittest.TestCase):
             if tool["name"] == "evidence_finish"
         )
         self.assertIs(finish["terminate_turn"], True)
+
+    def test_agentic_map_reduce_decomposes_then_reduces_grounded_evidence(self):
+        transport = ScriptedTransport(map_reduce_script())
+        retrieval = SyntheticRetrieval()
+        bundle = service(transport).use_recall(
+            principal(),
+            REQUEST,
+            retrieval,
+        )
+        self.assertEqual(
+            retrieval.calls,
+            ["recall_investigate", "recall_map_reduce"],
+        )
+        self.assertEqual(
+            retrieval.filters,
+            [
+                {"since": REQUEST["since"], "until": REQUEST["until"]},
+                {"since": REQUEST["since"], "until": REQUEST["until"]},
+                {"since": REQUEST["since"], "until": REQUEST["until"]},
+            ],
+        )
+        self.assertEqual(bundle["result"]["status"], "complete")
+        self.assertEqual(
+            bundle["result"]["citations"],
+            [DECISION, IMPLEMENTATION],
+        )
+        map_event = next(
+            event
+            for event in bundle["trace"]
+            if event["tool"] == "recall.map_reduce"
+        )
+        self.assertEqual(map_event["stage"], "inspect")
+        self.assertEqual(map_event["receipt_count"], 2)
+
+    def test_map_reduce_cannot_widen_explicit_time_or_source_scope(self):
+        script = map_reduce_script()
+        call = next(
+            arguments
+            for name, arguments in script
+            if name == "recall_map_reduce"
+        )
+        call["maps"][0]["filters"]["since"] = "2026-01-01T00:00:00Z"
+        with self.assertRaises(AgentExecutionError) as caught:
+            service(ScriptedTransport(script)).use_recall(
+                principal(),
+                REQUEST,
+                SyntheticRetrieval(),
+            )
+        self.assertEqual(caught.exception.code, "agent_query_scope_violation")
+
+        scoped_request = {
+            **REQUEST,
+            "source_families": ["codex"],
+            "idempotency_key": "synthetic-pi-ati-source-scope",
+        }
+        source_script = map_reduce_script()
+        next(
+            arguments
+            for name, arguments in source_script
+            if name == "recall_map_reduce"
+        )["maps"][0]["filters"]["source_family"] = "slack"
+        with self.assertRaises(AgentExecutionError) as caught:
+            service(ScriptedTransport(source_script)).use_recall(
+                principal(),
+                scoped_request,
+                SyntheticRetrieval(),
+            )
+        self.assertEqual(caught.exception.code, "agent_query_scope_violation")
+
+    def test_map_reduce_seed_must_come_from_a_prior_hint_call(self):
+        script = [
+            item
+            for item in map_reduce_script()
+            if item[0] != "recall_investigate"
+        ]
+        with self.assertRaises(AgentExecutionError) as caught:
+            service(ScriptedTransport(script)).use_recall(
+                principal(),
+                REQUEST,
+                SyntheticRetrieval(),
+            )
+        self.assertEqual(caught.exception.code, "agent_map_seed_not_opened")
+
+    def test_incomplete_map_supports_one_targeted_second_wave(self):
+        script = map_reduce_script()
+        filters = {
+            "since": REQUEST["since"],
+            "until": REQUEST["until"],
+        }
+        script.insert(
+            2,
+            (
+                "recall_map_reduce",
+                {
+                    "question": REQUEST["question"],
+                    "maps": [{
+                        "map_id": "implementation_retry",
+                        "objective": "Close the missing implementation proof gap.",
+                        "query": "Project Aurora exact grounding verification",
+                        "filters": filters,
+                        "seed_receipts": [IMPLEMENTATION],
+                    }],
+                    "depth": "deep",
+                },
+            ),
+        )
+        retrieval = WaveRetrieval()
+        bundle = service(ScriptedTransport(script)).use_recall(
+            principal(),
+            REQUEST,
+            retrieval,
+        )
+        self.assertEqual(
+            retrieval.map_batches,
+            [["decision", "verification"], ["implementation_retry"]],
+        )
+        self.assertEqual(bundle["result"]["status"], "complete")
+        self.assertEqual(
+            [
+                event["tool"]
+                for event in bundle["trace"]
+                if event["tool"] == "recall.map_reduce"
+            ],
+            ["recall.map_reduce", "recall.map_reduce"],
+        )
 
     def test_semantic_runner_beats_scripted_generic_baseline(self):
         pi = service(ScriptedTransport(success_script())).use_recall(

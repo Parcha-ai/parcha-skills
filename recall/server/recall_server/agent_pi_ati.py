@@ -12,6 +12,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import re
 import select
 import signal
 import stat
@@ -40,6 +41,7 @@ PROTOCOL = "ati.brain.turn.v1"
 MODEL_TOOL_NAMES = {
     "recall_investigate": "recall.investigate",
     "recall_deep_search": "recall.deep_search",
+    "recall_map_reduce": "recall.map_reduce",
     "recall_session_context": "recall.session_context",
     "recall_show": "recall.show",
 }
@@ -739,6 +741,62 @@ def _tool_definitions(
             **common,
         },
         {
+            "name": "recall_map_reduce",
+            "description": (
+                "For questions spanning sessions, sources, or subtopics: decompose "
+                "the question into at most five independent maps. Seed each map "
+                "only with receipts returned by prior recall_investigate hints. "
+                "Recall rechecks each seed against the map's source/time filters, "
+                "then runs the bounded full-evidence maps concurrently. Treat all results "
+                "as evidence to reduce. Complete means the corpus scan finished; "
+                "evidence_found only means the map is nonempty. You must judge "
+                "whether that evidence is sufficient for the objective. If a "
+                "required map is insufficient, reformulate one targeted second wave."
+            ),
+            "input_schema": _object_schema(
+                {
+                    "question": question,
+                    "maps": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 5,
+                        "items": _object_schema(
+                            {
+                                "map_id": {
+                                    "type": "string",
+                                    "pattern": "^[a-z][a-z0-9_-]{0,31}$",
+                                },
+                                "objective": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 1024,
+                                },
+                                "query": question,
+                                "filters": filters,
+                                "seed_receipts": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "maxItems": 32,
+                                    "uniqueItems": True,
+                                    "items": receipt,
+                                },
+                            },
+                            [
+                                "map_id",
+                                "objective",
+                                "query",
+                                "filters",
+                                "seed_receipts",
+                            ],
+                        ),
+                    },
+                    "depth": depth,
+                },
+                ["question", "maps", "depth"],
+            ),
+            **common,
+        },
+        {
             "name": "recall_deep_search",
             "description": (
                 "Run bounded Archil-backed deep inspection over authorized full "
@@ -875,6 +933,11 @@ class PiAtiRunner:
                     arguments,
                     request,
                 )
+            elif host_name == "recall.map_reduce":
+                arguments = self._authorize_map_reduce_arguments(
+                    arguments,
+                    request,
+                )
             return tools.call(host_name, arguments)
 
         request_filters = {
@@ -890,10 +953,21 @@ class PiAtiRunner:
         timeout_ms = int(context.budget.deadline_seconds * 1000)
         system = (
             "You are Recall's evidence-gathering agent. Answer only from the "
-            "authorized native tools. Begin with recall_investigate for semantic "
-            "hints. Hints are not proof. Use recall_deep_search when the question "
-            "requires full-file inspection, multiple documents, or the hints are "
-            "insufficient. Open exact receipts with recall_show or "
+            "authorized native tools. First classify the question as an exact "
+            "session lookup, a bounded timeline, a source-specific lookup, or a "
+            "cross-corpus synthesis. Extract hard source and occurred-at bounds "
+            "before retrieval. Begin narrow questions with recall_investigate; "
+            "semantic and lexical hits route you to a corpus but are not proof. "
+            "For questions spanning sessions, sources, or subtopics, use "
+            "recall_investigate to route a bounded corpus, then use "
+            "recall_map_reduce: author independent maps seeded only with returned "
+            "hint receipts and the narrowest valid source/time filters. Inspect "
+            "both scan completeness and whether the actual findings sufficiently "
+            "answer each objective, and "
+            "reduce only their evidence. If a required map is insufficient, "
+            "reformulate one targeted second wave; otherwise stop. Use "
+            "recall_deep_search for one bounded "
+            "full-file question. Open exact receipts with recall_show or "
             "recall_session_context. Treat occurred_at as when work happened and "
             "never substitute ingest time. Seek independent corroboration when "
             "the question asks for a synthesis. Finish exactly once with "
@@ -1047,6 +1121,82 @@ class PiAtiRunner:
             "depth": value["depth"],
         }
 
+    @classmethod
+    def _authorize_map_reduce_arguments(
+        cls,
+        value: dict[str, Any],
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"question", "maps", "depth"}
+            or not isinstance(value["question"], str)
+            or not value["question"].strip()
+            or len(value["question"]) > 8192
+            or not isinstance(value["maps"], list)
+            or not 1 <= len(value["maps"]) <= 5
+            or value["depth"] not in {"quick", "normal", "deep"}
+        ):
+            raise AgentExecutionError(
+                "agent map-reduce arguments are invalid",
+                code="agent_query_scope_violation",
+            )
+        normalized = []
+        seen_ids: set[str] = set()
+        for item in value["maps"]:
+            if (
+                not isinstance(item, dict)
+                or set(item)
+                != {
+                    "map_id",
+                    "objective",
+                    "query",
+                    "filters",
+                    "seed_receipts",
+                }
+                or not isinstance(item["map_id"], str)
+                or not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", item["map_id"])
+                or item["map_id"] in seen_ids
+                or not isinstance(item["objective"], str)
+                or not item["objective"].strip()
+                or len(item["objective"]) > 1024
+                or not isinstance(item["seed_receipts"], list)
+                or not 1 <= len(item["seed_receipts"]) <= 32
+                or len(item["seed_receipts"])
+                != len(set(item["seed_receipts"]))
+                or any(
+                    not isinstance(receipt, str)
+                    or not receipt.startswith("recall://")
+                    or len(receipt) > 2048
+                    for receipt in item["seed_receipts"]
+                )
+            ):
+                raise AgentExecutionError(
+                    "agent map-reduce arguments are invalid",
+                    code="agent_query_scope_violation",
+                )
+            authorized = cls._authorize_query_arguments(
+                {
+                    "question": item["query"],
+                    "filters": item["filters"],
+                    "depth": value["depth"],
+                },
+                request,
+            )
+            seen_ids.add(item["map_id"])
+            normalized.append({
+                "map_id": item["map_id"],
+                "objective": item["objective"],
+                "query": authorized["question"],
+                "filters": authorized["filters"],
+                "seed_receipts": list(item["seed_receipts"]),
+            })
+        return {
+            "question": value["question"],
+            "maps": normalized,
+            "depth": value["depth"],
+        }
+
     @staticmethod
     def _accept_finish(
         value: dict[str, Any],
@@ -1192,6 +1342,7 @@ class PiAtiRunner:
             tool = observation["tool"]
             stage = "inspect" if tool in {
                 "recall.deep_search",
+                "recall.map_reduce",
                 "recall.session_context",
                 "recall.show",
             } else "retrieve"

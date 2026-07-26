@@ -6,6 +6,7 @@ import logging
 import re
 import time
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit
@@ -25,6 +26,9 @@ ALLOWED_FILTERS = frozenset(
     {"since", "until", "source_id", "source_family", "source_alias"}
 )
 MAX_CANONICAL_EMBEDDING_BATCH = 5000
+MAX_AGENTIC_MAPS = 5
+MAX_AGENTIC_MAP_FINDINGS = 40
+MAX_AGENTIC_MAP_FINDING_BYTES = 64_000
 LOG = logging.getLogger(__name__)
 
 
@@ -1183,6 +1187,7 @@ class BoundCanonicalRetrieval:
         filters: dict[str, Any] | None = None,
         depth: str = "normal",
         authorized_source: Any = None,
+        _seed_receipts: tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
         """Deepen authorized Recall candidates in full evidence objects."""
         budgets = {
@@ -1241,33 +1246,94 @@ class BoundCanonicalRetrieval:
                     "Deep inspection is not configured for this Recall deployment."
                 ],
             }
-        investigation = self.investigate(
-            question,
-            filters=filters,
-            depth=depth,
-            authorized_source=authorized_source,
-        )
-        receipts = tuple(
-            dict.fromkeys(
-                chunk["receipt"]
-                for item in investigation["investigations"]
-                for event in item["context"]["events"]
-                for chunk in event["chunks"]
-            )
-        )
         budget = budgets[depth]
+        if _seed_receipts is not None:
+            if (
+                not isinstance(_seed_receipts, tuple)
+                or not 1 <= len(_seed_receipts) <= 32
+                or len(_seed_receipts) != len(set(_seed_receipts))
+                or any(
+                    not isinstance(receipt, str)
+                    or not receipt.startswith("recall://")
+                    or len(receipt) > 2048
+                    for receipt in _seed_receipts
+                )
+            ):
+                raise ValueError("invalid canonical map seed")
+            _, source_family, source_alias, since, until = self._filters(filters or {})
+            eligible_sources = set(self._sources(
+                source_id=(filters or {}).get("source_id"),
+                source_family=source_family,
+                source_alias=source_alias,
+            ))
+            since_bound = (
+                datetime.fromisoformat(since.replace("Z", "+00:00"))
+                if since is not None
+                else None
+            )
+            until_bound = (
+                datetime.fromisoformat(until.replace("Z", "+00:00"))
+                if until is not None
+                else None
+            )
+            resolved = []
+            with self.store.connect() as connection:
+                for receipt in _seed_receipts:
+                    row = self._receipt_event(connection, receipt)
+                    occurred_at = row["occurred_at"] if row is not None else None
+                    if (
+                        row is None
+                        or row["source_id"] not in eligible_sources
+                        or (
+                            since_bound is not None
+                            and occurred_at < since_bound
+                        )
+                        or (
+                            until_bound is not None
+                            and occurred_at > until_bound
+                        )
+                    ):
+                        raise ValueError(
+                            "canonical map seed escaped its hard scope"
+                        )
+                    resolved.append(row["resolved_receipt"])
+            receipts = tuple(dict.fromkeys(resolved))
+            route_coverage = {
+                "mode": "seeded",
+                "candidates": len(receipts),
+            }
+            uncertainty = []
+        else:
+            investigation = self.investigate(
+                question,
+                filters=filters,
+                depth=depth,
+                authorized_source=authorized_source,
+            )
+            receipts = tuple(
+                dict.fromkeys(
+                    chunk["receipt"]
+                    for item in investigation["investigations"]
+                    for event in item["context"]["events"]
+                    for chunk in event["chunks"]
+                )
+            )
+            route_coverage = investigation["coverage"]
+            uncertainty = list(investigation["uncertainty"])
         selected = self.evidence_projector.targets_for_receipts(
             tenant_id=self.tenant_id,
             source_ids=self.authorized_sources,
             receipts=receipts,
-            limit=budget.max_files,
+            limit=min(budget.max_files + 1, 100),
         )
+        selection_complete = len(selected) <= budget.max_files
+        selected_targets = selected[: budget.max_files]
         targets = tuple(
             EvidenceTarget.from_reference(
                 item["reference"],
                 receipts=item["receipts"],
             )
-            for item in selected
+            for item in selected_targets
         )
         deep = self.deep_inspector.inspect(
             tenant_id=self.tenant_id,
@@ -1284,25 +1350,33 @@ class BoundCanonicalRetrieval:
                     and row["source_id"] in self.authorized_sources
                 ):
                     verified.append(finding)
-        uncertainty = list(investigation["uncertainty"])
         if len(verified) != len(deep["findings"]):
             uncertainty.append(
                 "One or more deep findings became unavailable during verification."
             )
         if not deep["complete"]:
             uncertainty.append("Deep inspection returned partial coverage.")
+        if not selection_complete:
+            uncertainty.append(
+                "Candidate evidence exceeded the deep-inspection file bound."
+            )
         return {
             "status": "complete",
             "question": question,
             "findings": verified,
             "coverage": {
                 "candidate_receipts": len(receipts),
-                "candidate_files": len(targets),
+                "candidate_files": len(selected),
+                "candidate_files_truncated": not selection_complete,
                 "files_scanned": deep["files_scanned"],
-                "complete": bool(deep["complete"]),
-                "stopped_reason": deep["stopped_reason"],
+                "complete": bool(deep["complete"]) and selection_complete,
+                "stopped_reason": (
+                    deep["stopped_reason"]
+                    if selection_complete
+                    else "max_files"
+                ),
                 "provider": deep["provider"],
-                "recall": investigation["coverage"],
+                "recall": route_coverage,
             },
             "uncertainty": uncertainty,
             "diagnostics": {
@@ -1315,6 +1389,176 @@ class BoundCanonicalRetrieval:
                     "timeout_seconds": budget.timeout_seconds,
                 },
                 "provider_timing": deep["timing"],
+            },
+        }
+
+    def map_reduce_search(
+        self,
+        question: str,
+        *,
+        maps: list[dict[str, Any]],
+        depth: str = "normal",
+    ) -> dict[str, Any]:
+        """Run agent-authored retrieval maps concurrently for later reduction.
+
+        The calling agent owns semantic decomposition and final synthesis. Recall
+        owns the hard boundary: every seed came from prior hybrid routing and is
+        rechecked against tenant, source, and time scope before Archil receives a
+        bounded object list.
+        """
+        if (
+            not isinstance(question, str)
+            or not question.strip()
+            or len(question) > 8192
+            or not isinstance(maps, list)
+            or not 1 <= len(maps) <= MAX_AGENTIC_MAPS
+            or depth not in {"quick", "normal", "deep"}
+        ):
+            raise ValueError("invalid canonical map-reduce request")
+        normalized: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for item in maps:
+            if not isinstance(item, dict) or set(item) != {
+                "map_id",
+                "objective",
+                "query",
+                "filters",
+                "seed_receipts",
+            }:
+                raise ValueError("invalid canonical map-reduce request")
+            map_id = item["map_id"]
+            objective = item["objective"]
+            query = item["query"]
+            filters = item["filters"]
+            seed_receipts = item["seed_receipts"]
+            if (
+                not isinstance(map_id, str)
+                or not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", map_id)
+                or map_id in seen_ids
+                or not isinstance(objective, str)
+                or not objective.strip()
+                or len(objective) > 1024
+                or not isinstance(query, str)
+                or not query.strip()
+                or len(query) > 8192
+                or not isinstance(filters, dict)
+                or not isinstance(seed_receipts, list)
+                or not 1 <= len(seed_receipts) <= 32
+                or len(seed_receipts) != len(set(seed_receipts))
+                or any(
+                    not isinstance(receipt, str)
+                    or not receipt.startswith("recall://")
+                    or len(receipt) > 2048
+                    for receipt in seed_receipts
+                )
+            ):
+                raise ValueError("invalid canonical map-reduce request")
+            self._filters(filters)
+            seen_ids.add(map_id)
+            normalized.append({
+                "map_id": map_id,
+                "objective": objective,
+                "query": query,
+                "filters": dict(filters),
+                "seed_receipts": list(seed_receipts),
+            })
+
+        started_at = time.monotonic()
+
+        def run_map(item: dict[str, Any]) -> dict[str, Any]:
+            result = self.deep_search(
+                item["query"],
+                filters=item["filters"],
+                depth=depth,
+                _seed_receipts=tuple(item["seed_receipts"]),
+            )
+            bounded_findings: list[dict[str, Any]] = []
+            for finding in result["findings"]:
+                candidate = [*bounded_findings, finding]
+                if (
+                    len(candidate) > MAX_AGENTIC_MAP_FINDINGS
+                    or len(
+                        json.dumps(
+                            candidate,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ).encode()
+                    )
+                    > MAX_AGENTIC_MAP_FINDING_BYTES
+                ):
+                    break
+                bounded_findings.append(finding)
+            coverage = dict(result["coverage"])
+            uncertainty = list(result["uncertainty"])
+            if len(bounded_findings) != len(result["findings"]):
+                coverage["complete"] = False
+                coverage["stopped_reason"] = "map_output_bound"
+                uncertainty.append(
+                    "Map evidence was truncated at the agentic output bound."
+                )
+            coverage["evidence_found"] = bool(bounded_findings)
+            if not bounded_findings:
+                uncertainty.append(
+                    "No evidence matched this map objective; reformulation may be required."
+                )
+            return {
+                "map_id": item["map_id"],
+                "objective": item["objective"],
+                "query": item["query"],
+                "filters": item["filters"],
+                "status": result["status"],
+                "findings": bounded_findings,
+                "coverage": coverage,
+                "uncertainty": uncertainty,
+            }
+
+        with ThreadPoolExecutor(
+            max_workers=min(len(normalized), MAX_AGENTIC_MAPS),
+            thread_name_prefix="recall-map",
+        ) as executor:
+            results = list(executor.map(run_map, normalized))
+
+        findings = [
+            finding
+            for item in results
+            for finding in item["findings"]
+        ]
+        unique_receipts = {
+            finding["receipt"]
+            for finding in findings
+            if isinstance(finding, dict)
+            and isinstance(finding.get("receipt"), str)
+        }
+        complete_maps = sum(
+            bool(item["coverage"].get("complete"))
+            for item in results
+            if isinstance(item.get("coverage"), dict)
+        )
+        maps_with_evidence = sum(
+            bool(item["coverage"].get("evidence_found"))
+            for item in results
+            if isinstance(item.get("coverage"), dict)
+        )
+        return {
+            "contract": "recall.agentic-map-reduce.v1",
+            "question": question,
+            "maps": results,
+            "coverage": {
+                "maps": len(results),
+                "complete_maps": complete_maps,
+                "complete": complete_maps == len(results),
+                "maps_with_evidence": maps_with_evidence,
+                "evidence_found_for_every_map": maps_with_evidence == len(results),
+                "unique_receipts": len(unique_receipts),
+            },
+            "diagnostics": {
+                "engine": "canonical-agentic-map-reduce-v1",
+                "elapsed_ms": round(
+                    (time.monotonic() - started_at) * 1000,
+                    3,
+                ),
+                "parallelism": min(len(normalized), MAX_AGENTIC_MAPS),
+                "reducer": "agent",
             },
         }
 

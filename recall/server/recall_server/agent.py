@@ -122,6 +122,7 @@ class ConstrainedAgentTools:
     TOOL_NAMES = (
         "recall.deep_search",
         "recall.investigate",
+        "recall.map_reduce",
         "recall.session_context",
         "recall.show",
     )
@@ -183,6 +184,24 @@ class ConstrainedAgentTools:
                 result = self._retrieval.deep_search(
                     arguments["question"],
                     filters=arguments["filters"],
+                    depth=arguments["depth"],
+                )
+            elif name == "recall.map_reduce":
+                if set(arguments) != {"question", "maps", "depth"}:
+                    raise AgentExecutionError("agent tool arguments are invalid")
+                seed_receipts = {
+                    receipt
+                    for item in arguments["maps"]
+                    for receipt in item["seed_receipts"]
+                }
+                if not seed_receipts <= set(self._opened_receipts):
+                    raise AgentExecutionError(
+                        "agent map seed was not returned by a prior hint call",
+                        code="agent_map_seed_not_opened",
+                    )
+                result = self._retrieval.map_reduce_search(
+                    arguments["question"],
+                    maps=arguments["maps"],
                     depth=arguments["depth"],
                 )
             elif name == "recall.session_context":
