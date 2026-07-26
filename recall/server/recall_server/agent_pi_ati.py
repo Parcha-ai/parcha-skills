@@ -902,7 +902,9 @@ def _tool_definitions(
                 "as evidence to reduce. Complete means the corpus scan finished; "
                 "evidence_found only means the map is nonempty. You must judge "
                 "whether that evidence is sufficient for the objective. If a "
-                "required map is insufficient, reformulate one targeted second wave."
+                "required map is insufficient, reformulate one targeted second "
+                "wave. Each finding's occurred_at is authoritative for when that "
+                "work happened; dates merely mentioned inside text are context."
             ),
             "input_schema": _object_schema(
                 {
@@ -1137,8 +1139,10 @@ class PiAtiRunner:
             "recall_deep_search for one bounded "
             "full-file question. Open exact receipts with recall_show or "
             "recall_session_context. Treat occurred_at as when work happened and "
-            "never substitute ingest time or change the year in an explicit "
-            "request window. Copy every explicit since/until filter exactly. "
+            "never substitute ingest time, or a date merely mentioned in evidence "
+            "text, or change the year in an explicit request window. Exclude work "
+            "whose authoritative occurred_at is outside the requested window. "
+            "Copy every explicit since/until filter exactly. "
             "When the request allows one source family, copy that exact family; "
             "Codex and Claude are sources inside coding_history, not separate "
             "source families. Seek independent corroboration when "

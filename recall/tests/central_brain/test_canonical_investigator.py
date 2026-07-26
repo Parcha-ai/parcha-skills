@@ -98,7 +98,12 @@ class CanonicalInvestigatorContractTest(unittest.TestCase):
             def inspect(self, *, targets, **_kwargs):
                 self.targets = targets
                 return {
-                    "findings": [],
+                    "findings": [{
+                        "receipt": targets[0].receipts[0],
+                        "text": "bounded proof",
+                        "line": 1,
+                        "object_key": targets[0].object_key,
+                    }],
                     "complete": True,
                     "files_scanned": len(targets),
                     "stopped_reason": "completed",
@@ -107,6 +112,19 @@ class CanonicalInvestigatorContractTest(unittest.TestCase):
                 }
 
         class Retrieval(BoundCanonicalRetrieval):
+            def _receipt_event(self, *_args, **_kwargs):
+                return {
+                    "source_id": "codex.jsonl:test",
+                    "native_id": "event-1",
+                    "native_parent_id": "session-1",
+                    "occurred_at": datetime(
+                        2026,
+                        7,
+                        23,
+                        tzinfo=timezone.utc,
+                    ),
+                }
+
             def investigate(self, *_args, **_kwargs):
                 return {
                     "investigations": [{
@@ -142,6 +160,11 @@ class CanonicalInvestigatorContractTest(unittest.TestCase):
         self.assertIs(result["coverage"]["candidate_files_truncated"], True)
         self.assertIs(result["coverage"]["complete"], False)
         self.assertEqual(result["coverage"]["stopped_reason"], "max_files")
+        self.assertEqual(
+            result["findings"][0]["occurred_at"],
+            "2026-07-23T00:00:00+00:00",
+        )
+        self.assertEqual(result["findings"][0]["time_basis"], "occurred_at")
 
     def test_agentic_maps_run_concurrently_and_preserve_hard_filters(self) -> None:
         retrieval = ParallelMapRetrieval()

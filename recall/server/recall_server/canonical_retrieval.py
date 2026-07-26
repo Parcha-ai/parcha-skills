@@ -1500,7 +1500,14 @@ class BoundCanonicalRetrieval:
                     row is not None
                     and row["source_id"] in self.authorized_sources
                 ):
-                    verified.append(finding)
+                    verified.append({
+                        **finding,
+                        "source_id": row["source_id"],
+                        "native_id": row["native_id"],
+                        "native_parent_id": row["native_parent_id"],
+                        "occurred_at": _timestamp(row["occurred_at"]),
+                        "time_basis": "occurred_at",
+                    })
         if len(verified) != len(deep["findings"]):
             uncertainty.append(
                 "One or more deep findings became unavailable during verification."
