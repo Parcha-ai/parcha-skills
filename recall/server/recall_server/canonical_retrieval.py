@@ -1222,6 +1222,99 @@ class BoundCanonicalRetrieval:
             },
         }
 
+    def _exact_session_receipts(
+        self,
+        question: str,
+        investigation: dict[str, Any],
+        filters: dict[str, Any] | None,
+        *,
+        limit: int,
+    ) -> tuple[str, ...]:
+        """Rank evidence inside the session routed by an explicit UUID."""
+
+        if UUID_RE.search(question) is None or not 1 <= limit <= 100:
+            return ()
+        investigations = investigation.get("investigations")
+        if not isinstance(investigations, list) or not investigations:
+            return ()
+        match = investigations[0].get("match", {})
+        source_id = match.get("source_id")
+        parent_id = match.get("native_parent_id")
+        if (
+            source_id not in self.authorized_sources
+            or not isinstance(parent_id, str)
+            or not parent_id
+        ):
+            return ()
+        terms = legacy_engine().informative_terms(
+            UUID_RE.sub(" ", question)
+        )[:16]
+        if not terms:
+            return ()
+        search_query = " OR ".join(f'"{term}"' for term in terms)
+        _, _, _, since, until = self._filters(filters or {})
+        deadline_at = time.monotonic() + self.store.search_deadline_ms / 1000
+        try:
+            with self.store.connect() as connection:
+                rows = self.store._execute_bounded(
+                    connection,
+                    """WITH session_documents AS MATERIALIZED (
+                         SELECT document.tenant_id,document.source_id,
+                                document.document_id
+                         FROM canonical_events event
+                         JOIN canonical_documents document
+                           USING(tenant_id,source_id,event_id)
+                         WHERE event.tenant_id=%s
+                           AND event.source_id=%s
+                           AND event.native_parent_id=%s
+                           AND (%s::timestamptz IS NULL
+                                OR event.occurred_at>=%s)
+                           AND (%s::timestamptz IS NULL
+                                OR event.occurred_at<=%s)
+                           AND document.is_current
+                           AND document.deleted_at IS NULL
+                       )
+                       SELECT chunk.receipt,
+                              (SELECT count(*)
+                                 FROM unnest(%s::text[]) query_term(value)
+                                WHERE chunk.search_vector @@
+                                      plainto_tsquery(
+                                          'simple',query_term.value
+                                      )
+                              ) AS matched_term_count,
+                              ts_rank_cd(
+                                  chunk.search_vector,
+                                  websearch_to_tsquery('simple',%s),
+                                  32
+                              ) AS score
+                       FROM session_documents document
+                       JOIN canonical_chunks chunk
+                         USING(tenant_id,source_id,document_id)
+                       WHERE chunk.deleted_at IS NULL
+                         AND chunk.search_vector @@
+                             websearch_to_tsquery('simple',%s)
+                       ORDER BY matched_term_count DESC,score DESC,
+                                chunk.chunk_id
+                       LIMIT %s""",
+                    (
+                        self.tenant_id,
+                        source_id,
+                        parent_id,
+                        since,
+                        since,
+                        until,
+                        until,
+                        terms,
+                        search_query,
+                        search_query,
+                        limit,
+                    ),
+                    deadline_at,
+                ).fetchall()
+        except SearchDeadlineExceeded:
+            return ()
+        return tuple(dict.fromkeys(row["receipt"] for row in rows))
+
     def deep_search(
         self,
         question: str,
@@ -1360,7 +1453,21 @@ class BoundCanonicalRetrieval:
                     for chunk in event["chunks"]
                 )
             )
-            route_coverage = investigation["coverage"]
+            exact_session_receipts = self._exact_session_receipts(
+                question,
+                investigation,
+                filters,
+                limit=min(budget.max_files, 100),
+            )
+            receipts = tuple(
+                dict.fromkeys((*exact_session_receipts, *receipts))
+            )
+            route_coverage = {
+                **investigation["coverage"],
+                "exact_session_candidate_receipts": len(
+                    exact_session_receipts
+                ),
+            }
             uncertainty = list(investigation["uncertainty"])
         selected = self.evidence_projector.targets_for_receipts(
             tenant_id=self.tenant_id,

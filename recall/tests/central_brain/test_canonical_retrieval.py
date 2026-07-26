@@ -55,6 +55,7 @@ class RecordingStore:
 
     def __init__(self) -> None:
         self.sql: list[str] = []
+        self.values: list[tuple] = []
 
     @contextmanager
     def connect(self):
@@ -62,6 +63,7 @@ class RecordingStore:
 
     def _execute_bounded(self, _connection, sql, _values, _deadline_at):
         self.sql.append(" ".join(sql.split()))
+        self.values.append(tuple(_values))
         return EmptyRows()
 
 
@@ -180,6 +182,39 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
             "chunk.search_vector @@ plainto_tsquery('simple',%s)",
             store.sql[0],
         )
+
+    def test_exact_session_deep_route_is_parent_scoped_and_term_ranked(self):
+        store = RecordingStore()
+        retrieval = BoundCanonicalRetrieval(
+            store,
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=("claude:test",),
+        )
+        session_id = "8668a658-a6cf-4358-9d7e-c29e5782c1dd"
+
+        receipts = retrieval._exact_session_receipts(
+            f"In session {session_id}, verify ATI harness default runtime",
+            {
+                "investigations": [{
+                    "match": {
+                        "source_id": "claude:test",
+                        "native_parent_id": "claude-session-hash",
+                    },
+                }],
+            },
+            {
+                "since": "2026-07-23T00:00:00Z",
+                "until": "2026-07-25T00:00:00Z",
+            },
+            limit=60,
+        )
+
+        self.assertEqual(receipts, ())
+        self.assertIn("event.native_parent_id=%s", store.sql[0])
+        self.assertIn("websearch_to_tsquery('simple',%s)", store.sql[0])
+        self.assertIn("matched_term_count DESC", store.sql[0])
+        self.assertIn("claude-session-hash", store.values[0])
 
 
 if __name__ == "__main__":
