@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -9,7 +10,26 @@ SERVER = Path(__file__).resolve().parents[2] / "server"
 sys.path.insert(0, str(SERVER))
 
 from recall_server.canonical_retrieval import BoundCanonicalRetrieval  # noqa: E402
+from recall_server.db import SearchDeadlineExceeded  # noqa: E402
 from recall_server.mcp import CANONICAL_SHOW_TOOL  # noqa: E402
+
+
+class DeadlineStore:
+    def __init__(self) -> None:
+        self.deadlines: list[float] = []
+
+    @contextmanager
+    def connect(self):
+        yield object()
+
+    def _execute_bounded(self, _connection, _sql, _values, deadline_at):
+        self.deadlines.append(deadline_at)
+        raise SearchDeadlineExceeded("synthetic investigation deadline")
+
+
+class DeadlineRetrieval(BoundCanonicalRetrieval):
+    def search(self, _query, _filters=None, _limit=10, _authorized_source=None):
+        return {"results": [], "diagnostics": {"engine": "synthetic"}}
 
 
 class CanonicalInvestigatorContractTest(unittest.TestCase):
@@ -46,6 +66,23 @@ class CanonicalInvestigatorContractTest(unittest.TestCase):
             set(CANONICAL_SHOW_TOOL["inputSchema"]["properties"]),
             {"target"},
         )
+
+    def test_investigation_metadata_queries_degrade_at_one_shared_deadline(
+        self,
+    ) -> None:
+        store = DeadlineStore()
+        retrieval = DeadlineRetrieval(
+            store,
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=("codex.jsonl:test",),
+        )
+
+        result = retrieval.investigate("What changed?", depth="quick")
+
+        self.assertEqual(result["investigations"], [])
+        self.assertEqual(len(store.deadlines), 2)
+        self.assertEqual(len(set(store.deadlines)), 1)
 
 
 if __name__ == "__main__":

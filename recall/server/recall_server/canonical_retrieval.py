@@ -662,15 +662,20 @@ class BoundCanonicalRetrieval:
         self,
         connection: Any,
         target: str,
+        *,
+        deadline_at: float | None = None,
     ) -> dict[str, Any] | None:
-        redirect = connection.execute(
+        redirect = self.store._execute_bounded(
+            connection,
             """SELECT new_receipt FROM receipt_redirects
                WHERE tenant_id=%s AND old_receipt=%s""",
             (self.tenant_id, target),
+            deadline_at,
         ).fetchone()
         if redirect:
             target = redirect["new_receipt"]
-        row = connection.execute(
+        row = self.store._execute_bounded(
+            connection,
             """SELECT chunk.source_id,chunk.document_id,chunk.ordinal AS anchor_ordinal,
                       document.native_id,
                       document.revision,event.event_id,event.native_parent_id,
@@ -696,6 +701,7 @@ class BoundCanonicalRetrieval:
                      AND later.is_tombstone
                  )""",
             (self.tenant_id, list(self.authorized_sources), target),
+            deadline_at,
         ).fetchone()
         if row is not None:
             row["resolved_receipt"] = target
@@ -732,6 +738,7 @@ class BoundCanonicalRetrieval:
         before: int = 4,
         after: int = 4,
         authorized_source: Any = None,
+        _deadline_at: float | None = None,
     ) -> dict[str, Any] | None:
         """Expand one receipt inside its source session without crossing grants."""
         if (
@@ -748,7 +755,11 @@ class BoundCanonicalRetrieval:
         if not self.authorized_sources:
             return None
         with self.store.connect() as connection:
-            anchor = self._receipt_event(connection, target)
+            anchor = self._receipt_event(
+                connection,
+                target,
+                deadline_at=_deadline_at,
+            )
             if anchor is None:
                 return None
             parent = anchor["native_parent_id"] or anchor["native_id"]
@@ -758,7 +769,8 @@ class BoundCanonicalRetrieval:
                     return []
                 comparator = "<" if direction == "before" else ">"
                 ordering = "DESC" if direction == "before" else "ASC"
-                return connection.execute(
+                return self.store._execute_bounded(
+                    connection,
                     f"""SELECT event.source_id,event.native_id,
                                event.native_parent_id,document.revision,event.kind,
                                event.occurred_at,event.observed_at,event.created_at,
@@ -803,11 +815,13 @@ class BoundCanonicalRetrieval:
                         anchor["native_id"],
                         limit,
                     ),
+                    _deadline_at,
                 ).fetchall()
 
             previous = list(reversed(neighbors("before", before)))
             following = neighbors("after", after)
-            anchor_chunks = connection.execute(
+            anchor_chunks = self.store._execute_bounded(
+                connection,
                 """SELECT ordinal,text,receipt
                    FROM (
                      SELECT ordinal,text_redacted AS text,receipt
@@ -824,6 +838,7 @@ class BoundCanonicalRetrieval:
                     anchor["document_id"],
                     anchor["anchor_ordinal"],
                 ),
+                _deadline_at,
             ).fetchall()
             anchor["chunks"] = anchor_chunks
         return {
@@ -916,6 +931,7 @@ class BoundCanonicalRetrieval:
         if depth not in budgets:
             raise ValueError("invalid canonical investigation depth")
         budget = budgets[depth]
+        deadline_at = started_at + budget["deadline_seconds"]
         effective_filters = dict(filters or {})
         source_id, source_family, source_alias, _, _ = self._filters(
             effective_filters
@@ -939,16 +955,21 @@ class BoundCanonicalRetrieval:
             name in effective_filters
             for name in ("source_id", "source_family", "source_alias")
         ):
-            with self.store.connect() as connection:
-                rows = connection.execute(
-                    """SELECT family,count(*) AS source_count
-                       FROM source_profiles
-                       WHERE source_id=ANY(%s)
-                       GROUP BY family
-                       ORDER BY source_count DESC,family
-                       LIMIT %s""",
-                    (eligible_sources, budget["families"]),
-                ).fetchall()
+            try:
+                with self.store.connect() as connection:
+                    rows = self.store._execute_bounded(
+                        connection,
+                        """SELECT family,count(*) AS source_count
+                           FROM source_profiles
+                           WHERE source_id=ANY(%s)
+                           GROUP BY family
+                           ORDER BY source_count DESC,family
+                           LIMIT %s""",
+                        (eligible_sources, budget["families"]),
+                        deadline_at,
+                    ).fetchall()
+            except SearchDeadlineExceeded:
+                rows = []
             for row in rows:
                 if time.monotonic() - started_at >= budget["deadline_seconds"]:
                     break
@@ -1003,11 +1024,15 @@ class BoundCanonicalRetrieval:
         for result in selected:
             if time.monotonic() - started_at >= budget["deadline_seconds"]:
                 break
-            context = self.session_context(
-                result["receipt"],
-                before=budget["context"],
-                after=budget["context"],
-            )
+            try:
+                context = self.session_context(
+                    result["receipt"],
+                    before=budget["context"],
+                    after=budget["context"],
+                    _deadline_at=deadline_at,
+                )
+            except SearchDeadlineExceeded:
+                break
             if context is not None:
                 context["events"] = [
                     event
@@ -1045,25 +1070,35 @@ class BoundCanonicalRetrieval:
         })
         source_families: list[str] = []
         if source_ids:
-            with self.store.connect() as connection:
-                rows = connection.execute(
-                    """SELECT DISTINCT family FROM source_profiles
-                       WHERE source_id=ANY(%s) ORDER BY family""",
-                    (source_ids,),
-                ).fetchall()
+            try:
+                with self.store.connect() as connection:
+                    rows = self.store._execute_bounded(
+                        connection,
+                        """SELECT DISTINCT family FROM source_profiles
+                           WHERE source_id=ANY(%s) ORDER BY family""",
+                        (source_ids,),
+                        deadline_at,
+                    ).fetchall()
+            except SearchDeadlineExceeded:
+                rows = []
             source_families = [row["family"] for row in rows]
-        with self.store.connect() as connection:
-            configured_rows = connection.execute(
-                """SELECT source.source_id,max(job.updated_at) AS last_activity_at
-                   FROM canonical_sources source
-                   LEFT JOIN canonical_ingest_jobs job
-                     USING(tenant_id,source_id)
-                   WHERE source.tenant_id=%s
-                     AND source.source_id=ANY(%s)
-                   GROUP BY source.source_id
-                   ORDER BY source.source_id""",
-                (self.tenant_id, list(self.authorized_sources)),
-            ).fetchall()
+        try:
+            with self.store.connect() as connection:
+                configured_rows = self.store._execute_bounded(
+                    connection,
+                    """SELECT source.source_id,max(job.updated_at) AS last_activity_at
+                       FROM canonical_sources source
+                       LEFT JOIN canonical_ingest_jobs job
+                         USING(tenant_id,source_id)
+                       WHERE source.tenant_id=%s
+                         AND source.source_id=ANY(%s)
+                       GROUP BY source.source_id
+                       ORDER BY source.source_id""",
+                    (self.tenant_id, list(self.authorized_sources)),
+                    deadline_at,
+                ).fetchall()
+        except SearchDeadlineExceeded:
+            configured_rows = []
         configured = {
             row["source_id"]: row["last_activity_at"]
             for row in configured_rows
