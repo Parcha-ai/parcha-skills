@@ -79,7 +79,7 @@ def _open_provider_key(
     key_path: Path,
     *,
     managed_secret_root: Path,
-) -> int:
+) -> tuple[int, bool]:
     """Open a private key file, including Render's managed secret symlink."""
 
     no_follow = getattr(os, "O_NOFOLLOW", 0)
@@ -89,13 +89,12 @@ def _open_provider_key(
         raise RuntimeError("Recall agent provider-key file is unavailable") from error
     if not stat.S_ISLNK(entry.st_mode):
         try:
-            return os.open(key_path, os.O_RDONLY | no_follow)
+            return os.open(key_path, os.O_RDONLY | no_follow), False
         except OSError as error:
             raise RuntimeError(
                 "Recall agent provider-key file is unavailable"
             ) from error
 
-    trusted_owners = {0, os.getuid()}
     try:
         root = managed_secret_root.resolve(strict=True)
         root_metadata = os.stat(root, follow_symlinks=False)
@@ -103,9 +102,7 @@ def _open_provider_key(
             key_path.parent.resolve(strict=True) != root
             or key_path.name in {"", ".", ".."}
             or not stat.S_ISDIR(root_metadata.st_mode)
-            or root_metadata.st_uid not in trusted_owners
             or stat.S_IMODE(root_metadata.st_mode) & 0o022
-            or entry.st_uid not in trusted_owners
         ):
             raise RuntimeError(
                 "Recall agent provider-key file is not private"
@@ -123,7 +120,7 @@ def _open_provider_key(
             raise RuntimeError(
                 "Recall agent provider-key file is not private"
             )
-        return descriptor
+        return descriptor, True
     except RuntimeError:
         raise
     except OSError as error:
@@ -136,14 +133,18 @@ def _load_provider_key(
     _managed_secret_root: Path = Path("/etc/secrets"),
 ) -> ProviderKey:
     key_path = Path(path)
-    descriptor = _open_provider_key(
+    descriptor, managed_secret = _open_provider_key(
         key_path,
         managed_secret_root=_managed_secret_root,
     )
     try:
         metadata = os.fstat(descriptor)
         permissions = stat.S_IMODE(metadata.st_mode)
-        owner_is_trusted = metadata.st_uid in {0, os.getuid()}
+        owner_is_trusted = metadata.st_uid in {0, os.getuid()} or (
+            managed_secret
+            and metadata.st_gid == 1000
+            and bool(permissions & stat.S_IRGRP)
+        )
         group_is_trusted = (
             not permissions & stat.S_IRGRP
             or metadata.st_gid in {os.getgid(), *os.getgroups()}

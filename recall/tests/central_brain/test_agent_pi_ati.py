@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 SERVER = Path(__file__).resolve().parents[2] / "server"
 sys.path.insert(0, str(SERVER))
@@ -437,14 +438,18 @@ class PiAtiSubprocessBoundaryTest(unittest.TestCase):
             root.mkdir(mode=0o700)
             target = Path(directory) / "runtime-secret"
             target.write_text("synthetic-provider-key-value\n")
-            target.chmod(0o600)
+            target.chmod(0o640)
             link = root / "cerebras-api-key"
             link.symlink_to(target)
 
-            key = _load_provider_key(
-                str(link),
-                _managed_secret_root=root,
-            )
+            with patch(
+                "recall_server.agent_pi_ati.os.getuid",
+                return_value=os.getuid() + 10_000,
+            ):
+                key = _load_provider_key(
+                    str(link),
+                    _managed_secret_root=root,
+                )
             self.assertNotIn("synthetic-provider-key-value", repr(key))
 
             root.chmod(0o777)
