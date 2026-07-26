@@ -64,6 +64,38 @@ MODEL_ROUTE_KINDS = {"private_broker", "direct_provider"}
 LOG = logging.getLogger(__name__)
 
 
+def _model_tool_error_message(error: AgentExecutionError) -> str:
+    """Return bounded recovery guidance without exposing private evidence."""
+
+    guidance = {
+        "agent_tool_budget_exhausted": (
+            "This tool's per-turn budget is exhausted; do not retry it. "
+            "Use evidence already returned and finish."
+        ),
+        "agent_finish_invalid": (
+            "Submit evidence_finish with exactly status, answer, claims, "
+            "citations, and gaps, matching the schema."
+        ),
+        "agent_citation_not_opened": (
+            "Cite only receipts opened by recall_show, "
+            "recall_session_context, recall_deep_search, or "
+            "recall_map_reduce."
+        ),
+        "agent_claim_not_grounded": (
+            "Every citation must support at least one claim, and every claim "
+            "receipt must be included in citations."
+        ),
+        "agent_query_scope_violation": (
+            "Copy the request's exact filters and depth; do not widen or "
+            "change them."
+        ),
+    }
+    return guidance.get(
+        error.code,
+        "Recall rejected the evidence operation.",
+    )
+
+
 class BrainTurnTransport(Protocol):
     def run(
         self,
@@ -603,7 +635,7 @@ class SubprocessBrainTurnTransport:
                             "status": "error",
                             "error": {
                                 "code": error.code,
-                                "message": "Recall rejected the evidence operation.",
+                                "message": _model_tool_error_message(error),
                             },
                         }
                     LOG.info(
@@ -729,21 +761,20 @@ def _tool_definitions(
     request: dict[str, Any],
 ) -> list[dict[str, Any]]:
     question = {"type": "string", "minLength": 1, "maxLength": 8192}
-    filter_properties: dict[str, Any] = {
-        "since": {"type": "string", "format": "date-time"},
-        "until": {"type": "string", "format": "date-time"},
-        "source_family": {"type": "string", "minLength": 1, "maxLength": 160},
-    }
-    filter_required = [
-        name for name in ("since", "until") if name in request
-    ]
+    filter_properties: dict[str, Any] = {}
+    for name in ("since", "until"):
+        if name in request:
+            filter_properties[name] = {
+                "type": "string",
+                "format": "date-time",
+            }
     families = request.get("source_families") or []
     if families:
         filter_properties["source_family"] = {
             "type": "string",
             "enum": families,
         }
-        filter_required.append("source_family")
+    filter_required = list(filter_properties)
     filters = _object_schema(filter_properties, filter_required)
     depth = {"type": "string", "enum": ["quick", "normal", "deep"]}
     receipt = {

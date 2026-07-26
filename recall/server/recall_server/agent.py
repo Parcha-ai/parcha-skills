@@ -126,11 +126,17 @@ class ConstrainedAgentTools:
         "recall.session_context",
         "recall.show",
     )
+    TOOL_CALL_LIMITS = {
+        "recall.deep_search": 1,
+        "recall.investigate": 2,
+        "recall.map_reduce": 2,
+    }
 
     def __init__(self, retrieval: Any, context: DelegationContext):
         self._retrieval = retrieval
         self._context = context
         self._calls = 0
+        self._calls_by_tool: dict[str, int] = {}
         self._opened_receipts: list[str] = []
         self._citable_receipts: list[str] = []
         self._observations: list[dict[str, Any]] = []
@@ -170,6 +176,14 @@ class ConstrainedAgentTools:
         self._calls += 1
         started_at = time.monotonic()
         try:
+            tool_calls = self._calls_by_tool.get(name, 0)
+            tool_limit = self.TOOL_CALL_LIMITS.get(name)
+            if tool_limit is not None and tool_calls >= tool_limit:
+                raise AgentExecutionError(
+                    f"{name} per-turn budget is exhausted",
+                    code="agent_tool_budget_exhausted",
+                )
+            self._calls_by_tool[name] = tool_calls + 1
             if name == "recall.investigate":
                 if set(arguments) != {"question", "filters", "depth"}:
                     raise AgentExecutionError("agent tool arguments are invalid")

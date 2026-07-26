@@ -252,6 +252,24 @@ class AgentFacadeUnitTest(unittest.TestCase):
         with self.assertRaisesRegex(AgentExecutionError, "budget is exhausted"):
             tools.call("recall.show", {"target": RECEIPT})
 
+    def test_expensive_tool_budgets_are_enforced_per_tool(self) -> None:
+        context = DelegationContext.from_principal(principal())
+        tools = ConstrainedAgentTools(FakeBoundRetrieval(), context)
+        arguments = {
+            "question": REQUEST["question"],
+            "filters": {},
+            "depth": "normal",
+        }
+        tools.call("recall.investigate", arguments)
+        tools.call("recall.investigate", arguments)
+        with self.assertRaises(AgentExecutionError) as caught:
+            tools.call("recall.investigate", arguments)
+        self.assertEqual(
+            caught.exception.code,
+            "agent_tool_budget_exhausted",
+        )
+        self.assertEqual(tools.observations[-1]["outcome"], "failed")
+
     def test_host_owned_receipt_budget_is_enforced(self) -> None:
         class ManyReceipts(FakeBoundRetrieval):
             def investigate(self, question, *, filters, depth):

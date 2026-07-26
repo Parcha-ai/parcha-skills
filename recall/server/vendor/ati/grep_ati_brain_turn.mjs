@@ -73451,7 +73451,7 @@ function convertTools2(tools, compat) {
       parameters: tool.parameters,
       // TypeBox already generates JSON Schema
       // Only include strict if provider supports it. Some reject unknown fields.
-      ...compat.supportsStrictMode !== false && { strict: false }
+      ...compat.supportsStrictMode !== false && { strict: true }
     }
   }));
 }

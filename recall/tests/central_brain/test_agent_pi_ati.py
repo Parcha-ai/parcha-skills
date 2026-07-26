@@ -27,6 +27,7 @@ from recall_server.agent_pi_ati import (  # noqa: E402
     ProviderKey,
     SubprocessBrainTurnTransport,
     _load_provider_key,
+    _model_tool_error_message,
 )
 
 
@@ -347,6 +348,22 @@ def service(transport) -> RecallAgentService:
 
 
 class PiAtiGroundingTest(unittest.TestCase):
+    def test_model_tool_errors_are_actionable_but_content_free(self):
+        budget = AgentExecutionError(
+            "private failure details",
+            code="agent_tool_budget_exhausted",
+        )
+        finish = AgentExecutionError(
+            "private failure details",
+            code="agent_finish_invalid",
+        )
+        self.assertIn("do not retry", _model_tool_error_message(budget))
+        self.assertIn("exactly", _model_tool_error_message(finish))
+        self.assertNotIn(
+            "private failure details",
+            _model_tool_error_message(budget),
+        )
+
     def test_agent_uses_hint_deep_inspection_exact_open_and_grounded_finish(self):
         transport = ScriptedTransport(success_script())
         retrieval = SyntheticRetrieval()
@@ -403,6 +420,32 @@ class PiAtiGroundingTest(unittest.TestCase):
             if tool["name"] == "evidence_finish"
         )
         self.assertIs(finish["terminate_turn"], True)
+
+    def test_every_model_tool_schema_is_strict_compatible(self):
+        transport = ScriptedTransport(success_script())
+        service(transport).use_recall(
+            principal(),
+            REQUEST,
+            SyntheticRetrieval(),
+        )
+
+        def assert_strict_schema(schema):
+            if not isinstance(schema, dict):
+                return
+            if schema.get("type") == "object":
+                properties = schema.get("properties", {})
+                self.assertIs(schema.get("additionalProperties"), False)
+                self.assertEqual(
+                    set(schema.get("required", [])),
+                    set(properties),
+                )
+                for child in properties.values():
+                    assert_strict_schema(child)
+            if schema.get("type") == "array":
+                assert_strict_schema(schema.get("items"))
+
+        for tool in transport.start["data"]["tools"]:
+            assert_strict_schema(tool["input_schema"])
 
     def test_agentic_map_reduce_decomposes_then_reduces_grounded_evidence(self):
         transport = ScriptedTransport(map_reduce_script())

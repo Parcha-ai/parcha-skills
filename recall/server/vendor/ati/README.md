@@ -2,7 +2,7 @@
 
 `grep_ati_brain_turn.mjs` is the standalone `brain-turn` bundle built from
 `Parcha-ai/ati-harness` commit
-`a0a86b7f9acd618e63773a9352e22dc209aa7f36`.
+`1f6a95ec135552f59b066976d73908aa7ec3d992`.
 
 Build command:
 
@@ -14,7 +14,7 @@ npm run build:brain-turn
 SHA-256:
 
 ```text
-58b75f00c0abd120bd2cc2d2b6b291b239f060d3487c442b5c0648fbbd0d7041
+c19ec8ffbf77ea8987915b84aa0693b257558feebb6b8fe39b6fe1f551da0273
 ```
 
 Recall verifies these bytes again before every agent turn. Update the source
