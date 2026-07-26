@@ -591,9 +591,11 @@ class BoundCanonicalRetrieval:
             except (json.JSONDecodeError, TimeoutError, urllib.error.URLError):
                 semantic_status = "unavailable"
             else:
-                with self.store.connect() as connection:
-                    semantic = connection.execute(
-                        """SELECT chunk.source_id,document.native_id,document.revision,
+                try:
+                    with self.store.connect() as connection:
+                        semantic = self.store._execute_bounded(
+                            connection,
+                            """SELECT chunk.source_id,document.native_id,document.revision,
                               event.native_parent_id,event.occurred_at,event.observed_at,
                               event.created_at,chunk.text_redacted,chunk.receipt,
                               1-(embedding.embedding <=> %s::halfvec) AS score
@@ -615,19 +617,22 @@ class BoundCanonicalRetrieval:
                        ORDER BY embedding.embedding <=> %s::halfvec,
                                 event.occurred_at DESC,chunk.chunk_id
                        LIMIT %s""",
-                        (
-                            vector,
-                            self.tenant_id,
-                            sources,
-                            runtime.fingerprint,
-                            since,
-                            since,
-                            until,
-                            until,
-                            vector,
-                            candidate_limit,
-                        ),
-                    ).fetchall()
+                            (
+                                vector,
+                                self.tenant_id,
+                                sources,
+                                runtime.fingerprint,
+                                since,
+                                since,
+                                until,
+                                until,
+                                vector,
+                                candidate_limit,
+                            ),
+                            lexical_deadline_at,
+                        ).fetchall()
+                except SearchDeadlineExceeded:
+                    semantic_status = "deadline-exceeded"
         combined: dict[str, tuple[dict[str, Any], float]] = {}
         for weight, rows in ((0.6, lexical), (0.4, semantic)):
             for rank, row in enumerate(rows, start=1):

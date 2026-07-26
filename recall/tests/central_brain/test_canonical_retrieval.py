@@ -30,6 +30,14 @@ class DeadlineStore:
         raise SearchDeadlineExceeded("synthetic canonical deadline")
 
 
+class SemanticRuntime:
+    fingerprint = "synthetic-runtime"
+
+    @staticmethod
+    def embed_query_bounded(_query):
+        return [0.0, 1.0]
+
+
 class CanonicalRetrievalDeadlineTest(unittest.TestCase):
     def test_date_only_filters_are_normalized_to_utc_boundaries(self) -> None:
         self.assertEqual(
@@ -58,6 +66,25 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
         assert store.deadline_at is not None
         self.assertGreaterEqual(store.deadline_at, started)
         self.assertLessEqual(store.deadline_at, started + 0.1)
+
+    def test_semantic_database_query_uses_the_same_hard_deadline(self) -> None:
+        store = DeadlineStore()
+        store.semantic_runtime = SemanticRuntime()
+        retrieval = BoundCanonicalRetrieval(
+            store,
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=("codex.jsonl:test",),
+        )
+
+        result = retrieval.search("synthetic canonical deadline query")
+
+        self.assertEqual(result["results"], [])
+        self.assertEqual(result["diagnostics"]["lexical_mode"], "deadline-exceeded")
+        self.assertEqual(
+            result["diagnostics"]["semantic_status"],
+            "deadline-exceeded",
+        )
 
 
 if __name__ == "__main__":
