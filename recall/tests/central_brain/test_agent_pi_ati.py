@@ -449,6 +449,7 @@ class PiAtiSubprocessBoundaryTest(unittest.TestCase):
                 key = _load_provider_key(
                     str(link),
                     _managed_secret_root=root,
+                    _managed_secret_group=os.getgid(),
                 )
             self.assertNotIn("synthetic-provider-key-value", repr(key))
 

@@ -131,6 +131,7 @@ def _load_provider_key(
     path: str,
     *,
     _managed_secret_root: Path = Path("/etc/secrets"),
+    _managed_secret_group: int = 1000,
 ) -> ProviderKey:
     key_path = Path(path)
     descriptor, managed_secret = _open_provider_key(
@@ -142,7 +143,7 @@ def _load_provider_key(
         permissions = stat.S_IMODE(metadata.st_mode)
         owner_is_trusted = metadata.st_uid in {0, os.getuid()} or (
             managed_secret
-            and metadata.st_gid == 1000
+            and metadata.st_gid == _managed_secret_group
             and bool(permissions & stat.S_IRGRP)
         )
         group_is_trusted = (
