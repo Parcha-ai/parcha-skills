@@ -68,12 +68,14 @@ class SyntheticRetrieval:
     def __init__(self, *, fail_deep: bool = False):
         self.calls: list[str] = []
         self.filters: list[dict] = []
+        self.questions: list[str] = []
         self.map_batches: list[list[str]] = []
         self.map_seed_batches: list[list[list[str]]] = []
         self.fail_deep = fail_deep
 
     def investigate(self, question, *, filters, depth):
         self.calls.append("recall_investigate")
+        self.questions.append(question)
         self.filters.append(dict(filters))
         return {
             "question_interpretation": {"time_basis": "occurred_at"},
@@ -680,6 +682,19 @@ class PiAtiGroundingTest(unittest.TestCase):
         for seeds in retrieval.map_seed_batches[0]:
             self.assertEqual(set(seeds), expected)
             self.assertLessEqual(len(seeds), 32)
+
+    def test_investigation_cannot_drop_the_original_user_question(self):
+        script = map_reduce_script()
+        script[0][1]["question"] = "lossy model rewrite"
+        retrieval = SyntheticRetrieval()
+
+        service(ScriptedTransport(script)).use_recall(
+            principal(),
+            REQUEST,
+            retrieval,
+        )
+
+        self.assertEqual(retrieval.questions, [REQUEST["question"]])
 
     def test_semantic_runner_beats_scripted_generic_baseline(self):
         pi = service(ScriptedTransport(success_script())).use_recall(

@@ -1129,6 +1129,11 @@ class PiAtiRunner:
                     arguments,
                     request,
                 )
+                if host_name == "recall.investigate":
+                    arguments = {
+                        **arguments,
+                        "question": request["question"],
+                    }
             elif host_name == "recall.map_reduce":
                 arguments = self._authorize_map_reduce_arguments(
                     arguments,
