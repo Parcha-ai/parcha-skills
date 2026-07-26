@@ -183,6 +183,9 @@ def service(runner=None) -> RecallAgentService:
 
 
 class AgentFacadeUnitTest(unittest.TestCase):
+    def test_default_agent_deadline_allows_bounded_multi_step_retrieval(self) -> None:
+        self.assertEqual(AgentBudget().deadline_seconds, 120)
+
     def test_runner_configuration_is_explicit_and_fail_closed(self) -> None:
         self.assertIsNone(service_from_env({}))
         self.assertIsInstance(
