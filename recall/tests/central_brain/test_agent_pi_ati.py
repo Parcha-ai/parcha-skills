@@ -420,6 +420,19 @@ class PiAtiGroundingTest(unittest.TestCase):
             if tool["name"] == "evidence_finish"
         )
         self.assertIs(finish["terminate_turn"], True)
+        system = next(
+            section["content"]
+            for section in transport.start["data"]["prompt_sections"]
+            if section["id"] == "role"
+        )
+        self.assertIn(
+            "For an exact session UUID, investigate once using only the UUID",
+            system,
+        )
+        self.assertIn(
+            "then run recall_deep_search over the full session evidence",
+            system,
+        )
 
     def test_every_model_tool_schema_is_strict_compatible(self):
         transport = ScriptedTransport(success_script())

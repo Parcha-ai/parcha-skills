@@ -797,7 +797,8 @@ def _tool_definitions(
             "description": (
                 "Search authorized semantic/index hints. Use a focused query of "
                 "two to six distinctive domain terms; omit dates and source names "
-                "already enforced by filters. Start here and call at most twice. "
+                "already enforced by filters. For an exact UUID, query only that "
+                "UUID. Start here and call at most twice. "
                 "Results are candidates, not sufficient proof; inspect exact "
                 "receipts before finishing."
             ),
@@ -867,7 +868,9 @@ def _tool_definitions(
             "name": "recall_deep_search",
             "description": (
                 "Run bounded Archil-backed deep inspection over authorized full "
-                "evidence objects selected from Recall hints."
+                "evidence objects selected from Recall hints. For an exact "
+                "session lookup, use this after the UUID hint to inspect the "
+                "whole raw session rather than one matching event."
             ),
             "input_schema": _object_schema(
                 {"question": question, "filters": filters, "depth": depth},
@@ -1025,6 +1028,11 @@ class PiAtiRunner:
             "cross-corpus synthesis. Extract hard source and occurred-at bounds "
             "before retrieval. Begin narrow questions with recall_investigate; "
             "semantic and lexical hits route you to a corpus but are not proof. "
+            "For an exact session UUID, investigate once using only the UUID, "
+            "then run recall_deep_search over the full session evidence using "
+            "the original question and exact filters. Do not conclude from one "
+            "matching event when the question asks what happened across the "
+            "session. "
             "For questions spanning sessions, sources, or subtopics, use "
             "recall_investigate once with two to six distinctive domain terms "
             "(at most one focused reformulation), then use "
