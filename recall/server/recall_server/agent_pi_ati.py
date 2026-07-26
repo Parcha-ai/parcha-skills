@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 import re
 import select
@@ -60,6 +61,7 @@ SAFE_CHILD_ENV = (
 MODEL_PROXY_PLACEHOLDER_KEY = "not-a-secret"
 CEREBRAS_API_BASE_URL = "https://api.cerebras.ai/v1"
 MODEL_ROUTE_KINDS = {"private_broker", "direct_provider"}
+LOG = logging.getLogger(__name__)
 
 
 class BrainTurnTransport(Protocol):
@@ -502,10 +504,12 @@ class SubprocessBrainTurnTransport:
         input_sequence = 0
         output_sequence = 0
         deadline = time.monotonic() + timeout_seconds
+        turn_started = time.monotonic()
         terminal: dict[str, Any] | None = None
         usage: dict[str, Any] | None = None
         output_buffer = bytearray()
         seen_call_ids: set[str] = set()
+        tool_invocations = 0
         try:
             if process.stdin is None or process.stdout is None:
                 raise AgentExecutionError(
@@ -578,6 +582,8 @@ class SubprocessBrainTurnTransport:
                             code="agent_transport_protocol_violation",
                         )
                     seen_call_ids.add(data["call_id"])
+                    tool_started = time.monotonic()
+                    tool_invocations += 1
                     try:
                         value = invoke(data["name"], data["arguments"])
                         if time.monotonic() > deadline:
@@ -600,6 +606,22 @@ class SubprocessBrainTurnTransport:
                                 "message": "Recall rejected the evidence operation.",
                             },
                         }
+                    LOG.info(
+                        "agent tool name=%s index=%s status=%s elapsed_ms=%s "
+                        "output_bytes=%s",
+                        data["name"],
+                        tool_invocations,
+                        result["status"],
+                        round((time.monotonic() - tool_started) * 1000, 3),
+                        len(
+                            json.dumps(
+                                result.get("value", result.get("error", {})),
+                                ensure_ascii=False,
+                                allow_nan=False,
+                                separators=(",", ":"),
+                            ).encode()
+                        ),
+                    )
                     self._write(process, {
                         "v": PROTOCOL,
                         "turn_id": turn_id,
@@ -612,6 +634,12 @@ class SubprocessBrainTurnTransport:
                     continue
                 if frame_type in TERMINAL_TYPES:
                     terminal = frame
+                    LOG.info(
+                        "agent terminal type=%s tool_invocations=%s elapsed_ms=%s",
+                        frame_type,
+                        tool_invocations,
+                        round((time.monotonic() - turn_started) * 1000, 3),
+                    )
                     continue
                 raise AgentExecutionError(
                     "ATI emitted an unsupported frame",
