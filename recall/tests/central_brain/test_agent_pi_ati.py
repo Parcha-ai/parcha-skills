@@ -404,6 +404,14 @@ class PiAtiGroundingTest(unittest.TestCase):
             "private failure details",
             _model_tool_error_message(budget),
         )
+        allowed = (
+            "recall://source:synthetic:company/opened?rev=1#item=0"
+        )
+        budget.model_guidance = f"Cite only {allowed}"
+        self.assertEqual(
+            _model_tool_error_message(budget),
+            f"Cite only {allowed}",
+        )
 
     def test_agent_uses_hint_deep_inspection_exact_open_and_grounded_finish(self):
         transport = ScriptedTransport(success_script())

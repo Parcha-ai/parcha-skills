@@ -67,6 +67,9 @@ LOG = logging.getLogger(__name__)
 def _model_tool_error_message(error: AgentExecutionError) -> str:
     """Return bounded recovery guidance without exposing private evidence."""
 
+    model_guidance = getattr(error, "model_guidance", None)
+    if isinstance(model_guidance, str) and len(model_guidance) <= 70_000:
+        return model_guidance
     guidance = {
         "agent_tool_budget_exhausted": (
             "This tool's per-turn budget is exhausted; do not retry it. "
@@ -1078,7 +1081,24 @@ class PiAtiRunner:
                 )
                 raise fatal_violation
             if name == "evidence_finish":
-                finished = self._accept_finish(arguments, tools, context)
+                try:
+                    finished = self._accept_finish(
+                        arguments,
+                        tools,
+                        context,
+                    )
+                except AgentExecutionError as error:
+                    if error.code == "agent_citation_not_opened":
+                        error.model_guidance = (
+                            "Cite only this exact opened receipt allowlist: "
+                            + json.dumps(
+                                list(tools.citable_receipts)[:32],
+                                separators=(",", ":"),
+                            )
+                            + ". Remove every other citation and claim receipt, "
+                            "then submit evidence_finish once."
+                        )
+                    raise
                 sealed = True
                 return {"accepted": True}
             host_name = MODEL_TOOL_NAMES.get(name)
