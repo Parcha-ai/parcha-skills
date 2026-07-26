@@ -69,6 +69,7 @@ class SyntheticRetrieval:
         self.calls: list[str] = []
         self.filters: list[dict] = []
         self.map_batches: list[list[str]] = []
+        self.map_seed_batches: list[list[list[str]]] = []
         self.fail_deep = fail_deep
 
     def investigate(self, question, *, filters, depth):
@@ -121,6 +122,9 @@ class SyntheticRetrieval:
     def map_reduce_search(self, question, *, maps, depth):
         self.calls.append("recall_map_reduce")
         self.map_batches.append([item["map_id"] for item in maps])
+        self.map_seed_batches.append([
+            item["seed_receipts"] for item in maps
+        ])
         self.filters.extend(dict(item["filters"]) for item in maps)
         rendered_maps = []
         for index, item in enumerate(maps):
@@ -664,6 +668,18 @@ class PiAtiGroundingTest(unittest.TestCase):
             ],
             ["recall.map_reduce", "recall.map_reduce"],
         )
+
+    def test_each_map_scans_the_full_bounded_hint_corpus(self):
+        retrieval = SyntheticRetrieval()
+        service(ScriptedTransport(map_reduce_script())).use_recall(
+            principal(),
+            REQUEST,
+            retrieval,
+        )
+        expected = {DECISION, IMPLEMENTATION, HINT}
+        for seeds in retrieval.map_seed_batches[0]:
+            self.assertEqual(set(seeds), expected)
+            self.assertLessEqual(len(seeds), 32)
 
     def test_semantic_runner_beats_scripted_generic_baseline(self):
         pi = service(ScriptedTransport(success_script())).use_recall(

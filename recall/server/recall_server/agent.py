@@ -213,9 +213,20 @@ class ConstrainedAgentTools:
                         "agent map seed was not returned by a prior hint call",
                         code="agent_map_seed_not_opened",
                     )
+                routed_receipts = tuple(self._opened_receipts)
+                maps = [
+                    {
+                        **item,
+                        "seed_receipts": list(dict.fromkeys((
+                            *item["seed_receipts"],
+                            *routed_receipts,
+                        )))[:32],
+                    }
+                    for item in arguments["maps"]
+                ]
                 result = self._retrieval.map_reduce_search(
                     arguments["question"],
-                    maps=arguments["maps"],
+                    maps=maps,
                     depth=arguments["depth"],
                 )
             elif name == "recall.session_context":
