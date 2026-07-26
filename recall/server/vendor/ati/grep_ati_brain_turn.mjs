@@ -73076,7 +73076,7 @@ function buildParams2(model, context, options, compat = getCompat(model), cacheR
     params.temperature = options.temperature;
   }
   if (context.tools && context.tools.length > 0) {
-    params.tools = convertTools2(context.tools, compat);
+    params.tools = convertTools2(context.tools, compat, model);
     if (compat.zaiToolStream) {
       params.tool_stream = true;
     }
@@ -73442,13 +73442,56 @@ function convertMessages2(model, context, compat) {
   }
   return params;
 }
-function convertTools2(tools, compat) {
+var CEREBRAS_STRICT_SCHEMA_KEYS = /* @__PURE__ */ new Set([
+  "type",
+  "properties",
+  "required",
+  "additionalProperties",
+  "enum",
+  "items",
+  "anyOf",
+  "$defs",
+  "$ref",
+  "prefixItems",
+  "minimum",
+  "maximum",
+  "exclusiveMinimum",
+  "exclusiveMaximum",
+  "multipleOf"
+]);
+function normalizeCerebrasStrictSchema(schema) {
+  if (Array.isArray(schema)) {
+    return schema.map((item) => normalizeCerebrasStrictSchema(item));
+  }
+  if (!schema || typeof schema !== "object") {
+    return schema;
+  }
+  const normalized = {};
+  for (const [key, value] of Object.entries(schema)) {
+    if (!CEREBRAS_STRICT_SCHEMA_KEYS.has(key)) {
+      continue;
+    }
+    if (key === "properties" || key === "$defs") {
+      normalized[key] = Object.fromEntries(Object.entries(value).map(([name, child]) => [
+        name,
+        normalizeCerebrasStrictSchema(child)
+      ]));
+    } else if (key === "items" || key === "anyOf" || key === "prefixItems") {
+      normalized[key] = normalizeCerebrasStrictSchema(value);
+    } else {
+      normalized[key] = value;
+    }
+  }
+  return normalized;
+}
+function convertTools2(tools, compat, model) {
+  const cerebrasStrict = compat.supportsStrictMode !== false && model.baseUrl.includes("api.cerebras.ai");
   return tools.map((tool) => ({
     type: "function",
     function: {
       name: tool.name,
       description: tool.description,
-      parameters: tool.parameters,
+      parameters: cerebrasStrict ? normalizeCerebrasStrictSchema(tool.parameters) : tool.parameters,
       // TypeBox already generates JSON Schema
       // Only include strict if provider supports it. Some reject unknown fields.
       ...compat.supportsStrictMode !== false && { strict: true }
