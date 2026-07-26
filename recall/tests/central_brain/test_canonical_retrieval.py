@@ -148,6 +148,27 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
                 sql.index("JOIN canonical_documents"),
             )
 
+    def test_strict_lexical_query_treats_uuid_hyphens_as_text(self) -> None:
+        store = RecordingStore()
+        retrieval = BoundCanonicalRetrieval(
+            store,
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=("codex.jsonl:test",),
+        )
+
+        retrieval.search("8668a658-a6cf-4358-9d7e-c29e5782c1dd")
+
+        self.assertIn(
+            "ts_rank_cd( chunk.search_vector, "
+            "plainto_tsquery('simple',%s)",
+            store.sql[0],
+        )
+        self.assertIn(
+            "chunk.search_vector @@ plainto_tsquery('simple',%s)",
+            store.sql[0],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -507,16 +507,20 @@ class BoundCanonicalRetrieval:
             search_query: str,
             *,
             minimum_matches: int,
+            literal: bool,
         ) -> list[dict[str, Any]]:
+            query_parser = (
+                "plainto_tsquery" if literal else "websearch_to_tsquery"
+            )
             rows = self.store._execute_bounded(
                 connection,
-                """WITH candidates AS MATERIALIZED (
+                f"""WITH candidates AS MATERIALIZED (
                      SELECT chunk.tenant_id,chunk.source_id,chunk.document_id,
                             chunk.chunk_id,chunk.text_redacted,chunk.receipt,
                             chunk.search_vector,
                             ts_rank_cd(
                               chunk.search_vector,
-                              websearch_to_tsquery('simple',%s),
+                              {query_parser}('simple',%s),
                               32
                             ) AS score
                      FROM canonical_chunks chunk
@@ -524,7 +528,7 @@ class BoundCanonicalRetrieval:
                        AND chunk.source_id=ANY(%s)
                        AND chunk.deleted_at IS NULL
                        AND chunk.search_vector @@
-                           websearch_to_tsquery('simple',%s)
+                           {query_parser}('simple',%s)
                      ORDER BY score DESC,chunk.chunk_id
                      LIMIT %s
                    )
@@ -577,6 +581,7 @@ class BoundCanonicalRetrieval:
                     connection,
                     strict_query,
                     minimum_matches=len(informative),
+                    literal=True,
                 )
                 lexical_mode = "strict"
                 if not lexical and len(informative) > 1:
@@ -587,6 +592,7 @@ class BoundCanonicalRetrieval:
                         connection,
                         relaxed_query,
                         minimum_matches=2 if len(informative) >= 3 else 1,
+                        literal=False,
                     )
                     lexical_mode = "relaxed" if lexical else "relaxed-empty"
         except SearchDeadlineExceeded:
