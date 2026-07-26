@@ -61,6 +61,8 @@ SAFE_CHILD_ENV = (
 MODEL_PROXY_PLACEHOLDER_KEY = "not-a-secret"
 CEREBRAS_API_BASE_URL = "https://api.cerebras.ai/v1"
 MODEL_ROUTE_KINDS = {"private_broker", "direct_provider"}
+MODEL_MAP_FINDINGS_PER_MAP = 6
+MODEL_MAP_FINDING_TEXT_BYTES = 1_200
 LOG = logging.getLogger(__name__)
 
 
@@ -108,6 +110,82 @@ def _model_tool_result(
 ) -> dict[str, Any]:
     """Keep routing hints compact; full evidence belongs in inspection tools."""
 
+    if name == "recall.map_reduce":
+        maps = result.get("maps")
+        if not isinstance(maps, list):
+            return result
+        compact_maps = []
+        finding_fields = (
+            "receipt",
+            "text",
+            "line",
+            "object_key",
+            "source_id",
+            "native_id",
+            "native_parent_id",
+            "occurred_at",
+            "time_basis",
+        )
+        for mapped in maps:
+            if not isinstance(mapped, dict):
+                continue
+            findings = mapped.get("findings")
+            if not isinstance(findings, list):
+                findings = []
+            compact_findings = []
+            for finding in findings[:MODEL_MAP_FINDINGS_PER_MAP]:
+                if not isinstance(finding, dict):
+                    continue
+                compact_finding = {
+                    key: finding[key]
+                    for key in finding_fields
+                    if key in finding
+                }
+                text = compact_finding.get("text")
+                if isinstance(text, str):
+                    encoded = text.encode()
+                    compact_finding["text"] = encoded[
+                        :MODEL_MAP_FINDING_TEXT_BYTES
+                    ].decode("utf-8", errors="ignore")
+                    compact_finding["text_clipped"] = (
+                        len(encoded) > MODEL_MAP_FINDING_TEXT_BYTES
+                    )
+                compact_findings.append(compact_finding)
+            compact_map = {
+                key: mapped[key]
+                for key in (
+                    "map_id",
+                    "objective",
+                    "query",
+                    "filters",
+                    "status",
+                    "coverage",
+                    "uncertainty",
+                )
+                if key in mapped
+            }
+            compact_map["findings"] = compact_findings
+            compact_map["model_view_truncated"] = (
+                len(compact_findings) != len(findings)
+            )
+            compact_maps.append(compact_map)
+        return {
+            key: result[key]
+            for key in (
+                "contract",
+                "question",
+                "coverage",
+                "diagnostics",
+            )
+            if key in result
+        } | {
+            "maps": compact_maps,
+            "next_step": (
+                "Reduce these representative findings now. Their receipts are "
+                "already citable; do not call recall_show unless a finding lacks "
+                "the context required for a claim."
+            ),
+        }
     if name != "recall.investigate":
         return result
     investigations = result.get("investigations")

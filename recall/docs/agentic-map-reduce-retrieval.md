@@ -54,6 +54,9 @@ The host:
   then revalidates every seed receipt against the map's hard scope (the
   already-decomposed map never re-enters the broad investigator);
 - returns per-map findings, coverage, uncertainty, and aggregate diagnostics;
+- records the full bounded evidence result for authorization and trace metrics,
+  but gives the reducer a diverse model view of at most six byte-bounded
+  findings per map so large successful scans cannot drown the synthesis step;
 - distinguishes a completed corpus scan and a nonempty result from the agent's
   semantic judgment that the evidence is sufficient for the map objective;
 - never puts questions, answers, source bodies, or credentials in the trace.

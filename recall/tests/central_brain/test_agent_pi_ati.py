@@ -419,6 +419,66 @@ class PiAtiGroundingTest(unittest.TestCase):
             f"Cite only {allowed}",
         )
 
+    def test_map_reduce_model_view_is_small_diverse_and_citable(self):
+        maps = []
+        for map_index in range(5):
+            findings = []
+            for finding_index in range(40):
+                receipt = (
+                    f"recall://{SOURCE}/map-{map_index}-"
+                    f"{finding_index}?rev=1#item=0"
+                )
+                findings.append({
+                    "receipt": receipt,
+                    "text": "🧠" * 4_000,
+                    "line": finding_index + 1,
+                    "object_key": f"objects/{map_index}/{finding_index}",
+                    "source_id": SOURCE,
+                    "native_id": f"event-{finding_index}",
+                    "native_parent_id": f"session-{map_index}",
+                    "occurred_at": "2026-07-23T15:00:00Z",
+                    "time_basis": "occurred_at",
+                })
+            maps.append({
+                "map_id": f"map_{map_index}",
+                "objective": f"Objective {map_index}",
+                "query": f"query {map_index}",
+                "filters": {},
+                "status": "complete",
+                "findings": findings,
+                "coverage": {"complete": True},
+                "uncertainty": [],
+            })
+
+        result = _model_tool_result(
+            "recall.map_reduce",
+            {
+                "contract": "recall.agentic-map-reduce.v1",
+                "question": "Synthesize the corpus.",
+                "maps": maps,
+                "coverage": {"maps": 5, "complete": True},
+                "diagnostics": {"reducer": "agent"},
+            },
+        )
+
+        self.assertLess(
+            len(json.dumps(result, ensure_ascii=False).encode()),
+            80_000,
+        )
+        self.assertEqual(len(result["maps"]), 5)
+        for map_index, mapped in enumerate(result["maps"]):
+            self.assertEqual(len(mapped["findings"]), 6)
+            self.assertEqual(
+                mapped["findings"][0]["receipt"],
+                maps[map_index]["findings"][0]["receipt"],
+            )
+            self.assertLessEqual(
+                len(mapped["findings"][0]["text"].encode()),
+                1_200,
+            )
+            self.assertIs(mapped["model_view_truncated"], True)
+        self.assertIn("already citable", result["next_step"])
+
     def test_finish_retry_loop_has_a_hard_bound(self):
         class FinishLoop:
             def run(self, _start, invoke, **_kwargs):
