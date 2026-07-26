@@ -91,9 +91,10 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
     def test_query_scaffolding_does_not_dilute_the_domain_concept(self) -> None:
         self.assertEqual(
             _informative_query_terms(
-                "Across Codex and Claude coding sessions, synthesize ATI "
-                "harness decisions, implementation steps, verification "
-                "evidence, and unresolved blockers."
+                "Across Codex and Claude coding sessions from July 22 "
+                "through July 24, 2026, synthesize ATI harness decisions, "
+                "implementation steps, verification evidence, and "
+                "unresolved blockers."
             ),
             ["ati", "harness"],
         )

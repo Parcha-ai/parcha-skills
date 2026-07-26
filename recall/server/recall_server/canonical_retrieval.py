@@ -35,12 +35,28 @@ MAX_CANONICAL_EMBEDDING_BATCH = 5000
 MAX_AGENTIC_MAPS = 5
 MAX_AGENTIC_MAP_FINDINGS = 40
 MAX_AGENTIC_MAP_FINDING_BYTES = 64_000
+MONTH_TERMS = frozenset({
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+})
 QUERY_SCAFFOLD_TERMS = frozenset({
+    *MONTH_TERMS,
     "across",
     "actual",
     "actually",
     "blocker",
     "blockers",
+    "between",
     "claude",
     "codex",
     "coding",
@@ -59,6 +75,7 @@ QUERY_SCAFFOLD_TERMS = frozenset({
     "sources",
     "steps",
     "synthesize",
+    "through",
     "unresolved",
     "verification",
     "verify",
@@ -73,8 +90,19 @@ def _informative_query_terms(query: str) -> list[str]:
     if identifier is not None:
         return [identifier.group(0).lower()]
     terms = legacy_engine().informative_terms(query)
+    has_month = any(term in MONTH_TERMS for term in terms)
     focused = [
-        term for term in terms if term not in QUERY_SCAFFOLD_TERMS
+        term
+        for term in terms
+        if term not in QUERY_SCAFFOLD_TERMS
+        and not (
+            has_month
+            and term.isdigit()
+            and (
+                1 <= int(term) <= 31
+                or 1900 <= int(term) <= 2100
+            )
+        )
     ]
     return (focused or terms)[:16]
 
