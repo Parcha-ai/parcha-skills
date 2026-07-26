@@ -443,11 +443,15 @@ class ArchilDeepInspector:
             or len(stdout.encode()) > budget.max_output_bytes + 16_384
             or not isinstance(data.get("timing"), dict)
         ):
-            raise DeepInspectionError("deep_inspector_result_invalid")
+            raise DeepInspectionError(
+                "deep_inspector_result_invalid_execution"
+            )
         try:
             value = json.loads(stdout)
         except json.JSONDecodeError:
-            raise DeepInspectionError("deep_inspector_result_invalid") from None
+            raise DeepInspectionError(
+                "deep_inspector_result_invalid_json"
+            ) from None
         if (
             not isinstance(value, dict)
             or set(value) != {"findings", "complete", "files_scanned"}
@@ -458,7 +462,7 @@ class ArchilDeepInspector:
             or not isinstance(value["files_scanned"], int)
             or not 0 <= value["files_scanned"] <= len(selected)
         ):
-            raise DeepInspectionError("deep_inspector_result_invalid")
+            raise DeepInspectionError("deep_inspector_result_invalid_shape")
         allowed_pairs = {
             (target.object_key, receipt)
             for target in selected
@@ -479,9 +483,11 @@ class ArchilDeepInspector:
                 or not isinstance(finding.get("line"), int)
                 or finding["line"] < 1
             ):
-                raise DeepInspectionError("deep_inspector_result_invalid")
+                raise DeepInspectionError(
+                    "deep_inspector_result_invalid_finding"
+                )
         if len(json.dumps(value["findings"], ensure_ascii=False).encode()) > budget.max_output_bytes:
-            raise DeepInspectionError("deep_inspector_result_invalid")
+            raise DeepInspectionError("deep_inspector_result_invalid_bytes")
         return {
             **value,
             "timing": {
