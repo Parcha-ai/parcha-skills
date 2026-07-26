@@ -384,6 +384,7 @@ class DeepInspectionContractTests(unittest.TestCase):
         command = call["body"]["command"]
         self.assertNotIn("rm -rf", command)
         self.assertNotIn(SAFE_TEXT, command)
+        self.assertIn('text.encode("utf-8")[:8192]', command)
         self.assertNotIn("synthetic-key", json.dumps(call["body"]))
         self.assertEqual(call["headers"]["Authorization"], "synthetic-key")
 

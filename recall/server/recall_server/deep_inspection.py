@@ -316,7 +316,8 @@ for key in p["object_keys"]:
         score=sum(lowered.count(term) for term in terms)
         if terms and score==0:
             continue
-        out.append({"receipt":receipt,"text":text[:8192],"line":int(chunk.get("ordinal",0))+1,"object_key":key,"_score":score})
+        text=text.encode("utf-8")[:8192].decode("utf-8","ignore")
+        out.append({"receipt":receipt,"text":text,"line":int(chunk.get("ordinal",0))+1,"object_key":key,"_score":score})
 out.sort(key=lambda x:(x["_score"],x["receipt"]),reverse=True)
 findings=[]
 for item in out:
