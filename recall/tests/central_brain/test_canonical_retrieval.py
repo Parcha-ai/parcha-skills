@@ -43,6 +43,17 @@ class SemanticRuntime:
         return [0.0, 1.0]
 
 
+class RecordingSemanticRuntime:
+    fingerprint = "synthetic-runtime"
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def embed_query_bounded(self, query):
+        self.calls.append(query)
+        return [0.0, 1.0]
+
+
 class EmptyRows:
     @staticmethod
     def fetchall():
@@ -75,6 +86,15 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
                 f"In session {session_id}, what was verified about ATI?"
             ),
             [session_id],
+        )
+
+    def test_query_scaffolding_does_not_dilute_the_domain_concept(self) -> None:
+        self.assertEqual(
+            _informative_query_terms(
+                "Synthesize ATI harness decisions, implementation, "
+                "verification evidence, and unresolved blockers."
+            ),
+            ["ati", "harness"],
         )
 
     def test_date_only_filters_are_normalized_to_utc_boundaries(self) -> None:
@@ -125,6 +145,25 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
         )
         self.assertEqual(len(store.deadlines), 2)
         self.assertGreaterEqual(store.deadlines[1], store.deadlines[0])
+
+    def test_semantic_search_adds_one_domain_noun_probe(self) -> None:
+        store = RecordingStore()
+        runtime = RecordingSemanticRuntime()
+        store.semantic_runtime = runtime
+        retrieval = BoundCanonicalRetrieval(
+            store,
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=("codex.jsonl:test",),
+        )
+        query = (
+            "ATI harness decisions implementation verification evidence"
+        )
+
+        result = retrieval.search(query)
+
+        self.assertEqual(runtime.calls, [query, "harness"])
+        self.assertEqual(result["diagnostics"]["semantic_probes"], 2)
 
     def test_session_expansion_uses_the_caller_deadline(self) -> None:
         store = DeadlineStore()

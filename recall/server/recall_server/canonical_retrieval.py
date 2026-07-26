@@ -35,6 +35,23 @@ MAX_CANONICAL_EMBEDDING_BATCH = 5000
 MAX_AGENTIC_MAPS = 5
 MAX_AGENTIC_MAP_FINDINGS = 40
 MAX_AGENTIC_MAP_FINDING_BYTES = 64_000
+QUERY_SCAFFOLD_TERMS = frozenset({
+    "actual",
+    "actually",
+    "blocker",
+    "blockers",
+    "decision",
+    "decisions",
+    "distinguish",
+    "evidence",
+    "happened",
+    "implementation",
+    "proposed",
+    "synthesize",
+    "unresolved",
+    "verification",
+    "verify",
+})
 LOG = logging.getLogger(__name__)
 
 
@@ -44,7 +61,11 @@ def _informative_query_terms(query: str) -> list[str]:
     identifier = UUID_RE.search(query)
     if identifier is not None:
         return [identifier.group(0).lower()]
-    return legacy_engine().informative_terms(query)[:16]
+    terms = legacy_engine().informative_terms(query)
+    focused = [
+        term for term in terms if term not in QUERY_SCAFFOLD_TERMS
+    ]
+    return (focused or terms)[:16]
 
 
 def _timestamp(value: Any) -> str:
@@ -616,77 +637,104 @@ class BoundCanonicalRetrieval:
         semantic: list[dict[str, Any]] = []
         runtime = self.store.semantic_runtime
         semantic_status = "disabled" if runtime is None else "ok"
+        semantic_probe_count = 0
         if runtime is not None:
-            try:
+            def semantic_probe(probe_query: str) -> list[dict[str, Any]]:
                 bounded_embed = getattr(runtime, "embed_query_bounded", None)
                 vector = (
-                    bounded_embed(query)
+                    bounded_embed(probe_query)
                     if bounded_embed is not None
-                    else runtime.embed_query(query)
+                    else runtime.embed_query(probe_query)
                 )
-            except (json.JSONDecodeError, TimeoutError, urllib.error.URLError):
-                semantic_status = "unavailable"
-            else:
+                semantic_candidate_limit = min(
+                    5_000,
+                    max(1_000, candidate_limit * 50),
+                )
+                semantic_deadline_at = (
+                    time.monotonic()
+                    + self.store.search_deadline_ms / 1000
+                )
+                with self.store.connect() as connection:
+                    return self.store._execute_bounded(
+                        connection,
+                        """WITH candidates AS MATERIALIZED (
+                             SELECT embedding.tenant_id,embedding.source_id,
+                                    embedding.chunk_id,
+                                    embedding.embedding <=> %s::halfvec AS distance
+                             FROM canonical_chunk_embeddings embedding
+                             WHERE embedding.tenant_id=%s
+                               AND embedding.source_id=ANY(%s)
+                               AND embedding.runtime_fingerprint=%s
+                             ORDER BY embedding.embedding <=> %s::halfvec
+                             LIMIT %s
+                           )
+                           SELECT chunk.source_id,document.native_id,
+                                  document.revision,
+                                  event.native_parent_id,event.occurred_at,
+                                  event.observed_at,event.created_at,
+                                  chunk.text_redacted,chunk.receipt,
+                                  1-candidate.distance AS score
+                           FROM candidates candidate
+                           JOIN canonical_chunks chunk
+                             USING(tenant_id,source_id,chunk_id)
+                           JOIN canonical_documents document
+                             USING(tenant_id,source_id,document_id)
+                           JOIN canonical_events event
+                             USING(tenant_id,source_id,event_id)
+                           WHERE chunk.deleted_at IS NULL
+                             AND document.is_current
+                             AND document.deleted_at IS NULL
+                             AND (%s::timestamptz IS NULL
+                                  OR event.occurred_at>=%s)
+                             AND (%s::timestamptz IS NULL
+                                  OR event.occurred_at<=%s)
+                           ORDER BY candidate.distance,
+                                    event.occurred_at DESC,chunk.chunk_id
+                           LIMIT %s""",
+                        (
+                            vector,
+                            self.tenant_id,
+                            sources,
+                            runtime.fingerprint,
+                            vector,
+                            semantic_candidate_limit,
+                            since,
+                            since,
+                            until,
+                            until,
+                            candidate_limit,
+                        ),
+                        semantic_deadline_at,
+                    ).fetchall()
+
+            probe_queries = [query]
+            if informative:
+                domain_probe = max(informative, key=len)
+                if domain_probe.casefold() != query.strip().casefold():
+                    probe_queries.append(domain_probe)
+            seen_semantic_receipts: set[str] = set()
+            for probe_query in probe_queries:
                 try:
-                    semantic_candidate_limit = min(
-                        5_000,
-                        max(1_000, candidate_limit * 50),
-                    )
-                    semantic_deadline_at = (
-                        time.monotonic()
-                        + self.store.search_deadline_ms / 1000
-                    )
-                    with self.store.connect() as connection:
-                        semantic = self.store._execute_bounded(
-                            connection,
-                            """WITH candidates AS MATERIALIZED (
-                                 SELECT embedding.tenant_id,embedding.source_id,
-                                        embedding.chunk_id,
-                                        embedding.embedding <=> %s::halfvec AS distance
-                                 FROM canonical_chunk_embeddings embedding
-                                 WHERE embedding.tenant_id=%s
-                                   AND embedding.source_id=ANY(%s)
-                                   AND embedding.runtime_fingerprint=%s
-                                 ORDER BY embedding.embedding <=> %s::halfvec
-                                 LIMIT %s
-                               )
-                               SELECT chunk.source_id,document.native_id,
-                                      document.revision,
-                              event.native_parent_id,event.occurred_at,event.observed_at,
-                              event.created_at,chunk.text_redacted,chunk.receipt,
-                              1-candidate.distance AS score
-                       FROM candidates candidate
-                       JOIN canonical_chunks chunk
-                         USING(tenant_id,source_id,chunk_id)
-                       JOIN canonical_documents document
-                         USING(tenant_id,source_id,document_id)
-                       JOIN canonical_events event
-                         USING(tenant_id,source_id,event_id)
-                       WHERE chunk.deleted_at IS NULL
-                         AND document.is_current
-                         AND document.deleted_at IS NULL
-                         AND (%s::timestamptz IS NULL OR event.occurred_at>=%s)
-                         AND (%s::timestamptz IS NULL OR event.occurred_at<=%s)
-                       ORDER BY candidate.distance,
-                                event.occurred_at DESC,chunk.chunk_id
-                       LIMIT %s""",
-                            (
-                                vector,
-                                self.tenant_id,
-                                sources,
-                                runtime.fingerprint,
-                                vector,
-                                semantic_candidate_limit,
-                                since,
-                                since,
-                                until,
-                                until,
-                                candidate_limit,
-                            ),
-                            semantic_deadline_at,
-                        ).fetchall()
+                    rows = semantic_probe(probe_query)
+                except (
+                    json.JSONDecodeError,
+                    TimeoutError,
+                    urllib.error.URLError,
+                ):
+                    if not semantic:
+                        semantic_status = "unavailable"
+                    break
                 except SearchDeadlineExceeded:
-                    semantic_status = "deadline-exceeded"
+                    if not semantic:
+                        semantic_status = "deadline-exceeded"
+                    break
+                semantic_probe_count += 1
+                for row in rows:
+                    if row["receipt"] not in seen_semantic_receipts:
+                        seen_semantic_receipts.add(row["receipt"])
+                        semantic.append(row)
+                if len(semantic) >= candidate_limit:
+                    break
         combined: dict[str, tuple[dict[str, Any], float]] = {}
         for weight, rows in ((0.6, lexical), (0.4, semantic)):
             for rank, row in enumerate(rows, start=1):
@@ -708,6 +756,7 @@ class BoundCanonicalRetrieval:
                 "lexical_candidates": len(lexical),
                 "semantic_candidates": len(semantic),
                 "semantic_status": semantic_status,
+                "semantic_probes": semantic_probe_count,
                 "lexical_mode": lexical_mode,
             },
         }
