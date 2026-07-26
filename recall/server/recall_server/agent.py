@@ -55,7 +55,7 @@ class AgentBudget:
     max_receipts: int = 256
     max_tool_output_bytes: int = 2_000_000
     max_trace_events: int = 64
-    deadline_seconds: int = 60
+    deadline_seconds: int = 120
 
 
 @dataclass(frozen=True)
