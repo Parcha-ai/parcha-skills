@@ -1266,7 +1266,9 @@ class BoundCanonicalRetrieval:
                            USING(tenant_id,source_id,event_id)
                          WHERE event.tenant_id=%s
                            AND event.source_id=%s
-                           AND event.native_parent_id=%s
+                           AND COALESCE(
+                                 event.native_parent_id,event.native_id
+                               )=%s
                            AND (%s::timestamptz IS NULL
                                 OR event.occurred_at>=%s)
                            AND (%s::timestamptz IS NULL

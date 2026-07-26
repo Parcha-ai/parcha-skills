@@ -211,7 +211,10 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
         )
 
         self.assertEqual(receipts, ())
-        self.assertIn("event.native_parent_id=%s", store.sql[0])
+        self.assertIn(
+            "COALESCE( event.native_parent_id,event.native_id )=%s",
+            store.sql[0],
+        )
         self.assertIn("websearch_to_tsquery('simple',%s)", store.sql[0])
         self.assertIn("matched_term_count DESC", store.sql[0])
         self.assertIn("claude-session-hash", store.values[0])
