@@ -102,7 +102,6 @@ def _open_provider_key(
             key_path.parent.resolve(strict=True) != root
             or key_path.name in {"", ".", ".."}
             or not stat.S_ISDIR(root_metadata.st_mode)
-            or stat.S_IMODE(root_metadata.st_mode) & 0o022
         ):
             raise RuntimeError(
                 "Recall agent provider-key file is not private"
@@ -141,10 +140,14 @@ def _load_provider_key(
     try:
         metadata = os.fstat(descriptor)
         permissions = stat.S_IMODE(metadata.st_mode)
-        owner_is_trusted = metadata.st_uid in {0, os.getuid()} or (
+        owner_is_trusted = (
             managed_secret
+            and metadata.st_uid != os.getuid()
             and metadata.st_gid == _managed_secret_group
             and bool(permissions & stat.S_IRGRP)
+        ) or (
+            not managed_secret
+            and metadata.st_uid in {0, os.getuid()}
         )
         group_is_trusted = (
             not permissions & stat.S_IRGRP

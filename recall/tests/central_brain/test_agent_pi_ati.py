@@ -453,12 +453,24 @@ class PiAtiSubprocessBoundaryTest(unittest.TestCase):
                 )
             self.assertNotIn("synthetic-provider-key-value", repr(key))
 
-            root.chmod(0o777)
             with self.assertRaisesRegex(RuntimeError, "not private"):
                 _load_provider_key(
                     str(link),
                     _managed_secret_root=root,
+                    _managed_secret_group=os.getgid(),
                 )
+
+            root.chmod(0o777)
+            with patch(
+                "recall_server.agent_pi_ati.os.getuid",
+                return_value=os.getuid() + 10_000,
+            ):
+                key = _load_provider_key(
+                    str(link),
+                    _managed_secret_root=root,
+                    _managed_secret_group=os.getgid(),
+                )
+            self.assertNotIn("synthetic-provider-key-value", repr(key))
 
     def test_unmanaged_provider_key_symlink_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
