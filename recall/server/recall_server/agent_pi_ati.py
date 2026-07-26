@@ -155,7 +155,7 @@ def _model_tool_result(
             "match": bounded_match,
             "seed_receipts": receipts,
         })
-    return {
+    compact_result = {
         key: result[key]
         for key in (
             "question_interpretation",
@@ -165,6 +165,18 @@ def _model_tool_result(
         )
         if key in result
     } | {"investigations": compact}
+    coverage = result.get("coverage")
+    if (
+        isinstance(coverage, dict)
+        and isinstance(coverage.get("sessions"), int)
+        and coverage["sessions"] > 1
+    ):
+        compact_result["recommended_next_tool"] = "recall_map_reduce"
+        compact_result["next_step"] = (
+            "This evidence spans multiple sessions. Call recall_map_reduce now "
+            "using the returned seed_receipts; do not answer from routing hints."
+        )
+    return compact_result
 
 
 class BrainTurnTransport(Protocol):
@@ -967,7 +979,11 @@ def _tool_definitions(
         },
         {
             "name": "recall_show",
-            "description": "Open one exact authorized Recall receipt.",
+            "description": (
+                "Open one exact authorized Recall receipt. Do not use this to "
+                "answer a multi-session timeline or synthesis directly; first "
+                "run recall_map_reduce."
+            ),
             "input_schema": _object_schema({"target": receipt}, ["target"]),
             **common,
         },
@@ -1111,7 +1127,8 @@ class PiAtiRunner:
             "recall_investigate once with one to three distinctive domain terms. "
             "If that returns no hints, reformulate once using only the single "
             "most distinctive noun. Once hints exist, do not investigate again; use "
-            "recall_map_reduce: author independent maps seeded only with returned "
+            "recall_map_reduce before recall_show or finishing: author independent "
+            "maps seeded only with returned "
             "hint receipts and the narrowest valid source/time filters. Inspect "
             "both scan completeness and whether the actual findings sufficiently "
             "answer each objective, and "

@@ -374,7 +374,7 @@ class PiAtiGroundingTest(unittest.TestCase):
                         ],
                     },
                 }],
-                "coverage": {"sessions": 1},
+                "coverage": {"sessions": 2},
                 "uncertainty": [],
             },
         )
@@ -384,6 +384,10 @@ class PiAtiGroundingTest(unittest.TestCase):
         self.assertEqual(len(hint["seed_receipts"]), 16)
         self.assertNotIn("private_field", hint["match"])
         self.assertNotIn("context", hint)
+        self.assertEqual(
+            result["recommended_next_tool"],
+            "recall_map_reduce",
+        )
 
     def test_model_tool_errors_are_actionable_but_content_free(self):
         budget = AgentExecutionError(
