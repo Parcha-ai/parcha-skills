@@ -28,6 +28,7 @@ from recall_server.agent_pi_ati import (  # noqa: E402
     SubprocessBrainTurnTransport,
     _load_provider_key,
     _model_tool_error_message,
+    _model_tool_result,
 )
 
 
@@ -348,6 +349,42 @@ def service(transport) -> RecallAgentService:
 
 
 class PiAtiGroundingTest(unittest.TestCase):
+    def test_investigation_model_result_is_compact_and_keeps_map_seeds(self):
+        receipts = [
+            f"recall://source:synthetic:company/item-{index}?rev=1#item=0"
+            for index in range(20)
+        ]
+        result = _model_tool_result(
+            "recall.investigate",
+            {
+                "investigations": [{
+                    "match": {
+                        "source_id": SOURCE,
+                        "native_id": "item-0",
+                        "native_parent_id": "session-0",
+                        "occurred_at": "2026-07-23T00:00:00Z",
+                        "receipt": receipts[0],
+                        "text": "x" * 10_000,
+                        "private_field": "not-for-model",
+                    },
+                    "context": {
+                        "events": [
+                            {"chunks": [{"receipt": receipt}]}
+                            for receipt in receipts
+                        ],
+                    },
+                }],
+                "coverage": {"sessions": 1},
+                "uncertainty": [],
+            },
+        )
+
+        hint = result["investigations"][0]
+        self.assertLessEqual(len(hint["match"]["text"]), 1_200)
+        self.assertEqual(len(hint["seed_receipts"]), 16)
+        self.assertNotIn("private_field", hint["match"])
+        self.assertNotIn("context", hint)
+
     def test_model_tool_errors_are_actionable_but_content_free(self):
         budget = AgentExecutionError(
             "private failure details",

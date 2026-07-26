@@ -96,6 +96,77 @@ def _model_tool_error_message(error: AgentExecutionError) -> str:
     )
 
 
+def _model_tool_result(
+    name: str,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep routing hints compact; full evidence belongs in inspection tools."""
+
+    if name != "recall.investigate":
+        return result
+    investigations = result.get("investigations")
+    if not isinstance(investigations, list):
+        return result
+    compact = []
+    for investigation in investigations[:8]:
+        if not isinstance(investigation, dict):
+            continue
+        match = investigation.get("match")
+        if not isinstance(match, dict):
+            continue
+        bounded_match = {
+            key: match[key]
+            for key in (
+                "source_id",
+                "native_id",
+                "native_parent_id",
+                "occurred_at",
+                "receipt",
+                "rank",
+                "time_basis",
+            )
+            if key in match
+        }
+        text = match.get("text")
+        if isinstance(text, str):
+            bounded_match["text"] = text[:1_200]
+            bounded_match["text_clipped"] = len(text) > 1_200
+        receipts: list[str] = []
+
+        def collect(value: Any) -> None:
+            if len(receipts) >= 16:
+                return
+            if isinstance(value, dict):
+                receipt = value.get("receipt")
+                if (
+                    isinstance(receipt, str)
+                    and receipt.startswith("recall://")
+                    and receipt not in receipts
+                ):
+                    receipts.append(receipt)
+                for child in value.values():
+                    collect(child)
+            elif isinstance(value, list):
+                for child in value:
+                    collect(child)
+
+        collect(investigation)
+        compact.append({
+            "match": bounded_match,
+            "seed_receipts": receipts,
+        })
+    return {
+        key: result[key]
+        for key in (
+            "question_interpretation",
+            "coverage",
+            "uncertainty",
+            "diagnostics",
+        )
+        if key in result
+    } | {"investigations": compact}
+
+
 class BrainTurnTransport(Protocol):
     def run(
         self,
@@ -796,7 +867,7 @@ def _tool_definitions(
             "name": "recall_investigate",
             "description": (
                 "Search authorized semantic/index hints. Use a focused query of "
-                "two to six distinctive domain terms; omit dates and source names "
+                "one to three distinctive domain terms; omit dates and source names "
                 "already enforced by filters. For an exact UUID, query only that "
                 "UUID. Start here and call at most twice. "
                 "Results are candidates, not sufficient proof; inspect exact "
@@ -1008,7 +1079,10 @@ class PiAtiRunner:
                     arguments,
                     request,
                 )
-            return tools.call(host_name, arguments)
+            return _model_tool_result(
+                host_name,
+                tools.call(host_name, arguments),
+            )
 
         request_filters = {
             key: request[key] for key in ("since", "until") if key in request
@@ -1034,8 +1108,9 @@ class PiAtiRunner:
             "matching event when the question asks what happened across the "
             "session. "
             "For questions spanning sessions, sources, or subtopics, use "
-            "recall_investigate once with two to six distinctive domain terms "
-            "(at most one focused reformulation), then use "
+            "recall_investigate once with one to three distinctive domain terms. "
+            "If that returns no hints, reformulate once using only the single "
+            "most distinctive noun. Once hints exist, do not investigate again; use "
             "recall_map_reduce: author independent maps seeded only with returned "
             "hint receipts and the narrowest valid source/time filters. Inspect "
             "both scan completeness and whether the actual findings sufficiently "
