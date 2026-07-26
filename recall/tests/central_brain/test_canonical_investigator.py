@@ -60,6 +60,85 @@ class ParallelMapRetrieval(BoundCanonicalRetrieval):
 
 
 class CanonicalInvestigatorContractTest(unittest.TestCase):
+    def test_map_seed_expands_to_ranked_session_evidence(self) -> None:
+        seed = "recall://codex.jsonl:test/seed?rev=1#item=0"
+        expanded = (
+            "recall://codex.jsonl:test/decision?rev=1#item=0"
+        )
+
+        class Store:
+            @contextmanager
+            def connect(self):
+                yield object()
+
+        class Projector:
+            bound_tenant_id = "tenant:test"
+
+            def targets_for_receipts(self, *, receipts, **_kwargs):
+                self.receipts = receipts
+                return []
+
+        class Inspector:
+            @staticmethod
+            def inspect(*, targets, **_kwargs):
+                return {
+                    "findings": [],
+                    "complete": True,
+                    "files_scanned": len(targets),
+                    "stopped_reason": "completed",
+                    "provider": "synthetic",
+                    "timing": None,
+                }
+
+        class Retrieval(BoundCanonicalRetrieval):
+            def _receipt_event(self, *_args, **_kwargs):
+                return {
+                    "resolved_receipt": seed,
+                    "source_id": "codex.jsonl:test",
+                    "native_id": "event-1",
+                    "native_parent_id": "session-1",
+                    "occurred_at": datetime(
+                        2026,
+                        7,
+                        23,
+                        tzinfo=timezone.utc,
+                    ),
+                }
+
+            def _parent_scoped_receipts(self, **kwargs):
+                self.parent_call = kwargs
+                return (expanded,)
+
+        projector = Projector()
+        retrieval = Retrieval(
+            Store(),
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=("codex.jsonl:test",),
+            evidence_projector=projector,
+            deep_inspector=Inspector(),
+        )
+
+        result = retrieval.deep_search(
+            "ATI harness decision",
+            filters={
+                "since": "2026-07-22T00:00:00Z",
+                "until": "2026-07-24T23:59:59Z",
+            },
+            depth="quick",
+            _seed_receipts=(seed,),
+        )
+
+        self.assertEqual(projector.receipts, (expanded, seed))
+        self.assertEqual(
+            retrieval.parent_call["parent_id"],
+            "session-1",
+        )
+        self.assertEqual(
+            result["coverage"]["recall"]["seed_sessions"],
+            1,
+        )
+
     def test_deep_candidate_file_bound_is_reported_as_partial(self) -> None:
         class Store:
             @contextmanager

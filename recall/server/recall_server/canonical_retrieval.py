@@ -1282,34 +1282,27 @@ class BoundCanonicalRetrieval:
             },
         }
 
-    def _exact_session_receipts(
+    def _parent_scoped_receipts(
         self,
-        question: str,
-        investigation: dict[str, Any],
-        filters: dict[str, Any] | None,
         *,
+        source_id: str,
+        parent_id: str,
+        terms: list[str],
+        filters: dict[str, Any] | None,
         limit: int,
     ) -> tuple[str, ...]:
-        """Rank evidence inside the session routed by an explicit UUID."""
+        """Rank objective-bearing evidence inside one authorized session."""
 
-        if UUID_RE.search(question) is None or not 1 <= limit <= 100:
-            return ()
-        investigations = investigation.get("investigations")
-        if not isinstance(investigations, list) or not investigations:
-            return ()
-        match = investigations[0].get("match", {})
-        source_id = match.get("source_id")
-        parent_id = match.get("native_parent_id")
         if (
             source_id not in self.authorized_sources
             or not isinstance(parent_id, str)
             or not parent_id
+            or not isinstance(terms, list)
+            or not terms
+            or len(terms) > 16
+            or any(not isinstance(term, str) or not term for term in terms)
+            or not 1 <= limit <= 100
         ):
-            return ()
-        terms = legacy_engine().informative_terms(
-            UUID_RE.sub(" ", question)
-        )[:16]
-        if not terms:
             return ()
         search_query = " OR ".join(f'"{term}"' for term in terms)
         _, _, _, since, until = self._filters(filters or {})
@@ -1376,6 +1369,33 @@ class BoundCanonicalRetrieval:
         except SearchDeadlineExceeded:
             return ()
         return tuple(dict.fromkeys(row["receipt"] for row in rows))
+
+    def _exact_session_receipts(
+        self,
+        question: str,
+        investigation: dict[str, Any],
+        filters: dict[str, Any] | None,
+        *,
+        limit: int,
+    ) -> tuple[str, ...]:
+        """Rank evidence inside the session routed by an explicit UUID."""
+
+        if UUID_RE.search(question) is None:
+            return ()
+        investigations = investigation.get("investigations")
+        if not isinstance(investigations, list) or not investigations:
+            return ()
+        match = investigations[0].get("match", {})
+        terms = legacy_engine().informative_terms(
+            UUID_RE.sub(" ", question)
+        )[:16]
+        return self._parent_scoped_receipts(
+            source_id=match.get("source_id"),
+            parent_id=match.get("native_parent_id"),
+            terms=terms,
+            filters=filters,
+            limit=limit,
+        )
 
     def deep_search(
         self,
@@ -1474,6 +1494,7 @@ class BoundCanonicalRetrieval:
                 else None
             )
             resolved = []
+            seed_parents: list[tuple[str, str]] = []
             with self.store.connect() as connection:
                 for receipt in _seed_receipts:
                     row = self._receipt_event(connection, receipt)
@@ -1494,10 +1515,38 @@ class BoundCanonicalRetrieval:
                             "canonical map seed escaped its hard scope"
                         )
                     resolved.append(row["resolved_receipt"])
-            receipts = tuple(dict.fromkeys(resolved))
+                    parent_id = (
+                        row["native_parent_id"] or row["native_id"]
+                    )
+                    parent = (row["source_id"], parent_id)
+                    if parent not in seed_parents:
+                        seed_parents.append(parent)
+            parent_receipts: list[str] = []
+            terms = _informative_query_terms(question)
+            bounded_parents = seed_parents[:8]
+            per_parent_limit = max(
+                1,
+                budget.max_files // max(1, len(bounded_parents)),
+            )
+            for source_id, parent_id in bounded_parents:
+                parent_receipts.extend(
+                    self._parent_scoped_receipts(
+                        source_id=source_id,
+                        parent_id=parent_id,
+                        terms=terms,
+                        filters=filters,
+                        limit=min(per_parent_limit, 100),
+                    )
+                )
+            receipts = tuple(dict.fromkeys((
+                *parent_receipts,
+                *resolved,
+            )))[: budget.max_files]
             route_coverage = {
                 "mode": "seeded",
                 "candidates": len(receipts),
+                "seed_sessions": len(seed_parents),
+                "session_candidate_receipts": len(parent_receipts),
             }
             uncertainty = []
         else:
