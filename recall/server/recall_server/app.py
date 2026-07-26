@@ -53,6 +53,7 @@ from .canonical import (
 from .canonical_retrieval import CanonicalRetrieval
 from .control import ControlError, ControlPlane
 from .db import BrainStore, IdempotencyConflict
+from .deep_inspection import DeepInspectionError
 from .deep_inspection_runtime import build_deep_inspector
 from .evidence_projection import (
     CanonicalEvidenceProjector,
@@ -1444,6 +1445,16 @@ class Handler(BaseHTTPRequestHandler):
                     200,
                     mcp_error_response(
                         McpProtocolError(-32602, "tool arguments rejected"),
+                        request_id,
+                    ),
+                )
+                return
+            except DeepInspectionError as exc:
+                LOG.error("mcp deep inspection failed code=%s", exc.code)
+                self.send_json(
+                    200,
+                    mcp_error_response(
+                        McpProtocolError(-32603, "tool execution failed"),
                         request_id,
                     ),
                 )
