@@ -22,6 +22,12 @@ from .federation import SOURCE_FAMILIES
 from .projectors import legacy_engine
 
 AUTHORITY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._/@+-]{1,255}\Z")
+UUID_RE = re.compile(
+    r"(?<![0-9a-f])"
+    r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}"
+    r"(?![0-9a-f])",
+    re.IGNORECASE,
+)
 ALLOWED_FILTERS = frozenset(
     {"since", "until", "source_id", "source_family", "source_alias"}
 )
@@ -30,6 +36,15 @@ MAX_AGENTIC_MAPS = 5
 MAX_AGENTIC_MAP_FINDINGS = 40
 MAX_AGENTIC_MAP_FINDING_BYTES = 64_000
 LOG = logging.getLogger(__name__)
+
+
+def _informative_query_terms(query: str) -> list[str]:
+    """Prefer an explicit UUID as an exact corpus route over surrounding prose."""
+
+    identifier = UUID_RE.search(query)
+    if identifier is not None:
+        return [identifier.group(0).lower()]
+    return legacy_engine().informative_terms(query)[:16]
 
 
 def _timestamp(value: Any) -> str:
@@ -485,7 +500,7 @@ class BoundCanonicalRetrieval:
                     "semantic_candidates": 0,
                 },
             }
-        informative = legacy_engine().informative_terms(query)[:16]
+        informative = _informative_query_terms(query)
         if not informative:
             return {
                 "results": [],

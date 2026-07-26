@@ -10,7 +10,10 @@ from pathlib import Path
 SERVER = Path(__file__).resolve().parents[2] / "server"
 sys.path.insert(0, str(SERVER))
 
-from recall_server.canonical_retrieval import BoundCanonicalRetrieval  # noqa: E402
+from recall_server.canonical_retrieval import (  # noqa: E402
+    BoundCanonicalRetrieval,
+    _informative_query_terms,
+)
 from recall_server.db import SearchDeadlineExceeded  # noqa: E402
 
 
@@ -63,6 +66,15 @@ class RecordingStore:
 
 
 class CanonicalRetrievalDeadlineTest(unittest.TestCase):
+    def test_uuid_routes_exactly_even_when_the_question_has_other_terms(self) -> None:
+        session_id = "8668a658-a6cf-4358-9d7e-c29e5782c1dd"
+        self.assertEqual(
+            _informative_query_terms(
+                f"In session {session_id}, what was verified about ATI?"
+            ),
+            [session_id],
+        )
+
     def test_date_only_filters_are_normalized_to_utc_boundaries(self) -> None:
         self.assertEqual(
             BoundCanonicalRetrieval._filters(
