@@ -413,6 +413,37 @@ class PiAtiGroundingTest(unittest.TestCase):
             f"Cite only {allowed}",
         )
 
+    def test_finish_retry_loop_has_a_hard_bound(self):
+        class FinishLoop:
+            def run(self, _start, invoke, **_kwargs):
+                for _ in range(5):
+                    try:
+                        invoke(
+                            "evidence_finish",
+                            {
+                                "status": "no_answer",
+                                "answer": "invalid",
+                                "claims": [],
+                                "citations": [],
+                                "gaps": ["missing evidence"],
+                            },
+                        )
+                    except AgentExecutionError as error:
+                        if error.code == "agent_finish_attempts_exhausted":
+                            raise
+                raise AssertionError("finish retry bound was bypassed")
+
+        with self.assertRaises(AgentExecutionError) as caught:
+            service(FinishLoop()).use_recall(
+                principal(),
+                REQUEST,
+                SyntheticRetrieval(),
+            )
+        self.assertEqual(
+            caught.exception.code,
+            "agent_finish_attempts_exhausted",
+        )
+
     def test_agent_uses_hint_deep_inspection_exact_open_and_grounded_finish(self):
         transport = ScriptedTransport(success_script())
         retrieval = SyntheticRetrieval()

@@ -77,7 +77,10 @@ def _model_tool_error_message(error: AgentExecutionError) -> str:
         ),
         "agent_finish_invalid": (
             "Submit evidence_finish with exactly status, answer, claims, "
-            "citations, and gaps, matching the schema."
+            "citations, and gaps. The gaps field means missing evidence only, "
+            "not project blockers: complete requires gaps=[], partial requires "
+            "at least one evidence gap, and no_answer requires empty answer, "
+            "claims, and citations plus at least one evidence gap."
         ),
         "agent_citation_not_opened": (
             "Cite only receipts opened by recall_show, "
@@ -716,6 +719,8 @@ class SubprocessBrainTurnTransport:
                             "effect_receipt": {"committed": False},
                         }
                     except AgentExecutionError as error:
+                        if error.code == "agent_finish_attempts_exhausted":
+                            raise
                         result = {
                             "call_id": data["call_id"],
                             "status": "error",
@@ -996,7 +1001,9 @@ def _tool_definitions(
             "name": "evidence_finish",
             "description": (
                 "Submit the final answer once. Every citation and every claim "
-                "receipt must have been opened by a prior evidence tool call."
+                "receipt must have been opened by a prior evidence tool call. "
+                "gaps means missing evidence, not unresolved project blockers: "
+                "complete requires [], partial requires a nonempty list."
             ),
             "input_schema": _object_schema(
                 {
@@ -1071,9 +1078,10 @@ class PiAtiRunner:
         finished: dict[str, Any] | None = None
         sealed = False
         fatal_violation: AgentExecutionError | None = None
+        finish_attempts = 0
 
         def invoke(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-            nonlocal finished, sealed, fatal_violation
+            nonlocal finished, sealed, fatal_violation, finish_attempts
             if sealed:
                 fatal_violation = AgentExecutionError(
                     "agent invoked a tool after finishing",
@@ -1081,6 +1089,13 @@ class PiAtiRunner:
                 )
                 raise fatal_violation
             if name == "evidence_finish":
+                finish_attempts += 1
+                if finish_attempts > 4:
+                    fatal_violation = AgentExecutionError(
+                        "agent finish-attempt budget is exhausted",
+                        code="agent_finish_attempts_exhausted",
+                    )
+                    raise fatal_violation
                 try:
                     finished = self._accept_finish(
                         arguments,
@@ -1165,7 +1180,9 @@ class PiAtiRunner:
             "Copy every explicit since/until filter exactly. "
             "When the request allows one source family, copy that exact family; "
             "Codex and Claude are sources inside coding_history, not separate "
-            "source families. Seek independent corroboration when "
+            "source families. Put unresolved project blockers in the answer and "
+            "claims, not gaps; gaps is reserved for missing evidence. Seek "
+            "independent corroboration when "
             "the question asks for a synthesis. Finish exactly once with "
             "evidence_finish. Every factual claim must cite only receipts you "
             "actually opened this turn. If evidence is insufficient, return "
