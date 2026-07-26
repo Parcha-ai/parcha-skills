@@ -479,6 +479,49 @@ class PiAtiGroundingTest(unittest.TestCase):
             self.assertIs(mapped["model_view_truncated"], True)
         self.assertIn("already citable", result["next_step"])
 
+    def test_map_reduce_model_view_prefers_distinct_sessions(self):
+        findings = [
+            {
+                "receipt": (
+                    f"recall://{SOURCE}/dominant-{index}?rev=1#item=0"
+                ),
+                "text": f"dominant {index}",
+                "source_id": SOURCE,
+                "native_id": f"event-{index}",
+                "native_parent_id": "dominant-session",
+            }
+            for index in range(12)
+        ]
+        findings.extend([
+            {
+                "receipt": f"recall://{SOURCE}/other-{index}?rev=1#item=0",
+                "text": f"other {index}",
+                "source_id": SOURCE,
+                "native_id": f"other-{index}",
+                "native_parent_id": f"other-session-{index}",
+            }
+            for index in range(5)
+        ])
+
+        result = _model_tool_result(
+            "recall.map_reduce",
+            {
+                "maps": [{
+                    "map_id": "diverse",
+                    "findings": findings,
+                    "coverage": {"complete": True},
+                }],
+            },
+        )
+
+        parents = {
+            finding["native_parent_id"]
+            for finding in result["maps"][0]["findings"]
+        }
+        self.assertEqual(len(parents), 6)
+        self.assertIn("dominant-session", parents)
+        self.assertIn("other-session-4", parents)
+
     def test_finish_retry_loop_has_a_hard_bound(self):
         class FinishLoop:
             def run(self, _start, invoke, **_kwargs):

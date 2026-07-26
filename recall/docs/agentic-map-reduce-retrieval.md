@@ -55,8 +55,9 @@ The host:
   already-decomposed map never re-enters the broad investigator);
 - returns per-map findings, coverage, uncertainty, and aggregate diagnostics;
 - records the full bounded evidence result for authorization and trace metrics,
-  but gives the reducer a diverse model view of at most six byte-bounded
-  findings per map so large successful scans cannot drown the synthesis step;
+  but gives the reducer a model view of at most six byte-bounded findings per
+  map, selecting the highest-ranked finding from each distinct source/session
+  before filling by rank, so one giant session cannot drown the synthesis step;
 - distinguishes a completed corpus scan and a nonempty result from the agent's
   semantic judgment that the evidence is sufficient for the map objective;
 - never puts questions, answers, source bodies, or credentials in the trace.

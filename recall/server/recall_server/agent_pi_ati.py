@@ -132,10 +132,36 @@ def _model_tool_result(
             findings = mapped.get("findings")
             if not isinstance(findings, list):
                 findings = []
-            compact_findings = []
-            for finding in findings[:MODEL_MAP_FINDINGS_PER_MAP]:
+            selected_findings = []
+            selected_ids: set[int] = set()
+            seen_sessions: set[tuple[Any, Any]] = set()
+            for finding in findings:
                 if not isinstance(finding, dict):
                     continue
+                session = (
+                    finding.get("source_id"),
+                    finding.get("native_parent_id")
+                    or finding.get("native_id"),
+                )
+                if session in seen_sessions:
+                    continue
+                seen_sessions.add(session)
+                selected_findings.append(finding)
+                selected_ids.add(id(finding))
+                if len(selected_findings) >= MODEL_MAP_FINDINGS_PER_MAP:
+                    break
+            if len(selected_findings) < MODEL_MAP_FINDINGS_PER_MAP:
+                for finding in findings:
+                    if (
+                        not isinstance(finding, dict)
+                        or id(finding) in selected_ids
+                    ):
+                        continue
+                    selected_findings.append(finding)
+                    if len(selected_findings) >= MODEL_MAP_FINDINGS_PER_MAP:
+                        break
+            compact_findings = []
+            for finding in selected_findings:
                 compact_finding = {
                     key: finding[key]
                     for key in finding_fields
