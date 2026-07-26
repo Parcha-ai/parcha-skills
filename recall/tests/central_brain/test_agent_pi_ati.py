@@ -25,6 +25,7 @@ from recall_server.agent_pi_ati import (  # noqa: E402
     PiAtiRunner,
     ProviderKey,
     SubprocessBrainTurnTransport,
+    _load_provider_key,
 )
 
 
@@ -430,6 +431,44 @@ class PiAtiGroundingTest(unittest.TestCase):
 
 
 class PiAtiSubprocessBoundaryTest(unittest.TestCase):
+    def test_render_managed_secret_symlink_is_narrowly_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "managed-secrets"
+            root.mkdir(mode=0o700)
+            target = Path(directory) / "runtime-secret"
+            target.write_text("synthetic-provider-key-value\n")
+            target.chmod(0o600)
+            link = root / "cerebras-api-key"
+            link.symlink_to(target)
+
+            key = _load_provider_key(
+                str(link),
+                _managed_secret_root=root,
+            )
+            self.assertNotIn("synthetic-provider-key-value", repr(key))
+
+            root.chmod(0o777)
+            with self.assertRaisesRegex(RuntimeError, "not private"):
+                _load_provider_key(
+                    str(link),
+                    _managed_secret_root=root,
+                )
+
+    def test_unmanaged_provider_key_symlink_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            managed_root = Path(directory) / "managed-secrets"
+            managed_root.mkdir(mode=0o700)
+            target = Path(directory) / "runtime-secret"
+            target.write_text("synthetic-provider-key-value\n")
+            target.chmod(0o600)
+            link = Path(directory) / "cerebras-api-key"
+            link.symlink_to(target)
+            with self.assertRaisesRegex(RuntimeError, "not private"):
+                _load_provider_key(
+                    str(link),
+                    _managed_secret_root=managed_root,
+                )
+
     def test_private_broker_passes_only_non_secret_placeholder(self):
         child = r"""
 import json,os,sys
