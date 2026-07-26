@@ -2,12 +2,20 @@ from __future__ import annotations
 
 import sys
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 SERVER = Path(__file__).resolve().parents[2] / "server"
 sys.path.insert(0, str(SERVER))
 
-from recall_server.agent_runs import backend_from_env  # noqa: E402
+from recall_server.agent import (  # noqa: E402
+    AgentExecutionError,
+    DelegationContext,
+)
+from recall_server.agent_runs import (  # noqa: E402
+    AgentRunCoordinator,
+    backend_from_env,
+)
 from recall_server.mcp import McpProtocolError, dispatch  # noqa: E402
 
 
@@ -264,6 +272,59 @@ class DurableConfigurationTest(unittest.TestCase):
         self.assertIn("pg_column_size(trace_events) <= 1048576", schema)
         self.assertNotIn("question", schema)
         self.assertNotIn("credential", schema)
+
+    def test_coordinator_persists_safe_typed_failure_code(self) -> None:
+        class Service:
+            def execute(self, *_args):
+                raise AgentExecutionError(
+                    "provider body is not durable",
+                    code="agent_model_timeout",
+                )
+
+        class Backend:
+            retention_seconds = 60
+
+            def __init__(self):
+                self.failure = None
+
+            def claim(self, *_args, **_kwargs):
+                return {
+                    "created_at": "2026-07-25T10:00:00Z",
+                    "attempt": 1,
+                }
+
+            def fail(self, *_args, **kwargs):
+                self.failure = kwargs
+
+        backend = Backend()
+        coordinator = AgentRunCoordinator(
+            Service(),
+            backend,
+            clock=lambda: datetime(
+                2026, 7, 25, 10, 0, tzinfo=timezone.utc
+            ),
+        )
+        try:
+            coordinator._execute(
+                DelegationContext.from_principal(principal()),
+                REQUEST,
+                object(),
+                RUN_ID,
+            )
+        finally:
+            coordinator.close()
+        self.assertEqual(
+            backend.failure["error_code"],
+            "agent_model_timeout",
+        )
+        self.assertEqual(backend.failure["trace"], [])
+
+    def test_execution_error_normalizes_unsafe_failure_code(self) -> None:
+        error = AgentExecutionError(
+            "provider body is not durable",
+            code="unsafe value from provider",
+        )
+        self.assertEqual(error.code, "agent_execution_failed")
 
 
 if __name__ == "__main__":

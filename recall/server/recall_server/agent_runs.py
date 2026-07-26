@@ -14,6 +14,7 @@ from typing import Any, Callable, Protocol
 from contracts.agent_v1 import derive_run_id, validate_agent_contract
 
 from .agent import (
+    AgentExecutionError,
     DelegationContext,
     RecallAgentService,
 )
@@ -640,14 +641,24 @@ class AgentRunCoordinator:
                 bundle=bundle,
                 now=now,
             )
-        except Exception:
+        except Exception as error:
+            code = (
+                error.code
+                if isinstance(error, AgentExecutionError)
+                else "agent_execution_failed"
+            )
+            trace = (
+                error.trace
+                if isinstance(error, AgentExecutionError)
+                else []
+            )
             try:
                 self.backend.fail(
                     context,
                     run_id,
                     lease_owner=self.lease_owner,
-                    error_code="agent_execution_failed",
-                    trace=[],
+                    error_code=code,
+                    trace=trace,
                     now=self.clock(),
                 )
             except AgentRunStateError:

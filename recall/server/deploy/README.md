@@ -284,6 +284,64 @@ also advertises `io.modelcontextprotocol/tasks` and returns a native task only
 when the individual `tools/call` opts into that extension. Older or
 non-negotiating clients keep the synchronous `use_recall` result.
 
+For semantic synthesis, set `RECALL_AGENT_RUNNER=pi-ati` and run a pinned ATI
+Harness `brain-turn` artifact:
+
+```text
+RECALL_ATI_COMMAND_JSON=["node","/opt/ati/grep_ati_brain_turn.mjs"]
+RECALL_ATI_ARTIFACT_PATH=/opt/ati/grep_ati_brain_turn.mjs
+RECALL_ATI_ARTIFACT_SHA256=<lowercase-sha256>
+RECALL_AGENT_MODEL_ALIAS=gemma-4-31b
+RECALL_LITELLM_BASE_URL=https://<approved-litellm-router>
+RECALL_LITELLM_APPROVED_URL=https://<approved-litellm-router>
+RECALL_LITELLM_ROUTER_IDENTITY=<approved-litellm-router-hostname>
+RECALL_LITELLM_CREDENTIAL_MODE=virtual-key
+RECALL_LITELLM_VIRTUAL_KEY_FILE=/run/secrets/recall-agent-virtual-key.json
+```
+
+The command is a JSON argument array and never passes through a shell. The key
+file must be a nonsymlinked, owner-owned `0600` regular file:
+
+```json
+{
+  "virtual_key": "<short-lived-scoped-key>",
+  "scope": "recall-agent",
+  "expires_at": "2026-07-25T16:30:00Z"
+}
+```
+
+Recall reloads this file before every child process, so a credential rotator can
+atomically replace it without restarting the service. The declared expiration
+must be in the future and no more than 24 hours away. The ATI child receives
+only that virtual key, the exact approved LiteLLM URL, and a minimal process
+environment.
+
+On a Greppy host, use the dedicated credential-owning local broker instead.
+Recall passes the literal `not-a-secret` placeholder to ATI; no model bearer
+credential enters Recall or the child:
+
+```text
+RECALL_LITELLM_CREDENTIAL_MODE=credentialless-broker
+RECALL_LITELLM_BASE_URL=http://<private-greppy-llm-proxy-host>:<port>
+RECALL_LITELLM_APPROVED_URL=http://<private-greppy-llm-proxy-host>:<port>
+RECALL_LITELLM_ROUTER_IDENTITY=<private-greppy-llm-proxy-host>
+```
+
+This mode fails closed unless the exact approved URL is loopback, link-local,
+RFC1918, carrier-grade NAT, or the private Docker host gateway. Do not expose
+the broker publicly. A Recall deployment outside that private network must use
+the scoped virtual-key mode or an explicitly designed private connectivity
+boundary.
+
+Recall and Archil credentials remain in the host.
+
+The child can call only authorized read-only evidence tools. Semantic search is
+a hint; only receipts returned by deep inspection, exact show, or session
+context are citable. The model must finish through `evidence_finish`, and Recall
+rejects citations that were not opened in the same turn. Raw reasoning,
+questions, answers, tool arguments, source bodies, and credentials are excluded
+from durable traces.
+
 Lifecycle rows contain authority identifiers, a request hash, opaque handles,
 state, bounded redacted trace events, and terminal results. They never contain
 the original question, credentials, or source bodies. Expired worker leases become
