@@ -810,6 +810,7 @@ def _tool_definitions(
                 },
                 ["status", "answer", "claims", "citations", "gaps"],
             ),
+            "terminate_turn": True,
             **common,
         },
     ]
@@ -930,7 +931,11 @@ class PiAtiRunner:
                 ],
                 "capabilities": ["recall:evidence:read"],
                 "tools": _tool_definitions(timeout_ms, request),
-                "model": {"alias": self.model_alias, "thinking": "low"},
+                "model": {
+                    "alias": self.model_alias,
+                    "thinking": "low",
+                    "tool_choice": "required",
+                },
                 "limits": {
                     "turn_timeout_ms": timeout_ms,
                     "tool_timeout_ms": min(timeout_ms, 30_000),
