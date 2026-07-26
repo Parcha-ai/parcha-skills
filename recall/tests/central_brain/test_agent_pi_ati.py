@@ -239,7 +239,11 @@ class PiAtiGroundingTest(unittest.TestCase):
         self.assertNotIn("Exact evidence opened", rendered_trace)
         self.assertEqual(
             transport.start["data"]["model"],
-            {"alias": "gemma-4-31b", "thinking": "low"},
+            {
+                "alias": "gemma-4-31b",
+                "thinking": "low",
+                "tool_choice": "required",
+            },
         )
         self.assertEqual(
             {tool["name"] for tool in transport.start["data"]["tools"]},
@@ -251,6 +255,12 @@ class PiAtiGroundingTest(unittest.TestCase):
                 "evidence_finish",
             },
         )
+        finish = next(
+            tool
+            for tool in transport.start["data"]["tools"]
+            if tool["name"] == "evidence_finish"
+        )
+        self.assertIs(finish["terminate_turn"], True)
 
     def test_semantic_runner_beats_scripted_generic_baseline(self):
         pi = service(ScriptedTransport(success_script())).use_recall(

@@ -425,11 +425,11 @@ class ContainerContractTest(unittest.TestCase):
         digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
         self.assertEqual(
             digest,
-            "a63283ab81a75d48afc89a513b7c5469750fb7ac476c2a8aa218883fe0b8e713",
+            "24b3bb162a847b039f14d1a2d079bc3a6988d709c12fc36ab0fe8b544411f320",
         )
         self.assertIn(digest, provenance)
         self.assertIn(
-            "b6a05916b2e2833da5d8ae81b2cbd8fb845336a7",
+            "6f91523ff18c6fe3ce5d4950ad76ac9987159811",
             provenance,
         )
 
