@@ -1,3 +1,5 @@
+FROM node:22.23.1-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3 AS node-runtime
+
 FROM python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -11,6 +13,8 @@ COPY server/requirements.txt /opt/recall/requirements.txt
 RUN python -m pip install --no-cache-dir --disable-pip-version-check --no-compile -r requirements.txt \
     && groupadd --gid 10001 recall \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin recall \
+    && (getent group 1000 >/dev/null || groupadd --gid 1000 render-secrets) \
+    && usermod -a -G 1000 recall \
     && install -d -m 0700 -o 10001 -g 10001 \
          /var/lib/recall /tmp/recall-composio-cache
 
@@ -23,12 +27,16 @@ COPY --chown=10001:10001 collector /opt/recall/collector
 COPY --chown=10001:10001 privacy /opt/recall/privacy
 COPY --chown=10001:10001 scripts/install_gws.py /opt/recall/scripts/install_gws.py
 COPY --chown=10001:10001 skills/recall/scripts/recall.py /opt/skills/recall/scripts/recall.py
+COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
+COPY server/vendor/ati/grep_ati_brain_turn.mjs /opt/ati/grep_ati_brain_turn.mjs
 
 RUN python /opt/recall/scripts/install_gws.py \
       --target x86_64-unknown-linux-gnu \
-      --prefix /opt/recall/vendor/gws/0.22.5
+      --prefix /opt/recall/vendor/gws/0.22.5 \
+    && chmod 0555 /opt/ati \
+    && chmod 0444 /opt/ati/grep_ati_brain_turn.mjs
 
-USER 10001:10001
+USER 10001
 EXPOSE 8788
 VOLUME ["/var/lib/recall"]
 

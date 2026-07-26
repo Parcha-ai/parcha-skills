@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import socket
@@ -385,12 +386,22 @@ class ContainerContractTest(unittest.TestCase):
         self,
     ) -> None:
         dockerfile = (RECALL / "Dockerfile").read_text()
-        first = dockerfile.splitlines()[0]
         self.assertRegex(
-            first,
-            r"^FROM python:3\.12-slim-bookworm@sha256:[0-9a-f]{64}$",
+            dockerfile,
+            r"FROM python:3\.12-slim-bookworm@sha256:[0-9a-f]{64}",
         )
-        self.assertIn("USER 10001:10001", dockerfile)
+        self.assertRegex(
+            dockerfile,
+            r"FROM node:22\.23\.1-bookworm-slim@sha256:[0-9a-f]{64} "
+            r"AS node-runtime",
+        )
+        self.assertIn(
+            "server/vendor/ati/grep_ati_brain_turn.mjs "
+            "/opt/ati/grep_ati_brain_turn.mjs",
+            dockerfile,
+        )
+        self.assertIn("USER 10001", dockerfile)
+        self.assertIn("usermod -a -G 1000 recall", dockerfile)
         self.assertIn(
             "COMPOSIO_CACHE_DIR=/tmp/recall-composio-cache",
             dockerfile,
@@ -407,6 +418,20 @@ class ContainerContractTest(unittest.TestCase):
         self.assertIn('"--capability-profile", "production"', dockerfile)
         self.assertNotIn("ENV RECALL_AUTH_REQUIRED", dockerfile)
         self.assertNotRegex(dockerfile, re.compile(r"COPY\s+\.\s+\.", re.IGNORECASE))
+
+    def test_vendored_ati_artifact_has_exact_public_provenance(self) -> None:
+        artifact = SERVER / "vendor" / "ati" / "grep_ati_brain_turn.mjs"
+        provenance = (SERVER / "vendor" / "ati" / "README.md").read_text()
+        digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        self.assertEqual(
+            digest,
+            "a63283ab81a75d48afc89a513b7c5469750fb7ac476c2a8aa218883fe0b8e713",
+        )
+        self.assertIn(digest, provenance)
+        self.assertIn(
+            "b6a05916b2e2833da5d8ae81b2cbd8fb845336a7",
+            provenance,
+        )
 
     def test_build_context_excludes_private_and_development_surfaces(self) -> None:
         ignored = (RECALL / ".dockerignore").read_text()

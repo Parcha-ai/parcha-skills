@@ -7,7 +7,7 @@ import stat
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 SERVER = Path(__file__).resolve().parents[2] / "server"
@@ -20,10 +20,11 @@ from recall_server.agent import (  # noqa: E402
     service_from_env,
 )
 from recall_server.agent_pi_ati import (  # noqa: E402
+    CEREBRAS_API_BASE_URL,
     MODEL_PROXY_PLACEHOLDER_KEY,
     PiAtiRunner,
+    ProviderKey,
     SubprocessBrainTurnTransport,
-    VirtualKey,
 )
 
 
@@ -135,8 +136,9 @@ class ScriptedTransport:
                 "status": "complete",
                 "model_attestation": {
                     "model_alias": "gemma-4-31b",
-                    "router_identity": "litellm.synthetic",
-                    "credential_kind": "greppy_llm_proxy",
+                    "route_kind": "private_broker",
+                    "provider": "broker",
+                    "route_identity": "10.23.45.67",
                 },
             },
             "usage": {},
@@ -428,19 +430,22 @@ class PiAtiGroundingTest(unittest.TestCase):
 
 
 class PiAtiSubprocessBoundaryTest(unittest.TestCase):
-    def test_credentialless_broker_passes_only_non_secret_placeholder(self):
+    def test_private_broker_passes_only_non_secret_placeholder(self):
         child = r"""
 import json,os,sys
 assert os.environ["LITELLM_API_KEY"]=="not-a-secret"
 assert os.environ["LITELLM_BASE_URL"]=="http://10.23.45.67:9420"
+assert os.environ["ATI_MODEL_ROUTE_KIND"]=="private_broker"
+assert os.environ["ATI_MODEL_PROVIDER"]=="broker"
 start=json.loads(sys.stdin.readline())
-print(json.dumps({"v":"ati.brain.turn.v1","turn_id":start["turn_id"],"seq":0,"type":"terminal.complete","at":"2026-07-25T10:00:00Z","data":{"status":"complete","unresolved_call_ids":[],"model_attestation":{"model_alias":"gemma-4-31b","thinking":"low","router_identity":"10.23.45.67","credential_kind":"greppy_llm_proxy"}}}),flush=True)
+print(json.dumps({"v":"ati.brain.turn.v1","turn_id":start["turn_id"],"seq":0,"type":"terminal.complete","at":"2026-07-25T10:00:00Z","data":{"status":"complete","unresolved_call_ids":[],"model_attestation":{"model_alias":"gemma-4-31b","thinking":"low","route_kind":"private_broker","provider":"broker","route_identity":"10.23.45.67"}}}),flush=True)
 """
         transport = SubprocessBrainTurnTransport(
             (sys.executable, "-c", child),
-            litellm_base_url="http://10.23.45.67:9420",
-            credentialless_broker=True,
-            expected_router_identity="10.23.45.67",
+            model_base_url="http://10.23.45.67:9420",
+            route_kind="private_broker",
+            provider="broker",
+            expected_route_identity="10.23.45.67",
             environment={"PATH": os.environ["PATH"], "FORBIDDEN_SECRET": "no"},
         )
         outcome = transport.run(
@@ -452,39 +457,41 @@ print(json.dumps({"v":"ati.brain.turn.v1","turn_id":start["turn_id"],"seq":0,"ty
             timeout_seconds=3,
         )
         self.assertEqual(
-            outcome["terminal"]["model_attestation"]["router_identity"],
+            outcome["terminal"]["model_attestation"]["route_identity"],
             "10.23.45.67",
         )
-        self.assertTrue(transport.credentialless_broker)
+        self.assertEqual(transport.route_kind, "private_broker")
         self.assertNotIn("FORBIDDEN_SECRET", transport.child_environment)
         self.assertEqual(MODEL_PROXY_PLACEHOLDER_KEY, "not-a-secret")
 
-    def test_credentialless_broker_rejects_public_url_and_key_sources(self):
+    def test_private_broker_rejects_public_url_and_key_sources(self):
         with self.assertRaisesRegex(RuntimeError, "must be private"):
             SubprocessBrainTurnTransport(
                 (sys.executable, "-c", "pass"),
-                litellm_base_url="https://litellm.example",
-                credentialless_broker=True,
-                expected_router_identity="litellm.example",
+                model_base_url="https://litellm.example",
+                route_kind="private_broker",
+                provider="broker",
+                expected_route_identity="litellm.example",
             )
         with self.assertRaisesRegex(RuntimeError, "credential mode"):
             SubprocessBrainTurnTransport(
                 (sys.executable, "-c", "pass"),
-                litellm_base_url="http://10.23.45.67:9420",
-                virtual_key=VirtualKey(
-                    value="synthetic-virtual-key-value",
-                    scope="recall-agent",
-                    expires_at=datetime.now(timezone.utc)
-                    + timedelta(minutes=10),
+                model_base_url="http://10.23.45.67:9420",
+                route_kind="private_broker",
+                provider="broker",
+                provider_key=ProviderKey(
+                    value="synthetic-provider-key-value",
                 ),
-                credentialless_broker=True,
-                expected_router_identity="10.23.45.67",
+                expected_route_identity="10.23.45.67",
             )
 
-    def test_bidirectional_ndjson_transport_and_attestation(self):
+    def test_direct_cerebras_transport_and_attestation(self):
         child = r"""
 import json,os,sys
-assert os.environ["LITELLM_API_KEY"]=="synthetic-virtual-key-value"
+assert os.environ["LITELLM_API_KEY"]=="synthetic-provider-key-value"
+assert os.environ["LITELLM_BASE_URL"]=="https://api.cerebras.ai/v1"
+assert os.environ["ATI_MODEL_ROUTE_KIND"]=="direct_provider"
+assert os.environ["ATI_MODEL_PROVIDER"]=="cerebras"
 start=json.loads(sys.stdin.readline())
 turn=start["turn_id"]
 def send(seq,kind,data):
@@ -492,18 +499,18 @@ def send(seq,kind,data):
 send(0,"tool.invoke",{"call_id":"call-1","name":"recall_show","arguments":{"target":"recall://source:synthetic:company/item?rev=1#item=0"},"parent_event_id":"event-1","effect":"read","approval":"never","timeout_hint_ms":1000,"idempotency":"none","readback":"result"})
 result=json.loads(sys.stdin.readline())
 assert result["data"]["status"]=="ok"
-send(1,"terminal.complete",{"status":"complete","unresolved_call_ids":[],"model_attestation":{"model_alias":"gemma-4-31b","thinking":"low","router_identity":"litellm.synthetic","credential_kind":"greppy_llm_proxy"}})
+send(1,"terminal.complete",{"status":"complete","unresolved_call_ids":[],"model_attestation":{"model_alias":"gemma-4-31b","thinking":"low","route_kind":"direct_provider","provider":"cerebras","route_identity":"api.cerebras.ai"}})
 """
-        key = VirtualKey(
-            value="synthetic-virtual-key-value",
-            scope="recall-agent",
-            expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+        key = ProviderKey(
+            value="synthetic-provider-key-value",
         )
         transport = SubprocessBrainTurnTransport(
             (sys.executable, "-c", child),
-            litellm_base_url="https://litellm.synthetic",
-            virtual_key=key,
-            expected_router_identity="litellm.synthetic",
+            model_base_url=CEREBRAS_API_BASE_URL,
+            route_kind="direct_provider",
+            provider="cerebras",
+            provider_key=key,
+            expected_route_identity="api.cerebras.ai",
             environment={"PATH": os.environ["PATH"], "FORBIDDEN_SECRET": "no"},
         )
         seen = []
@@ -523,18 +530,16 @@ send(1,"terminal.complete",{"status":"complete","unresolved_call_ids":[],"model_
         )
         self.assertEqual(seen[0][0], "recall_show")
         self.assertEqual(
-            outcome["terminal"]["model_attestation"]["credential_kind"],
-            "greppy_llm_proxy",
+            outcome["terminal"]["model_attestation"]["route_kind"],
+            "direct_provider",
         )
         self.assertNotIn("FORBIDDEN_SECRET", transport.child_environment)
         self.assertNotIn("LITELLM_API_KEY", transport.child_environment)
-        self.assertNotIn("synthetic-virtual-key-value", repr(key))
+        self.assertNotIn("synthetic-provider-key-value", repr(key))
 
     def test_transport_rejects_malformed_unattested_and_timed_out_children(self):
-        key = VirtualKey(
-            value="synthetic-virtual-key-value",
-            scope="recall-agent",
-            expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+        key = ProviderKey(
+            value="synthetic-provider-key-value",
         )
         cases = {
             "malformed": (
@@ -545,7 +550,7 @@ send(1,"terminal.complete",{"status":"complete","unresolved_call_ids":[],"model_
                 """
 import json,sys
 s=json.loads(sys.stdin.readline())
-print(json.dumps({"v":"ati.brain.turn.v1","turn_id":s["turn_id"],"seq":0,"type":"terminal.complete","at":"2026-07-25T10:00:00Z","data":{"status":"complete","unresolved_call_ids":[],"model_attestation":{"model_alias":"gemma-4-31b","router_identity":"wrong","credential_kind":"greppy_llm_proxy"}}}),flush=True)
+print(json.dumps({"v":"ati.brain.turn.v1","turn_id":s["turn_id"],"seq":0,"type":"terminal.complete","at":"2026-07-25T10:00:00Z","data":{"status":"complete","unresolved_call_ids":[],"model_attestation":{"model_alias":"gemma-4-31b","route_kind":"direct_provider","provider":"cerebras","route_identity":"wrong"}}}),flush=True)
 """,
                 "agent_model_attestation_invalid",
             ),
@@ -566,9 +571,11 @@ print(json.dumps({"v":"ati.brain.turn.v1","turn_id":s["turn_id"],"seq":0,"type":
             with self.subTest(label=label):
                 transport = SubprocessBrainTurnTransport(
                     (sys.executable, "-c", child),
-                    litellm_base_url="https://litellm.synthetic",
-                    virtual_key=key,
-                    expected_router_identity="litellm.synthetic",
+                    model_base_url=CEREBRAS_API_BASE_URL,
+                    route_kind="direct_provider",
+                    provider="cerebras",
+                    provider_key=key,
+                    expected_route_identity="api.cerebras.ai",
                     environment={"PATH": os.environ["PATH"]},
                 )
                 with self.assertRaises(AgentExecutionError) as caught:
@@ -610,13 +617,13 @@ time.sleep(2)
 """
         transport = SubprocessBrainTurnTransport(
             (sys.executable, "-c", child),
-            litellm_base_url="https://litellm.synthetic",
-            virtual_key=VirtualKey(
-                value="synthetic-virtual-key-value",
-                scope="recall-agent",
-                expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+            model_base_url=CEREBRAS_API_BASE_URL,
+            route_kind="direct_provider",
+            provider="cerebras",
+            provider_key=ProviderKey(
+                value="synthetic-provider-key-value",
             ),
-            expected_router_identity="litellm.synthetic",
+            expected_route_identity="api.cerebras.ai",
             environment={"PATH": os.environ["PATH"]},
         )
         with self.assertRaises(AgentExecutionError) as caught:
@@ -630,16 +637,10 @@ time.sleep(2)
             )
         self.assertEqual(caught.exception.code, "agent_model_timeout")
 
-    def test_configuration_requires_approved_url_and_explicit_credentials(self):
+    def test_configuration_has_one_explicit_route_and_private_secret_file(self):
         with tempfile.TemporaryDirectory() as directory:
-            key_path = Path(directory) / "key.json"
-            key_path.write_text(json.dumps({
-                "virtual_key": "synthetic-virtual-key-value",
-                "scope": "recall-agent",
-                "expires_at": (
-                    datetime.now(timezone.utc) + timedelta(minutes=10)
-                ).isoformat(),
-            }))
+            key_path = Path(directory) / "cerebras.key"
+            key_path.write_text("synthetic-provider-key-value\n")
             key_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
             artifact_path = Path(directory) / "ati-runner.mjs"
             artifact_path.write_text("export {};\n")
@@ -654,67 +655,77 @@ time.sleep(2)
                 ]),
                 "RECALL_ATI_ARTIFACT_PATH": str(artifact_path),
                 "RECALL_ATI_ARTIFACT_SHA256": artifact_sha256,
-                "RECALL_LITELLM_BASE_URL": "https://litellm.synthetic",
-                "RECALL_LITELLM_APPROVED_URL": "https://litellm.synthetic",
-                "RECALL_LITELLM_VIRTUAL_KEY_FILE": str(key_path),
+                "RECALL_AGENT_MODEL_ROUTE": "direct-provider:cerebras",
+                "RECALL_AGENT_MODEL_KEY_FILE": str(key_path),
+                "RECALL_AGENT_MODEL_ALIAS": "gpt-oss-120b",
             }
             self.assertIsInstance(
                 service_from_env(environment).runner,
                 PiAtiRunner,
             )
             self.assertNotIn(
-                "synthetic-virtual-key-value",
-                repr(service_from_env(environment).runner.transport.virtual_key),
+                "synthetic-provider-key-value",
+                repr(service_from_env(environment).runner.transport.provider_key),
             )
-            environment["RECALL_LITELLM_APPROVED_URL"] = (
-                "https://other.synthetic"
-            )
-            with self.assertRaisesRegex(RuntimeError, "not approved"):
+            environment["RECALL_AGENT_MODEL_ROUTE"] = "direct-provider:other"
+            with self.assertRaisesRegex(RuntimeError, "route is invalid"):
                 service_from_env(environment)
-            environment["RECALL_LITELLM_APPROVED_URL"] = (
-                "https://litellm.synthetic"
-            )
+            environment["RECALL_AGENT_MODEL_ROUTE"] = "direct-provider:cerebras"
             environment["RECALL_ATI_ARTIFACT_SHA256"] = "0" * 64
             with self.assertRaisesRegex(RuntimeError, "does not match"):
                 service_from_env(environment)
             environment["RECALL_ATI_ARTIFACT_SHA256"] = artifact_sha256
-            key_path.write_text(json.dumps({
-                "virtual_key": "synthetic-virtual-key-value",
-                "scope": "recall-agent",
-                "expires_at": "2026-07-25T16:30:00",
-            }))
+            key_path.write_text("contains whitespace")
             with self.assertRaisesRegex(RuntimeError, "invalid"):
                 service_from_env(environment)
-            key_path.write_text(json.dumps({
-                "virtual_key": "synthetic-virtual-key-value",
-                "scope": "recall-agent",
-                "expires_at": (
-                    datetime.now(timezone.utc) + timedelta(minutes=10)
-                ).isoformat(),
-            }))
+            key_path.write_text("synthetic-provider-key-value\n")
             key_path.chmod(0o644)
             with self.assertRaisesRegex(RuntimeError, "not private"):
                 service_from_env(environment)
 
+            key_path.chmod(0o600)
             broker_environment = {
                 **environment,
-                "RECALL_LITELLM_CREDENTIAL_MODE": "credentialless-broker",
-                "RECALL_LITELLM_BASE_URL": "http://10.23.45.67:9420",
-                "RECALL_LITELLM_APPROVED_URL": "http://10.23.45.67:9420",
+                "RECALL_AGENT_MODEL_ROUTE": "private-broker",
+                "RECALL_AGENT_MODEL_BASE_URL": "http://10.23.45.67:9420",
             }
-            broker_environment.pop("RECALL_LITELLM_VIRTUAL_KEY_FILE")
+            broker_environment.pop("RECALL_AGENT_MODEL_KEY_FILE")
             self.assertIsInstance(
                 service_from_env(broker_environment).runner,
                 PiAtiRunner,
             )
-            broker_environment["RECALL_LITELLM_BASE_URL"] = (
-                "https://litellm.example"
-            )
-            broker_environment["RECALL_LITELLM_APPROVED_URL"] = (
+            broker_environment["RECALL_AGENT_MODEL_BASE_URL"] = (
                 "https://litellm.example"
             )
             with self.assertRaisesRegex(RuntimeError, "must be private"):
                 service_from_env(broker_environment)
+
+    def test_hostile_direct_provider_configurations_fail_closed(self):
+        common = {
+            "RECALL_AGENT_RUNNER": "pi-ati",
+            "RECALL_ATI_COMMAND_JSON": json.dumps([sys.executable, "-c", "pass"]),
+            "RECALL_ATI_ARTIFACT_PATH": "/tmp/missing-artifact",
+            "RECALL_ATI_ARTIFACT_SHA256": "0" * 64,
+        }
+        for environment in (
+            {
+                **common,
+                "RECALL_AGENT_MODEL_ROUTE": "direct-provider:cerebras",
+            },
+            {
+                **common,
+                "RECALL_AGENT_MODEL_ROUTE": "private-broker",
+                "RECALL_AGENT_MODEL_BASE_URL": "https://api.cerebras.ai/v1",
+            },
+            {
+                **common,
+                "RECALL_AGENT_MODEL_ROUTE": "private-broker",
+                "RECALL_AGENT_MODEL_BASE_URL": "http://10.23.45.67:9420?next=x",
+            },
+        ):
+            with self.subTest(environment=environment):
+                with self.assertRaises(RuntimeError):
+                    service_from_env(environment)
 
 
 if __name__ == "__main__":

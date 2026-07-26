@@ -2,8 +2,8 @@
 
 Recall owns authorization, evidence access, Archil credentials, and the final
 grounding decision. The child owns semantic planning only and receives a
-closed native-tool catalog plus either a short-lived LiteLLM virtual key or
-the non-secret placeholder for a private credential-owning broker.
+closed native-tool catalog plus exactly one explicit model route: a private
+credential-owning broker or the Cerebras API with a deployment secret.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import stat
 import subprocess  # nosec B404
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Protocol
 from urllib.parse import urlsplit
@@ -56,6 +56,8 @@ SAFE_CHILD_ENV = (
     "SSL_CERT_DIR",
 )
 MODEL_PROXY_PLACEHOLDER_KEY = "not-a-secret"
+CEREBRAS_API_BASE_URL = "https://api.cerebras.ai/v1"
+MODEL_ROUTE_KINDS = {"private_broker", "direct_provider"}
 
 
 class BrainTurnTransport(Protocol):
@@ -69,13 +71,11 @@ class BrainTurnTransport(Protocol):
 
 
 @dataclass(frozen=True)
-class VirtualKey:
+class ProviderKey:
     value: str = field(repr=False)
-    scope: str
-    expires_at: datetime
 
 
-def _load_virtual_key(path: str, *, now: datetime) -> VirtualKey:
+def _load_provider_key(path: str) -> ProviderKey:
     key_path = Path(path)
     try:
         descriptor = os.open(
@@ -83,51 +83,40 @@ def _load_virtual_key(path: str, *, now: datetime) -> VirtualKey:
             os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
         )
     except OSError as error:
-        raise RuntimeError("Recall agent virtual-key file is unavailable") from error
+        raise RuntimeError("Recall agent provider-key file is unavailable") from error
     try:
         metadata = os.fstat(descriptor)
+        permissions = stat.S_IMODE(metadata.st_mode)
+        owner_is_trusted = metadata.st_uid in {0, os.getuid()}
+        group_is_trusted = (
+            not permissions & stat.S_IRGRP
+            or metadata.st_gid in {os.getgid(), *os.getgroups()}
+        )
         if (
             not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != os.getuid()
-            or stat.S_IMODE(metadata.st_mode) & 0o077
-            or metadata.st_size > 16_384
+            or not owner_is_trusted
+            or not group_is_trusted
+            or permissions & 0o037
+            or not 1 <= metadata.st_size <= 4096
         ):
-            raise RuntimeError("Recall agent virtual-key file is not private")
-        with os.fdopen(descriptor) as stream:
+            raise RuntimeError("Recall agent provider-key file is not private")
+        with os.fdopen(descriptor, encoding="utf-8") as stream:
             descriptor = -1
-            value = json.load(stream)
-        if (
-            not isinstance(value, dict)
-            or set(value) != {"virtual_key", "scope", "expires_at"}
-        ):
-            raise RuntimeError("Recall agent virtual-key file is invalid")
-        parsed_expiry = datetime.fromisoformat(
-            value["expires_at"].replace("Z", "+00:00")
-        )
-        if parsed_expiry.tzinfo is None:
-            raise RuntimeError("Recall agent virtual-key file is invalid")
-        expires = parsed_expiry.astimezone(timezone.utc)
-        key = VirtualKey(
-            value=value["virtual_key"],
-            scope=value["scope"],
-            expires_at=expires,
-        )
+            value = stream.read().strip()
     except RuntimeError:
         raise
-    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-        raise RuntimeError("Recall agent virtual-key file is invalid") from error
+    except (OSError, UnicodeError) as error:
+        raise RuntimeError("Recall agent provider-key file is invalid") from error
     finally:
         if descriptor >= 0:
             os.close(descriptor)
     if (
-        not isinstance(key.value, str)
-        or not 16 <= len(key.value) <= 4096
-        or key.scope != "recall-agent"
-        or key.expires_at <= now
-        or key.expires_at > now.replace(microsecond=0) + timedelta(hours=24)
+        not 16 <= len(value) <= 4096
+        or any(character.isspace() for character in value)
+        or any(ord(character) < 0x21 or ord(character) > 0x7E for character in value)
     ):
-        raise RuntimeError("Recall agent virtual key is invalid or unscoped")
-    return key
+        raise RuntimeError("Recall agent provider key is invalid")
+    return ProviderKey(value=value)
 
 
 class SubprocessBrainTurnTransport:
@@ -137,17 +126,18 @@ class SubprocessBrainTurnTransport:
         self,
         command: tuple[str, ...],
         *,
-        litellm_base_url: str,
-        virtual_key: VirtualKey | None = None,
-        virtual_key_file: str | None = None,
-        credentialless_broker: bool = False,
-        expected_router_identity: str,
+        model_base_url: str,
+        route_kind: str,
+        provider: str,
+        provider_key: ProviderKey | None = None,
+        provider_key_file: str | None = None,
+        expected_route_identity: str,
         artifact_path: str | None = None,
         expected_artifact_sha256: str | None = None,
         max_frame_bytes: int = 1_000_000,
         environment: dict[str, str] | None = None,
     ):
-        parsed = urlsplit(litellm_base_url)
+        parsed = urlsplit(model_base_url)
         clean_url = (
             parsed.scheme in {"http", "https"}
             and bool(parsed.hostname)
@@ -157,8 +147,12 @@ class SubprocessBrainTurnTransport:
             and not parsed.fragment
         )
         if not clean_url:
-            raise RuntimeError("Recall agent LiteLLM URL is invalid")
-        if credentialless_broker:
+            raise RuntimeError("Recall agent model URL is invalid")
+        if route_kind not in MODEL_ROUTE_KINDS:
+            raise RuntimeError("Recall agent model route kind is invalid")
+        if route_kind == "private_broker":
+            if provider != "broker":
+                raise RuntimeError("Recall private broker provider is invalid")
             try:
                 address = ipaddress.ip_address(parsed.hostname)
                 private_broker = (
@@ -188,24 +182,28 @@ class SubprocessBrainTurnTransport:
                 }
             if not private_broker:
                 raise RuntimeError(
-                    "Recall credentialless broker URL must be private"
+                    "Recall private broker URL must be private"
                 )
-        elif parsed.scheme != "https":
+        elif (
+            provider != "cerebras"
+            or model_base_url.rstrip("/") != CEREBRAS_API_BASE_URL
+        ):
             raise RuntimeError(
-                "Recall virtual-key LiteLLM URL must use HTTPS"
+                "Recall direct provider must be Cerebras at its approved API URL"
             )
         if (
             not command
             or any(not isinstance(part, str) or not part for part in command)
             or not 64_000 <= max_frame_bytes <= 1_000_000
+            or expected_route_identity != parsed.hostname
         ):
             raise RuntimeError("Recall ATI process configuration is invalid")
         key_source_count = sum(
-            source is not None for source in (virtual_key, virtual_key_file)
+            source is not None for source in (provider_key, provider_key_file)
         )
         if (
-            (credentialless_broker and key_source_count != 0)
-            or (not credentialless_broker and key_source_count != 1)
+            (route_kind == "private_broker" and key_source_count != 0)
+            or (route_kind == "direct_provider" and key_source_count != 1)
         ):
             raise RuntimeError(
                 "Recall agent model credential mode is invalid"
@@ -223,11 +221,12 @@ class SubprocessBrainTurnTransport:
         ):
             raise RuntimeError("Recall ATI artifact digest is invalid")
         self.command = command
-        self.litellm_base_url = litellm_base_url.rstrip("/")
-        self.virtual_key = virtual_key
-        self.virtual_key_file = virtual_key_file
-        self.credentialless_broker = credentialless_broker
-        self.expected_router_identity = expected_router_identity
+        self.model_base_url = model_base_url.rstrip("/")
+        self.route_kind = route_kind
+        self.provider = provider
+        self.provider_key = provider_key
+        self.provider_key_file = provider_key_file
+        self.expected_route_identity = expected_route_identity
         self.artifact_path = artifact_path
         self.expected_artifact_sha256 = expected_artifact_sha256
         self.max_frame_bytes = max_frame_bytes
@@ -264,20 +263,14 @@ class SubprocessBrainTurnTransport:
         if digest != self.expected_artifact_sha256:
             raise RuntimeError("Recall ATI artifact digest does not match")
 
-    def _current_key(self) -> VirtualKey:
-        now = datetime.now(timezone.utc)
+    def _current_key(self) -> ProviderKey:
         key = (
-            _load_virtual_key(self.virtual_key_file, now=now)
-            if self.virtual_key_file is not None
-            else self.virtual_key
+            _load_provider_key(self.provider_key_file)
+            if self.provider_key_file is not None
+            else self.provider_key
         )
         if key is None:
-            raise RuntimeError("Recall agent virtual-key source is unavailable")
-        if key.expires_at <= now + timedelta(seconds=30):
-            raise AgentExecutionError(
-                "Recall agent virtual key is expired",
-                code="agent_model_credential_expired",
-            )
+            raise RuntimeError("Recall agent provider-key source is unavailable")
         return key
 
     def _write(
@@ -410,12 +403,18 @@ class SubprocessBrainTurnTransport:
         self._verify_artifact()
         api_key = (
             MODEL_PROXY_PLACEHOLDER_KEY
-            if self.credentialless_broker
+            if self.route_kind == "private_broker"
             else self._current_key().value
         )
         child_environment = {
             **self.child_environment,
-            "LITELLM_BASE_URL": self.litellm_base_url,
+            # pi-ai currently consumes this OpenAI-compatible route through
+            # its LITELLM_* compatibility seam. The explicit route metadata
+            # below determines whether the value is a private broker or the
+            # one approved direct provider.
+            "ATI_MODEL_ROUTE_KIND": self.route_kind,
+            "ATI_MODEL_PROVIDER": self.provider,
+            "LITELLM_BASE_URL": self.model_base_url,
             "LITELLM_API_KEY": api_key,
             "GREP_DISABLE_STATUS_PUBLISH": "1",
         }
@@ -571,9 +570,10 @@ class SubprocessBrainTurnTransport:
                 data.get("status") != "complete"
                 or data.get("unresolved_call_ids") != []
                 or not isinstance(attestation, dict)
-                or attestation.get("credential_kind") != "greppy_llm_proxy"
-                or attestation.get("router_identity")
-                != self.expected_router_identity
+                or attestation.get("route_kind") != self.route_kind
+                or attestation.get("provider") != self.provider
+                or attestation.get("route_identity")
+                != self.expected_route_identity
                 or attestation.get("model_alias")
                 != start["data"]["model"]["alias"]
             ):
@@ -1183,51 +1183,42 @@ def runner_from_env(environment: dict[str, str]) -> PiAtiRunner:
         if not isinstance(command_value, list):
             raise TypeError
         command = tuple(command_value)
-        base_url = environment["RECALL_LITELLM_BASE_URL"].rstrip("/")
-        approved_url = environment["RECALL_LITELLM_APPROVED_URL"].rstrip("/")
-        if base_url != approved_url:
-            raise RuntimeError("Recall agent LiteLLM URL is not approved")
-        credential_mode = environment.get(
-            "RECALL_LITELLM_CREDENTIAL_MODE",
-            "virtual-key",
-        )
-        if credential_mode not in {"virtual-key", "credentialless-broker"}:
-            raise RuntimeError(
-                "Recall agent LiteLLM credential mode is invalid"
-            )
-        credentialless_broker = credential_mode == "credentialless-broker"
-        key_file = environment.get("RECALL_LITELLM_VIRTUAL_KEY_FILE")
-        if credentialless_broker:
+        route = environment["RECALL_AGENT_MODEL_ROUTE"].strip()
+        key_file = environment.get("RECALL_AGENT_MODEL_KEY_FILE")
+        if route == "direct-provider:cerebras":
+            route_kind = "direct_provider"
+            provider = "cerebras"
+            base_url = CEREBRAS_API_BASE_URL
+            if not key_file:
+                raise RuntimeError("Recall Cerebras key file is required")
+            _load_provider_key(key_file)
+        elif route == "private-broker":
+            route_kind = "private_broker"
+            provider = "broker"
+            base_url = environment["RECALL_AGENT_MODEL_BASE_URL"].rstrip("/")
             if key_file:
                 raise RuntimeError(
-                    "Recall credentialless broker cannot receive a virtual key"
+                    "Recall private broker cannot receive a provider key"
                 )
         else:
-            if not key_file:
-                raise RuntimeError(
-                    "Recall virtual-key file is required"
-                )
-            _load_virtual_key(
-                key_file,
-                now=datetime.now(timezone.utc),
-            )
-        expected_router = environment.get(
-            "RECALL_LITELLM_ROUTER_IDENTITY",
-            urlsplit(base_url).hostname or "",
-        )
+            raise RuntimeError("Recall agent model route is invalid")
+        expected_route_identity = urlsplit(base_url).hostname or ""
         artifact_path = environment["RECALL_ATI_ARTIFACT_PATH"]
         artifact_sha256 = environment["RECALL_ATI_ARTIFACT_SHA256"]
         transport = SubprocessBrainTurnTransport(
             command,
-            litellm_base_url=base_url,
-            virtual_key_file=key_file if not credentialless_broker else None,
-            credentialless_broker=credentialless_broker,
-            expected_router_identity=expected_router,
+            model_base_url=base_url,
+            route_kind=route_kind,
+            provider=provider,
+            provider_key_file=key_file if route_kind == "direct_provider" else None,
+            expected_route_identity=expected_route_identity,
             artifact_path=artifact_path,
             expected_artifact_sha256=artifact_sha256,
             environment=environment,
         )
-        model = environment.get("RECALL_AGENT_MODEL_ALIAS", "gemma-4-31b")
+        model = environment.get("RECALL_AGENT_MODEL_ALIAS")
+        if not model and route_kind == "private_broker":
+            model = "gemma-4-31b"
         if not model or len(model) > 160:
             raise RuntimeError("Recall agent model alias is invalid")
         return PiAtiRunner(transport, model_alias=model)
