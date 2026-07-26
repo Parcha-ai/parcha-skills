@@ -86,6 +86,22 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
             "deadline-exceeded",
         )
 
+    def test_session_expansion_uses_the_caller_deadline(self) -> None:
+        store = DeadlineStore()
+        retrieval = BoundCanonicalRetrieval(
+            store,
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=("codex.jsonl:test",),
+        )
+
+        with self.assertRaises(SearchDeadlineExceeded):
+            retrieval.session_context(
+                "recall://canonical/test",
+                _deadline_at=time.monotonic() + 0.025,
+            )
+        self.assertIsNotNone(store.deadline_at)
+
 
 if __name__ == "__main__":
     unittest.main()
