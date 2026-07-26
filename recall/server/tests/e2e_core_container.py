@@ -118,8 +118,13 @@ def main() -> None:
         identity = run(
             "docker", "image", "inspect", image, "--format", "{{.Config.User}}",
         ).stdout.strip()
-        if identity != "10001:10001":
+        if identity != "10001":
             raise RuntimeError("container user contract failed")
+        groups = run(
+            "docker", "run", "--rm", "--entrypoint", "id", image, "-G",
+        ).stdout.split()
+        if "10001" not in groups or "1000" not in groups:
+            raise RuntimeError("container secret-file group contract failed")
         composio_import = run(
             "docker",
             "run",

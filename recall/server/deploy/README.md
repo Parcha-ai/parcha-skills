@@ -291,47 +291,34 @@ Harness `brain-turn` artifact:
 RECALL_ATI_COMMAND_JSON=["node","/opt/ati/grep_ati_brain_turn.mjs"]
 RECALL_ATI_ARTIFACT_PATH=/opt/ati/grep_ati_brain_turn.mjs
 RECALL_ATI_ARTIFACT_SHA256=<lowercase-sha256>
-RECALL_AGENT_MODEL_ALIAS=gemma-4-31b
-RECALL_LITELLM_BASE_URL=https://<approved-litellm-router>
-RECALL_LITELLM_APPROVED_URL=https://<approved-litellm-router>
-RECALL_LITELLM_ROUTER_IDENTITY=<approved-litellm-router-hostname>
-RECALL_LITELLM_CREDENTIAL_MODE=virtual-key
-RECALL_LITELLM_VIRTUAL_KEY_FILE=/run/secrets/recall-agent-virtual-key.json
+RECALL_AGENT_MODEL_ALIAS=gpt-oss-120b
+RECALL_AGENT_MODEL_ROUTE=direct-provider:cerebras
+RECALL_AGENT_MODEL_KEY_FILE=/etc/secrets/cerebras-api-key
 ```
 
-The command is a JSON argument array and never passes through a shell. The key
-file must be a nonsymlinked, owner-owned `0600` regular file:
-
-```json
-{
-  "virtual_key": "<short-lived-scoped-key>",
-  "scope": "recall-agent",
-  "expires_at": "2026-07-25T16:30:00Z"
-}
-```
-
-Recall reloads this file before every child process, so a credential rotator can
-atomically replace it without restarting the service. The declared expiration
-must be in the future and no more than 24 hours away. The ATI child receives
-only that virtual key, the exact approved LiteLLM URL, and a minimal process
-environment.
+The command is a JSON argument array and never passes through a shell. The
+Render secret file contains only the Cerebras API key. It must be a
+nonsymlinked regular file owned by the service user or root, with no write or
+execute permission for its group and no permissions for other users. Recall
+reloads it immediately before each child process. The child receives only that
+key, the fixed `https://api.cerebras.ai/v1` endpoint, explicit Cerebras route
+metadata, and a minimal process environment. The image includes the reviewed
+ATI artifact and Node runtime; the configured digest pins the artifact bytes.
 
 On a Greppy host, use the dedicated credential-owning local broker instead.
 Recall passes the literal `not-a-secret` placeholder to ATI; no model bearer
 credential enters Recall or the child:
 
 ```text
-RECALL_LITELLM_CREDENTIAL_MODE=credentialless-broker
-RECALL_LITELLM_BASE_URL=http://<private-greppy-llm-proxy-host>:<port>
-RECALL_LITELLM_APPROVED_URL=http://<private-greppy-llm-proxy-host>:<port>
-RECALL_LITELLM_ROUTER_IDENTITY=<private-greppy-llm-proxy-host>
+RECALL_AGENT_MODEL_ROUTE=private-broker
+RECALL_AGENT_MODEL_BASE_URL=http://<private-greppy-llm-proxy-host>:<port>
+RECALL_AGENT_MODEL_ALIAS=gemma-4-31b
 ```
 
 This mode fails closed unless the exact approved URL is loopback, link-local,
 RFC1918, carrier-grade NAT, or the private Docker host gateway. Do not expose
-the broker publicly. A Recall deployment outside that private network must use
-the scoped virtual-key mode or an explicitly designed private connectivity
-boundary.
+the broker publicly. A Render deployment outside that private network uses the
+explicit direct Cerebras route.
 
 Recall and Archil credentials remain in the host.
 
