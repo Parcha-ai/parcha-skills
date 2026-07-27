@@ -101,6 +101,13 @@ def validate(report: Path, expected_target: str | None = None) -> list[str]:
         errors.append("Cleanup must be PASS or NOT REQUIRED")
     if not fields.get("Cleanup witness") or not cleanup_witness.is_file():
         errors.append("cleanup witness does not resolve")
+    elif fields.get("Cleanup") == "PASS":
+        cleanup_text = cleanup_witness.read_text(errors="ignore").lower()
+        pending_markers = ("pending", "todo", "not verified", "unverified")
+        if not cleanup_text.strip():
+            errors.append("cleanup PASS requires a non-empty cleanup witness")
+        elif any(marker in cleanup_text for marker in pending_markers):
+            errors.append("cleanup PASS conflicts with a pending or unverified cleanup witness")
 
     chrome_required = fields.get("Chrome DevTools required") == "YES"
     if verdict not in SHIP_VERDICTS | {"DO NOT SHIP", "BLOCKED"}:
