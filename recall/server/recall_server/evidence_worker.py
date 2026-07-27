@@ -7,6 +7,7 @@ from typing import Any
 
 from .evidence_projection import CanonicalEvidenceProjector
 from .logical_evidence_projection import CanonicalLogicalEvidenceProjector
+from .logical_evidence_projection import MAX_LOGICAL_EVIDENCE_BATCH_SIZE
 
 LOG = logging.getLogger(__name__)
 
@@ -62,9 +63,10 @@ def run_logical_evidence_worker(
 ) -> dict[str, int | str]:
     """Continuously materialize dirty source sessions as bounded S3 documents."""
 
-    if not 1 <= batch_size <= 2_000:
+    if not 1 <= batch_size <= MAX_LOGICAL_EVIDENCE_BATCH_SIZE:
         raise ValueError(
-            "logical evidence worker batch size must be between 1 and 2000"
+            "logical evidence worker batch size must be between 1 and "
+            f"{MAX_LOGICAL_EVIDENCE_BATCH_SIZE}"
         )
     if not 1 <= max_batches_per_cycle <= 100:
         raise ValueError(

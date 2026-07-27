@@ -48,6 +48,9 @@ class FakeS3:
     def __init__(self):
         self.objects: dict[tuple[str, str, str], dict] = {}
         self.put_calls: list[dict] = []
+        self.get_calls: list[dict] = []
+        self.head_calls: list[dict] = []
+        self.delete_calls: list[dict] = []
         self.version = 0
 
     def put_object(self, **kwargs):
@@ -58,6 +61,7 @@ class FakeS3:
         return {"VersionId": version}
 
     def get_object(self, **kwargs):
+        self.get_calls.append(kwargs)
         try:
             value = self.objects[(kwargs["Bucket"], kwargs["Key"], kwargs["VersionId"])]
         except KeyError as error:
@@ -70,6 +74,7 @@ class FakeS3:
         }
 
     def head_object(self, **kwargs):
+        self.head_calls.append(kwargs)
         matches = [
             (version, value)
             for (bucket, key, version), value in self.objects.items()
@@ -92,6 +97,7 @@ class FakeS3:
         }
 
     def delete_object(self, **kwargs):
+        self.delete_calls.append(kwargs)
         self.objects.pop(
             (kwargs["Bucket"], kwargs["Key"], kwargs["VersionId"]),
             None,
@@ -245,6 +251,34 @@ class ArchiveStoreParityTest(unittest.TestCase):
             )
             self.assertTrue(store.delete_raw(reference))
             self.assertFalse(store.delete_raw(reference))
+
+    def test_internal_delete_verifies_metadata_without_downloading_payload(self):
+        reference = self.s3.put_raw(
+            tenant_id=TENANT,
+            source_id=SOURCE,
+            native_id="native:internal-delete",
+            payload=PAYLOAD,
+            media_type="application/json",
+            created_at="2026-07-19T00:00:00Z",
+        )
+        get_count = len(self.s3_client.get_calls)
+
+        self.assertTrue(self.s3.delete_internal_raw(reference))
+        self.assertEqual(len(self.s3_client.get_calls), get_count)
+        self.assertTrue(self.s3_client.head_calls)
+        self.assertTrue(self.s3_client.delete_calls)
+
+        protected = self.s3.put_raw(
+            tenant_id=TENANT,
+            source_id=SOURCE,
+            native_id="native:internal-delete-protected",
+            payload=PAYLOAD,
+            media_type="application/json",
+            created_at="2026-07-19T00:00:00Z",
+        )
+        forged = {**protected, "tenant_id": "tenant:other"}
+        self.assertFalse(self.s3.delete_internal_raw(forged))
+        self.assertEqual(self.s3.read_raw(protected), PAYLOAD)
 
     def test_filesystem_rejects_a_symlinked_parent(self):
         with tempfile.TemporaryDirectory() as temporary:

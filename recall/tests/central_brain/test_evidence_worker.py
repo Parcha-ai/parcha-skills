@@ -93,7 +93,7 @@ class LogicalEvidenceWorkerTests(TestCase):
     def test_invalid_worker_budgets_fail_before_projection(self) -> None:
         invalid = (
             {"batch_size": 0},
-            {"batch_size": 2001},
+            {"batch_size": 10001},
             {"max_batches_per_cycle": 0},
             {"upload_concurrency": 0},
             {"upload_concurrency": 33},
@@ -117,3 +117,18 @@ class LogicalEvidenceWorkerTests(TestCase):
                 )
             self.assertEqual(projector.seed_calls, [])
             self.assertEqual(projector.project_calls, [])
+
+    def test_full_corpus_wave_accepts_ten_thousand_documents(self) -> None:
+        projector = FakeLogicalProjector([result(documents=1, records=1)])
+
+        run_logical_evidence_worker(
+            projector,  # type: ignore[arg-type]
+            tenant_id="tenant:company:synthetic",
+            batch_size=10_000,
+            max_batches_per_cycle=1,
+            upload_concurrency=32,
+            interval_seconds=5,
+            once=True,
+        )
+
+        self.assertEqual(projector.project_calls[0]["batch_size"], 10_000)

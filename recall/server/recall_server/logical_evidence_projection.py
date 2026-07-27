@@ -32,6 +32,7 @@ DEFAULT_EXCLUDED_STRUCTURAL_TYPES = (
     "token_count",
     "turn_context",
 )
+MAX_LOGICAL_EVIDENCE_BATCH_SIZE = 10_000
 
 
 @dataclass(frozen=True)
@@ -736,8 +737,14 @@ class CanonicalLogicalEvidenceProjector:
         *,
         tenant_id: str | None = None,
         limit: int = 500,
+        concurrency: int = 1,
     ) -> dict[str, int | str]:
-        if not 1 <= limit <= 5_000:
+        if (
+            not 1 <= limit <= 5_000
+            or isinstance(concurrency, bool)
+            or not isinstance(concurrency, int)
+            or not 1 <= concurrency <= 32
+        ):
             raise LogicalEvidenceError("logical_evidence_budget_invalid")
         tenant_id = self._tenant(tenant_id)
         completed = deleted = failures = 0
@@ -752,37 +759,80 @@ class CanonicalLogicalEvidenceProjector:
                         FOR UPDATE SKIP LOCKED""",
                     (tenant_id, tenant_id, limit),
                 ).fetchall()
-                for row in rows:
-                    reference = self._reference(row)
-                    try:
-                        removed = self.projection.delete_reference(reference)
-                    except Exception:
-                        connection.execute(
-                            """UPDATE canonical_evidence_cleanup_queue
-                                  SET attempts=attempts+1,
-                                      last_attempt_at=clock_timestamp()
-                                WHERE tenant_id=%s AND source_id=%s
-                                  AND artifact_id=%s""",
-                            (
-                                row["tenant_id"],
-                                row["source_id"],
-                                row["artifact_id"],
-                            ),
+                references = [
+                    self._reference(row)
+                    for row in rows
+                ]
+                with ThreadPoolExecutor(
+                    max_workers=min(concurrency, max(1, len(rows))),
+                    thread_name_prefix="recall-logical-cleanup",
+                ) as executor:
+                    futures = [
+                        executor.submit(
+                            self.projection.delete_reference,
+                            reference,
                         )
+                        for reference in references
+                    ]
+                succeeded: list[tuple[str, str, str]] = []
+                failed: list[tuple[str, str, str]] = []
+                for row, future in zip(rows, futures, strict=True):
+                    identity = (
+                        row["tenant_id"],
+                        row["source_id"],
+                        row["artifact_id"],
+                    )
+                    try:
+                        removed = future.result()
+                    except Exception:
+                        failed.append(identity)
                         failures += 1
                         continue
-                    connection.execute(
-                        """DELETE FROM canonical_evidence_cleanup_queue
-                            WHERE tenant_id=%s AND source_id=%s
-                              AND artifact_id=%s""",
-                        (
-                            row["tenant_id"],
-                            row["source_id"],
-                            row["artifact_id"],
-                        ),
-                    )
+                    succeeded.append(identity)
                     completed += 1
                     deleted += int(removed)
+                if succeeded:
+                    connection.execute(
+                        """WITH completed(
+                               tenant_id,source_id,artifact_id
+                           ) AS (
+                               SELECT * FROM unnest(
+                                   %s::text[],%s::text[],%s::text[]
+                               )
+                           )
+                           DELETE FROM canonical_evidence_cleanup_queue queue
+                           USING completed
+                           WHERE queue.tenant_id=completed.tenant_id
+                             AND queue.source_id=completed.source_id
+                             AND queue.artifact_id=completed.artifact_id""",
+                        (
+                            [identity[0] for identity in succeeded],
+                            [identity[1] for identity in succeeded],
+                            [identity[2] for identity in succeeded],
+                        ),
+                    )
+                if failed:
+                    connection.execute(
+                        """WITH failed(
+                               tenant_id,source_id,artifact_id
+                           ) AS (
+                               SELECT * FROM unnest(
+                                   %s::text[],%s::text[],%s::text[]
+                               )
+                           )
+                           UPDATE canonical_evidence_cleanup_queue queue
+                              SET attempts=queue.attempts+1,
+                                  last_attempt_at=clock_timestamp()
+                             FROM failed
+                            WHERE queue.tenant_id=failed.tenant_id
+                              AND queue.source_id=failed.source_id
+                              AND queue.artifact_id=failed.artifact_id""",
+                        (
+                            [identity[0] for identity in failed],
+                            [identity[1] for identity in failed],
+                            [identity[2] for identity in failed],
+                        ),
+                    )
         with self.store.connect() as connection:
             pending = connection.execute(
                 """SELECT count(*) AS count
@@ -1062,7 +1112,7 @@ class CanonicalLogicalEvidenceProjector:
         if (
             isinstance(batch_size, bool)
             or not isinstance(batch_size, int)
-            or not 1 <= batch_size <= 2_000
+            or not 1 <= batch_size <= MAX_LOGICAL_EVIDENCE_BATCH_SIZE
             or isinstance(max_batches, bool)
             or not isinstance(max_batches, int)
             or not 1 <= max_batches <= 100
@@ -1085,7 +1135,11 @@ class CanonicalLogicalEvidenceProjector:
         documents = records = receipts = objects = bytes_uploaded = batches = 0
         old_objects_deleted = cleanup_failures = source_races = pruned = 0
         cleanup_completed = cleanup_pending = 0
-        cleanup = self.drain_cleanup(tenant_id=tenant_id, limit=5_000)
+        cleanup = self.drain_cleanup(
+            tenant_id=tenant_id,
+            limit=5_000,
+            concurrency=upload_concurrency,
+        )
         old_objects_deleted += int(cleanup["deleted"])
         cleanup_failures += int(cleanup["failures"])
         cleanup_completed += int(cleanup["completed"])
@@ -1161,11 +1215,19 @@ class CanonicalLogicalEvidenceProjector:
                         if upload is not None
                     )
                 self._schedule_upload_cleanup(interrupted_uploads)
-                self.drain_cleanup(tenant_id=tenant_id, limit=5_000)
+                self.drain_cleanup(
+                    tenant_id=tenant_id,
+                    limit=5_000,
+                    concurrency=upload_concurrency,
+                )
                 raise
             if failures:
                 self._schedule_upload_cleanup(successful)
-                self.drain_cleanup(tenant_id=tenant_id, limit=5_000)
+                self.drain_cleanup(
+                    tenant_id=tenant_id,
+                    limit=5_000,
+                    concurrency=upload_concurrency,
+                )
                 raise failures[0]
             statuses: list[str | None] = [None] * len(candidates)
             failures = []
@@ -1213,7 +1275,11 @@ class CanonicalLogicalEvidenceProjector:
                     int(reference["size_bytes"]) for reference in upload.all_references
                 )
             batches += 1
-            cleanup = self.drain_cleanup(tenant_id=tenant_id, limit=5_000)
+            cleanup = self.drain_cleanup(
+                tenant_id=tenant_id,
+                limit=5_000,
+                concurrency=upload_concurrency,
+            )
             old_objects_deleted += int(cleanup["deleted"])
             cleanup_failures += int(cleanup["failures"])
             cleanup_completed += int(cleanup["completed"])

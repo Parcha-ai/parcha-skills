@@ -858,4 +858,7 @@ class LogicalEvidenceProjectionStore:
         return deleted
 
     def delete_reference(self, reference: dict[str, Any]) -> bool:
+        delete_internal = getattr(self.archive, "delete_internal_raw", None)
+        if callable(delete_internal):
+            return bool(delete_internal(reference))
         return self.archive.delete_raw(reference)

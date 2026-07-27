@@ -265,6 +265,24 @@ class _ArchiveStore:
             source_id=value["source_id"],
         )
 
+    def delete_internal_raw(self, value: dict[str, Any]) -> bool:
+        """Delete a trusted persisted reference without downloading its payload.
+
+        This path is intentionally limited to server-owned references recovered
+        from the database. Connector-facing references must continue through
+        ``delete_raw`` and its full integrity check.
+        """
+
+        reference = self._from_contract(value)
+        try:
+            return self.delete(
+                reference,
+                tenant_id=value["tenant_id"],
+                source_id=value["source_id"],
+            )
+        except ArchiveNotFound:
+            return False
+
     def read_raw(self, value: dict[str, Any]) -> bytes:
         """Resolve one closed reference without exposing namespace-key material."""
         reference = self._from_contract(value)
