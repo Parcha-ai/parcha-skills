@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import os
@@ -61,6 +62,8 @@ def insert_record(
     text: str,
     role: str,
     byte_start: int,
+    raw_reference: dict[str, object] | None = None,
+    canonical_content: dict[str, object] | None = None,
 ) -> str:
     identity = digest(f"{tenant}\0{source}\0{native}\0{text}")
     artifact = "art_" + identity[:32]
@@ -68,22 +71,35 @@ def insert_record(
     event = "evt_" + identity[:32]
     document = "doc_" + identity[:32]
     object_digest = digest("raw\0" + identity)
+    if raw_reference is None:
+        raw_reference = {
+            "artifact_id": artifact,
+            "storage_backend": "filesystem",
+            "object_key": f"objects/{object_digest[:2]}/{object_digest}",
+            "content_sha256": digest(text),
+            "size_bytes": len(text.encode()),
+            "media_type": "application/json",
+            "encryption": "filesystem-owner-only",
+            "version_id": "fs-" + identity,
+        }
     connection.execute(
         """INSERT INTO raw_artifacts(
                tenant_id,source_id,artifact_id,storage_backend,object_key,
                content_sha256,size_bytes,media_type,encryption,version_id
            ) VALUES (
-               %s,%s,%s,'filesystem',%s,%s,%s,'application/json',
-               'filesystem-owner-only',%s
+               %s,%s,%s,%s,%s,%s,%s,%s,%s,%s
            )""",
         (
             tenant,
             source,
-            artifact,
-            f"objects/{object_digest[:2]}/{object_digest}",
-            digest(text),
-            len(text.encode()),
-            "fs-" + identity,
+            raw_reference["artifact_id"],
+            raw_reference["storage_backend"],
+            raw_reference["object_key"],
+            raw_reference["content_sha256"],
+            raw_reference["size_bytes"],
+            raw_reference["media_type"],
+            raw_reference["encryption"],
+            raw_reference["version_id"],
         ),
     )
     connection.execute(
@@ -95,10 +111,11 @@ def insert_record(
         (tenant, source, job),
     )
     envelope = {
-        "content": {
+        "content": canonical_content or {
             "message": {"role": role, "text": text},
             "type": role,
         },
+        "type": role,
         "provenance": {"byte_start": byte_start, "byte_end": byte_start + 10},
     }
     connection.execute(
@@ -116,7 +133,7 @@ def insert_record(
             event,
             native,
             parent,
-            artifact,
+            raw_reference["artifact_id"],
             job,
             digest(text),
             json.dumps(envelope),
@@ -132,7 +149,7 @@ def insert_record(
             source,
             document,
             event,
-            artifact,
+            raw_reference["artifact_id"],
             native,
             digest(text),
             text,
@@ -258,11 +275,50 @@ def main() -> None:
                 namespace_key=b"synthetic-logical-projector-key-32",
             ),
         )
+        oversized_text = json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": "complete oversized source record " + "x" * 40_000,
+                },
+            },
+            separators=(",", ":"),
+        )
+        oversized_payload = gzip.compress(oversized_text.encode())
+        oversized_reference = archive.put_raw(
+            tenant_id=tenant,
+            source_id=codex,
+            native_id=f"codex-record-{nonce}-oversized:full",
+            payload=oversized_payload,
+            media_type="application/vnd.recall.oversized-record+gzip",
+            created_at="2026-07-27T00:00:01Z",
+        )
+        with store.connect() as connection:
+            receipts["codex-oversized"] = insert_record(
+                connection,
+                tenant=tenant,
+                source=codex,
+                parent=codex_parent,
+                native=f"codex-record-{nonce}-oversized",
+                text="bounded oversized projection",
+                role="assistant",
+                byte_start=20,
+                raw_reference=oversized_reference,
+                canonical_content={
+                    "contract": "recall.oversized-projection.v1",
+                    "archive_encoding": "gzip",
+                    "full_record_available": True,
+                    "full_size_bytes": len(oversized_text.encode()),
+                    "full_content_sha256": digest(oversized_text),
+                },
+            )
         projection = LogicalEvidenceProjectionStore(archive)
         projector = CanonicalLogicalEvidenceProjector(
             store,
             projection,
             bound_tenant_id=tenant,
+            raw_archive=archive,
         )
         assert projector.seed_backfill(tenant_id=tenant) == 2
         first = projector.project_pending(
@@ -272,11 +328,11 @@ def main() -> None:
             upload_concurrency=2,
         )
         assert first["documents"] == 2
-        assert first["records"] == 5
-        assert first["receipts"] == 6
+        assert first["records"] == 6
+        assert first["receipts"] == 7
         assert first["objects"] == 4
         assert first["cleanup_failures"] == 0
-        assert archive_object_count(archive_root) == 4
+        assert archive_object_count(archive_root) == 5
         assert projector.project_pending(
             tenant_id=tenant,
             batch_size=10,
@@ -307,6 +363,21 @@ def main() -> None:
             ["assistant"],
         ]
         assert targets[0]["receipts"] == (receipts["claude-1"],)
+        oversized_targets = projector.targets_for_receipts(
+            tenant_id=tenant,
+            source_ids=(codex,),
+            receipts=(receipts["codex-oversized"],),
+            limit=10,
+        )
+        oversized_rows = [
+            json.loads(line)
+            for line in projection.read_part(
+                oversized_targets[0]["reference"],
+                tenant_id=tenant,
+                source_id=codex,
+            ).splitlines()
+        ]
+        assert oversized_rows[-1]["text"] == oversized_text
 
         with store.connect() as connection:
             receipts["claude-3"] = insert_record(
@@ -338,13 +409,13 @@ def main() -> None:
         assert revised["old_objects_deleted"] == 1
         assert revised["cleanup_failures"] == 1
         assert revised["cleanup_pending"] == 1
-        assert archive_object_count(archive_root) == 5
+        assert archive_object_count(archive_root) == 6
         cleanup = projector.drain_cleanup(tenant_id=tenant)
         assert cleanup["completed"] == 1
         assert cleanup["deleted"] == 1
         assert cleanup["failures"] == 0
         assert cleanup["pending"] == 0
-        assert archive_object_count(archive_root) == 4
+        assert archive_object_count(archive_root) == 5
         with store.connect() as connection:
             state = connection.execute(
                 """SELECT revision,record_count,part_count
@@ -377,7 +448,7 @@ def main() -> None:
             source_id=claude,
             native_ids=[forgotten_native],
         ) == 2
-        assert archive_object_count(archive_root) == 2
+        assert archive_object_count(archive_root) == 3
         assert projector.targets_for_receipts(
             tenant_id=tenant,
             source_ids=(claude,),
@@ -391,7 +462,7 @@ def main() -> None:
         )
         assert rebuilt["documents"] == 1
         assert rebuilt["records"] == 3
-        assert archive_object_count(archive_root) == 4
+        assert archive_object_count(archive_root) == 5
 
         try:
             projector.project_pending(tenant_id=other_tenant)
@@ -416,7 +487,7 @@ def main() -> None:
     assert counts == {
         "documents": 2,
         "receipt_documents": 2,
-        "receipts": 6,
+        "receipts": 7,
     }
     print(
         json.dumps(
@@ -424,7 +495,8 @@ def main() -> None:
                 "status": "pass",
                 "logical_documents": 2,
                 "source_families": 2,
-                "exact_receipts": 6,
+                "exact_receipts": 7,
+                "oversized_sql_restorations": 1,
                 "idempotent_reprojects": 0,
                 "revision_replacements": 1,
                 "durable_cleanup_retries": 1,

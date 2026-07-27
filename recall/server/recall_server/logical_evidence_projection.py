@@ -390,7 +390,8 @@ class CanonicalLogicalEvidenceProjector:
             ) as cursor:
                 cursor.itersize = 2_000
                 cursor.execute(
-                    """SELECT event.event_id,event.native_id,event.kind,
+                    """SELECT event.tenant_id,event.source_id,
+                              event.event_id,event.native_id,event.kind,
                               event.occurred_at,
                               event.canonical_redacted,
                               document.document_id,
