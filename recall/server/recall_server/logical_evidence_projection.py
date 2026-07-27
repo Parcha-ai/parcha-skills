@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from itertools import groupby
 from typing import Any
 
+import orjson
+
 from .canonical_text import canonical_text_chunks
 from .logical_evidence import (
     LogicalEvidenceError,
@@ -107,6 +109,49 @@ def _explicit_roles(values: Any) -> tuple[str, ...]:
             }
         )
     )
+
+
+def _structural_values(text: str) -> tuple[bool, tuple[str, ...], tuple[str, ...]]:
+    try:
+        value = orjson.loads(text)
+    except orjson.JSONDecodeError:
+        return False, (), ()
+    if not isinstance(value, dict):
+        return True, (), ()
+
+    def string_at(*path: str) -> str | None:
+        current: Any = value
+        for key in path:
+            if not isinstance(current, dict):
+                return None
+            current = current.get(key)
+        return current if isinstance(current, str) else None
+
+    types = tuple(
+        candidate
+        for candidate in (
+            string_at("type"),
+            string_at("message", "type"),
+            string_at("payload", "type"),
+            string_at("payload", "message", "type"),
+        )
+        if candidate is not None
+    )
+    roles = tuple(
+        candidate
+        for candidate in (
+            string_at("role"),
+            string_at("type"),
+            string_at("message", "role"),
+            string_at("message", "type"),
+            string_at("payload", "role"),
+            string_at("payload", "type"),
+            string_at("payload", "message", "role"),
+            string_at("payload", "message", "type"),
+        )
+        if candidate is not None
+    )
+    return True, types, roles
 
 
 class CanonicalLogicalEvidenceProjector:
@@ -278,6 +323,15 @@ class CanonicalLogicalEvidenceProjector:
                 or revision < 1
             ):
                 raise LogicalEvidenceError("logical_evidence_state_invalid")
+            parsed, structural_types, structural_roles = _structural_values(text)
+            if not parsed:
+                structural_types = tuple(row["fallback_type_values"])
+                structural_roles = tuple(row["fallback_role_values"])
+            if set(structural_types).intersection(
+                self.excluded_structural_types
+            ):
+                continue
+            row["explicit_role_values"] = list(structural_roles)
             receipts = [
                 item_receipt(
                     row["source_id"],
@@ -414,28 +468,46 @@ class CanonicalLogicalEvidenceProjector:
                               event.tenant_id,event.source_id,
                               event.event_id,event.native_id,event.kind,
                               event.occurred_at,
-                              (
-                                  jsonb_path_query_array(
-                                      event.canonical_redacted,
-                                      '$.**.role ? (@.type() == "string")'
+                              CASE
+                                  WHEN left(
+                                      ltrim(document.text_redacted),1
+                                  ) IN ('{','[') THEN '[]'::jsonb
+                                  ELSE jsonb_build_array(
+                                      event.canonical_redacted->>'role',
+                                      event.canonical_redacted->>'type',
+                                      event.canonical_redacted
+                                          #>> '{content,role}',
+                                      event.canonical_redacted
+                                          #>> '{content,type}',
+                                      event.canonical_redacted
+                                          #>> '{content,message,role}',
+                                      event.canonical_redacted
+                                          #>> '{content,message,type}',
+                                      event.canonical_redacted
+                                          #>> '{content,payload,role}',
+                                      event.canonical_redacted
+                                          #>> '{content,payload,type}'
                                   )
-                                  ||
-                                  jsonb_path_query_array(
-                                      event.canonical_redacted,
-                                      '$.**.type ? (@.type() == "string")'
+                              END AS fallback_role_values,
+                              CASE
+                                  WHEN left(
+                                      ltrim(document.text_redacted),1
+                                  ) IN ('{','[') THEN '[]'::jsonb
+                                  ELSE jsonb_build_array(
+                                      event.canonical_redacted->>'type',
+                                      event.canonical_redacted
+                                          #>> '{content,type}',
+                                      event.canonical_redacted
+                                          #>> '{content,message,type}',
+                                      event.canonical_redacted
+                                          #>> '{content,payload,type}'
                                   )
-                              ) AS explicit_role_values,
+                              END AS fallback_type_values,
                               CASE WHEN artifact.media_type=%s
                                    THEN event.canonical_redacted->'content'
                                    ELSE NULL
                               END AS oversized_content,
-                              CASE WHEN jsonb_typeof(
-                                  event.canonical_redacted
-                                      #> '{provenance,byte_start}'
-                              )='number' THEN (
-                                  event.canonical_redacted
-                                      #>> '{provenance,byte_start}'
-                              )::bigint END AS byte_start,
+                              event.source_ordinal AS byte_start,
                               document.text_redacted AS event_text,
                               document.revision AS document_revision,
                               source_record.chunk_count,
@@ -455,12 +527,6 @@ class CanonicalLogicalEvidenceProjector:
                           AND COALESCE(
                               event.native_parent_id,event.native_id
                           )=selected.native_parent_id
-                          AND NOT (
-                              jsonb_path_query_array(
-                                  event.canonical_redacted,
-                                  '$.**.type ? (@.type() == "string")'
-                              ) ?| %s::text[]
-                          )
                          JOIN canonical_documents document
                            ON document.tenant_id=event.tenant_id
                           AND document.source_id=event.source_id
@@ -482,8 +548,7 @@ class CanonicalLogicalEvidenceProjector:
                            ON source_record.chunk_count>0
                         ORDER BY
                           selected.candidate_ordinal,
-                          event.canonical_redacted
-                              #> '{provenance,byte_start}' IS NULL,
+                          event.source_ordinal IS NULL,
                           byte_start,event.occurred_at,event.native_id""",
                         (
                             list(range(len(candidates))),
@@ -491,7 +556,6 @@ class CanonicalLogicalEvidenceProjector:
                             [candidate.source_id for candidate in candidates],
                             [candidate.native_parent_id for candidate in candidates],
                             OVERSIZED_MEDIA_TYPE,
-                            list(self.excluded_structural_types),
                         ),
                     )
                     previous_ordinal = -1
@@ -628,6 +692,18 @@ class CanonicalLogicalEvidenceProjector:
         with self.store.connect() as connection:
             with connection.transaction():
                 return self._enqueue_cleanup(connection, references)
+
+    def _schedule_upload_cleanup(
+        self,
+        uploads: list[LogicalEvidenceUpload],
+    ) -> int:
+        return self._schedule_cleanup(
+            tuple(
+                reference
+                for upload in uploads
+                for reference in upload.all_references
+            )
+        )
 
     def drain_cleanup(
         self,
@@ -1014,37 +1090,55 @@ class CanonicalLogicalEvidenceProjector:
             uploads: list[LogicalEvidenceUpload | None] = [None] * len(candidates)
             successful: list[LogicalEvidenceUpload] = []
             failures: list[Exception] = []
-            with ThreadPoolExecutor(
-                max_workers=worker_count,
-                thread_name_prefix="recall-logical-evidence",
-            ) as executor:
-                futures = [
-                    (
-                        shard,
-                        executor.submit(
-                            self._prepare_batch_and_upload,
-                            tuple(candidate for _, candidate in shard),
-                        ),
-                    )
-                    for shard in shards
-                ]
-                for shard, future in futures:
+            futures = []
+            try:
+                with ThreadPoolExecutor(
+                    max_workers=worker_count,
+                    thread_name_prefix="recall-logical-evidence",
+                ) as executor:
+                    futures = [
+                        (
+                            shard,
+                            executor.submit(
+                                self._prepare_batch_and_upload,
+                                tuple(candidate for _, candidate in shard),
+                            ),
+                        )
+                        for shard in shards
+                    ]
+                    for shard, future in futures:
+                        try:
+                            shard_uploads = future.result()
+                        except Exception as error:
+                            failures.append(error)
+                            continue
+                        for (index, _candidate), upload in zip(
+                            shard,
+                            shard_uploads,
+                            strict=True,
+                        ):
+                            uploads[index] = upload
+                            if upload is not None:
+                                successful.append(upload)
+            except BaseException:
+                interrupted_uploads: list[LogicalEvidenceUpload] = []
+                for _shard, future in futures:
+                    if future.cancelled():
+                        continue
                     try:
                         shard_uploads = future.result()
-                    except Exception as error:
-                        failures.append(error)
+                    except BaseException:
                         continue
-                    for (index, _candidate), upload in zip(
-                        shard,
-                        shard_uploads,
-                        strict=True,
-                    ):
-                        uploads[index] = upload
-                        if upload is not None:
-                            successful.append(upload)
+                    interrupted_uploads.extend(
+                        upload
+                        for upload in shard_uploads
+                        if upload is not None
+                    )
+                self._schedule_upload_cleanup(interrupted_uploads)
+                self.drain_cleanup(tenant_id=tenant_id, limit=5_000)
+                raise
             if failures:
-                for upload in successful:
-                    self._schedule_cleanup(upload.all_references)
+                self._schedule_upload_cleanup(successful)
                 self.drain_cleanup(tenant_id=tenant_id, limit=5_000)
                 raise failures[0]
             statuses: list[str | None] = [None] * len(candidates)
@@ -1155,10 +1249,19 @@ class CanonicalLogicalEvidenceProjector:
                           AND document.is_current
                           AND document.deleted_at IS NULL
                           AND NOT (
-                              jsonb_path_query_array(
-                                  event.canonical_redacted,
-                                  '$.**.type ? (@.type() == "string")'
-                              ) ?| %s::text[]
+                              ARRAY[
+                                  event.canonical_redacted->>'type',
+                                  event.canonical_redacted
+                                      #>> '{content,type}',
+                                  event.canonical_redacted
+                                      #>> '{content,message,type}',
+                                  event.canonical_redacted
+                                      #>> '{content,payload,type}',
+                                  event.canonical_redacted
+                                      #>> '{message,type}',
+                                  event.canonical_redacted
+                                      #>> '{payload,type}'
+                              ] && %s::text[]
                           )
                         GROUP BY evidence.tenant_id,evidence.source_id,
                                  evidence.logical_document_id,evidence.revision
