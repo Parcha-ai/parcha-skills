@@ -62,3 +62,19 @@ PYTHONPATH=recall python -m evals.agentic_truth score \
 The result contains aggregate Boundary Recall@20, Boundary MRR, pointer integrity,
 authorization violations, backend errors, and latency only. Per-question rankings, questions,
 facts, receipts, source bodies, and traces are never copied into Git output.
+
+## Logical corpus reconstruction
+
+The logical-corpus audit deterministically samples across every source and
+document-size quartile. It recomputes each sample from current canonical rows
+through the production projector, reads every persisted S3 part, validates the
+manifest and record contracts, and compares exact encoded-byte digests. Its
+stdout is aggregate-only.
+
+```bash
+PYTHONPATH=recall:recall/server python -m evals.logical_corpus_audit \
+  --tenant tenant:company:example \
+  --sample-size 200 \
+  --concurrency 8 \
+  --repo-root "$(git rev-parse --show-toplevel)"
+```
