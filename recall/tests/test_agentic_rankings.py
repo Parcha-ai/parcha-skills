@@ -42,7 +42,18 @@ class AgenticRankingsTest(unittest.TestCase):
                     }
                 }
             ),
-            "RetrievalDeadlineExceeded",
+            "RetrievalLexicalDeadlineExceeded",
+        )
+        self.assertEqual(
+            _retrieval_error(
+                {
+                    "diagnostics": {
+                        "lexical_mode": "strict",
+                        "semantic_status": "deadline-exceeded",
+                    }
+                }
+            ),
+            "RetrievalSemanticDeadlineExceeded",
         )
         self.assertEqual(
             _retrieval_error(

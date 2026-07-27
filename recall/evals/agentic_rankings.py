@@ -203,9 +203,9 @@ def _retrieval_error(response: Any) -> str:
     if not isinstance(diagnostics, dict):
         return ""
     if diagnostics.get("lexical_mode") == "deadline-exceeded":
-        return "RetrievalDeadlineExceeded"
+        return "RetrievalLexicalDeadlineExceeded"
     if diagnostics.get("semantic_status") == "deadline-exceeded":
-        return "RetrievalDeadlineExceeded"
+        return "RetrievalSemanticDeadlineExceeded"
     if diagnostics.get("semantic_status") == "unavailable":
         return "RetrievalBackendUnavailable"
     return ""
