@@ -57,6 +57,11 @@ FROM (VALUES
   ('canonical_documents','tenant_id,source_id,document_id'),
   ('canonical_chunks','tenant_id,source_id,chunk_id'),
   ('canonical_chunk_embeddings','tenant_id,source_id,chunk_id'),
+  ('canonical_evidence_objects','tenant_id,source_id,document_id'),
+  ('canonical_evidence_documents','tenant_id,source_id,logical_document_id'),
+  ('canonical_evidence_document_parts','tenant_id,source_id,logical_document_id,part_ordinal'),
+  ('canonical_evidence_document_queue','tenant_id,source_id,native_parent_id'),
+  ('canonical_evidence_cleanup_queue','tenant_id,source_id,artifact_id'),
   ('receipt_redirects','tenant_id,old_receipt'),
   ('forget_tombstones','tenant_id,source_id,target_identity_sha256'),
   ('canonical_audit_events','tenant_id,source_id,audit_id')
@@ -81,6 +86,9 @@ approved = {
     "connector_installations", "oauth_sessions", "control_audit_events",
     "canonical_events", "canonical_documents", "canonical_chunks",
     "canonical_chunk_embeddings",
+    "canonical_evidence_objects",
+    "canonical_evidence_documents", "canonical_evidence_document_parts",
+    "canonical_evidence_document_queue", "canonical_evidence_cleanup_queue",
     "receipt_redirects", "forget_tombstones", "canonical_audit_events",
 }
 rows = []

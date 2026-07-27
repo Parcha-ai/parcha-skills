@@ -25,7 +25,12 @@ from .evidence_projection import (
     CanonicalEvidenceProjector,
     EvidenceProjectionStore,
 )
-from .evidence_worker import run_canonical_evidence_worker
+from .evidence_worker import (
+    run_canonical_evidence_worker,
+    run_logical_evidence_worker,
+)
+from .logical_evidence import LogicalEvidenceProjectionStore
+from .logical_evidence_projection import CanonicalLogicalEvidenceProjector
 from .federation import QUALITY_SCORES, SOURCE_FAMILIES
 from .live_providers import (
     LiveProviderError,
@@ -126,6 +131,24 @@ def main() -> None:
         "--interval-seconds", type=float, default=5
     )
     canonical_evidence_worker.add_argument("--once", action="store_true")
+    logical_evidence = sub.add_parser("backfill-logical-evidence")
+    logical_evidence.add_argument("--tenant", required=True)
+    logical_evidence.add_argument("--batch-size", type=int, default=25)
+    logical_evidence.add_argument("--max-batches", type=int, default=10)
+    logical_evidence.add_argument("--upload-concurrency", type=int, default=2)
+    logical_evidence_worker = sub.add_parser("logical-evidence-worker")
+    logical_evidence_worker.add_argument("--tenant", required=True)
+    logical_evidence_worker.add_argument("--batch-size", type=int, default=25)
+    logical_evidence_worker.add_argument(
+        "--max-batches-per-cycle", type=int, default=10
+    )
+    logical_evidence_worker.add_argument(
+        "--upload-concurrency", type=int, default=2
+    )
+    logical_evidence_worker.add_argument(
+        "--interval-seconds", type=float, default=5
+    )
+    logical_evidence_worker.add_argument("--once", action="store_true")
     sub.add_parser("export")
     conformance = sub.add_parser("mcp-conformance")
     conformance.add_argument("--config", type=Path, required=True)
@@ -466,6 +489,36 @@ def main() -> None:
                 tenant_id=args.tenant,
                 batch_size=args.batch_size,
                 max_batches_per_cycle=args.max_batches_per_cycle,
+                interval_seconds=args.interval_seconds,
+                once=args.once,
+            )
+        print(json.dumps(result, sort_keys=True))
+    elif args.command in {
+        "backfill-logical-evidence",
+        "logical-evidence-worker",
+    }:
+        projector = CanonicalLogicalEvidenceProjector(
+            store,
+            LogicalEvidenceProjectionStore(build_evidence_archive_store()),
+            bound_tenant_id=args.tenant,
+            raw_archive=build_archive_store(),
+        )
+        if args.command == "backfill-logical-evidence":
+            seeded = projector.seed_backfill(tenant_id=args.tenant)
+            result = projector.project_pending(
+                tenant_id=args.tenant,
+                batch_size=args.batch_size,
+                max_batches=args.max_batches,
+                upload_concurrency=args.upload_concurrency,
+            )
+            result = {"seeded": seeded, **result}
+        else:
+            result = run_logical_evidence_worker(
+                projector,
+                tenant_id=args.tenant,
+                batch_size=args.batch_size,
+                max_batches_per_cycle=args.max_batches_per_cycle,
+                upload_concurrency=args.upload_concurrency,
                 interval_seconds=args.interval_seconds,
                 once=args.once,
             )

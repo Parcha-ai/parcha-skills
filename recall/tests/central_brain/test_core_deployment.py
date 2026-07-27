@@ -200,6 +200,10 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
             "forget_tombstones",
             "canonical_audit_events",
             "canonical_evidence_objects",
+            "canonical_evidence_documents",
+            "canonical_evidence_document_parts",
+            "canonical_evidence_document_queue",
+            "canonical_evidence_cleanup_queue",
         ):
             self.assertIn(f"('{table}')", lowered)
         for provider in ("planetscale", "render", "supabase", "neon"):

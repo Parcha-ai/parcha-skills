@@ -64,7 +64,7 @@ infrastructure. The example is synthetic; a live manifest belongs in a private m
 location and contains references, never credential values.
 
 The production database gate requires a standard PostgreSQL URL with
-`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 38,
+`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 39,
 pgvector 0.8.0 or newer, and a runtime role without superuser, database/role creation,
 replication, or RLS-bypass privilege:
 
@@ -215,6 +215,32 @@ python -m recall_server.cli backfill-canonical-evidence \
 python -m recall_server.cli canonical-evidence-worker \
   --tenant tenant:company:example
 ```
+
+The source-native evidence projection stores one logical session, thread, or
+document revision rather than one object per retrieval chunk. Each JSONL record
+contains the complete privacy-processed source content, structural role and
+time metadata, and every canonical receipt for that source record. Documents
+larger than one object are represented by ordered immutable parts behind one
+opaque manifest. Oversized collector records are restored from the separately
+credentialed raw archive and verified against their declared size and digest
+before projection.
+
+Migration 39 adds the logical-document catalog, dirty-session queue, and
+durable object-cleanup queue. Populate it without removing the prior projection:
+
+```bash
+python -m recall_server.cli backfill-logical-evidence \
+  --tenant tenant:company:example --batch-size 100 --max-batches 100 \
+  --upload-concurrency 2
+python -m recall_server.cli logical-evidence-worker \
+  --tenant tenant:company:example --upload-concurrency 2
+```
+
+Ingest and forget transactions enqueue only affected logical documents.
+Revision replacement queues superseded S3 references in the same database
+transaction; transient delete failures remain durable and are retried by the
+worker. Keep the prior `canonical-evidence-worker` running until the
+logical-document integrity, rollback, and consumer cutover gates pass.
 
 `recall_deep_search` first uses canonical retrieval to select authorized
 candidates, passes only opaque evidence keys and exact allowed receipts to a

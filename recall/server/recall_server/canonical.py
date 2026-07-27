@@ -10,6 +10,7 @@ from urllib.parse import unquote, urlsplit
 from contracts.v2 import ContractError, IDENTITY_RE, validate_contract
 
 from .db import BrainStore
+from .logical_evidence_projection import mark_logical_evidence_dirty
 from .projectors import validate_envelope
 
 MAX_CANONICAL_TEXT_BYTES = 8_000_000
@@ -526,6 +527,13 @@ class CanonicalPlane:
                                 for ordinal, chunk_text in enumerate(chunk_texts)
                             ],
                         )
+                mark_logical_evidence_dirty(
+                    conn,
+                    tenant_id=tenant_id,
+                    source_id=source_id,
+                    native_ids=affected_native_ids,
+                    reason="ingest",
+                )
                 conn.execute(
                     """INSERT INTO canonical_audit_events(
                            tenant_id,source_id,audit_id,operation,status,
@@ -1025,6 +1033,15 @@ class CanonicalPlane:
                             json.dumps(chunk_rows),
                         ),
                     )
+                    mark_logical_evidence_dirty(
+                        connection,
+                        tenant_id=tenant_id,
+                        source_id=source_id,
+                        native_ids=[
+                            item["native_id"] for item in live_rows
+                        ],
+                        reason="ingest",
+                    )
                     audit_rows = [
                         {
                             "audit_id": _opaque(
@@ -1259,6 +1276,13 @@ class CanonicalPlane:
                                AND NOT (retained.native_id=ANY(%s))
                          )""",
                     (tenant_id, source_id, native_ids, native_ids),
+                )
+                mark_logical_evidence_dirty(
+                    conn,
+                    tenant_id=tenant_id,
+                    source_id=source_id,
+                    native_ids=native_ids,
+                    reason="forget",
                 )
 
         evidence_deleted = 0
