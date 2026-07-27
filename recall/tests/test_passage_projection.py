@@ -459,6 +459,17 @@ class PassageProjectionTests(unittest.TestCase):
         )
         self.assertNotIn("prepare_pool(concurrency)", source)
 
+    def test_backfill_is_idempotent_and_avoids_large_head_of_line_blocking(
+        self,
+    ) -> None:
+        seed = inspect.getsource(CanonicalPassageProjector.seed_backfill)
+        pending = inspect.getsource(CanonicalPassageProjector._pending)
+
+        self.assertIn("ON CONFLICT(tenant_id,source_id,logical_document_id)", seed)
+        self.assertIn("DO NOTHING", seed)
+        self.assertNotIn("generation+1", seed)
+        self.assertIn("sum(size_part.size_bytes)", pending)
+
     def test_worker_projects_then_embeds_in_one_bounded_cycle(self) -> None:
         class Projector:
             def __init__(self) -> None:

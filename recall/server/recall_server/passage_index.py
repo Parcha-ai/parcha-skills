@@ -123,15 +123,10 @@ class CanonicalPassageProjector:
                           =evidence.logical_document_id
                       AND projected.revision=evidence.revision
                       AND projected.policy_fingerprint=%s
-                    WHERE (%s::text IS NULL OR evidence.tenant_id=%s)
+                   WHERE (%s::text IS NULL OR evidence.tenant_id=%s)
                       AND projected.logical_document_id IS NULL
                    ON CONFLICT(tenant_id,source_id,logical_document_id)
-                   DO UPDATE SET
-                       revision=excluded.revision,
-                       generation=
-                           canonical_passage_projection_queue.generation+1,
-                       reason='backfill',
-                       changed_at=clock_timestamp()""",
+                   DO NOTHING""",
                 (self.policy.fingerprint, tenant_id, tenant_id),
             )
         return max(0, result.rowcount)
@@ -170,9 +165,25 @@ class CanonicalPassageProjector:
                      FROM (
                            SELECT *
                              FROM canonical_passage_projection_queue
-                            WHERE (%s::text IS NULL OR tenant_id=%s)
-                            ORDER BY changed_at,tenant_id,source_id,
-                                     logical_document_id
+                                  candidate_queue
+                            WHERE (%s::text IS NULL
+                                   OR candidate_queue.tenant_id=%s)
+                            ORDER BY (
+                                SELECT coalesce(sum(size_part.size_bytes),0)
+                                  FROM canonical_evidence_document_parts
+                                       size_part
+                                 WHERE size_part.tenant_id=
+                                           candidate_queue.tenant_id
+                                   AND size_part.source_id=
+                                           candidate_queue.source_id
+                                   AND size_part.logical_document_id=
+                                           candidate_queue.logical_document_id
+                                   AND size_part.revision=
+                                           candidate_queue.revision
+                            ),candidate_queue.changed_at,
+                              candidate_queue.tenant_id,
+                              candidate_queue.source_id,
+                              candidate_queue.logical_document_id
                             LIMIT %s
                      ) queue
                      JOIN canonical_evidence_documents evidence
