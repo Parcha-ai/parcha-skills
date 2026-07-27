@@ -1,11 +1,19 @@
 from __future__ import annotations
 
-import unittest
 import inspect
+import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
 from recall_server import SCHEMA_VERSION
+from recall_server.logical_evidence import LogicalEvidenceRecord
+from recall_server.logical_evidence_projection import (
+    CanonicalLogicalEvidenceProjector,
+)
+from recall_server.passage_index import (
+    CanonicalPassageProjector,
+    PassageCandidate,
+)
 from recall_server.passage_projection import (
     MAX_PASSAGE_TOKEN_BYTES,
     PASSAGE_CONTRACT,
@@ -16,16 +24,11 @@ from recall_server.passage_projection import (
     reconstruct_passage,
     visible_messages,
 )
-from recall_server.logical_evidence import LogicalEvidenceRecord
-from recall_server.logical_evidence_projection import (
-    CanonicalLogicalEvidenceProjector,
-)
-from recall_server.passage_index import (
-    CanonicalPassageProjector,
-    PassageCandidate,
+from recall_server.passage_retrieval import (
+    PassageHintRetrieval,
+    collapse_document_candidates,
 )
 from recall_server.passage_worker import run_passage_worker
-from recall_server.passage_retrieval import collapse_document_candidates
 
 
 class PassageProjectionTests(unittest.TestCase):
@@ -464,6 +467,21 @@ class PassageProjectionTests(unittest.TestCase):
         self.assertNotIn("prepare_pool(concurrency)", source)
         self.assertIn("self.store.pool_max_size - 1", source)
         self.assertIn("PASSAGE_COMMIT_WORKERS", source)
+
+    def test_dense_temporal_candidates_are_oversampled_before_filtering(
+        self,
+    ) -> None:
+        source = inspect.getsource(PassageHintRetrieval.search)
+        nearest = source.split("WITH nearest AS MATERIALIZED", 1)[1]
+        nearest = nearest.split("LIMIT %s", 1)[0]
+
+        self.assertIn(
+            "dense_oversample = 50 if temporal_scope else 5",
+            source,
+        )
+        self.assertNotIn("canonical_passages", nearest)
+        self.assertIn("passage.last_occurred_at>=%s", source)
+        self.assertIn("passage.first_occurred_at<=%s", source)
 
     def test_backfill_is_idempotent_and_avoids_large_head_of_line_blocking(
         self,

@@ -254,6 +254,8 @@ class PassageHintRetrieval:
                     if bounded is not None
                     else runtime.embed_query(query)
                 )
+                temporal_scope = since is not None or until is not None
+                dense_oversample = 50 if temporal_scope else 5
                 with self.store.connect() as connection:
                     dense = self.store._execute_bounded(
                         connection,
@@ -312,7 +314,7 @@ class PassageHintRetrieval:
                             self.sources,
                             runtime.passage_fingerprint,
                             vector,
-                            candidate_limit * 5,
+                            candidate_limit * dense_oversample,
                             self.policy_fingerprint,
                             since,
                             since,
