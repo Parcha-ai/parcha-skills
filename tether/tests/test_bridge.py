@@ -345,6 +345,57 @@ class StoreTest(unittest.TestCase):
             "ok": True, "team_id": "T12345678", "user_id": "U12345678", "user": "agent",
         })
 
+    def test_group_dm_opens_inside_broker_and_creates_resumable_bridge(self):
+        broker = self.runtime.Broker("test-token", self.store)
+        request = {
+            "op": "dm_notify",
+            "text": "Welcome",
+            "source_kind": "headless_run",
+            "source": {"run_id": "onboarding-1", "cwd": "/tmp/project"},
+            "user_ids": ["U12345678", "U87654321"],
+            "idempotency_key": "onboarding-1",
+        }
+        with mock.patch.dict(
+            os.environ,
+            {"SLACK_ALLOWED_USERS": "U12345678,U87654321"},
+            clear=False,
+        ), mock.patch.object(self.runtime, "_slack_call", side_effect=[
+            {"ok": True, "channel": {"id": "C12345678"}},
+            {"ok": True, "team_id": "T12345678", "user_id": "U11111111", "user": "agent"},
+        ]) as call, mock.patch.object(
+            self.runtime, "slack_post", return_value="123.456",
+        ) as post:
+            result = broker.handle(request)
+        self.assertEqual(call.call_args_list[0], mock.call(
+            "test-token",
+            "conversations.open",
+            {"users": "U12345678,U87654321", "return_im": True},
+        ))
+        self.assertEqual(len(call.call_args_list), 2)
+        post.assert_called_once()
+        bridge = self.store.get(result["bridge_id"])
+        self.assertEqual(bridge.channel_id, "C12345678")
+        self.assertEqual(bridge.team_id, "T12345678")
+        self.assertEqual(bridge.owner_user_id, "*")
+
+    def test_group_dm_rejects_non_allowlisted_recipients_before_slack(self):
+        broker = self.runtime.Broker("test-token", self.store)
+        with mock.patch.dict(
+            os.environ,
+            {"SLACK_ALLOWED_USERS": "U12345678"},
+            clear=False,
+        ), mock.patch.object(self.runtime, "_slack_call") as call:
+            with self.assertRaisesRegex(ValueError, "explicitly allowlisted"):
+                broker.handle({
+                    "op": "dm_notify",
+                    "text": "Welcome",
+                    "source_kind": "headless_run",
+                    "source": {"run_id": "onboarding-2", "cwd": "/tmp/project"},
+                    "user_ids": ["U12345678", "U87654321"],
+                    "idempotency_key": "onboarding-2",
+                })
+        call.assert_not_called()
+
     def test_brokered_thread_post_does_not_create_a_second_bridge(self):
         broker = self.runtime.Broker("test-token", self.store)
         with mock.patch.object(broker, "_ensure_channel_membership"), mock.patch.object(
@@ -1387,6 +1438,22 @@ class PluginRoutingTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertFalse(self.plugin._allows_bot_message(adapter, event, "T12345678"))
         with mock.patch.dict(os.environ, {"TETHER_ALLOWED_BOT_USERS": "UOTHER,UPEER"}, clear=True):
+            self.assertTrue(self.plugin._allows_bot_message(adapter, event, "T12345678"))
+
+    def test_peer_bot_can_be_allowlisted_by_bot_id_when_user_is_absent(self):
+        adapter = types.SimpleNamespace(
+            _bot_user_id="ULOCAL",
+            _team_bot_user_ids={"T12345678": "ULOCAL"},
+            config=types.SimpleNamespace(extra={"allow_bots": "all"}),
+        )
+        event = {
+            "text": ":tada: New signup: person@example.com",
+            "bot_id": "BPOSTHOG",
+            "subtype": "bot_message",
+        }
+        with mock.patch.dict(
+            os.environ, {"TETHER_ALLOWED_BOT_USERS": "BPOSTHOG"}, clear=True,
+        ):
             self.assertTrue(self.plugin._allows_bot_message(adapter, event, "T12345678"))
 
     def test_trusted_peer_bot_in_bound_thread_routes_to_bound_session(self):

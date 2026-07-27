@@ -225,8 +225,13 @@ def _is_silence_control_output(value: Any) -> bool:
 
 
 def _allows_bot_message(adapter, event: dict[str, Any], team_id: str = "") -> bool:
-    user_id = str(event.get("user") or "")
-    if user_id not in _allowed_peer_bot_users():
+    event_identities = {
+        value for value in (
+            str(event.get("user") or ""),
+            str(event.get("bot_id") or ""),
+        ) if value
+    }
+    if not event_identities.intersection(_allowed_peer_bot_users()):
         return False
     mode = str(
         getattr(getattr(adapter, "config", None), "extra", {}).get("allow_bots")

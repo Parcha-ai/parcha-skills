@@ -115,6 +115,15 @@ def build_parser() -> argparse.ArgumentParser:
     notify.add_argument("--run-id")
     notify.add_argument("--hermes-session-id")
     notify.add_argument("--file")
+    dm = sub.add_parser("dm")
+    dm.add_argument("--user", action="append", required=True, dest="users")
+    dm.add_argument("--text", required=True)
+    dm.add_argument("--owner")
+    dm.add_argument("--team")
+    dm.add_argument("--idempotency-key", default="")
+    dm.add_argument("--run-id")
+    dm.add_argument("--hermes-session-id")
+    dm.add_argument("--file")
     reply = sub.add_parser("reply")
     reply.add_argument("--bridge-id", required=True)
     reply.add_argument("--reply-key")
@@ -277,6 +286,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = broker_call({
             "op": "rebind", "channel_id": args.channel,
             "thread_ts": args.thread_ts, "source_kind": kind, "source": source,
+        })
+    elif args.command == "dm":
+        kind, source = detected_source(args)
+        result = broker_call({
+            "op": "dm_notify", "text": args.text, "source_kind": kind, "source": source,
+            "owner_user_id": args.owner or "", "team_id": args.team or "",
+            "idempotency_key": args.idempotency_key or str(uuid.uuid4()),
+            "file_path": args.file, "user_ids": args.users,
         })
     elif args.command == "attach":
         kind, source = attached_source(args)
