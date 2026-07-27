@@ -189,12 +189,19 @@ class PassageProjectionTests(unittest.TestCase):
                 encoded[span.source_byte_start:span.source_byte_end].decode()
 
     def test_minified_payload_is_split_into_bounded_utf8_tokens(self) -> None:
+        class CountingText(str):
+            encode_calls = 0
+
+            def encode(self, *args, **kwargs):
+                type(self).encode_calls += 1
+                return super().encode(*args, **kwargs)
+
         message = PassageMessage(
             record_ordinal=0,
             occurred_at="2026-07-27T00:00:00Z",
             roles=("assistant",),
             receipts=("recall://source:test/minified?rev=1#item=0",),
-            text=("ñ" * 600_000),
+            text=CountingText("ñ" * 600_000),
         )
         policy = PassagePolicy(target_tokens=1024, overlap_tokens=128)
 
@@ -224,6 +231,7 @@ class PassageProjectionTests(unittest.TestCase):
             )
         }
         self.assertEqual(covered, set(range(len(message.text.encode()))))
+        self.assertEqual(CountingText.encode_calls, 2)
 
     def test_decodes_and_combines_segmented_visible_messages_only(self) -> None:
         records = (

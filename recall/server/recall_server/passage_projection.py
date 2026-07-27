@@ -154,13 +154,12 @@ def _bounded_tokens(
 
 
 def _message_tokens(
-    message: PassageMessage,
+    text: str,
+    encoded: bytes,
     message_index: int,
 ) -> Iterator[_Token]:
     """Partition every message byte into stable word-like token units."""
 
-    text = message.text
-    encoded = text.encode()
     if not encoded:
         return
     char_cursor = 0
@@ -288,17 +287,20 @@ def build_passages(
     ):
         raise ValueError("lossless passage records must be unique and ordered")
 
+    encoded_messages = tuple(message.text.encode() for message in messages)
     tokens = (
         token
-        for index, message in enumerate(messages)
-        for token in _message_tokens(message, index)
+        for index, (message, encoded) in enumerate(
+            zip(messages, encoded_messages, strict=True)
+        )
+        for token in _message_tokens(message.text, encoded, index)
     )
     passages: list[LosslessPassage] = []
     window = list(islice(tokens, policy.target_tokens))
     while window:
         spans = _spans(window, messages)
         text = PASSAGE_SEPARATOR.join(
-            messages[span.message_index].text.encode()[
+            encoded_messages[span.message_index][
                 span.source_byte_start:span.source_byte_end
             ].decode()
             for span in spans
