@@ -11,6 +11,7 @@ from contracts.v2 import ContractError, IDENTITY_RE, validate_contract
 
 from .db import BrainStore
 from .canonical_text import (
+    MAX_CANONICAL_CHUNK_BYTES,
     MAX_CANONICAL_TEXT_BYTES,
     canonical_text_chunks,
 )

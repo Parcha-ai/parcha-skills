@@ -38,3 +38,27 @@ PYTHONPATH=recall python -m evals.runner score \
 
 The runner never queries a private Brain itself. A separately authorized process produces the
 private ranking file so credentials and raw responses stay outside the evaluator and repository.
+
+## Agentic boundary truth
+
+The agentic evaluator freezes 60 owner-approved questions: 12 each for exact-document,
+bounded-timeline, source-specific, cross-source, and insufficient retrieval. It enforces a
+25/15/20 optimize/validation/test split and rejects any logical-document revision shared across
+splits. Gold facts and receipts remain in an owner-only file outside Git.
+
+```bash
+PYTHONPATH=recall python -m evals.agentic_truth validate \
+  --input "$RECALL_PRIVATE_EVAL_DIR/truth.jsonl" \
+  --repo-root "$(git rev-parse --show-toplevel)"
+
+PYTHONPATH=recall python -m evals.agentic_truth score \
+  --truth "$RECALL_PRIVATE_EVAL_DIR/truth.jsonl" \
+  --results "$RECALL_PRIVATE_EVAL_DIR/boundaries.jsonl" \
+  --output "$RECALL_PRIVATE_EVAL_DIR/aggregate.json" \
+  --run-id frozen-baseline-1 \
+  --repo-root "$(git rev-parse --show-toplevel)"
+```
+
+The result contains aggregate Boundary Recall@20, Boundary MRR, pointer integrity,
+authorization violations, backend errors, and latency only. Per-question rankings, questions,
+facts, receipts, source bodies, and traces are never copied into Git output.
