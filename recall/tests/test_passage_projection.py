@@ -7,6 +7,8 @@ from pathlib import Path
 
 from recall_server import SCHEMA_VERSION
 from recall_server.passage_projection import (
+    MAX_PASSAGE_TOKEN_BYTES,
+    PASSAGE_CONTRACT,
     PassageMessage,
     PassagePolicy,
     build_passages,
@@ -185,6 +187,43 @@ class PassageProjectionTests(unittest.TestCase):
             for span in passage.spans:
                 encoded = message.text.encode()
                 encoded[span.source_byte_start:span.source_byte_end].decode()
+
+    def test_minified_payload_is_split_into_bounded_utf8_tokens(self) -> None:
+        message = PassageMessage(
+            record_ordinal=0,
+            occurred_at="2026-07-27T00:00:00Z",
+            roles=("assistant",),
+            receipts=("recall://source:test/minified?rev=1#item=0",),
+            text=("ñ" * 600_000),
+        )
+        policy = PassagePolicy(target_tokens=1024, overlap_tokens=128)
+
+        passages = build_passages(
+            tenant_id="tenant:company:test",
+            source_id="source:test",
+            logical_document_id="ldoc_0123456789abcdef0123456789abcdef",
+            revision=1,
+            messages=(message,),
+            policy=policy,
+        )
+
+        self.assertEqual(PASSAGE_CONTRACT.rsplit(".", 1)[-1], "v2")
+        self.assertGreater(len(passages), 1)
+        self.assertTrue(all(
+            len(passage.text.encode())
+            <= policy.target_tokens * MAX_PASSAGE_TOKEN_BYTES
+            for passage in passages
+        ))
+        covered = {
+            byte
+            for passage in passages
+            for span in passage.spans
+            for byte in range(
+                span.source_byte_start,
+                span.source_byte_end,
+            )
+        }
+        self.assertEqual(covered, set(range(len(message.text.encode()))))
 
     def test_decodes_and_combines_segmented_visible_messages_only(self) -> None:
         records = (

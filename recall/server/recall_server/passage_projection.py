@@ -13,8 +13,9 @@ import orjson
 from .logical_evidence import LogicalEvidenceError, LogicalEvidenceRecord
 
 
-PASSAGE_CONTRACT = "recall.lossless-message-passage.v1"
+PASSAGE_CONTRACT = "recall.lossless-message-passage.v2"
 PASSAGE_SEPARATOR = "\n"
+MAX_PASSAGE_TOKEN_BYTES = 64
 VISIBLE_DENSE_ROLES = frozenset({"user", "assistant"})
 IDENTITY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._/@+=-]{0,511}\Z")
 LOGICAL_DOCUMENT_ID_RE = re.compile(r"ldoc_[0-9a-f]{32}\Z")
@@ -136,16 +137,33 @@ def _message_tokens(message: PassageMessage, message_index: int) -> list[_Token]
 
     text = message.text
     encoded = text.encode()
-    matches = list(TOKEN_RE.finditer(text))
-    if not matches:
-        return [_Token(message_index, 0, len(encoded))]
-    char_ends = [match.end() for match in matches]
-    byte_ends = [len(text[:end].encode()) for end in char_ends]
-    byte_ends[-1] = len(encoded)
+    if not encoded:
+        return []
+    byte_ends: list[int] = []
+    char_cursor = 0
+    byte_cursor = 0
+    for match in TOKEN_RE.finditer(text):
+        byte_cursor += len(text[char_cursor:match.end()].encode())
+        byte_ends.append(byte_cursor)
+        char_cursor = match.end()
+    if not byte_ends:
+        byte_ends.append(len(encoded))
+    else:
+        byte_ends[-1] = len(encoded)
     tokens: list[_Token] = []
     start = 0
     for end in byte_ends:
-        tokens.append(_Token(message_index, start, end))
+        while start < end:
+            bounded_end = min(end, start + MAX_PASSAGE_TOKEN_BYTES)
+            while (
+                bounded_end < end
+                and encoded[bounded_end] & 0b1100_0000 == 0b1000_0000
+            ):
+                bounded_end -= 1
+            if bounded_end <= start:
+                raise ValueError("passage token contains invalid UTF-8")
+            tokens.append(_Token(message_index, start, bounded_end))
+            start = bounded_end
         start = end
     return tokens
 
