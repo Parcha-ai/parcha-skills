@@ -20,6 +20,13 @@ STRATA = (
     "cross-source",
     "insufficient",
 )
+INTENTS = (
+    "project-status",
+    "decision-rationale",
+    "change-history",
+    "incident-root-cause",
+    "ownership-next-step",
+)
 
 
 def private_directory(root: Path) -> Path:
@@ -86,6 +93,7 @@ def truth_cases() -> list[dict]:
                     "id": f"case_{case_ordinal:032x}",
                     "split": split,
                     "stratum": stratum,
+                    "intent": INTENTS[case_ordinal % len(INTENTS)],
                     "question": (
                         f"What happened in synthetic boundary {case_ordinal}?"
                     ),
@@ -117,6 +125,9 @@ class AgenticTruthSetTest(unittest.TestCase):
         })
         self.assertEqual(receipt["stratum_counts"], {
             stratum: 12 for stratum in sorted(STRATA)
+        })
+        self.assertEqual(receipt["intent_counts"], {
+            intent: 12 for intent in sorted(INTENTS)
         })
         self.assertEqual(receipt["answerable_cases"], 48)
         self.assertEqual(receipt["insufficient_cases"], 12)
@@ -189,6 +200,43 @@ class AgenticTruthSetTest(unittest.TestCase):
             with self.assertRaisesRegex(EvaluationInputError, "gold receipt"):
                 validate_truth_set(truth)
 
+    def test_rejects_prompt_shaped_questions_and_raw_fact_payloads(self) -> None:
+        rows = truth_cases()
+        rows[0]["question"] = "Read this first:\n" + ("x" * 241)
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = private_directory(Path(temporary))
+            truth = directory / "truth.jsonl"
+            private_write(truth, rows)
+            with self.assertRaisesRegex(
+                EvaluationInputError,
+                "question is invalid",
+            ):
+                validate_truth_set(truth)
+
+        rows = truth_cases()
+        rows[0]["gold_facts"][0]["description"] = (
+            '{"checklist":[{"verdict":"pass"}]}'
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = private_directory(Path(temporary))
+            truth = directory / "truth.jsonl"
+            private_write(truth, rows)
+            with self.assertRaisesRegex(EvaluationInputError, "gold receipt"):
+                validate_truth_set(truth)
+
+    def test_rejects_unbalanced_employee_intents(self) -> None:
+        rows = truth_cases()
+        rows[0]["intent"] = rows[1]["intent"]
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = private_directory(Path(temporary))
+            truth = directory / "truth.jsonl"
+            private_write(truth, rows)
+            with self.assertRaisesRegex(
+                EvaluationInputError,
+                "intent counts are invalid",
+            ):
+                validate_truth_set(truth)
+
     def test_builds_private_static_owner_review_packet_from_pending_truth(
         self,
     ) -> None:
@@ -216,10 +264,23 @@ class AgenticTruthSetTest(unittest.TestCase):
             self.assertEqual(receipt["owner_pending_cases"], 60)
             self.assertEqual(packet.stat().st_mode & 0o777, 0o600)
             self.assertEqual(rendered.count("<article>"), 60)
+            self.assertEqual(rendered.count('class="review-check"'), 60)
             self.assertIn(
                 "What happened in synthetic boundary 0?",
                 rendered,
             )
+            self.assertIn("Expected answer", rendered)
+            self.assertIn(
+                "Technical evidence IDs and receipts",
+                rendered,
+            )
+            first_question = rendered.index(
+                "What happened in synthetic boundary 0?"
+            )
+            first_receipt = rendered.index(
+                "recall://synthetic:source:0/record-0"
+            )
+            self.assertLess(first_question, first_receipt)
             self.assertNotIn("<script", rendered)
 
     def test_scores_boundary_recall_mrr_pointer_and_authorization(self) -> None:

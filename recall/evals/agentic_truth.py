@@ -25,7 +25,7 @@ from .retrieval import EvaluationInputError, receipt_source
 from .runner import git_dirty, git_sha
 
 
-SCHEMA_VERSION = "recall.agentic-retrieval-truth.v1"
+SCHEMA_VERSION = "recall.agentic-retrieval-truth.v2"
 SPLIT_COUNTS = {
     "optimize": 25,
     "validation": 15,
@@ -43,10 +43,18 @@ STRATA = (
     "cross-source",
     "insufficient",
 )
+INTENTS = (
+    "project-status",
+    "decision-rationale",
+    "change-history",
+    "incident-root-cause",
+    "ownership-next-step",
+)
 CASE_FIELDS = {
     "id",
     "split",
     "stratum",
+    "intent",
     "question",
     "answerability",
     "gold_boundaries",
@@ -74,6 +82,10 @@ CANDIDATE_FIELDS = {
 CASE_ID_RE = re.compile(r"^case_[0-9a-f]{32}$")
 FACT_ID_RE = re.compile(r"^fact_[0-9a-f]{32}$")
 DOCUMENT_ID_RE = re.compile(r"^ldoc_[0-9a-f]{32}$")
+ABSOLUTE_PATH_RE = re.compile(r"(?:^|\s)(?:/(?:home|tmp|Users|var|opt|etc)/|[A-Za-z]:\\)")
+QUESTION_MAX_CHARS = 240
+FACT_MAX_CHARS = 600
+MAX_FACTS_PER_CASE = 5
 
 
 def _timestamp(value: Any) -> datetime:
@@ -142,6 +154,7 @@ def _validate_cases(
     boundary_splits: dict[tuple[str, str, int], str] = {}
     split_counts: Counter[str] = Counter()
     stratum_counts: Counter[str] = Counter()
+    intent_counts: Counter[str] = Counter()
     matrix: Counter[tuple[str, str]] = Counter()
     answerable_cases = 0
     insufficient_cases = 0
@@ -158,6 +171,7 @@ def _validate_cases(
         question = case["question"]
         split = case["split"]
         stratum = case["stratum"]
+        intent = case["intent"]
         if (
             not isinstance(case_id, str)
             or CASE_ID_RE.fullmatch(case_id) is None
@@ -167,8 +181,11 @@ def _validate_cases(
         ids.add(case_id)
         if (
             not isinstance(question, str)
-            or not question.strip()
-            or len(question.encode()) > 32_768
+            or not question
+            or question != question.strip()
+            or any(character in question for character in "\r\n")
+            or len(question) > QUESTION_MAX_CHARS
+            or ABSOLUTE_PATH_RE.search(question) is not None
         ):
             raise EvaluationInputError("agentic truth question is invalid")
         question_digest = hashlib.sha256(
@@ -177,10 +194,13 @@ def _validate_cases(
         if question_digest in questions:
             raise EvaluationInputError("agentic truth questions must be unique")
         questions.add(question_digest)
-        if split not in SPLIT_COUNTS or stratum not in STRATA:
-            raise EvaluationInputError("agentic truth split or stratum is invalid")
+        if split not in SPLIT_COUNTS or stratum not in STRATA or intent not in INTENTS:
+            raise EvaluationInputError(
+                "agentic truth split, stratum, or intent is invalid"
+            )
         split_counts[split] += 1
         stratum_counts[stratum] += 1
+        intent_counts[intent] += 1
         matrix[(stratum, split)] += 1
 
         review = case["owner_review"]
@@ -204,7 +224,11 @@ def _validate_cases(
         if not isinstance(boundaries, list) or not isinstance(facts, list):
             raise EvaluationInputError("agentic truth gold evidence is invalid")
         if case["answerability"] == "answerable":
-            if not boundaries or not facts or stratum == "insufficient":
+            if (
+                not boundaries
+                or not 1 <= len(facts) <= MAX_FACTS_PER_CASE
+                or stratum == "insufficient"
+            ):
                 raise EvaluationInputError("answerable case requires gold evidence")
             answerable_cases += 1
         elif case["answerability"] == "insufficient":
@@ -245,8 +269,11 @@ def _validate_cases(
                 or FACT_ID_RE.fullmatch(fact["id"]) is None
                 or fact["id"] in fact_ids
                 or not isinstance(fact["description"], str)
-                or not fact["description"].strip()
-                or len(fact["description"].encode()) > 32_768
+                or not fact["description"]
+                or fact["description"] != fact["description"].strip()
+                or any(character in fact["description"] for character in "\r\n")
+                or len(fact["description"]) > FACT_MAX_CHARS
+                or fact["description"].startswith(("{", "[", "```"))
                 or not isinstance(fact["receipts"], list)
                 or not fact["receipts"]
                 or any(
@@ -265,6 +292,8 @@ def _validate_cases(
         raise EvaluationInputError("agentic truth split counts are invalid")
     if dict(stratum_counts) != {stratum: 12 for stratum in STRATA}:
         raise EvaluationInputError("agentic truth stratum counts are invalid")
+    if dict(intent_counts) != {intent: 12 for intent in INTENTS}:
+        raise EvaluationInputError("agentic truth intent counts are invalid")
     if any(
         matrix[(stratum, split)] != expected
         for stratum in STRATA
@@ -275,6 +304,7 @@ def _validate_cases(
         "case_count": len(cases),
         "split_counts": dict(sorted(split_counts.items())),
         "stratum_counts": dict(sorted(stratum_counts.items())),
+        "intent_counts": dict(sorted(intent_counts.items())),
         "answerable_cases": answerable_cases,
         "insufficient_cases": insufficient_cases,
         "owner_approved_cases": approved_cases,
@@ -330,33 +360,108 @@ def build_owner_review_packet(
         )
     cases, payload = _load_jsonl(source)
     receipt = _validate_cases(cases, require_owner_approval=False)
-    articles = "\n".join(
-        (
+    def render_case(ordinal: int, case: dict[str, Any]) -> str:
+        if case["gold_facts"]:
+            facts = "".join(
+                f"<li>{html.escape(fact['description'])}</li>"
+                for fact in case["gold_facts"]
+            )
+            expected = f"<ol>{facts}</ol>"
+        else:
+            expected = (
+                "<p><b>Expected behavior:</b> say there is not enough "
+                "evidence to answer confidently.</p>"
+            )
+        boundaries = "".join(
+            "<li>"
+            f"{html.escape(boundary['source_id'])} · "
+            f"{html.escape(boundary['first_occurred_at'])} → "
+            f"{html.escape(boundary['last_occurred_at'])}"
+            "</li>"
+            for boundary in case["gold_boundaries"]
+        )
+        source_summary = (
+            f"<ul>{boundaries}</ul>"
+            if boundaries
+            else "<p>No gold source by design.</p>"
+        )
+        technical = {
+            "id": case["id"],
+            "owner_review": case["owner_review"],
+            "gold_boundaries": case["gold_boundaries"],
+            "gold_fact_receipts": [
+                {"id": fact["id"], "receipts": fact["receipts"]}
+                for fact in case["gold_facts"]
+            ],
+        }
+        return (
             "<article>"
-            f"<h2>{ordinal}. {html.escape(case['split'])} / "
-            f"{html.escape(case['stratum'])}</h2>"
-            f"<pre>{html.escape(json.dumps(case, indent=2, sort_keys=True))}</pre>"
+            f"<p class=\"eyebrow\">Case {ordinal} · "
+            f"{html.escape(case['intent'])} · "
+            f"{html.escape(case['stratum'])} · "
+            f"{html.escape(case['split'])}</p>"
+            f"<h2>{html.escape(case['question'])}</h2>"
+            "<h3>Expected answer</h3>"
+            f"{expected}"
+            "<h3>Where the evidence lives</h3>"
+            f"{source_summary}"
+            "<label class=\"review-check\"><input type=\"checkbox\"> "
+            "I reviewed this card (local checklist only)</label>"
+            "<details><summary>Technical evidence IDs and receipts</summary>"
+            f"<pre>{html.escape(json.dumps(technical, indent=2, sort_keys=True))}</pre>"
+            "</details>"
             "</article>"
         )
+
+    articles = "\n".join(
+        render_case(ordinal, case)
         for ordinal, case in enumerate(cases, 1)
     )
     rendered = f"""<!doctype html>
 <meta charset="utf-8">
 <title>Private Recall truth-set owner review</title>
 <style>
-body {{ font: 15px/1.5 system-ui; margin: 2rem auto; max-width: 1100px;
+body {{ font: 16px/1.55 system-ui; margin: 2rem auto; max-width: 960px;
        padding: 0 1rem; color: #17202a; }}
-article {{ border-top: 1px solid #ccd1d1; padding: 1rem 0 2rem; }}
+article {{ border: 1px solid #d5d8dc; border-radius: 12px; padding: 1.25rem;
+           margin: 1.25rem 0; }}
+article h2 {{ margin-top: .25rem; }}
+article h3 {{ margin-bottom: .25rem; }}
 pre {{ white-space: pre-wrap; overflow-wrap: anywhere; background: #f4f6f7;
        padding: 1rem; }}
 .warning {{ color: #922b21; font-weight: 700; }}
+.explainer {{ background: #eef6ff; border: 1px solid #b8d8f8;
+              border-radius: 12px; padding: 1rem 1.25rem; }}
+.action {{ background: #eef9f0; border-left: 5px solid #238636;
+           padding: .8rem 1rem; }}
+.eyebrow {{ color: #576574; font-size: .88rem; margin: 0;
+            text-transform: uppercase; letter-spacing: .03em; }}
+.review-check {{ display: block; background: #fff8dc; padding: .7rem;
+                 margin: 1rem 0; }}
+details {{ margin-top: 1rem; }}
+summary {{ cursor: pointer; font-weight: 700; }}
+code {{ background: #f4f6f7; padding: .1rem .3rem; }}
 </style>
 <h1>Private Recall truth-set owner review</h1>
 <p class="warning">Private source-derived evaluation data. Do not publish or
 serve this file outside the owner's trusted device.</p>
-<p>Review all 60 natural questions, expected evidence boundaries, facts,
-receipts, and insufficient labels. Approval must be recorded in the private
-JSONL; this packet does not modify it.</p>
+<section class="explainer">
+<h2>What is this?</h2>
+<p>This is a 60-question exam for the company brain. Each card shows a short
+question an employee might ask, the useful answer Recall should recover, and
+the source/time boundary that proves it.</p>
+<h2>What do I need from you?</h2>
+<ol>
+<li>Would a real employee ask this question?</li>
+<li>Is the expected answer correct, concise, and useful?</li>
+<li>Does the source/time look like the right evidence?</li>
+</ol>
+<p class="action">Use each checkbox as a local reading aid. To record approval,
+reply in chat with <code>approve all 60</code>, or list corrections such as
+<code>Case 7: expected answer should say …</code>. This page is read-only.</p>
+<p>You can ignore hashes, IDs, and receipts unless something looks wrong. They
+are collapsed under each card for machine verification.</p>
+</section>
 {articles}
 """
     descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
