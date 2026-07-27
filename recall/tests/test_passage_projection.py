@@ -442,6 +442,15 @@ class PassageProjectionTests(unittest.TestCase):
         self.assertNotIn("completion", source.casefold())
         self.assertNotIn("canonical_chunk_embeddings", source)
 
+    def test_projection_warms_only_bounded_database_headroom(self) -> None:
+        source = inspect.getsource(CanonicalPassageProjector.project_pending)
+
+        self.assertIn(
+            "prepare_pool(min(PASSAGE_POOL_WARM_SIZE, concurrency))",
+            source,
+        )
+        self.assertNotIn("prepare_pool(concurrency)", source)
+
     def test_worker_projects_then_embeds_in_one_bounded_cycle(self) -> None:
         class Projector:
             def __init__(self) -> None:

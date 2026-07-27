@@ -24,6 +24,7 @@ from .passage_projection import (
 
 MAX_PASSAGE_PROJECTION_BATCH = 1_000
 MAX_PASSAGE_EMBEDDING_BATCH = 5_000
+PASSAGE_POOL_WARM_SIZE = 4
 
 
 @dataclass(frozen=True)
@@ -442,7 +443,7 @@ class CanonicalPassageProjector:
             raise ValueError("passage projection budget is invalid")
         prepare_pool = getattr(self.store, "prepare_pool", None)
         if callable(prepare_pool):
-            prepare_pool(concurrency)
+            prepare_pool(min(PASSAGE_POOL_WARM_SIZE, concurrency))
         started = time.monotonic()
         documents = passages = stale = batches = 0
         while batches < max_batches:
