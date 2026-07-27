@@ -65,6 +65,10 @@ class WorkingDirectoryIdentityTest(unittest.TestCase):
 
     def test_missing_identity_requires_rebind_before_process_start(self):
         with mock.patch.object(
+            self.runtime,
+            "_resolve_executable",
+            return_value="/usr/bin/codex",
+        ), mock.patch.object(
             self.runtime.subprocess,
             "Popen",
         ) as process, self.assertRaisesRegex(
@@ -83,6 +87,10 @@ class WorkingDirectoryIdentityTest(unittest.TestCase):
         self.project.rename(self.home / "project-original")
         self.project.mkdir()
         with mock.patch.object(
+            self.runtime,
+            "_resolve_executable",
+            return_value="/usr/bin/codex",
+        ), mock.patch.object(
             self.runtime.subprocess,
             "Popen",
         ) as process, self.assertRaisesRegex(

@@ -1,3 +1,4 @@
+import contextlib
 import importlib.util
 import os
 import pathlib
@@ -202,7 +203,7 @@ class FileUploadProtocolTest(unittest.TestCase):
                 ) VALUES('brg_legacy','result','client','root_posted','/tmp/staged')
                 """
             )
-        with sqlite3.connect(legacy_path) as database:
+        with contextlib.closing(sqlite3.connect(legacy_path)) as database, database:
             database.execute(
                 "ALTER TABLE bridge_roots DROP COLUMN slack_file_id"
             )

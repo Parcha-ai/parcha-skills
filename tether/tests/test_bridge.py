@@ -1684,14 +1684,15 @@ class NativeBindingContractTest(unittest.TestCase):
     def test_null_command_resolver_selects_nested_agent_executable(self):
         proc_root = self.home / "proc"
         proc_root.mkdir()
+        broker_python = str(self.home / "usr" / "bin" / "python3")
         self._write_process(
             proc_root,
             pid=100,
             parent_pid=1,
             start_time=10_000,
-            executable="/usr/bin/python3",
+            executable=broker_python,
             argv=(
-                "/usr/bin/python3",
+                broker_python,
                 "-m",
                 "agent_observatory.broker_launch",
                 "--runtime",

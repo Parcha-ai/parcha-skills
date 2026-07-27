@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -135,7 +136,7 @@ class StoreSecurityIntegrationTest(unittest.TestCase):
         state = self.home / ".hermes"
         state.mkdir(mode=0o700)
         target = self.home / "target.db"
-        with sqlite3.connect(target) as database:
+        with contextlib.closing(sqlite3.connect(target)) as database, database:
             database.execute("PRAGMA user_version=0")
         target.chmod(0o600)
         link = state / "bridges.db"
@@ -146,14 +147,17 @@ class StoreSecurityIntegrationTest(unittest.TestCase):
         ):
             self.runtime.Store(link)
 
-        with sqlite3.connect(target) as database:
+        with contextlib.closing(sqlite3.connect(target)) as database:
             self.assertEqual(database.execute("PRAGMA user_version").fetchone()[0], 0)
 
     def test_store_tightens_owner_owned_legacy_database_before_migration(self):
         state = self.home / ".hermes"
         state.mkdir(mode=0o700)
         database_path = state / "bridges.db"
-        with sqlite3.connect(database_path) as database:
+        with (
+            contextlib.closing(sqlite3.connect(database_path)) as database,
+            database,
+        ):
             database.execute("PRAGMA user_version=0")
         database_path.chmod(0o644)
 
@@ -164,7 +168,7 @@ class StoreSecurityIntegrationTest(unittest.TestCase):
         state = self.home / ".hermes"
         state.mkdir(mode=0o700)
         database_path = state / "bridges.db"
-        with sqlite3.connect(database_path):
+        with contextlib.closing(sqlite3.connect(database_path)):
             pass
         database_path.chmod(0o600)
 

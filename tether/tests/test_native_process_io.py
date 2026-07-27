@@ -94,7 +94,8 @@ class NativeProcessIOTest(unittest.TestCase):
 
     def test_capture_does_not_wait_for_descendants_holding_pipes(self):
         process = self.start(
-            "import subprocess, sys; "
+            "import subprocess, sys, warnings; "
+            "warnings.simplefilter('ignore', ResourceWarning); "
             "subprocess.Popen([sys.executable, '-c', "
             "\"import signal,time; "
             "signal.signal(signal.SIGTERM, signal.SIG_IGN); "

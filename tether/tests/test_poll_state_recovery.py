@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.util
 import logging
 import os
@@ -198,7 +199,7 @@ class PollStateRecoveryTest(unittest.TestCase):
     def test_schema_12_adds_durable_pending_message_buffer(self):
         legacy_path = self.home / ".hermes" / "legacy-schema-12.db"
         self.runtime.Store(legacy_path)
-        with sqlite3.connect(legacy_path) as database:
+        with contextlib.closing(sqlite3.connect(legacy_path)) as database, database:
             database.execute(
                 "ALTER TABLE slack_reply_poll_state "
                 "DROP COLUMN pending_messages_json"
