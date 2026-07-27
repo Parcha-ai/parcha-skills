@@ -6,7 +6,8 @@ import hashlib
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Iterable
+from itertools import islice
+from typing import Iterable, Iterator
 
 import orjson
 
@@ -132,40 +133,58 @@ class _Token:
     byte_end: int
 
 
-def _message_tokens(message: PassageMessage, message_index: int) -> list[_Token]:
+def _bounded_tokens(
+    encoded: bytes,
+    *,
+    message_index: int,
+    start: int,
+    end: int,
+) -> Iterator[_Token]:
+    while start < end:
+        bounded_end = min(end, start + MAX_PASSAGE_TOKEN_BYTES)
+        while (
+            bounded_end < end
+            and encoded[bounded_end] & 0b1100_0000 == 0b1000_0000
+        ):
+            bounded_end -= 1
+        if bounded_end <= start:
+            raise ValueError("passage token contains invalid UTF-8")
+        yield _Token(message_index, start, bounded_end)
+        start = bounded_end
+
+
+def _message_tokens(
+    message: PassageMessage,
+    message_index: int,
+) -> Iterator[_Token]:
     """Partition every message byte into stable word-like token units."""
 
     text = message.text
     encoded = text.encode()
     if not encoded:
-        return []
-    byte_ends: list[int] = []
+        return
     char_cursor = 0
     byte_cursor = 0
+    source_start = 0
+    prior_end: int | None = None
     for match in TOKEN_RE.finditer(text):
         byte_cursor += len(text[char_cursor:match.end()].encode())
-        byte_ends.append(byte_cursor)
+        if prior_end is not None:
+            yield from _bounded_tokens(
+                encoded,
+                message_index=message_index,
+                start=source_start,
+                end=prior_end,
+            )
+            source_start = prior_end
+        prior_end = byte_cursor
         char_cursor = match.end()
-    if not byte_ends:
-        byte_ends.append(len(encoded))
-    else:
-        byte_ends[-1] = len(encoded)
-    tokens: list[_Token] = []
-    start = 0
-    for end in byte_ends:
-        while start < end:
-            bounded_end = min(end, start + MAX_PASSAGE_TOKEN_BYTES)
-            while (
-                bounded_end < end
-                and encoded[bounded_end] & 0b1100_0000 == 0b1000_0000
-            ):
-                bounded_end -= 1
-            if bounded_end <= start:
-                raise ValueError("passage token contains invalid UTF-8")
-            tokens.append(_Token(message_index, start, bounded_end))
-            start = bounded_end
-        start = end
-    return tokens
+    yield from _bounded_tokens(
+        encoded,
+        message_index=message_index,
+        start=source_start,
+        end=len(encoded),
+    )
 
 
 def _spans(tokens: list[_Token], messages: tuple[PassageMessage, ...]) -> tuple[
@@ -269,16 +288,14 @@ def build_passages(
     ):
         raise ValueError("lossless passage records must be unique and ordered")
 
-    tokens = [
+    tokens = (
         token
         for index, message in enumerate(messages)
         for token in _message_tokens(message, index)
-    ]
+    )
     passages: list[LosslessPassage] = []
-    start = 0
-    while start < len(tokens):
-        end = min(len(tokens), start + policy.target_tokens)
-        window = tokens[start:end]
+    window = list(islice(tokens, policy.target_tokens))
+    while window:
         spans = _spans(window, messages)
         text = PASSAGE_SEPARATOR.join(
             messages[span.message_index].text.encode()[
@@ -344,9 +361,20 @@ def build_passages(
                 spans=spans,
             )
         )
-        if end == len(tokens):
+        if len(window) < policy.target_tokens:
             break
-        start = end - policy.overlap_tokens
+        retained = (
+            window[-policy.overlap_tokens:]
+            if policy.overlap_tokens
+            else []
+        )
+        added = list(islice(
+            tokens,
+            policy.target_tokens - len(retained),
+        ))
+        if not added:
+            break
+        window = retained + added
     return tuple(passages)
 
 
