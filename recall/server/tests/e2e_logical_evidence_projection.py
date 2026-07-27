@@ -64,6 +64,7 @@ def insert_record(
     byte_start: int,
     raw_reference: dict[str, object] | None = None,
     canonical_content: dict[str, object] | None = None,
+    top_level_type: object | None = None,
 ) -> str:
     identity = digest(f"{tenant}\0{source}\0{native}\0{text}")
     artifact = "art_" + identity[:32]
@@ -115,7 +116,7 @@ def insert_record(
             "message": {"role": role, "text": text},
             "type": role,
         },
-        "type": role,
+        "type": role if top_level_type is None else top_level_type,
         "provenance": {"byte_start": byte_start, "byte_end": byte_start + 10},
     }
     connection.execute(
@@ -311,7 +312,23 @@ def main() -> None:
                     "full_record_available": True,
                     "full_size_bytes": len(oversized_text.encode()),
                     "full_content_sha256": digest(oversized_text),
+                    "type": {"nested": "non-role metadata"},
                 },
+            )
+            receipts["codex-housekeeping"] = insert_record(
+                connection,
+                tenant=tenant,
+                source=codex,
+                parent=codex_parent,
+                native=f"codex-record-{nonce}-housekeeping",
+                text="redundant file history " + "z" * 100_000,
+                role="assistant",
+                byte_start=30,
+                canonical_content={
+                    "type": "file-history-snapshot",
+                    "snapshot": {"entries": 1},
+                },
+                top_level_type="file-history-snapshot",
             )
         projection = LogicalEvidenceProjectionStore(archive)
         projector = CanonicalLogicalEvidenceProjector(
@@ -325,7 +342,7 @@ def main() -> None:
             tenant_id=tenant,
             batch_size=10,
             max_batches=2,
-            upload_concurrency=2,
+            upload_concurrency=1,
         )
         assert first["documents"] == 2
         assert first["records"] == 6
@@ -378,6 +395,12 @@ def main() -> None:
             ).splitlines()
         ]
         assert oversized_rows[-1]["text"] == oversized_text
+        assert projector.targets_for_receipts(
+            tenant_id=tenant,
+            source_ids=(codex,),
+            receipts=(receipts["codex-housekeeping"],),
+            limit=10,
+        ) == []
 
         with store.connect() as connection:
             receipts["claude-3"] = insert_record(

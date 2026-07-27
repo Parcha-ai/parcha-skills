@@ -62,17 +62,17 @@ def run_logical_evidence_worker(
 ) -> dict[str, int | str]:
     """Continuously materialize dirty source sessions as bounded S3 documents."""
 
-    if not 1 <= batch_size <= 250:
+    if not 1 <= batch_size <= 2_000:
         raise ValueError(
-            "logical evidence worker batch size must be between 1 and 250"
+            "logical evidence worker batch size must be between 1 and 2000"
         )
     if not 1 <= max_batches_per_cycle <= 100:
         raise ValueError(
             "logical evidence worker max batches per cycle must be between 1 and 100"
         )
-    if not 1 <= upload_concurrency <= 8:
+    if not 1 <= upload_concurrency <= 32:
         raise ValueError(
-            "logical evidence worker upload concurrency must be between 1 and 8"
+            "logical evidence worker upload concurrency must be between 1 and 32"
         )
     if not 0.1 <= interval_seconds <= 300:
         raise ValueError(

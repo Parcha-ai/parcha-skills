@@ -110,6 +110,7 @@ def main() -> None:
         )
         assert manifest["record_count"] == len(records)
         assert manifest["receipt_count"] == len(records) + 1
+        assert manifest["retention_profile"] == "lossless-v1"
         assert len(manifest["parts"]) == len(prepared.parts)
         manifest_payload = archive.read_raw(upload.manifest_reference)
         assert tenant.encode() not in manifest_payload
@@ -240,19 +241,17 @@ def main() -> None:
             "native_id": f"event:oversized:{nonce}",
             "kind": "transcript_record",
             "occurred_at": "2026-07-28T01:00:00Z",
-            "canonical_redacted": {
-                "content": {
-                    "contract": "recall.oversized-projection.v1",
-                    "full_record_available": True,
-                    "archive_encoding": "gzip",
-                    "full_size_bytes": len(full_text.encode()),
-                    "full_content_sha256": hashlib.sha256(
-                        full_text.encode()
-                    ).hexdigest(),
-                },
-                "role": "assistant",
+            "oversized_content": {
+                "contract": "recall.oversized-projection.v1",
+                "full_record_available": True,
+                "archive_encoding": "gzip",
+                "full_size_bytes": len(full_text.encode()),
+                "full_content_sha256": hashlib.sha256(
+                    full_text.encode()
+                ).hexdigest(),
             },
-            "chunk_ordinal": 1,
+            "explicit_role_values": ["assistant"],
+            "chunk_count": 2,
             **{
                 "raw_" + key: full_reference[key]
                 for key in (
@@ -281,7 +280,7 @@ def main() -> None:
         restored = list(
             projector._event_records(
                 row,
-                chunks=["bounded-head", "bounded-tail"],
+                text="bounded-headbounded-tail",
                 receipts=oversized_receipts,
                 start_ordinal=0,
             )

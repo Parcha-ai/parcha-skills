@@ -9,6 +9,8 @@ from datetime import datetime
 from typing import Any, Iterable, Protocol
 from urllib.parse import urlsplit
 
+import orjson
+
 LOGICAL_DOCUMENT_ID_RE = re.compile(r"ldoc_[0-9a-f]{32}\Z")
 EVIDENCE_ID_RE = re.compile(r"evd_[0-9a-f]{32}\Z")
 ARTIFACT_ID_RE = re.compile(r"art_[0-9a-f]{32}\Z")
@@ -27,6 +29,7 @@ MAX_DOCUMENT_RECORDS = 5_000_000
 MAX_DOCUMENT_RECEIPTS = 5_000_000
 MAX_RECORD_RECEIPTS = 512
 MIN_PART_BYTES = 1_024
+RETENTION_PROFILES = {"lossless-v1", "conversation-useful-v1"}
 
 
 class LogicalEvidenceError(ValueError):
@@ -156,30 +159,18 @@ class LogicalEvidenceRecord:
             value["content_fragment"] = self.text
         else:
             try:
-                content = json.loads(self.text)
-                canonical = json.dumps(
+                content = orjson.loads(self.text)
+                canonical = orjson.dumps(
                     content,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                    sort_keys=True,
-                    allow_nan=False,
-                )
-            except (TypeError, ValueError, json.JSONDecodeError):
+                    option=orjson.OPT_SORT_KEYS,
+                ).decode()
+            except (TypeError, ValueError, orjson.JSONDecodeError):
                 canonical = None
             if canonical == self.text:
                 value["content"] = content
             else:
                 value["text"] = self.text
-        return (
-            json.dumps(
-                value,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True,
-                allow_nan=False,
-            ).encode()
-            + b"\n"
-        )
+        return orjson.dumps(value, option=orjson.OPT_SORT_KEYS) + b"\n"
 
 
 @dataclass(frozen=True)
@@ -321,6 +312,7 @@ class LogicalEvidenceManifest:
     last_occurred_at: str
     record_count: int
     receipt_count: int
+    retention_profile: str
     parts: tuple[ManifestPart, ...]
 
     def validate(self) -> None:
@@ -342,6 +334,7 @@ class LogicalEvidenceManifest:
             or isinstance(self.receipt_count, bool)
             or not isinstance(self.receipt_count, int)
             or not 1 <= self.receipt_count <= MAX_DOCUMENT_RECEIPTS
+            or self.retention_profile not in RETENTION_PROFILES
             or not isinstance(self.parts, tuple)
             or not self.parts
         ):
@@ -369,7 +362,7 @@ class LogicalEvidenceManifest:
         self.validate()
         return json.dumps(
             {
-                "contract": "recall.logical-document-manifest.v1",
+                "contract": "recall.logical-document-manifest.v2",
                 "document_content_sha256": self.document_content_sha256,
                 "evidence_id": self.evidence_id,
                 "first_occurred_at": self.first_occurred_at,
@@ -393,8 +386,9 @@ class LogicalEvidenceManifest:
                 ],
                 "receipt_count": self.receipt_count,
                 "record_count": self.record_count,
+                "retention_profile": self.retention_profile,
                 "revision": self.revision,
-                "schema_version": 1,
+                "schema_version": 2,
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -531,7 +525,12 @@ class LogicalEvidenceProjectionStore:
     def __init__(self, archive: EvidenceArchive):
         self.archive = archive
 
-    def put(self, prepared: PreparedLogicalDocument) -> LogicalEvidenceUpload:
+    def put(
+        self,
+        prepared: PreparedLogicalDocument,
+        *,
+        retention_profile: str = "lossless-v1",
+    ) -> LogicalEvidenceUpload:
         part_references: list[dict[str, Any]] = []
         try:
             for part in prepared.parts:
@@ -571,6 +570,7 @@ class LogicalEvidenceProjectionStore:
                 last_occurred_at=prepared.last_occurred_at,
                 record_count=prepared.record_count,
                 receipt_count=prepared.receipt_count,
+                retention_profile=retention_profile,
                 parts=manifest_parts,
             )
             manifest_reference = self.archive.put_raw(
@@ -607,6 +607,7 @@ class LogicalEvidenceProjectionStore:
         revision: int,
         records: Iterable[LogicalEvidenceRecord],
         part_bytes: int = DEFAULT_PART_BYTES,
+        retention_profile: str = "lossless-v1",
     ) -> LogicalEvidenceUpload:
         """Upload a logical document with memory bounded to one object part."""
 
@@ -622,6 +623,7 @@ class LogicalEvidenceProjectionStore:
             or isinstance(part_bytes, bool)
             or not isinstance(part_bytes, int)
             or not MIN_PART_BYTES <= part_bytes <= MAX_PART_BYTES
+            or retention_profile not in RETENTION_PROFILES
         ):
             raise LogicalEvidenceError("logical_evidence_document_invalid")
 
@@ -763,6 +765,7 @@ class LogicalEvidenceProjectionStore:
                 last_occurred_at=last_occurred,
                 record_count=record_count,
                 receipt_count=receipt_count,
+                retention_profile=retention_profile,
                 parts=tuple(manifest_parts),
             )
             manifest_reference = self.archive.put_raw(
@@ -809,10 +812,14 @@ class LogicalEvidenceProjectionStore:
             if error.__class__.__name__ == "ArchiveCorruption":
                 raise LogicalEvidenceError("logical_evidence_corrupt") from None
             raise LogicalEvidenceError("logical_evidence_not_found") from error
+        if not isinstance(value, dict):
+            raise LogicalEvidenceError("logical_evidence_manifest_invalid")
+        version = (value.get("contract"), value.get("schema_version"))
+        if version == ("recall.logical-document-manifest.v1", 1):
+            return value
         if (
-            not isinstance(value, dict)
-            or value.get("contract") != "recall.logical-document-manifest.v1"
-            or value.get("schema_version") != 1
+            version != ("recall.logical-document-manifest.v2", 2)
+            or value.get("retention_profile") not in RETENTION_PROFILES
         ):
             raise LogicalEvidenceError("logical_evidence_manifest_invalid")
         return value

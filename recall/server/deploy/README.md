@@ -239,7 +239,13 @@ python -m recall_server.cli logical-evidence-worker \
 Ingest and forget transactions enqueue only affected logical documents.
 Revision replacement queues superseded S3 references in the same database
 transaction; transient delete failures remain durable and are retried by the
-worker. Keep the prior `canonical-evidence-worker` running until the
+worker. The operational default of 25 documents over two upload streams keeps
+memory and database load boring. One-time backfills may use up to 2,000
+documents per batch and raise `--upload-concurrency` as high as 32 only when
+`RECALL_DATABASE_POOL_MAX_SIZE` is at least the same value and a live
+throughput/memory measurement justifies it. The worker pre-warms that bounded
+pool before starting the measured projection. Keep the prior
+`canonical-evidence-worker` running until the
 logical-document integrity, rollback, and consumer cutover gates pass.
 
 `recall_deep_search` first uses canonical retrieval to select authorized

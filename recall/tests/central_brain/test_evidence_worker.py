@@ -94,8 +94,10 @@ class LogicalEvidenceWorkerTests(TestCase):
     def test_invalid_worker_budgets_fail_before_projection(self) -> None:
         invalid = (
             {"batch_size": 0},
+            {"batch_size": 2001},
             {"max_batches_per_cycle": 0},
             {"upload_concurrency": 0},
+            {"upload_concurrency": 33},
             {"interval_seconds": 0.0},
         )
         for override in invalid:

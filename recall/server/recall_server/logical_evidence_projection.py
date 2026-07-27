@@ -7,6 +7,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from itertools import groupby
 from typing import Any
 
 from .logical_evidence import (
@@ -21,6 +22,12 @@ from .logical_evidence import (
 OVERSIZED_MEDIA_TYPE = "application/vnd.recall.oversized-record+gzip"
 MAX_RESTORED_RECORD_BYTES = 256 * 1024 * 1024
 TEXT_SEGMENT_BYTES = 14 * 1024 * 1024
+DEFAULT_EXCLUDED_STRUCTURAL_TYPES = (
+    "file-history-snapshot",
+    "queue-operation",
+    "token_count",
+    "turn_context",
+)
 
 
 @dataclass(frozen=True)
@@ -80,37 +87,23 @@ def _timestamp(value: datetime | str) -> str:
     raise LogicalEvidenceError("logical_evidence_state_invalid")
 
 
-def _roles(value: Any) -> tuple[str, ...]:
-    """Extract only explicit structural roles; never classify source prose."""
+def _explicit_roles(values: Any) -> tuple[str, ...]:
+    """Validate compact structural role values extracted by PostgreSQL."""
 
-    found: set[str] = set()
-    pending: list[tuple[Any, int]] = [(value, 0)]
-    while pending:
-        item, depth = pending.pop()
-        if depth > 8:
-            continue
-        if isinstance(item, dict):
-            for key, child in item.items():
-                if (
-                    key == "role"
-                    and isinstance(child, str)
-                    and ROLE_RE.fullmatch(child)
-                ):
-                    found.add(child)
-                elif (
-                    key == "type"
-                    and child in {"user", "assistant", "system", "developer", "tool"}
-                ):
-                    found.add(child)
-                elif isinstance(child, (dict, list)):
-                    pending.append((child, depth + 1))
-        elif isinstance(item, list):
-            pending.extend(
-                (child, depth + 1)
-                for child in item
-                if isinstance(child, (dict, list))
-            )
-    return tuple(sorted(found))
+    if not isinstance(values, list):
+        raise LogicalEvidenceError("logical_evidence_state_invalid")
+    allowed = {"user", "assistant", "system", "developer", "tool"}
+    return tuple(
+        sorted(
+            {
+                value
+                for value in values
+                if isinstance(value, str)
+                and value in allowed
+                and ROLE_RE.fullmatch(value)
+            }
+        )
+    )
 
 
 class CanonicalLogicalEvidenceProjector:
@@ -123,6 +116,10 @@ class CanonicalLogicalEvidenceProjector:
         *,
         bound_tenant_id: str | None = None,
         raw_archive: Any | None = None,
+        excluded_structural_types: tuple[str, ...] = (
+            DEFAULT_EXCLUDED_STRUCTURAL_TYPES
+        ),
+        retention_profile: str = "conversation-useful-v1",
     ) -> None:
         if bound_tenant_id is not None and (
             not isinstance(bound_tenant_id, str)
@@ -134,6 +131,20 @@ class CanonicalLogicalEvidenceProjector:
         self.projection = projection
         self.bound_tenant_id = bound_tenant_id
         self.raw_archive = raw_archive
+        if (
+            not isinstance(excluded_structural_types, tuple)
+            or not excluded_structural_types
+            or any(
+                not isinstance(value, str) or not value
+                for value in excluded_structural_types
+            )
+            or len(set(excluded_structural_types))
+            != len(excluded_structural_types)
+            or retention_profile != "conversation-useful-v1"
+        ):
+            raise LogicalEvidenceError("logical_evidence_retention_invalid")
+        self.excluded_structural_types = excluded_structural_types
+        self.retention_profile = retention_profile
 
     def _tenant(self, tenant_id: str | None) -> str | None:
         if self.bound_tenant_id is None:
@@ -188,7 +199,7 @@ class CanonicalLogicalEvidenceProjector:
     def _restored_record_text(self, row: dict[str, Any], fallback: str) -> str:
         if row["raw_media_type"] != OVERSIZED_MEDIA_TYPE:
             return fallback
-        content = row["canonical_redacted"].get("content")
+        content = row["oversized_content"]
         if (
             self.raw_archive is None
             or not isinstance(content, dict)
@@ -235,19 +246,20 @@ class CanonicalLogicalEvidenceProjector:
         self,
         row: dict[str, Any],
         *,
-        chunks: list[str],
+        text: str,
         receipts: list[str],
         start_ordinal: int,
     ):
         if (
-            not receipts
+            not isinstance(text, str)
+            or not receipts
             or len(receipts) != len(set(receipts))
-            or row["chunk_ordinal"] != len(receipts) - 1
+            or row["chunk_count"] != len(receipts)
         ):
             raise LogicalEvidenceError("logical_evidence_state_invalid")
-        text = self._restored_record_text(row, "".join(chunks))
+        text = self._restored_record_text(row, text)
         segments = self._text_segments(text)
-        roles = _roles(row["canonical_redacted"])
+        roles = _explicit_roles(row["explicit_role_values"])
         for segment_ordinal, segment in enumerate(segments):
             yield LogicalEvidenceRecord(
                 ordinal=start_ordinal + segment_ordinal,
@@ -262,45 +274,21 @@ class CanonicalLogicalEvidenceProjector:
             )
 
     def _record_stream(self, cursor: Any):
-        current_key: tuple[str, str] | None = None
-        current_row: dict[str, Any] | None = None
-        chunks: list[str] = []
-        receipts: list[str] = []
         next_ordinal = 0
-        expected_chunk = 0
         for row in cursor:
-            key = (row["event_id"], row["document_id"])
-            if current_key is not None and key != current_key:
-                assert current_row is not None
-                records = tuple(
-                    self._event_records(
-                        current_row,
-                        chunks=chunks,
-                        receipts=receipts,
-                        start_ordinal=next_ordinal,
-                    )
-                )
-                yield from records
-                next_ordinal += len(records)
-                chunks = []
-                receipts = []
-                expected_chunk = 0
-            if key != current_key:
-                current_key = key
-                current_row = row
-            if row["chunk_ordinal"] != expected_chunk:
+            receipts = row["receipts"]
+            if not isinstance(receipts, list):
                 raise LogicalEvidenceError("logical_evidence_state_invalid")
-            chunks.append(row["text_redacted"])
-            receipts.append(row["receipt"])
-            expected_chunk += 1
-            current_row = row
-        if current_row is not None:
-            yield from self._event_records(
-                current_row,
-                chunks=chunks,
-                receipts=receipts,
-                start_ordinal=next_ordinal,
+            records = tuple(
+                self._event_records(
+                    row,
+                    text=row["event_text"],
+                    receipts=receipts,
+                    start_ordinal=next_ordinal,
+                )
             )
+            yield from records
+            next_ordinal += len(records)
 
     def _pending(
         self,
@@ -380,23 +368,58 @@ class CanonicalLogicalEvidenceProjector:
             )
         return max(0, result.rowcount)
 
-    def _prepare_and_upload(
+    def _prepare_batch_and_upload(
         self,
-        candidate: LogicalGroupCandidate,
-    ) -> LogicalEvidenceUpload:
-        with self.store.connect() as connection:
-            with connection.cursor(
-                name="logical_evidence_stream",
-            ) as cursor:
-                cursor.itersize = 2_000
-                cursor.execute(
-                    """SELECT event.tenant_id,event.source_id,
+        candidates: tuple[LogicalGroupCandidate, ...],
+    ) -> list[LogicalEvidenceUpload | None]:
+        if not candidates:
+            return []
+        uploads: list[LogicalEvidenceUpload | None] = [None] * len(candidates)
+        completed: list[LogicalEvidenceUpload] = []
+        try:
+            with self.store.connect() as connection:
+                with connection.cursor(
+                    name="logical_evidence_batch_stream",
+                ) as cursor:
+                    cursor.itersize = 10_000
+                    cursor.execute(
+                        """WITH selected(
+                               candidate_ordinal,tenant_id,source_id,
+                               native_parent_id
+                           ) AS MATERIALIZED (
+                               SELECT * FROM unnest(
+                                   %s::integer[],%s::text[],%s::text[],%s::text[]
+                               )
+                           )
+                           SELECT selected.candidate_ordinal,
+                              event.tenant_id,event.source_id,
                               event.event_id,event.native_id,event.kind,
                               event.occurred_at,
-                              event.canonical_redacted,
-                              document.document_id,
-                              chunk.ordinal AS chunk_ordinal,
-                              chunk.receipt,chunk.text_redacted,
+                              (
+                                  jsonb_path_query_array(
+                                      event.canonical_redacted,
+                                      '$.**.role ? (@.type() == "string")'
+                                  )
+                                  ||
+                                  jsonb_path_query_array(
+                                      event.canonical_redacted,
+                                      '$.**.type ? (@.type() == "string")'
+                                  )
+                              ) AS explicit_role_values,
+                              CASE WHEN artifact.media_type=%s
+                                   THEN event.canonical_redacted->'content'
+                                   ELSE NULL
+                              END AS oversized_content,
+                              CASE WHEN jsonb_typeof(
+                                  event.canonical_redacted
+                                      #> '{provenance,byte_start}'
+                              )='number' THEN (
+                                  event.canonical_redacted
+                                      #>> '{provenance,byte_start}'
+                              )::bigint END AS byte_start,
+                              source_record.event_text,
+                              source_record.receipts,
+                              source_record.chunk_count,
                               artifact.artifact_id AS raw_artifact_id,
                               artifact.storage_backend AS raw_storage_backend,
                               artifact.object_key AS raw_object_key,
@@ -406,7 +429,19 @@ class CanonicalLogicalEvidenceProjector:
                               artifact.encryption AS raw_encryption,
                               artifact.version_id AS raw_version_id,
                               artifact.created_at AS raw_created_at
-                         FROM canonical_events event
+                         FROM selected
+                         JOIN canonical_events event
+                           ON event.tenant_id=selected.tenant_id
+                          AND event.source_id=selected.source_id
+                          AND COALESCE(
+                              event.native_parent_id,event.native_id
+                          )=selected.native_parent_id
+                          AND NOT (
+                              jsonb_path_query_array(
+                                  event.canonical_redacted,
+                                  '$.**.type ? (@.type() == "string")'
+                              ) ?| %s::text[]
+                          )
                          JOIN canonical_documents document
                            ON document.tenant_id=event.tenant_id
                           AND document.source_id=event.source_id
@@ -417,41 +452,75 @@ class CanonicalLogicalEvidenceProjector:
                            ON artifact.tenant_id=event.tenant_id
                           AND artifact.source_id=event.source_id
                           AND artifact.artifact_id=event.artifact_id
-                         JOIN canonical_chunks chunk
-                           ON chunk.tenant_id=document.tenant_id
-                          AND chunk.source_id=document.source_id
-                          AND chunk.document_id=document.document_id
-                          AND chunk.deleted_at IS NULL
-                        WHERE event.tenant_id=%s AND event.source_id=%s
-                          AND COALESCE(
-                              event.native_parent_id,event.native_id
-                          )=%s
+                         JOIN LATERAL (
+                              SELECT
+                                  string_agg(
+                                      chunk.text_redacted,''
+                                      ORDER BY chunk.ordinal
+                                  ) AS event_text,
+                                  array_agg(
+                                      chunk.receipt ORDER BY chunk.ordinal
+                                  ) AS receipts,
+                                  count(*)::integer AS chunk_count
+                                FROM canonical_chunks chunk
+                               WHERE chunk.tenant_id=document.tenant_id
+                                 AND chunk.source_id=document.source_id
+                                 AND chunk.document_id=document.document_id
+                                 AND chunk.deleted_at IS NULL
+                        ) source_record
+                           ON source_record.chunk_count>0
                         ORDER BY
-                          CASE WHEN jsonb_typeof(
-                              event.canonical_redacted
-                                  #> '{provenance,byte_start}'
-                          )='number' THEN 0 ELSE 1 END,
-                          CASE WHEN jsonb_typeof(
-                              event.canonical_redacted
-                                  #> '{provenance,byte_start}'
-                          )='number' THEN (
-                              event.canonical_redacted
-                                  #>> '{provenance,byte_start}'
-                          )::bigint END,
-                          event.occurred_at,event.native_id,chunk.ordinal""",
-                    (
-                        candidate.tenant_id,
-                        candidate.source_id,
-                        candidate.native_parent_id,
-                    ),
-                )
-                return self.projection.put_records(
-                    tenant_id=candidate.tenant_id,
-                    source_id=candidate.source_id,
-                    native_parent_id=candidate.native_parent_id,
-                    revision=candidate.revision,
-                    records=self._record_stream(cursor),
-                )
+                          selected.candidate_ordinal,
+                          event.canonical_redacted
+                              #> '{provenance,byte_start}' IS NULL,
+                          byte_start,event.occurred_at,event.native_id""",
+                        (
+                            list(range(len(candidates))),
+                            [candidate.tenant_id for candidate in candidates],
+                            [candidate.source_id for candidate in candidates],
+                            [
+                                candidate.native_parent_id
+                                for candidate in candidates
+                            ],
+                            OVERSIZED_MEDIA_TYPE,
+                            list(self.excluded_structural_types),
+                        ),
+                    )
+                    previous_ordinal = -1
+                    for ordinal, rows in groupby(
+                        cursor,
+                        key=lambda row: int(row["candidate_ordinal"]),
+                    ):
+                        if not previous_ordinal < ordinal < len(candidates):
+                            raise LogicalEvidenceError(
+                                "logical_evidence_state_invalid"
+                            )
+                        previous_ordinal = ordinal
+                        candidate = candidates[ordinal]
+                        try:
+                            upload = self.projection.put_records(
+                                tenant_id=candidate.tenant_id,
+                                source_id=candidate.source_id,
+                                native_parent_id=candidate.native_parent_id,
+                                revision=candidate.revision,
+                                records=self._record_stream(rows),
+                                retention_profile=self.retention_profile,
+                            )
+                        except LogicalEvidenceError as error:
+                            if str(error) == "logical_evidence_document_empty":
+                                continue
+                            raise
+                        uploads[ordinal] = upload
+                        completed.append(upload)
+            return uploads
+        except Exception:
+            for upload in completed:
+                self._schedule_cleanup(upload.all_references)
+            self.drain_cleanup(
+                tenant_id=candidates[0].tenant_id,
+                limit=5_000,
+            )
+            raise
 
     def _old_references(
         self,
@@ -872,15 +941,25 @@ class CanonicalLogicalEvidenceProjector:
         if (
             isinstance(batch_size, bool)
             or not isinstance(batch_size, int)
-            or not 1 <= batch_size <= 250
+            or not 1 <= batch_size <= 2_000
             or isinstance(max_batches, bool)
             or not isinstance(max_batches, int)
             or not 1 <= max_batches <= 100
             or isinstance(upload_concurrency, bool)
             or not isinstance(upload_concurrency, int)
-            or not 1 <= upload_concurrency <= 8
+            or not 1 <= upload_concurrency <= 32
         ):
             raise LogicalEvidenceError("logical_evidence_budget_invalid")
+        pool_size = getattr(self.store, "pool_max_size", upload_concurrency)
+        if (
+            isinstance(pool_size, bool)
+            or not isinstance(pool_size, int)
+            or upload_concurrency > pool_size
+        ):
+            raise LogicalEvidenceError("logical_evidence_budget_invalid")
+        prepare_pool = getattr(self.store, "prepare_pool", None)
+        if callable(prepare_pool):
+            prepare_pool(min(upload_concurrency, batch_size))
         tenant_id = self._tenant(tenant_id)
         documents = records = receipts = objects = bytes_uploaded = batches = 0
         old_objects_deleted = cleanup_failures = source_races = pruned = 0
@@ -894,47 +973,48 @@ class CanonicalLogicalEvidenceProjector:
             candidates = self._pending(tenant_id=tenant_id, limit=batch_size)
             if not candidates:
                 break
-            uploads: list[LogicalEvidenceUpload | None] = []
-            futures = []
-
-            def prepare(
-                candidate: LogicalGroupCandidate,
-            ) -> LogicalEvidenceUpload | None:
-                try:
-                    return self._prepare_and_upload(candidate)
-                except LogicalEvidenceError as error:
-                    if str(error) == "logical_evidence_document_empty":
-                        return None
-                    raise
-
-            try:
-                with ThreadPoolExecutor(
-                    max_workers=min(upload_concurrency, len(candidates)),
-                    thread_name_prefix="recall-logical-evidence",
-                ) as executor:
-                    futures = [
-                        executor.submit(prepare, candidate)
-                        for candidate in candidates
-                    ]
-                    uploads = [future.result() for future in futures]
-            except Exception:
-                completed = list(uploads)
-                for future in futures:
-                    if not future.done():
-                        future.cancel()
-                        continue
+            worker_count = min(upload_concurrency, len(candidates))
+            shards: list[list[tuple[int, LogicalGroupCandidate]]] = [
+                [] for _ in range(worker_count)
+            ]
+            for index, candidate in enumerate(candidates):
+                shards[index % worker_count].append((index, candidate))
+            uploads: list[LogicalEvidenceUpload | None] = [None] * len(candidates)
+            successful: list[LogicalEvidenceUpload] = []
+            failures: list[Exception] = []
+            with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="recall-logical-evidence",
+            ) as executor:
+                futures = [
+                    (
+                        shard,
+                        executor.submit(
+                            self._prepare_batch_and_upload,
+                            tuple(candidate for _, candidate in shard),
+                        ),
+                    )
+                    for shard in shards
+                ]
+                for shard, future in futures:
                     try:
-                        upload = future.result()
-                    except Exception:
+                        shard_uploads = future.result()
+                    except Exception as error:
+                        failures.append(error)
                         continue
-                    if upload is not None and upload not in completed:
-                        completed.append(upload)
-                for upload in completed:
-                    if upload is None:
-                        continue
+                    for (index, _candidate), upload in zip(
+                        shard,
+                        shard_uploads,
+                        strict=True,
+                    ):
+                        uploads[index] = upload
+                        if upload is not None:
+                            successful.append(upload)
+            if failures:
+                for upload in successful:
                     self._schedule_cleanup(upload.all_references)
                 self.drain_cleanup(tenant_id=tenant_id, limit=5_000)
-                raise
+                raise failures[0]
             for candidate, upload in zip(candidates, uploads, strict=True):
                 if upload is None:
                     status = self._commit_empty(candidate)
@@ -1025,6 +1105,12 @@ class CanonicalLogicalEvidenceProjector:
                           AND chunk.deleted_at IS NULL
                           AND document.is_current
                           AND document.deleted_at IS NULL
+                          AND NOT (
+                              jsonb_path_query_array(
+                                  event.canonical_redacted,
+                                  '$.**.type ? (@.type() == "string")'
+                              ) ?| %s::text[]
+                          )
                         GROUP BY evidence.tenant_id,evidence.source_id,
                                  evidence.logical_document_id,evidence.revision
                    )
@@ -1041,7 +1127,13 @@ class CanonicalLogicalEvidenceProjector:
                       AND part.revision=hit.revision
                     ORDER BY part.logical_document_id,part.part_ordinal
                     LIMIT %s""",
-                (tenant_id, list(source_ids), list(receipts), limit),
+                (
+                    tenant_id,
+                    list(source_ids),
+                    list(receipts),
+                    list(self.excluded_structural_types),
+                    limit,
+                ),
             ).fetchall()
         return [
             {
