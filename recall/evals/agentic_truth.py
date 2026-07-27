@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import math
 import os
@@ -129,7 +130,11 @@ def _validate_boundary(value: Any) -> tuple[str, str, int]:
     return _boundary_identity(value)
 
 
-def _validate_cases(cases: list[dict[str, Any]]) -> dict[str, Any]:
+def _validate_cases(
+    cases: list[dict[str, Any]],
+    *,
+    require_owner_approval: bool = True,
+) -> dict[str, Any]:
     if not isinstance(cases, list) or len(cases) != 60:
         raise EvaluationInputError("agentic truth set must contain exactly 60 cases")
     ids: set[str] = set()
@@ -182,15 +187,17 @@ def _validate_cases(cases: list[dict[str, Any]]) -> dict[str, Any]:
         if (
             not isinstance(review, dict)
             or set(review) != REVIEW_FIELDS
-            or review["status"] != "approved"
+            or review["status"] not in {"pending", "approved", "rejected"}
             or isinstance(review["revision"], bool)
             or not isinstance(review["revision"], int)
             or review["revision"] < 1
         ):
+            raise EvaluationInputError("agentic truth owner review is invalid")
+        if require_owner_approval and review["status"] != "approved":
             raise EvaluationInputError(
                 "all agentic truth cases must be owner-approved"
             )
-        approved_cases += 1
+        approved_cases += int(review["status"] == "approved")
 
         boundaries = case["gold_boundaries"]
         facts = case["gold_facts"]
@@ -300,6 +307,69 @@ def validate_truth_set(
     return {
         "schema_version": SCHEMA_VERSION,
         **receipt,
+        "manifest_sha256": hashlib.sha256(payload).hexdigest(),
+    }
+
+
+def build_owner_review_packet(
+    source_path: Path,
+    output_path: Path,
+    *,
+    repo_root: Path,
+) -> dict[str, Any]:
+    """Render a private, static packet without publishing truth-set bodies."""
+
+    source = _private_path(source_path, exists=True)
+    output = _private_path(output_path, exists=False)
+    _outside_repository(source, repo_root)
+    repo = Path(repo_root).resolve(strict=True)
+    resolved_output = output.resolve(strict=False)
+    if resolved_output == repo or repo in resolved_output.parents:
+        raise EvaluationInputError(
+            "private agentic evaluation files must stay outside Git"
+        )
+    cases, payload = _load_jsonl(source)
+    receipt = _validate_cases(cases, require_owner_approval=False)
+    articles = "\n".join(
+        (
+            "<article>"
+            f"<h2>{ordinal}. {html.escape(case['split'])} / "
+            f"{html.escape(case['stratum'])}</h2>"
+            f"<pre>{html.escape(json.dumps(case, indent=2, sort_keys=True))}</pre>"
+            "</article>"
+        )
+        for ordinal, case in enumerate(cases, 1)
+    )
+    rendered = f"""<!doctype html>
+<meta charset="utf-8">
+<title>Private Recall truth-set owner review</title>
+<style>
+body {{ font: 15px/1.5 system-ui; margin: 2rem auto; max-width: 1100px;
+       padding: 0 1rem; color: #17202a; }}
+article {{ border-top: 1px solid #ccd1d1; padding: 1rem 0 2rem; }}
+pre {{ white-space: pre-wrap; overflow-wrap: anywhere; background: #f4f6f7;
+       padding: 1rem; }}
+.warning {{ color: #922b21; font-weight: 700; }}
+</style>
+<h1>Private Recall truth-set owner review</h1>
+<p class="warning">Private source-derived evaluation data. Do not publish or
+serve this file outside the owner's trusted device.</p>
+<p>Review all 60 natural questions, expected evidence boundaries, facts,
+receipts, and insufficient labels. Approval must be recorded in the private
+JSONL; this packet does not modify it.</p>
+{articles}
+"""
+    descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.fchmod(descriptor, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as target:
+        target.write(rendered)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "case_count": receipt["case_count"],
+        "owner_approved_cases": receipt["owner_approved_cases"],
+        "owner_pending_cases": sum(
+            case["owner_review"]["status"] == "pending" for case in cases
+        ),
         "manifest_sha256": hashlib.sha256(payload).hexdigest(),
     }
 
@@ -519,6 +589,10 @@ def parser() -> argparse.ArgumentParser:
     validate = commands.add_parser("validate")
     validate.add_argument("--input", required=True)
     validate.add_argument("--repo-root", required=True)
+    review = commands.add_parser("review")
+    review.add_argument("--input", required=True)
+    review.add_argument("--output", required=True)
+    review.add_argument("--repo-root", required=True)
     score = commands.add_parser("score")
     score.add_argument("--truth", required=True)
     score.add_argument("--results", required=True)
@@ -534,6 +608,12 @@ def main() -> None:
         if args.command == "validate":
             result = validate_truth_set(
                 Path(args.input),
+                repo_root=Path(args.repo_root),
+            )
+        elif args.command == "review":
+            result = build_owner_review_packet(
+                Path(args.input),
+                Path(args.output),
                 repo_root=Path(args.repo_root),
             )
         else:

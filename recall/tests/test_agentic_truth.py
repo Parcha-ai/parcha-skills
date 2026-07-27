@@ -7,6 +7,7 @@ from pathlib import Path
 
 from evals.agentic_truth import (
     EvaluationInputError,
+    build_owner_review_packet,
     score_boundary_candidates,
     validate_truth_set,
 )
@@ -187,6 +188,39 @@ class AgenticTruthSetTest(unittest.TestCase):
             private_write(truth, rows)
             with self.assertRaisesRegex(EvaluationInputError, "gold receipt"):
                 validate_truth_set(truth)
+
+    def test_builds_private_static_owner_review_packet_from_pending_truth(
+        self,
+    ) -> None:
+        rows = truth_cases()
+        for row in rows:
+            row["owner_review"]["status"] = "pending"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory = private_directory(root)
+            truth = directory / "truth.jsonl"
+            packet = directory / "truth-review.html"
+            repo = root / "repo"
+            repo.mkdir()
+            private_write(truth, rows)
+
+            receipt = build_owner_review_packet(
+                truth,
+                packet,
+                repo_root=repo,
+            )
+            rendered = packet.read_text()
+
+            self.assertEqual(receipt["case_count"], 60)
+            self.assertEqual(receipt["owner_approved_cases"], 0)
+            self.assertEqual(receipt["owner_pending_cases"], 60)
+            self.assertEqual(packet.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(rendered.count("<article>"), 60)
+            self.assertIn(
+                "What happened in synthetic boundary 0?",
+                rendered,
+            )
+            self.assertNotIn("<script", rendered)
 
     def test_scores_boundary_recall_mrr_pointer_and_authorization(self) -> None:
         cases = truth_cases()
