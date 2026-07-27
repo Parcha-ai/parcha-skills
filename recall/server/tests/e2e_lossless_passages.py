@@ -38,6 +38,7 @@ from recall_server.canonical_retrieval import (  # noqa: E402
 class SyntheticEmbeddingRuntime:
     dimensions = 512
     fingerprint = "synthetic-lossless-passage-runtime"
+    passage_fingerprint = "synthetic-lossless-passage-runtime"
     model = "synthetic-lossless-passage-model"
 
     def __init__(self) -> None:
@@ -46,6 +47,9 @@ class SyntheticEmbeddingRuntime:
     def embed_documents(self, values: list[str]) -> list[list[float]]:
         self.document_calls += 1
         return [[float(index % 2)] * 512 for index, _value in enumerate(values)]
+
+    def embed_passages(self, values: list[str]) -> list[list[float]]:
+        return self.embed_documents(values)
 
     @staticmethod
     def embed_query(_value: str) -> list[float]:
@@ -140,6 +144,34 @@ def main() -> None:
         assert embedding_result["status"] == "complete"
         assert embedding_result["processed"] == passage_result["passages"]
         assert runtime.document_calls == 1
+        with store.connect() as connection:
+            connection.execute(
+                """INSERT INTO canonical_passage_projection_queue(
+                       tenant_id,source_id,logical_document_id,revision,
+                       generation,reason,changed_at
+                   )
+                   SELECT tenant_id,source_id,logical_document_id,revision,
+                          1,'backfill',clock_timestamp()
+                     FROM canonical_evidence_documents
+                    WHERE tenant_id=%s AND source_id=%s
+                      AND native_parent_id=%s
+                   ON CONFLICT(tenant_id,source_id,logical_document_id)
+                   DO UPDATE SET
+                       revision=excluded.revision,
+                       generation=
+                           canonical_passage_projection_queue.generation+1,
+                       reason='backfill',
+                       changed_at=clock_timestamp()""",
+                (tenant, source, parent),
+            )
+        reprojected = passages.project_pending(
+            tenant_id=tenant,
+            batch_size=10,
+            max_batches=1,
+            concurrency=2,
+        )
+        assert reprojected["passages"] == passage_result["passages"]
+        assert runtime.document_calls == 1
         bound = BoundCanonicalRetrieval(
             store,
             tenant_id=tenant,
@@ -204,6 +236,7 @@ def main() -> None:
                 "passage_documents": counts["documents"],
                 "passages": counts["passages"],
                 "embeddings": counts["embeddings"],
+                "reused_embeddings": counts["embeddings"],
                 "dense_tool_hits": counts["dense_tool_hits"],
                 "sparse_tool_hits": counts["sparse_tool_hits"],
                 "completion_model_calls": 0,

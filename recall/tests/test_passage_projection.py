@@ -468,6 +468,26 @@ class PassageProjectionTests(unittest.TestCase):
         self.assertIn("self.store.pool_max_size - 1", source)
         self.assertIn("PASSAGE_COMMIT_WORKERS", source)
 
+    def test_revision_projection_reuses_unchanged_content_embeddings(
+        self,
+    ) -> None:
+        source = inspect.getsource(CanonicalPassageProjector._commit)
+
+        reusable = source.index(
+            "recall_reusable_passage_embeddings"
+        )
+        delete = source.index(
+            "DELETE FROM canonical_passage_documents"
+        )
+        restore = source.rindex(
+            "INSERT INTO canonical_passage_embeddings"
+        )
+        self.assertLess(reusable, delete)
+        self.assertLess(delete, restore)
+        self.assertIn("cached.content_sha256=", source)
+        self.assertIn("passage.text_sha256", source)
+        self.assertIn("ON COMMIT DROP", source)
+
     def test_dense_temporal_candidates_are_oversampled_before_filtering(
         self,
     ) -> None:

@@ -352,6 +352,26 @@ class CanonicalPassageProjector:
                 ):
                     return "stale"
                 connection.execute(
+                    """CREATE TEMP TABLE
+                           recall_reusable_passage_embeddings
+                           ON COMMIT DROP AS
+                       SELECT embedding.model,embedding.dimensions,
+                              embedding.content_sha256,
+                              embedding.runtime_fingerprint,
+                              embedding.embedding,embedding.embedded_at
+                         FROM canonical_passage_embeddings embedding
+                         JOIN canonical_passages passage
+                           USING(tenant_id,source_id,passage_id)
+                        WHERE passage.tenant_id=%s
+                          AND passage.source_id=%s
+                          AND passage.logical_document_id=%s""",
+                    (
+                        candidate.tenant_id,
+                        candidate.source_id,
+                        candidate.logical_document_id,
+                    ),
+                )
+                connection.execute(
                     """DELETE FROM canonical_passage_documents
                         WHERE tenant_id=%s AND source_id=%s
                           AND logical_document_id=%s""",
@@ -423,6 +443,47 @@ class CanonicalPassageProjector:
                                 for passage in prepared.passages
                             ],
                         )
+                    connection.execute(
+                        """INSERT INTO canonical_passage_embeddings(
+                               tenant_id,source_id,passage_id,model,
+                               dimensions,content_sha256,
+                               runtime_fingerprint,embedding,embedded_at
+                           )
+                           SELECT passage.tenant_id,passage.source_id,
+                                  passage.passage_id,reusable.model,
+                                  reusable.dimensions,
+                                  reusable.content_sha256,
+                                  reusable.runtime_fingerprint,
+                                  reusable.embedding,reusable.embedded_at
+                             FROM canonical_passages passage
+                             JOIN LATERAL (
+                                   SELECT cached.model,cached.dimensions,
+                                          cached.content_sha256,
+                                          cached.runtime_fingerprint,
+                                          cached.embedding,cached.embedded_at
+                                     FROM
+                                          recall_reusable_passage_embeddings
+                                          cached
+                                    WHERE cached.content_sha256=
+                                          passage.text_sha256
+                                    ORDER BY cached.runtime_fingerprint
+                                    LIMIT 1
+                             ) reusable ON true
+                            WHERE passage.tenant_id=%s
+                              AND passage.source_id=%s
+                              AND passage.logical_document_id=%s
+                              AND passage.revision=%s
+                              AND passage.policy_fingerprint=%s
+                           ON CONFLICT(tenant_id,source_id,passage_id)
+                           DO NOTHING""",
+                        (
+                            candidate.tenant_id,
+                            candidate.source_id,
+                            candidate.logical_document_id,
+                            candidate.revision,
+                            self.policy.fingerprint,
+                        ),
+                    )
                 deleted = connection.execute(
                     """DELETE FROM canonical_passage_projection_queue
                         WHERE tenant_id=%s AND source_id=%s
