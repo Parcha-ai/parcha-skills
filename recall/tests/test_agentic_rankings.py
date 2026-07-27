@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from evals.agentic_rankings import (
+    _retrieval_error,
     rank_private_questions,
     resolve_logical_boundaries,
 )
@@ -31,6 +32,41 @@ def private_write(path: Path, rows: list[dict]) -> None:
 
 
 class AgenticRankingsTest(unittest.TestCase):
+    def test_classifies_partial_retrieval_as_a_backend_error(self) -> None:
+        self.assertEqual(
+            _retrieval_error(
+                {
+                    "diagnostics": {
+                        "lexical_mode": "deadline-exceeded",
+                        "semantic_status": "ok",
+                    }
+                }
+            ),
+            "RetrievalDeadlineExceeded",
+        )
+        self.assertEqual(
+            _retrieval_error(
+                {
+                    "diagnostics": {
+                        "lexical_mode": "strict",
+                        "semantic_status": "unavailable",
+                    }
+                }
+            ),
+            "RetrievalBackendUnavailable",
+        )
+        self.assertEqual(
+            _retrieval_error(
+                {
+                    "diagnostics": {
+                        "lexical_mode": "strict",
+                        "semantic_status": "ok",
+                    }
+                }
+            ),
+            "",
+        )
+
     def test_resolves_ranked_hits_to_deduplicated_current_boundaries(self) -> None:
         tenant = "tenant:company:synthetic"
         source = "codex:linux:synthetic"

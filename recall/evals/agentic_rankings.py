@@ -194,6 +194,23 @@ def _validated_candidates(value: Any) -> list[dict[str, Any]]:
     return value
 
 
+def _retrieval_error(response: Any) -> str:
+    """Classify a bounded partial retrieval as an instrument failure."""
+
+    if not isinstance(response, dict):
+        return "EvaluationInputError"
+    diagnostics = response.get("diagnostics")
+    if not isinstance(diagnostics, dict):
+        return ""
+    if diagnostics.get("lexical_mode") == "deadline-exceeded":
+        return "RetrievalDeadlineExceeded"
+    if diagnostics.get("semantic_status") == "deadline-exceeded":
+        return "RetrievalDeadlineExceeded"
+    if diagnostics.get("semantic_status") == "unavailable":
+        return "RetrievalBackendUnavailable"
+    return ""
+
+
 def rank_private_questions(
     input_path: Path,
     output_path: Path,
@@ -234,7 +251,7 @@ def rank_private_questions(
             response = search(case["question"])
             results = response.get("results") if isinstance(response, dict) else None
             candidates = _validated_candidates(resolve(results))
-            error = ""
+            error = _retrieval_error(response)
         except Exception as failure:
             candidates = []
             error = type(failure).__name__[:160]
