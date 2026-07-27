@@ -470,7 +470,11 @@ class CanonicalPassageProjector:
             ) as executor:
                 prepared_documents = list(executor.map(self._prepare, candidates))
             with ThreadPoolExecutor(
-                max_workers=min(concurrency, len(prepared_documents)),
+                max_workers=min(
+                    concurrency,
+                    len(prepared_documents),
+                    max(1, self.store.pool_max_size - 1),
+                ),
                 thread_name_prefix="recall-passage-commit",
             ) as executor:
                 statuses = list(
