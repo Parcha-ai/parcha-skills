@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from itertools import groupby
 from typing import Any
 
+from .canonical_text import canonical_text_chunks
 from .logical_evidence import (
     LogicalEvidenceError,
     LogicalEvidenceProjectionStore,
@@ -18,6 +19,7 @@ from .logical_evidence import (
     ROLE_RE,
     logical_document_id,
 )
+from .projectors import item_receipt
 
 OVERSIZED_MEDIA_TYPE = "application/vnd.recall.oversized-record+gzip"
 MAX_RESTORED_RECORD_BYTES = 256 * 1024 * 1024
@@ -38,6 +40,7 @@ class LogicalGroupCandidate:
     source_updated_at: datetime
     generation: int
     revision: int
+    estimated_records: int = 1
 
 
 def mark_logical_evidence_dirty(
@@ -138,8 +141,7 @@ class CanonicalLogicalEvidenceProjector:
                 not isinstance(value, str) or not value
                 for value in excluded_structural_types
             )
-            or len(set(excluded_structural_types))
-            != len(excluded_structural_types)
+            or len(set(excluded_structural_types)) != len(excluded_structural_types)
             or retention_profile != "conversation-useful-v1"
         ):
             raise LogicalEvidenceError("logical_evidence_retention_invalid")
@@ -211,29 +213,20 @@ class CanonicalLogicalEvidenceProjector:
             or not 1 <= content["full_size_bytes"] <= MAX_RESTORED_RECORD_BYTES
             or not isinstance(content.get("full_content_sha256"), str)
         ):
-            raise LogicalEvidenceError(
-                "logical_evidence_full_record_unavailable"
-            )
+            raise LogicalEvidenceError("logical_evidence_full_record_unavailable")
         try:
-            compressed = self.raw_archive.read_raw(
-                self._reference(row, prefix="raw_")
-            )
+            compressed = self.raw_archive.read_raw(self._reference(row, prefix="raw_"))
             with gzip.GzipFile(fileobj=io.BytesIO(compressed)) as source:
                 payload = source.read(MAX_RESTORED_RECORD_BYTES + 1)
             if (
                 len(payload) != content["full_size_bytes"]
                 or len(payload) > MAX_RESTORED_RECORD_BYTES
-                or hashlib.sha256(payload).hexdigest()
-                != content["full_content_sha256"]
+                or hashlib.sha256(payload).hexdigest() != content["full_content_sha256"]
             ):
-                raise LogicalEvidenceError(
-                    "logical_evidence_full_record_corrupt"
-                )
+                raise LogicalEvidenceError("logical_evidence_full_record_corrupt")
             text = payload.decode()
             if not isinstance(json.loads(text), dict):
-                raise LogicalEvidenceError(
-                    "logical_evidence_full_record_corrupt"
-                )
+                raise LogicalEvidenceError("logical_evidence_full_record_corrupt")
             return text
         except LogicalEvidenceError:
             raise
@@ -276,13 +269,28 @@ class CanonicalLogicalEvidenceProjector:
     def _record_stream(self, cursor: Any):
         next_ordinal = 0
         for row in cursor:
-            receipts = row["receipts"]
-            if not isinstance(receipts, list):
+            text = row["event_text"]
+            revision = row["document_revision"]
+            if (
+                not isinstance(text, str)
+                or isinstance(revision, bool)
+                or not isinstance(revision, int)
+                or revision < 1
+            ):
                 raise LogicalEvidenceError("logical_evidence_state_invalid")
+            receipts = [
+                item_receipt(
+                    row["source_id"],
+                    row["native_id"],
+                    revision,
+                    ordinal,
+                )
+                for ordinal, _chunk in enumerate(canonical_text_chunks(text))
+            ]
             records = tuple(
                 self._event_records(
                     row,
-                    text=row["event_text"],
+                    text=text,
                     receipts=receipts,
                     start_ordinal=next_ordinal,
                 )
@@ -302,7 +310,17 @@ class CanonicalLogicalEvidenceProjector:
                           queue.native_parent_id,
                           queue.changed_at AS source_updated_at,
                           queue.generation,
-                          COALESCE(evidence.revision,0)+1 AS revision
+                          COALESCE(evidence.revision,0)+1 AS revision,
+                          (
+                              SELECT count(*)
+                                FROM canonical_events session_event
+                               WHERE session_event.tenant_id=queue.tenant_id
+                                 AND session_event.source_id=queue.source_id
+                                 AND COALESCE(
+                                     session_event.native_parent_id,
+                                     session_event.native_id
+                                 )=queue.native_parent_id
+                          ) AS estimated_records
                      FROM canonical_evidence_document_queue queue
                      LEFT JOIN canonical_evidence_documents evidence
                        ON evidence.tenant_id=queue.tenant_id
@@ -322,6 +340,7 @@ class CanonicalLogicalEvidenceProjector:
                 source_updated_at=row["source_updated_at"],
                 generation=int(row["generation"]),
                 revision=int(row["revision"]),
+                estimated_records=max(1, int(row["estimated_records"])),
             )
             for row in rows
         ]
@@ -417,8 +436,8 @@ class CanonicalLogicalEvidenceProjector:
                                   event.canonical_redacted
                                       #>> '{provenance,byte_start}'
                               )::bigint END AS byte_start,
-                              source_record.event_text,
-                              source_record.receipts,
+                              document.text_redacted AS event_text,
+                              document.revision AS document_revision,
                               source_record.chunk_count,
                               artifact.artifact_id AS raw_artifact_id,
                               artifact.storage_backend AS raw_storage_backend,
@@ -453,21 +472,13 @@ class CanonicalLogicalEvidenceProjector:
                           AND artifact.source_id=event.source_id
                           AND artifact.artifact_id=event.artifact_id
                          JOIN LATERAL (
-                              SELECT
-                                  string_agg(
-                                      chunk.text_redacted,''
-                                      ORDER BY chunk.ordinal
-                                  ) AS event_text,
-                                  array_agg(
-                                      chunk.receipt ORDER BY chunk.ordinal
-                                  ) AS receipts,
-                                  count(*)::integer AS chunk_count
+                              SELECT count(*)::integer AS chunk_count
                                 FROM canonical_chunks chunk
                                WHERE chunk.tenant_id=document.tenant_id
                                  AND chunk.source_id=document.source_id
                                  AND chunk.document_id=document.document_id
                                  AND chunk.deleted_at IS NULL
-                        ) source_record
+                         ) source_record
                            ON source_record.chunk_count>0
                         ORDER BY
                           selected.candidate_ordinal,
@@ -478,10 +489,7 @@ class CanonicalLogicalEvidenceProjector:
                             list(range(len(candidates))),
                             [candidate.tenant_id for candidate in candidates],
                             [candidate.source_id for candidate in candidates],
-                            [
-                                candidate.native_parent_id
-                                for candidate in candidates
-                            ],
+                            [candidate.native_parent_id for candidate in candidates],
                             OVERSIZED_MEDIA_TYPE,
                             list(self.excluded_structural_types),
                         ),
@@ -492,9 +500,7 @@ class CanonicalLogicalEvidenceProjector:
                         key=lambda row: int(row["candidate_ordinal"]),
                     ):
                         if not previous_ordinal < ordinal < len(candidates):
-                            raise LogicalEvidenceError(
-                                "logical_evidence_state_invalid"
-                            )
+                            raise LogicalEvidenceError("logical_evidence_state_invalid")
                         previous_ordinal = ordinal
                         candidate = candidates[ordinal]
                         try:
@@ -701,10 +707,7 @@ class CanonicalLogicalEvidenceProjector:
             with connection.transaction():
                 connection.execute(
                     "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
-                    (
-                        "logical-evidence\x1f"
-                        + prepared.logical_document_id,
-                    ),
+                    ("logical-evidence\x1f" + prepared.logical_document_id,),
                 )
                 queued = connection.execute(
                     """SELECT generation,changed_at
@@ -930,6 +933,22 @@ class CanonicalLogicalEvidenceProjector:
                     raise LogicalEvidenceError("logical_evidence_queue_conflict")
         return "pruned"
 
+    def _commit_upload(
+        self,
+        candidate: LogicalGroupCandidate,
+        upload: LogicalEvidenceUpload | None,
+    ) -> str:
+        if upload is None:
+            return self._commit_empty(candidate)
+        try:
+            status = self._commit(candidate, upload)
+        except Exception:
+            self._schedule_cleanup(upload.all_references)
+            raise
+        if status == "stale":
+            self._schedule_cleanup(upload.all_references)
+        return status
+
     def project_pending(
         self,
         *,
@@ -977,8 +996,21 @@ class CanonicalLogicalEvidenceProjector:
             shards: list[list[tuple[int, LogicalGroupCandidate]]] = [
                 [] for _ in range(worker_count)
             ]
-            for index, candidate in enumerate(candidates):
-                shards[index % worker_count].append((index, candidate))
+            shard_loads = [0] * worker_count
+            weighted_candidates = sorted(
+                enumerate(candidates),
+                key=lambda value: (
+                    -value[1].estimated_records,
+                    value[0],
+                ),
+            )
+            for index, candidate in weighted_candidates:
+                shard_index = min(
+                    range(worker_count),
+                    key=lambda value: (shard_loads[value], value),
+                )
+                shards[shard_index].append((index, candidate))
+                shard_loads[shard_index] += candidate.estimated_records
             uploads: list[LogicalEvidenceUpload | None] = [None] * len(candidates)
             successful: list[LogicalEvidenceUpload] = []
             failures: list[Exception] = []
@@ -1015,33 +1047,50 @@ class CanonicalLogicalEvidenceProjector:
                     self._schedule_cleanup(upload.all_references)
                 self.drain_cleanup(tenant_id=tenant_id, limit=5_000)
                 raise failures[0]
-            for candidate, upload in zip(candidates, uploads, strict=True):
-                if upload is None:
-                    status = self._commit_empty(candidate)
-                    if status == "stale":
-                        source_races += 1
-                        continue
-                    pruned += 1
-                    continue
-                try:
-                    status = self._commit(candidate, upload)
-                except Exception:
-                    self._schedule_cleanup(upload.all_references)
-                    self.drain_cleanup(tenant_id=tenant_id, limit=5_000)
-                    raise
+            statuses: list[str | None] = [None] * len(candidates)
+            failures = []
+            with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="recall-logical-commit",
+            ) as executor:
+                commit_futures = [
+                    (
+                        index,
+                        executor.submit(
+                            self._commit_upload,
+                            candidate,
+                            upload,
+                        ),
+                    )
+                    for index, (candidate, upload) in enumerate(
+                        zip(candidates, uploads, strict=True)
+                    )
+                ]
+                for index, future in commit_futures:
+                    try:
+                        statuses[index] = future.result()
+                    except Exception as error:
+                        failures.append(error)
+            if failures:
+                self.drain_cleanup(tenant_id=tenant_id, limit=5_000)
+                raise failures[0]
+            for upload, status in zip(uploads, statuses, strict=True):
                 if status == "stale":
-                    self._schedule_cleanup(upload.all_references)
                     source_races += 1
                     continue
                 if status == "adopted":
                     continue
+                if status == "pruned":
+                    pruned += 1
+                    continue
+                if status != "committed" or upload is None:
+                    raise LogicalEvidenceError("logical_evidence_state_invalid")
                 documents += 1
                 records += upload.prepared.record_count
                 receipts += upload.prepared.receipt_count
                 objects += len(upload.all_references)
                 bytes_uploaded += sum(
-                    int(reference["size_bytes"])
-                    for reference in upload.all_references
+                    int(reference["size_bytes"]) for reference in upload.all_references
                 )
             batches += 1
             cleanup = self.drain_cleanup(tenant_id=tenant_id, limit=5_000)
