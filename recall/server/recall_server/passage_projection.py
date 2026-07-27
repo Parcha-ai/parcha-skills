@@ -269,6 +269,17 @@ def build_passages(
             for span in spans
         )
         text_sha256 = hashlib.sha256(text.encode()).hexdigest()
+        occurred = [
+            messages[index].occurred_at
+            for index in dict.fromkeys(
+                span.message_index for span in spans
+            )
+        ]
+        occurred.sort(
+            key=lambda value: datetime.fromisoformat(
+                value.replace("Z", "+00:00")
+            )
+        )
         identity = "\0".join(
             (
                 tenant_id,
@@ -298,12 +309,8 @@ def build_passages(
                 ordinal=len(passages),
                 policy_fingerprint=policy.fingerprint,
                 token_count=len(window),
-                first_occurred_at=messages[
-                    spans[0].message_index
-                ].occurred_at,
-                last_occurred_at=messages[
-                    spans[-1].message_index
-                ].occurred_at,
+                first_occurred_at=occurred[0],
+                last_occurred_at=occurred[-1],
                 roles=tuple(sorted({
                     role
                     for span in spans

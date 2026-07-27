@@ -120,6 +120,44 @@ class PassageProjectionTests(unittest.TestCase):
         for index, message in enumerate(messages):
             self.assertEqual(covered[index], set(range(len(message.text.encode()))))
 
+    def test_passage_time_bounds_handle_source_order_clock_regression(
+        self,
+    ) -> None:
+        messages = (
+            PassageMessage(
+                record_ordinal=0,
+                occurred_at="2026-07-27T00:00:01Z",
+                roles=("user",),
+                receipts=("recall://source:test/user?rev=1#item=0",),
+                text="first source record",
+            ),
+            PassageMessage(
+                record_ordinal=1,
+                occurred_at="2026-07-27T00:00:00Z",
+                roles=("assistant",),
+                receipts=("recall://source:test/assistant?rev=1#item=0",),
+                text="second source record",
+            ),
+        )
+
+        passage = build_passages(
+            tenant_id="tenant:company:test",
+            source_id="source:test",
+            logical_document_id="ldoc_0123456789abcdef0123456789abcdef",
+            revision=1,
+            messages=messages,
+            policy=PassagePolicy(target_tokens=8, overlap_tokens=1),
+        )[0]
+
+        self.assertEqual(
+            passage.first_occurred_at,
+            "2026-07-27T00:00:00Z",
+        )
+        self.assertEqual(
+            passage.last_occurred_at,
+            "2026-07-27T00:00:01Z",
+        )
+
     def test_long_unicode_message_splits_on_utf8_boundaries_and_reconstructs(
         self,
     ) -> None:
