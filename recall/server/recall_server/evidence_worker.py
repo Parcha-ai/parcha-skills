@@ -78,7 +78,6 @@ def run_logical_evidence_worker(
         raise ValueError(
             "logical evidence worker interval seconds must be between 0.1 and 300"
         )
-    seeded = projector.seed_backfill(tenant_id=tenant_id)
     while True:
         result = projector.project_pending(
             tenant_id=tenant_id,
@@ -96,7 +95,6 @@ def run_logical_evidence_worker(
             result["cleanup_failures"],
         )
         if once:
-            return {"seeded": seeded, **result}
-        seeded = 0
+            return result
         if result["documents"] == 0 and result["pruned"] == 0:
             sleep(interval_seconds)

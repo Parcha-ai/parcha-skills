@@ -62,7 +62,7 @@ def result(*, documents: int, records: int, pruned: int = 0) -> dict[str, int | 
 
 
 class LogicalEvidenceWorkerTests(TestCase):
-    def test_once_seeds_and_drains_with_explicit_memory_concurrency(self) -> None:
+    def test_once_drains_without_full_corpus_seed_scan(self) -> None:
         projector = FakeLogicalProjector([result(documents=3, records=42)])
 
         actual = run_logical_evidence_worker(
@@ -75,10 +75,9 @@ class LogicalEvidenceWorkerTests(TestCase):
             once=True,
         )
 
-        self.assertEqual(actual["seeded"], 7)
         self.assertEqual(actual["documents"], 3)
         self.assertEqual(actual["records"], 42)
-        self.assertEqual(projector.seed_calls, ["tenant:company:synthetic"])
+        self.assertEqual(projector.seed_calls, [])
         self.assertEqual(
             projector.project_calls,
             [
