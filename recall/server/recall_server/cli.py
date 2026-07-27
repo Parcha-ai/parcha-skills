@@ -31,6 +31,9 @@ from .evidence_worker import (
 )
 from .logical_evidence import LogicalEvidenceProjectionStore
 from .logical_evidence_projection import CanonicalLogicalEvidenceProjector
+from .passage_index import CanonicalPassageProjector
+from .passage_projection import PassagePolicy
+from .passage_worker import run_passage_worker
 from .federation import QUALITY_SCORES, SOURCE_FAMILIES
 from .live_providers import (
     LiveProviderError,
@@ -164,6 +167,39 @@ def main() -> None:
         "--interval-seconds", type=float, default=5
     )
     logical_evidence_worker.add_argument("--once", action="store_true")
+    passage_backfill = sub.add_parser("backfill-lossless-passages")
+    passage_backfill.add_argument("--tenant", required=True)
+    passage_backfill.add_argument("--target-tokens", type=int, default=1024)
+    passage_backfill.add_argument("--overlap-tokens", type=int, default=128)
+    passage_backfill.add_argument("--batch-size", type=int, default=100)
+    passage_backfill.add_argument("--max-batches", type=int, default=10)
+    passage_backfill.add_argument("--concurrency", type=int, default=4)
+    passage_worker = sub.add_parser("lossless-passage-worker")
+    passage_worker.add_argument("--tenant", required=True)
+    passage_worker.add_argument("--target-tokens", type=int, default=1024)
+    passage_worker.add_argument("--overlap-tokens", type=int, default=128)
+    passage_worker.add_argument(
+        "--projection-batch-size",
+        type=int,
+        default=100,
+    )
+    passage_worker.add_argument(
+        "--embedding-batch-size",
+        type=int,
+        default=128,
+    )
+    passage_worker.add_argument(
+        "--max-batches-per-cycle",
+        type=int,
+        default=10,
+    )
+    passage_worker.add_argument("--concurrency", type=int, default=4)
+    passage_worker.add_argument(
+        "--interval-seconds",
+        type=float,
+        default=5,
+    )
+    passage_worker.add_argument("--once", action="store_true")
     sub.add_parser("export")
     conformance = sub.add_parser("mcp-conformance")
     conformance.add_argument("--config", type=Path, required=True)
@@ -541,6 +577,42 @@ def main() -> None:
                 batch_size=args.batch_size,
                 max_batches_per_cycle=args.max_batches_per_cycle,
                 upload_concurrency=args.upload_concurrency,
+                interval_seconds=args.interval_seconds,
+                once=args.once,
+            )
+        print(json.dumps(result, sort_keys=True))
+    elif args.command in {
+        "backfill-lossless-passages",
+        "lossless-passage-worker",
+    }:
+        projector = CanonicalPassageProjector(
+            store,
+            LogicalEvidenceProjectionStore(
+                build_evidence_archive_store(),
+            ),
+            policy=PassagePolicy(
+                target_tokens=args.target_tokens,
+                overlap_tokens=args.overlap_tokens,
+            ),
+            bound_tenant_id=args.tenant,
+        )
+        if args.command == "backfill-lossless-passages":
+            seeded = projector.seed_backfill(tenant_id=args.tenant)
+            result = projector.project_pending(
+                tenant_id=args.tenant,
+                batch_size=args.batch_size,
+                max_batches=args.max_batches,
+                concurrency=args.concurrency,
+            )
+            result = {"seeded": seeded, **result}
+        else:
+            result = run_passage_worker(
+                projector,
+                tenant_id=args.tenant,
+                projection_batch_size=args.projection_batch_size,
+                embedding_batch_size=args.embedding_batch_size,
+                max_batches_per_cycle=args.max_batches_per_cycle,
+                concurrency=args.concurrency,
                 interval_seconds=args.interval_seconds,
                 once=args.once,
             )

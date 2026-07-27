@@ -1138,6 +1138,28 @@ class CanonicalLogicalEvidenceProjector:
                             )
                         ],
                     )
+                connection.execute(
+                    """INSERT INTO canonical_passage_projection_queue(
+                           tenant_id,source_id,logical_document_id,revision,
+                           generation,reason,changed_at
+                       ) VALUES (%s,%s,%s,%s,1,'logical-update',
+                                 clock_timestamp())
+                       ON CONFLICT(
+                           tenant_id,source_id,logical_document_id
+                       )
+                       DO UPDATE SET
+                           revision=excluded.revision,
+                           generation=
+                               canonical_passage_projection_queue.generation+1,
+                           reason='logical-update',
+                           changed_at=clock_timestamp()""",
+                    (
+                        prepared.tenant_id,
+                        prepared.source_id,
+                        prepared.logical_document_id,
+                        prepared.revision,
+                    ),
+                )
                 deleted = connection.execute(
                     """DELETE FROM canonical_evidence_document_queue
                         WHERE tenant_id=%s AND source_id=%s

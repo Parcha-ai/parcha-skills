@@ -64,7 +64,7 @@ infrastructure. The example is synthetic; a live manifest belongs in a private m
 location and contains references, never credential values.
 
 The production database gate requires a standard PostgreSQL URL with
-`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 40,
+`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 41,
 pgvector 0.8.0 or newer, and a runtime role without superuser, database/role creation,
 replication, or RLS-bypass privilege:
 
@@ -258,6 +258,26 @@ throughput/memory measurement justifies it. The worker pre-warms that bounded
 pool before starting the measured projection. Keep the prior
 `canonical-evidence-worker` running until the
 logical-document integrity, rollback, and consumer cutover gates pass.
+
+Migration 41 adds the disposable, document-linked lossless passage index. It
+packs exact visible user and assistant message bytes into overlapping passages
+without crossing logical documents. Tool text remains available through the
+canonical sparse index; no completion model summarizes, classifies, or segments
+ingestion.
+
+```bash
+python -m recall_server.cli backfill-lossless-passages \
+  --tenant tenant:company:example --target-tokens 1024 \
+  --overlap-tokens 128 --batch-size 100 --max-batches 100 \
+  --concurrency 8
+python -m recall_server.cli lossless-passage-worker \
+  --tenant tenant:company:example --target-tokens 1024 \
+  --overlap-tokens 128
+```
+
+The passage policy is versioned by fingerprint. Evaluate alternative target and
+overlap values on a shadow database; production keeps one policy and deletes
+losing variants after cutover.
 
 `recall_deep_search` first uses canonical retrieval to select authorized
 candidates, passes only opaque evidence keys and exact allowed receipts to a

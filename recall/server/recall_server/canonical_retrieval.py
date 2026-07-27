@@ -20,6 +20,8 @@ from .deep_inspection import (
 )
 from .federation import SOURCE_FAMILIES
 from .projectors import legacy_engine
+from .passage_projection import PassagePolicy
+from .passage_retrieval import PassageHintRetrieval
 
 AUTHORITY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._/@+-]{1,255}\Z")
 UUID_RE = re.compile(
@@ -123,11 +125,16 @@ class CanonicalRetrieval:
         *,
         evidence_projector: Any = None,
         deep_inspector: Any = None,
+        passage_policy: PassagePolicy | None = None,
     ):
         self.store = store
         self.archive = archive
         self.evidence_projector = evidence_projector
         self.deep_inspector = deep_inspector
+        self.passage_policy = passage_policy or PassagePolicy(
+            target_tokens=1024,
+            overlap_tokens=128,
+        )
 
     def bind(self, principal: dict[str, Any]) -> BoundCanonicalRetrieval:
         tenant_id = principal.get("tenant_id")
@@ -158,6 +165,7 @@ class CanonicalRetrieval:
             archive=self.archive,
             evidence_projector=self.evidence_projector,
             deep_inspector=self.deep_inspector,
+            passage_policy=self.passage_policy,
         )
 
     def embed_pending(
@@ -440,6 +448,7 @@ class BoundCanonicalRetrieval:
         archive: Any = None,
         evidence_projector: Any = None,
         deep_inspector: Any = None,
+        passage_policy: PassagePolicy | None = None,
     ):
         self.store = store
         self.tenant_id = tenant_id
@@ -448,6 +457,10 @@ class BoundCanonicalRetrieval:
         self.archive = archive
         self.evidence_projector = evidence_projector
         self.deep_inspector = deep_inspector
+        self.passage_policy = passage_policy or PassagePolicy(
+            target_tokens=1024,
+            overlap_tokens=128,
+        )
 
     @staticmethod
     def _filters(
@@ -766,6 +779,53 @@ class BoundCanonicalRetrieval:
                 "lexical_mode": lexical_mode,
             },
         }
+
+    def passage_hints(
+        self,
+        query: str,
+        filters: dict[str, Any] | None = None,
+        limit: int = 10,
+    ) -> dict[str, Any]:
+        """Return document/range hints without answering the natural question."""
+
+        if not isinstance(query, str) or not query.strip() or len(query) > 8192:
+            raise ValueError("invalid passage hint query")
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 20
+        ):
+            raise ValueError("invalid passage hint limit")
+        source_id, source_family, source_alias, since, until = self._filters(
+            filters or {}
+        )
+        sources = self._sources(
+            source_id=source_id,
+            source_family=source_family,
+            source_alias=source_alias,
+        )
+        if not sources:
+            return {
+                "results": [],
+                "diagnostics": {
+                    "engine": "lossless-passages-v1",
+                    "reason": "no-authorized-sources",
+                },
+            }
+        informative = _informative_query_terms(query)
+        lexical_query = " ".join(informative) if informative else query
+        return PassageHintRetrieval(
+            self.store,
+            tenant_id=self.tenant_id,
+            sources=sources,
+            policy_fingerprint=self.passage_policy.fingerprint,
+        ).search(
+            query,
+            lexical_query=lexical_query,
+            since=since,
+            until=until,
+            limit=limit,
+        )
 
     def _receipt_event(
         self,
