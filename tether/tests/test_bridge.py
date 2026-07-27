@@ -345,6 +345,61 @@ class StoreTest(unittest.TestCase):
             "ok": True, "team_id": "T12345678", "user_id": "U12345678", "user": "agent",
         })
 
+    def test_user_lookup_returns_only_sanitized_human_matches(self):
+        broker = self.runtime.Broker("test-token", self.store)
+        with mock.patch.dict(
+            os.environ, {"SLACK_ALLOWED_USERS": "U12345678"}, clear=False,
+        ), mock.patch.object(self.runtime, "_slack_call", return_value={
+            "ok": True,
+            "members": [
+                {
+                    "id": "U12345678", "name": "aj", "real_name": "AJ Example",
+                    "profile": {"display_name": "AJ", "email": "private@example.com"},
+                },
+                {"id": "U87654321", "name": "agent", "is_bot": True},
+            ],
+        }):
+            result = broker.handle({"op": "users", "query": "AJ"})
+        self.assertEqual(result["users"], [{
+            "id": "U12345678", "name": "aj", "real_name": "AJ Example", "display_name": "AJ",
+        }])
+        self.assertNotIn("email", result["users"][0])
+
+    def test_group_dm_is_allowlisted_brokered_and_bound(self):
+        broker = self.runtime.Broker("test-token", self.store)
+        request = {
+            "op": "dm", "text": "Q is ready. Please schedule the reboot.",
+            "source_kind": "headless_run", "source": {"run_id": "intro", "cwd": "/tmp/project"},
+            "user_ids": ["U12345678", "U87654321"], "team_id": "T12345678",
+            "idempotency_key": "q-intro",
+        }
+        with mock.patch.dict(
+            os.environ, {"SLACK_ALLOWED_USERS": "U12345678,U87654321"}, clear=False,
+        ), mock.patch.object(
+            self.runtime, "_slack_call", return_value={"ok": True, "channel": {"id": "G12345678"}},
+        ) as call, mock.patch.object(
+            broker, "_ensure_channel_membership",
+        ), mock.patch.object(self.runtime, "slack_post", return_value="123.456") as post:
+            result = broker.handle(request)
+        call.assert_called_once_with(
+            "test-token", "conversations.open",
+            {"users": "U12345678,U87654321", "return_im": True},
+        )
+        self.assertEqual(result["channel_id"], "G12345678")
+        self.assertEqual(self.store.get(result["bridge_id"]).channel_id, "G12345678")
+        self.assertIn("Q is ready", post.call_args.args[2])
+
+    def test_group_dm_rejects_nonoperators(self):
+        broker = self.runtime.Broker("test-token", self.store)
+        with mock.patch.dict(
+            os.environ, {"SLACK_ALLOWED_USERS": "U12345678"}, clear=False,
+        ), self.assertRaisesRegex(ValueError, "authorized Hermes operator"):
+            broker.handle({
+                "op": "dm", "text": "Hello.", "source_kind": "headless_run",
+                "source": {"run_id": "intro", "cwd": "/tmp/project"},
+                "user_ids": ["U99999999"], "idempotency_key": "blocked",
+            })
+
     def test_brokered_thread_post_does_not_create_a_second_bridge(self):
         broker = self.runtime.Broker("test-token", self.store)
         with mock.patch.object(broker, "_ensure_channel_membership"), mock.patch.object(

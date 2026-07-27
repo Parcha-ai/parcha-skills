@@ -33,6 +33,12 @@ Native Codex and Claude Code replies resume the captured session. Zellij-only re
 
 Tether uses Socket Mode for immediate replies and polls recent active bridge threads as a deduplicated recovery path. A reply missed during a websocket disconnect or gateway restart is admitted through the same allowlist and owner checks, then handled once. Do not add a second relay or polling script.
 
+For an explicitly requested direct or group message, resolve recipients with
+`tether users --query '<name>'`, then use `tether dm --user U... [--user U...]`
+with a stable idempotency key. The broker opens the conversation and keeps the
+Slack credential inside Hermes. Every recipient must already be an authorized
+Hermes operator; Tether refuses arbitrary recipients.
+
 When a bound session is busy, Tether batches queued follow-ups into one next turn. The bound agent
 is the sole writer for that batch: it posts at most one useful reply, or `NO_REPLY` when an earlier
 response already handled the thread. Bound-session replies default to 50 words, 500 characters,

@@ -23,3 +23,6 @@ python ~/.codex/skills/hermes-slack-bridge/scripts/hermes_notify.py notify \
 Use `--run-id` for a durable headless run. Use the exact `reply` command supplied
 to a resumed native session. Do not call Slack APIs directly, expose credentials,
 or invent a replacement session when the bound source is stale.
+
+For a user-requested DM, use `users --query` and `dm --user U...`; the broker
+permits only authorized Hermes operators and keeps the Slack token private.

@@ -76,7 +76,9 @@ SLACK_METHOD_PATHS = {
     "chat.postMessage": "/api/chat.postMessage",
     "conversations.history": "/api/conversations.history",
     "conversations.join": "/api/conversations.join",
+    "conversations.open": "/api/conversations.open",
     "conversations.replies": "/api/conversations.replies",
+    "users.list": "/api/users.list",
 }
 class BridgeRequest(TypedDict, total=False):
     op: str
@@ -92,6 +94,8 @@ class BridgeRequest(TypedDict, total=False):
     reply_key: str
     file_path: str | None
     limit: int
+    query: str
+    user_ids: list[str]
 
 
 @dataclass(frozen=True)
@@ -654,7 +658,7 @@ def _slack_call(token: str, method: str, payload: dict[str, Any]) -> dict[str, A
     connection = http.client.HTTPSConnection("slack.com", timeout=30)
     try:
         headers = {"Authorization": "Bearer " + token}
-        if method == "conversations.replies":
+        if method in {"conversations.replies", "users.list"}:
             query = urllib.parse.urlencode(payload)
             connection.request("GET", f"{path}?{query}", headers=headers)
         else:
@@ -994,6 +998,65 @@ class Broker:
         )
         return {"ok": True, "thread_ts": thread_ts, "message_ts": message_ts}
 
+    def _users(self, request: BridgeRequest, allowed_users: tuple[str, ...]) -> dict[str, Any]:
+        query = str(request.get("query") or "").strip().casefold()
+        if not query:
+            raise ValueError("user query is required")
+        result = _slack_call(self.token, "users.list", {"limit": 200})
+        allowed = set(allowed_users)
+        matches = []
+        for member in result.get("members", []):
+            if (
+                not isinstance(member, dict)
+                or str(member.get("id") or "") not in allowed
+                or member.get("deleted")
+                or member.get("is_bot")
+            ):
+                continue
+            profile = member.get("profile") if isinstance(member.get("profile"), dict) else {}
+            candidate = {
+                "id": str(member.get("id") or ""),
+                "name": str(member.get("name") or ""),
+                "real_name": str(member.get("real_name") or profile.get("real_name") or ""),
+                "display_name": str(profile.get("display_name") or ""),
+            }
+            if query in " ".join(candidate.values()).casefold():
+                matches.append(candidate)
+        return {"ok": True, "users": matches[:20]}
+
+    def _direct_message(
+        self,
+        incoming: BridgeRequest,
+        config: Config,
+        allowed_users: tuple[str, ...],
+    ) -> dict[str, Any]:
+        recipients = tuple(dict.fromkeys(str(item) for item in incoming.get("user_ids", [])))
+        if not 1 <= len(recipients) <= 7:
+            raise ValueError("a DM requires between one and seven unique recipients")
+        if any(not ID_PATTERN.fullmatch(user_id) for user_id in recipients):
+            raise ValueError("DM recipient is not a valid Slack member ID")
+        allowed = set(allowed_users)
+        if not allowed or any(user_id not in allowed for user_id in recipients):
+            raise ValueError("every DM recipient must be an authorized Hermes operator")
+        text = validate_reply_text(str(incoming.get("text") or ""), config)
+        opened = _slack_call(
+            self.token,
+            "conversations.open",
+            {"users": ",".join(recipients), "return_im": True},
+        )
+        channel = opened.get("channel")
+        channel_id = str(channel.get("id") if isinstance(channel, dict) else "")
+        if not ID_PATTERN.fullmatch(channel_id):
+            raise RuntimeError("Slack opened a DM without a valid channel ID")
+        request = BridgeRequest(incoming)
+        request["text"] = text
+        request["channel_id"] = channel_id
+        request["owner_user_id"] = "*"
+        request["team_id"] = str(request.get("team_id") or config.team_id)
+        result = self._notify(request, config, allowed_users)
+        result["channel_id"] = channel_id
+        return result
+
     def handle(self, request: BridgeRequest) -> dict[str, Any]:
         operation = str(request.get("op", "notify"))
         config = load_config()
@@ -1018,6 +1081,11 @@ class Broker:
             return self._thread_history(request, config)
         if operation == "thread_reply":
             return self._thread_reply(request, config)
+        if operation == "users":
+            return self._users(request, allowed_users)
+        if operation == "dm":
+            with self._notify_lock:
+                return self._direct_message(request, config, allowed_users)
         raise ValueError("unsupported operation")
 
 

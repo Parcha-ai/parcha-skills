@@ -61,6 +61,19 @@ Replies continue as a durable Hermes operator conversation, even after the origi
 
 You can also add `--channel C…`, `--owner U…`, or `--file /absolute/path/report.png`. Keep destinations in operator config and secrets out of message text.
 
+For an explicitly requested direct or group message, resolve only authorized
+operators and open the conversation through the broker:
+
+```bash
+tether users --query "Alex"
+tether dm --user U12345678 --user U87654321 \
+  --run-id onboarding --idempotency-key onboarding-2026-01 \
+  --text "The machine is ready. Please test SSH."
+```
+
+The Slack token never enters the caller, and Tether refuses recipients outside
+Hermes's configured human allowlist.
+
 ## Level 4: understand the trick
 
 ```text

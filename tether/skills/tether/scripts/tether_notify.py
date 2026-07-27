@@ -147,6 +147,15 @@ def build_parser() -> argparse.ArgumentParser:
     thread.add_argument("--channel", required=True)
     thread.add_argument("--thread-ts", required=True)
     thread.add_argument("--limit", type=int, default=100)
+    users = sub.add_parser("users")
+    users.add_argument("--query", required=True)
+    dm = sub.add_parser("dm")
+    dm.add_argument("--user", action="append", required=True)
+    dm.add_argument("--text", required=True)
+    dm.add_argument("--team")
+    dm.add_argument("--idempotency-key", required=True)
+    dm.add_argument("--run-id")
+    dm.add_argument("--hermes-session-id")
     sub.add_parser("doctor")
     sub.add_parser("identity")
     setup = sub.add_parser("setup")
@@ -306,6 +315,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             "limit": args.limit,
         })
         print(json.dumps(result["messages"], ensure_ascii=False))
+        return 0
+    elif args.command == "users":
+        result = broker_call({"op": "users", "query": args.query})
+        print(json.dumps(result["users"], ensure_ascii=False))
+        return 0
+    elif args.command == "dm":
+        kind, source = detected_source(args)
+        result = broker_call({
+            "op": "dm", "text": args.text, "source_kind": kind, "source": source,
+            "user_ids": args.user, "team_id": args.team or "",
+            "idempotency_key": args.idempotency_key,
+        })
+        print(result["channel_id"])
         return 0
     else:
         kind, source = detected_source(args)
