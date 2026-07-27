@@ -580,22 +580,16 @@ class BoundCanonicalRetrieval:
         def lexical_rows(
             connection: Any,
             search_query: str,
-            *,
-            minimum_matches: int,
-            literal: bool,
         ) -> list[dict[str, Any]]:
-            query_parser = (
-                "plainto_tsquery" if literal else "websearch_to_tsquery"
-            )
-            rows = self.store._execute_bounded(
+            return self.store._execute_bounded(
                 connection,
-                f"""WITH candidates AS MATERIALIZED (
+                """WITH candidates AS MATERIALIZED (
                      SELECT chunk.tenant_id,chunk.source_id,chunk.document_id,
                             chunk.chunk_id,chunk.text_redacted,chunk.receipt,
                             chunk.search_vector,
                             ts_rank_cd(
                               chunk.search_vector,
-                              {query_parser}('simple',%s),
+                              plainto_tsquery('simple',%s),
                               32
                             ) AS score
                      FROM canonical_chunks chunk
@@ -603,19 +597,14 @@ class BoundCanonicalRetrieval:
                        AND chunk.source_id=ANY(%s)
                        AND chunk.deleted_at IS NULL
                        AND chunk.search_vector @@
-                           {query_parser}('simple',%s)
+                           plainto_tsquery('simple',%s)
                      ORDER BY score DESC,chunk.chunk_id
                      LIMIT %s
                    )
                    SELECT candidate.source_id,document.native_id,document.revision,
                           event.native_parent_id,event.occurred_at,event.observed_at,
                           event.created_at,candidate.text_redacted,candidate.receipt,
-                          candidate.score,
-                          (SELECT count(*)
-                             FROM unnest(%s::text[]) AS query_term(value)
-                            WHERE candidate.search_vector @@
-                                  plainto_tsquery('simple',query_term.value)
-                          ) AS matched_term_count
+                          candidate.score
                    FROM candidates candidate
                    JOIN canonical_documents document
                      USING(tenant_id,source_id,document_id)
@@ -625,8 +614,8 @@ class BoundCanonicalRetrieval:
                      AND document.deleted_at IS NULL
                      AND (%s::timestamptz IS NULL OR event.occurred_at>=%s)
                      AND (%s::timestamptz IS NULL OR event.occurred_at<=%s)
-                   ORDER BY matched_term_count DESC,score DESC,
-                            event.occurred_at DESC,candidate.chunk_id
+                   ORDER BY score DESC,event.occurred_at DESC,
+                            candidate.chunk_id
                    LIMIT %s""",
                 (
                     search_query,
@@ -634,7 +623,6 @@ class BoundCanonicalRetrieval:
                     sources,
                     search_query,
                     lexical_candidate_limit,
-                    informative,
                     since,
                     since,
                     until,
@@ -643,33 +631,12 @@ class BoundCanonicalRetrieval:
                 ),
                 lexical_deadline_at,
             ).fetchall()
-            return [
-                row
-                for row in rows
-                if int(row["matched_term_count"]) >= minimum_matches
-            ]
 
         strict_query = " ".join(informative)
         try:
             with self.store.connect() as connection:
-                lexical = lexical_rows(
-                    connection,
-                    strict_query,
-                    minimum_matches=len(informative),
-                    literal=True,
-                )
-                lexical_mode = "strict"
-                if not lexical and len(informative) > 1:
-                    relaxed_query = " OR ".join(
-                        f'"{term}"' for term in informative
-                    )
-                    lexical = lexical_rows(
-                        connection,
-                        relaxed_query,
-                        minimum_matches=2 if len(informative) >= 3 else 1,
-                        literal=False,
-                    )
-                    lexical_mode = "relaxed" if lexical else "relaxed-empty"
+                lexical = lexical_rows(connection, strict_query)
+                lexical_mode = "strict" if lexical else "strict-empty"
         except SearchDeadlineExceeded:
             lexical = []
             lexical_mode = "deadline-exceeded"

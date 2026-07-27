@@ -194,7 +194,7 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
 
         retrieval.search("ATI harness default runtime")
 
-        self.assertEqual(len(store.sql), 2)
+        self.assertEqual(len(store.sql), 1)
         for sql in store.sql:
             self.assertIn("WITH candidates AS MATERIALIZED", sql)
             self.assertIn("FROM candidates candidate", sql)
@@ -202,6 +202,21 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
                 sql.index("LIMIT %s ) SELECT"),
                 sql.index("JOIN canonical_documents"),
             )
+
+    def test_empty_strict_search_does_not_issue_a_broad_or_scan(self) -> None:
+        store = RecordingStore()
+        retrieval = BoundCanonicalRetrieval(
+            store,
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=("codex.jsonl:test",),
+        )
+
+        result = retrieval.search("ATI harness default runtime")
+
+        self.assertEqual(len(store.sql), 1)
+        self.assertEqual(result["diagnostics"]["lexical_mode"], "strict-empty")
+        self.assertNotIn(" OR ", store.values[0][0])
 
     def test_strict_lexical_query_treats_uuid_hyphens_as_text(self) -> None:
         store = RecordingStore()
