@@ -360,7 +360,7 @@ class PassageProjectionTests(unittest.TestCase):
 
         self.assertIn("FROM canonical_passages passage", source)
         self.assertIn("canonical_passage_embeddings", source)
-        self.assertIn("runtime.embed_documents(", source)
+        self.assertIn("runtime.embed_passages(", source)
         self.assertNotIn("chat", source.casefold())
         self.assertNotIn("completion", source.casefold())
         self.assertNotIn("canonical_chunk_embeddings", source)

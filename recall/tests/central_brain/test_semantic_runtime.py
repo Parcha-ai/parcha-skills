@@ -180,6 +180,40 @@ class SemanticRuntimeContractTest(unittest.TestCase):
                 ],
             )
 
+    def test_passage_embeddings_preserve_the_complete_passage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            key = Path(temporary) / "embedding.key"
+            key.write_text("short-lived-synthetic-embedding-key")
+            os.chmod(key, 0o600)
+            runtime = SemanticRuntime(
+                embedding_protocol="voyage",
+                embedding_url="https://api.voyage.example",
+                embedding_approved_url="https://api.voyage.example",
+                embedding_key_file=str(key),
+                model="voyage-synthetic",
+                revision="voyage-synthetic-v1",
+                dimensions=512,
+            )
+            passage = "begin-" + ("x" * MAX_DOCUMENT_CHARS) + "-end"
+            response = {
+                "object": "list",
+                "data": [
+                    {
+                        "object": "embedding",
+                        "index": 0,
+                        "embedding": [0.0] * 512,
+                    }
+                ],
+                "model": "voyage-synthetic",
+            }
+            with mock.patch.object(
+                runtime, "_post", return_value=response
+            ) as post:
+                runtime.embed_passages([passage])
+
+            self.assertEqual(post.call_args.args[1]["input"], [passage])
+            self.assertNotEqual(runtime.passage_fingerprint, runtime.fingerprint)
+
     def test_managed_embedding_retries_one_malformed_json_response(self) -> None:
         runtime = SemanticRuntime(
             embedding_protocol="voyage",

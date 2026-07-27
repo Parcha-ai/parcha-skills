@@ -309,7 +309,7 @@ class PassageHintRetrieval:
                             vector,
                             self.tenant_id,
                             self.sources,
-                            runtime.fingerprint,
+                            runtime.passage_fingerprint,
                             vector,
                             candidate_limit * 5,
                             self.policy_fingerprint,

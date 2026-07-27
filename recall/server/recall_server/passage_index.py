@@ -539,7 +539,7 @@ class CanonicalPassageProjector:
                                      passage.passage_id
                             LIMIT %s""",
                         (
-                            runtime.fingerprint,
+                            runtime.passage_fingerprint,
                             self.policy.fingerprint,
                             tenant_scope,
                             tenant_scope,
@@ -549,7 +549,7 @@ class CanonicalPassageProjector:
                     connection.commit()
                     if not rows:
                         break
-                    vectors = runtime.embed_documents(
+                    vectors = runtime.embed_passages(
                         [row["text_redacted"] for row in rows]
                     )
                     with connection.transaction():
@@ -578,7 +578,7 @@ class CanonicalPassageProjector:
                                         row["passage_id"],
                                         runtime.model,
                                         row["text_sha256"],
-                                        runtime.fingerprint,
+                                        runtime.passage_fingerprint,
                                         vector,
                                     )
                                     for row, vector in zip(
@@ -610,7 +610,7 @@ class CanonicalPassageProjector:
                               AND embedding.passage_id IS NULL
                        ) AS value""",
                     (
-                        runtime.fingerprint,
+                        runtime.passage_fingerprint,
                         self.policy.fingerprint,
                         tenant_scope,
                         tenant_scope,

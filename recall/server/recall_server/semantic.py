@@ -23,6 +23,7 @@ QUERY_INSTRUCTION = (
     "Query: "
 )
 DOCUMENT_EMBEDDING_CONTRACT = "recall.document-embedding.v5:head-tail-4096"
+PASSAGE_EMBEDDING_CONTRACT = "recall.passage-embedding.v1:full-text"
 DEFAULT_EMBEDDING_REVISION = "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3"
 MAX_SEMANTIC_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_DOCUMENT_CHARS = 4096
@@ -304,6 +305,21 @@ class SemanticRuntime:
         )
         return hashlib.sha256(value.encode()).hexdigest()
 
+    @property
+    def passage_fingerprint(self) -> str:
+        value = "\0".join(
+            (
+                PASSAGE_EMBEDDING_CONTRACT,
+                self.embedding_protocol,
+                self.model,
+                self.revision,
+                str(self.dimensions),
+                self.document_prefix,
+                self.query_prefix,
+            )
+        )
+        return hashlib.sha256(value.encode()).hexdigest()
+
     @staticmethod
     def _cache_key(value: str) -> str:
         return hashlib.sha256(value.encode()).hexdigest()
@@ -440,22 +456,31 @@ class SemanticRuntime:
             return self.embedding_url + "/embeddings"
         return self.embedding_url + "/v1/embeddings"
 
-    def _embed(self, texts: list[str], *, input_type: str) -> list[list[float]]:
+    def _embed(
+        self,
+        texts: list[str],
+        *,
+        input_type: str,
+        clip_documents: bool = True,
+    ) -> list[list[float]]:
         if not texts:
             return []
         lock = self._embedding_lock or nullcontext()
         with lock:
             self._ensure_embedding_identity()
+            prefix = (
+                self.document_prefix
+                if input_type == "document"
+                else self.query_prefix
+            )
+            prepare = (
+                self._document_text
+                if input_type == "document" and clip_documents
+                else str
+            )
             batches = [
                 [
-                    self._document_text(
-                        (
-                            self.document_prefix
-                            if input_type == "document"
-                            else self.query_prefix
-                        )
-                        + value
-                    )
+                    prepare(prefix + value)
                     for value in texts[start : start + self.embedding_batch_size]
                 ]
                 for start in range(0, len(texts), self.embedding_batch_size)
@@ -566,6 +591,15 @@ class SemanticRuntime:
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         return self._embed(texts, input_type="document")
+
+    def embed_passages(self, texts: list[str]) -> list[list[float]]:
+        """Embed bounded passages without applying the legacy 4,096-char clip."""
+
+        return self._embed(
+            texts,
+            input_type="document",
+            clip_documents=False,
+        )
 
     @staticmethod
     def _document_text(value: str) -> str:
