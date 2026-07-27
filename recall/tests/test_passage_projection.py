@@ -361,6 +361,10 @@ class PassageProjectionTests(unittest.TestCase):
             ),
         }
 
+        class StreamingPayload(bytes):
+            def splitlines(self, *args, **kwargs):
+                raise AssertionError("projection must not materialize all lines")
+
         class Projection:
             @staticmethod
             def read_manifest(_reference, *, tenant_id, source_id):
@@ -394,7 +398,7 @@ class PassageProjectionTests(unittest.TestCase):
             def read_part(_reference, *, tenant_id, source_id):
                 self.assertEqual(tenant_id, "tenant:company:test")
                 self.assertEqual(source_id, "source:test")
-                return payload
+                return StreamingPayload(payload)
 
         projector = CanonicalPassageProjector(
             object(),

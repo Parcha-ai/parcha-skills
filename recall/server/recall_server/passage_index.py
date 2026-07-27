@@ -7,7 +7,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import datetime
-from typing import Any
+from io import BytesIO
+from typing import Any, Iterator
 
 from .logical_evidence import (
     LogicalEvidenceError,
@@ -20,7 +21,6 @@ from .passage_projection import (
     decode_logical_record,
     visible_messages,
 )
-
 
 MAX_PASSAGE_PROJECTION_BATCH = 1_000
 MAX_PASSAGE_EMBEDDING_BATCH = 5_000
@@ -254,36 +254,42 @@ class CanonicalPassageProjector:
             != len(candidate.part_references)
         ):
             raise LogicalEvidenceError("passage_manifest_catalog_mismatch")
-        records = []
-        for ordinal, reference in enumerate(candidate.part_references):
-            manifest_part = manifest["parts"][ordinal]
-            if (
-                manifest_part.get("ordinal") != ordinal
-                or any(
-                    manifest_part.get(field) != reference[field]
-                    for field in (
-                        "artifact_id",
-                        "object_key",
-                        "content_sha256",
-                        "size_bytes",
-                        "media_type",
-                        "version_id",
+        def records() -> Iterator[Any]:
+            for ordinal, reference in enumerate(candidate.part_references):
+                manifest_part = manifest["parts"][ordinal]
+                if (
+                    manifest_part.get("ordinal") != ordinal
+                    or any(
+                        manifest_part.get(field) != reference[field]
+                        for field in (
+                            "artifact_id",
+                            "object_key",
+                            "content_sha256",
+                            "size_bytes",
+                            "media_type",
+                            "version_id",
+                        )
                     )
+                ):
+                    raise LogicalEvidenceError(
+                        "passage_manifest_part_mismatch"
+                    )
+                payload = self.logical_projection.read_part(
+                    reference,
+                    tenant_id=candidate.tenant_id,
+                    source_id=candidate.source_id,
                 )
-            ):
-                raise LogicalEvidenceError("passage_manifest_part_mismatch")
-            payload = self.logical_projection.read_part(
-                reference,
-                tenant_id=candidate.tenant_id,
-                source_id=candidate.source_id,
-            )
-            if not payload.endswith(b"\n"):
-                raise LogicalEvidenceError("passage_logical_part_invalid")
-            records.extend(
-                decode_logical_record(line, source_id=candidate.source_id)
-                for line in payload.splitlines(keepends=True)
-            )
-        messages = visible_messages(records)
+                if not payload.endswith(b"\n"):
+                    raise LogicalEvidenceError(
+                        "passage_logical_part_invalid"
+                    )
+                for line in BytesIO(payload):
+                    yield decode_logical_record(
+                        line,
+                        source_id=candidate.source_id,
+                    )
+
+        messages = visible_messages(records())
         passages = (
             build_passages(
                 tenant_id=candidate.tenant_id,
