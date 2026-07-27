@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -442,6 +443,7 @@ class CanonicalPassageProjector:
         prepare_pool = getattr(self.store, "prepare_pool", None)
         if callable(prepare_pool):
             prepare_pool(concurrency)
+        started = time.monotonic()
         documents = passages = stale = batches = 0
         while batches < max_batches:
             candidates = self._pending(
@@ -455,8 +457,18 @@ class CanonicalPassageProjector:
                 thread_name_prefix="recall-passage-projector",
             ) as executor:
                 prepared_documents = list(executor.map(self._prepare, candidates))
-            for prepared in prepared_documents:
-                status = self._commit(prepared)
+            with ThreadPoolExecutor(
+                max_workers=min(concurrency, len(prepared_documents)),
+                thread_name_prefix="recall-passage-commit",
+            ) as executor:
+                statuses = list(
+                    executor.map(self._commit, prepared_documents)
+                )
+            for prepared, status in zip(
+                prepared_documents,
+                statuses,
+                strict=True,
+            ):
                 if status == "stale":
                     stale += 1
                     continue
@@ -470,6 +482,7 @@ class CanonicalPassageProjector:
                     WHERE (%s::text IS NULL OR tenant_id=%s)""",
                 (tenant_id, tenant_id),
             ).fetchone()["count"]
+        elapsed_seconds = max(0.001, time.monotonic() - started)
         return {
             "status": "complete" if int(pending) == 0 else "pending",
             "documents": documents,
@@ -477,6 +490,15 @@ class CanonicalPassageProjector:
             "stale": stale,
             "batches": batches,
             "pending": int(pending),
+            "elapsed_seconds": round(elapsed_seconds, 3),
+            "documents_per_second": round(
+                documents / elapsed_seconds,
+                3,
+            ),
+            "passages_per_second": round(
+                passages / elapsed_seconds,
+                3,
+            ),
         }
 
     def embed_pending(

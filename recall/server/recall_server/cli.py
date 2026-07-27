@@ -424,7 +424,17 @@ def main() -> None:
                 json.dumps({"status": "rejected", "code": error.code}), file=sys.stderr
             )
             raise SystemExit(2) from None
-    store = BrainStore(args.dsn, semantic_runtime=SemanticRuntime.from_env())
+    pool_max_size = (
+        max(8, args.concurrency)
+        if args.command
+        in {"backfill-lossless-passages", "lossless-passage-worker"}
+        else None
+    )
+    store = BrainStore(
+        args.dsn,
+        semantic_runtime=SemanticRuntime.from_env(),
+        pool_max_size=pool_max_size,
+    )
     if args.command == "migrate":
         store.migrate()
         print(json.dumps({"status": "ok", "schema_version": SCHEMA_VERSION}))
