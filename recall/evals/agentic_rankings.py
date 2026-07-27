@@ -161,6 +161,79 @@ def resolve_logical_boundaries(
     return candidates
 
 
+def resolve_passage_boundaries(
+    results: list[dict[str, Any]],
+    *,
+    tenant_id: str,
+    authorized_sources: tuple[str, ...],
+    lookup: Callable[
+        [tuple[tuple[str, str], ...]],
+        dict[tuple[str, str], dict[str, Any]],
+    ],
+) -> list[dict[str, Any]]:
+    """Validate document-level passage hints against the current catalog."""
+
+    if not isinstance(results, list):
+        raise EvaluationInputError("Recall passage response is invalid")
+    ranked: list[tuple[tuple[str, str], str, int]] = []
+    seen: set[tuple[str, str]] = set()
+    for result in results:
+        if not isinstance(result, dict):
+            raise EvaluationInputError("Recall passage result is invalid")
+        source_id = result.get("source_id")
+        native_parent_id = result.get("native_parent_id")
+        document_id = result.get("logical_document_id")
+        revision = result.get("revision")
+        if (
+            not isinstance(source_id, str)
+            or AUTHORITY_RE.fullmatch(source_id) is None
+            or not isinstance(native_parent_id, str)
+            or not native_parent_id
+            or not isinstance(document_id, str)
+            or DOCUMENT_ID_RE.fullmatch(document_id) is None
+            or isinstance(revision, bool)
+            or not isinstance(revision, int)
+            or revision < 1
+        ):
+            raise EvaluationInputError(
+                "Recall passage result boundary is invalid"
+            )
+        key = (source_id, native_parent_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        ranked.append((key, document_id, revision))
+        if len(ranked) == MAX_CANDIDATES:
+            break
+    catalog = lookup(tuple(value[0] for value in ranked))
+    authorized = set(authorized_sources)
+    candidates = []
+    for key, document_id, revision in ranked:
+        source_id, native_parent_id = key
+        expected_id = _logical_document_id(
+            tenant_id,
+            source_id,
+            native_parent_id,
+        )
+        row = catalog.get(key)
+        pointer_valid = bool(
+            row is not None
+            and document_id == expected_id
+            and row.get("logical_document_id") == document_id
+            and row.get("revision") == revision
+        )
+        candidates.append(
+            {
+                "logical_document_id": document_id,
+                "source_id": source_id,
+                "revision": revision,
+                "pointer_valid": pointer_valid,
+                "authorized": source_id in authorized,
+            }
+        )
+    return candidates
+
+
 def _logical_document_id(
     tenant_id: str,
     source_id: str,
@@ -202,11 +275,21 @@ def _retrieval_error(response: Any) -> str:
     diagnostics = response.get("diagnostics")
     if not isinstance(diagnostics, dict):
         return ""
-    if diagnostics.get("lexical_mode") == "deadline-exceeded":
+    if (
+        diagnostics.get("lexical_mode") == "deadline-exceeded"
+        or diagnostics.get("passage_lexical_status") == "deadline-exceeded"
+        or diagnostics.get("sparse_status") == "deadline-exceeded"
+    ):
         return "RetrievalLexicalDeadlineExceeded"
-    if diagnostics.get("semantic_status") == "deadline-exceeded":
+    if (
+        diagnostics.get("semantic_status") == "deadline-exceeded"
+        or diagnostics.get("dense_status") == "deadline-exceeded"
+    ):
         return "RetrievalSemanticDeadlineExceeded"
-    if diagnostics.get("semantic_status") == "unavailable":
+    if (
+        diagnostics.get("semantic_status") == "unavailable"
+        or diagnostics.get("dense_status") == "unavailable"
+    ):
         return "RetrievalBackendUnavailable"
     return ""
 
@@ -322,6 +405,7 @@ def _live_rankings(
     repo_root: Path,
     run_id: str,
     workers: int,
+    retrieval_mode: str,
 ) -> dict[str, Any]:
     from recall_server.canonical_retrieval import BoundCanonicalRetrieval
     from recall_server.db import BrainStore
@@ -346,7 +430,12 @@ def _live_rankings(
         authorized_sources=source_ids,
     )
 
+    if retrieval_mode not in {"event", "passage"}:
+        raise EvaluationInputError("private ranking retrieval mode is invalid")
+
     def search(question: str) -> dict[str, Any]:
+        if retrieval_mode == "passage":
+            return retrieval.passage_hints(question, limit=MAX_CANDIDATES)
         return retrieval.search(question, limit=MAX_CANDIDATES)
 
     def lookup(
@@ -380,7 +469,12 @@ def _live_rankings(
         }
 
     def resolve(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return resolve_logical_boundaries(
+        resolver = (
+            resolve_passage_boundaries
+            if retrieval_mode == "passage"
+            else resolve_logical_boundaries
+        )
+        return resolver(
             results,
             tenant_id=tenant_id,
             authorized_sources=source_ids,
@@ -388,7 +482,7 @@ def _live_rankings(
         )
 
     try:
-        return rank_private_questions(
+        report = rank_private_questions(
             input_path,
             output_path,
             search=search,
@@ -397,6 +491,7 @@ def _live_rankings(
             run_id=run_id,
             workers=workers,
         )
+        return {**report, "retrieval_mode": retrieval_mode}
     finally:
         store.close()
 
@@ -411,6 +506,11 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--source", action="append", required=True)
     value.add_argument("--dsn-env", default="RECALL_DATABASE_URL")
     value.add_argument("--workers", type=int, default=4)
+    value.add_argument(
+        "--retrieval-mode",
+        choices=("event", "passage"),
+        default="event",
+    )
     return value
 
 
@@ -429,6 +529,7 @@ def main() -> None:
             repo_root=Path(args.repo_root),
             run_id=args.run_id,
             workers=args.workers,
+            retrieval_mode=args.retrieval_mode,
         )
     except EvaluationInputError as error:
         raise SystemExit(f"agentic rankings rejected: {error}") from None

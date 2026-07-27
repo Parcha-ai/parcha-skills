@@ -121,7 +121,6 @@ class PassageHintRetrieval:
         limit: int,
     ) -> dict[str, Any]:
         candidate_limit = min(400, max(80, limit * 20))
-        deadline = time.monotonic() + self.store.search_deadline_ms / 1000
         with self.store.connect() as connection:
             try:
                 lexical = self.store._execute_bounded(
@@ -176,7 +175,8 @@ class PassageHintRetrieval:
                         until,
                         candidate_limit,
                     ),
-                    deadline,
+                    time.monotonic()
+                    + self.store.search_deadline_ms / 1000,
                 ).fetchall()
                 lexical_status = "ok"
             except SearchDeadlineExceeded:
@@ -235,7 +235,8 @@ class PassageHintRetrieval:
                         until,
                         candidate_limit,
                     ),
-                    deadline,
+                    time.monotonic()
+                    + self.store.search_deadline_ms / 1000,
                 ).fetchall()
                 sparse_status = "ok"
             except SearchDeadlineExceeded:

@@ -10,6 +10,7 @@ from evals.agentic_rankings import (
     _retrieval_error,
     rank_private_questions,
     resolve_logical_boundaries,
+    resolve_passage_boundaries,
 )
 from recall_server.logical_evidence import logical_document_id
 
@@ -77,6 +78,18 @@ class AgenticRankingsTest(unittest.TestCase):
             ),
             "",
         )
+        self.assertEqual(
+            _retrieval_error(
+                {
+                    "diagnostics": {
+                        "dense_status": "ok",
+                        "passage_lexical_status": "deadline-exceeded",
+                        "sparse_status": "ok",
+                    }
+                }
+            ),
+            "RetrievalLexicalDeadlineExceeded",
+        )
 
     def test_resolves_ranked_hits_to_deduplicated_current_boundaries(self) -> None:
         tenant = "tenant:company:synthetic"
@@ -125,6 +138,45 @@ class AgenticRankingsTest(unittest.TestCase):
         self.assertEqual(candidates[1]["revision"], 1)
         self.assertFalse(candidates[1]["pointer_valid"])
         self.assertFalse(candidates[1]["authorized"])
+
+    def test_validates_passage_hits_against_current_boundaries(self) -> None:
+        tenant = "tenant:company:synthetic"
+        source = "codex:linux:synthetic"
+        parent = "session-one"
+        document_id = logical_document_id(tenant, source, parent)
+
+        candidates = resolve_passage_boundaries(
+            [
+                {
+                    "source_id": source,
+                    "native_parent_id": parent,
+                    "logical_document_id": document_id,
+                    "revision": 7,
+                },
+                {
+                    "source_id": source,
+                    "native_parent_id": parent,
+                    "logical_document_id": document_id,
+                    "revision": 7,
+                },
+            ],
+            tenant_id=tenant,
+            authorized_sources=(source,),
+            lookup=lambda _keys: {
+                (source, parent): {
+                    "logical_document_id": document_id,
+                    "revision": 7,
+                }
+            },
+        )
+
+        self.assertEqual(candidates, [{
+            "logical_document_id": document_id,
+            "source_id": source,
+            "revision": 7,
+            "pointer_valid": True,
+            "authorized": True,
+        }])
 
     def test_writes_private_rankings_and_returns_aggregate_only(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
