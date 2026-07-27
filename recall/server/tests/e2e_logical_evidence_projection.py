@@ -486,6 +486,24 @@ def main() -> None:
         assert rebuilt["documents"] == 1
         assert rebuilt["records"] == 3
         assert archive_object_count(archive_root) == 5
+        assert (
+            projector.seed_backfill(
+                tenant_id=tenant,
+                include_existing=True,
+            )
+            == 2
+        )
+        reprojected = projector.project_pending(
+            tenant_id=tenant,
+            batch_size=10,
+            max_batches=1,
+            upload_concurrency=2,
+        )
+        assert reprojected["documents"] == 2
+        assert reprojected["records"] == 6
+        assert reprojected["receipts"] == 7
+        assert reprojected["cleanup_failures"] == 0
+        assert archive_object_count(archive_root) == 5
 
         try:
             projector.project_pending(tenant_id=other_tenant)
@@ -520,7 +538,7 @@ def main() -> None:
                 "source_families": 2,
                 "exact_receipts": 7,
                 "oversized_sql_restorations": 1,
-                "idempotent_reprojects": 0,
+                "idempotent_reprojects": 2,
                 "revision_replacements": 1,
                 "durable_cleanup_retries": 1,
                 "forgotten_receipt_hits": 0,

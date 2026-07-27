@@ -399,11 +399,37 @@ class CanonicalLogicalEvidenceProjector:
             for row in rows
         ]
 
-    def seed_backfill(self, *, tenant_id: str | None = None) -> int:
-        """Queue every current logical document absent from the v2 projection once."""
+    def seed_backfill(
+        self,
+        *,
+        tenant_id: str | None = None,
+        include_existing: bool = False,
+    ) -> int:
+        """Queue missing projections, or every current logical document on request."""
 
         tenant_id = self._tenant(tenant_id)
+        if not isinstance(include_existing, bool):
+            raise LogicalEvidenceError("logical_evidence_rebuild_invalid")
         with self.store.connect() as connection:
+            if include_existing:
+                result = connection.execute(
+                    """INSERT INTO canonical_evidence_document_queue(
+                           tenant_id,source_id,native_parent_id,
+                           generation,reason,changed_at
+                       )
+                       SELECT evidence.tenant_id,evidence.source_id,
+                              evidence.native_parent_id,
+                              1,'backfill',clock_timestamp()
+                         FROM canonical_evidence_documents evidence
+                        WHERE %s::text IS NULL OR evidence.tenant_id=%s
+                       ON CONFLICT(tenant_id,source_id,native_parent_id)
+                       DO UPDATE SET
+                           generation=canonical_evidence_document_queue.generation+1,
+                           reason='backfill',
+                           changed_at=clock_timestamp()""",
+                    (tenant_id, tenant_id),
+                )
+                return max(0, result.rowcount)
             result = connection.execute(
                 """INSERT INTO canonical_evidence_document_queue(
                        tenant_id,source_id,native_parent_id,

@@ -136,6 +136,11 @@ def main() -> None:
     logical_evidence.add_argument("--batch-size", type=int, default=25)
     logical_evidence.add_argument("--max-batches", type=int, default=10)
     logical_evidence.add_argument("--upload-concurrency", type=int, default=2)
+    logical_evidence.add_argument(
+        "--rebuild-existing",
+        action="store_true",
+        help="queue current logical documents even when a projection already exists",
+    )
     logical_evidence_worker = sub.add_parser("logical-evidence-worker")
     logical_evidence_worker.add_argument("--tenant", required=True)
     logical_evidence_worker.add_argument("--batch-size", type=int, default=25)
@@ -504,7 +509,10 @@ def main() -> None:
             raw_archive=build_archive_store(),
         )
         if args.command == "backfill-logical-evidence":
-            seeded = projector.seed_backfill(tenant_id=args.tenant)
+            seeded = projector.seed_backfill(
+                tenant_id=args.tenant,
+                include_existing=args.rebuild_existing,
+            )
             result = projector.project_pending(
                 tenant_id=args.tenant,
                 batch_size=args.batch_size,

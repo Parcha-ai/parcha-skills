@@ -238,6 +238,15 @@ python -m recall_server.cli logical-evidence-worker \
   --tenant tenant:company:example --upload-concurrency 2
 ```
 
+After a retention-policy or projection-format change, intentionally replace
+every current logical document through the same tenant-scoped path:
+
+```bash
+python -m recall_server.cli backfill-logical-evidence \
+  --tenant tenant:company:example --rebuild-existing \
+  --batch-size 2000 --max-batches 100 --upload-concurrency 16
+```
+
 Ingest and forget transactions enqueue only affected logical documents.
 Revision replacement queues superseded S3 references in the same database
 transaction; transient delete failures remain durable and are retried by the
