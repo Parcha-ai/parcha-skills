@@ -459,6 +459,7 @@ class PassageProjectionTests(unittest.TestCase):
         )
         self.assertNotIn("prepare_pool(concurrency)", source)
         self.assertIn("self.store.pool_max_size - 1", source)
+        self.assertIn("PASSAGE_COMMIT_WORKERS", source)
 
     def test_backfill_is_idempotent_and_avoids_large_head_of_line_blocking(
         self,

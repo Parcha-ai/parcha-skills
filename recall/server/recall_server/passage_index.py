@@ -25,6 +25,7 @@ from .passage_projection import (
 MAX_PASSAGE_PROJECTION_BATCH = 1_000
 MAX_PASSAGE_EMBEDDING_BATCH = 5_000
 PASSAGE_POOL_WARM_SIZE = 4
+PASSAGE_COMMIT_WORKERS = 8
 
 
 @dataclass(frozen=True)
@@ -474,6 +475,7 @@ class CanonicalPassageProjector:
                     concurrency,
                     len(prepared_documents),
                     max(1, self.store.pool_max_size - 1),
+                    PASSAGE_COMMIT_WORKERS,
                 ),
                 thread_name_prefix="recall-passage-commit",
             ) as executor:
