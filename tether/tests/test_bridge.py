@@ -3,11 +3,14 @@ import concurrent.futures
 import datetime
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import pathlib
 import shutil
+import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -19,6 +22,10 @@ from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 RUNTIME_PATH = ROOT / "runtime" / "bridge_runtime.py"
+SECURITY_PATH = ROOT / "runtime" / "security.py"
+HERMES_COMPAT_PATH = ROOT / "runtime" / "hermes_compat.py"
+ROUTING_PATH = ROOT / "runtime" / "routing.py"
+SLACK_PROTOCOL_PATH = ROOT / "runtime" / "slack_protocol.py"
 PLUGIN_PATH = ROOT / "runtime" / "plugin" / "__init__.py"
 NOTIFIER_PATH = ROOT / "skills" / "tether" / "scripts" / "tether_notify.py"
 INSTALL_PATH = ROOT / "install.sh"
@@ -38,6 +45,31 @@ def load_runtime(home: pathlib.Path):
         sys.modules[name] = module
         spec.loader.exec_module(module)
         return module
+
+
+def process_identity(
+    *,
+    agent="codex",
+    pid=200,
+    start="20000",
+    session="work",
+    pane="7",
+    tty="34823",
+):
+    payload = {
+        "agent": agent,
+        "boot": "00000000-0000-4000-8000-000000000001",
+        "exe": "1:2",
+        "exe_path": hashlib.sha256(f"/opt/{agent}/bin/{agent}".encode()).hexdigest()[:16],
+        "pane": pane,
+        "pid": pid,
+        "session": session,
+        "start": start,
+        "tty": tty,
+    }
+    return "linux-proc-v2:" + json.dumps(
+        payload, sort_keys=True, separators=(",", ":")
+    )
 
 
 class StoreTest(unittest.TestCase):
@@ -91,19 +123,20 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(self.store.claim_event_batch(bridge.bridge_id), [])
 
     def test_processing_events_are_requeued_after_restart(self):
-        bridge = self.store.create(self.request())
+        bridge = self.store.bind(
+            self.store.create(self.request()).bridge_id,
+            "123.456",
+        )
         self.assertTrue(self.store.enqueue_event("111.1", bridge.bridge_id, "resume me"))
         self.assertEqual(self.store.claim_next_event(bridge.bridge_id)["text"], "resume me")
         self.store.requeue_processing()
         self.assertEqual(self.store.claim_next_event(bridge.bridge_id)["text"], "resume me")
 
-    def test_ingress_is_persistent_and_recognizes_legacy_native_events(self):
+    def test_ingress_is_persistent_in_the_unified_event_ledger(self):
         bridge = self.store.bind(self.store.create(self.request()).bridge_id, "123.456")
-        self.assertTrue(self.store.mark_ingress("111.1", bridge.bridge_id))
+        self.assertTrue(self.store.enqueue_event("111.1", bridge.bridge_id, "event"))
         self.assertTrue(self.store.has_ingress("111.1"))
-        self.assertFalse(self.store.mark_ingress("111.1", bridge.bridge_id))
-        self.assertTrue(self.store.enqueue_event("111.2", bridge.bridge_id, "legacy event"))
-        self.assertTrue(self.store.has_ingress("111.2"))
+        self.assertFalse(self.store.enqueue_event("111.1", bridge.bridge_id, "duplicate"))
 
     def test_recent_active_bridges_include_native_and_headless_sources(self):
         native_request = self.request("native")
@@ -118,8 +151,42 @@ class StoreTest(unittest.TestCase):
             {native.bridge_id, headless.bridge_id},
         )
 
+    def test_recovery_keeps_old_active_bindings(self):
+        bridge = self.store.bind(
+            self.store.create(self.request("old-active")).bridge_id,
+            "123.456",
+        )
+        with self.store.connect() as db:
+            db.execute(
+                """
+                UPDATE bridges
+                SET created_at='2020-01-01 00:00:00',
+                    updated_at='2020-01-01 00:00:00'
+                WHERE bridge_id=?
+                """,
+                (bridge.bridge_id,),
+            )
+        self.assertEqual(self.store.recent_active_bridges(), [])
+        self.assertEqual(
+            [item.bridge_id for item in self.store.active_bridges()],
+            [bridge.bridge_id],
+        )
+
+    def test_legacy_owner_database_permissions_are_tightened_before_migration(self):
+        legacy_path = self.home / "legacy.db"
+        database = sqlite3.connect(legacy_path)
+        database.execute("CREATE TABLE legacy(value TEXT)")
+        database.commit()
+        database.close()
+        legacy_path.chmod(0o644)
+        self.runtime.Store(legacy_path)
+        self.assertEqual(stat.S_IMODE(legacy_path.stat().st_mode), 0o600)
+
     def test_stored_errors_are_truncated(self):
-        bridge = self.store.create(self.request())
+        bridge = self.store.bind(
+            self.store.create(self.request()).bridge_id,
+            "123.456",
+        )
         self.store.claim_event("111.1", bridge.bridge_id)
         self.store.finish_event("111.1", "sensitive" * 500)
         with self.store.connect() as db:
@@ -153,14 +220,529 @@ class StoreTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "source value is too large"):
             self.store.create(request)
 
+    def test_source_contract_rejects_incomplete_contradictory_and_option_like_records(self):
+        invalid_sources = (
+            ("claude_session", {"cwd": "/tmp/project"}, "missing native session"),
+            (
+                "claude_session",
+                {"session_id": "--resume", "cwd": "/tmp/project"},
+                "option-like Claude session",
+            ),
+            (
+                "claude_session",
+                {
+                    "session_id": "claude-1",
+                    "cwd": "/tmp/project",
+                    "zellij_session": "work",
+                    "zellij_pane_id": "7",
+                    "pane_agent": "codex",
+                    "pane_command_hash": "fingerprint",
+                },
+                "Claude session bound to Codex pane",
+            ),
+            ("codex_session", {"cwd": "/tmp/project"}, "missing Codex session"),
+            (
+                "codex_session",
+                {"session_id": "-danger-full-access", "cwd": "/tmp/project"},
+                "option-like Codex session",
+            ),
+            (
+                "codex_session",
+                {
+                    "session_id": "codex-1",
+                    "cwd": "/tmp/project",
+                    "zellij_session": "work",
+                    "zellij_pane_id": "7",
+                    "pane_agent": "claude",
+                    "pane_command_hash": "fingerprint",
+                },
+                "Codex session bound to Claude pane",
+            ),
+            (
+                "zellij_pane",
+                {"session_name": "work", "pane_agent": "codex"},
+                "incomplete Zellij endpoint",
+            ),
+            (
+                "zellij_pane",
+                {
+                    "session_name": "work",
+                    "zellij_session": "other-work",
+                    "pane_id": "7",
+                    "zellij_pane_id": "8",
+                    "pane_agent": "codex",
+                    "pane_command_hash": "fingerprint",
+                },
+                "contradictory Zellij aliases",
+            ),
+            ("headless_run", {"cwd": "/tmp/project"}, "missing headless run ID"),
+            (
+                "headless_run",
+                {"run_id": "run-1", "queue_id": "run-2", "cwd": "/tmp/project"},
+                "contradictory headless IDs",
+            ),
+        )
+        for kind, source, reason in invalid_sources:
+            with self.subTest(reason=reason):
+                with self.assertRaises(ValueError):
+                    self.store.validate_source(kind, source)
+
+        valid_sources = (
+            ("claude_session", {"session_id": "claude-1", "cwd": "/tmp/project"}),
+            (
+                "codex_session",
+                {
+                    "session_id": "codex-1",
+                    "cwd": "/tmp/project",
+                    "zellij_session": "work",
+                    "zellij_pane_id": "7",
+                    "pane_agent": "codex",
+                    "pane_command_hash": "fingerprint",
+                    "process_identity": process_identity(),
+                },
+            ),
+            (
+                "zellij_pane",
+                {
+                    "session_name": "work",
+                    "pane_id": "7",
+                    "cwd": "/tmp/project",
+                    "pane_agent": "codex",
+                    "pane_command_hash": "fingerprint",
+                    "process_identity": process_identity(),
+                },
+            ),
+            (
+                "headless_run",
+                {"run_id": "run-1", "queue_id": "run-1", "cwd": "/tmp/project"},
+            ),
+            (
+                "headless_run",
+                {"queue_id": "legacy-queue-1", "cwd": "/tmp/project"},
+            ),
+        )
+        for kind, source in valid_sources:
+            with self.subTest(valid_kind=kind):
+                canonical = self.store.validate_source(kind, source)
+                self.assertEqual(
+                    {key: canonical[key] for key in source},
+                    source,
+                    "canonical BindingV2 metadata may be added, but source identity must be preserved",
+                )
+                self.assertEqual(canonical["binding_version"], "2")
+                self.assertEqual(canonical["binding_state"], "verified")
+        _, legacy_headless = self.runtime._canonical_source(
+            "headless_run",
+            {"queue_id": "legacy-queue-1", "cwd": "/tmp/project"},
+        )
+        self.assertEqual(legacy_headless.run_id, "legacy-queue-1")
+
+    def test_schema_v2_migrates_bindings_and_removes_dead_routes(self):
+        path = self.home / "legacy.db"
+        database = sqlite3.connect(path)
+        database.executescript(
+            """
+            CREATE TABLE bridges (
+              bridge_id TEXT PRIMARY KEY, source_kind TEXT NOT NULL,
+              source_json TEXT NOT NULL, owner_user_id TEXT NOT NULL,
+              team_id TEXT NOT NULL DEFAULT '', channel_id TEXT NOT NULL,
+              thread_ts TEXT, idempotency_key TEXT NOT NULL UNIQUE,
+              status TEXT NOT NULL DEFAULT 'pending',
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE thread_routes (
+              team_id TEXT NOT NULL DEFAULT '', channel_id TEXT NOT NULL,
+              thread_ts TEXT NOT NULL, route TEXT NOT NULL,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              PRIMARY KEY (team_id, channel_id, thread_ts)
+            );
+            """
+        )
+        rows = (
+            (
+                "brg_detached",
+                "codex_session",
+                json.dumps({"session_id": "codex-1", "cwd": "/tmp/project"}),
+            ),
+            (
+                "brg_legacy_pane",
+                "claude_session",
+                json.dumps({
+                    "session_id": "claude-1",
+                    "cwd": "/tmp/project",
+                    "zellij_session": "work",
+                    "zellij_pane_id": "7",
+                    "pane_agent": "claude",
+                    "pane_command_hash": "command-only",
+                }),
+            ),
+            ("brg_invalid", "headless_run", "{not-json"),
+        )
+        for index, (bridge_id, source_kind, source_json) in enumerate(rows):
+            database.execute(
+                """
+                INSERT INTO bridges(
+                  bridge_id,source_kind,source_json,owner_user_id,team_id,
+                  channel_id,thread_ts,idempotency_key,status
+                ) VALUES(?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    bridge_id,
+                    source_kind,
+                    source_json,
+                    "U12345678",
+                    "T12345678",
+                    "C12345678",
+                    f"123.45{index}",
+                    f"legacy-{index}",
+                    "active",
+                ),
+            )
+        database.execute(
+            """
+            INSERT INTO thread_routes(team_id,channel_id,thread_ts,route)
+            VALUES('T12345678','C12345678','123.450','self')
+            """
+        )
+        database.commit()
+        database.close()
+        path.chmod(0o600)
+
+        migrated = self.runtime.Store(path)
+        self.assertEqual(migrated.get("brg_detached").binding_state, "verified")
+        legacy = migrated.get("brg_legacy_pane")
+        self.assertEqual(legacy.binding_state, "rebind_required")
+        self.assertEqual(legacy.binding_error_code, "process_identity_missing")
+        invalid = migrated.get("brg_invalid")
+        self.assertEqual(invalid.binding_state, "rebind_required")
+        self.assertEqual(invalid.binding_error_code, "binding_invalid")
+        with migrated.connect() as database:
+            self.assertEqual(
+                database.execute("PRAGMA user_version").fetchone()[0],
+                self.runtime.SCHEMA_VERSION,
+            )
+            self.assertIsNone(
+                database.execute(
+                    """
+                    SELECT 1 FROM sqlite_master
+                    WHERE type='table' AND name='thread_routes'
+                    """
+                ).fetchone()
+            )
+            self.assertEqual(database.execute("SELECT count(*) FROM bridges").fetchone()[0], 3)
+
+    def test_schema_rejects_future_version_before_mutation(self):
+        path = self.home / "future.db"
+        database = sqlite3.connect(path)
+        database.execute("PRAGMA user_version=99")
+        database.close()
+        path.chmod(0o600)
+        with self.assertRaisesRegex(RuntimeError, "newer than this runtime"):
+            self.runtime.Store(path)
+        database = sqlite3.connect(path)
+        self.assertEqual(database.execute("PRAGMA user_version").fetchone()[0], 99)
+        self.assertEqual(
+            database.execute(
+                "SELECT count(*) FROM sqlite_master WHERE type='table'"
+            ).fetchone()[0],
+            0,
+        )
+        database.close()
+
+    def test_concurrent_schema_open_is_serialized_and_idempotent(self):
+        path = self.home / "concurrent-migration.db"
+        database = sqlite3.connect(path)
+        database.execute("PRAGMA user_version=1")
+        database.close()
+        path.chmod(0o600)
+        barrier = threading.Barrier(8)
+
+        def open_store(_index):
+            barrier.wait()
+            store = self.runtime.Store(path)
+            return store.get("missing")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(open_store, range(8)))
+
+        self.assertEqual(results, [None] * 8)
+        database = sqlite3.connect(path)
+        self.assertEqual(
+            database.execute("PRAGMA user_version").fetchone()[0],
+            self.runtime.SCHEMA_VERSION,
+        )
+        self.assertEqual(
+            database.execute(
+                "SELECT count(*) FROM sqlite_master WHERE name='bridge_attempts'"
+            ).fetchone()[0],
+            1,
+        )
+        database.close()
+
+    def test_failed_schema_migration_rolls_back_as_one_transaction(self):
+        path = self.home / "failed-migration.db"
+        database = sqlite3.connect(path)
+        database.execute("PRAGMA user_version=1")
+        database.close()
+        path.chmod(0o600)
+
+        with mock.patch.object(
+            self.runtime.Store,
+            "_backfill_bindings",
+            side_effect=RuntimeError("fault injection"),
+        ), self.assertRaisesRegex(RuntimeError, "fault injection"):
+            self.runtime.Store(path)
+
+        database = sqlite3.connect(path)
+        self.assertEqual(database.execute("PRAGMA user_version").fetchone()[0], 1)
+        self.assertEqual(
+            database.execute(
+                """
+                SELECT count(*) FROM sqlite_master
+                WHERE type IN ('table','index') AND name NOT LIKE 'sqlite_%'
+                """
+            ).fetchone()[0],
+            0,
+        )
+        database.close()
+
+    def test_tampered_verified_binding_is_downgraded_on_reopen(self):
+        bridge = self.store.create(self.request("tampered-v2"))
+        with self.store.connect() as database:
+            database.execute(
+                """
+                UPDATE bridges
+                SET source_json='{}',binding_version=2,binding_state='verified'
+                WHERE bridge_id=?
+                """,
+                (bridge.bridge_id,),
+            )
+        reopened = self.runtime.Store(self.store.path)
+        loaded = reopened.get(bridge.bridge_id)
+        self.assertEqual(loaded.binding_state, "rebind_required")
+        self.assertEqual(loaded.binding_error_code, "binding_invalid")
+
+    def test_rebind_is_generation_safe_and_blocks_open_attempt(self):
+        exact = process_identity(agent="codex", session="work", pane="7")
+        request = self.request("generation-safe")
+        request["source_kind"] = "codex_session"
+        request["source"] = {
+            "session_id": "codex-1",
+            "cwd": "/tmp/project",
+            "zellij_session": "work",
+            "zellij_pane_id": "7",
+            "pane_agent": "codex",
+            "pane_command_hash": hashlib.sha256(exact.encode()).hexdigest(),
+            "process_identity": exact,
+        }
+        bridge = self.store.bind(self.store.create(request).bridge_id, "123.456")
+        self.store.enqueue_event("111.1", bridge.bridge_id, "continue")
+        self.store.claim_event_batch(bridge.bridge_id)
+        attempt = self.runtime.delivery_attempt_id(
+            bridge.bridge_id, ("111.1",), bridge.binding_generation
+        )
+        self.assertTrue(self.store.prepare_delivery_attempt(
+            ["111.1"], bridge.bridge_id, bridge.binding_generation, attempt
+        ))
+        replacement = {
+            **request["source"],
+            "process_identity": process_identity(
+                agent="codex", pid=300, start="30000", session="work", pane="7"
+            ),
+        }
+        with self.assertRaisesRegex(ValueError, "active delivery attempt"):
+            self.store.rebind(
+                bridge.bridge_id,
+                "codex_session",
+                replacement,
+                expected_generation=bridge.binding_generation,
+            )
+        self.store.fail_attempt(attempt, bridge.bridge_id, "operator retry")
+        rebound = self.store.rebind(
+            bridge.bridge_id,
+            "codex_session",
+            replacement,
+            expected_generation=bridge.binding_generation,
+        )
+        self.assertEqual(rebound.binding_generation, bridge.binding_generation + 1)
+        with self.assertRaisesRegex(ValueError, "binding changed"):
+            self.store.rebind(
+                bridge.bridge_id,
+                "codex_session",
+                replacement,
+                expected_generation=bridge.binding_generation,
+            )
+
+    def test_attempt_reply_and_no_reply_acknowledge_exact_events(self):
+        bridge = self.store.bind(self.store.create(self.request()).bridge_id, "123.456")
+        broker = self.runtime.Broker("test-token", self.store, verified_workspace_team_id="T12345678")
+        for event_id, text, response, expected_ack in (
+            ("111.1", "status?", "Fixed.", "reply"),
+            ("111.2", "anything else?", "NO_REPLY", "no_reply"),
+        ):
+            self.assertTrue(self.store.enqueue_event(event_id, bridge.bridge_id, text))
+            self.store.claim_event_batch(bridge.bridge_id)
+            attempt = self.runtime.delivery_attempt_id(
+                bridge.bridge_id, (event_id,), bridge.binding_generation
+            )
+            self.assertTrue(self.store.prepare_delivery_attempt(
+                [event_id], bridge.bridge_id, bridge.binding_generation, attempt
+            ))
+            self.assertTrue(self.store.mark_attempt_awaiting_ack(
+                attempt, bridge.bridge_id, bridge.binding_generation
+            ))
+            with mock.patch.object(
+                broker, "_ensure_channel_membership"
+            ), mock.patch.object(
+                self.runtime, "slack_post", return_value="123.999"
+            ) as post:
+                result = broker.handle({
+                    "op": "reply",
+                    "bridge_id": bridge.bridge_id,
+                    "reply_key": attempt,
+                    "text": response,
+                })
+            self.assertEqual(result["acknowledged_events"], 1)
+            self.assertEqual(post.call_count, 0 if response == "NO_REPLY" else 1)
+            with self.store.connect() as database:
+                event_state = database.execute(
+                    "SELECT state FROM bridge_events WHERE event_id=?", (event_id,)
+                ).fetchone()[0]
+                attempt_row = database.execute(
+                    "SELECT state,ack_kind FROM bridge_attempts WHERE attempt_id=?",
+                    (attempt,),
+                ).fetchone()
+            self.assertEqual(event_state, "delivered")
+            self.assertEqual(tuple(attempt_row), ("acknowledged", expected_ack))
+
+    def test_fast_attempt_ack_wins_over_late_awaiting_transition(self):
+        bridge = self.store.bind(self.store.create(self.request()).bridge_id, "123.456")
+        self.store.enqueue_event("111.1", bridge.bridge_id, "status?")
+        self.store.claim_event_batch(bridge.bridge_id)
+        attempt = self.runtime.delivery_attempt_id(
+            bridge.bridge_id, ("111.1",), bridge.binding_generation
+        )
+        self.assertTrue(self.store.prepare_delivery_attempt(
+            ["111.1"], bridge.bridge_id, bridge.binding_generation, attempt
+        ))
+        self.assertTrue(self.store.mark_attempt_submitting(
+            attempt, bridge.bridge_id, bridge.binding_generation
+        ))
+        self.assertEqual(
+            self.store.acknowledge_attempt(
+                attempt, bridge.bridge_id, ack_kind="no_reply"
+            ),
+            1,
+        )
+        self.assertTrue(self.store.mark_attempt_awaiting_ack(
+            attempt, bridge.bridge_id, bridge.binding_generation
+        ))
+        self.assertEqual(
+            self.store.attempt_state(attempt, bridge.bridge_id),
+            "acknowledged",
+        )
+        with self.store.connect() as database:
+            self.assertEqual(
+                database.execute(
+                    "SELECT state FROM bridge_events WHERE event_id='111.1'"
+                ).fetchone()[0],
+                "delivered",
+            )
+
     def test_broker_socket_is_private(self):
         socket_path = self.home / "hermes" / "bridge.sock"
         server = self.runtime.start_broker("test-token", socket_path)
         try:
             self.assertTrue(socket_path.is_socket())
             self.assertEqual(socket_path.stat().st_mode & 0o777, 0o600)
-            with self.assertRaisesRegex(RuntimeError, "unsupported operation"):
+            with self.assertRaisesRegex(
+                self.runtime.NativeContinuationError, "unsupported operation"
+            ) as rejected:
                 self.runtime.broker_call({"op": "unsupported"}, socket_path)
+            self.assertEqual(rejected.exception.code, "invalid_request")
+            self.assertEqual(rejected.exception.status, "rejected")
+            self.assertFalse(rejected.exception.retryable)
+            self.assertEqual(
+                rejected.exception.next_action,
+                "Correct the request and retry.",
+            )
+            with self.assertRaises(
+                ValueError
+            ) as invalid_request:
+                self.runtime.broker_call([], socket_path)
+            self.assertIn("JSON object", str(invalid_request.exception))
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.connect(str(socket_path))
+                client.sendall(b"[]\n")
+                raw_response = client.recv(4096)
+            malformed = json.loads(raw_response)
+            self.assertFalse(malformed["ok"])
+            self.assertEqual(malformed["code"], "invalid_request")
+
+            server.broker.handle = mock.Mock(
+                side_effect=RuntimeError(
+                    "credential secret-value leaked from /private/operator/path"
+                )
+            )
+            with self.assertRaises(
+                self.runtime.NativeContinuationError
+            ) as internal:
+                self.runtime.broker_call({"op": "status"}, socket_path)
+            self.assertEqual(internal.exception.code, "broker_internal_error")
+            self.assertTrue(internal.exception.retryable)
+            self.assertNotIn("secret-value", str(internal.exception))
+            self.assertNotIn("/private/operator/path", str(internal.exception))
+        finally:
+            server.shutdown()
+            server.server_close()
+            socket_path.unlink(missing_ok=True)
+
+    def test_broker_response_budget_supports_history_but_fails_closed(self):
+        socket_path = self.home / "hermes" / "bridge.sock"
+        server = self.runtime.start_broker("test-token", socket_path)
+        try:
+            server.broker.handle = mock.Mock(
+                return_value={"ok": True, "padding": "x" * (2 * 1024 * 1024)}
+            )
+            accepted = self.runtime.broker_call({"op": "status"}, socket_path)
+            self.assertEqual(len(accepted["padding"]), 2 * 1024 * 1024)
+
+            server.broker.handle = mock.Mock(
+                return_value={
+                    "ok": True,
+                    "padding": "x" * self.runtime.MAX_BROKER_RESPONSE_BYTES,
+                }
+            )
+            with self.assertRaises(
+                self.runtime.NativeContinuationError
+            ) as oversized:
+                self.runtime.broker_call({"op": "status"}, socket_path)
+            self.assertEqual(
+                oversized.exception.code,
+                "broker_internal_error",
+            )
+
+            server.broker.handle = mock.Mock(
+                return_value={"ok": True, "not_json": object()}
+            )
+            with self.assertRaises(
+                self.runtime.NativeContinuationError
+            ) as invalid:
+                self.runtime.broker_call({"op": "status"}, socket_path)
+            self.assertEqual(
+                invalid.exception.code,
+                "broker_internal_error",
+            )
+
+            server.broker.handle = mock.Mock(return_value=[])
+            with self.assertRaises(
+                self.runtime.NativeContinuationError
+            ) as wrong_contract:
+                self.runtime.broker_call({"op": "status"}, socket_path)
+            self.assertEqual(
+                wrong_contract.exception.code,
+                "broker_internal_error",
+            )
         finally:
             server.shutdown()
             server.server_close()
@@ -174,7 +756,7 @@ class StoreTest(unittest.TestCase):
             db.execute("SELECT 1")
 
     def test_broker_reuses_hermes_channel_and_allowlist_without_copying_ids(self):
-        broker = self.runtime.Broker("test-token", self.store)
+        broker = self.runtime.Broker("test-token", self.store, verified_workspace_team_id="T12345678")
         request = {
             "op": "notify", "text": "finished", "source_kind": "headless_run",
             "source": {"run_id": "run-2", "cwd": "/tmp/project"},
@@ -193,11 +775,11 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(bridge.owner_user_id, "*", "Hermes's explicit allowlist is shared by default")
         self.assertEqual(status["allowed_user_count"], 2)
         self.assertEqual(status["implementation"], "tether")
-        self.assertEqual(status["protocol_version"], 3)
+        self.assertEqual(status["protocol_version"], 5)
         self.assertNotIn("allowed_users", status, "status reports readiness, never identities")
 
     def test_shared_channel_rejects_accidental_owner_restriction(self):
-        broker = self.runtime.Broker("test-token", self.store)
+        broker = self.runtime.Broker("test-token", self.store, verified_workspace_team_id="T12345678")
         request = {
             "op": "notify", "text": "finished", "source_kind": "headless_run",
             "source": {"run_id": "run-owner", "cwd": "/tmp/project"},
@@ -212,10 +794,21 @@ class StoreTest(unittest.TestCase):
 
     def test_bound_reply_is_brief_and_idempotent_per_agent_turn(self):
         bridge = self.store.bind(self.store.create(self.request()).bridge_id, "123.456")
-        broker = self.runtime.Broker("test-token", self.store)
+        self.store.enqueue_event("111.1", bridge.bridge_id, "status?")
+        self.store.claim_event_batch(bridge.bridge_id)
+        reply_key = self.runtime.delivery_attempt_id(
+            bridge.bridge_id, ("111.1",), bridge.binding_generation
+        )
+        self.assertTrue(self.store.prepare_delivery_attempt(
+            ["111.1"], bridge.bridge_id, bridge.binding_generation, reply_key
+        ))
+        self.assertTrue(self.store.mark_attempt_awaiting_ack(
+            reply_key, bridge.bridge_id, bridge.binding_generation
+        ))
+        broker = self.runtime.Broker("test-token", self.store, verified_workspace_team_id="T12345678")
         request = {
             "op": "reply", "bridge_id": bridge.bridge_id,
-            "reply_key": "tether-123456789abc", "text": "Fixed and verified.",
+            "reply_key": reply_key, "text": "Fixed and verified.",
         }
         with mock.patch.object(broker, "_ensure_channel_membership"), mock.patch.object(
             self.runtime, "slack_post", return_value="123.457",
@@ -226,24 +819,29 @@ class StoreTest(unittest.TestCase):
         self.assertTrue(second["deduplicated"])
         self.assertEqual(post.call_count, 1)
 
-        too_long = " ".join(["detail"] * 51)
-        with self.assertRaisesRegex(ValueError, "Slack reply is too long"):
+        detailed = " ".join(["detail"] * 51)
+        self.assertEqual(self.runtime.validate_reply_text(detailed), detailed)
+
+        too_long = "x" * (self.runtime.MAX_TEXT + 1)
+        with self.assertRaisesRegex(ValueError, "transport limit"):
             broker.handle({
                 "op": "reply", "bridge_id": bridge.bridge_id,
-                "reply_key": "tether-abcdef123456", "text": too_long,
+                "reply_key": "tether-" + "abcdef123458", "text": too_long,
             })
 
     def test_explicit_rebind_updates_only_the_matching_active_thread(self):
         bridge = self.store.bind(self.store.create(self.request()).bridge_id, "123.456")
-        broker = self.runtime.Broker("test-token", self.store)
+        broker = self.runtime.Broker("test-token", self.store, verified_workspace_team_id="T12345678")
         result = broker.handle({
             "op": "rebind",
+            "team_id": bridge.team_id,
             "channel_id": bridge.channel_id,
             "thread_ts": bridge.thread_ts,
             "source_kind": "zellij_pane",
             "source": {
                 "session_name": "work", "pane_id": "7", "cwd": "/tmp/project",
                 "pane_agent": "claude", "pane_command_hash": "new-fingerprint",
+                "process_identity": process_identity(agent="claude"),
             },
         })
         rebound = self.store.get(bridge.bridge_id)
@@ -253,6 +851,7 @@ class StoreTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "active bridge not found"):
             broker.handle({
                 "op": "rebind",
+                "team_id": bridge.team_id,
                 "channel_id": "C99999999",
                 "thread_ts": bridge.thread_ts,
                 "source_kind": "zellij_pane",
@@ -261,17 +860,28 @@ class StoreTest(unittest.TestCase):
 
     def test_no_reply_control_token_is_suppressed(self):
         bridge = self.store.bind(self.store.create(self.request()).bridge_id, "123.456")
-        broker = self.runtime.Broker("test-token", self.store)
+        self.store.enqueue_event("111.1", bridge.bridge_id, "anything else?")
+        self.store.claim_event_batch(bridge.bridge_id)
+        reply_key = self.runtime.delivery_attempt_id(
+            bridge.bridge_id, ("111.1",), bridge.binding_generation
+        )
+        self.assertTrue(self.store.prepare_delivery_attempt(
+            ["111.1"], bridge.bridge_id, bridge.binding_generation, reply_key
+        ))
+        self.assertTrue(self.store.mark_attempt_awaiting_ack(
+            reply_key, bridge.bridge_id, bridge.binding_generation
+        ))
+        broker = self.runtime.Broker("test-token", self.store, verified_workspace_team_id="T12345678")
         with mock.patch.object(self.runtime, "slack_post") as post:
             result = broker.handle({
                 "op": "reply", "bridge_id": bridge.bridge_id,
-                "reply_key": "tether-abcdef123456", "text": "NO_REPLY",
+                "reply_key": reply_key, "text": "NO_REPLY",
             })
         self.assertTrue(result["suppressed"])
         post.assert_not_called()
 
     def test_thread_history_stays_behind_broker_and_returns_sanitized_messages(self):
-        broker = self.runtime.Broker("test-token", self.store)
+        broker = self.runtime.Broker("test-token", self.store, verified_workspace_team_id="T12345678")
         response = {
             "messages": [{
                 "ts": "123.456", "thread_ts": "100.000", "text": "reply",
@@ -300,7 +910,7 @@ class StoreTest(unittest.TestCase):
         ])
 
     def test_public_destination_is_joined_only_once_per_broker(self):
-        broker = self.runtime.Broker("test-token", self.store)
+        broker = self.runtime.Broker("test-token", self.store, verified_workspace_team_id="T12345678")
         with mock.patch.object(
             self.runtime,
             "_slack_call",
@@ -321,21 +931,21 @@ class StoreTest(unittest.TestCase):
         ])
 
     def test_dm_with_c_prefixed_id_is_not_joined(self):
-        broker = self.runtime.Broker("test-token", self.store)
+        broker = self.runtime.Broker("test-token", self.store, verified_workspace_team_id="T12345678")
         with mock.patch.object(
             self.runtime,
             "_slack_call",
             return_value={"ok": True, "messages": []},
         ) as call:
-            broker._ensure_channel_membership("C0BHSK52GP5")
+            broker._ensure_channel_membership("C87654321")
         call.assert_called_once_with(
             "test-token",
             "conversations.history",
-            {"channel": "C0BHSK52GP5", "limit": 1},
+            {"channel": "C87654321", "limit": 1},
         )
 
     def test_identity_returns_only_nonsecret_bot_metadata(self):
-        broker = self.runtime.Broker("test-token", self.store)
+        broker = self.runtime.Broker("test-token", self.store, verified_workspace_team_id="T12345678")
         with mock.patch.object(self.runtime, "_slack_call", return_value={
             "ok": True, "team_id": "T12345678", "user_id": "U12345678",
             "user": "agent", "url": "https://example.slack.com/",
@@ -346,26 +956,38 @@ class StoreTest(unittest.TestCase):
         })
 
     def test_brokered_thread_post_does_not_create_a_second_bridge(self):
-        broker = self.runtime.Broker("test-token", self.store)
+        broker = self.runtime.Broker("test-token", self.store, verified_workspace_team_id="T12345678")
         with mock.patch.object(broker, "_ensure_channel_membership"), mock.patch.object(
             self.runtime, "slack_post", return_value="123.457",
         ) as post:
             result = broker.handle({
                 "op": "thread_reply", "channel_id": "C12345678",
                 "thread_ts": "123.456", "text": "progress",
+                "idempotency_key": "progress-123.456",
             })
-        post.assert_called_once_with("test-token", "C12345678", "progress", "123.456")
+        post.assert_called_once()
+        self.assertEqual(
+            post.call_args.args,
+            ("test-token", "C12345678", "progress", "123.456"),
+        )
+        self.assertTrue(post.call_args.kwargs["client_msg_id"])
+        self.assertEqual(
+            post.call_args.kwargs["metadata_event_type"],
+            "tether_message",
+        )
         self.assertEqual(result["thread_ts"], "123.456")
         self.assertEqual(self.store.recent_active_bridges(), [])
-        self.assertTrue(self.store.participates("", "C12345678", "123.456"))
+        self.assertTrue(
+            self.store.participates("T12345678", "C12345678", "123.456")
+        )
 
     def test_attach_binds_existing_thread_without_posting(self):
-        broker = self.runtime.Broker("test-token", self.store)
+        broker = self.runtime.Broker("test-token", self.store, verified_workspace_team_id="T12345678")
         with mock.patch.object(self.runtime, "slack_post") as post:
             result = broker.handle({
                 "op": "attach",
                 "source_kind": "claude_session",
-                "source": {"session_id": "claude-1", "cwd": "/tmp/parcha"},
+                "source": {"session_id": "claude-1", "cwd": "/tmp/project"},
                 "owner_user_id": "U12345678",
                 "team_id": "T12345678",
                 "channel_id": "C12345678",
@@ -379,17 +1001,17 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(bridge.source["session_id"], "claude-1")
 
     def test_attach_refuses_to_replace_active_binding(self):
-        broker = self.runtime.Broker("test-token", self.store)
+        broker = self.runtime.Broker("test-token", self.store, verified_workspace_team_id="T12345678")
         request = {
             "op": "attach", "source_kind": "claude_session",
-            "source": {"session_id": "claude-1", "cwd": "/tmp/parcha"},
+            "source": {"session_id": "claude-1", "cwd": "/tmp/project"},
             "owner_user_id": "U12345678", "team_id": "T12345678",
             "channel_id": "C12345678", "thread_ts": "123.456",
             "idempotency_key": "review-one",
         }
         broker.handle(request)
         request["idempotency_key"] = "review-two"
-        request["source"] = {"session_id": "claude-2", "cwd": "/tmp/parcha"}
+        request["source"] = {"session_id": "claude-2", "cwd": "/tmp/project"}
         with self.assertRaisesRegex(ValueError, "already has an active"):
             broker.handle(request)
 
@@ -401,12 +1023,29 @@ class StoreTest(unittest.TestCase):
 
     def test_participating_thread_ingress_is_deduplicated_and_kept_recent(self):
         self.store.mark_participation("T12345678", "C12345678", "123.456")
-        self.assertTrue(self.store.mark_thread_ingress(
-            "123.457", "T12345678", "C12345678", "123.456",
-        ))
-        self.assertFalse(self.store.mark_thread_ingress(
-            "123.457", "T12345678", "C12345678", "123.456",
-        ))
+        claimed = self.store.claim_thread_ingress(
+            "123.457",
+            "T12345678",
+            "C12345678",
+            "123.456",
+        )
+        self.assertEqual(claimed["status"], "claimed")
+        self.assertTrue(
+            self.store.complete_thread_ingress(
+                "123.457",
+                claimed["lease_id"],
+                claimed["fence_epoch"],
+            )
+        )
+        self.assertEqual(
+            self.store.claim_thread_ingress(
+                "123.457",
+                "T12345678",
+                "C12345678",
+                "123.456",
+            )["status"],
+            "completed",
+        )
         self.assertTrue(self.store.has_ingress("123.457"))
         recent = self.store.recent_participating_threads()
         self.assertIn(
@@ -415,8 +1054,97 @@ class StoreTest(unittest.TestCase):
         )
         self.assertIsInstance(recent[0][3], float)
 
+    def test_thread_ingress_lease_recovers_failures_without_parallel_dispatch(self):
+        identity = (
+            "slack:T12345678:C12345678:123.457",
+            "T12345678",
+            "C12345678",
+            "123.456",
+        )
+        first = self.store.claim_thread_ingress(*identity)
+        self.assertEqual(first["status"], "claimed")
+        self.assertEqual(
+            self.store.claim_thread_ingress(*identity)["status"],
+            "busy",
+        )
+        self.assertTrue(
+            self.store.renew_thread_ingress(
+                identity[0],
+                first["lease_id"],
+            )
+        )
+        self.assertTrue(
+            self.store.release_thread_ingress(
+                identity[0],
+                first["lease_id"],
+                "dispatch_failed",
+            )
+        )
+        second = self.store.claim_thread_ingress(*identity)
+        self.assertEqual(second["status"], "claimed")
+        self.assertNotEqual(second["lease_id"], first["lease_id"])
+        self.assertTrue(
+            self.store.complete_thread_ingress(
+                identity[0],
+                second["lease_id"],
+            )
+        )
+        self.assertEqual(
+            self.store.claim_thread_ingress(*identity)["status"],
+            "completed",
+        )
+
+    def test_retention_prunes_only_terminal_records_and_keeps_active_binding(self):
+        bridge = self.store.bind(
+            self.store.create(self.request("retention")).bridge_id,
+            "123.456",
+        )
+        with self.store.connect() as db:
+            db.execute(
+                """
+                INSERT INTO bridge_events(
+                  event_id,bridge_id,state,payload_json,created_at,updated_at
+                ) VALUES(
+                  'old-done',?,'delivered','{"text":"private"}',
+                  '2020-01-01','2020-01-01'
+                )
+                """,
+                (bridge.bridge_id,),
+            )
+            db.execute(
+                """
+                INSERT INTO bridge_events(
+                  event_id,bridge_id,state,payload_json,created_at,updated_at
+                ) VALUES(
+                  'old-open',?,'uncertain','{"text":"retain"}',
+                  '2020-01-01','2020-01-01'
+                )
+                """,
+                (bridge.bridge_id,),
+            )
+            db.execute(
+                """
+                INSERT INTO thread_ingress(
+                  event_id,team_id,channel_id,thread_ts,state,
+                  created_at,updated_at
+                ) VALUES(
+                  'old-thread','T12345678','C12345678','123.456',
+                  'completed','2020-01-01','2020-01-01'
+                )
+                """
+            )
+        counts = self.store.prune(retention_days=30)
+        self.assertEqual(counts["bridge_events"], 1)
+        self.assertEqual(counts["thread_ingress"], 1)
+        self.assertIsNotNone(self.store.get(bridge.bridge_id))
+        with self.store.connect() as db:
+            rows = db.execute(
+                "SELECT event_id FROM bridge_events ORDER BY event_id"
+            ).fetchall()
+        self.assertEqual([row[0] for row in rows], ["old-open"])
+
     def test_concurrent_idempotent_notifications_post_one_root_message(self):
-        broker = self.runtime.Broker("test-token", self.store)
+        broker = self.runtime.Broker("test-token", self.store, verified_workspace_team_id="T12345678")
         request = {
             "op": "notify", "text": "finished", "source_kind": "headless_run",
             "source": {"run_id": "run-concurrent", "cwd": "/tmp/project"},
@@ -447,9 +1175,12 @@ class CredentialBoundaryTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.home = pathlib.Path(self.temp.name)
         self.runtime = load_runtime(self.home)
+        cwd_identity = self.runtime.working_directory_identity(str(self.home))
         self.bridge = self.runtime.Bridge(
-            "brg_test", "codex_session", {"session_id": "session-1", "cwd": str(self.home)},
+            "brg_test", "codex_session",
+            {"session_id": "session-1", **cwd_identity},
             "U12345678", "T12345678", "C12345678", "123.456", "key", "active",
+            1, 2, "verified", "",
         )
 
     def tearDown(self):
@@ -467,9 +1198,9 @@ class CredentialBoundaryTest(unittest.TestCase):
                 captured["command"] = command
                 captured["env"] = kwargs["env"]
 
-            def communicate(self, input=None, timeout=None):
-                captured["input"] = input
-                return "native answer", ""
+        def collect(_process, prompt, _deadline, _cancel_event):
+            captured["input"] = prompt
+            return b"native answer", b"", False
 
         with mock.patch.dict(os.environ, {
             "SLACK_BOT_TOKEN": "not-forwarded",
@@ -478,7 +1209,11 @@ class CredentialBoundaryTest(unittest.TestCase):
             "PATH": os.environ.get("PATH", ""),
         }, clear=False), mock.patch.object(self.runtime, "load_config", return_value=config), mock.patch.object(
             self.runtime, "_resolve_executable", return_value="/usr/bin/codex"
-        ), mock.patch.object(self.runtime.subprocess, "Popen", Process):
+        ), mock.patch.object(
+            self.runtime.subprocess, "Popen", Process
+        ), mock.patch.object(
+            self.runtime, "_collect_native_output", side_effect=collect
+        ):
             output = self.runtime.continue_native(self.bridge, "private operator prompt")
 
         self.assertEqual(output, "native answer")
@@ -490,12 +1225,14 @@ class CredentialBoundaryTest(unittest.TestCase):
 
     def test_credential_helper_is_allowlisted_and_silent(self):
         config = self.runtime.Config(
-            credential_command=("credential-helper",),
+            credential_command=("/usr/bin/credential-helper",),
             credential_env_allowlist=("OPENAI_API_KEY", "OPENAI_BASE_URL"),
         )
         result = types.SimpleNamespace(returncode=0, stdout=json.dumps({"OPENAI_API_KEY": "short-lived"}))
         with mock.patch.object(
-            self.runtime, "_resolve_executable", return_value="/usr/bin/credential-helper"
+            self.runtime,
+            "_resolve_credential_helper",
+            return_value="/usr/bin/credential-helper",
         ), mock.patch.object(self.runtime.subprocess, "run", return_value=result) as run:
             values = self.runtime._credential_env(self.bridge, config)
         self.assertEqual(values, {"OPENAI_API_KEY": "short-lived"})
@@ -506,16 +1243,50 @@ class CredentialBoundaryTest(unittest.TestCase):
         for values, allowlist in (
             ({"AWS_SECRET_ACCESS_KEY": "x"}, ("OPENAI_API_KEY",)),
             ({"SLACK_BOT_TOKEN": "x"}, ("SLACK_BOT_TOKEN",)),
+            ({"LD_PRELOAD": "/tmp/x.so"}, ("LD_PRELOAD",)),
         ):
             config = self.runtime.Config(
-                credential_command=("credential-helper",), credential_env_allowlist=allowlist
+                credential_command=("/usr/bin/credential-helper",),
+                credential_env_allowlist=allowlist,
             )
             result = types.SimpleNamespace(returncode=0, stdout=json.dumps(values))
             with mock.patch.object(
-                self.runtime, "_resolve_executable", return_value="/usr/bin/credential-helper"
+                self.runtime,
+                "_resolve_credential_helper",
+                return_value="/usr/bin/credential-helper",
             ), mock.patch.object(self.runtime.subprocess, "run", return_value=result):
                 with self.assertRaises(self.runtime.NativeContinuationError):
                     self.runtime._credential_env(self.bridge, config)
+
+    def test_credential_helper_requires_private_absolute_executable(self):
+        helper = self.home / "credential-helper"
+        helper.write_text("#!/bin/sh\nprintf '{}'\n", encoding="utf-8")
+        helper.chmod(0o700)
+        self.assertEqual(
+            self.runtime._resolve_credential_helper(str(helper)),
+            str(helper),
+        )
+
+        helper.chmod(0o722)
+        with self.assertRaises(self.runtime.NativeContinuationError):
+            self.runtime._resolve_credential_helper(str(helper))
+        with self.assertRaises(self.runtime.NativeContinuationError):
+            self.runtime._resolve_credential_helper("credential-helper")
+
+    def test_native_child_does_not_inherit_ambient_proxy_credentials(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HTTP_PROXY": "http://user:secret@proxy.example",
+                "HTTPS_PROXY": "https://user:secret@proxy.example",
+                "NO_PROXY": "localhost",
+            },
+            clear=False,
+        ):
+            child = self.runtime._base_child_env()
+        self.assertNotIn("HTTP_PROXY", child)
+        self.assertNotIn("HTTPS_PROXY", child)
+        self.assertNotIn("NO_PROXY", child)
 
     def test_missing_configured_executable_fails_closed(self):
         with mock.patch.object(self.runtime.shutil, "which", return_value=None):
@@ -561,16 +1332,35 @@ class CredentialBoundaryTest(unittest.TestCase):
         completed = types.SimpleNamespace(stdout=json.dumps(panes))
         with mock.patch.object(self.runtime, "_resolve_executable", return_value="/usr/bin/zellij"), mock.patch.object(
             self.runtime.subprocess, "run", return_value=completed
+        ), mock.patch.object(
+            self.runtime,
+            "_trusted_agent_paths",
+            return_value={"codex": {"/opt/agents/codex"}},
+        ), mock.patch.object(
+            self.runtime,
+            "_zellij_agent_process",
+            return_value=("codex", process_identity()),
         ):
             identity = self.runtime.zellij_pane_identity("work", "7", "/tmp/project")
         self.assertEqual(identity["pane_agent"], "codex")
         self.assertEqual(len(identity["pane_command_hash"]), 64)
+        self.assertEqual(identity["process_identity"], process_identity())
         self.assertNotIn("session-secret", json.dumps(identity))
 
         panes[0]["terminal_command"] = "bash"
         completed = types.SimpleNamespace(stdout=json.dumps(panes))
         with mock.patch.object(self.runtime, "_resolve_executable", return_value="/usr/bin/zellij"), mock.patch.object(
             self.runtime.subprocess, "run", return_value=completed
+        ), mock.patch.object(
+            self.runtime,
+            "_trusted_agent_paths",
+            return_value={"codex": {"/opt/agents/codex"}},
+        ), mock.patch.object(
+            self.runtime,
+            "_zellij_agent_process",
+            side_effect=self.runtime.NativeContinuationError(
+                "captured Zellij pane is not running an allowlisted agent"
+            ),
         ):
             with self.assertRaisesRegex(self.runtime.NativeContinuationError, "not running an allowlisted agent"):
                 self.runtime.zellij_pane_identity("work", "7")
@@ -589,6 +1379,10 @@ class CredentialBoundaryTest(unittest.TestCase):
             self.runtime.subprocess, "run", return_value=completed
         ), mock.patch.object(
             self.runtime,
+            "_trusted_agent_paths",
+            return_value={"claude": {"/opt/agents/claude"}},
+        ), mock.patch.object(
+            self.runtime,
             "_zellij_agent_process",
             return_value=("claude", "proc:3381024:39575982:command-hash"),
         ) as process_identity:
@@ -596,7 +1390,11 @@ class CredentialBoundaryTest(unittest.TestCase):
                 "didactic-jellyfish", "31", "/tmp/project"
             )
         process_identity.assert_called_once_with(
-            "didactic-jellyfish", "31", {"claude", "codex", "gemini", "hermes", "pi"}
+            "didactic-jellyfish",
+            "31",
+            {"claude", "codex", "gemini", "hermes", "pi"},
+            metadata_agent="",
+            trusted_paths={"claude": {"/opt/agents/claude"}},
         )
         self.assertEqual(identity["pane_agent"], "claude")
         self.assertEqual(len(identity["pane_command_hash"]), 64)
@@ -607,16 +1405,26 @@ class CredentialBoundaryTest(unittest.TestCase):
             {
                 "session_name": "work", "pane_id": "7", "cwd": "/tmp/project",
                 "pane_agent": "codex", "pane_command_hash": "expected",
+                "process_identity": process_identity(),
             },
             "U12345678", "T12345678", "C12345678", "123.456", "key", "active",
+            1, 2, "verified", "",
         )
         with mock.patch.object(
             self.runtime,
             "zellij_pane_identity",
-            return_value={"pane_command_hash": "different"},
+            return_value={
+                "pane_command_hash": "different",
+                "process_identity": process_identity(pid=300, start="30000"),
+            },
         ), mock.patch.object(self.runtime.subprocess, "run") as run:
-            with self.assertRaisesRegex(self.runtime.NativeContinuationError, "different process"):
+            with self.assertRaisesRegex(
+                self.runtime.NativeContinuationError, "different process"
+            ) as changed:
                 self.runtime.deliver_zellij(bridge, "continue")
+        self.assertEqual(changed.exception.code, "process_identity_changed")
+        self.assertEqual(changed.exception.binding_id, "brg_test")
+        self.assertEqual(changed.exception.status, "stale")
         run.assert_not_called()
 
     def test_native_zellij_delivery_verifies_visible_input_and_live_agent_after_enter(self):
@@ -626,13 +1434,19 @@ class CredentialBoundaryTest(unittest.TestCase):
                 "session_id": "session-1", "zellij_session": "work",
                 "zellij_pane_id": "7", "cwd": "/tmp/project",
                 "pane_agent": "claude", "pane_command_hash": "expected",
+                "process_identity": process_identity(agent="claude"),
             },
             "*", "T12345678", "C12345678", "123.456", "key", "active",
+            1, 2, "verified", "",
         )
         text = "review AJ's correction"
-        marker = "tether-" + self.runtime.hashlib.sha256(
-            f"{bridge.bridge_id}\0{text}".encode()
-        ).hexdigest()[:12]
+        marker = "att_legacytest1234567890"
+        inbox_dir = self.home / ".local" / "share" / "tether" / "inbox"
+        inbox_dir.mkdir(parents=True)
+        stale = inbox_dir / "att_stalehandoff1234567890.txt"
+        stale.write_text("stale request")
+        stale.chmod(0o600)
+        os.utime(stale, (0, 0))
 
         def run(command, **_kwargs):
             if "dump-screen" in command:
@@ -641,11 +1455,14 @@ class CredentialBoundaryTest(unittest.TestCase):
 
         with mock.patch.object(
             self.runtime, "zellij_pane_identity",
-            return_value={"pane_command_hash": "expected"},
+            return_value={
+                "pane_command_hash": "expected",
+                "process_identity": process_identity(agent="claude"),
+            },
         ) as identity, mock.patch.object(self.runtime.subprocess, "run", side_effect=run) as invoked, mock.patch.object(
             self.runtime.time, "sleep"
         ), mock.patch.object(self.runtime, "_resolve_executable", return_value="/usr/bin/zellij"):
-            self.runtime.deliver_zellij(bridge, text)
+            self.runtime.deliver_zellij(bridge, text, marker)
 
         commands = [call.args[0] for call in invoked.call_args_list]
         self.assertTrue(any("write-chars" in command for command in commands))
@@ -658,10 +1475,554 @@ class CredentialBoundaryTest(unittest.TestCase):
         )
         self.assertIn("--reply-key " + marker, written)
         self.assertIn("at most one Slack message", written)
-        self.assertIn("50 words", written)
+        self.assertIn("Default to 50 words", written)
+        self.assertIn("--text-stdin", written)
+        self.assertNotIn("--text '", written)
+        self.assertGreaterEqual(identity.call_count, 3)
         inbox = self.home / ".local" / "share" / "tether" / "inbox" / f"{marker}.txt"
         self.assertEqual(inbox.read_text().strip(), text)
         self.assertEqual(inbox.stat().st_mode & 0o777, 0o600)
+        self.assertFalse(stale.exists())
+
+    def test_zellij_delivery_rechecks_process_before_enter(self):
+        bridge = self.runtime.Bridge(
+            "brg_test", "claude_session",
+            {
+                "session_id": "session-1", "zellij_session": "work",
+                "zellij_pane_id": "7", "cwd": "/tmp/project",
+                "pane_agent": "claude", "pane_command_hash": "expected",
+                "process_identity": process_identity(agent="claude"),
+            },
+            "*", "T12345678", "C12345678", "123.456", "key", "active",
+            1, 2, "verified", "",
+        )
+        expected = {
+            "process_identity": process_identity(agent="claude"),
+        }
+        changed = {
+            "process_identity": process_identity(
+                agent="claude",
+                pid=301,
+                start="30100",
+            ),
+        }
+        marker = "att_preenterrace123456789"
+
+        def run(command, **_kwargs):
+            if "dump-screen" in command:
+                return types.SimpleNamespace(
+                    stdout=f"prompt contains {marker}",
+                    stderr="",
+                    returncode=0,
+                )
+            return types.SimpleNamespace(stdout="", stderr="", returncode=0)
+
+        with mock.patch.object(
+            self.runtime,
+            "zellij_pane_identity",
+            side_effect=(expected, changed),
+        ), mock.patch.object(
+            self.runtime.subprocess,
+            "run",
+            side_effect=run,
+        ) as invoked, mock.patch.object(
+            self.runtime.time,
+            "sleep",
+        ), mock.patch.object(
+            self.runtime,
+            "_resolve_executable",
+            return_value="/usr/bin/zellij",
+        ):
+            with self.assertRaises(
+                self.runtime.NativeContinuationError
+            ) as raised:
+                self.runtime.deliver_zellij(bridge, "continue", marker)
+
+        self.assertEqual(raised.exception.code, "terminal_submit_uncertain")
+        commands = [call.args[0] for call in invoked.call_args_list]
+        self.assertTrue(any("write-chars" in command for command in commands))
+        self.assertFalse(
+            any(
+                "send-keys" in command and "Enter" in command
+                for command in commands
+            )
+        )
+
+    def test_zellij_delivery_refuses_existing_symlink_without_truncating_target(self):
+        marker = "att_symlinktest123456789"
+        target = self.home / "target.txt"
+        target.write_text("preserve me", encoding="utf-8")
+        target.chmod(0o600)
+        inbox_dir = self.home / ".local" / "share" / "tether" / "inbox"
+        inbox_dir.mkdir(mode=0o700, parents=True)
+        (inbox_dir / f"{marker}.txt").symlink_to(target)
+        bridge = self.runtime.Bridge(
+            "brg_test",
+            "claude_session",
+            {
+                "session_id": "session-1",
+                "zellij_session": "work",
+                "zellij_pane_id": "7",
+                "cwd": "/tmp/project",
+                "pane_agent": "claude",
+                "pane_command_hash": "expected",
+                "process_identity": process_identity(agent="claude"),
+            },
+            "*",
+            "T12345678",
+            "C12345678",
+            "123.456",
+            "key",
+            "active",
+            1,
+            2,
+            "verified",
+            "",
+        )
+        with mock.patch.object(
+            self.runtime,
+            "zellij_pane_identity",
+            return_value={
+                "pane_command_hash": "expected",
+                "process_identity": process_identity(agent="claude"),
+            },
+        ), mock.patch.object(self.runtime.subprocess, "run") as invoked:
+            with self.assertRaises(self.runtime.security.StatePathError):
+                self.runtime.deliver_zellij(bridge, "replacement", marker)
+        invoked.assert_not_called()
+        self.assertEqual(target.read_text(encoding="utf-8"), "preserve me")
+
+
+class NativeBindingContractTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.home = pathlib.Path(self.temp.name)
+        self.runtime = load_runtime(self.home)
+        self.store = self.runtime.Store(self.home / "bridges.db")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _write_process(
+        self,
+        proc_root,
+        *,
+        pid,
+        parent_pid,
+        start_time,
+        executable,
+        argv,
+        session="didactic-jellyfish",
+        pane="51",
+    ):
+        executable_path = pathlib.Path(executable)
+        if not executable_path.exists():
+            executable_path.parent.mkdir(parents=True, exist_ok=True)
+            executable_path.write_text("#!/bin/sh\n")
+            executable_path.chmod(0o700)
+        process = proc_root / str(pid)
+        process.mkdir(parents=True)
+        (process / "environ").write_bytes(
+            f"ZELLIJ_SESSION_NAME={session}\0ZELLIJ_PANE_ID={pane}\0".encode()
+        )
+        (process / "cmdline").write_bytes(
+            b"\0".join(part.encode() for part in argv) + b"\0"
+        )
+        # Both processes are foreground leaders of nested PTYs. Executable
+        # identity, not argv token matching, must distinguish the real agent.
+        stat_fields = [
+            "S",
+            str(parent_pid),
+            str(pid),
+            str(pid),
+            "34851",
+            str(pid),
+            *(["0"] * 13),
+            str(start_time),
+        ]
+        (process / "stat").write_text(
+            f"{pid} ({pathlib.Path(executable).name}) " + " ".join(stat_fields)
+        )
+        (process / "exe").symlink_to(executable_path)
+
+    def _zellij_bridge(
+        self,
+        pane_hash="expected",
+        exact_process_identity=None,
+    ):
+        exact_process_identity = exact_process_identity or process_identity(
+            session="didactic-jellyfish", pane="51"
+        )
+        return self.runtime.Bridge(
+            "brg_test",
+            "codex_session",
+            {
+                "session_id": "codex-session",
+                "zellij_session": "didactic-jellyfish",
+                "zellij_pane_id": "51",
+                "cwd": "/tmp/project",
+                "pane_agent": "codex",
+                "pane_command_hash": pane_hash,
+                "process_identity": exact_process_identity,
+                "binding_version": "2",
+                "binding_state": "verified",
+                "endpoint_kind": "zellij_pane",
+                "delivery_policy": "native_required",
+            },
+            "*",
+            "T12345678",
+            "C12345678",
+            "123.456",
+            "key",
+            "active",
+            1,
+            2,
+            "verified",
+            "",
+        )
+
+    def test_null_command_resolver_selects_nested_agent_executable(self):
+        proc_root = self.home / "proc"
+        proc_root.mkdir()
+        self._write_process(
+            proc_root,
+            pid=100,
+            parent_pid=1,
+            start_time=10_000,
+            executable="/usr/bin/python3",
+            argv=(
+                "/usr/bin/python3",
+                "-m",
+                "agent_observatory.broker_launch",
+                "--runtime",
+                "codex",
+                "--executable",
+                "/opt/codex/bin/codex",
+            ),
+        )
+        self._write_process(
+            proc_root,
+            pid=200,
+            parent_pid=100,
+            start_time=20_000,
+            executable=str(self.home / "opt" / "codex" / "bin" / "codex"),
+            argv=(
+                str(self.home / "opt" / "codex" / "bin" / "codex"),
+                "exec",
+                "resume",
+                "session-1",
+            ),
+        )
+        panes = [{
+            "id": 51,
+            "is_plugin": False,
+            "exited": False,
+            "terminal_command": None,
+        }]
+        completed = types.SimpleNamespace(stdout=json.dumps(panes))
+        original_resolver = self.runtime._zellij_agent_process
+        resolved = {}
+
+        codex = str(self.home / "opt" / "codex" / "bin" / "codex")
+
+        def resolve(
+            session,
+            pane,
+            allowed,
+            metadata_agent="",
+            trusted_paths=None,
+        ):
+            result = original_resolver(
+                session,
+                pane,
+                allowed,
+                proc_root,
+                metadata_agent=metadata_agent or "codex",
+                trusted_paths=trusted_paths,
+            )
+            resolved["agent"], resolved["descriptor"] = result
+            return result
+
+        with mock.patch.object(
+            self.runtime, "_resolve_executable", return_value="/usr/bin/zellij"
+        ), mock.patch.object(
+            self.runtime.subprocess, "run", return_value=completed
+        ), mock.patch.object(
+            self.runtime,
+            "_trusted_agent_paths",
+            return_value={"codex": {codex}},
+        ), mock.patch.object(
+            self.runtime, "_zellij_agent_process", side_effect=resolve
+        ):
+            identity = self.runtime.zellij_pane_identity(
+                "didactic-jellyfish", "51", "/tmp/project"
+            )
+
+        self.assertEqual(identity["pane_agent"], "codex")
+        self.assertEqual(resolved["agent"], "codex")
+        self.assertTrue(
+            resolved["descriptor"].startswith(self.runtime.PROCESS_IDENTITY_PREFIX)
+        )
+        descriptor = json.loads(
+            resolved["descriptor"].removeprefix(
+                self.runtime.PROCESS_IDENTITY_PREFIX
+            )
+        )
+        self.assertEqual(descriptor["pid"], 200)
+        self.assertEqual(descriptor["start"], "20000")
+        self.assertEqual(
+            descriptor["exe_path"],
+            hashlib.sha256(
+                str(self.home / "opt" / "codex" / "bin" / "codex").encode()
+            ).hexdigest()[:16],
+        )
+        self.assertEqual(identity["process_identity"], resolved["descriptor"])
+        self.assertEqual(
+            identity["pane_command_hash"],
+            hashlib.sha256(resolved["descriptor"].encode()).hexdigest(),
+        )
+
+    def test_process_resolver_uses_non_agent_ancestors_to_select_nested_agent(self):
+        proc_root = self.home / "proc"
+        proc_root.mkdir()
+        codex = str(self.home / "bin" / "codex")
+        self._write_process(
+            proc_root,
+            pid=100,
+            parent_pid=1,
+            start_time=10_000,
+            executable=codex,
+            argv=(codex, "exec", "resume", "outer-session"),
+        )
+        self._write_process(
+            proc_root,
+            pid=150,
+            parent_pid=100,
+            start_time=15_000,
+            executable="/usr/bin/bash",
+            argv=("/usr/bin/bash", "-l"),
+        )
+        self._write_process(
+            proc_root,
+            pid=200,
+            parent_pid=150,
+            start_time=20_000,
+            executable=codex,
+            argv=(codex, "exec", "resume", "inner-session"),
+        )
+
+        agent, descriptor = self.runtime._zellij_agent_process(
+            "didactic-jellyfish",
+            "51",
+            {"codex"},
+            proc_root,
+            metadata_agent="codex",
+            trusted_paths={"codex": {str(pathlib.Path(codex).resolve())}},
+        )
+
+        self.assertEqual(agent, "codex")
+        payload = json.loads(
+            descriptor.removeprefix(self.runtime.PROCESS_IDENTITY_PREFIX)
+        )
+        self.assertEqual(payload["pid"], 200)
+        self.assertEqual(payload["start"], "20000")
+
+    def test_same_command_with_new_process_identity_is_stale(self):
+        panes = [{
+            "id": 51,
+            "is_plugin": False,
+            "exited": False,
+            "terminal_command": "/opt/codex/bin/codex exec resume session-1",
+        }]
+        completed = types.SimpleNamespace(stdout=json.dumps(panes))
+        original_identity = process_identity(
+            pid=200,
+            start="20000",
+            session="didactic-jellyfish",
+            pane="51",
+        )
+        replacement_identity = process_identity(
+            pid=300,
+            start="30000",
+            session="didactic-jellyfish",
+            pane="51",
+        )
+        with mock.patch.object(
+            self.runtime, "_resolve_executable", return_value="/usr/bin/zellij"
+        ), mock.patch.object(
+            self.runtime.subprocess, "run", return_value=completed
+        ), mock.patch.object(
+            self.runtime,
+            "_trusted_agent_paths",
+            return_value={"codex": {"/opt/codex/bin/codex"}},
+        ), mock.patch.object(
+            self.runtime,
+            "_zellij_agent_process",
+            side_effect=(
+                ("codex", original_identity),
+                ("codex", replacement_identity),
+            ),
+        ) as resolver_mock:
+            original = self.runtime.zellij_pane_identity(
+                "didactic-jellyfish", "51", "/tmp/project"
+            )
+            replacement = self.runtime.zellij_pane_identity(
+                "didactic-jellyfish", "51", "/tmp/project"
+            )
+
+        self.assertEqual(resolver_mock.call_count, 2)
+        self.assertNotEqual(
+            original["process_identity"],
+            replacement["process_identity"],
+            "same command text must not make a replacement process look current",
+        )
+        self.assertNotEqual(
+            original["pane_command_hash"], replacement["pane_command_hash"]
+        )
+        bridge = self._zellij_bridge(
+            original["pane_command_hash"], original["process_identity"]
+        )
+        with mock.patch.object(
+            self.runtime, "zellij_pane_identity", return_value=replacement
+        ), mock.patch.object(self.runtime.subprocess, "run") as run:
+            with self.assertRaisesRegex(
+                self.runtime.NativeContinuationError, "different process|stale"
+            ):
+                self.runtime.deliver_zellij(bridge, "continue")
+        run.assert_not_called()
+
+    def test_delivery_waits_for_attempt_specific_acknowledgement(self):
+        exact_process_identity = process_identity(
+            session="didactic-jellyfish", pane="51"
+        )
+        request = {
+            "source_kind": "codex_session",
+            "source": {
+                "session_id": "codex-session",
+                "zellij_session": "didactic-jellyfish",
+                "zellij_pane_id": "51",
+                "cwd": "/tmp/project",
+                "pane_agent": "codex",
+                "pane_command_hash": "expected",
+                "process_identity": exact_process_identity,
+                "binding_version": "2",
+                "binding_state": "verified",
+                "endpoint_kind": "zellij_pane",
+                "delivery_policy": "native_required",
+            },
+            "owner_user_id": "*",
+            "team_id": "T12345678",
+            "channel_id": "C12345678",
+            "idempotency_key": "ack-contract",
+        }
+        bridge = self.store.bind(self.store.create(request).bridge_id, "123.456")
+        self.assertEqual(
+            bridge.source.get("process_identity"),
+            exact_process_identity,
+            "Store must persist the process identity required to acknowledge this binding",
+        )
+        self.assertTrue(self.store.enqueue_event("111.1", bridge.bridge_id, "status?"))
+        self.assertEqual(self.store.claim_event_batch(bridge.bridge_id)[0]["event_id"], "111.1")
+
+        first_key = self.runtime.delivery_attempt_id(
+            bridge.bridge_id, ("111.1",), bridge.binding_generation
+        )
+        second_key = self.runtime.delivery_attempt_id(
+            bridge.bridge_id, ("111.2",), bridge.binding_generation
+        )
+        self.assertNotEqual(
+            first_key,
+            second_key,
+            "identical message text in separate events must receive separate acknowledgements",
+        )
+        self.assertTrue(
+            self.store.prepare_delivery_attempt(
+                ["111.1"],
+                bridge.bridge_id,
+                bridge.binding_generation,
+                first_key,
+            )
+        )
+        self.assertEqual(
+            self.store.attempt_state(first_key, bridge.bridge_id),
+            "prepared",
+            "prepare the generation-bound attempt before terminal I/O starts",
+        )
+        self.assertTrue(
+            self.store.mark_attempt_submitting(
+                first_key,
+                bridge.bridge_id,
+                bridge.binding_generation,
+            )
+        )
+
+        staged_instruction = ""
+
+        def run(command, **_kwargs):
+            nonlocal staged_instruction
+            if "write-chars" in command:
+                staged_instruction = command[-1]
+            if "dump-screen" in command:
+                return types.SimpleNamespace(
+                    stdout=staged_instruction, stderr="", returncode=0
+                )
+            return types.SimpleNamespace(stdout="", stderr="", returncode=0)
+
+        with mock.patch.object(
+            self.runtime,
+            "zellij_pane_identity",
+            return_value={
+                "pane_command_hash": "expected",
+                "process_identity": exact_process_identity,
+            },
+        ), mock.patch.object(
+            self.runtime.subprocess, "run", side_effect=run
+        ), mock.patch.object(
+            self.runtime.time, "sleep"
+        ), mock.patch.object(
+            self.runtime, "_resolve_executable", return_value="/usr/bin/zellij"
+        ):
+            self.runtime.deliver_zellij(
+                bridge, "status?", attempt_id=first_key
+            )
+
+        self.assertEqual(
+            self.store.attempt_state(first_key, bridge.bridge_id),
+            "submitting",
+            "terminal I/O must not complete or acknowledge the durable attempt",
+        )
+        self.assertTrue(
+            self.store.mark_attempt_awaiting_ack(
+                first_key,
+                bridge.bridge_id,
+                bridge.binding_generation,
+            )
+        )
+        with self.store.connect() as db:
+            state = db.execute(
+                "SELECT state FROM bridge_events WHERE event_id='111.1'"
+            ).fetchone()[0]
+        self.assertEqual(
+            state,
+            "awaiting_ack",
+            "write-chars and Enter prove submission, not agent acceptance",
+        )
+        self.assertFalse(
+            self.store.acknowledge_attempt("wrong-attempt", bridge.bridge_id)
+        )
+        with self.store.connect() as db:
+            state = db.execute(
+                "SELECT state FROM bridge_events WHERE event_id='111.1'"
+            ).fetchone()[0]
+        self.assertEqual(state, "awaiting_ack")
+        self.assertTrue(
+            self.store.acknowledge_attempt(first_key, bridge.bridge_id)
+        )
+        with self.store.connect() as db:
+            state = db.execute(
+                "SELECT state FROM bridge_events WHERE event_id='111.1'"
+            ).fetchone()[0]
+        self.assertEqual(state, "delivered")
 
 
 class NotifierTest(unittest.TestCase):
@@ -671,6 +2032,10 @@ class NotifierTest(unittest.TestCase):
         data = self.home / "data" / "tether"
         data.mkdir(parents=True)
         shutil.copy2(RUNTIME_PATH, data / "bridge_runtime.py")
+        shutil.copy2(SECURITY_PATH, data / "security.py")
+        shutil.copy2(HERMES_COMPAT_PATH, data / "hermes_compat.py")
+        shutil.copy2(ROUTING_PATH, data / "routing.py")
+        shutil.copy2(SLACK_PROTOCOL_PATH, data / "slack_protocol.py")
         env = {
             "HOME": str(self.home),
             "HERMES_HOME": str(self.home / ".hermes"),
@@ -689,21 +2054,191 @@ class NotifierTest(unittest.TestCase):
         sys.modules.pop("bridge_runtime", None)
         self.temp.cleanup()
 
-    def test_explicit_run_id_precedes_ambient_sessions(self):
+    def _setup_runner(
+        self,
+        *,
+        tether: str = "disabled",
+        legacy: str = "absent",
+        config: dict[str, str] | None = None,
+        fail_on: tuple[str, ...] | None = None,
+        fail_code: int = 74,
+        raise_on: tuple[str, ...] | None = None,
+    ):
+        plugins = {"tether": tether, "session-bridge": legacy}
+        values = dict(config or {})
+
+        def completed(returncode=0, stdout="", stderr=""):
+            return types.SimpleNamespace(
+                returncode=returncode,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+        def run(command, **_kwargs):
+            operation = tuple(command[1:])
+            if raise_on == operation:
+                raise subprocess.TimeoutExpired(command, 60)
+            if fail_on == operation:
+                return completed(fail_code)
+            if operation == ("plugins", "list", "--plain"):
+                lines = []
+                for name in ("tether", "session-bridge"):
+                    state = plugins[name]
+                    if state == "enabled":
+                        lines.append(f"enabled user 0.2.0 {name}")
+                    elif state == "disabled":
+                        lines.append(f"not enabled user 0.2.0 {name}")
+                return completed(stdout="\n".join(lines) + ("\n" if lines else ""))
+            if operation[:2] == ("plugins", "enable"):
+                plugins[operation[2]] = "enabled"
+                return completed()
+            if operation[:2] == ("plugins", "disable"):
+                if plugins.get(operation[2]) != "absent":
+                    plugins[operation[2]] = "disabled"
+                return completed()
+            if operation[:2] == ("config", "get"):
+                key = operation[2]
+                if key in values:
+                    return completed(stdout=f"{values[key]}\n")
+                return completed(1, stderr=f"Config key not set: {key}\n")
+            if operation[:2] == ("config", "set"):
+                values[operation[2]] = operation[3]
+                return completed()
+            if operation[:2] == ("config", "unset"):
+                values.pop(operation[2], None)
+                return completed()
+            return completed()
+
+        return run, plugins, values
+
+    def test_explicit_run_id_cannot_replace_ambient_native_session(self):
         args = types.SimpleNamespace(run_id="cron-2026", hermes_session_id=None)
         with mock.patch.dict(os.environ, {
             "CLAUDE_CODE_SESSION_ID": "claude-session",
             "CODEX_THREAD_ID": "codex-session",
         }, clear=False):
+            with self.assertRaisesRegex(
+                SystemExit,
+                "cannot replace an active",
+            ):
+                self.notifier.detected_source(args)
+
+    def test_explicit_hermes_id_cannot_replace_ambient_native_session(self):
+        args = types.SimpleNamespace(
+            run_id=None,
+            hermes_session_id="hermes-session",
+        )
+        with mock.patch.dict(
+            os.environ,
+            {"CODEX_THREAD_ID": "codex-session"},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(
+                SystemExit,
+                "cannot replace an active",
+            ):
+                self.notifier.detected_source(args)
+
+    def test_explicit_run_id_is_accepted_without_native_context(self):
+        args = types.SimpleNamespace(run_id="cron-2026", hermes_session_id=None)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CLAUDE_CODE_SESSION_ID": "",
+                "CODEX_THREAD_ID": "",
+                "ZELLIJ_SESSION_NAME": "",
+                "ZELLIJ_PANE_ID": "",
+            },
+            clear=False,
+        ):
             kind, source = self.notifier.detected_source(args)
         self.assertEqual(kind, "headless_run")
         self.assertEqual(source["run_id"], "cron-2026")
+
+    def test_both_ambient_native_ids_use_the_bound_pane_agent(self):
+        args = types.SimpleNamespace(run_id=None, hermes_session_id=None)
+        for pane_agent, expected_kind, expected_session in (
+            ("claude", "claude_session", "claude-session"),
+            ("codex", "codex_session", "codex-session"),
+        ):
+            identity = {
+                "session_name": "work",
+                "pane_id": "7",
+                "cwd": str(pathlib.Path.cwd()),
+                "pane_agent": pane_agent,
+                "pane_command_hash": "process-fingerprint",
+                "process_identity": process_identity(
+                    agent=pane_agent,
+                    session="work",
+                    pane="7",
+                ),
+            }
+            with self.subTest(pane_agent=pane_agent):
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "CLAUDE_CODE_SESSION_ID": "claude-session",
+                        "CODEX_THREAD_ID": "codex-session",
+                        "ZELLIJ_SESSION_NAME": "work",
+                        "ZELLIJ_PANE_ID": "7",
+                    },
+                    clear=True,
+                ), mock.patch.object(
+                    self.notifier, "zellij_pane_identity", return_value=identity
+                ):
+                    kind, source = self.notifier.detected_source(args)
+                self.assertEqual(kind, expected_kind)
+                self.assertEqual(source["session_id"], expected_session)
+                self.assertEqual(source["pane_agent"], pane_agent)
+
+    def test_both_ambient_native_ids_without_a_matching_pane_fail(self):
+        args = types.SimpleNamespace(run_id=None, hermes_session_id=None)
+        scenarios = (
+            ({}, None),
+            (
+                {
+                    "ZELLIJ_SESSION_NAME": "work",
+                    "ZELLIJ_PANE_ID": "7",
+                },
+                {
+                    "session_name": "work",
+                    "pane_id": "7",
+                    "cwd": str(pathlib.Path.cwd()),
+                    "pane_agent": "gemini",
+                    "pane_command_hash": "process-fingerprint",
+                    "process_identity": process_identity(
+                        agent="gemini",
+                        session="work",
+                        pane="7",
+                    ),
+                },
+            ),
+        )
+        for terminal_env, identity in scenarios:
+            environment = {
+                "CLAUDE_CODE_SESSION_ID": "claude-session",
+                "CODEX_THREAD_ID": "codex-session",
+                **terminal_env,
+            }
+            with self.subTest(terminal=bool(terminal_env)), mock.patch.dict(
+                os.environ, environment, clear=True
+            ), mock.patch.object(
+                self.notifier,
+                "zellij_pane_identity",
+                return_value=identity,
+            ):
+                with self.assertRaisesRegex(
+                    SystemExit,
+                    "(?i)(ambiguous|both|does not match|ambient native session)",
+                ):
+                    self.notifier.detected_source(args)
 
     def test_native_session_keeps_zellij_metadata(self):
         args = types.SimpleNamespace(run_id=None, hermes_session_id=None)
         identity = {
             "session_name": "work", "pane_id": "7", "cwd": str(pathlib.Path.cwd()),
             "pane_agent": "claude", "pane_command_hash": "abc123",
+            "process_identity": process_identity(agent="claude"),
         }
         with mock.patch.dict(os.environ, {
             "CLAUDE_CODE_SESSION_ID": "claude-session",
@@ -715,12 +2250,14 @@ class NotifierTest(unittest.TestCase):
         self.assertEqual(source["zellij_session"], "work")
         self.assertEqual(source["zellij_pane_id"], "7")
         self.assertEqual(source["pane_command_hash"], "abc123")
+        self.assertEqual(source["process_identity"], process_identity(agent="claude"))
 
     def test_zellij_only_source_captures_process_identity(self):
         args = types.SimpleNamespace(run_id=None, hermes_session_id=None)
         identity = {
             "session_name": "work", "pane_id": "7", "cwd": "/tmp/project",
             "pane_agent": "codex", "pane_command_hash": "abc123",
+            "process_identity": process_identity(),
         }
         with mock.patch.dict(os.environ, {
             "ZELLIJ_SESSION_NAME": "work",
@@ -729,12 +2266,14 @@ class NotifierTest(unittest.TestCase):
             kind, source = self.notifier.detected_source(args)
         self.assertEqual(kind, "zellij_pane")
         self.assertEqual(source["pane_command_hash"], "abc123")
+        self.assertEqual(source["process_identity"], process_identity())
         capture.assert_called_once_with("work", "7", str(pathlib.Path.cwd()))
 
     def test_rebind_captures_the_current_exact_pane(self):
         identity = {
             "session_name": "work", "pane_id": "7", "cwd": "/tmp/project",
             "pane_agent": "claude", "pane_command_hash": "new-fingerprint",
+            "process_identity": process_identity(agent="claude"),
         }
         with mock.patch.dict(os.environ, {
             "ZELLIJ_SESSION_NAME": "work",
@@ -752,14 +2291,24 @@ class NotifierTest(unittest.TestCase):
         request = broker.call_args.args[0]
         self.assertEqual(request["op"], "rebind")
         self.assertEqual(request["source"]["pane_command_hash"], "new-fingerprint")
+        self.assertEqual(
+            request["source"]["process_identity"], process_identity(agent="claude")
+        )
 
     def test_attach_captures_an_explicit_existing_native_pane(self):
+        project = self.home / "project"
+        project.mkdir()
         identity = {
             "session_name": "didactic-jellyfish",
             "pane_id": "31",
-            "cwd": "/tmp/project",
+            "cwd": str(project),
             "pane_agent": "claude",
             "pane_command_hash": "exact-fingerprint",
+            "process_identity": process_identity(
+                agent="claude",
+                session="didactic-jellyfish",
+                pane="31",
+            ),
         }
         with mock.patch.object(
             self.notifier, "zellij_pane_identity", return_value=identity,
@@ -778,13 +2327,13 @@ class NotifierTest(unittest.TestCase):
                 "--claude-session-id", "claude-session",
                 "--zellij-session", "didactic-jellyfish",
                 "--zellij-pane-id", "31",
-                "--cwd", "/tmp/project",
-                "--idempotency-key", "attach-existing-123",
+                "--cwd", str(project),
+                "--idempotency-key", "attach-" + "existing-123",
                 "--json",
             ])
         self.assertEqual(result, 0)
         capture.assert_called_once_with(
-            "didactic-jellyfish", "31", "/tmp/project"
+            "didactic-jellyfish", "31", str(project)
         )
         request = broker.call_args.args[0]
         self.assertEqual(request["source_kind"], "claude_session")
@@ -803,21 +2352,24 @@ class NotifierTest(unittest.TestCase):
                 "--thread-ts", "123.456",
                 "--claude-session-id", "claude-session",
                 "--zellij-session", "work",
-                "--idempotency-key", "attach-existing-123",
+                "--idempotency-key", "attach-" + "existing-123",
             ])
 
     def test_noninteractive_setup_delegates_manifest_to_hermes(self):
         args = types.SimpleNamespace(non_interactive=True, no_restart=False)
-        completed = types.SimpleNamespace(returncode=0)
+        runner, _, _ = self._setup_runner()
         with mock.patch.object(self.notifier, "_find_hermes", return_value="/usr/bin/hermes"), mock.patch.object(
-            self.notifier.subprocess, "run", return_value=completed
+            self.notifier.subprocess, "run", side_effect=runner
         ) as run:
             self.assertEqual(self.notifier.run_setup(args), 0)
         self.assertEqual(
             [call.args[0] for call in run.call_args_list],
             [
+                ["/usr/bin/hermes", "plugins", "list", "--plain"],
+                ["/usr/bin/hermes", "config", "get", "slack.allow_bots"],
+                ["/usr/bin/hermes", "config", "get", "display.busy_ack_enabled"],
                 ["/usr/bin/hermes", "plugins", "enable", "tether"],
-                ["/usr/bin/hermes", "config", "set", "slack.allow_bots", "all"],
+                ["/usr/bin/hermes", "config", "set", "slack.allow_bots", "mentions"],
                 ["/usr/bin/hermes", "config", "set", "display.busy_ack_enabled", "false"],
                 ["/usr/bin/hermes", "slack", "manifest", "--write"],
             ],
@@ -825,16 +2377,19 @@ class NotifierTest(unittest.TestCase):
 
     def test_interactive_setup_runs_hermes_onboarding_restart_and_live_doctor(self):
         args = types.SimpleNamespace(non_interactive=False, no_restart=False)
-        completed = types.SimpleNamespace(returncode=0)
+        runner, _, _ = self._setup_runner()
         with mock.patch.object(self.notifier, "_find_hermes", return_value="/usr/bin/hermes"), mock.patch.object(
-            self.notifier.subprocess, "run", return_value=completed
+            self.notifier.subprocess, "run", side_effect=runner
         ) as run, mock.patch.object(self.notifier, "doctor", return_value=(True, ["ok live broker"])):
             self.assertEqual(self.notifier.run_setup(args), 0)
         self.assertEqual(
             [call.args[0] for call in run.call_args_list],
             [
+                ["/usr/bin/hermes", "plugins", "list", "--plain"],
+                ["/usr/bin/hermes", "config", "get", "slack.allow_bots"],
+                ["/usr/bin/hermes", "config", "get", "display.busy_ack_enabled"],
                 ["/usr/bin/hermes", "plugins", "enable", "tether"],
-                ["/usr/bin/hermes", "config", "set", "slack.allow_bots", "all"],
+                ["/usr/bin/hermes", "config", "set", "slack.allow_bots", "mentions"],
                 ["/usr/bin/hermes", "config", "set", "display.busy_ack_enabled", "false"],
                 ["/usr/bin/hermes", "gateway", "setup"],
                 ["/usr/bin/hermes", "gateway", "restart"],
@@ -846,26 +2401,101 @@ class NotifierTest(unittest.TestCase):
                 self.notifier.SERVICE_TIMEOUT_SECONDS,
                 self.notifier.SERVICE_TIMEOUT_SECONDS,
                 self.notifier.SERVICE_TIMEOUT_SECONDS,
+                self.notifier.SERVICE_TIMEOUT_SECONDS,
+                self.notifier.SERVICE_TIMEOUT_SECONDS,
+                self.notifier.SERVICE_TIMEOUT_SECONDS,
                 self.notifier.SETUP_TIMEOUT_SECONDS,
                 self.notifier.SERVICE_TIMEOUT_SECONDS,
             ],
         )
 
-    def test_setup_disables_detected_legacy_bridge_before_restart(self):
-        legacy = self.home / ".hermes" / "plugins" / "session-bridge"
-        legacy.mkdir(parents=True)
+    def test_setup_discovers_and_disables_legacy_before_enabling_tether(self):
+        args = types.SimpleNamespace(non_interactive=True, no_restart=False)
+        runner, plugins, _ = self._setup_runner(legacy="enabled")
         with mock.patch.object(self.notifier, "_find_hermes", return_value="/usr/bin/hermes"), mock.patch.object(
-            self.notifier.subprocess, "run", return_value=types.SimpleNamespace(returncode=0)
+            self.notifier.subprocess, "run", side_effect=runner
         ) as run:
-            result = self.notifier._enable_plugin("/usr/bin/hermes")
+            result = self.notifier.run_setup(args)
         self.assertEqual(result, 0)
-        self.assertEqual(
-            [call.args[0] for call in run.call_args_list],
-            [
-                ["/usr/bin/hermes", "plugins", "enable", "tether"],
-                ["/usr/bin/hermes", "plugins", "disable", "session-bridge"],
-            ],
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertLess(
+            commands.index(["/usr/bin/hermes", "plugins", "disable", "session-bridge"]),
+            commands.index(["/usr/bin/hermes", "plugins", "enable", "tether"]),
         )
+        self.assertEqual(plugins, {"tether": "enabled", "session-bridge": "disabled"})
+
+    def test_setup_failure_restores_plugin_and_config_state(self):
+        args = types.SimpleNamespace(non_interactive=True, no_restart=False)
+        original = {
+            "slack.allow_bots": "none",
+            "display.busy_ack_enabled": "true",
+        }
+        runner, plugins, values = self._setup_runner(
+            legacy="enabled",
+            config=original,
+            fail_on=("slack", "manifest", "--write"),
+        )
+        with mock.patch.object(
+            self.notifier, "_find_hermes", return_value="/usr/bin/hermes"
+        ), mock.patch.object(
+            self.notifier.subprocess, "run", side_effect=runner
+        ) as run:
+            result = self.notifier.run_setup(args)
+        self.assertEqual(result, 74)
+        self.assertEqual(plugins, {"tether": "disabled", "session-bridge": "enabled"})
+        self.assertEqual(values, original)
+        self.assertEqual(
+            sum(
+                call.args[0][1:] == ["plugins", "list", "--plain"]
+                for call in run.call_args_list
+            ),
+            1,
+        )
+
+    def test_setup_rollback_never_restores_two_active_bridges(self):
+        args = types.SimpleNamespace(non_interactive=True, no_restart=False)
+        runner, plugins, _ = self._setup_runner(
+            tether="enabled",
+            legacy="enabled",
+            fail_on=("slack", "manifest", "--write"),
+        )
+        with mock.patch.object(
+            self.notifier, "_find_hermes", return_value="/usr/bin/hermes"
+        ), mock.patch.object(self.notifier.subprocess, "run", side_effect=runner):
+            result = self.notifier.run_setup(args)
+        self.assertEqual(result, 74)
+        self.assertEqual(plugins, {"tether": "enabled", "session-bridge": "disabled"})
+
+    def test_setup_timeout_rolls_back_completed_mutations(self):
+        args = types.SimpleNamespace(non_interactive=True, no_restart=False)
+        runner, plugins, values = self._setup_runner(
+            legacy="enabled",
+            raise_on=("slack", "manifest", "--write"),
+        )
+        with mock.patch.object(
+            self.notifier, "_find_hermes", return_value="/usr/bin/hermes"
+        ), mock.patch.object(self.notifier.subprocess, "run", side_effect=runner):
+            result = self.notifier.run_setup(args)
+        self.assertEqual(result, 1)
+        self.assertEqual(plugins, {"tether": "disabled", "session-bridge": "enabled"})
+        self.assertEqual(values, {})
+
+    def test_setup_redacts_exception_details_before_printing(self):
+        args = types.SimpleNamespace(non_interactive=True, no_restart=False)
+        captured = io.StringIO()
+        with mock.patch.object(
+            self.notifier, "_find_hermes", return_value="/usr/bin/hermes"
+        ), mock.patch.object(
+            self.notifier,
+            "_snapshot_setup",
+            side_effect=RuntimeError(
+                "OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+            ),
+        ), mock.patch("sys.stderr", captured):
+            result = self.notifier.run_setup(args)
+        self.assertEqual(result, 2)
+        self.assertIn("[REDACTED_PROVIDER_KEY]", captured.getvalue())
+        self.assertNotIn("sk-proj-", captured.getvalue())
 
 
 class PluginRoutingTest(unittest.TestCase):
@@ -878,6 +2508,9 @@ class PluginRoutingTest(unittest.TestCase):
         self.plugin = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = self.plugin
         spec.loader.exec_module(self.plugin)
+        self.plugin.store = self.runtime.Store()
+        self.plugin.state.store = self.plugin.store
+        self.plugin.state.ready = True
         self.plugin_module_name = spec.name
         self.config = self.home / ".config" / "tether" / "config.toml"
         self.config.parent.mkdir(parents=True)
@@ -904,16 +2537,134 @@ class PluginRoutingTest(unittest.TestCase):
         })
         return self.plugin.store.bind(bridge.bridge_id, "123.456")
 
+    def gateway_turn(
+        self,
+        *,
+        platform,
+        thread_ts,
+        message_ts,
+        text,
+        user_id,
+        action,
+        reason,
+        bridge_id=None,
+        is_bot=False,
+    ):
+        source = types.SimpleNamespace(
+            platform=platform,
+            thread_id=thread_ts,
+            guild_id="T12345678",
+            chat_id="C12345678",
+            user_id=user_id,
+            message_id=message_ts,
+            is_bot=is_bot,
+        )
+        bridge = self.plugin.store.get(bridge_id) if bridge_id else None
+        decision = self.plugin.routing.RoutingDecision(
+            action=action,
+            reason=reason,
+            message_identity=self.plugin.routing.MessageIdentity(
+                "T12345678", "C12345678", message_ts,
+            ),
+            writer_id="writer:test" if action is not self.plugin.routing.RouteAction.SILENT else None,
+            bridge_id=bridge_id,
+            binding_generation=(
+                bridge.binding_generation if bridge is not None else None
+            ),
+        )
+        raw_message = {self.plugin.ROUTING_DECISION_KEY: decision}
+        if (
+            action is self.plugin.routing.RouteAction.HERMES
+            and bridge is not None
+        ):
+            event_id = f"slack:T12345678:C12345678:{message_ts}"
+            claim = self.plugin.store.claim_thread_ingress(
+                event_id,
+                "T12345678",
+                "C12345678",
+                thread_ts,
+                route_action="hermes",
+                writer_id="writer:test",
+                bridge_id=bridge.bridge_id,
+                binding_generation=bridge.binding_generation,
+                payload={"text": text, "subtype": ""},
+            )
+            raw_message["_tether_ingress_claim"] = (
+                event_id,
+                claim["lease_id"],
+                claim["fence_epoch"],
+            )
+        return types.SimpleNamespace(
+            source=source,
+            message_id=message_ts,
+            text=text,
+            raw_message=raw_message,
+        )
+
+    def simulate_polled_hermes(self, event, adapter):
+        decision = event[self.plugin.ROUTING_DECISION_KEY]
+        event_id = self.plugin._composite_event_id(decision)
+        claim = self.plugin.store.claim_thread_ingress(
+            event_id,
+            decision.message_identity.team_id,
+            decision.message_identity.channel_id,
+            str(event.get("thread_ts") or decision.message_identity.message_ts),
+            route_action="hermes",
+            writer_id=str(decision.writer_id or ""),
+            bridge_id=str(decision.bridge_id or ""),
+            binding_generation=decision.binding_generation,
+            payload={"text": event["text"], "subtype": str(event.get("subtype") or "")},
+        )
+        if claim["status"] != "claimed":
+            return False, None
+        event["_tether_ingress_claim"] = (
+            event_id,
+            claim["lease_id"],
+            claim["fence_epoch"],
+        )
+        result = None
+        if decision.bridge_id:
+            class Platform:
+                value = "slack"
+
+            platform = Platform()
+            source = types.SimpleNamespace(
+                platform=platform,
+                thread_id=event["thread_ts"],
+                guild_id=decision.message_identity.team_id,
+                chat_id=decision.message_identity.channel_id,
+                user_id=event.get("user"),
+                message_id=event["ts"],
+                is_bot=bool(event.get("bot_id")),
+            )
+            gateway_event = types.SimpleNamespace(
+                source=source,
+                message_id=event["ts"],
+                text=event["text"],
+                raw_message=event,
+            )
+            result = self.plugin._pre_gateway_dispatch(
+                event=gateway_event,
+                gateway=types.SimpleNamespace(adapters={platform: adapter}),
+            )
+        self.plugin.store.complete_thread_ingress(
+            event_id,
+            claim["lease_id"],
+            claim["fence_epoch"],
+        )
+        event["_tether_ingress_dispatched"] = True
+        return True, result
+
     def test_imports_recent_native_slack_sessions_for_restart_recovery(self):
         sessions = self.runtime.HERMES_HOME / "sessions" / "sessions.json"
         sessions.parent.mkdir(parents=True)
         sessions.write_text(json.dumps({
-            "agent:main:slack:dm:C0BHSK52GP5:1784319237.201969": {
+            "agent:main:slack:dm:C87654321:1785000000.000001": {
                 "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 "origin": {
                     "platform": "slack",
-                    "chat_id": "C0BHSK52GP5",
-                    "thread_id": "1784319237.201969",
+                    "chat_id": "C87654321",
+                    "thread_id": "1785000000.000001",
                 },
             },
             "old": {
@@ -926,12 +2677,12 @@ class PluginRoutingTest(unittest.TestCase):
             },
         }))
         adapter = types.SimpleNamespace(
-            _channel_team={"C0BHSK52GP5": "T12345678"},
+            _channel_team={"C87654321": "T12345678"},
         )
         imported = self.plugin._import_native_slack_participation(adapter)
         self.assertEqual(imported, 1)
         self.assertTrue(self.plugin.store.participates(
-            "T12345678", "C0BHSK52GP5", "1784319237.201969",
+            "T12345678", "C87654321", "1785000000.000001",
         ))
         participation = self.plugin.store.recent_participating_threads(
             hours=24 * 365, limit=10,
@@ -957,20 +2708,20 @@ class PluginRoutingTest(unittest.TestCase):
             "updated_at": now.isoformat(),
             "origin": {
                 "platform": "slack",
-                "chat_id": "C0BHSK52GP5",
-                "thread_id": "1784319237.201969",
+                "chat_id": "C87654321",
+                "thread_id": "1785000000.000001",
             },
         }
         sessions.write_text(json.dumps(payload))
         adapter = types.SimpleNamespace(
-            _channel_team={"C0BHSK52GP5": "T12345678"},
+            _channel_team={"C87654321": "T12345678"},
         )
 
         imported = self.plugin._import_native_slack_participation(adapter)
 
         self.assertEqual(imported, 1)
         self.assertTrue(self.plugin.store.participates(
-            "T12345678", "C0BHSK52GP5", "1784319237.201969",
+            "T12345678", "C87654321", "1785000000.000001",
         ))
 
     def test_authorization_fails_closed_and_honors_owner(self):
@@ -993,21 +2744,28 @@ class PluginRoutingTest(unittest.TestCase):
             value = "slack"
 
         platform = Platform()
-        source = types.SimpleNamespace(
-            platform=platform, thread_id="123.456", guild_id="T12345678",
-            chat_id="C12345678", user_id="U99999999", message_id="111.1",
-            is_bot=False,
+        event = self.gateway_turn(
+            platform=platform,
+            thread_ts="123.456",
+            message_ts="111.1",
+            text="continue",
+            user_id="U99999999",
+            action=self.plugin.routing.RouteAction.SILENT,
+            reason="human_not_authorized",
         )
-        event = types.SimpleNamespace(source=source, message_id="111.1", text="continue")
 
         class Adapter:
-            _reacting_message_ids = {"111.1"}
+            _reacting_message_ids = {("T12345678", "111.1")}
 
             def __init__(self):
                 self.removed = []
 
-            async def _remove_reaction(self, channel, event_id, reaction):
-                self.removed.append((channel, event_id, reaction))
+            async def _remove_reaction(
+                self, channel, event_id, reaction, team_id=""
+            ):
+                self.removed.append(
+                    (channel, event_id, reaction, team_id)
+                )
 
         adapter = Adapter()
         gateway = types.SimpleNamespace(adapters={platform: adapter})
@@ -1019,29 +2777,16 @@ class PluginRoutingTest(unittest.TestCase):
 
         result = asyncio.run(exercise())
         self.assertEqual(result["reason"], "bridge-user-not-authorized")
-        self.assertNotIn("111.1", adapter._reacting_message_ids)
-        self.assertEqual(adapter.removed, [("C12345678", "111.1", "eyes")])
+        self.assertNotIn(
+            ("T12345678", "111.1"),
+            adapter._reacting_message_ids,
+        )
+        self.assertEqual(
+            adapter.removed,
+            [("C12345678", "111.1", "eyes", "T12345678")],
+        )
 
-    def test_exact_thread_prefilter_marks_only_active_bridge(self):
-        self.make_bridge()
-        adapter = types.SimpleNamespace(_bot_message_ts=set(), _channel_team={"C12345678": "T12345678"})
-        self.assertTrue(self.plugin._mark_bridge_thread_before_slack_gate(adapter, {
-            "thread_ts": "123.456", "channel": "C12345678",
-        }))
-        self.assertIn("123.456", adapter._bot_message_ts)
-        self.assertFalse(self.plugin._mark_bridge_thread_before_slack_gate(adapter, {
-            "thread_ts": "999.999", "channel": "C12345678",
-        }))
-
-    def test_prefilter_marks_persisted_non_bridge_participation(self):
-        self.plugin.store.mark_participation("T12345678", "C12345678", "123.456")
-        adapter = types.SimpleNamespace(_bot_message_ts=set(), _channel_team={"C12345678": "T12345678"})
-        self.assertTrue(self.plugin._mark_bridge_thread_before_slack_gate(adapter, {
-            "thread_ts": "123.456", "channel": "C12345678",
-        }))
-        self.assertIn("123.456", adapter._bot_message_ts)
-
-    def test_native_send_persists_thread_participation(self):
+    def test_native_send_routes_thread_reply_through_durable_broker(self):
         class SlackAdapter:
             _tether_prefilter = False
 
@@ -1065,50 +2810,40 @@ class PluginRoutingTest(unittest.TestCase):
             "plugins.platforms.slack.adapter": types.ModuleType("plugins.platforms.slack.adapter"),
         }
         modules["plugins.platforms.slack.adapter"].SlackAdapter = SlackAdapter
-        with mock.patch.dict(sys.modules, modules), mock.patch.object(self.plugin, "_ensure_reply_poller"):
+        delivery = mock.AsyncMock(
+            return_value={"message_ts": "123.457"},
+        )
+        with mock.patch.dict(
+            sys.modules,
+            modules,
+        ), mock.patch.object(
+            self.plugin,
+            "_ensure_reply_poller",
+        ), mock.patch.object(
+            self.plugin,
+            "_deliver_hermes_message_group",
+            new=delivery,
+        ):
             self.plugin._install_slack_bridge_prefilter()
             adapter = SlackAdapter()
             asyncio.run(adapter.send("C12345678", "done", "123.456", None))
-        self.assertTrue(self.plugin.store.participates(
-            "T12345678", "C12345678", "123.456",
-        ))
-
-    def test_existing_bot_thread_is_discovered_once_and_persisted(self):
-        class Client:
-            calls = 0
-
-            async def conversations_replies(self, **kwargs):
-                self.calls += 1
-                return {"messages": [
-                    {"ts": "123.456", "user": "UHUMAN001"},
-                    {"ts": "123.457", "user": "UBOT00001", "bot_id": "BBOT00001"},
-                ]}
-
-        client = Client()
-        adapter = types.SimpleNamespace(
-            _bot_message_ts=set(),
-            _channel_team={"C12345678": "T12345678"},
-            _team_bot_user_ids={"T12345678": "UBOT00001"},
-            _get_client=lambda _channel: client,
-        )
-        event = {"thread_ts": "123.456", "channel": "C12345678"}
-        self.assertTrue(asyncio.run(
-            self.plugin._discover_existing_thread_participation(adapter, event)
-        ))
-        self.assertTrue(self.plugin.store.participates(
-            "T12345678", "C12345678", "123.456",
-        ))
-        self.assertEqual(client.calls, 1)
+        delivery.assert_awaited_once()
+        self.assertEqual(delivery.await_args.kwargs["team_id"], "T12345678")
+        self.assertEqual(delivery.await_args.kwargs["channel_id"], "C12345678")
+        self.assertEqual(delivery.await_args.kwargs["thread_ts"], "123.456")
 
     def test_prefilter_admits_unmentioned_reply_before_hermes_mention_gate(self):
-        self.make_bridge()
+        bridge = self.make_bridge()
 
         class SlackAdapter:
             _tether_prefilter = False
 
             def __init__(self):
                 self._bot_message_ts = set()
+                self._bot_user_id = "UBOT00001"
+                self._team_bot_user_ids = {"T12345678": "UBOT00001"}
                 self._channel_team = {"C12345678": "T12345678"}
+                self.config = types.SimpleNamespace(extra={})
                 self.sent = []
 
             async def connect(self):
@@ -1117,6 +2852,34 @@ class PluginRoutingTest(unittest.TestCase):
             async def send(self, channel, content, metadata=None):
                 self.sent.append((channel, content, metadata))
                 return {"ok": True}
+
+            def _get_client(self, _channel, team_id=None):
+                return types.SimpleNamespace(
+                    users_info=mock.AsyncMock(
+                        return_value={
+                            "user": {
+                                "id": "U12345678",
+                                "is_bot": False,
+                            }
+                        }
+                    ),
+                    conversations_replies=mock.AsyncMock(
+                        return_value={
+                            "messages": [{
+                                "ts": "123.456",
+                                "user": "UBOT00001",
+                                "bot_id": "BBOT00001",
+                                "metadata": {
+                                    "event_type": "tether_root",
+                                    "event_payload": {
+                                        "bridge_id": bridge.bridge_id,
+                                    },
+                                },
+                            }],
+                            "response_metadata": {"next_cursor": ""},
+                        }
+                    ),
+                )
 
             async def _handle_slack_message(self, event, payload=None):
                 return event.get("thread_ts") in self._bot_message_ts, payload
@@ -1133,19 +2896,15 @@ class PluginRoutingTest(unittest.TestCase):
             adapter = SlackAdapter()
             admitted, payload = asyncio.run(adapter._handle_slack_message({
                 "ts": "111.1", "thread_ts": "123.456", "channel": "C12345678",
+                "text": "continue", "user": "U12345678",
             }, {"team_id": "T12345678"}))
-            ignored, _ = asyncio.run(adapter._handle_slack_message({
+            ignored = asyncio.run(adapter._handle_slack_message({
                 "ts": "111.2", "thread_ts": "999.999", "channel": "C12345678",
+                "team": "T12345678", "text": "ambient", "user": "U12345678",
             }))
-            suppressed = asyncio.run(adapter.send("C12345678", "NO_REPLY"))
-            delivered = asyncio.run(adapter.send("C12345678", "NO_REPLY is a control token"))
         self.assertTrue(admitted)
         self.assertEqual(payload, {"team_id": "T12345678"})
-        self.assertFalse(ignored)
-        self.assertTrue(suppressed["suppressed"])
-        self.assertEqual(len(adapter.sent), 1)
-        self.assertEqual(adapter.sent[0][1], "NO_REPLY is a control token")
-        self.assertTrue(delivered["ok"])
+        self.assertIsNone(ignored)
 
     def test_live_hermes_adapter_alias_precedes_source_tree_fallback(self):
         class LiveSlackAdapter:
@@ -1172,13 +2931,31 @@ class PluginRoutingTest(unittest.TestCase):
     def test_reply_poller_recovers_only_authorized_unseen_human_reply(self):
         bridge = self.make_bridge()
         messages = [
-            {"ts": bridge.thread_ts, "text": "root", "bot_id": "B12345678"},
+            {
+                "ts": bridge.thread_ts,
+                "text": "root",
+                "bot_id": "B12345678",
+                "user": "ULOCAL",
+                "metadata": {
+                    "event_type": "tether_root",
+                    "event_payload": {"bridge_id": bridge.bridge_id},
+                },
+            },
             {"ts": "111.1", "thread_ts": bridge.thread_ts, "text": "continue", "user": "U12345678"},
             {"ts": "111.2", "thread_ts": bridge.thread_ts, "text": "no", "user": "U99999999"},
-            {"ts": "111.3", "thread_ts": bridge.thread_ts, "text": "bot", "bot_id": "B12345678"},
+            {
+                "ts": "111.3",
+                "thread_ts": bridge.thread_ts,
+                "text": "bot",
+                "bot_id": "B12345678",
+                "user": "ULOCAL",
+            },
         ]
 
         class Client:
+            async def users_info(self, *, user):
+                return {"user": {"id": user, "is_bot": False}}
+
             async def conversations_history(self, **_kwargs):
                 return {"ok": True, "messages": []}
 
@@ -1189,40 +2966,38 @@ class PluginRoutingTest(unittest.TestCase):
                 return {"messages": messages}
 
         class Adapter:
+            _bot_user_id = "ULOCAL"
+            _team_bot_user_ids = {"T12345678": "ULOCAL"}
+            _channel_team = {"C12345678": "T12345678"}
+            config = types.SimpleNamespace(extra={})
+
             def __init__(self):
                 self.events = []
 
-            def _get_client(self, _channel):
+            def _get_client(self, _channel, team_id=None):
                 return Client()
 
             async def _handle_slack_message(self, event):
-                self.events.append(event)
-                source = types.SimpleNamespace(
-                    platform=platform,
-                    thread_id=event["thread_ts"],
-                    guild_id="T12345678",
-                    chat_id=event["channel"],
-                    user_id=event["user"],
-                    message_id=event["ts"],
-                    is_bot=False,
+                decision = await test_case.plugin._route_slack_event(
+                    self,
+                    event,
                 )
-                gateway_event = types.SimpleNamespace(
-                    source=source,
-                    message_id=event["ts"],
-                    text=event["text"],
+                if (
+                    decision is None
+                    or decision.action
+                    is test_case.plugin.routing.RouteAction.SILENT
+                ):
+                    return
+                event[test_case.plugin.ROUTING_DECISION_KEY] = decision
+                dispatched, result = test_case.simulate_polled_hermes(
+                    event,
+                    self,
                 )
-                result = self_plugin._pre_gateway_dispatch(
-                    event=gateway_event,
-                    gateway=types.SimpleNamespace(adapters={platform: self}),
-                )
-                self.events[-1]["dispatch_result"] = result
+                if dispatched:
+                    self.events.append(event)
+                    self.events[-1]["dispatch_result"] = result
 
-        self_plugin = self.plugin
-
-        class Platform:
-            value = "slack"
-
-        platform = Platform()
+        test_case = self
         adapter = Adapter()
         recovered = asyncio.run(self.plugin._poll_recent_replies(adapter))
         recovered_again = asyncio.run(self.plugin._poll_recent_replies(adapter))
@@ -1249,7 +3024,7 @@ class PluginRoutingTest(unittest.TestCase):
                 return {"messages": []}
 
         class Adapter:
-            def _get_client(self, _channel):
+            def _get_client(self, _channel, team_id=None):
                 return Client()
 
             async def _handle_slack_message(self, _event):
@@ -1272,6 +3047,9 @@ class PluginRoutingTest(unittest.TestCase):
         ]
 
         class Client:
+            async def users_info(self, *, user):
+                return {"user": {"id": user, "is_bot": False}}
+
             async def conversations_history(self, **_kwargs):
                 return {"ok": True, "messages": []}
 
@@ -1282,14 +3060,36 @@ class PluginRoutingTest(unittest.TestCase):
                 return {"messages": messages}
 
         class Adapter:
+            _bot_user_id = "ULOCAL"
+            _team_bot_user_ids = {"T12345678": "ULOCAL"}
+            _channel_team = {"C12345678": "T12345678"}
+            config = types.SimpleNamespace(extra={})
+
             def __init__(self):
                 self.events = []
 
-            def _get_client(self, _channel):
+            def _get_client(self, _channel, team_id=None):
                 return Client()
 
             async def _handle_slack_message(self, event):
-                self.events.append(event)
+                decision = await test_case.plugin._route_slack_event(
+                    self,
+                    event,
+                )
+                if (
+                    decision is None
+                    or decision.action
+                    is test_case.plugin.routing.RouteAction.SILENT
+                ):
+                    return
+                event[test_case.plugin.ROUTING_DECISION_KEY] = decision
+                dispatched, _result = test_case.simulate_polled_hermes(
+                    event,
+                    self,
+                )
+                if dispatched:
+                    self.events.append(event)
+        test_case = self
         adapter = Adapter()
         recovered = asyncio.run(self.plugin._poll_recent_replies(adapter))
         recovered_again = asyncio.run(self.plugin._poll_recent_replies(adapter))
@@ -1299,9 +3099,18 @@ class PluginRoutingTest(unittest.TestCase):
         self.assertTrue(adapter.events[0]["_tether_polled"])
 
     def test_reply_poller_recovers_peer_bot_thread_turns_when_enabled(self):
-        bridge = self.make_bridge()
+        bridge = self.make_bridge(owner="*")
         messages = [
-            {"ts": bridge.thread_ts, "text": "root", "bot_id": "BLOCAL", "user": "ULOCAL"},
+            {
+                "ts": bridge.thread_ts,
+                "text": "root",
+                "bot_id": "BLOCAL",
+                "user": "ULOCAL",
+                "metadata": {
+                    "event_type": "tether_root",
+                    "event_payload": {"bridge_id": bridge.bridge_id},
+                },
+            },
             {
                 "ts": "111.1", "thread_ts": bridge.thread_ts,
                 "text": "<@ULOCAL> challenge this premise", "bot_id": "BPEER", "user": "UPEER",
@@ -1332,75 +3141,58 @@ class PluginRoutingTest(unittest.TestCase):
             def __init__(self):
                 self.events = []
 
-            def _get_client(self, _channel):
+            def _get_client(self, _channel, team_id=None):
                 return Client()
 
             async def _handle_slack_message(self, event):
-                self.events.append(event)
-                source = types.SimpleNamespace(
-                    platform=platform,
-                    thread_id=event["thread_ts"],
-                    guild_id="T12345678",
-                    chat_id=event["channel"],
-                    user_id=event["user"],
-                    message_id=event["ts"],
-                    is_bot=True,
+                decision = await test_case.plugin._route_slack_event(
+                    self,
+                    event,
                 )
-                gateway_event = types.SimpleNamespace(
-                    source=source,
-                    message_id=event["ts"],
-                    text=event["text"],
+                if (
+                    decision is None
+                    or decision.action
+                    is test_case.plugin.routing.RouteAction.SILENT
+                ):
+                    return
+                event[test_case.plugin.ROUTING_DECISION_KEY] = decision
+                dispatched, result = test_case.simulate_polled_hermes(
+                    event,
+                    self,
                 )
-                result = self_plugin._pre_gateway_dispatch(
-                    event=gateway_event,
-                    gateway=types.SimpleNamespace(adapters={platform: self}),
-                )
-                self.events[-1]["dispatch_result"] = result
+                if dispatched:
+                    self.events.append(event)
+                    self.events[-1]["dispatch_result"] = result
 
-        self_plugin = self.plugin
-
-        class Platform:
-            value = "slack"
-
-        platform = Platform()
+        test_case = self
         adapter = Adapter()
         with mock.patch.dict(os.environ, {"TETHER_ALLOWED_BOT_USERS": "UPEER"}, clear=False):
             recovered = asyncio.run(self.plugin._poll_recent_replies(adapter))
             recovered_again = asyncio.run(self.plugin._poll_recent_replies(adapter))
-        self.assertEqual(recovered, 2)
+        self.assertEqual(recovered, 1)
         self.assertEqual(recovered_again, 0)
+        self.assertEqual(len(adapter.events), 1)
         self.assertEqual(adapter.events[0]["ts"], "111.1")
         self.assertEqual(adapter.events[0]["dispatch_result"]["action"], "rewrite")
 
-    def test_peer_bot_requires_explicit_tether_allowlist(self):
-        adapter = types.SimpleNamespace(
-            _bot_user_id="ULOCAL",
-            _team_bot_user_ids={"T12345678": "ULOCAL"},
-            config=types.SimpleNamespace(extra={"allow_bots": "all"}),
-        )
-        event = {
-            "text": "general bot chatter",
-            "bot_id": "BPEER",
-            "user": "UPEER",
-            "subtype": "bot_message",
-        }
-        with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertFalse(self.plugin._allows_bot_message(adapter, event, "T12345678"))
-        with mock.patch.dict(os.environ, {"TETHER_ALLOWED_BOT_USERS": "UOTHER,UPEER"}, clear=True):
-            self.assertTrue(self.plugin._allows_bot_message(adapter, event, "T12345678"))
-
     def test_trusted_peer_bot_in_bound_thread_routes_to_bound_session(self):
-        self.make_bridge()
+        bridge = self.make_bridge()
 
         class Platform:
             value = "slack"
 
         platform = Platform()
-        source = types.SimpleNamespace(
-            platform=platform, thread_id="123.456", guild_id="T12345678",
-            chat_id="C12345678", user_id="UPEER", message_id="111.1", is_bot=True,
+        event = self.gateway_turn(
+            platform=platform,
+            thread_ts="123.456",
+            message_ts="111.1",
+            text="<@ULOCAL> challenge this",
+            user_id="UPEER",
+            action=self.plugin.routing.RouteAction.HERMES,
+            reason="active_hermes_binding",
+            bridge_id=bridge.bridge_id,
+            is_bot=True,
         )
-        event = types.SimpleNamespace(source=source, message_id="111.1", text="challenge this")
         gateway = types.SimpleNamespace(adapters={platform: types.SimpleNamespace()})
         with mock.patch.dict(os.environ, {"TETHER_ALLOWED_BOT_USERS": "UPEER"}, clear=False):
             result = self.plugin._pre_gateway_dispatch(event=event, gateway=gateway)
@@ -1414,11 +3206,16 @@ class PluginRoutingTest(unittest.TestCase):
             value = "slack"
 
         platform = Platform()
-        source = types.SimpleNamespace(
-            platform=platform, thread_id="123.456", guild_id="T12345678",
-            chat_id="C12345678", user_id="UUNTRUSTED", message_id="111.1", is_bot=True,
+        event = self.gateway_turn(
+            platform=platform,
+            thread_ts="123.456",
+            message_ts="111.1",
+            text="run this",
+            user_id="UUNTRUSTED",
+            action=self.plugin.routing.RouteAction.SILENT,
+            reason="untrusted_peer_bot",
+            is_bot=True,
         )
-        event = types.SimpleNamespace(source=source, message_id="111.1", text="run this")
         gateway = types.SimpleNamespace(adapters={platform: types.SimpleNamespace()})
         with mock.patch.dict(os.environ, {"TETHER_ALLOWED_BOT_USERS": "UPEER"}, clear=False):
             result = self.plugin._pre_gateway_dispatch(event=event, gateway=gateway)
@@ -1429,17 +3226,22 @@ class PluginRoutingTest(unittest.TestCase):
         self.assertEqual(self.plugin._reply_delta(text), "please continue")
 
     def test_authorized_headless_reply_rewrites_into_durable_hermes_context(self):
-        self.make_bridge()
+        bridge = self.make_bridge()
 
         class Platform:
             value = "slack"
 
         platform = Platform()
-        source = types.SimpleNamespace(
-            platform=platform, thread_id="123.456", guild_id="T12345678",
-            chat_id="C12345678", user_id="U12345678", message_id="111.1",
+        event = self.gateway_turn(
+            platform=platform,
+            thread_ts="123.456",
+            message_ts="111.1",
+            text="continue the run",
+            user_id="U12345678",
+            action=self.plugin.routing.RouteAction.HERMES,
+            reason="active_hermes_binding",
+            bridge_id=bridge.bridge_id,
         )
-        event = types.SimpleNamespace(source=source, message_id="111.1", text="continue the run")
         adapter = types.SimpleNamespace(_reacting_message_ids=set())
         gateway = types.SimpleNamespace(adapters={platform: adapter})
         result = self.plugin._pre_gateway_dispatch(event=event, gateway=gateway)
@@ -1448,16 +3250,38 @@ class PluginRoutingTest(unittest.TestCase):
         self.assertIn("continue the run", result["text"])
 
     def test_restart_recovery_delivers_queued_reply_and_marks_it_complete(self):
-        bridge = self.make_bridge()
+        bridge = self.plugin.store.create({
+            "source_kind": "claude_session",
+            "source": {"session_id": "claude-restart", "cwd": "/tmp/project"},
+            "owner_user_id": "U12345678",
+            "team_id": "T12345678",
+            "channel_id": "C12345678",
+            "idempotency_key": "claude-restart",
+        })
+        bridge = self.plugin.store.bind(bridge.bridge_id, "123.456")
         self.plugin.store.enqueue_event("111.1", bridge.bridge_id, "continue after restart")
         replies = []
 
         def broker_call(request):
             replies.append(request["text"])
-            return {"ok": True}
+            acknowledged = self.plugin.store.acknowledge_attempt(
+                request["reply_key"],
+                request["bridge_id"],
+                ack_kind="reply",
+                message_ts="123.457",
+            )
+            return {"ok": True, "acknowledged_events": acknowledged}
 
-        with mock.patch.object(self.plugin, "broker_call", side_effect=broker_call), mock.patch.object(
-            self.plugin, "_run_recovered_event", return_value="finished after restart"
+        def continue_after_restart(_bridge, _prompt, _cancellation, persist):
+            persist("finished after restart")
+            return "finished after restart"
+
+        with mock.patch.object(
+            self.plugin, "broker_call", side_effect=broker_call
+        ), mock.patch.object(
+            self.plugin,
+            "continue_native",
+            side_effect=continue_after_restart,
         ):
             self.plugin._recover_queued_events()
 
@@ -1465,6 +3289,63 @@ class PluginRoutingTest(unittest.TestCase):
             state = database.execute("SELECT state FROM bridge_events WHERE event_id='111.1'").fetchone()[0]
         self.assertEqual(state, "delivered")
         self.assertIn("finished after restart", replies)
+
+    def test_zellij_dispatch_waits_for_attempt_ack_before_completion(self):
+        exact = process_identity(
+            agent="codex", session="didactic-jellyfish", pane="51"
+        )
+        bridge = self.plugin.store.create({
+            "source_kind": "codex_session",
+            "source": {
+                "session_id": "codex-1",
+                "cwd": "/tmp/project",
+                "zellij_session": "didactic-jellyfish",
+                "zellij_pane_id": "51",
+                "pane_agent": "codex",
+                "pane_command_hash": hashlib.sha256(exact.encode()).hexdigest(),
+                "process_identity": exact,
+            },
+            "owner_user_id": "*",
+            "team_id": "T12345678",
+            "channel_id": "C12345678",
+            "idempotency_key": "zellij-awaiting-ack",
+        })
+        bridge = self.plugin.store.bind(bridge.bridge_id, "456.789")
+        self.plugin.store.enqueue_event("111.1", bridge.bridge_id, "status?")
+
+        class Platform:
+            value = "slack"
+
+        platform = Platform()
+        adapter = types.SimpleNamespace(sent=[])
+        gateway = types.SimpleNamespace(adapters={platform: adapter})
+        with mock.patch.object(
+            self.plugin, "deliver_zellij", return_value="unused"
+        ) as deliver:
+            asyncio.run(self.plugin._drain_bridge(bridge.bridge_id, gateway, platform))
+
+        deliver.assert_called_once()
+        attempt_id = deliver.call_args.args[2]
+        self.assertEqual(
+            attempt_id,
+            self.runtime.delivery_attempt_id(
+                bridge.bridge_id, ("111.1",), bridge.binding_generation
+            ),
+        )
+        with self.plugin.store.connect() as database:
+            self.assertEqual(
+                database.execute(
+                    "SELECT state FROM bridge_events WHERE event_id='111.1'"
+                ).fetchone()[0],
+                "awaiting_ack",
+            )
+            self.assertEqual(
+                database.execute(
+                    "SELECT state FROM bridge_attempts WHERE attempt_id=?",
+                    (attempt_id,),
+                ).fetchone()[0],
+                "awaiting_ack",
+            )
 
     def test_busy_native_followups_share_one_agent_turn_and_one_slack_reply(self):
         bridge = self.plugin.store.create({
@@ -1495,17 +3376,37 @@ class PluginRoutingTest(unittest.TestCase):
         gateway = types.SimpleNamespace(adapters={platform: adapter})
         prompts = []
 
-        def continue_native(_bridge, prompt, _cancellation):
+        def continue_native(_bridge, prompt, _cancellation, persist):
             prompts.append(prompt)
-            return "Fixed and verified."
+            response = "Fixed and verified."
+            persist(response)
+            return response
 
-        with mock.patch.object(self.plugin, "continue_native", side_effect=continue_native):
+        broker_requests = []
+
+        def broker_call(request):
+            broker_requests.append(request)
+            acknowledged = self.plugin.store.acknowledge_attempt(
+                request["reply_key"],
+                request["bridge_id"],
+                ack_kind="reply",
+                message_ts="456.790",
+            )
+            return {"ok": True, "acknowledged_events": acknowledged}
+
+        with mock.patch.object(
+            self.plugin, "continue_native", side_effect=continue_native
+        ), mock.patch.object(
+            self.plugin, "broker_call", side_effect=broker_call
+        ):
             asyncio.run(self.plugin._drain_bridge(bridge.bridge_id, gateway, platform))
 
         self.assertEqual(len(prompts), 1)
         self.assertIn("first follow-up", prompts[0])
         self.assertIn("latest follow-up", prompts[0])
-        self.assertEqual(len(adapter.sent), 1)
+        self.assertEqual(len(adapter.sent), 0)
+        self.assertEqual(len(broker_requests), 1)
+        self.assertEqual(broker_requests[0]["text"], "Fixed and verified.")
         with self.plugin.store.connect() as database:
             states = [
                 row[0] for row in database.execute(
@@ -1530,29 +3431,42 @@ class PluginRoutingTest(unittest.TestCase):
             value = "slack"
 
         platform = Platform()
-        source = types.SimpleNamespace(
-            platform=platform, thread_id="456.789", guild_id="T12345678",
-            chat_id="C12345678", user_id="U12345678", message_id="111.2",
+        event = self.gateway_turn(
+            platform=platform,
+            thread_ts="456.789",
+            message_ts="111.2",
+            text="stop",
+            user_id="U12345678",
+            action=self.plugin.routing.RouteAction.NATIVE,
+            reason="active_native_binding",
+            bridge_id=bridge.bridge_id,
         )
-        event = types.SimpleNamespace(source=source, message_id="111.2", text="stop")
-        sent = []
+        notices = []
 
         class Adapter:
             _reacting_message_ids = set()
 
-            async def send(self, channel, text, metadata):
-                sent.append((channel, text, metadata))
-
         gateway = types.SimpleNamespace(adapters={platform: Adapter()})
 
+        async def record_notice(_bridge, **kwargs):
+            notices.append(kwargs)
+
         async def exercise():
-            result = self.plugin._pre_gateway_dispatch(event=event, gateway=gateway)
+            with mock.patch.object(
+                self.plugin,
+                "_post_control_notice",
+                side_effect=record_notice,
+            ):
+                result = self.plugin._pre_gateway_dispatch(event=event, gateway=gateway)
+                await asyncio.sleep(0)
             await asyncio.sleep(0)
             return result
 
         result = asyncio.run(exercise())
         self.assertEqual(result["reason"], "tether-cancel")
-        self.assertIn("Cancelled 1 queued replies", sent[0][1])
+        self.assertEqual(len(notices), 1)
+        self.assertIn("Cancelled 1 queued reply", notices[0]["text"])
+        self.assertTrue(notices[0]["idempotency_key"].startswith("control:cancel:"))
         with self.plugin.store.connect() as database:
             state = database.execute("SELECT state FROM bridge_events WHERE event_id='111.1'").fetchone()[0]
         self.assertEqual(state, "failed")
@@ -1580,9 +3494,13 @@ class InstallerAndPackageTest(unittest.TestCase):
             for harness in ("codex", "claude"):
                 legacy = home / harness / "skills" / "hermes-slack-bridge" / "scripts"
                 legacy.mkdir(parents=True)
-                (legacy / "hermes_notify.py").write_text(
+                compatibility_client = legacy / "hermes_notify.py"
+                compatibility_client.write_text(
                     'notify.add_argument("--owner", default="U12345678")\n'
                 )
+                compatibility_client.chmod(0o600)
+            for directory in (path for path in home.rglob("*") if path.is_dir()):
+                directory.chmod(0o700)
             first = self.run_installer(home)
             self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
             for harness in ("codex", "claude"):

@@ -3,5 +3,9 @@ __pycache__/
 *.tgz
 .ruff_cache/
 .desloppify/
+.coverage
+coverage.xml
+htmlcov/
+scorecard.png
 config.toml
 bridges.db

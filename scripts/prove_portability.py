@@ -14,7 +14,16 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SKILLS = ("hands-free", "parable", "cascade", "recall", "recap", "tether", "desloppify")
+SKILLS = (
+    "hands-free",
+    "parable",
+    "cascade",
+    "recall",
+    "recap",
+    "tether",
+    "desloppify",
+    "autoqa",
+)
 
 
 def digest(path: Path) -> str:
@@ -164,6 +173,12 @@ def main() -> int:
         run(
             "smoke-desloppify",
             ["python3", "-m", "unittest", "discover", "-s", "desloppify/tests", "-v"],
+            smoke_env,
+            output,
+        )
+        run(
+            "smoke-autoqa",
+            ["python3", "-m", "unittest", "discover", "-s", "autoqa/tests", "-v"],
             smoke_env,
             output,
         )
