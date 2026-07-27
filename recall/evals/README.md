@@ -63,6 +63,21 @@ The result contains aggregate Boundary Recall@20, Boundary MRR, pointer integrit
 authorization violations, backend errors, and latency only. Per-question rankings, questions,
 facts, receipts, source bodies, and traces are never copied into Git output.
 
+Generate the private boundary ranking file through an explicitly tenant- and
+source-bound runtime. This step does not inspect gold labels or imply owner
+approval:
+
+```bash
+PYTHONPATH=recall:recall/server python -m evals.agentic_rankings \
+  --input "$RECALL_PRIVATE_EVAL_DIR/truth.jsonl" \
+  --output "$RECALL_PRIVATE_EVAL_DIR/boundaries-run-1.jsonl" \
+  --repo-root "$(git rev-parse --show-toplevel)" \
+  --run-id frozen-baseline-1 \
+  --tenant tenant:company:example \
+  --source claude:linux:example \
+  --source codex:linux:example
+```
+
 ## Logical corpus reconstruction
 
 The logical-corpus audit deterministically samples across every source and
