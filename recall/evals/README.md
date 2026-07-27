@@ -78,6 +78,35 @@ PYTHONPATH=recall:recall/server python -m evals.agentic_rankings \
   --source codex:linux:example
 ```
 
+Select the lossless passage hint index without changing the private output
+contract:
+
+```bash
+PYTHONPATH=recall:recall/server python -m evals.agentic_rankings \
+  --input "$RECALL_PRIVATE_EVAL_DIR/truth.jsonl" \
+  --output "$RECALL_PRIVATE_EVAL_DIR/passage-boundaries.jsonl" \
+  --repo-root "$(git rev-parse --show-toplevel)" \
+  --run-id passage-validation-1 \
+  --tenant tenant:company:example \
+  --source claude:linux:example \
+  --source codex:linux:example \
+  --retrieval-mode passage
+```
+
+After a passage projection, audit exact S3 reconstruction, full dense-span
+coverage, embedding convergence, and vector compression. The report is
+aggregate-only; source bodies, identifiers, object keys, and receipts never
+leave process memory.
+
+```bash
+PYTHONPATH=recall:recall/server python -m evals.passage_index_audit \
+  --tenant tenant:company:example \
+  --target-tokens 1024 \
+  --overlap-tokens 128 \
+  --sample-size 500 \
+  --repo-root "$(git rev-parse --show-toplevel)"
+```
+
 ## Logical corpus reconstruction
 
 The logical-corpus audit deterministically samples across every source and
