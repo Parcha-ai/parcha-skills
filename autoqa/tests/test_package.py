@@ -126,6 +126,17 @@ class AutoqaPackageTest(unittest.TestCase):
             self.assertNotEqual(missing_devtools.returncode, 0)
             self.assertIn("DevTools visual and network/console", missing_devtools.stderr)
 
+            (evidence / "cleanup.txt").write_text("PENDING EXTERNAL CLEANUP WITNESS\n")
+            report.write_text(self._report("PASS", "SHIP"))
+            pending_cleanup = subprocess.run(
+                ["python3", str(VALIDATOR), str(report)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(pending_cleanup.returncode, 0)
+            self.assertIn("pending or unverified cleanup witness", pending_cleanup.stderr)
+
     @staticmethod
     def _report(result: str, verdict: str) -> str:
         sha = "a" * 40
