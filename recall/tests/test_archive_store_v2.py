@@ -110,6 +110,7 @@ class FakeR2:
         self.objects: dict[tuple[str, str], dict] = {}
         self.put_calls: list[dict] = []
         self.get_calls: list[dict] = []
+        self.head_calls: list[dict] = []
         self.delete_calls: list[dict] = []
 
     def put_object(self, **kwargs):
@@ -134,6 +135,7 @@ class FakeR2:
         }
 
     def head_object(self, **kwargs):
+        self.head_calls.append(kwargs)
         try:
             value = self.objects[(kwargs["Bucket"], kwargs["Key"])]
         except KeyError as error:
@@ -343,8 +345,10 @@ class ArchiveStoreParityTest(unittest.TestCase):
         )
 
         first = store.put(request())
+        self.assertEqual(client.head_calls, [])
         replay = store.put(request())
         self.assertEqual(first, replay)
+        self.assertEqual(len(client.head_calls), 1)
         self.assertEqual(
             first.version_id,
             "r2-sha256-" + hashlib.sha256(PAYLOAD).hexdigest(),
@@ -382,8 +386,10 @@ class ArchiveStoreParityTest(unittest.TestCase):
         )
 
         first = store.put(request())
+        self.assertEqual(client.head_calls, [])
         replay = store.put(request())
         self.assertEqual(first, replay)
+        self.assertEqual(len(client.head_calls), 1)
         self.assertEqual(
             first.version_id,
             "s3-sha256-" + hashlib.sha256(PAYLOAD).hexdigest(),

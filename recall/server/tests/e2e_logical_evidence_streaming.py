@@ -95,7 +95,10 @@ def main() -> None:
     count = 100_000
     part_bytes = 4 * 1024 * 1024
     archive = MeasuringArchive()
-    projection = LogicalEvidenceProjectionStore(archive)
+    projection = LogicalEvidenceProjectionStore(
+        archive,
+        part_upload_concurrency=4,
+    )
     tracemalloc.start()
     started = time.monotonic()
     upload = projection.put_records(

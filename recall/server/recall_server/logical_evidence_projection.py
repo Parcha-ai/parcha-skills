@@ -44,6 +44,7 @@ class LogicalGroupCandidate:
     generation: int
     revision: int
     estimated_records: int = 1
+    estimated_bytes: int = 1
 
 
 def mark_logical_evidence_dirty(
@@ -112,13 +113,15 @@ def _explicit_roles(values: Any) -> tuple[str, ...]:
     )
 
 
-def _structural_values(text: str) -> tuple[bool, tuple[str, ...], tuple[str, ...]]:
+def _parsed_structural_values(
+    text: str,
+) -> tuple[bool, tuple[str, ...], tuple[str, ...], Any]:
     try:
         value = orjson.loads(text)
     except orjson.JSONDecodeError:
-        return False, (), ()
+        return False, (), (), None
     if not isinstance(value, dict):
-        return True, (), ()
+        return True, (), (), value
 
     def string_at(*path: str) -> str | None:
         current: Any = value
@@ -152,7 +155,12 @@ def _structural_values(text: str) -> tuple[bool, tuple[str, ...], tuple[str, ...
         )
         if candidate is not None
     )
-    return True, types, roles
+    return True, types, roles, value
+
+
+def _structural_values(text: str) -> tuple[bool, tuple[str, ...], tuple[str, ...]]:
+    parsed, types, roles, _content = _parsed_structural_values(text)
+    return parsed, types, roles
 
 
 class CanonicalLogicalEvidenceProjector:
@@ -169,6 +177,7 @@ class CanonicalLogicalEvidenceProjector:
             DEFAULT_EXCLUDED_STRUCTURAL_TYPES
         ),
         retention_profile: str = "conversation-useful-v1",
+        cursor_fetch_rows: int = 10_000,
     ) -> None:
         if bound_tenant_id is not None and (
             not isinstance(bound_tenant_id, str)
@@ -191,8 +200,15 @@ class CanonicalLogicalEvidenceProjector:
             or retention_profile != "conversation-useful-v1"
         ):
             raise LogicalEvidenceError("logical_evidence_retention_invalid")
+        if (
+            isinstance(cursor_fetch_rows, bool)
+            or not isinstance(cursor_fetch_rows, int)
+            or not 1_000 <= cursor_fetch_rows <= 50_000
+        ):
+            raise LogicalEvidenceError("logical_evidence_budget_invalid")
         self.excluded_structural_types = excluded_structural_types
         self.retention_profile = retention_profile
+        self.cursor_fetch_rows = cursor_fetch_rows
 
     def _tenant(self, tenant_id: str | None) -> str | None:
         if self.bound_tenant_id is None:
@@ -288,6 +304,7 @@ class CanonicalLogicalEvidenceProjector:
         text: str,
         receipts: list[str],
         start_ordinal: int,
+        canonical_content_bytes: bytes | None = None,
     ):
         if (
             not isinstance(text, str)
@@ -299,6 +316,10 @@ class CanonicalLogicalEvidenceProjector:
         text = self._restored_record_text(row, text)
         segments = self._text_segments(text)
         roles = _explicit_roles(row["explicit_role_values"])
+        use_cached_content = (
+            canonical_content_bytes is not None
+            and len(segments) == 1
+        )
         for segment_ordinal, segment in enumerate(segments):
             yield LogicalEvidenceRecord(
                 ordinal=start_ordinal + segment_ordinal,
@@ -310,6 +331,11 @@ class CanonicalLogicalEvidenceProjector:
                 segment_ordinal=segment_ordinal,
                 segment_count=len(segments),
                 text=segment,
+                canonical_content_bytes=(
+                    canonical_content_bytes
+                    if use_cached_content
+                    else None
+                ),
             )
 
     def _record_stream(self, cursor: Any):
@@ -324,7 +350,12 @@ class CanonicalLogicalEvidenceProjector:
                 or revision < 1
             ):
                 raise LogicalEvidenceError("logical_evidence_state_invalid")
-            parsed, structural_types, structural_roles = _structural_values(text)
+            (
+                parsed,
+                structural_types,
+                structural_roles,
+                canonical_content,
+            ) = _parsed_structural_values(text)
             if not parsed:
                 structural_types = tuple(row["fallback_type_values"])
                 structural_roles = tuple(row["fallback_role_values"])
@@ -332,6 +363,16 @@ class CanonicalLogicalEvidenceProjector:
                 self.excluded_structural_types
             ):
                 continue
+            canonical_content_bytes = None
+            if parsed and row["raw_media_type"] != OVERSIZED_MEDIA_TYPE:
+                source_bytes = text.encode()
+                if len(source_bytes) <= TEXT_SEGMENT_BYTES:
+                    candidate_bytes = orjson.dumps(
+                        canonical_content,
+                        option=orjson.OPT_SORT_KEYS,
+                    )
+                    if candidate_bytes == source_bytes:
+                        canonical_content_bytes = candidate_bytes
             row["explicit_role_values"] = list(structural_roles)
             receipts = [
                 item_receipt(
@@ -348,6 +389,7 @@ class CanonicalLogicalEvidenceProjector:
                     text=text,
                     receipts=receipts,
                     start_ordinal=next_ordinal,
+                    canonical_content_bytes=canonical_content_bytes,
                 )
             )
             yield from records
@@ -366,8 +408,19 @@ class CanonicalLogicalEvidenceProjector:
                           queue.changed_at AS source_updated_at,
                           queue.generation,
                           COALESCE(evidence.revision,0)+1 AS revision,
-                          (
+                          estimate.estimated_records,
+                          COALESCE(
+                              evidence_size.estimated_bytes,
+                              estimate.estimated_records
+                          ) AS estimated_bytes
+                     FROM canonical_evidence_document_queue queue
+                     LEFT JOIN canonical_evidence_documents evidence
+                       ON evidence.tenant_id=queue.tenant_id
+                      AND evidence.source_id=queue.source_id
+                      AND evidence.native_parent_id=queue.native_parent_id
+                     CROSS JOIN LATERAL (
                               SELECT count(*)
+                                         AS estimated_records
                                 FROM canonical_events session_event
                                WHERE session_event.tenant_id=queue.tenant_id
                                  AND session_event.source_id=queue.source_id
@@ -375,12 +428,17 @@ class CanonicalLogicalEvidenceProjector:
                                      session_event.native_parent_id,
                                      session_event.native_id
                                  )=queue.native_parent_id
-                          ) AS estimated_records
-                     FROM canonical_evidence_document_queue queue
-                     LEFT JOIN canonical_evidence_documents evidence
-                       ON evidence.tenant_id=queue.tenant_id
-                      AND evidence.source_id=queue.source_id
-                      AND evidence.native_parent_id=queue.native_parent_id
+                     ) estimate
+                     LEFT JOIN LATERAL (
+                              SELECT sum(part.size_bytes)
+                                         AS estimated_bytes
+                                FROM canonical_evidence_document_parts part
+                               WHERE part.tenant_id=evidence.tenant_id
+                                 AND part.source_id=evidence.source_id
+                                 AND part.logical_document_id
+                                     =evidence.logical_document_id
+                                 AND part.revision=evidence.revision
+                     ) evidence_size ON true
                     WHERE (%s::text IS NULL OR queue.tenant_id=%s)
                     ORDER BY queue.changed_at,queue.tenant_id,
                              queue.source_id,queue.native_parent_id
@@ -396,6 +454,7 @@ class CanonicalLogicalEvidenceProjector:
                 generation=int(row["generation"]),
                 revision=int(row["revision"]),
                 estimated_records=max(1, int(row["estimated_records"])),
+                estimated_bytes=max(1, int(row["estimated_bytes"])),
             )
             for row in rows
         ]
@@ -478,10 +537,47 @@ class CanonicalLogicalEvidenceProjector:
         completed: list[LogicalEvidenceUpload] = []
         try:
             with self.store.connect() as connection:
+                existing_parts: dict[int, list[dict[str, Any]]] = {}
+                part_rows = connection.execute(
+                    """WITH selected(
+                           candidate_ordinal,tenant_id,source_id,
+                           native_parent_id
+                       ) AS MATERIALIZED (
+                           SELECT * FROM unnest(
+                               %s::integer[],%s::text[],%s::text[],%s::text[]
+                           )
+                       )
+                       SELECT selected.candidate_ordinal,part.*
+                         FROM selected
+                         JOIN canonical_evidence_documents evidence
+                           ON evidence.tenant_id=selected.tenant_id
+                          AND evidence.source_id=selected.source_id
+                          AND evidence.native_parent_id
+                              =selected.native_parent_id
+                         JOIN canonical_evidence_document_parts part
+                           ON part.tenant_id=evidence.tenant_id
+                          AND part.source_id=evidence.source_id
+                          AND part.logical_document_id
+                              =evidence.logical_document_id
+                          AND part.revision=evidence.revision
+                        ORDER BY selected.candidate_ordinal,
+                                 part.part_ordinal""",
+                    (
+                        list(range(len(candidates))),
+                        [candidate.tenant_id for candidate in candidates],
+                        [candidate.source_id for candidate in candidates],
+                        [candidate.native_parent_id for candidate in candidates],
+                    ),
+                ).fetchall()
+                for row in part_rows:
+                    existing_parts.setdefault(
+                        int(row["candidate_ordinal"]),
+                        [],
+                    ).append(self._reference(row))
                 with connection.cursor(
                     name="logical_evidence_batch_stream",
                 ) as cursor:
-                    cursor.itersize = 10_000
+                    cursor.itersize = self.cursor_fetch_rows
                     cursor.execute(
                         """WITH selected(
                                candidate_ordinal,tenant_id,source_id,
@@ -602,6 +698,9 @@ class CanonicalLogicalEvidenceProjector:
                                 revision=candidate.revision,
                                 records=self._record_stream(rows),
                                 retention_profile=self.retention_profile,
+                                existing_part_references=tuple(
+                                    existing_parts.get(ordinal, ())
+                                ),
                             )
                         except LogicalEvidenceError as error:
                             if str(error) == "logical_evidence_document_empty":
@@ -751,20 +850,45 @@ class CanonicalLogicalEvidenceProjector:
         with self.store.connect() as connection:
             with connection.transaction():
                 rows = connection.execute(
-                    """SELECT *
-                         FROM canonical_evidence_cleanup_queue
-                        WHERE (%s::text IS NULL OR tenant_id=%s)
-                        ORDER BY queued_at,tenant_id,source_id,artifact_id
+                    """SELECT queue.*,
+                              NOT EXISTS (
+                                  SELECT 1
+                                    FROM canonical_evidence_documents document
+                                   WHERE document.tenant_id=queue.tenant_id
+                                     AND document.source_id=queue.source_id
+                                     AND document.manifest_artifact_id
+                                         =queue.artifact_id
+                                  UNION ALL
+                                  SELECT 1
+                                    FROM canonical_evidence_document_parts part
+                                   WHERE part.tenant_id=queue.tenant_id
+                                     AND part.source_id=queue.source_id
+                                     AND part.artifact_id=queue.artifact_id
+                              ) AS removable
+                         FROM canonical_evidence_cleanup_queue queue
+                        WHERE (%s::text IS NULL OR queue.tenant_id=%s)
+                        ORDER BY queue.queued_at,queue.tenant_id,
+                                 queue.source_id,queue.artifact_id
                         LIMIT %s
                         FOR UPDATE SKIP LOCKED""",
                     (tenant_id, tenant_id, limit),
                 ).fetchall()
+                protected = [
+                    row
+                    for row in rows
+                    if row["removable"] is not True
+                ]
+                removable = [
+                    row
+                    for row in rows
+                    if row["removable"] is True
+                ]
                 references = [
                     self._reference(row)
-                    for row in rows
+                    for row in removable
                 ]
                 with ThreadPoolExecutor(
-                    max_workers=min(concurrency, max(1, len(rows))),
+                    max_workers=min(concurrency, max(1, len(removable))),
                     thread_name_prefix="recall-logical-cleanup",
                 ) as executor:
                     futures = [
@@ -774,9 +898,17 @@ class CanonicalLogicalEvidenceProjector:
                         )
                         for reference in references
                     ]
-                succeeded: list[tuple[str, str, str]] = []
+                succeeded: list[tuple[str, str, str]] = [
+                    (
+                        row["tenant_id"],
+                        row["source_id"],
+                        row["artifact_id"],
+                    )
+                    for row in protected
+                ]
+                completed += len(protected)
                 failed: list[tuple[str, str, str]] = []
-                for row, future in zip(rows, futures, strict=True):
+                for row, future in zip(removable, futures, strict=True):
                     identity = (
                         row["tenant_id"],
                         row["source_id"],
@@ -901,12 +1033,20 @@ class CanonicalLogicalEvidenceProjector:
                     connection,
                     candidate,
                 )
+                retained_artifacts = {
+                    reference["artifact_id"]
+                    for reference in upload.all_references
+                }
                 self._enqueue_cleanup(
                     connection,
                     tuple(
                         reference
                         for reference in (old_manifest, *old_parts)
-                        if reference is not None
+                        if (
+                            reference is not None
+                            and reference["artifact_id"]
+                            not in retained_artifacts
+                        )
                     ),
                 )
                 connection.execute(
@@ -1156,7 +1296,7 @@ class CanonicalLogicalEvidenceProjector:
             weighted_candidates = sorted(
                 enumerate(candidates),
                 key=lambda value: (
-                    -value[1].estimated_records,
+                    -value[1].estimated_bytes,
                     value[0],
                 ),
             )
@@ -1166,7 +1306,7 @@ class CanonicalLogicalEvidenceProjector:
                     key=lambda value: (shard_loads[value], value),
                 )
                 shards[shard_index].append((index, candidate))
-                shard_loads[shard_index] += candidate.estimated_records
+                shard_loads[shard_index] += candidate.estimated_bytes
             uploads: list[LogicalEvidenceUpload | None] = [None] * len(candidates)
             successful: list[LogicalEvidenceUpload] = []
             failures: list[Exception] = []

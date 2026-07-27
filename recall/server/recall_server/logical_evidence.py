@@ -4,6 +4,8 @@ import hashlib
 import hmac
 import json
 import re
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Iterable, Protocol
@@ -107,6 +109,7 @@ class LogicalEvidenceRecord:
     segment_ordinal: int
     segment_count: int
     text: str
+    canonical_content_bytes: bytes | None = None
 
     def validate(self, *, source_id: str) -> None:
         if (
@@ -137,6 +140,14 @@ class LogicalEvidenceRecord:
             or (self.segment_ordinal > 0 and self.receipts)
             or not isinstance(self.text, str)
             or len(self.text.encode()) > MAX_RECORD_BYTES
+            or (
+                self.canonical_content_bytes is not None
+                and not isinstance(self.canonical_content_bytes, bytes)
+            )
+            or (
+                self.canonical_content_bytes is not None
+                and self.segment_count != 1
+            )
         ):
             raise LogicalEvidenceError("logical_evidence_record_invalid")
         _parsed_timestamp(self.occurred_at)
@@ -158,18 +169,19 @@ class LogicalEvidenceRecord:
         if self.segment_count > 1:
             value["content_fragment"] = self.text
         else:
+            canonical = self.canonical_content_bytes
             try:
-                content = orjson.loads(self.text)
-                canonical = orjson.dumps(
-                    content,
-                    option=orjson.OPT_SORT_KEYS,
-                ).decode()
+                if canonical is None:
+                    canonical = orjson.dumps(
+                        orjson.loads(self.text),
+                        option=orjson.OPT_SORT_KEYS,
+                    )
             except (TypeError, ValueError, orjson.JSONDecodeError):
                 canonical = None
-            if canonical == self.text:
-                value["content"] = content
-            else:
-                value["text"] = self.text
+            if canonical is not None and canonical == self.text.encode():
+                encoded = orjson.dumps(value, option=orjson.OPT_SORT_KEYS)
+                return b'{"content":' + canonical + b"," + encoded[1:] + b"\n"
+            value["text"] = self.text
         return orjson.dumps(value, option=orjson.OPT_SORT_KEYS) + b"\n"
 
 
@@ -522,8 +534,20 @@ def prepare_logical_document(
 class LogicalEvidenceProjectionStore:
     """Write immutable logical-document parts and their opaque manifest."""
 
-    def __init__(self, archive: EvidenceArchive):
+    def __init__(
+        self,
+        archive: EvidenceArchive,
+        *,
+        part_upload_concurrency: int = 1,
+    ):
+        if (
+            isinstance(part_upload_concurrency, bool)
+            or not isinstance(part_upload_concurrency, int)
+            or not 1 <= part_upload_concurrency <= 8
+        ):
+            raise LogicalEvidenceError("logical_evidence_budget_invalid")
         self.archive = archive
+        self.part_upload_concurrency = part_upload_concurrency
 
     def put(
         self,
@@ -540,7 +564,7 @@ class LogicalEvidenceProjectionStore:
                         source_id=prepared.source_id,
                         native_id=(
                             f"logical-part:{prepared.logical_document_id}:"
-                            f"{prepared.revision}:{part.ordinal}"
+                            f"{part.ordinal}"
                         ),
                         payload=part.payload,
                         media_type=PART_MEDIA_TYPE,
@@ -578,7 +602,7 @@ class LogicalEvidenceProjectionStore:
                 source_id=prepared.source_id,
                 native_id=(
                     f"logical-manifest:{prepared.logical_document_id}:"
-                    f"{prepared.revision}:{prepared.document_content_sha256[:16]}"
+                    f"{prepared.document_content_sha256[:16]}"
                 ),
                 payload=manifest.encode(),
                 media_type=MANIFEST_MEDIA_TYPE,
@@ -608,6 +632,7 @@ class LogicalEvidenceProjectionStore:
         records: Iterable[LogicalEvidenceRecord],
         part_bytes: int = DEFAULT_PART_BYTES,
         retention_profile: str = "lossless-v1",
+        existing_part_references: tuple[dict[str, Any], ...] = (),
     ) -> LogicalEvidenceUpload:
         """Upload a logical document with memory bounded to one object part."""
 
@@ -624,6 +649,7 @@ class LogicalEvidenceProjectionStore:
             or not isinstance(part_bytes, int)
             or not MIN_PART_BYTES <= part_bytes <= MAX_PART_BYTES
             or retention_profile not in RETENTION_PROFILES
+            or not isinstance(existing_part_references, tuple)
         ):
             raise LogicalEvidenceError("logical_evidence_document_invalid")
 
@@ -641,32 +667,38 @@ class LogicalEvidenceProjectionStore:
         parts: list[PreparedPart] = []
         manifest_parts: list[ManifestPart] = []
         part_references: list[dict[str, Any]] = []
-
-        def close_part(last_record: int) -> None:
-            nonlocal part_payload, part_start
-            nonlocal part_receipt_count, part_created_at
-            payload = bytes(part_payload)
-            if not payload:
-                return
-            prepared_part = PreparedPart(
-                ordinal=len(parts),
-                first_record_ordinal=part_start,
-                last_record_ordinal=last_record,
-                receipt_count=part_receipt_count,
-                payload=payload,
-                content_sha256=hashlib.sha256(payload).hexdigest(),
+        pending_parts: deque[
+            tuple[PreparedPart, Future[dict[str, Any]]]
+        ] = deque()
+        part_executor = (
+            ThreadPoolExecutor(
+                max_workers=self.part_upload_concurrency,
+                thread_name_prefix="recall-logical-part",
             )
-            reference = self.archive.put_raw(
+            if self.part_upload_concurrency > 1
+            else None
+        )
+
+        def publish_part(
+            prepared_part: PreparedPart,
+            created_at: str,
+        ) -> dict[str, Any]:
+            return self.archive.put_raw(
                 tenant_id=tenant_id,
                 source_id=source_id,
                 native_id=(
                     f"logical-part:{document_id}:"
-                    f"{revision}:{prepared_part.ordinal}"
+                    f"{prepared_part.ordinal}"
                 ),
-                payload=payload,
+                payload=prepared_part.payload,
                 media_type=PART_MEDIA_TYPE,
-                created_at=part_created_at,
+                created_at=created_at,
             )
+
+        def accept_part(
+            prepared_part: PreparedPart,
+            reference: dict[str, Any],
+        ) -> None:
             part_references.append(reference)
             manifest_parts.append(
                 ManifestPart.from_reference(
@@ -686,6 +718,64 @@ class LogicalEvidenceProjectionStore:
                     content_sha256=prepared_part.content_sha256,
                 )
             )
+
+        def finish_oldest_part() -> None:
+            prepared_part, future = pending_parts.popleft()
+            accept_part(prepared_part, future.result())
+
+        def reusable_part(
+            prepared_part: PreparedPart,
+        ) -> dict[str, Any] | None:
+            if prepared_part.ordinal >= len(existing_part_references):
+                return None
+            reference = existing_part_references[prepared_part.ordinal]
+            if (
+                not isinstance(reference, dict)
+                or reference.get("tenant_id") != tenant_id
+                or reference.get("source_id") != source_id
+                or reference.get("content_sha256")
+                    != prepared_part.content_sha256
+                or reference.get("size_bytes") != len(prepared_part.payload)
+                or reference.get("media_type") != PART_MEDIA_TYPE
+            ):
+                return None
+            return reference
+
+        def close_part(last_record: int) -> None:
+            nonlocal part_payload, part_start
+            nonlocal part_receipt_count, part_created_at
+            payload = bytes(part_payload)
+            if not payload:
+                return
+            prepared_part = PreparedPart(
+                ordinal=len(parts) + len(pending_parts),
+                first_record_ordinal=part_start,
+                last_record_ordinal=last_record,
+                receipt_count=part_receipt_count,
+                payload=payload,
+                content_sha256=hashlib.sha256(payload).hexdigest(),
+            )
+            existing_reference = reusable_part(prepared_part)
+            if existing_reference is not None:
+                accept_part(prepared_part, existing_reference)
+            elif part_executor is None:
+                accept_part(
+                    prepared_part,
+                    publish_part(prepared_part, part_created_at),
+                )
+            else:
+                if len(pending_parts) >= self.part_upload_concurrency:
+                    finish_oldest_part()
+                pending_parts.append(
+                    (
+                        prepared_part,
+                        part_executor.submit(
+                            publish_part,
+                            prepared_part,
+                            part_created_at,
+                        ),
+                    )
+                )
             part_payload = bytearray()
             part_start = last_record + 1
             part_receipt_count = 0
@@ -730,6 +820,8 @@ class LogicalEvidenceProjectionStore:
             if receipt_count == 0:
                 raise LogicalEvidenceError("logical_evidence_document_invalid")
             close_part(record_count - 1)
+            while pending_parts:
+                finish_oldest_part()
             digest = document_digest.hexdigest()
             evidence_id = _opaque(
                 "evd_",
@@ -773,19 +865,28 @@ class LogicalEvidenceProjectionStore:
                 source_id=source_id,
                 native_id=(
                     f"logical-manifest:{document_id}:"
-                    f"{revision}:{digest[:16]}"
+                    f"{digest[:16]}"
                 ),
                 payload=manifest.encode(),
                 media_type=MANIFEST_MEDIA_TYPE,
                 created_at=first_occurred,
             )
-        except Exception:
+        except BaseException:
+            while pending_parts:
+                prepared_part, future = pending_parts.popleft()
+                try:
+                    accept_part(prepared_part, future.result())
+                except Exception:
+                    pass
             for reference in reversed(part_references):
                 try:
                     self.archive.delete_raw(reference)
                 except Exception:
                     pass
             raise
+        finally:
+            if part_executor is not None:
+                part_executor.shutdown(wait=True, cancel_futures=True)
         return LogicalEvidenceUpload(
             prepared=prepared,
             manifest=manifest,

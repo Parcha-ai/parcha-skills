@@ -137,6 +137,11 @@ def main() -> None:
     logical_evidence.add_argument("--max-batches", type=int, default=10)
     logical_evidence.add_argument("--upload-concurrency", type=int, default=2)
     logical_evidence.add_argument(
+        "--cursor-fetch-rows",
+        type=int,
+        default=10_000,
+    )
+    logical_evidence.add_argument(
         "--rebuild-existing",
         action="store_true",
         help="queue current logical documents even when a projection already exists",
@@ -149,6 +154,11 @@ def main() -> None:
     )
     logical_evidence_worker.add_argument(
         "--upload-concurrency", type=int, default=2
+    )
+    logical_evidence_worker.add_argument(
+        "--cursor-fetch-rows",
+        type=int,
+        default=10_000,
     )
     logical_evidence_worker.add_argument(
         "--interval-seconds", type=float, default=5
@@ -504,9 +514,13 @@ def main() -> None:
     }:
         projector = CanonicalLogicalEvidenceProjector(
             store,
-            LogicalEvidenceProjectionStore(build_evidence_archive_store()),
+            LogicalEvidenceProjectionStore(
+                build_evidence_archive_store(),
+                part_upload_concurrency=min(4, args.upload_concurrency),
+            ),
             bound_tenant_id=args.tenant,
             raw_archive=build_archive_store(),
+            cursor_fetch_rows=args.cursor_fetch_rows,
         )
         if args.command == "backfill-logical-evidence":
             seeded = projector.seed_backfill(

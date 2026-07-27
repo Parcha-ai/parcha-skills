@@ -486,6 +486,16 @@ def main() -> None:
         assert rebuilt["documents"] == 1
         assert rebuilt["records"] == 3
         assert archive_object_count(archive_root) == 5
+        with store.connect() as connection:
+            part_artifacts_before = {
+                row["artifact_id"]
+                for row in connection.execute(
+                    """SELECT part.artifact_id
+                         FROM canonical_evidence_document_parts part
+                        WHERE part.tenant_id=%s""",
+                    (tenant,),
+                ).fetchall()
+            }
         assert (
             projector.seed_backfill(
                 tenant_id=tenant,
@@ -503,6 +513,38 @@ def main() -> None:
         assert reprojected["records"] == 6
         assert reprojected["receipts"] == 7
         assert reprojected["cleanup_failures"] == 0
+        assert archive_object_count(archive_root) == 5
+        with store.connect() as connection:
+            part_artifacts_after = {
+                row["artifact_id"]
+                for row in connection.execute(
+                    """SELECT part.artifact_id
+                         FROM canonical_evidence_document_parts part
+                        WHERE part.tenant_id=%s""",
+                    (tenant,),
+                ).fetchall()
+            }
+            assert part_artifacts_after == part_artifacts_before
+            connection.execute(
+                """INSERT INTO canonical_evidence_cleanup_queue(
+                       tenant_id,source_id,artifact_id,storage_backend,
+                       object_key,content_sha256,size_bytes,media_type,
+                       encryption,version_id,created_at
+                   )
+                   SELECT tenant_id,source_id,artifact_id,storage_backend,
+                          object_key,content_sha256,size_bytes,media_type,
+                          encryption,version_id,created_at
+                     FROM canonical_evidence_document_parts
+                    WHERE tenant_id=%s
+                    ORDER BY source_id,logical_document_id,part_ordinal
+                    LIMIT 1""",
+                (tenant,),
+            )
+        protected_cleanup = projector.drain_cleanup(tenant_id=tenant)
+        assert protected_cleanup["completed"] == 1
+        assert protected_cleanup["deleted"] == 0
+        assert protected_cleanup["failures"] == 0
+        assert protected_cleanup["pending"] == 0
         assert archive_object_count(archive_root) == 5
 
         try:
@@ -541,6 +583,7 @@ def main() -> None:
                 "idempotent_reprojects": 2,
                 "revision_replacements": 1,
                 "durable_cleanup_retries": 1,
+                "protected_cleanup_deletes": 0,
                 "forgotten_receipt_hits": 0,
                 "tenant_escape_writes": 0,
                 "orphan_objects": 0,

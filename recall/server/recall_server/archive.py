@@ -610,19 +610,23 @@ class S3ArchiveStore(_ArchiveStore):
             size_bytes=size_bytes,
             version_id="pending",
         )
-        try:
-            existing = self.client.head_object(Bucket=self.bucket, Key=pending.object_key)
-        except ArchiveNotFound:
-            pass
-        except Exception as error:
-            raise ArchiveError("archive provider request failed") from error
-        else:
-            return self._existing_reference(
-                request,
-                content_sha256=content_sha256,
-                size_bytes=size_bytes,
-                response=existing,
-            )
+        if self.compatibility_profile == "aws":
+            try:
+                existing = self.client.head_object(
+                    Bucket=self.bucket,
+                    Key=pending.object_key,
+                )
+            except ArchiveNotFound:
+                pass
+            except Exception as error:
+                raise ArchiveError("archive provider request failed") from error
+            else:
+                return self._existing_reference(
+                    request,
+                    content_sha256=content_sha256,
+                    size_bytes=size_bytes,
+                    response=existing,
+                )
         kwargs: dict[str, Any] = {
             "Bucket": self.bucket,
             "Key": pending.object_key,
@@ -670,17 +674,11 @@ class S3ArchiveStore(_ArchiveStore):
                 size_bytes=size_bytes,
                 version_id=self._version_id(content_sha256, response),
             )
-        try:
-            stored = self.client.head_object(
-                Bucket=self.bucket, Key=pending.object_key,
-            )
-        except Exception as error:
-            raise ArchiveError("archive provider request failed") from error
-        return self._existing_reference(
+        return self._reference(
             request,
             content_sha256=content_sha256,
             size_bytes=size_bytes,
-            response=stored,
+            version_id=self._version_id(content_sha256, response),
         )
 
     def read(
