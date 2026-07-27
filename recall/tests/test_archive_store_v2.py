@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from server.recall_server.archive import (
     ArchiveCorruption,
@@ -66,12 +67,26 @@ class FakeS3:
             value = self.objects[(kwargs["Bucket"], kwargs["Key"], kwargs["VersionId"])]
         except KeyError as error:
             raise ArchiveNotFound("archive object not found") from error
-        return {
-            "Body": FakeBody(value["Body"]),
-            "ContentLength": value["ContentLength"],
+        payload = value["Body"]
+        response = {
+            "Body": FakeBody(payload),
+            "ContentLength": len(payload),
             "Metadata": value["Metadata"],
             "VersionId": kwargs["VersionId"],
         }
+        if "Range" in kwargs:
+            byte_range = kwargs["Range"].removeprefix("bytes=")
+            start_text, end_text = byte_range.split("-", 1)
+            start, end = int(start_text), int(end_text)
+            payload = payload[start:end + 1]
+            response.update({
+                "Body": FakeBody(payload),
+                "ContentLength": len(payload),
+                "ContentRange": (
+                    f"bytes {start}-{end}/{value['ContentLength']}"
+                ),
+            })
+        return response
 
     def head_object(self, **kwargs):
         self.head_calls.append(kwargs)
@@ -330,6 +345,38 @@ class ArchiveStoreParityTest(unittest.TestCase):
                 client=self.s3_client,
             )
         self.assertEqual(len(self.s3_client.put_calls), 1)
+
+    def test_large_s3_read_uses_verified_parallel_ranges(self):
+        payload = b"0123456789abcdef" * 16
+        reference = self.s3.put(request(payload=payload))
+
+        with (
+            patch(
+                "server.recall_server.archive."
+                "S3_PARALLEL_READ_THRESHOLD_BYTES",
+                1,
+            ),
+            patch(
+                "server.recall_server.archive."
+                "S3_PARALLEL_READ_CHUNK_BYTES",
+                64,
+            ),
+        ):
+            result = self.s3.read(
+                reference,
+                tenant_id=TENANT,
+                source_id=SOURCE,
+            )
+
+        range_calls = [
+            call for call in self.s3_client.get_calls if "Range" in call
+        ]
+        self.assertEqual(result, payload)
+        self.assertEqual(len(range_calls), 4)
+        self.assertTrue(all(
+            call["VersionId"] == reference.version_id
+            for call in range_calls
+        ))
 
     def test_r2_uses_immutable_keys_without_unsupported_s3_features(self):
         client = FakeR2()
