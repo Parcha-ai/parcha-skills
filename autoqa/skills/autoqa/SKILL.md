@@ -25,6 +25,13 @@ Establish three facts before anything else:
 
 Done when: repo path, instance URL (or "must boot"), and config-or-none are stated.
 
+### Bind the run to the target
+
+`AUTOQA.md` owns the authoritative instance. Record the requested commit and prove that exact
+commit is deployed there before testing. A different checkout, local Compose project, or
+convenient running service is not a substitute. If the target cannot be deployed or its
+identity cannot be verified, the run is `BLOCKED`.
+
 ## Phase 1 — DISCOVER
 
 Read the repo the way a new engineer would, in this order, stopping when the three questions
@@ -56,10 +63,12 @@ Build the plan from the union of two sources:
 
 First write both inventories as numbered lists, preserving their source (`BASE` or `DIFF`).
 Then build one matrix from their union: one row per inventory item, columns = source,
-modality, entry point, check, pass criterion, witness to capture. Deduplicate overlapping
-rows without dropping the stronger pass criterion. The matrix must have ≥1 row per union
-item; the report states separate and total coverage arithmetic so a reader sees nothing was
-silently dropped.
+required, disposition, depth, modality, entry point, check, pass criterion, witness to
+capture. `Required=YES` means the row gates the requested scope. Depth is `LIVE-E2E`,
+`INTEGRATION`, `CONTRACT`, or `SMOKE`; disposition remains `DEEP`, `SMOKE`, `UNTESTED`, or
+`SKIPPED`. Deduplicate overlapping rows without dropping the stronger pass criterion. The
+matrix must have ≥1 row per union item; the report states separate and total coverage
+arithmetic so a reader sees nothing was silently dropped.
 
 ### Confirm execution scope with the user
 
@@ -82,6 +91,14 @@ customer data. If the user already explicitly selected scope (for example, “sm
 If no structured question tool is available and scope is not explicit, ask the same concise
 multi-choice question in plain text and wait.
 
+- **Autonomous slots do not need per-fixture permission.** When `AUTOQA.md` declares a
+  disposable development/test slot and synthetic-write authority, selected stateful/full
+  scope authorizes normal synthetic product writes and configured dev resources. Create
+  what the real flow needs, namespace it to the run, and clean it up. This never authorizes
+  production, customer data, shared snapshots, manual credential retrieval/injection, or a
+  new infrastructure topology. Read
+  [references/autonomous-execution.md](references/autonomous-execution.md) for the execution
+  and cleanup contract.
 - **Entry point is a gating column, decided here — not at execute time.** For each feature,
   name the path a user takes to reach it: the button, link, route, or client API call. A
   feature whose entry point you cannot trace is not tested — its disposition is
@@ -102,6 +119,10 @@ multi-choice question in plain text and wait.
 - **Diff cases are additive.** `AUTOQA.md`, a feature tracker, or a prior report can never
   suppress a test implied by the current diff. A prior PASS is context, not a witness for
   the current run.
+- **Required DEEP means live E2E.** Every selected core or DIFF behavior marked `DEEP` is a
+  ship gate and runs against the authoritative instance through the real entry point,
+  database, workers, and configured dependencies. Unit, mocked, contract, or source
+  inspection evidence may diagnose it but cannot replace the live row.
 - Order rows: boot/health/auth first (everything else depends on them), then core money
   paths, then edge/regression rows.
 
@@ -114,6 +135,8 @@ user's selected execution scope is recorded.
 Execute only rows whose entry point was traced in PLAN. Run the matrix top to bottom
 against the live instance.
 
+- Verify the deployed commit before the first row and capture the witness. Stop `BLOCKED`
+  on a mismatch; do not continue against the wrong build.
 - Instance not up? Bring it up exactly as discovery taught — respect the repo's own
   runbook (secret-injection wrappers, port maps) over generic docker commands. If it
   cannot be brought up at all (missing secrets, port conflict, boot crash), the whole run
@@ -128,7 +151,19 @@ against the live instance.
   whose entry point couldn't be traced were already SKIPPED in PLAN — you never reach here
   for dead code.)
 - Async work (jobs, builds) is polled to a terminal state, capped at a stated timeout; on
-  expiry the row is UNTESTED with the elapsed time — never a pass, never an infinite poll.
+  expiry the row is UNTESTED with the elapsed time — never a pass. Keep polling for the
+  repo-declared timeout; do not stop early because the flow is slow.
+- A missing fixture triggers a synthesis attempt through the real UI/API before
+  `UNTESTED`. Reuse one run-scoped fixture graph across rows. The UNTESTED witness must show
+  the attempted creation and concrete failure; “needs fixture” alone is invalid.
+- When `AUTOQA.md` requires Chrome DevTools, use it for every required UI row and capture
+  DOM plus network/console evidence. Recover a busy profile or create a dedicated session;
+  do not silently downgrade to another browser driver. If DevTools remains unavailable,
+  required UI coverage makes the run `BLOCKED`.
+- Run the repo-defined slot E2E command when present. It must target the running instance
+  and real configured services; a mocked in-process API suite is not slot E2E.
+- Delete run-scoped fixtures/resources and capture cleanup evidence even after failures.
+  Cleanup failure blocks a ship verdict.
 - Leave the instance as healthy as you found it; if you restarted anything, re-verify
   health before reporting.
 
@@ -143,8 +178,11 @@ Write the report from the template in
 modality, result, witness path), failure triage (release blocker vs env quirk vs test
 bug), and the one-paragraph bottom line a release owner can act on.
 
-Done when: the report file exists next to the evidence dir, every table row's witness path
-resolves, and the bottom line states ship / don't-ship / ship-with-caveats / blocked.
+Run `python3 scripts/validate_report.py <report> [--expected-target <sha>]` from the skill
+directory. Fix the report or missing execution; never weaken the validator for a run.
+
+Done when: the report exists next to the evidence dir, every witness resolves, the bottom
+line states ship / don't-ship / ship-with-caveats / blocked, and the validator passes.
 
 ## Hard rules
 
@@ -164,5 +202,10 @@ resolves, and the bottom line states ship / don't-ship / ship-with-caveats / blo
   as out of scope; do not silently omit them.
 - **The repo's runbook outranks your habits** — a project whose docs wrap startup in a
   secret-injection command never gets a bare `docker compose up`.
+- **Required gaps block shipping** — any selected required row that is FAIL, UNTESTED, or
+  SKIPPED prevents `SHIP` and `SHIP WITH CAVEATS`. A required DEEP row not exercised as
+  `LIVE-E2E` is also a gap.
+- **Chrome means Chrome DevTools** when the repo requires it — browser substitution is not
+  equivalent evidence.
 - **Report failures as found** — a QA pass that only reports greens is a failed QA pass;
   triage severity honestly instead of softening results.
