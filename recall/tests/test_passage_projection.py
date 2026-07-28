@@ -517,6 +517,14 @@ class PassageProjectionTests(unittest.TestCase):
         self.assertIn("passage.text_sha256", source)
         self.assertIn("ON COMMIT DROP", source)
 
+    def test_projection_bulk_loads_passages_in_one_copy_stream(self) -> None:
+        source = inspect.getsource(CanonicalPassageProjector._commit)
+
+        self.assertIn("cursor.copy(", source)
+        self.assertIn("COPY canonical_passages(", source)
+        self.assertIn("copy.write_row(", source)
+        self.assertNotIn("cursor.executemany(", source)
+
     def test_dense_temporal_candidates_are_oversampled_before_filtering(
         self,
     ) -> None:

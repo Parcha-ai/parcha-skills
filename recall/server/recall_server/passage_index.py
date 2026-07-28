@@ -408,8 +408,8 @@ class CanonicalPassageProjector:
                 )
                 if prepared.passages:
                     with connection.cursor() as cursor:
-                        cursor.executemany(
-                            """INSERT INTO canonical_passages(
+                        with cursor.copy(
+                            """COPY canonical_passages(
                                    tenant_id,source_id,logical_document_id,
                                    revision,passage_id,ordinal,
                                    policy_fingerprint,target_tokens,
@@ -417,12 +417,10 @@ class CanonicalPassageProjector:
                                    first_occurred_at,last_occurred_at,
                                    roles,receipts,spans,text_redacted,
                                    text_sha256
-                               ) VALUES (
-                                   %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                                   %s,%s,%s,%s,%s::jsonb,%s,%s
-                               )""",
-                            [
-                                (
+                               ) FROM STDIN"""
+                        ) as copy:
+                            for passage in prepared.passages:
+                                copy.write_row((
                                     passage.tenant_id,
                                     passage.source_id,
                                     passage.logical_document_id,
@@ -443,10 +441,7 @@ class CanonicalPassageProjector:
                                     ]),
                                     passage.text,
                                     passage.text_sha256,
-                                )
-                                for passage in prepared.passages
-                            ],
-                        )
+                                ))
                     connection.execute(
                         """INSERT INTO canonical_passage_embeddings(
                                tenant_id,source_id,passage_id,model,
