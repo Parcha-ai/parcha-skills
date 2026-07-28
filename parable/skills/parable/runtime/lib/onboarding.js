@@ -26,14 +26,14 @@ const PARABLE_PY = path.join(
   PACKAGE_ROOT, "skills", "parable", "scripts", "parable.py",
 );
 const PATCH_PATH = path.join(
-  path.resolve(__dirname, ".."), "patches", "cliproxyapi-v7.2.88-claude-effort.patch",
+  path.resolve(__dirname, ".."), "patches", "cliproxyapi-v7.2.103-claude-effort.patch",
 );
 
 const SETUP_SCHEMA_VERSION = 1;
 const DEFAULT_PORT = 8317;
 const PROXY_REPOSITORY = "https://github.com/router-for-me/CLIProxyAPI.git";
-const PROXY_COMMIT = "93d74a890a44802f656d7f39a573916b2611896e";
-const PROXY_PATCH_SHA256 = "d35b422da321265150fe393da80a686862ef642ee45c65a3e2fb908d689d5d1f";
+const PROXY_COMMIT = "cade44b9cdee6b9328ea2648fd119129fdf11e2d";
+const PROXY_PATCH_SHA256 = "6fc4938f05991926b72ed5e85e0e4011fb570fec0490dff0691e792e5cb94c8d";
 const PROXY_BINARY_NAME = "parable-cliproxy-api";
 const DEFAULT_PROXY_READY_TIMEOUT_MS = 15_000;
 const PROXY_PROBE_TIMEOUT_MS = 750;
@@ -247,6 +247,15 @@ function proxyBuildUsage() {
   ].join("\n");
 }
 
+function proxyUpgradeUsage() {
+  return [
+    "usage: parable proxy upgrade",
+    "",
+    "Build the pinned proxy and atomically stage it for the next Parable launch.",
+    "An already-running proxy is not interrupted.",
+  ].join("\n");
+}
+
 function parseVendors(raw) {
   const parts = String(raw).split(",").map((value) => value.trim()).filter(Boolean);
   if (!parts.length) throw new OnboardingError("--vendors cannot be empty");
@@ -374,6 +383,20 @@ function yamlString(value) {
 }
 
 function renderProxyYaml(port, authDir, token) {
+  return [
+    'host: "127.0.0.1"',
+    `port: ${port}`,
+    `auth-dir: ${yamlString(authDir)}`,
+    "api-keys:",
+    `  - "${token}"`,
+    "debug: false",
+    "claude-code:",
+    "  disable-cloaking-model-list: true",
+    "",
+  ].join("\n");
+}
+
+function renderLegacyProxyYaml(port, authDir, token) {
   return [
     'host: "127.0.0.1"',
     `port: ${port}`,
@@ -597,13 +620,33 @@ function validateExistingSetup(configDir, authDir, paths, desired, options = {})
     [paths.manifest, renderManifest(desired)],
   ]);
   for (const [target, content] of expected) {
-    if (fs.readFileSync(target, "utf8") !== content) {
+    const actual = fs.readFileSync(target, "utf8");
+    const legacyProxyConfig = (
+      options.acceptLegacyProxyConfig === true
+      && target === paths.proxyConfig
+      && actual === renderLegacyProxyYaml(desired.port, authDir, token)
+    );
+    if (actual !== content && !legacyProxyConfig) {
       throw new OnboardingError(`generated setup file has changed; refusing to overwrite: ${target}`);
     }
   }
   if (options.requireProxy !== false) {
     requireExecutable(desired.proxyBinary, "configured proxy binary");
   }
+}
+
+function migrateLegacyProxyConfig(paths, desired, authDir) {
+  const token = readExistingToken(paths);
+  const current = renderProxyYaml(desired.port, authDir, token);
+  const actual = fs.readFileSync(paths.proxyConfig, "utf8");
+  if (actual === current) return false;
+  if (actual !== renderLegacyProxyYaml(desired.port, authDir, token)) {
+    throw new OnboardingError(
+      `generated setup file has changed; refusing to overwrite: ${paths.proxyConfig}`,
+    );
+  }
+  replacePrivateFileSet([[paths.proxyConfig, current]]);
+  return true;
 }
 
 // Validate the setup surfaces that never change during an additive vendor upgrade.
@@ -614,11 +657,15 @@ function validateExistingSetupEnvelope(configDir, authDir, paths, manifest) {
   for (const [name, target] of Object.entries(paths)) requirePrivateFile(target, name);
   const token = readExistingToken(paths);
   const expected = new Map([
-    [paths.proxyConfig, renderProxyYaml(manifest.port, authDir, token)],
+    [paths.proxyConfig, [
+      renderProxyYaml(manifest.port, authDir, token),
+      renderLegacyProxyYaml(manifest.port, authDir, token),
+    ]],
     [paths.proxyEnv, renderProxyEnv(token)],
   ]);
   for (const [target, content] of expected) {
-    if (fs.readFileSync(target, "utf8") !== content) {
+    const accepted = Array.isArray(content) ? content : [content];
+    if (!accepted.includes(fs.readFileSync(target, "utf8"))) {
       throw new OnboardingError(`generated setup file has changed; refusing to overwrite: ${target}`);
     }
   }
@@ -901,6 +948,90 @@ async function runProxyBuild(argv, log) {
   buildProxy(options, log);
 }
 
+async function runProxyUpgrade(argv, log) {
+  const options = parseOptions(argv, new Set(), new Set(["--help"]));
+  if (options._.length) {
+    throw new OnboardingError(`unexpected proxy upgrade argument: ${options._[0]}`);
+  }
+  if (options.help) {
+    log(proxyUpgradeUsage());
+    return;
+  }
+
+  const context = loadSetupContext();
+  const destination = defaultBuildDirectory();
+  const nextBinary = path.join(destination, PROXY_BINARY_NAME);
+  if (context.manifest.proxyBinary === nextBinary) {
+    const migrated = migrateLegacyProxyConfig(
+      context.paths,
+      context.manifest,
+      context.authDir,
+    );
+    validateExistingSetup(
+      context.configDir,
+      context.authDir,
+      context.paths,
+      context.manifest,
+    );
+    log(
+      migrated
+        ? `proxy is current; updated generated compatibility -> ${context.paths.proxyConfig}`
+        : `proxy is current -> ${nextBinary}`,
+    );
+    return;
+  }
+  if (lstatOrNull(destination)) {
+    throw new OnboardingError(
+      `current pinned build directory already exists but is not configured: ${destination}`,
+    );
+  }
+
+  const builtBinary = buildProxy({}, log);
+  const token = readExistingToken(context.paths);
+  const nextManifest = manifestFor(
+    context.configDir,
+    context.authDir,
+    context.paths,
+    context.vendors,
+    builtBinary,
+    context.manifest.port,
+  );
+  const previousEntries = [
+    [context.paths.proxyConfig, fs.readFileSync(context.paths.proxyConfig, "utf8")],
+    [context.paths.manifest, fs.readFileSync(context.paths.manifest, "utf8")],
+  ];
+  const nextEntries = [
+    [
+      context.paths.proxyConfig,
+      renderProxyYaml(context.manifest.port, context.authDir, token),
+    ],
+    [context.paths.manifest, renderManifest(nextManifest)],
+  ];
+  try {
+    replacePrivateFileSet(nextEntries);
+    validateExistingSetup(
+      context.configDir,
+      context.authDir,
+      context.paths,
+      nextManifest,
+    );
+  } catch (error) {
+    replacePrivateFileSet(previousEntries);
+    fs.rmSync(destination, { recursive: true, force: true });
+    throw error;
+  }
+
+  const listener = await probeModels(context.manifest.port, token);
+  if (listener.kind === "ready") {
+    log("upgrade staged; the running proxy was not interrupted");
+    log("the next managed proxy start will use the new binary");
+  } else if (listener.kind === "absent") {
+    log("upgrade active; the next Parable session will start the new binary");
+  } else {
+    log(`upgrade staged; configured endpoint is currently unhealthy (${listener.detail})`);
+  }
+}
+
 function existingManifestSkeleton(configDir, paths) {
   if (stateOf(paths) !== "complete") return null;
   requirePrivateDirectory(configDir, "configuration directory");
@@ -949,7 +1080,13 @@ function loadSetupContext(options = {}) {
     manifest.proxyBinary,
     manifest.port,
   );
-  validateExistingSetup(configDir, authDir, paths, desired, options);
+  validateExistingSetup(
+    configDir,
+    authDir,
+    paths,
+    desired,
+    { ...options, acceptLegacyProxyConfig: true },
+  );
   return { configDir, authDir, paths, manifest: desired, vendors };
 }
 
@@ -1661,6 +1798,14 @@ async function runSetupAddVendors(options, log) {
   // must also match this exact requested upgrade before they may be completed or removed.
   let currentValidationError = null;
   try {
+    validateExistingSetup(
+      configDir,
+      authDir,
+      paths,
+      currentDesired,
+      { acceptLegacyProxyConfig: true },
+    );
+    migrateLegacyProxyConfig(paths, currentDesired, authDir);
     validateExistingSetup(configDir, authDir, paths, currentDesired);
   } catch (error) {
     currentValidationError = error;
@@ -1822,9 +1967,21 @@ async function runSetup(argv, log) {
     const desired = manifestFor(configDir, authDir, paths, vendors, proxyBinary, port);
 
     if (existing) {
+      validateExistingSetup(
+        configDir,
+        authDir,
+        paths,
+        desired,
+        { acceptLegacyProxyConfig: true },
+      );
+      const migratedProxyConfig = migrateLegacyProxyConfig(paths, desired, authDir);
       validateExistingSetup(configDir, authDir, paths, desired);
       validateParableConfig(paths.parableConfig, configDir);
-      log(`setup is valid and unchanged -> ${configDir}`);
+      log(
+        migratedProxyConfig
+          ? `updated generated proxy compatibility -> ${paths.proxyConfig}`
+          : `setup is valid and unchanged -> ${configDir}`,
+      );
     } else {
       const configCreated = createPrivateDirectory(configDir, "configuration directory");
       const authCreated = createPrivateDirectory(authDir, "CLIProxyAPI auth directory");
@@ -1885,4 +2042,6 @@ module.exports = {
   setupClientEnvironment,
   setupUsage,
   proxyBuildUsage,
+  proxyUpgradeUsage,
+  runProxyUpgrade,
 };

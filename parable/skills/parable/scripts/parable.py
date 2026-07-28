@@ -875,23 +875,34 @@ def add_claude_welcome(argv: list[str], launch_env: dict[str, str], cfg: dict,
                        brain_model: str, decision: str, available: set[str],
                        forwarded: list[str], *, solo: bool = False
                        ) -> tuple[list[str], dict[str, str]]:
-    """Inject the in-UI startup card only for interactive Claude sessions."""
-    skip_flags = {
-        "-h", "--help", "-v", "--version", "-p", "--print", "--bare", "--init-only",
+    """Inject Parable's session plugin and its card for interactive sessions."""
+    plugin_skip_flags = {
+        "-h", "--help", "-v", "--version", "--bare", "--init-only",
     }
     scan = forwarded[:forwarded.index("--")] if "--" in forwarded else forwarded
-    if any(argument.split("=", 1)[0] in skip_flags for argument in scan):
+    if any(argument.split("=", 1)[0] in plugin_skip_flags for argument in scan):
+        return argv, launch_env
+    print_flags = {"-p", "--print"}
+    is_print = any(argument.split("=", 1)[0] in print_flags for argument in scan)
+    if solo and is_print:
         return argv, launch_env
     manifest = PARABLE_WELCOME_PLUGIN / ".claude-plugin" / "plugin.json"
     hook = PARABLE_WELCOME_PLUGIN / "hooks" / "hooks.json"
-    script = PARABLE_WELCOME_PLUGIN / "scripts" / "welcome.py"
-    if not all(path.is_file() and not path.is_symlink() for path in (manifest, hook, script)):
+    scripts = [
+        PARABLE_WELCOME_PLUGIN / "scripts" / name
+        for name in ("welcome.py", "model_guard.py")
+    ]
+    if not all(
+        path.is_file() and not path.is_symlink()
+        for path in (manifest, hook, *scripts)
+    ):
         raise ValueError("Parable welcome plugin is missing or unsafe; reinstall Parable")
     env = dict(launch_env)
-    env[PARABLE_WELCOME_ENV] = (
-        render_claude_solo_welcome(cfg, brain_model, decision)
-        if solo else render_claude_welcome(cfg, brain_model, decision, available)
-    )
+    if not is_print:
+        env[PARABLE_WELCOME_ENV] = (
+            render_claude_solo_welcome(cfg, brain_model, decision)
+            if solo else render_claude_welcome(cfg, brain_model, decision, available)
+        )
     return [argv[0], "--plugin-dir", str(PARABLE_WELCOME_PLUGIN), *argv[1:]], env
 
 

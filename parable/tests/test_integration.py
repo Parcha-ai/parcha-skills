@@ -21,8 +21,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "skills" / "parable" / "scripts" / "parable.py"
 NODE = shutil.which("node") or "node"
-PROXY_COMMIT = "93d74a890a44802f656d7f39a573916b2611896e"
-PROXY_PATCH_SHA256 = "d35b422da321265150fe393da80a686862ef642ee45c65a3e2fb908d689d5d1f"
+PROXY_COMMIT = "cade44b9cdee6b9328ea2648fd119129fdf11e2d"
+PROXY_PATCH_SHA256 = "6fc4938f05991926b72ed5e85e0e4011fb570fec0490dff0691e792e5cb94c8d"
 
 FAKE_CODEX = """#!/usr/bin/env bash
 cat > /dev/null   # drain the plan from stdin like the real binary
@@ -283,9 +283,15 @@ class TestClaudeSubscriptionLauncher(unittest.TestCase):
             capture_text = capture.read_text()
             self.assertNotIn(token, capture_text)
             captured = json.loads(capture_text)
+            welcome_plugin = (
+                REPO / "skills" / "parable" / "runtime" / "welcome-plugin"
+            )
             self.assertEqual(
                 captured["argv"],
-                ["--model", "gpt-5.6-sol", "--print", "hello"],
+                [
+                    "--plugin-dir", str(welcome_plugin),
+                    "--model", "gpt-5.6-sol", "--print", "hello",
+                ],
             )
             self.assertEqual(captured["base_url"], base_url)
             self.assertTrue(captured["auth_token_present"])
@@ -495,7 +501,7 @@ exit 0
             self.assertEqual(first.stdout.count(handoff), 1)
             self.assertIn(launch, first.stdout)
 
-            installed = home / ".local" / "share" / "parable" / "0.1.19"
+            installed = home / ".local" / "share" / "parable" / "0.1.20"
             durable = home / ".local" / "bin" / "parable"
             self.assertTrue((installed / "bin" / "parable.js").is_file())
             self.assertTrue((installed / "lib" / "onboarding.js").is_file())
@@ -646,7 +652,7 @@ exit 0
         self.assertEqual(welcome_manifest["version"], package["version"])
         patch = (
             REPO / "skills" / "parable" / "runtime" / "patches"
-            / "cliproxyapi-v7.2.88-claude-effort.patch"
+            / "cliproxyapi-v7.2.103-claude-effort.patch"
         )
         self.assertEqual(hashlib.sha256(patch.read_bytes()).hexdigest(), PROXY_PATCH_SHA256)
 
@@ -688,6 +694,62 @@ exit 0
             self.assertTrue((home / ".config" / "parable" / "parable.toml").is_file())
             self.assertTrue((home / ".local" / "bin" / "parable").is_symlink())
             self.assertIn("In a new terminal", proc.stdout)
+
+
+class TestClaudeAgentModelGuard(unittest.TestCase):
+    def run_guard(self, payload: object) -> subprocess.CompletedProcess:
+        guard = (
+            REPO / "skills" / "parable" / "runtime" / "welcome-plugin"
+            / "scripts" / "model_guard.py"
+        )
+        return subprocess.run(
+            ["python3", str(guard)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    def test_generated_agent_override_is_removed_without_losing_other_input(self):
+        payload = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Agent",
+            "tool_input": {
+                "description": "Plan PoA visual profile",
+                "prompt": "Inspect the visual profile.",
+                "subagent_type": "parable-kimi",
+                "model": "haiku",
+                "run_in_background": True,
+            },
+        }
+        result = self.run_guard(payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        decision = json.loads(result.stdout)["hookSpecificOutput"]
+        self.assertEqual(decision["hookEventName"], "PreToolUse")
+        self.assertEqual(decision["permissionDecision"], "allow")
+        self.assertEqual(
+            decision["updatedInput"],
+            {
+                "description": "Plan PoA visual profile",
+                "prompt": "Inspect the visual profile.",
+                "subagent_type": "parable-kimi",
+                "run_in_background": True,
+            },
+        )
+
+    def test_unmanaged_or_already_exact_agent_input_is_untouched(self):
+        for tool_input in (
+            {"subagent_type": "Explore", "model": "haiku", "prompt": "look"},
+            {"subagent_type": "parable-kimi", "prompt": "build"},
+        ):
+            with self.subTest(tool_input=tool_input):
+                result = self.run_guard({
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Agent",
+                    "tool_input": tool_input,
+                })
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "")
 
 
 class TestFirstRunSetup(unittest.TestCase):
@@ -760,6 +822,7 @@ class TestFirstRunSetup(unittest.TestCase):
             self.assertIn("port: 8317", yaml)
             self.assertIn(f'auth-dir: "{auth_dir}"', yaml)
             self.assertIn(token, yaml)
+            self.assertIn("claude-code:\n  disable-cloaking-model-list: true\n", yaml)
             config = (config_dir / "parable.toml").read_text()
             self.assertIn('brain_model = "claude-fable-5"', config)
             for present in (
@@ -803,6 +866,35 @@ class TestFirstRunSetup(unittest.TestCase):
                     (target.read_bytes(), target.stat().st_mtime_ns),
                     before[target],
                 )
+
+    def test_setup_migrates_only_the_previous_generated_proxy_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            proxy = self.make_proxy(home / "tools")
+            first = self.run_cli(
+                home,
+                "setup", "--non-interactive", "--vendors", "claude",
+                "--proxy-bin", str(proxy), "--no-auth",
+            )
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            config = home / ".config" / "parable" / "cliproxy.yaml"
+            legacy = config.read_text().replace(
+                "claude-code:\n  disable-cloaking-model-list: true\n",
+                "",
+            )
+            config.write_text(legacy)
+            config.chmod(0o600)
+
+            migrated = self.run_cli(
+                home,
+                "setup", "--non-interactive", "--vendors", "claude", "--no-auth",
+            )
+            self.assertEqual(migrated.returncode, 0, migrated.stdout + migrated.stderr)
+            self.assertIn("updated generated proxy compatibility", migrated.stdout)
+            self.assertIn(
+                "claude-code:\n  disable-cloaking-model-list: true\n",
+                config.read_text(),
+            )
 
     def test_interactive_and_all_vendor_configs_use_exact_models(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1362,6 +1454,68 @@ if args and args[0] == "build":
             self.assertTrue(any("am" in call for call in git_calls))
             self.assertEqual([call[0] for call in go_calls], ["test", "test", "build"])
 
+    def test_proxy_upgrade_stages_new_binary_without_replacing_credentials(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            home.mkdir()
+            data_home = root / "data"
+            old_proxy = root / "old-proxy"
+            old_proxy.write_text("#!/usr/bin/env sh\nexit 0\n")
+            old_proxy.chmod(0o755)
+            bindir, git_log, go_log = self.make_tools(root)
+            env = self.build_env(home, bindir, git_log, go_log)
+            env["XDG_DATA_HOME"] = str(data_home)
+            setup = subprocess.run(
+                [
+                    NODE, str(REPO / "bin" / "parable.js"),
+                    "setup", "--non-interactive", "--vendors", "claude",
+                    "--proxy-bin", str(old_proxy), "--no-auth",
+                ],
+                cwd=home,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(setup.returncode, 0, setup.stdout + setup.stderr)
+            config_dir = home / ".config" / "parable"
+            token_before = (config_dir / "cliproxy.env").read_bytes()
+
+            upgraded = subprocess.run(
+                [NODE, str(REPO / "bin" / "parable.js"), "proxy", "upgrade"],
+                cwd=home,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(upgraded.returncode, 0, upgraded.stdout + upgraded.stderr)
+            expected = (
+                data_home / "parable" / "cliproxyapi" / PROXY_COMMIT
+                / "parable-cliproxy-api"
+            )
+            manifest = json.loads((config_dir / "setup.json").read_text())
+            self.assertEqual(manifest["proxyBinary"], str(expected))
+            self.assertTrue(expected.is_file())
+            self.assertEqual((config_dir / "cliproxy.env").read_bytes(), token_before)
+            self.assertIn(
+                "claude-code:\n  disable-cloaking-model-list: true\n",
+                (config_dir / "cliproxy.yaml").read_text(),
+            )
+            self.assertIn("upgrade active", upgraded.stdout)
+
+            again = subprocess.run(
+                [NODE, str(REPO / "bin" / "parable.js"), "proxy", "upgrade"],
+                cwd=home,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+            self.assertIn("proxy is current", again.stdout)
+
     def test_interactive_setup_requires_consent_before_build_work(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1468,7 +1622,7 @@ if args and args[0] == "build":
             shutil.copytree(REPO / "skills", package / "skills")
             patch = (
                 package / "skills" / "parable" / "runtime" / "patches"
-                / "cliproxyapi-v7.2.88-claude-effort.patch"
+                / "cliproxyapi-v7.2.103-claude-effort.patch"
             )
             patch.write_text(patch.read_text() + "\n# checksum mutation\n")
             destination = root / "checksum"
@@ -2086,9 +2240,15 @@ for flag, (vendor, record_type) in mapping.items():
             captured_text = claude_capture.read_text()
             self.assertNotIn(token, captured_text)
             captured = json.loads(captured_text)
+            welcome_plugin = (
+                REPO / "skills" / "parable" / "runtime" / "welcome-plugin"
+            )
             self.assertEqual(
                 captured["argv"],
-                ["--model", "claude-fable-5", "--print", "hello"],
+                [
+                    "--plugin-dir", str(welcome_plugin),
+                    "--model", "claude-fable-5", "--print", "hello",
+                ],
             )
             self.assertIsNone(captured["welcome_message"])
             self.assertTrue(captured["auth_token_present"])
@@ -2208,6 +2368,7 @@ for flag, (vendor, record_type) in mapping.items():
             self.assertEqual(
                 captured["argv"],
                 [
+                    "--plugin-dir", str(welcome_plugin),
                     "--model", "claude-fable-5", "--dangerously-skip-permissions",
                     "--effort", "low", "--print", "direct",
                 ],
@@ -2222,7 +2383,10 @@ for flag, (vendor, record_type) in mapping.items():
             captured = json.loads(claude_capture.read_text())
             self.assertEqual(
                 captured["argv"],
-                ["--model", "claude-fable-5", "--print", "auto"],
+                [
+                    "--plugin-dir", str(welcome_plugin),
+                    "--model", "claude-fable-5", "--print", "auto",
+                ],
             )
 
     def test_finalize_subset_and_missing_exact_id_fail_closed_without_aliases(self):
@@ -2267,9 +2431,15 @@ for flag, (vendor, record_type) in mapping.items():
             self.assertEqual(auto.returncode, 0, auto.stdout + auto.stderr)
             self.assertIn("brain: claude-fable-5 (Sol is not configured; using Fable)", auto.stdout)
             captured = json.loads(claude_capture.read_text())
+            welcome_plugin = (
+                REPO / "skills" / "parable" / "runtime" / "welcome-plugin"
+            )
             self.assertEqual(
                 captured["argv"],
-                ["--model", "claude-fable-5", "--print", "claude-only"],
+                [
+                    "--plugin-dir", str(welcome_plugin),
+                    "--model", "claude-fable-5", "--print", "claude-only",
+                ],
             )
             explicit_sol = self.run_cli(repo, env, "claude", "--brain", "sol")
             self.assertNotEqual(explicit_sol.returncode, 0)

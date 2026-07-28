@@ -175,10 +175,13 @@ remains a compatibility alias. Permission bypass is never enabled implicitly.
 For safe existing-install upgrades, run `parable setup --add-vendors kimi --no-auth` followed by the ordinary new-terminal
 `parable auth login` — existing providers are skipped.
 
-Interactive multi-model launches add a session-scoped startup hook that renders Parable ASCII art, the live
+Multi-model launches add a session-scoped plugin that preserves each generated
+`parable-*` agent's exact frontmatter model even if an Agent call supplies a conflicting model.
+Interactive launches also render Parable ASCII art, the live
 brain decision, and every routed model with its task guidance inside Claude Code. The card is a
 user-only `systemMessage`: it creates no prompt and consumes no model context. Headless `--print`
-and `--bare` launches stay clean. Solo launches show a user-only SOLO startup card instead.
+launches load the guard without showing a card; `--bare` loads neither. Solo launches show a
+user-only SOLO startup card instead.
 
 The generated cast gives the parent evidence-informed stage directions: Fable for ambiguous
 planning and architecture; Sol for long implementation, difficult debugging, and high-recall

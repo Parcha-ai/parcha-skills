@@ -15,6 +15,7 @@ const {
   runFinalize,
   runProxyBuild,
   runProxyStart,
+  runProxyUpgrade,
   runSetup,
   setupClientEnvironment,
 } = require("../lib/onboarding");
@@ -187,6 +188,7 @@ function printUsage() {
   log("  auth add VENDOR    authorize chatgpt, claude, xai, or kimi through CLIProxyAPI");
   log("  auth status        show credential-safe provider presence and record counts");
   log("  proxy build        build the pinned, patched CLIProxyAPI source");
+  log("  proxy upgrade      stage the current pinned proxy without interrupting sessions");
   log("  proxy start        diagnostic foreground CLIProxyAPI process");
   log("  claude [...]       backward-compatible explicit launcher alias");
   log("  agents sync        synchronize project-local parable-* custom agents");
@@ -219,6 +221,10 @@ async function main() {
   }
   if (raw[0] === "proxy" && raw[1] === "build") {
     await runProxyBuild(raw.slice(2), log);
+    return;
+  }
+  if (raw[0] === "proxy" && raw[1] === "upgrade") {
+    await runProxyUpgrade(raw.slice(2), log);
     return;
   }
   if (raw[0] === "proxy" && raw[1] === "start") {

@@ -184,7 +184,10 @@ headless/recovery diagnostics.
 **Multi-model mode:** Arbitrary-model Claude executors are
 synchronized as project-local native agents named `parable-<normalized-executor-id>`;
 `parable-config.sh` prints the exact
-`agent=` name beside each one. Invoke that named agent through the Agent tool. Claude Code's
+`agent=` name beside each one. Invoke that named agent through the Agent tool and omit the
+Agent call's optional `model` field. The generated agent file owns the exact model; a per-call
+model silently overrides its frontmatter. Parable's session plugin removes such an override
+from `parable-*` calls as a final guard. Claude Code's
 built-in model aliases remain normal model-selected subagents.
 
 **Solo mode:** Agent synchronization is skipped. The selected model runs directly as the parent; the Agent tool is unavailable.
@@ -246,6 +249,9 @@ this tool exists to prevent. The per-pool selection detail lives in `references/
   `parable claude` remains a backward-compatible explicit alias. `parable setup finalize`
   performs only the catalog/sync diagnostic against an already-running proxy. These are package
   CLI commands, not skill scripts.
+- `parable proxy upgrade` — build Parable's current pinned, patched CLIProxyAPI in a new
+  versioned directory and atomically stage it for future launches. It does not interrupt an
+  already-running proxy; the next managed start uses the new binary.
 - `scripts/parable-resume.sh <run-dir> "<message>"` — continue an executor's existing session
   (caching economics: facts below). Sessions do not transfer between executors. Not used in solo mode
   (single executor, no orchestration).

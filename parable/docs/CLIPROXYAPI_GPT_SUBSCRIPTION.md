@@ -255,14 +255,19 @@ an existing checkout. The build stops before
 
 | Item | Pin |
 |---|---|
-| CLIProxyAPI base | `v7.2.88` / `93d74a890a44802f656d7f39a573916b2611896e` |
-| Vendored patch SHA-256 | `d35b422da321265150fe393da80a686862ef642ee45c65a3e2fb908d689d5d1f` |
-| Verified toolchain | Go `1.26.5` |
-| Verified harness | Claude Code `2.1.215` |
+| CLIProxyAPI base | `v7.2.103` / `cade44b9cdee6b9328ea2648fd119129fdf11e2d` |
+| Vendored patch SHA-256 | `6fc4938f05991926b72ed5e85e0e4011fb570fec0490dff0691e792e5cb94c8d` |
+| Verified toolchain | Go `1.26.0` |
+| Verified harness | Claude Code `2.1.220` |
 
 The builder applies the vendored effort-translation patch, runs the focused Go
 test slices, and emits a mode-`0700` `parable-cliproxy-api` executable. An
 existing destination is refused rather than reused or deleted.
+
+For an existing setup, `parable proxy upgrade` builds this pin in a new
+versioned directory and atomically points future launches at it. It never
+interrupts a proxy that is already serving a session. Re-running the command
+after the manifest points at the current pin is a no-op.
 
 Prerequisites are Node 18+, Python 3.11+, Git, Go, and stock Claude Code.
 

@@ -219,7 +219,13 @@ class TestClaudeLaunch(unittest.TestCase):
             argv, {}, cfg, "claude-fable-5", "explicit fable parent", available,
             ["--print", "hello"],
         )
-        self.assertEqual(print_argv, argv)
+        self.assertEqual(
+            print_argv,
+            [
+                "claude", "--plugin-dir", str(parable.PARABLE_WELCOME_PLUGIN),
+                "--model", "claude-fable-5",
+            ],
+        )
         self.assertNotIn(parable.PARABLE_WELCOME_ENV, print_env)
 
     def auto_cfg(self):
