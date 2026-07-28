@@ -15,8 +15,11 @@ from .authorization import decide
 from .canonical import CanonicalPlane
 from .db import BrainStore, SearchDeadlineExceeded, bounded_search_text
 from .deep_inspection import (
+    AgentExecObject,
     DeepInspectionBudget,
+    DeepInspectionError,
     EvidenceTarget,
+    RECEIPT_TOKEN_RE,
 )
 from .federation import SOURCE_FAMILIES
 from .projectors import legacy_engine
@@ -132,8 +135,8 @@ class CanonicalRetrieval:
         self.evidence_projector = evidence_projector
         self.deep_inspector = deep_inspector
         self.passage_policy = passage_policy or PassagePolicy(
-            target_tokens=1024,
-            overlap_tokens=128,
+            target_tokens=512,
+            overlap_tokens=64,
         )
 
     def bind(self, principal: dict[str, Any]) -> BoundCanonicalRetrieval:
@@ -458,8 +461,8 @@ class BoundCanonicalRetrieval:
         self.evidence_projector = evidence_projector
         self.deep_inspector = deep_inspector
         self.passage_policy = passage_policy or PassagePolicy(
-            target_tokens=1024,
-            overlap_tokens=128,
+            target_tokens=512,
+            overlap_tokens=64,
         )
 
     @staticmethod
@@ -826,6 +829,120 @@ class BoundCanonicalRetrieval:
             until=until,
             limit=limit,
         )
+
+    def execute_agent_program(
+        self,
+        program: str,
+        *,
+        logical_document_ids: tuple[str, ...],
+        timeout_seconds: int,
+    ) -> dict[str, Any]:
+        """Execute beside only the immutable documents admitted by prior hints."""
+
+        if (
+            self.deep_inspector is None
+            or not callable(getattr(self.deep_inspector, "execute", None))
+        ):
+            raise DeepInspectionError("deep_inspector_not_configured")
+        if (
+            not isinstance(logical_document_ids, tuple)
+            or not 1 <= len(logical_document_ids) <= 80
+            or len(logical_document_ids) != len(set(logical_document_ids))
+            or any(
+                not isinstance(item, str)
+                or not re.fullmatch(r"ldoc_[0-9a-f]{32}", item)
+                for item in logical_document_ids
+            )
+        ):
+            raise DeepInspectionError("deep_inspector_target_invalid")
+        with self.store.connect() as connection:
+            rows = connection.execute(
+                """SELECT document.logical_document_id,
+                          document.manifest_object_key AS object_key,
+                          document.manifest_content_sha256 AS content_sha256
+                     FROM canonical_evidence_documents document
+                    WHERE document.tenant_id=%s
+                      AND document.source_id=ANY(%s)
+                      AND document.logical_document_id=ANY(%s)
+                    UNION ALL
+                   SELECT part.logical_document_id,part.object_key,
+                          part.content_sha256
+                     FROM canonical_evidence_document_parts part
+                    WHERE part.tenant_id=%s
+                      AND part.source_id=ANY(%s)
+                      AND part.logical_document_id=ANY(%s)
+                    ORDER BY logical_document_id,object_key""",
+                (
+                    self.tenant_id,
+                    list(self.authorized_sources),
+                    list(logical_document_ids),
+                    self.tenant_id,
+                    list(self.authorized_sources),
+                    list(logical_document_ids),
+                ),
+            ).fetchall()
+        admitted_documents = {
+            row["logical_document_id"] for row in rows
+        }
+        if not admitted_documents or len(rows) > 512:
+            raise DeepInspectionError("deep_inspector_target_invalid")
+        objects = tuple(
+            AgentExecObject(
+                object_key=row["object_key"],
+                content_sha256=row["content_sha256"],
+            )
+            for row in rows
+        )
+        result = self.deep_inspector.execute(
+            tenant_id=self.tenant_id,
+            program=program,
+            objects=objects,
+            timeout_seconds=timeout_seconds,
+        )
+        stdout = result.get("stdout")
+        if not isinstance(stdout, str):
+            raise DeepInspectionError("deep_inspector_result_invalid_execution")
+        mentioned = list(dict.fromkeys(RECEIPT_TOKEN_RE.findall(stdout)))
+        if mentioned:
+            with self.store.connect() as connection:
+                verified_rows = connection.execute(
+                    """SELECT DISTINCT chunk.receipt
+                         FROM canonical_chunks chunk
+                         JOIN canonical_documents canonical
+                           USING(tenant_id,source_id,document_id)
+                         JOIN canonical_events event
+                           USING(tenant_id,source_id,event_id)
+                         JOIN canonical_evidence_documents evidence
+                           ON evidence.tenant_id=event.tenant_id
+                          AND evidence.source_id=event.source_id
+                          AND evidence.native_parent_id=COALESCE(
+                              event.native_parent_id,event.native_id
+                          )
+                        WHERE chunk.tenant_id=%s
+                          AND chunk.source_id=ANY(%s)
+                          AND chunk.receipt=ANY(%s)
+                          AND evidence.logical_document_id=ANY(%s)
+                          AND chunk.deleted_at IS NULL
+                          AND canonical.is_current
+                          AND canonical.deleted_at IS NULL""",
+                    (
+                        self.tenant_id,
+                        list(self.authorized_sources),
+                        mentioned,
+                        sorted(admitted_documents),
+                    ),
+                ).fetchall()
+            verified = {row["receipt"] for row in verified_rows}
+            if set(mentioned) != verified:
+                raise DeepInspectionError(
+                    "deep_inspector_receipt_scope_violation"
+                )
+        return {
+            **result,
+            "opened_receipts": mentioned,
+            "documents_available": len(admitted_documents),
+            "objects_available": len(objects),
+        }
 
     def _receipt_event(
         self,
@@ -1495,6 +1612,7 @@ class BoundCanonicalRetrieval:
         if (
             self.evidence_projector is None
             or self.deep_inspector is None
+            or not callable(getattr(self.deep_inspector, "inspect", None))
             or (
                 configured_tenant is not None
                 and configured_tenant != self.tenant_id

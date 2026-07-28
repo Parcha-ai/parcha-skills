@@ -65,6 +65,38 @@ class FakeBoundRetrieval:
     def __init__(self) -> None:
         self.calls = []
 
+    def passage_hints(self, query, *, filters, limit):
+        self.calls.append(("hints", query, filters, limit))
+        return {
+            "results": [{
+                "source_id": SOURCE,
+                "logical_document_id": (
+                    "ldoc_0123456789abcdef0123456789abcdef"
+                ),
+                "matching_ranges": [],
+            }],
+            "diagnostics": {"engine": "synthetic"},
+        }
+
+    def execute_agent_program(
+        self,
+        program,
+        *,
+        logical_document_ids,
+        timeout_seconds,
+    ):
+        self.calls.append((
+            "exec",
+            program,
+            logical_document_ids,
+            timeout_seconds,
+        ))
+        return {
+            "stdout": RECEIPT,
+            "opened_receipts": [RECEIPT],
+            "complete": True,
+        }
+
     def investigate(self, question, *, filters, depth):
         self.calls.append(("investigate", question, filters, depth))
         return {
@@ -245,25 +277,36 @@ class AgentFacadeUnitTest(unittest.TestCase):
             )
 
     def test_host_owned_tool_budget_is_enforced(self) -> None:
-        context = DelegationContext.from_principal(principal())
+        context = dataclasses.replace(
+            DelegationContext.from_principal(principal()),
+            budget=AgentBudget(max_tool_calls=2),
+        )
         tools = ConstrainedAgentTools(FakeBoundRetrieval(), context)
         for _ in range(context.budget.max_tool_calls):
-            tools.call("recall.show", {"target": RECEIPT})
+            tools.call("recall.hints", {
+                "query": REQUEST["question"],
+                "filters": {},
+                "limit": 1,
+            })
         with self.assertRaisesRegex(AgentExecutionError, "budget is exhausted"):
-            tools.call("recall.show", {"target": RECEIPT})
+            tools.call("recall.hints", {
+                "query": REQUEST["question"],
+                "filters": {},
+                "limit": 1,
+            })
 
     def test_expensive_tool_budgets_are_enforced_per_tool(self) -> None:
         context = DelegationContext.from_principal(principal())
         tools = ConstrainedAgentTools(FakeBoundRetrieval(), context)
         arguments = {
-            "question": REQUEST["question"],
+            "query": REQUEST["question"],
             "filters": {},
-            "depth": "normal",
+            "limit": 1,
         }
-        tools.call("recall.investigate", arguments)
-        tools.call("recall.investigate", arguments)
+        for _ in range(6):
+            tools.call("recall.hints", arguments)
         with self.assertRaises(AgentExecutionError) as caught:
-            tools.call("recall.investigate", arguments)
+            tools.call("recall.hints", arguments)
         self.assertEqual(
             caught.exception.code,
             "agent_tool_budget_exhausted",
@@ -272,15 +315,11 @@ class AgentFacadeUnitTest(unittest.TestCase):
 
     def test_host_owned_receipt_budget_is_enforced(self) -> None:
         class ManyReceipts(FakeBoundRetrieval):
-            def investigate(self, question, *, filters, depth):
+            def execute_agent_program(self, *args, **kwargs):
                 return {
-                    "items": [
-                        {"receipt": RECEIPT},
-                        {
-                            "receipt": (
-                                f"recall://{SOURCE}/item-2?rev=1#item=0"
-                            )
-                        },
+                    "opened_receipts": [
+                        RECEIPT,
+                        f"recall://{SOURCE}/item-2?rev=1#item=0",
                     ]
                 }
 
@@ -289,11 +328,15 @@ class AgentFacadeUnitTest(unittest.TestCase):
             budget=AgentBudget(max_receipts=1),
         )
         tools = ConstrainedAgentTools(ManyReceipts(), context)
+        tools.call("recall.hints", {
+            "query": REQUEST["question"],
+            "filters": {},
+            "limit": 1,
+        })
         with self.assertRaises(AgentExecutionError) as caught:
-            tools.call("recall.investigate", {
-                "question": REQUEST["question"],
-                "filters": {},
-                "depth": "normal",
+            tools.call("recall.exec", {
+                "program": "rg synthetic /mnt/archil/evidence",
+                "timeout_seconds": 10,
             })
         self.assertEqual(
             caught.exception.code,
@@ -302,20 +345,29 @@ class AgentFacadeUnitTest(unittest.TestCase):
 
     def test_cumulative_tool_output_budget_is_enforced(self) -> None:
         class LargeResult(FakeBoundRetrieval):
-            def show(self, target):
+            def execute_agent_program(self, *args, **kwargs):
                 return {
-                    "resolved_receipt": target,
+                    "opened_receipts": [RECEIPT],
                     "text": "x" * 200,
                 }
 
         context = dataclasses.replace(
             DelegationContext.from_principal(principal()),
-            budget=AgentBudget(max_tool_output_bytes=400),
+            budget=AgentBudget(max_tool_output_bytes=700),
         )
         tools = ConstrainedAgentTools(LargeResult(), context)
-        tools.call("recall.show", {"target": RECEIPT})
+        tools.call("recall.hints", {
+            "query": REQUEST["question"],
+            "filters": {},
+            "limit": 1,
+        })
+        arguments = {
+            "program": "rg synthetic /mnt/archil/evidence",
+            "timeout_seconds": 10,
+        }
+        tools.call("recall.exec", arguments)
         with self.assertRaises(AgentExecutionError) as caught:
-            tools.call("recall.show", {"target": RECEIPT})
+            tools.call("recall.exec", arguments)
         self.assertEqual(
             caught.exception.code,
             "agent_tool_output_budget_exhausted",

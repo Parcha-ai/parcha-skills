@@ -9,6 +9,7 @@ from pathlib import Path
 
 from recall_server.archive import FilesystemArchiveStore
 from recall_server.deep_inspection import (
+    AgentExecObject,
     ArchilDeepInspector,
     DeepInspectionBudget,
     DeepInspectionError,
@@ -340,57 +341,7 @@ class DeepInspectionContractTests(unittest.TestCase):
             )
         self.assertEqual(len(projection.deleted), 2)
 
-    def test_archil_adapter_uses_fixed_read_only_mount_and_encoded_payload(self):
-        transport = RecordingTransport()
-        inspector = ArchilDeepInspector(
-            api_key="synthetic-key",
-            disk_id="dsk-0123456789abcdef",
-            region="aws-us-west-2",
-            transport=transport,
-        )
-        target = EvidenceTarget(
-            tenant_id=TENANT,
-            source_id=SOURCE,
-            object_key="objects/aa/" + "a" * 64,
-            content_sha256="c" * 64,
-            receipts=(RECEIPT,),
-        )
-        result = inspector.inspect(
-            tenant_id=TENANT,
-            question='Atlas"; rm -rf / #',
-            targets=(target,),
-            budget=DeepInspectionBudget(
-                max_files=4,
-                max_matches=5,
-                max_output_bytes=16_000,
-                timeout_seconds=10,
-            ),
-        )
-        self.assertTrue(result["complete"])
-        call = transport.calls[0]
-        self.assertEqual(
-            call["url"],
-            "https://control.green.us-west-2.aws.prod.archil.com/api/exec",
-        )
-        self.assertEqual(
-            call["body"]["disks"],
-            {
-                "evidence": {
-                    "disk": "dsk-0123456789abcdef",
-                    "readOnly": True,
-                }
-            },
-        )
-        command = call["body"]["command"]
-        self.assertNotIn("rm -rf", command)
-        self.assertNotIn(SAFE_TEXT, command)
-        self.assertIn('text.encode("utf-8")[:8192]', command)
-        self.assertNotIn("synthetic-key", json.dumps(call["body"]))
-        self.assertEqual(call["headers"]["Authorization"], "synthetic-key")
-
-    def test_archil_rejects_untrusted_identifiers_and_oversized_or_foreign_results(
-        self,
-    ):
+    def test_archil_rejects_untrusted_identifiers(self):
         with self.assertRaises(DeepInspectionError):
             ArchilDeepInspector(
                 api_key="synthetic-key",
@@ -406,53 +357,86 @@ class DeepInspectionContractTests(unittest.TestCase):
                 content_sha256="c" * 64,
                 receipts=(RECEIPT,),
             )
-        foreign = RecordingTransport(
-            {
-                "success": True,
-                "data": {
-                    "stdout": json.dumps(
-                        {
-                            "findings": [
-                                {
-                                    "receipt": (
-                                        "recall://source:personal:synthetic/"
-                                        "private?rev=1#item=0"
-                                    ),
-                                    "text": "foreign",
-                                    "line": 1,
-                                    "object_key": "objects/aa/" + "a" * 64,
-                                }
-                            ],
-                            "complete": True,
-                            "files_scanned": 1,
-                        }
-                    ),
-                    "stderr": "",
-                    "exitCode": 0,
-                    "timing": {"totalMs": 1, "queueMs": 0, "executeMs": 1},
-                },
-            }
-        )
+
+
+    def test_agent_exec_is_arbitrary_but_sees_only_staged_read_only_objects(self):
+        hostile = "rg -n Atlas /mnt/archil/evidence; echo $ARCHIL_API_KEY"
+        transport = RecordingTransport({
+            "success": True,
+            "data": {
+                "stdout": f"Atlas changed {RECEIPT}\n",
+                "stderr": "",
+                "exitCode": 0,
+                "timing": {"totalMs": 18, "queueMs": 3, "executeMs": 15},
+            },
+        })
         inspector = ArchilDeepInspector(
             api_key="synthetic-key",
             disk_id="dsk-0123456789abcdef",
             region="aws-us-west-2",
-            transport=foreign,
+            transport=transport,
         )
-        target = EvidenceTarget(
+        result = inspector.execute(
             tenant_id=TENANT,
-            source_id=SOURCE,
-            object_key="objects/aa/" + "a" * 64,
-            content_sha256="c" * 64,
-            receipts=(RECEIPT,),
+            program=hostile,
+            objects=(
+                AgentExecObject(
+                    object_key="objects/aa/" + "a" * 64,
+                    content_sha256="c" * 64,
+                ),
+            ),
+            timeout_seconds=10,
         )
-        with self.assertRaisesRegex(DeepInspectionError, "result_invalid"):
-            inspector.inspect(
+        self.assertTrue(result["complete"])
+        call = transport.calls[0]
+        self.assertEqual(
+            call["body"]["disks"],
+            {
+                "evidence": {
+                    "disk": "dsk-0123456789abcdef",
+                    "readOnly": True,
+                }
+            },
+        )
+        command = call["body"]["command"]
+        self.assertNotIn(hostile, command)
+        self.assertIn("unshare --user --map-root-user --net", command)
+        self.assertIn(
+            "mount --bind /tmp/recall-authorized /mnt/archil/evidence",
+            command,
+        )
+        self.assertIn("env -i HOME=/tmp", command)
+        self.assertNotIn("synthetic-key", json.dumps(call["body"]))
+
+    def test_agent_exec_timeout_is_bounded_twenty_out_of_twenty(self):
+        for _ in range(20):
+            transport = RecordingTransport({
+                "success": True,
+                "data": {
+                    "stdout": "",
+                    "stderr": "Killed",
+                    "exitCode": 137,
+                    "timing": {"totalMs": 1001, "queueMs": 1, "executeMs": 1000},
+                },
+            })
+            result = ArchilDeepInspector(
+                api_key="synthetic-key",
+                disk_id="dsk-0123456789abcdef",
+                region="aws-us-west-2",
+                transport=transport,
+            ).execute(
                 tenant_id=TENANT,
-                question="Atlas",
-                targets=(target,),
-                budget=DeepInspectionBudget(max_files=1, max_matches=1),
+                program="sleep 10",
+                objects=(
+                    AgentExecObject(
+                        object_key="objects/aa/" + "a" * 64,
+                        content_sha256="c" * 64,
+                    ),
+                ),
+                timeout_seconds=1,
             )
+            self.assertEqual(result["stopped_reason"], "timeout")
+            self.assertFalse(result["complete"])
 
 
 if __name__ == "__main__":

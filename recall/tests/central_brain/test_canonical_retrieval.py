@@ -15,6 +15,7 @@ from recall_server.canonical_retrieval import (  # noqa: E402
     _informative_query_terms,
 )
 from recall_server.db import SearchDeadlineExceeded  # noqa: E402
+from recall_server.deep_inspection import DeepInspectionError  # noqa: E402
 
 
 class DeadlineStore:
@@ -76,6 +77,67 @@ class RecordingStore:
         self.sql.append(" ".join(sql.split()))
         self.values.append(tuple(_values))
         return EmptyRows()
+
+
+class AgentExecStore:
+    semantic_runtime = None
+
+    def __init__(self, receipt: str, *, verify_receipt: bool = True) -> None:
+        self.receipt = receipt
+        self.verify_receipt = verify_receipt
+        self.calls: list[tuple[str, tuple]] = []
+
+    @contextmanager
+    def connect(self):
+        yield self
+
+    def execute(self, sql, values):
+        normalized = " ".join(sql.split())
+        self.calls.append((normalized, tuple(values)))
+        if "canonical_evidence_document_parts" in normalized:
+            return Rows([
+                {
+                    "logical_document_id": (
+                        "ldoc_0123456789abcdef0123456789abcdef"
+                    ),
+                    "object_key": "objects/aa/" + "a" * 64,
+                    "content_sha256": "b" * 64,
+                },
+                {
+                    "logical_document_id": (
+                        "ldoc_0123456789abcdef0123456789abcdef"
+                    ),
+                    "object_key": "objects/bb/" + "c" * 64,
+                    "content_sha256": "d" * 64,
+                },
+            ])
+        return Rows(
+            [{"receipt": self.receipt}] if self.verify_receipt else []
+        )
+
+
+class Rows:
+    def __init__(self, values):
+        self.values = values
+
+    def fetchall(self):
+        return self.values
+
+
+class RecordingExecInspector:
+    def __init__(self, receipt: str) -> None:
+        self.receipt = receipt
+        self.calls: list[dict] = []
+
+    def execute(self, **arguments):
+        self.calls.append(arguments)
+        return {
+            "provider": "synthetic-archil",
+            "stdout": f"verified {self.receipt}",
+            "stderr": "",
+            "exit_code": 0,
+            "complete": True,
+        }
 
 
 class CanonicalRetrievalDeadlineTest(unittest.TestCase):
@@ -274,6 +336,71 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
         self.assertIn("websearch_to_tsquery('simple',%s)", store.sql[0])
         self.assertIn("matched_term_count DESC", store.sql[0])
         self.assertIn("claude-session-hash", store.values[0])
+
+    def test_agent_exec_stages_only_authorized_documents_and_verifies_receipts(
+        self,
+    ):
+        source = "codex.jsonl:test"
+        receipt = f"recall://{source}/event?rev=1#item=0"
+        store = AgentExecStore(receipt)
+        inspector = RecordingExecInspector(receipt)
+        retrieval = BoundCanonicalRetrieval(
+            store,
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=(source,),
+            deep_inspector=inspector,
+        )
+        document_id = "ldoc_0123456789abcdef0123456789abcdef"
+
+        result = retrieval.execute_agent_program(
+            "rg -n verified /mnt/archil/evidence",
+            logical_document_ids=(document_id,),
+            timeout_seconds=7,
+        )
+
+        self.assertEqual(result["opened_receipts"], [receipt])
+        self.assertEqual(result["documents_available"], 1)
+        self.assertEqual(result["objects_available"], 2)
+        call = inspector.calls[0]
+        self.assertEqual(call["tenant_id"], "tenant:test")
+        self.assertEqual(call["timeout_seconds"], 7)
+        self.assertEqual(len(call["objects"]), 2)
+        self.assertEqual(
+            store.calls[0][1],
+            (
+                "tenant:test",
+                [source],
+                [document_id],
+                "tenant:test",
+                [source],
+                [document_id],
+            ),
+        )
+
+    def test_agent_exec_rejects_a_receipt_not_proven_by_admitted_documents(self):
+        source = "codex.jsonl:test"
+        receipt = f"recall://{source}/foreign?rev=1#item=0"
+        store = AgentExecStore(receipt, verify_receipt=False)
+        retrieval = BoundCanonicalRetrieval(
+            store,
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=(source,),
+            deep_inspector=RecordingExecInspector(receipt),
+        )
+
+        with self.assertRaisesRegex(
+            DeepInspectionError,
+            "receipt_scope_violation",
+        ):
+            retrieval.execute_agent_program(
+                "rg -n foreign /mnt/archil/evidence",
+                logical_document_ids=(
+                    "ldoc_0123456789abcdef0123456789abcdef",
+                ),
+                timeout_seconds=7,
+            )
 
 
 if __name__ == "__main__":

@@ -17,7 +17,6 @@ sys.path.insert(0, str(SERVER))
 from recall_server.agent import (  # noqa: E402
     AgentExecutionError,
     RecallAgentService,
-    ScriptedAgentRunner,
     service_from_env,
 )
 from recall_server.agent_pi_ati import (  # noqa: E402
@@ -27,15 +26,12 @@ from recall_server.agent_pi_ati import (  # noqa: E402
     ProviderKey,
     SubprocessBrainTurnTransport,
     _load_provider_key,
-    _model_tool_error_message,
-    _model_tool_result,
 )
 
 
 TENANT = "tenant:synthetic:company"
 PRINCIPAL = "principal:synthetic:member"
 SOURCE = "source:synthetic:company"
-OTHER_SOURCE = "source:synthetic:personal"
 HINT = f"recall://{SOURCE}/hint?rev=1#item=0"
 DECISION = f"recall://{SOURCE}/decision?rev=1#item=0"
 IMPLEMENTATION = f"recall://{SOURCE}/implementation?rev=1#item=0"
@@ -68,127 +64,63 @@ class SyntheticRetrieval:
     def __init__(self, *, fail_deep: bool = False):
         self.calls: list[str] = []
         self.filters: list[dict] = []
-        self.questions: list[str] = []
-        self.map_batches: list[list[str]] = []
-        self.map_seed_batches: list[list[list[str]]] = []
         self.fail_deep = fail_deep
 
-    def investigate(self, question, *, filters, depth):
-        self.calls.append("recall_investigate")
-        self.questions.append(question)
+    def passage_hints(self, query, *, filters, limit):
+        self.calls.append("recall_hints")
         self.filters.append(dict(filters))
         return {
-            "question_interpretation": {"time_basis": "occurred_at"},
-            "routing_hints": [
-                {"receipt": DECISION},
-                {"receipt": IMPLEMENTATION},
-            ],
-            "investigations": [{
-                "match": {
-                    "receipt": HINT,
-                    "occurred_at": "2026-07-10T12:00:00Z",
-                    "ingested_at": "2026-07-23T18:00:00Z",
-                    "text": "Old decoy ingested inside the requested window.",
+            "results": [
+                {
+                    "source_id": SOURCE,
+                    "logical_document_id": (
+                        "ldoc_0123456789abcdef0123456789abcdef"
+                    ),
+                    "matching_ranges": [
+                        {"text": "Aurora bridge decision", "receipts": [HINT]}
+                    ],
                 },
-                "context": {"events": []},
-            }],
-            "coverage": {"sessions": 3, "sources": [SOURCE]},
+                {
+                    "source_id": SOURCE,
+                    "logical_document_id": (
+                        "ldoc_fedcba9876543210fedcba9876543210"
+                    ),
+                    "matching_ranges": [
+                        {
+                            "text": "Grounding verification",
+                            "receipts": [IMPLEMENTATION],
+                        }
+                    ],
+                },
+            ][:limit],
+            "diagnostics": {"engine": "synthetic-voyage-hybrid"},
         }
 
-    def deep_search(self, question, *, filters, depth):
-        self.calls.append("recall_deep_search")
-        self.filters.append(dict(filters))
+    def execute_agent_program(
+        self,
+        program,
+        *,
+        logical_document_ids,
+        timeout_seconds,
+    ):
+        self.calls.append("recall_exec")
         if self.fail_deep:
             raise RuntimeError("synthetic provider body must not escape")
         return {
-            "findings": [
-                {
-                    "receipt": DECISION,
-                    "occurred_at": "2026-07-23T09:00:00Z",
-                    "text": "The team selected the bounded agent bridge.",
-                },
-                {
-                    "receipt": IMPLEMENTATION,
-                    "occurred_at": "2026-07-23T15:00:00Z",
-                    "text": "The bridge passed its receipt-grounding check.",
-                },
-            ],
-            "coverage": {
-                "sessions": 2,
-                "sources": [SOURCE],
-                "provider": "synthetic-archil",
-                "complete": True,
-            },
+            "provider": "synthetic-archil",
+            "stdout": (
+                "Decision: selected the bounded agent bridge "
+                f"{DECISION}\n"
+                "Verification: grounding check passed "
+                f"{IMPLEMENTATION}\n"
+            ),
+            "stderr": "",
+            "exit_code": 0,
+            "complete": True,
+            "stopped_reason": "completed",
+            "opened_receipts": [DECISION, IMPLEMENTATION],
+            "timing": {"totalMs": 80, "queueMs": 10, "executeMs": 70},
         }
-
-    def map_reduce_search(self, question, *, maps, depth):
-        self.calls.append("recall_map_reduce")
-        self.map_batches.append([item["map_id"] for item in maps])
-        self.map_seed_batches.append([
-            item["seed_receipts"] for item in maps
-        ])
-        self.filters.extend(dict(item["filters"]) for item in maps)
-        rendered_maps = []
-        for index, item in enumerate(maps):
-            implementation = (
-                "implementation" in item["map_id"]
-                or "verification" in item["map_id"]
-                or index > 0
-            )
-            rendered_maps.append({
-                "map_id": item["map_id"],
-                "objective": item["objective"],
-                "query": item["query"],
-                "filters": item["filters"],
-                "status": "complete",
-                "findings": [{
-                    "receipt": IMPLEMENTATION if implementation else DECISION,
-                    "occurred_at": (
-                        "2026-07-23T15:00:00Z"
-                        if implementation
-                        else "2026-07-23T09:00:00Z"
-                    ),
-                    "text": (
-                        "The bridge passed its receipt-grounding check."
-                        if implementation
-                        else "The team selected the bounded agent bridge."
-                    ),
-                }],
-                "coverage": {"complete": True},
-                "uncertainty": [],
-            })
-        return {
-            "contract": "recall.agentic-map-reduce.v1",
-            "question": question,
-            "maps": rendered_maps,
-            "coverage": {
-                "maps": len(maps),
-                "complete_maps": len(maps),
-                "complete": True,
-                "unique_receipts": len({
-                    finding["receipt"]
-                    for item in rendered_maps
-                    for finding in item["findings"]
-                }),
-            },
-            "diagnostics": {
-                "engine": "synthetic-agentic-map-reduce",
-                "parallelism": len(maps),
-                "reducer": "agent",
-            },
-        }
-
-    def show(self, target):
-        self.calls.append("recall_show")
-        return {
-            "resolved_receipt": target,
-            "occurred_at": "2026-07-23T15:00:00Z",
-            "text": "Exact evidence opened.",
-        }
-
-    def session_context(self, target, *, before, after):
-        self.calls.append("recall_session_context")
-        return {"anchor_receipt": target, "events": []}
 
 
 class ScriptedTransport:
@@ -214,51 +146,42 @@ class ScriptedTransport:
         }
 
 
-class WaveRetrieval(SyntheticRetrieval):
-    def map_reduce_search(self, question, *, maps, depth):
-        result = super().map_reduce_search(
-            question,
-            maps=maps,
-            depth=depth,
-        )
-        if len(self.map_batches) == 1:
-            result["maps"] = result["maps"][:1]
-            result["maps"][0]["coverage"]["complete"] = False
-            result["maps"][0]["uncertainty"] = ["Implementation proof is missing."]
-            result["coverage"] = {
-                "maps": 2,
-                "complete_maps": 1,
-                "complete": False,
-                "unique_receipts": 1,
-            }
-        return result
-
 
 def success_script():
     filters = {
         "since": REQUEST["since"],
         "until": REQUEST["until"],
+        "source_family": None,
     }
     return [
         (
-            "recall_investigate",
+            "recall_hints",
             {
-                "question": REQUEST["question"],
+                "query": "Project Aurora bridge decision",
                 "filters": filters,
-                "depth": "deep",
+                "limit": 8,
             },
         ),
         (
-            "recall_deep_search",
+            "recall_hints",
             {
-                "question": REQUEST["question"],
+                "query": "Project Aurora grounding verification",
                 "filters": filters,
-                "depth": "deep",
+                "limit": 8,
             },
         ),
-        ("recall_show", {"target": IMPLEMENTATION}),
         (
-            "evidence_finish",
+            "exec",
+            {
+                "program": (
+                    "rg -n 'bounded agent bridge|grounding check' "
+                    "/mnt/archil/evidence"
+                ),
+                "timeout_seconds": 20,
+            },
+        ),
+        (
+            "finish",
             {
                 "status": "complete",
                 "answer": (
@@ -281,67 +204,6 @@ def success_script():
         ),
     ]
 
-
-def map_reduce_script():
-    filters = {
-        "since": REQUEST["since"],
-        "until": REQUEST["until"],
-    }
-    return [
-        (
-            "recall_investigate",
-            {
-                "question": REQUEST["question"],
-                "filters": filters,
-                "depth": "deep",
-            },
-        ),
-        (
-            "recall_map_reduce",
-            {
-                "question": REQUEST["question"],
-                "maps": [
-                    {
-                        "map_id": "decision",
-                        "objective": "Find the decision and its rationale.",
-                        "query": "Project Aurora bounded bridge decision",
-                        "filters": filters,
-                        "seed_receipts": [DECISION],
-                    },
-                    {
-                        "map_id": "verification",
-                        "objective": "Find implementation and verification.",
-                        "query": "Project Aurora bridge grounding check",
-                        "filters": filters,
-                        "seed_receipts": [IMPLEMENTATION],
-                    },
-                ],
-                "depth": "deep",
-            },
-        ),
-        (
-            "evidence_finish",
-            {
-                "status": "complete",
-                "answer": (
-                    "On July 23, Aurora selected the bounded agent bridge and "
-                    "then passed its receipt-grounding check."
-                ),
-                "claims": [
-                    {
-                        "statement": "The bounded bridge was selected on July 23.",
-                        "receipts": [DECISION],
-                    },
-                    {
-                        "statement": "Its grounding check passed later that day.",
-                        "receipts": [IMPLEMENTATION],
-                    },
-                ],
-                "citations": [DECISION, IMPLEMENTATION],
-                "gaps": [],
-            },
-        ),
-    ]
 
 
 def service(transport) -> RecallAgentService:
@@ -354,206 +216,8 @@ def service(transport) -> RecallAgentService:
     )
 
 
-class PiAtiGroundingTest(unittest.TestCase):
-    def test_investigation_model_result_is_compact_and_keeps_map_seeds(self):
-        receipts = [
-            f"recall://source:synthetic:company/item-{index}?rev=1#item=0"
-            for index in range(20)
-        ]
-        result = _model_tool_result(
-            "recall.investigate",
-            {
-                "investigations": [{
-                    "match": {
-                        "source_id": SOURCE,
-                        "native_id": "item-0",
-                        "native_parent_id": "session-0",
-                        "occurred_at": "2026-07-23T00:00:00Z",
-                        "receipt": receipts[0],
-                        "text": "x" * 10_000,
-                        "private_field": "not-for-model",
-                    },
-                    "context": {
-                        "events": [
-                            {"chunks": [{"receipt": receipt}]}
-                            for receipt in receipts
-                        ],
-                    },
-                }],
-                "coverage": {"sessions": 2},
-                "uncertainty": [],
-            },
-        )
-
-        hint = result["investigations"][0]
-        self.assertLessEqual(len(hint["match"]["text"]), 1_200)
-        self.assertEqual(len(hint["seed_receipts"]), 16)
-        self.assertNotIn("private_field", hint["match"])
-        self.assertNotIn("context", hint)
-        self.assertEqual(
-            result["recommended_next_tool"],
-            "recall_map_reduce",
-        )
-
-    def test_model_tool_errors_are_actionable_but_content_free(self):
-        budget = AgentExecutionError(
-            "private failure details",
-            code="agent_tool_budget_exhausted",
-        )
-        finish = AgentExecutionError(
-            "private failure details",
-            code="agent_finish_invalid",
-        )
-        self.assertIn("do not retry", _model_tool_error_message(budget))
-        self.assertIn("exactly", _model_tool_error_message(finish))
-        self.assertNotIn(
-            "private failure details",
-            _model_tool_error_message(budget),
-        )
-        allowed = (
-            "recall://source:synthetic:company/opened?rev=1#item=0"
-        )
-        budget.model_guidance = f"Cite only {allowed}"
-        self.assertEqual(
-            _model_tool_error_message(budget),
-            f"Cite only {allowed}",
-        )
-
-    def test_map_reduce_model_view_is_small_diverse_and_citable(self):
-        maps = []
-        for map_index in range(5):
-            findings = []
-            for finding_index in range(40):
-                receipt = (
-                    f"recall://{SOURCE}/map-{map_index}-"
-                    f"{finding_index}?rev=1#item=0"
-                )
-                findings.append({
-                    "receipt": receipt,
-                    "text": "🧠" * 4_000,
-                    "line": finding_index + 1,
-                    "object_key": f"objects/{map_index}/{finding_index}",
-                    "source_id": SOURCE,
-                    "native_id": f"event-{finding_index}",
-                    "native_parent_id": f"session-{map_index}",
-                    "occurred_at": "2026-07-23T15:00:00Z",
-                    "time_basis": "occurred_at",
-                })
-            maps.append({
-                "map_id": f"map_{map_index}",
-                "objective": f"Objective {map_index}",
-                "query": f"query {map_index}",
-                "filters": {},
-                "status": "complete",
-                "findings": findings,
-                "coverage": {"complete": True},
-                "uncertainty": [],
-            })
-
-        result = _model_tool_result(
-            "recall.map_reduce",
-            {
-                "contract": "recall.agentic-map-reduce.v1",
-                "question": "Synthesize the corpus.",
-                "maps": maps,
-                "coverage": {"maps": 5, "complete": True},
-                "diagnostics": {"reducer": "agent"},
-            },
-        )
-
-        self.assertLess(
-            len(json.dumps(result, ensure_ascii=False).encode()),
-            80_000,
-        )
-        self.assertEqual(len(result["maps"]), 5)
-        for map_index, mapped in enumerate(result["maps"]):
-            self.assertEqual(len(mapped["findings"]), 6)
-            self.assertEqual(
-                mapped["findings"][0]["receipt"],
-                maps[map_index]["findings"][0]["receipt"],
-            )
-            self.assertLessEqual(
-                len(mapped["findings"][0]["text"].encode()),
-                1_200,
-            )
-            self.assertIs(mapped["model_view_truncated"], True)
-        self.assertIn("already citable", result["next_step"])
-
-    def test_map_reduce_model_view_prefers_distinct_sessions(self):
-        findings = [
-            {
-                "receipt": (
-                    f"recall://{SOURCE}/dominant-{index}?rev=1#item=0"
-                ),
-                "text": f"dominant {index}",
-                "source_id": SOURCE,
-                "native_id": f"event-{index}",
-                "native_parent_id": "dominant-session",
-            }
-            for index in range(12)
-        ]
-        findings.extend([
-            {
-                "receipt": f"recall://{SOURCE}/other-{index}?rev=1#item=0",
-                "text": f"other {index}",
-                "source_id": SOURCE,
-                "native_id": f"other-{index}",
-                "native_parent_id": f"other-session-{index}",
-            }
-            for index in range(5)
-        ])
-
-        result = _model_tool_result(
-            "recall.map_reduce",
-            {
-                "maps": [{
-                    "map_id": "diverse",
-                    "findings": findings,
-                    "coverage": {"complete": True},
-                }],
-            },
-        )
-
-        parents = {
-            finding["native_parent_id"]
-            for finding in result["maps"][0]["findings"]
-        }
-        self.assertEqual(len(parents), 6)
-        self.assertIn("dominant-session", parents)
-        self.assertIn("other-session-4", parents)
-
-    def test_finish_retry_loop_has_a_hard_bound(self):
-        class FinishLoop:
-            def run(self, _start, invoke, **_kwargs):
-                for _ in range(5):
-                    try:
-                        invoke(
-                            "evidence_finish",
-                            {
-                                "status": "no_answer",
-                                "answer": "invalid",
-                                "claims": [],
-                                "citations": [],
-                                "gaps": ["missing evidence"],
-                            },
-                        )
-                    except AgentExecutionError as error:
-                        if error.code == "agent_finish_attempts_exhausted":
-                            raise
-                raise AssertionError("finish retry bound was bypassed")
-
-        with self.assertRaises(AgentExecutionError) as caught:
-            service(FinishLoop()).use_recall(
-                principal(),
-                REQUEST,
-                SyntheticRetrieval(),
-            )
-        self.assertEqual(
-            caught.exception.code,
-            "agent_finish_attempts_exhausted",
-        )
-
-    def test_agent_uses_hint_deep_inspection_exact_open_and_grounded_finish(self):
+class SimpleAgentKernelTest(unittest.TestCase):
+    def test_two_agent_chosen_queries_exec_and_grounded_finish(self):
         transport = ScriptedTransport(success_script())
         retrieval = SyntheticRetrieval()
         bundle = service(transport).use_recall(
@@ -563,419 +227,156 @@ class PiAtiGroundingTest(unittest.TestCase):
         )
         self.assertEqual(
             retrieval.calls,
-            ["recall_investigate", "recall_deep_search", "recall_show"],
+            ["recall_hints", "recall_hints", "recall_exec"],
         )
         self.assertEqual(bundle["result"]["status"], "complete")
         self.assertEqual(
             bundle["result"]["citations"],
             [DECISION, IMPLEMENTATION],
         )
-        self.assertIn("July 23", bundle["result"]["answer"])
-        stages = [event["stage"] for event in bundle["trace"]]
-        self.assertEqual(stages[:2], ["authorize", "plan"])
-        self.assertIn("retrieve", stages)
-        self.assertIn("inspect", stages)
-        self.assertEqual(stages[-3:], ["synthesize", "verify", "complete"])
-        self.assertEqual(bundle["trace"][-1]["elapsed_ms"], 250.0)
-        self.assertEqual(bundle["trace"][0]["elapsed_ms"], 0.0)
-        self.assertEqual(bundle["trace"][1]["elapsed_ms"], 0.0)
-        self.assertEqual(bundle["trace"][-2]["elapsed_ms"], 0.0)
-        rendered_trace = json.dumps(bundle["trace"])
-        self.assertNotIn(REQUEST["question"], rendered_trace)
-        self.assertNotIn(bundle["result"]["answer"], rendered_trace)
-        self.assertNotIn("Exact evidence opened", rendered_trace)
         self.assertEqual(
-            transport.start["data"]["model"],
-            {
-                "alias": "gemma-4-31b",
-                "thinking": "low",
-                "tool_choice": "required",
-            },
+            [tool["name"] for tool in transport.start["data"]["tools"]],
+            ["recall_hints", "exec", "finish"],
         )
         self.assertEqual(
-            {tool["name"] for tool in transport.start["data"]["tools"]},
-            {
-                "recall_investigate",
-                "recall_deep_search",
-                "recall_map_reduce",
-                "recall_session_context",
-                "recall_show",
-                "evidence_finish",
-            },
+            [event["stage"] for event in bundle["trace"]][2:5],
+            ["retrieve", "retrieve", "inspect"],
         )
-        finish = next(
-            tool
-            for tool in transport.start["data"]["tools"]
-            if tool["name"] == "evidence_finish"
-        )
-        self.assertIs(finish["terminate_turn"], True)
-        system = next(
-            section["content"]
-            for section in transport.start["data"]["prompt_sections"]
-            if section["id"] == "role"
-        )
-        self.assertIn(
-            "For an exact session UUID, investigate once using only the UUID",
-            system,
-        )
-        self.assertIn(
-            "then run recall_deep_search over the full session evidence",
-            system,
-        )
-
-    def test_every_model_tool_schema_is_strict_compatible(self):
-        transport = ScriptedTransport(success_script())
-        service(transport).use_recall(
-            principal(),
-            REQUEST,
-            SyntheticRetrieval(),
-        )
-
-        def assert_strict_schema(schema):
-            if not isinstance(schema, dict):
-                return
-            if schema.get("type") == "object":
-                properties = schema.get("properties", {})
-                self.assertIs(schema.get("additionalProperties"), False)
-                self.assertEqual(
-                    set(schema.get("required", [])),
-                    set(properties),
-                )
-                for child in properties.values():
-                    assert_strict_schema(child)
-            if schema.get("type") == "array":
-                assert_strict_schema(schema.get("items"))
-
+        system = transport.start["data"]["prompt_sections"][0]["content"]
+        self.assertIn("whatever shell", system)
+        self.assertNotIn("classify the question", system)
+        self.assertNotIn("map_reduce", system)
         for tool in transport.start["data"]["tools"]:
-            assert_strict_schema(tool["input_schema"])
+            stack = [tool["input_schema"]]
+            while stack:
+                schema = stack.pop()
+                if not isinstance(schema, dict):
+                    continue
+                if schema.get("type") == "object":
+                    self.assertIs(schema.get("additionalProperties"), False)
+                    self.assertEqual(
+                        set(schema["properties"]),
+                        set(schema["required"]),
+                    )
+                    stack.extend(schema["properties"].values())
+                if schema.get("type") == "array":
+                    stack.append(schema["items"])
+                stack.extend(schema.get("anyOf", []))
 
-    def test_agentic_map_reduce_decomposes_then_reduces_grounded_evidence(self):
-        transport = ScriptedTransport(map_reduce_script())
-        retrieval = SyntheticRetrieval()
-        bundle = service(transport).use_recall(
-            principal(),
-            REQUEST,
-            retrieval,
-        )
-        self.assertEqual(
-            retrieval.calls,
-            ["recall_investigate", "recall_map_reduce"],
-        )
-        self.assertEqual(
-            retrieval.filters,
-            [
-                {"since": REQUEST["since"], "until": REQUEST["until"]},
-                {"since": REQUEST["since"], "until": REQUEST["until"]},
-                {"since": REQUEST["since"], "until": REQUEST["until"]},
-            ],
-        )
-        self.assertEqual(bundle["result"]["status"], "complete")
-        self.assertEqual(
-            bundle["result"]["citations"],
-            [DECISION, IMPLEMENTATION],
-        )
-        map_event = next(
-            event
-            for event in bundle["trace"]
-            if event["tool"] == "recall.map_reduce"
-        )
-        self.assertEqual(map_event["stage"], "inspect")
-        self.assertEqual(map_event["receipt_count"], 2)
-
-    def test_map_reduce_cannot_widen_explicit_time_or_source_scope(self):
-        script = map_reduce_script()
-        call = next(
-            arguments
-            for name, arguments in script
-            if name == "recall_map_reduce"
-        )
-        call["maps"][0]["filters"]["since"] = "2026-01-01T00:00:00Z"
-        with self.assertRaises(AgentExecutionError) as caught:
-            service(ScriptedTransport(script)).use_recall(
-                principal(),
-                REQUEST,
-                SyntheticRetrieval(),
-            )
-        self.assertEqual(caught.exception.code, "agent_query_scope_violation")
-
-        scoped_request = {
-            **REQUEST,
-            "source_families": ["codex"],
-            "idempotency_key": "synthetic-pi-ati-source-scope",
+    def test_explicit_scope_is_a_host_ceiling(self):
+        script = success_script()
+        script[0][1]["filters"] = {
+            "since": "2020-01-01T00:00:00Z",
+            "until": "2030-01-01T00:00:00Z",
+            "source_family": None,
         }
-        source_script = map_reduce_script()
-        next(
-            arguments
-            for name, arguments in source_script
-            if name == "recall_map_reduce"
-        )["maps"][0]["filters"]["source_family"] = "slack"
-        with self.assertRaises(AgentExecutionError) as caught:
-            service(ScriptedTransport(source_script)).use_recall(
-                principal(),
-                scoped_request,
-                SyntheticRetrieval(),
-            )
-        self.assertEqual(caught.exception.code, "agent_query_scope_violation")
-
-    def test_map_reduce_seed_must_come_from_a_prior_hint_call(self):
-        script = [
-            item
-            for item in map_reduce_script()
-            if item[0] != "recall_investigate"
-        ]
-        with self.assertRaises(AgentExecutionError) as caught:
-            service(ScriptedTransport(script)).use_recall(
-                principal(),
-                REQUEST,
-                SyntheticRetrieval(),
-            )
-        self.assertEqual(caught.exception.code, "agent_map_seed_not_opened")
-
-    def test_incomplete_map_supports_one_targeted_second_wave(self):
-        script = map_reduce_script()
-        filters = {
-            "since": REQUEST["since"],
-            "until": REQUEST["until"],
-        }
-        script.insert(
-            2,
-            (
-                "recall_map_reduce",
-                {
-                    "question": REQUEST["question"],
-                    "maps": [{
-                        "map_id": "implementation_retry",
-                        "objective": "Close the missing implementation proof gap.",
-                        "query": "Project Aurora exact grounding verification",
-                        "filters": filters,
-                        "seed_receipts": [IMPLEMENTATION],
-                    }],
-                    "depth": "deep",
-                },
-            ),
-        )
-        retrieval = WaveRetrieval()
-        bundle = service(ScriptedTransport(script)).use_recall(
-            principal(),
-            REQUEST,
-            retrieval,
-        )
-        self.assertEqual(
-            retrieval.map_batches,
-            [["decision", "verification"], ["implementation_retry"]],
-        )
-        self.assertEqual(bundle["result"]["status"], "complete")
-        self.assertEqual(
-            [
-                event["tool"]
-                for event in bundle["trace"]
-                if event["tool"] == "recall.map_reduce"
-            ],
-            ["recall.map_reduce", "recall.map_reduce"],
-        )
-
-    def test_each_map_scans_the_full_bounded_hint_corpus(self):
         retrieval = SyntheticRetrieval()
-        service(ScriptedTransport(map_reduce_script())).use_recall(
-            principal(),
-            REQUEST,
-            retrieval,
-        )
-        expected = {DECISION, IMPLEMENTATION, HINT}
-        for seeds in retrieval.map_seed_batches[0]:
-            self.assertEqual(set(seeds), expected)
-            self.assertLessEqual(len(seeds), 32)
-
-    def test_investigation_cannot_drop_the_original_user_question(self):
-        script = map_reduce_script()
-        script[0][1]["question"] = "lossy model rewrite"
-        retrieval = SyntheticRetrieval()
-
         service(ScriptedTransport(script)).use_recall(
             principal(),
             REQUEST,
             retrieval,
         )
-
-        self.assertEqual(retrieval.questions, [REQUEST["question"]])
-
-    def test_semantic_runner_beats_scripted_generic_baseline(self):
-        pi = service(ScriptedTransport(success_script())).use_recall(
-            principal(), REQUEST, SyntheticRetrieval()
+        self.assertEqual(
+            retrieval.filters[0],
+            {"since": REQUEST["since"], "until": REQUEST["until"]},
         )
-        baseline = RecallAgentService(
-            ScriptedAgentRunner(),
-            clock=lambda: datetime(
-                2026, 7, 25, 10, 0, tzinfo=timezone.utc
-            ),
-            monotonic=lambda: 10.0,
-        ).use_recall(principal(), REQUEST, SyntheticRetrieval())
-        def rubric(bundle):
-            return sum([
-                bundle["result"]["status"] == "complete",
-                "bounded agent bridge" in bundle["result"]["answer"],
-                "July 23" in bundle["result"]["answer"],
-                len(bundle["result"]["claims"]) >= 2,
-            ])
-        self.assertEqual(rubric(pi), 4)
-        self.assertEqual(rubric(baseline), 0)
 
-    def test_hint_only_receipt_cannot_be_cited_as_proof(self):
+    def test_exec_requires_hints(self):
+        script = success_script()[2:]
+        with self.assertRaises(AgentExecutionError) as caught:
+            service(ScriptedTransport(script)).use_recall(
+                principal(),
+                REQUEST,
+                SyntheticRetrieval(),
+            )
+        self.assertEqual(caught.exception.code, "agent_exec_without_hints")
+
+    def test_hints_are_not_citable(self):
         script = success_script()
-        del script[1:3]
+        script.pop(2)
         script[-1] = (
-            "evidence_finish",
+            "finish",
             {
                 "status": "complete",
-                "answer": "The old hint proves the change.",
+                "answer": "A hint is not proof.",
                 "claims": [{"statement": "Hint claim", "receipts": [HINT]}],
                 "citations": [HINT],
                 "gaps": [],
             },
         )
-        with self.assertRaisesRegex(
-            AgentExecutionError, "did not open"
-        ) as caught:
+        with self.assertRaises(AgentExecutionError) as caught:
             service(ScriptedTransport(script)).use_recall(
-                principal(), REQUEST, SyntheticRetrieval()
+                principal(),
+                REQUEST,
+                SyntheticRetrieval(),
             )
         self.assertEqual(caught.exception.code, "agent_citation_not_opened")
 
-    def test_cross_brain_citation_fails_closed(self):
-        other = f"recall://{OTHER_SOURCE}/item?rev=1#item=0"
-        script = success_script()
-        script[-1] = (
-            "evidence_finish",
-            {
-                "status": "complete",
-                "answer": "Invented.",
-                "claims": [{"statement": "Invented", "receipts": [other]}],
-                "citations": [other],
-                "gaps": [],
-            },
-        )
+    def test_provider_failure_is_content_free(self):
         with self.assertRaises(AgentExecutionError) as caught:
-            service(ScriptedTransport(script)).use_recall(
-                principal(), REQUEST, SyntheticRetrieval()
-            )
-        self.assertEqual(caught.exception.code, "agent_citation_not_opened")
-
-    def test_missing_finish_and_post_finish_tool_call_fail_closed(self):
-        with self.assertRaises(AgentExecutionError) as missing:
-            service(ScriptedTransport(success_script()[:-1])).use_recall(
-                principal(), REQUEST, SyntheticRetrieval()
-            )
-        self.assertEqual(missing.exception.code, "agent_finish_missing")
-        script = success_script() + [
-            ("recall_show", {"target": IMPLEMENTATION}),
-        ]
-        with self.assertRaises(AgentExecutionError) as post:
-            service(ScriptedTransport(script)).use_recall(
-                principal(), REQUEST, SyntheticRetrieval()
-            )
-        self.assertEqual(post.exception.code, "agent_post_finish_tool_call")
-
-    def test_finish_status_and_claim_receipt_set_must_be_truthful(self):
-        cases = {
-            "complete_with_gap": lambda finish: finish["gaps"].append(
-                "Material evidence is missing."
-            ),
-            "unclaimed_citation": lambda finish: finish["claims"].pop(),
-        }
-        for label, mutate in cases.items():
-            with self.subTest(label=label):
-                script = success_script()
-                mutate(script[-1][1])
-                with self.assertRaises(AgentExecutionError) as caught:
-                    service(ScriptedTransport(script)).use_recall(
-                        principal(), REQUEST, SyntheticRetrieval()
-                    )
-                self.assertIn(
-                    caught.exception.code,
-                    {"agent_finish_invalid", "agent_claim_not_grounded"},
-                )
-
-    def test_archil_failure_cannot_turn_into_an_unsupported_answer(self):
-        script = success_script()
-        with self.assertRaises(AgentExecutionError) as caught:
-            service(ScriptedTransport(script)).use_recall(
-                principal(), REQUEST, SyntheticRetrieval(fail_deep=True)
+            service(ScriptedTransport(success_script())).use_recall(
+                principal(),
+                REQUEST,
+                SyntheticRetrieval(fail_deep=True),
             )
         self.assertEqual(caught.exception.code, "agent_evidence_tool_failed")
         self.assertNotIn("synthetic provider body", str(caught.exception))
 
-    def test_transport_failure_codes_are_preserved(self):
-        class Failure:
-            def run(self, *_args, **_kwargs):
-                raise AgentExecutionError(
-                    "provider unavailable",
-                    code="agent_model_failed",
+    def test_cross_source_exec_receipts_fail_closed_two_hundred_out_of_two_hundred(
+        self,
+    ):
+        class CrossSourceRetrieval(SyntheticRetrieval):
+            def __init__(self, index):
+                super().__init__()
+                self.index = index
+
+            def execute_agent_program(self, *args, **kwargs):
+                receipt = (
+                    "recall://source:foreign:"
+                    f"{self.index}/private?rev=1#item=0"
                 )
+                return {
+                    "stdout": receipt,
+                    "opened_receipts": [receipt],
+                    "complete": True,
+                }
 
-        with self.assertRaises(AgentExecutionError) as caught:
-            service(Failure()).use_recall(
-                principal(), REQUEST, SyntheticRetrieval()
-            )
-        self.assertEqual(caught.exception.code, "agent_model_failed")
-
-    def test_source_family_and_explicit_time_scope_are_host_enforced(self):
-        family_request = {
-            **REQUEST,
-            "source_families": ["coding"],
-        }
-        script = success_script()
-        for _name, arguments in script[:2]:
-            arguments["filters"]["source_family"] = "coding"
-        retrieval = SyntheticRetrieval()
-        service(ScriptedTransport(script)).use_recall(
-            principal(),
-            family_request,
-            retrieval,
-        )
-        self.assertEqual(
-            retrieval.filters,
-            [
-                {
-                    "since": REQUEST["since"],
-                    "until": REQUEST["until"],
-                    "source_family": "coding",
-                },
-                {
-                    "since": REQUEST["since"],
-                    "until": REQUEST["until"],
-                    "source_family": "coding",
-                },
-            ],
-        )
-        for label, mutate in (
-            (
-                "family",
-                lambda arguments: arguments["filters"].update({
-                    "source_family": "gmail"
-                }),
-            ),
-            (
-                "time",
-                lambda arguments: arguments["filters"].update({
-                    "since": "2020-01-01T00:00:00Z"
-                }),
-            ),
-        ):
-            with self.subTest(label=label):
-                escaped = success_script()
-                for _name, arguments in escaped[:2]:
-                    arguments["filters"]["source_family"] = "coding"
-                mutate(escaped[0][1])
+        for index in range(200):
+            with self.subTest(index=index):
                 with self.assertRaises(AgentExecutionError) as caught:
-                    service(ScriptedTransport(escaped)).use_recall(
+                    service(ScriptedTransport(success_script())).use_recall(
                         principal(),
-                        family_request,
-                        SyntheticRetrieval(),
+                        {
+                            **REQUEST,
+                            "request_id": f"req_{index:016x}",
+                            "idempotency_key": f"cross-source-{index}",
+                        },
+                        CrossSourceRetrieval(index),
                     )
                 self.assertEqual(
                     caught.exception.code,
-                    "agent_query_scope_violation",
+                    "agent_evidence_scope_violation",
                 )
+
+    def test_missing_finish_and_post_finish_calls_fail_closed(self):
+        with self.assertRaises(AgentExecutionError) as missing:
+            service(ScriptedTransport(success_script()[:-1])).use_recall(
+                principal(),
+                REQUEST,
+                SyntheticRetrieval(),
+            )
+        self.assertEqual(missing.exception.code, "agent_finish_missing")
+        with self.assertRaises(AgentExecutionError) as post:
+            service(
+                ScriptedTransport(
+                    success_script()
+                    + [(
+                        "exec",
+                        {"program": "true", "timeout_seconds": 1},
+                    )]
+                )
+            ).use_recall(principal(), REQUEST, SyntheticRetrieval())
+        self.assertEqual(post.exception.code, "agent_post_finish_tool_call")
 
 
 class PiAtiSubprocessBoundaryTest(unittest.TestCase):

@@ -21,6 +21,11 @@ REGION_ENDPOINTS = {
     "aws-eu-west-1": "https://control.green.eu-west-1.aws.prod.archil.com",
 }
 MAX_TRANSPORT_BYTES = 256 * 1024
+MAX_AGENT_PROGRAM_BYTES = 16_000
+MAX_AGENT_EXEC_OUTPUT_BYTES = 96_000
+RECEIPT_TOKEN_RE = re.compile(
+    r"recall://[A-Za-z0-9:._@+-]+/[^\s\"'<>()[\]{},;]{1,1900}"
+)
 
 
 class DeepInspectionError(RuntimeError):
@@ -175,6 +180,105 @@ class EvidenceTarget:
             raise DeepInspectionError("deep_inspector_target_invalid") from None
 
 
+@dataclass(frozen=True)
+class AgentExecObject:
+    """One immutable object admitted into an agent execution sandbox."""
+
+    object_key: str
+    content_sha256: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.object_key, str)
+            or not OBJECT_KEY_RE.fullmatch(self.object_key)
+            or not isinstance(self.content_sha256, str)
+            or not SHA256_RE.fullmatch(self.content_sha256)
+        ):
+            raise DeepInspectionError("deep_inspector_target_invalid")
+
+
+def _agent_exec_command(
+    *,
+    program: str,
+    objects: tuple[AgentExecObject, ...],
+    timeout_seconds: int,
+) -> str:
+    """Build a content-addressed, no-network view for an agent-authored program."""
+
+    payload = base64.b64encode(
+        json.dumps(
+            [
+                {
+                    "object_key": item.object_key,
+                    "content_sha256": item.content_sha256,
+                }
+                for item in objects
+            ],
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    ).decode()
+    encoded_program = base64.b64encode(program.encode()).decode()
+    stage_script = r"""
+import base64,hashlib,json,pathlib,shutil,sys
+items=json.loads(base64.b64decode(sys.argv[1]))
+source=pathlib.Path("/mnt/archil/evidence").resolve()
+target=pathlib.Path("/tmp/recall-authorized").resolve()
+target.mkdir(mode=0o700,parents=True,exist_ok=True)
+for item in items:
+    relative=pathlib.PurePosixPath(item["object_key"])
+    if relative.is_absolute() or ".." in relative.parts:
+        raise SystemExit(64)
+    src=(source/pathlib.Path(*relative.parts)).resolve()
+    if source not in src.parents or not src.is_file():
+        raise SystemExit(66)
+    dst=(target/pathlib.Path(*relative.parts)).resolve()
+    if target not in dst.parents:
+        raise SystemExit(64)
+    dst.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+    digest=hashlib.sha256()
+    with src.open("rb") as reader,dst.open("wb") as writer:
+        while True:
+            chunk=reader.read(1024*1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            writer.write(chunk)
+    if digest.hexdigest()!=item["content_sha256"]:
+        raise SystemExit(65)
+    dst.chmod(0o400)
+""".strip()
+    return "\n".join([
+        "set -eu",
+        "umask 077",
+        "rm -rf /tmp/recall-authorized /tmp/recall-agent",
+        "mkdir -p /tmp/recall-agent",
+        (
+            "python3 -c "
+            + shlex.quote(stage_script)
+            + " "
+            + shlex.quote(payload)
+        ),
+        (
+            "printf '%s' "
+            + shlex.quote(encoded_program)
+            + " | base64 -d > /tmp/recall-agent/program.sh"
+        ),
+        "chmod 0500 /tmp/recall-agent/program.sh",
+        (
+            f"timeout --signal=KILL {timeout_seconds}s "
+            "unshare --user --map-root-user --net --mount --pid --fork "
+            "--mount-proc sh -c "
+            + shlex.quote(
+                "mount --bind /tmp/recall-authorized /mnt/archil/evidence && "
+                "mount -o remount,bind,ro /mnt/archil/evidence && "
+                "exec env -i HOME=/tmp PATH=/usr/local/bin:/usr/bin:/bin "
+                "LC_ALL=C sh /tmp/recall-agent/program.sh"
+            )
+        ),
+    ])
+
+
 def _terms(question: str) -> tuple[str, ...]:
     if not isinstance(question, str) or not question.strip() or len(question) > 8192:
         raise DeepInspectionError("deep_inspector_question_invalid")
@@ -286,52 +390,10 @@ class LocalDeepInspector:
         }
 
 
-ARCHIL_INSPECT_SCRIPT = r"""
-import base64,json,pathlib,re,sys
-p=json.loads(base64.b64decode(sys.argv[1]))
-root=pathlib.Path("/mnt/archil/evidence").resolve()
-terms=[]
-for term in re.findall(r"[\w.-]{3,}",p["question"].casefold()):
-    if term not in terms:
-        terms.append(term)
-terms=terms[:32]
-allowed=set(p["allowed_receipts"])
-out=[]
-scanned=0
-for key in p["object_keys"]:
-    path=(root/key).resolve()
-    if root not in path.parents:
-        continue
-    try:
-        value=json.loads(path.read_text())
-    except Exception:
-        continue
-    scanned+=1
-    for chunk in value.get("chunks",[]):
-        receipt=chunk.get("receipt")
-        text=chunk.get("text")
-        if receipt not in allowed or not isinstance(text,str):
-            continue
-        lowered=text.casefold()
-        score=sum(lowered.count(term) for term in terms)
-        if terms and score==0:
-            continue
-        text=text.encode("utf-8")[:8192].decode("utf-8","ignore")
-        out.append({"receipt":receipt,"text":text,"line":int(chunk.get("ordinal",0))+1,"object_key":key,"_score":score})
-out.sort(key=lambda x:(x["_score"],x["receipt"]),reverse=True)
-findings=[]
-for item in out:
-    item.pop("_score",None)
-    candidate=findings+[item]
-    if len(candidate)>p["max_matches"] or len(json.dumps(candidate,ensure_ascii=False).encode())>p["max_output_bytes"]:
-        break
-    findings.append(item)
-print(json.dumps({"findings":findings,"complete":scanned==len(p["object_keys"]),"files_scanned":scanned},ensure_ascii=False,separators=(",",":")))
-""".strip()
 
 
 class ArchilDeepInspector:
-    """Archil serverless execution with a fixed script and read-only disk mount."""
+    """Archil serverless execution over immutable, tenant-selected objects."""
 
     def __init__(
         self,
@@ -355,47 +417,34 @@ class ArchilDeepInspector:
         self.region = region
         self.transport = transport or UrllibTransport()
 
-    def inspect(
+    def execute(
         self,
         *,
         tenant_id: str,
-        question: str,
-        targets: tuple[EvidenceTarget, ...],
-        budget: DeepInspectionBudget,
+        program: str,
+        objects: tuple[AgentExecObject, ...],
+        timeout_seconds: int,
     ) -> dict[str, Any]:
-        _terms(question)
-        if not targets:
-            return {
-                "provider": "archil",
-                "findings": [],
-                "complete": True,
-                "files_scanned": 0,
-                "stopped_reason": "completed",
-                "timing": None,
-            }
-        selected = targets[: budget.max_files]
-        if any(target.tenant_id != tenant_id for target in selected):
-            raise DeepInspectionError("deep_inspector_target_invalid")
-        object_keys = [target.object_key for target in selected]
-        allowed_receipts = sorted(
-            {receipt for target in selected for receipt in target.receipts}
-        )
-        payload = {
-            "question": question,
-            "object_keys": object_keys,
-            "allowed_receipts": allowed_receipts,
-            "max_matches": budget.max_matches,
-            "max_output_bytes": budget.max_output_bytes,
-        }
-        encoded = base64.b64encode(
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
-        ).decode()
-        command = (
-            "python3 -c "
-            + shlex.quote(ARCHIL_INSPECT_SCRIPT)
-            + " "
-            + shlex.quote(encoded)
-        )
+        """Run arbitrary agent-authored shell against only admitted objects."""
+
+        if (
+            not isinstance(tenant_id, str)
+            or not tenant_id
+            or not isinstance(program, str)
+            or not program.strip()
+            or len(program.encode()) > MAX_AGENT_PROGRAM_BYTES
+            or not isinstance(objects, tuple)
+            or not 1 <= len(objects) <= 512
+            or any(not isinstance(item, AgentExecObject) for item in objects)
+            or isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, int)
+            or not 1 <= timeout_seconds <= 30
+        ):
+            raise DeepInspectionError("deep_inspector_exec_invalid")
+        unique = tuple({
+            (item.object_key, item.content_sha256): item
+            for item in objects
+        }.values())
         response = self.transport.post(
             url=REGION_ENDPOINTS[self.region] + "/api/exec",
             headers={"Authorization": self.api_key},
@@ -406,30 +455,14 @@ class ArchilDeepInspector:
                         "readOnly": True,
                     }
                 },
-                "command": command,
+                "command": _agent_exec_command(
+                    program=program,
+                    objects=unique,
+                    timeout_seconds=timeout_seconds,
+                ),
             },
-            timeout=budget.timeout_seconds + 2,
+            timeout=timeout_seconds + 4,
         )
-        result = self._validate_response(
-            response,
-            selected=selected,
-            budget=budget,
-        )
-        result["provider"] = "archil"
-        result["stopped_reason"] = (
-            "completed"
-            if result["complete"] and len(targets) <= budget.max_files
-            else "partial"
-        )
-        return result
-
-    @staticmethod
-    def _validate_response(
-        response: dict[str, Any],
-        *,
-        selected: tuple[EvidenceTarget, ...],
-        budget: DeepInspectionBudget,
-    ) -> dict[str, Any]:
         if (
             not isinstance(response, dict)
             or response.get("success") is not True
@@ -438,61 +471,46 @@ class ArchilDeepInspector:
             raise DeepInspectionError("deep_inspector_unavailable")
         data = response["data"]
         stdout = data.get("stdout")
+        stderr = data.get("stderr", "")
+        exit_code = data.get("exitCode")
+        timing = data.get("timing")
         if (
-            data.get("exitCode") != 0
-            or not isinstance(stdout, str)
-            or len(stdout.encode()) > budget.max_output_bytes + 16_384
-            or not isinstance(data.get("timing"), dict)
+            not isinstance(stdout, str)
+            or not isinstance(stderr, str)
+            or isinstance(exit_code, bool)
+            or not isinstance(exit_code, int)
+            or not isinstance(timing, dict)
         ):
-            raise DeepInspectionError(
-                "deep_inspector_result_invalid_execution"
-            )
-        try:
-            value = json.loads(stdout)
-        except json.JSONDecodeError:
-            raise DeepInspectionError(
-                "deep_inspector_result_invalid_json"
-            ) from None
-        if (
-            not isinstance(value, dict)
-            or set(value) != {"findings", "complete", "files_scanned"}
-            or not isinstance(value["findings"], list)
-            or len(value["findings"]) > budget.max_matches
-            or not isinstance(value["complete"], bool)
-            or isinstance(value["files_scanned"], bool)
-            or not isinstance(value["files_scanned"], int)
-            or not 0 <= value["files_scanned"] <= len(selected)
-        ):
-            raise DeepInspectionError("deep_inspector_result_invalid_shape")
-        allowed_pairs = {
-            (target.object_key, receipt)
-            for target in selected
-            for receipt in target.receipts
-        }
-        for finding in value["findings"]:
-            if (
-                not isinstance(finding, dict)
-                or set(finding) != {"receipt", "text", "line", "object_key"}
-                or (
-                    finding.get("object_key"),
-                    finding.get("receipt"),
-                )
-                not in allowed_pairs
-                or not isinstance(finding.get("text"), str)
-                or len(finding["text"].encode()) > 8_192
-                or isinstance(finding.get("line"), bool)
-                or not isinstance(finding.get("line"), int)
-                or finding["line"] < 1
-            ):
-                raise DeepInspectionError(
-                    "deep_inspector_result_invalid_finding"
-                )
-        if len(json.dumps(value["findings"], ensure_ascii=False).encode()) > budget.max_output_bytes:
-            raise DeepInspectionError("deep_inspector_result_invalid_bytes")
+            raise DeepInspectionError("deep_inspector_result_invalid_execution")
+        stdout_bytes = stdout.encode()
+        stderr_bytes = stderr.encode()
+        truncated = (
+            len(stdout_bytes) > MAX_AGENT_EXEC_OUTPUT_BYTES
+            or len(stderr_bytes) > 8_000
+        )
+        bounded_stdout = stdout_bytes[:MAX_AGENT_EXEC_OUTPUT_BYTES].decode(
+            errors="ignore"
+        )
+        bounded_stderr = stderr_bytes[:8_000].decode(errors="ignore")
+        timed_out = exit_code in {124, 137}
         return {
-            **value,
+            "provider": "archil",
+            "stdout": bounded_stdout,
+            "stderr": bounded_stderr,
+            "exit_code": exit_code,
+            "complete": exit_code == 0 and not truncated,
+            "stopped_reason": (
+                "timeout"
+                if timed_out
+                else "output_limit"
+                if truncated
+                else "completed"
+                if exit_code == 0
+                else "nonzero_exit"
+            ),
+            "output_truncated": truncated,
             "timing": {
-                key: data["timing"].get(key)
+                key: timing.get(key)
                 for key in ("totalMs", "queueMs", "executeMs")
             },
         }

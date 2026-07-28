@@ -117,19 +117,20 @@ class AgentRunner(Protocol):
 
 
 class ConstrainedAgentTools:
-    """Closed host-owned wrappers over an already tenant-bound retrieval view."""
+    """Small host-owned tool boundary over one tenant-bound retrieval view.
+
+    The model gets semantic hints and a general read-only execution primitive.
+    Hints only authorize candidate documents; evidence becomes citable only
+    after the execution sandbox actually opens it.
+    """
 
     TOOL_NAMES = (
-        "recall.deep_search",
-        "recall.investigate",
-        "recall.map_reduce",
-        "recall.session_context",
-        "recall.show",
+        "recall.hints",
+        "recall.exec",
     )
     TOOL_CALL_LIMITS = {
-        "recall.deep_search": 1,
-        "recall.investigate": 2,
-        "recall.map_reduce": 2,
+        "recall.hints": 6,
+        "recall.exec": 6,
     }
 
     def __init__(self, retrieval: Any, context: DelegationContext):
@@ -139,6 +140,7 @@ class ConstrainedAgentTools:
         self._calls_by_tool: dict[str, int] = {}
         self._opened_receipts: list[str] = []
         self._citable_receipts: list[str] = []
+        self._hinted_documents: list[str] = []
         self._observations: list[dict[str, Any]] = []
         self._output_bytes = 0
 
@@ -184,67 +186,60 @@ class ConstrainedAgentTools:
                     code="agent_tool_budget_exhausted",
                 )
             self._calls_by_tool[name] = tool_calls + 1
-            if name == "recall.investigate":
-                if set(arguments) != {"question", "filters", "depth"}:
+            if name == "recall.hints":
+                if (
+                    not {"query", "filters", "limit"} == set(arguments)
+                    or not isinstance(arguments["query"], str)
+                    or not arguments["query"].strip()
+                    or len(arguments["query"]) > 8192
+                    or not isinstance(arguments["filters"], dict)
+                    or isinstance(arguments["limit"], bool)
+                    or not isinstance(arguments["limit"], int)
+                    or not 1 <= arguments["limit"] <= 20
+                ):
                     raise AgentExecutionError("agent tool arguments are invalid")
-                result = self._retrieval.investigate(
-                    arguments["question"],
+                result = self._retrieval.passage_hints(
+                    arguments["query"],
                     filters=arguments["filters"],
-                    depth=arguments["depth"],
+                    limit=arguments["limit"],
                 )
-            elif name == "recall.deep_search":
-                if set(arguments) != {"question", "filters", "depth"}:
-                    raise AgentExecutionError("agent tool arguments are invalid")
-                result = self._retrieval.deep_search(
-                    arguments["question"],
-                    filters=arguments["filters"],
-                    depth=arguments["depth"],
-                )
-            elif name == "recall.map_reduce":
-                if set(arguments) != {"question", "maps", "depth"}:
-                    raise AgentExecutionError("agent tool arguments are invalid")
-                seed_receipts = {
-                    receipt
-                    for item in arguments["maps"]
-                    for receipt in item["seed_receipts"]
-                }
-                if not seed_receipts <= set(self._opened_receipts):
-                    raise AgentExecutionError(
-                        "agent map seed was not returned by a prior hint call",
-                        code="agent_map_seed_not_opened",
+                results = result.get("results", [])
+                if not isinstance(results, list):
+                    raise AgentExecutionError("agent hint result is invalid")
+                for item in results:
+                    document_id = (
+                        item.get("logical_document_id")
+                        if isinstance(item, dict)
+                        else None
                     )
-                routed_receipts = tuple(self._opened_receipts)
-                maps = [
-                    {
-                        **item,
-                        "seed_receipts": list(dict.fromkeys((
-                            *item["seed_receipts"],
-                            *routed_receipts,
-                        )))[:32],
-                    }
-                    for item in arguments["maps"]
-                ]
-                result = self._retrieval.map_reduce_search(
-                    arguments["question"],
-                    maps=maps,
-                    depth=arguments["depth"],
-                )
-            elif name == "recall.session_context":
-                if set(arguments) != {"target", "before", "after"}:
+                    if (
+                        isinstance(document_id, str)
+                        and document_id not in self._hinted_documents
+                    ):
+                        self._hinted_documents.append(document_id)
+                if len(self._hinted_documents) > 80:
+                    self._hinted_documents = self._hinted_documents[:80]
+            elif name == "recall.exec":
+                if (
+                    set(arguments) != {"program", "timeout_seconds"}
+                    or not isinstance(arguments["program"], str)
+                    or not arguments["program"].strip()
+                    or len(arguments["program"]) > 16_000
+                    or isinstance(arguments["timeout_seconds"], bool)
+                    or not isinstance(arguments["timeout_seconds"], int)
+                    or not 1 <= arguments["timeout_seconds"] <= 30
+                ):
                     raise AgentExecutionError("agent tool arguments are invalid")
-                result = self._retrieval.session_context(
-                    arguments["target"],
-                    before=arguments["before"],
-                    after=arguments["after"],
+                if not self._hinted_documents:
+                    raise AgentExecutionError(
+                        "agent execution requires at least one prior hint",
+                        code="agent_exec_without_hints",
+                    )
+                result = self._retrieval.execute_agent_program(
+                    arguments["program"],
+                    logical_document_ids=tuple(self._hinted_documents),
+                    timeout_seconds=arguments["timeout_seconds"],
                 )
-                if result is None:
-                    raise AgentExecutionError("agent receipt was not found")
-            elif name == "recall.show":
-                if set(arguments) != {"target"}:
-                    raise AgentExecutionError("agent tool arguments are invalid")
-                result = self._retrieval.show(arguments["target"])
-                if result is None:
-                    raise AgentExecutionError("agent receipt was not found")
             else:
                 raise AgentExecutionError("agent tool is not authorized")
             encoded = json.dumps(
@@ -266,7 +261,11 @@ class ConstrainedAgentTools:
                     "agent cumulative tool output exceeds its bound",
                     code="agent_tool_output_budget_exhausted",
                 )
-            receipts = _receipts(result)
+            receipts = (
+                _receipts(result)
+                if name == "recall.exec"
+                else []
+            )
             granted = set(self._context.authorized_sources)
             if any(urlsplit(receipt).netloc not in granted for receipt in receipts):
                 raise AgentExecutionError(
@@ -289,10 +288,7 @@ class ConstrainedAgentTools:
             for receipt in receipts:
                 if receipt not in self._opened_receipts:
                     self._opened_receipts.append(receipt)
-                if (
-                    name != "recall.investigate"
-                    and receipt not in self._citable_receipts
-                ):
+                if receipt not in self._citable_receipts:
                     self._citable_receipts.append(receipt)
             self._output_bytes += len(encoded)
             coverage = result.get("coverage", {}) if isinstance(result, dict) else {}
@@ -363,6 +359,14 @@ def _receipts(value: Any) -> list[str]:
                 if key in {"receipt", "anchor_receipt", "resolved_receipt"}:
                     if isinstance(nested, str) and nested.startswith("recall://"):
                         found.append(nested)
+                elif key in {"receipts", "opened_receipts"}:
+                    if isinstance(nested, list):
+                        found.extend(
+                            item
+                            for item in nested
+                            if isinstance(item, str)
+                            and item.startswith("recall://")
+                        )
                 else:
                     visit(nested)
         elif isinstance(child, list):
@@ -374,7 +378,7 @@ def _receipts(value: Any) -> list[str]:
 
 
 class ScriptedAgentRunner:
-    """Deterministic transport/grounding proof; semantic synthesis arrives in L3."""
+    """Transport/grounding smoke test over the same small agent tool boundary."""
 
     def run(
         self,
@@ -400,34 +404,44 @@ class ScriptedAgentRunner:
             routed_filters = dict(filters)
             if family is not None:
                 routed_filters["source_family"] = family
-            packets.append(
-                tools.call(
-                    "recall.investigate",
-                    {
-                        "question": request["question"],
-                        "filters": routed_filters,
-                        "depth": request["depth"],
-                    },
-                )
-            )
-        receipts = list(dict.fromkeys(
-            receipt
+            packets.append(tools.call(
+                "recall.hints",
+                {
+                    "query": request["question"],
+                    "filters": routed_filters,
+                    "limit": 10,
+                },
+            ))
+        has_hints = any(
+            isinstance(packet.get("results"), list)
+            and packet["results"]
             for packet in packets
-            for receipt in _receipts(packet)
-        ))[: context.budget.max_receipts]
+        )
+        opened = (
+            tools.call(
+                "recall.exec",
+                {
+                    "program": (
+                        "find /mnt/archil/evidence -type f -print0 | "
+                        "xargs -0 rg -n --fixed-strings ''"
+                    ),
+                    "timeout_seconds": min(
+                        30,
+                        context.budget.deadline_seconds,
+                    ),
+                },
+            )
+            if has_hints
+            else {}
+        )
+        receipts = list(dict.fromkeys(_receipts(opened)))[
+            : context.budget.max_receipts
+        ]
         granted = set(context.authorized_sources)
         if any(urlsplit(receipt).netloc not in granted for receipt in receipts):
             raise AgentExecutionError("agent evidence escaped its source grant")
-        sessions = sum(
-            int(packet.get("coverage", {}).get("sessions", 0))
-            for packet in packets
-        )
-        sources = {
-            source
-            for packet in packets
-            for source in packet.get("coverage", {}).get("sources", [])
-            if isinstance(source, str)
-        }
+        sessions = 0
+        sources = {urlsplit(receipt).netloc for receipt in receipts}
         elapsed_ms = round(max(0.0, monotonic() - started) * 1000, 3)
         if receipts:
             status = "partial"
@@ -488,7 +502,7 @@ class ScriptedAgentRunner:
                 sequence=1,
                 now=now,
                 stage="retrieve",
-                tool="recall.investigate",
+                tool="recall.hints",
                 elapsed_ms=elapsed_ms,
                 receipts=receipts,
                 sources=len(sources),
