@@ -91,7 +91,8 @@ Claude Code does not know the real context window of models it does not recogniz
 200k, or 1M when the parent carries a `[1m]`/long-context marker — and for a proxied non-Anthropic
 model both guesses are wrong, so auto-compact fires far too late and the session dies with an
 upstream `400 Your input exceeds the context window` error. Parable fixes this at launch by
-setting `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the real ceiling:
+setting `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the real ceiling and
+`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=75` to leave room for tool results and the compaction request:
 
 - **Solo mode** uses the selected model's exact window.
 - **Multi-model mode** uses the minimum window across the brain and every enabled non-Claude
@@ -102,10 +103,13 @@ setting `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the real ceiling:
   372k, grok-4.5 500k, kimi-k3 1M via upstream `k3` normalization, Claude 5-class 1M). Override
   or extend per executor with `context_ktok`.
 - A `CLAUDE_CODE_MAX_CONTEXT_TOKENS` already present in your environment always wins; Parable
-  never overwrites it. An unknown solo model leaves the variable unset.
+  never overwrites it. The same rule applies to `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`. An unknown
+  solo model leaves both variables unset unless you explicitly provide a context ceiling.
 
-The launch line reports the applied ceiling (`context ceiling 372,000 tokens`) and the startup
-card shows each model's window (`· 372k ctx`).
+The launch line reports both controls (`context ceiling 372,000 tokens; auto-compact 75%`) and
+the startup card shows each model's real window (`· 372k ctx`). For Sol, 75% starts compaction
+near 279k instead of waiting until roughly 353k; this leaves about 74k of headroom below the
+Codex route's 353.4k effective input window.
 
 For a custom executor id such as `kimi`, `parable agents sync` creates the native Claude agent
 name `parable-kimi` with the exact configured model id. Only files carrying Parable's generated

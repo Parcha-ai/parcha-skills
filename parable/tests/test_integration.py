@@ -65,6 +65,7 @@ capture = {
         )
     },
     "max_context_tokens": os.environ.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS"),
+    "auto_compact_pct": os.environ.get("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"),
 }
 with open(os.environ["FAKE_CLAUDE_CAPTURE"], "w") as handle:
     json.dump(capture, handle)
@@ -501,7 +502,7 @@ exit 0
             self.assertEqual(first.stdout.count(handoff), 1)
             self.assertIn(launch, first.stdout)
 
-            installed = home / ".local" / "share" / "parable" / "0.1.20"
+            installed = home / ".local" / "share" / "parable" / "0.1.21"
             durable = home / ".local" / "bin" / "parable"
             self.assertTrue((installed / "bin" / "parable.js").is_file())
             self.assertTrue((installed / "lib" / "onboarding.js").is_file())
@@ -1459,6 +1460,9 @@ if args and args[0] == "build":
             root = Path(tmp)
             home = root / "home"
             home.mkdir()
+            with socket.socket() as listener:
+                listener.bind(("127.0.0.1", 0))
+                port = listener.getsockname()[1]
             data_home = root / "data"
             old_proxy = root / "old-proxy"
             old_proxy.write_text("#!/usr/bin/env sh\nexit 0\n")
@@ -1470,7 +1474,7 @@ if args and args[0] == "build":
                 [
                     NODE, str(REPO / "bin" / "parable.js"),
                     "setup", "--non-interactive", "--vendors", "claude",
-                    "--proxy-bin", str(old_proxy), "--no-auth",
+                    "--proxy-bin", str(old_proxy), "--port", str(port), "--no-auth",
                 ],
                 cwd=home,
                 env=env,
@@ -2275,6 +2279,7 @@ for flag, (vendor, record_type) in mapping.items():
             # models (gpt-5.6-* at 372k beat kimi-k3's 1M). Anthropic models
             # ignore the env var, so the brain is unaffected.
             self.assertEqual(captured["max_context_tokens"], "372000")
+            self.assertEqual(captured["auto_compact_pct"], "75")
             self.assertIn("TERRA", captured["welcome_message"])
             self.assertIn("React and frontend", captured["welcome_message"])
             self.assertNotIn(token, captured["welcome_message"])
@@ -2760,7 +2765,9 @@ finally:
             proc = self.run_claude(
                 case,
                 FAKE_CLAUDE_WAIT="1",
-                FAKE_PROXY_EXIT_AFTER_MS="300",
+                # Leave enough time for the fake Claude process to install its
+                # signal handler on a busy host before the proxy exits.
+                FAKE_PROXY_EXIT_AFTER_MS="1000",
                 FAKE_PROXY_EXIT="19",
             )
             self.assertEqual(proc.returncode, 19, proc.stdout + proc.stderr)

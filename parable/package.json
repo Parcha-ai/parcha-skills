@@ -1,6 +1,6 @@
 {
   "name": "@parcha/parable",
-  "version": "0.1.20",
+  "version": "0.1.21",
   "description": "Multi-model and solo coding orchestration for Claude Code, Codex, and pi.",
   "bin": {
     "parable": "bin/parable.js"

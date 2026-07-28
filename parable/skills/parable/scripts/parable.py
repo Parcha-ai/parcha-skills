@@ -95,6 +95,13 @@ MODEL_CONTEXT_WINDOWS = {
 # cast model's window is unknown so we never raise the assumed ceiling blindly.
 CLAUDE_DEFAULT_CONTEXT_WINDOW = 200_000
 CLAUDE_CONTEXT_ENV = "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
+CLAUDE_AUTO_COMPACT_PCT_ENV = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
+# Claude Code's default auto-compact point is about 95%. That leaves too little
+# room for a tool result between turns when a proxied model has a smaller input
+# ceiling than Claude expects. The pinned Sol registry window is 372k and live
+# sessions have been rejected as early as ~321k, so 75% triggers near 279k and
+# leaves roughly 74k before the Codex effective window (353.4k).
+CLAUDE_AUTO_COMPACT_PCT = 75
 PARABLE_WELCOME_ENV = "PARABLE_WELCOME_MESSAGE"
 PARABLE_WELCOME_PLUGIN = Path(__file__).resolve().parent.parent / "runtime" / "welcome-plugin"
 PARABLE_ASCII = (
@@ -558,12 +565,17 @@ def build_claude_launch(cfg: dict, forwarded: list[str], environ: dict[str, str]
     if solo:
         launch_env.pop("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", None)
     # Give Claude Code the real context ceiling for proxied non-Anthropic
-    # models so auto-compact fires before the upstream window, not after.
-    # A user's own CLAUDE_CODE_MAX_CONTEXT_TOKENS always wins.
+    # models, then trigger compaction with enough room for a tool result and
+    # the compacting request itself. Both user-provided values always win.
+    ceiling = claude_context_ceiling(cfg, claude["brain_model"], solo=solo)
     if not source_env.get(CLAUDE_CONTEXT_ENV):
-        ceiling = claude_context_ceiling(cfg, claude["brain_model"], solo=solo)
         if ceiling is not None:
             launch_env[CLAUDE_CONTEXT_ENV] = str(ceiling)
+    if (
+        (ceiling is not None or source_env.get(CLAUDE_CONTEXT_ENV))
+        and not source_env.get(CLAUDE_AUTO_COMPACT_PCT_ENV)
+    ):
+        launch_env[CLAUDE_AUTO_COMPACT_PCT_ENV] = str(CLAUDE_AUTO_COMPACT_PCT)
     isolation = ["--disallowedTools", "Agent"] if solo else []
     argv = [
         claude.get("binary", "claude"),
@@ -1024,7 +1036,10 @@ def cmd_claude(args: argparse.Namespace) -> int:
         print(f"parable: {exc}", file=sys.stderr)
         return 1
     ceiling = launch_env.get(CLAUDE_CONTEXT_ENV)
+    compact_pct = launch_env.get(CLAUDE_AUTO_COMPACT_PCT_ENV)
     context_note = f"; context ceiling {int(ceiling):,} tokens" if ceiling else ""
+    if compact_pct:
+        context_note += f"; auto-compact {compact_pct}%"
     if solo_selector is not None:
         print(f"proxy: ready ({len(available)} models); solo agent isolation enabled", flush=True)
         print(f"solo: {brain_model} ({decision}){context_note}", flush=True)

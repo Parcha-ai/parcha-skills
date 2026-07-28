@@ -125,9 +125,10 @@ Inside a solo session:
 Solo refusals are **hard fails** — a solo session does not silently degrade to multi-model or skip Agent invocations. If you need agents or multi-model casting, use normal Parable mode (`parable` or `parable --brain`).
 
 Every launch (solo and multi-model) also pins `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the real
-context window of the proxied non-Anthropic models in play, because Claude Code guesses 200k or
-1M for models it does not recognize and both guesses break auto-compact against the upstream
-limit. Details and the override knob (`context_ktok`): `references/config.md`.
+context window of the proxied non-Anthropic models in play and sets
+`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=75`. Claude Code otherwise guesses 200k or 1M for models it
+does not recognize, then waits until about 95% to compact; that leaves too little room for Sol
+tool results before the upstream limit. Details and override knobs: `references/config.md`.
 
 ### Solo requires `[claude]` configuration
 
