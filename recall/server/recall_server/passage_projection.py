@@ -384,6 +384,7 @@ def decode_logical_record(
     line: bytes,
     *,
     source_id: str,
+    verify_canonical: bool = True,
 ) -> LogicalEvidenceRecord:
     """Decode one canonical logical-document JSONL record without normalizing it."""
 
@@ -429,10 +430,13 @@ def decode_logical_record(
             segment_count=value["segment_count"],
             text=text,
         )
-        encoded = record.encode(source_id=source_id)
+        if verify_canonical:
+            encoded = record.encode(source_id=source_id)
+        else:
+            record.validate(source_id=source_id)
     except (KeyError, TypeError, ValueError) as error:
         raise LogicalEvidenceError("passage_logical_record_invalid") from error
-    if encoded != line:
+    if verify_canonical and encoded != line:
         raise LogicalEvidenceError("passage_logical_record_not_canonical")
     return record
 

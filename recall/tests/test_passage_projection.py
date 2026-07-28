@@ -4,6 +4,7 @@ import inspect
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 from recall_server import SCHEMA_VERSION
 from recall_server.logical_evidence import LogicalEvidenceRecord
@@ -294,6 +295,34 @@ class PassageProjectionTests(unittest.TestCase):
                 ),
             ),
         )
+
+    def test_trusted_archive_decode_validates_without_reserializing(self) -> None:
+        record = LogicalEvidenceRecord(
+            ordinal=0,
+            event_native_id="native:trusted",
+            event_kind="message",
+            occurred_at="2026-07-27T00:00:00Z",
+            roles=("user",),
+            receipts=("recall://source:test/trusted?rev=1#item=0",),
+            segment_ordinal=0,
+            segment_count=1,
+            text="trusted archive content",
+        )
+        encoded = record.encode(source_id="source:test")
+
+        with mock.patch.object(
+            LogicalEvidenceRecord,
+            "encode",
+            side_effect=AssertionError("unexpected reserialization"),
+        ) as serializer:
+            decoded = decode_logical_record(
+                encoded,
+                source_id="source:test",
+                verify_canonical=False,
+            )
+
+        self.assertEqual(decoded, record)
+        serializer.assert_not_called()
 
     def test_projector_reads_complete_logical_parts_and_excludes_tool_dense_text(
         self,

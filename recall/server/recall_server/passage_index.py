@@ -284,9 +284,13 @@ class CanonicalPassageProjector:
                         "passage_logical_part_invalid"
                     )
                 for line in BytesIO(payload):
+                    # read_part verifies the immutable object hash. Validate
+                    # each record contract without serializing trusted bytes
+                    # back into canonical JSON a second time.
                     yield decode_logical_record(
                         line,
                         source_id=candidate.source_id,
+                        verify_canonical=False,
                     )
 
         messages = visible_messages(records())
