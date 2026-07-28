@@ -8,6 +8,7 @@ from pathlib import Path
 
 from evals.agentic_rankings import (
     _retrieval_error,
+    parser,
     rank_private_questions,
     resolve_logical_boundaries,
     resolve_passage_boundaries,
@@ -33,6 +34,22 @@ def private_write(path: Path, rows: list[dict]) -> None:
 
 
 class AgenticRankingsTest(unittest.TestCase):
+    def test_accepts_an_explicit_passage_policy_for_live_rankings(self) -> None:
+        args = parser().parse_args([
+            "--input", "/private/questions.jsonl",
+            "--output", "/private/rankings.jsonl",
+            "--repo-root", str(REPO_ROOT),
+            "--run-id", "passage-arm",
+            "--tenant", "tenant:company:synthetic",
+            "--source", "codex:linux:synthetic",
+            "--retrieval-mode", "passage",
+            "--target-tokens", "512",
+            "--overlap-tokens", "64",
+        ])
+
+        self.assertEqual(args.target_tokens, 512)
+        self.assertEqual(args.overlap_tokens, 64)
+
     def test_classifies_partial_retrieval_as_a_backend_error(self) -> None:
         self.assertEqual(
             _retrieval_error(

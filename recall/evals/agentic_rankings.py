@@ -406,9 +406,12 @@ def _live_rankings(
     run_id: str,
     workers: int,
     retrieval_mode: str,
+    target_tokens: int,
+    overlap_tokens: int,
 ) -> dict[str, Any]:
     from recall_server.canonical_retrieval import BoundCanonicalRetrieval
     from recall_server.db import BrainStore
+    from recall_server.passage_projection import PassagePolicy
     from recall_server.semantic import SemanticRuntime
 
     if (
@@ -428,6 +431,10 @@ def _live_rankings(
         tenant_id=tenant_id,
         principal_id="private-eval",
         authorized_sources=source_ids,
+        passage_policy=PassagePolicy(
+            target_tokens=target_tokens,
+            overlap_tokens=overlap_tokens,
+        ),
     )
 
     if retrieval_mode not in {"event", "passage"}:
@@ -491,7 +498,15 @@ def _live_rankings(
             run_id=run_id,
             workers=workers,
         )
-        return {**report, "retrieval_mode": retrieval_mode}
+        return {
+            **report,
+            "retrieval_mode": retrieval_mode,
+            "passage_policy": {
+                "target_tokens": target_tokens,
+                "overlap_tokens": overlap_tokens,
+                "fingerprint": retrieval.passage_policy.fingerprint,
+            },
+        }
     finally:
         store.close()
 
@@ -511,6 +526,8 @@ def parser() -> argparse.ArgumentParser:
         choices=("event", "passage"),
         default="event",
     )
+    value.add_argument("--target-tokens", type=int, default=1024)
+    value.add_argument("--overlap-tokens", type=int, default=128)
     return value
 
 
@@ -530,6 +547,8 @@ def main() -> None:
             run_id=args.run_id,
             workers=args.workers,
             retrieval_mode=args.retrieval_mode,
+            target_tokens=args.target_tokens,
+            overlap_tokens=args.overlap_tokens,
         )
     except EvaluationInputError as error:
         raise SystemExit(f"agentic rankings rejected: {error}") from None
