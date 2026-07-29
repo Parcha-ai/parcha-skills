@@ -15,7 +15,6 @@ from urllib.parse import urlsplit
 
 from contracts.v2 import ContractError, validate_contract
 
-
 DEFAULT_MAXIMUM_BYTES = 64 * 1024 * 1024
 IDENTITY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._/@+-]{1,255}")
 MEDIA_TYPE_RE = re.compile(r"[a-z0-9][a-z0-9.+-]{0,63}/[a-z0-9][a-z0-9.+-]{0,127}")
@@ -251,6 +250,31 @@ class _ArchiveStore:
 
     def delete_raw(self, value: dict[str, Any]) -> bool:
         """Delete one contract reference without exposing archive namespace material."""
+        reference = self._from_contract(value)
+        try:
+            self.read(
+                reference,
+                tenant_id=value["tenant_id"],
+                source_id=value["source_id"],
+            )
+        except ArchiveNotFound:
+            return False
+        return self.delete(
+            reference,
+            tenant_id=value["tenant_id"],
+            source_id=value["source_id"],
+        )
+
+    def read_raw(self, value: dict[str, Any]) -> bytes:
+        """Resolve one closed reference without exposing namespace-key material."""
+        reference = self._from_contract(value)
+        return self.read(
+            reference,
+            tenant_id=value["tenant_id"],
+            source_id=value["source_id"],
+        )
+
+    def _from_contract(self, value: dict[str, Any]) -> ArtifactReference:
         try:
             reference = validate_contract(value, expected="recall.artifact-ref.v1")
         except ContractError:
@@ -273,19 +297,7 @@ class _ArchiveStore:
             encryption=reference["encryption"],
             version_id=reference["version_id"],
         )
-        try:
-            self.read(
-                internal,
-                tenant_id=reference["tenant_id"],
-                source_id=reference["source_id"],
-            )
-        except ArchiveNotFound:
-            return False
-        return self.delete(
-            internal,
-            tenant_id=reference["tenant_id"],
-            source_id=reference["source_id"],
-        )
+        return internal
 
 
 class _BytesReader:
@@ -494,7 +506,7 @@ class S3ArchiveStore(_ArchiveStore):
             raise ValueError("S3 endpoint must use credential-free HTTPS")
         if parsed.query or parsed.fragment:
             raise ValueError("S3 endpoint must use credential-free HTTPS")
-        if compatibility_profile not in {"aws", "r2"}:
+        if compatibility_profile not in {"aws", "aws-unversioned", "r2"}:
             raise ValueError("S3 compatibility profile is invalid")
         if compatibility_profile == "r2" and (
             not R2_HOST_RE.fullmatch(parsed.hostname)
@@ -518,15 +530,22 @@ class S3ArchiveStore(_ArchiveStore):
     def _version_id(self, content_sha256: str, response: dict[str, Any]) -> str:
         if self.compatibility_profile == "r2":
             return "r2-sha256-" + content_sha256
+        if self.compatibility_profile == "aws-unversioned":
+            return "s3-sha256-" + content_sha256
         version_id = response.get("VersionId")
         if not isinstance(version_id, str) or not version_id:
             raise ArchiveError("archive bucket versioning is required")
         return version_id
 
     def _version_kwargs(self, reference: ArtifactReference) -> dict[str, str]:
-        if self.compatibility_profile != "r2":
+        if self.compatibility_profile == "aws":
             return {"VersionId": reference.version_id}
-        expected = "r2-sha256-" + reference.content_sha256
+        prefix = (
+            "r2-sha256-"
+            if self.compatibility_profile == "r2"
+            else "s3-sha256-"
+        )
+        expected = prefix + reference.content_sha256
         if not hmac.compare_digest(reference.version_id, expected):
             raise ArchiveNotFound("archive object not found")
         return {}
@@ -594,12 +613,11 @@ class S3ArchiveStore(_ArchiveStore):
             "ContentType": request.media_type,
             "Metadata": _metadata(pending),
         }
-        if self.compatibility_profile == "r2":
-            # R2 encrypts every object at rest but rejects S3 SSE and VersionId
-            # headers. The opaque key is immutable and the conditional write
-            # prevents a concurrent overwrite.
+        if self.compatibility_profile != "aws":
+            # Versionless providers use opaque content-addressed keys plus a
+            # conditional write to preserve the immutable archive contract.
             kwargs["IfNoneMatch"] = "*"
-        else:
+        if self.compatibility_profile != "r2":
             kwargs["ServerSideEncryption"] = (
                 "aws:kms" if self.kms_key_id else "AES256"
             )
@@ -611,7 +629,7 @@ class S3ArchiveStore(_ArchiveStore):
         try:
             response = self.client.put_object(**kwargs)
         except Exception as error:
-            if self.compatibility_profile == "r2":
+            if self.compatibility_profile != "aws":
                 try:
                     existing = self.client.head_object(
                         Bucket=self.bucket, Key=pending.object_key,
@@ -627,7 +645,7 @@ class S3ArchiveStore(_ArchiveStore):
                 except Exception:
                     pass
             raise ArchiveError("archive provider request failed") from error
-        if self.compatibility_profile != "r2":
+        if self.compatibility_profile == "aws":
             return self._reference(
                 request,
                 content_sha256=content_sha256,

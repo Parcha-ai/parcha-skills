@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import socket
@@ -198,6 +199,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
             "receipt_redirects",
             "forget_tombstones",
             "canonical_audit_events",
+            "canonical_evidence_objects",
         ):
             self.assertIn(f"('{table}')", lowered)
         for provider in ("planetscale", "render", "supabase", "neon"):
@@ -310,6 +312,22 @@ class DeploymentPreviewContractTest(unittest.TestCase):
             load_manifest(self.write_manifest(value))["network"]["listen_port"], 10443
         )
 
+    def test_managed_embedding_manifest_accepts_the_runtime_batch_bound(self) -> None:
+        value = synthetic_manifest()
+        value["service"]["embedding"]["batch_size"] = 512
+        self.assertEqual(
+            load_manifest(self.write_manifest(value))["service"]["embedding"][
+                "batch_size"
+            ],
+            512,
+        )
+        value["service"]["embedding"]["batch_size"] = 513
+        with self.assertRaisesRegex(
+            DeploymentManifestError,
+            "invalid managed embedding batch size",
+        ):
+            load_manifest(self.write_manifest(value))
+
     def test_repository_profile_is_valid_and_safe_to_preview(self) -> None:
         profile = load_manifest(SERVER / "deploy" / "recall-core.plan.example.json")
         result = preview(profile)
@@ -339,7 +357,11 @@ class ContainerContractTest(unittest.TestCase):
         self.assertIn("file: recall/Dockerfile", workflow)
         self.assertIn("push: true", workflow)
         self.assertIn(
-            "ghcr.io/${{ github.repository_owner }}/recall-core:${{ github.sha }}",
+            'echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/recall-core"',
+            workflow,
+        )
+        self.assertIn(
+            "tags: ${{ steps.image.outputs.name }}:${{ github.sha }}",
             workflow,
         )
         self.assertNotIn("context: .", workflow)
@@ -364,12 +386,22 @@ class ContainerContractTest(unittest.TestCase):
         self,
     ) -> None:
         dockerfile = (RECALL / "Dockerfile").read_text()
-        first = dockerfile.splitlines()[0]
         self.assertRegex(
-            first,
-            r"^FROM python:3\.12-slim-bookworm@sha256:[0-9a-f]{64}$",
+            dockerfile,
+            r"FROM python:3\.12-slim-bookworm@sha256:[0-9a-f]{64}",
         )
-        self.assertIn("USER 10001:10001", dockerfile)
+        self.assertRegex(
+            dockerfile,
+            r"FROM node:22\.23\.1-bookworm-slim@sha256:[0-9a-f]{64} "
+            r"AS node-runtime",
+        )
+        self.assertIn(
+            "server/vendor/ati/grep_ati_brain_turn.mjs "
+            "/opt/ati/grep_ati_brain_turn.mjs",
+            dockerfile,
+        )
+        self.assertIn("USER 10001", dockerfile)
+        self.assertIn("usermod -a -G 1000 recall", dockerfile)
         self.assertIn(
             "COMPOSIO_CACHE_DIR=/tmp/recall-composio-cache",
             dockerfile,
@@ -386,6 +418,20 @@ class ContainerContractTest(unittest.TestCase):
         self.assertIn('"--capability-profile", "production"', dockerfile)
         self.assertNotIn("ENV RECALL_AUTH_REQUIRED", dockerfile)
         self.assertNotRegex(dockerfile, re.compile(r"COPY\s+\.\s+\.", re.IGNORECASE))
+
+    def test_vendored_ati_artifact_has_exact_public_provenance(self) -> None:
+        artifact = SERVER / "vendor" / "ati" / "grep_ati_brain_turn.mjs"
+        provenance = (SERVER / "vendor" / "ati" / "README.md").read_text()
+        digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        self.assertEqual(
+            digest,
+            "58b75f00c0abd120bd2cc2d2b6b291b239f060d3487c442b5c0648fbbd0d7041",
+        )
+        self.assertIn(digest, provenance)
+        self.assertIn(
+            "a0a86b7f9acd618e63773a9352e22dc209aa7f36",
+            provenance,
+        )
 
     def test_build_context_excludes_private_and_development_surfaces(self) -> None:
         ignored = (RECALL / ".dockerignore").read_text()

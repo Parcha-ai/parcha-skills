@@ -229,6 +229,12 @@ def _read_remote_object(response) -> dict:
     return rendered
 
 
+def _mcp_time_bound(value):
+    if isinstance(value, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return value + "T00:00:00Z"
+    return value
+
+
 def _mcp_call(base: str, method: str, path: str, body: dict | None) -> dict:
     if path == "/v1/session-export":
         raise RemoteRecallError("session export is not available over MCP")
@@ -282,6 +288,12 @@ def _mcp_call(base: str, method: str, path: str, body: dict | None) -> dict:
         arguments = {
             key: value for key, value in arguments.items() if value is not None
         }
+        filters = arguments.get("filters")
+        if isinstance(filters, dict):
+            arguments["filters"] = {
+                key: _mcp_time_bound(value) if key in {"since", "until"} else value
+                for key, value in filters.items()
+            }
         message = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -1175,7 +1187,11 @@ def search(args) -> int:
         return 2
     _, _, db = paths()
     if not db.exists():
-        if not args.paths: print("Recall index does not exist; run `recall index` first.", file=sys.stderr)
+        if not args.paths:
+            print("Recall index does not exist yet.", file=sys.stderr)
+            print("Answer now by scanning transcripts directly, e.g.:", file=sys.stderr)
+            print('  rg -l -i "<terms>" ~/.claude/projects ~/.codex/sessions', file=sys.stderr)
+            print("and start the index in the background: setsid nohup python3 scripts/recall.py index &", file=sys.stderr)
         return 0
     conn = connect_ro(db)
 
@@ -1766,6 +1782,11 @@ def related(args) -> int:
 
 
 def doctor(args) -> int:
+    mode = recall_mode()
+    if mode == "local":
+        print("OK mode=local — central Recall Brain available as an upgrade; see references/central-brain.md")
+    else:
+        print(f"OK mode={mode}")
     claude, codex, db = paths()
     conn = None
     try:

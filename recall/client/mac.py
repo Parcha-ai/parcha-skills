@@ -39,6 +39,7 @@ SOURCE_ID = re.compile(r"^[A-Za-z0-9_.:@-]{3,160}$")
 V2_IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._/@+-]{1,255}\Z")
 MAX_INGEST_BYTES = 8_000_000
 MAX_INGEST_EVENTS = 500
+MAX_CANONICAL_INGEST_EVENTS = 1_000
 MAX_CANONICAL_ARCHIVE_BYTES = 8_000_000
 MAX_CANONICAL_ARCHIVE_ATTEMPTS = 5
 MAX_EXPORT_BYTES = 256_000_000
@@ -528,8 +529,19 @@ class CanonicalArchiveClient(_CanonicalClient):
 class CanonicalBrainWriter(_CanonicalClient):
     """Connector BrainWriter that commits only privacy-safe canonical envelopes."""
 
+    def max_events_payload_bytes(self) -> int:
+        """Largest canonical event-array JSON that fits the base64 wire envelope."""
+        empty_body = canonical_json({
+            "tenant_id": self.tenant_id,
+            "principal_id": self.principal_id,
+            "source_id": self.source_id,
+            "events_base64": "",
+        })
+        available_base64_bytes = MAX_INGEST_BYTES - len(empty_body)
+        return 3 * (available_base64_bytes // 4)
+
     def ingest(self, events: list[dict[str, Any]]) -> dict[str, Any]:
-        if not events or len(events) > MAX_INGEST_EVENTS:
+        if not events or len(events) > MAX_CANONICAL_INGEST_EVENTS:
             raise ValueError("canonical ingest batch is invalid")
         for event in events:
             if (

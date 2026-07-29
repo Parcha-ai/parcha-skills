@@ -30,6 +30,20 @@ class AutoqaPackageTest(unittest.TestCase):
         self.assertEqual(phases, ["0", "1", "2", "3", "4"])
         self.assertEqual(text.count("Done when:"), 5)
 
+    def test_autoqa_config_is_baseline_and_diff_cases_are_additive(self):
+        text = SKILL.read_text()
+        self.assertIn("reusable **baseline**", text)
+        self.assertIn("**Diff inventory**", text)
+        self.assertIn("committed, staged, unstaged", text)
+        self.assertIn("**Diff cases are additive.**", text)
+
+    def test_scope_is_confirmed_with_structured_multiselect(self):
+        text = SKILL.read_text()
+        self.assertIn("use `AskUserQuestion`", text)
+        self.assertIn("`multiSelect: true`", text)
+        self.assertIn("Changed behavior + seams (Recommended)", text)
+        self.assertIn("Stateful/destructive cases", text)
+
 
 if __name__ == "__main__":
     unittest.main()

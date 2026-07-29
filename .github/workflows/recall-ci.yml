@@ -39,7 +39,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - run: python -m pip install -r server/requirements.txt bandit pip-audit ruff
+      - run: python -m pip install -r server/requirements.txt bandit pip-audit "ruff==0.15.18"
       - run: npm test
       - run: ruff check . --select E9,F,PLE
       - run: bandit -q -lll -r . -x tests,server/tests
@@ -50,6 +50,7 @@ jobs:
             e2e_brainstore.py \
             e2e_v2_canonical_plane.py \
             e2e_v2_lifecycle.py \
+            e2e_bulk_manifest.py \
             e2e_v2_isolation.py \
             e2e_v2_connector_writer.py \
             e2e_v2_multitenant_mcp.py \

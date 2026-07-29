@@ -295,6 +295,7 @@ def main():
             "embedded": 1,
             "has_more": True,
         }
+        assert embedding_calls[0].get("tenant_id") is None
         assert embedding_calls[0]["max_batches"] == 3
         assert SECRET not in json.dumps(first)
 

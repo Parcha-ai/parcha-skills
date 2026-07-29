@@ -99,6 +99,65 @@ class FakeStore:
         }
 
 
+class PolicyStore(FakeStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.audit: list[dict] = []
+
+    def authenticate_bearer(self, token: str, scope: str) -> dict | None:
+        self.calls.append(("authenticate", "redacted", scope))
+        identities = {
+            "synthetic-human-read": {
+                "principal_kind": "human",
+                "role": "admin",
+                "scopes": ["read"],
+                "audience": "recall-mcp",
+            },
+            "synthetic-workload-admin": {
+                "principal_kind": "workload",
+                "role": "admin",
+                "scopes": ["read", "forget"],
+                "audience": "recall-mcp",
+            },
+            "synthetic-wrong-audience": {
+                "principal_kind": "human",
+                "role": "member",
+                "scopes": ["read"],
+                "audience": "other-resource",
+            },
+        }
+        identity = identities.get(token)
+        if identity is None or scope not in identity["scopes"]:
+            return None
+        return {
+            "credential_kind": "mcp",
+            "name": "synthetic-policy-principal",
+            "tenant_id": "tenant:synthetic:company",
+            "principal_id": "principal:synthetic:member",
+            "source_id": None,
+            "capture_origin": None,
+            "webhook_privacy_mode": None,
+            **identity,
+        }
+
+    def authorized_canonical_source_ids(self, tenant_id, principal_id):
+        self.calls.append(("canonical_sources", tenant_id, principal_id))
+        return ["source:synthetic:company"]
+
+    def record_authorization_event(
+        self, principal, *, action, allowed, reason, policy_version
+    ):
+        self.audit.append({
+            "principal_kind": principal["principal_kind"],
+            "principal_id": principal["principal_id"],
+            "tenant_id": principal["tenant_id"],
+            "action": action,
+            "allowed": allowed,
+            "reason": reason,
+            "policy_version": policy_version,
+        })
+
+
 class FailingStore(FakeStore):
     def search(self, query, filters, limit, authorized_source):
         raise RuntimeError("private payload must not escape")
@@ -113,8 +172,9 @@ class OversizedShowStore(FakeStore):
 
 
 class McpHttpServer:
-    def __init__(self, store: FakeStore) -> None:
+    def __init__(self, store: FakeStore, verifier=None) -> None:
         Handler.store = store
+        Handler.external_identity_verifier = verifier
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
@@ -126,6 +186,7 @@ class McpHttpServer:
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
+        Handler.external_identity_verifier = None
 
     def request(
         self,
@@ -227,6 +288,123 @@ class RemoteMcpContractTest(unittest.TestCase):
                     "recall_forget",
                 ],
             )
+
+    def test_oauth_resource_challenge_and_default_deny_policy(self) -> None:
+        resource = "https://recall.synthetic.invalid/mcp"
+        with mock.patch.dict(
+            os.environ,
+            {
+                "RECALL_MCP_RESOURCE_URI": resource,
+                "RECALL_AUTHORIZATION_SERVERS":
+                    "https://identity.synthetic.invalid/oauth",
+                "RECALL_HTTP_PROFILE": "public-mcp",
+            },
+            clear=False,
+        ):
+            store = PolicyStore()
+            with McpHttpServer(store) as server:
+                for metadata_path in (
+                    "/.well-known/oauth-protected-resource",
+                    "/.well-known/oauth-protected-resource/mcp",
+                    (
+                        "/.well-known/oauth-protected-resource/mcp/brains/"
+                        "tenant:company:parcha"
+                    ),
+                ):
+                    with self.subTest(metadata_path=metadata_path):
+                        status, _, raw = server.request(
+                            "GET", path=metadata_path, token=None
+                        )
+                        self.assertEqual(status, 200)
+                        metadata = json.loads(raw)
+                        self.assertEqual(metadata["resource"], resource)
+                        self.assertEqual(metadata["scopes_supported"], ["read"])
+                        self.assertEqual(
+                            metadata["authorization_servers"],
+                            ["https://identity.synthetic.invalid/oauth"],
+                        )
+
+                status, _, _ = server.request(
+                    "GET",
+                    path=(
+                        "/.well-known/oauth-protected-resource/mcp/brains/"
+                        "invalid/extra"
+                    ),
+                    token=None,
+                )
+                self.assertEqual(status, 404)
+
+                status, headers, _ = server.request(
+                    "POST", request("ping"), token=None
+                )
+                self.assertEqual(status, 401)
+                self.assertEqual(
+                    headers["www-authenticate"],
+                    "Bearer resource_metadata=\""
+                    "https://recall.synthetic.invalid/"
+                    ".well-known/oauth-protected-resource/mcp\", scope=\"read\"",
+                )
+
+                status, _, raw = server.request(
+                    "POST",
+                    request("tools/list"),
+                    token="synthetic-human-read",
+                    protocol="2025-11-25",
+                )
+                self.assertEqual(status, 200)
+                names = {
+                    tool["name"] for tool in json.loads(raw)["result"]["tools"]
+                }
+                self.assertEqual(names, {
+                    "recall_search",
+                    "recall_deep_search",
+                    "recall_investigate",
+                    "recall_session_context",
+                    "recall_show",
+                    "recall_related",
+                })
+
+                status, _, raw = server.request(
+                    "POST",
+                    request("tools/call", params={
+                        "name": "recall_forget",
+                        "arguments": {"receipt": "recall://synthetic/hidden"},
+                    }),
+                    token="synthetic-human-read",
+                    protocol="2025-11-25",
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(raw)["error"]["message"], "unknown tool")
+
+                status, _, raw = server.request(
+                    "POST",
+                    request("tools/call", params={
+                        "name": "../../private-object",
+                        "arguments": {},
+                    }),
+                    token="synthetic-human-read",
+                    protocol="2025-11-25",
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(raw)["error"]["message"], "unknown tool")
+                self.assertEqual(store.audit[-1]["action"], "mcp.unknown_tool")
+
+                status, _, _ = server.request(
+                    "POST",
+                    request("ping"),
+                    token="synthetic-wrong-audience",
+                )
+                self.assertEqual(status, 401)
+
+            forget_audit = next(
+                item for item in store.audit
+                if item["action"] == "mcp.recall_forget"
+            )
+            self.assertFalse(forget_audit["allowed"])
+            self.assertEqual(forget_audit["reason"], "scope_denied")
+            rendered = json.dumps(store.audit)
+            self.assertNotIn("synthetic-human-read", rendered)
+            self.assertNotIn("synthetic-wrong-audience", rendered)
 
     def test_capture_and_forget_are_capability_gated_and_host_bound(self) -> None:
         body = "Synthetic bounded memory selected by the user"
@@ -374,6 +552,15 @@ class RemoteMcpContractTest(unittest.TestCase):
         self.assertEqual(
             tools["recall_search"]["properties"]["limit"]["maximum"],
             20,
+        )
+        self.assertEqual(
+            tools["recall_search"]["properties"]["filters"]["properties"]["since"],
+            {
+                "oneOf": [
+                    {"type": "string", "format": "date"},
+                    {"type": "string", "format": "date-time"},
+                ]
+            },
         )
         self.assertEqual(
             tools["recall_related"]["properties"]["limit"]["maximum"],

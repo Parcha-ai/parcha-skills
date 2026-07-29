@@ -18,6 +18,7 @@ from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
 
 from . import PROJECTOR_VERSION
+from .authorization import normalize_verified_email
 from .capture import (
     CAPTURE_ORIGIN_RE,
     build_capture_event,
@@ -422,6 +423,7 @@ class BrainStore:
         *,
         tenant_id: str,
         principal_id: str,
+        principal_kind: str = "workload",
         scopes: list[str] | None = None,
         expires_in_days: int = 30,
     ) -> dict[str, Any]:
@@ -433,6 +435,7 @@ class BrainStore:
             or not V2_AUTHORITY_RE.fullmatch(tenant_id)
             or not isinstance(principal_id, str)
             or not V2_AUTHORITY_RE.fullmatch(principal_id)
+            or principal_kind not in {"human", "workload"}
             or not isinstance(expires_in_days, int)
             or isinstance(expires_in_days, bool)
             or not 1 <= expires_in_days <= 365
@@ -448,9 +451,14 @@ class BrainStore:
         expires_at = datetime.now(timezone.utc) + timedelta(days=expires_in_days)
         with self.connect() as conn:
             access = conn.execute(
-                """SELECT 1 FROM brain_access_grants
-                   WHERE tenant_id=%s AND principal_id=%s
-                     AND permission IN ('owner','admin','read')""",
+                """SELECT 1
+                   FROM brain_access_grants access
+                   JOIN brain_spaces space USING(tenant_id)
+                   JOIN brain_memberships membership
+                     ON membership.organization_id=space.organization_id
+                    AND membership.principal_id=access.principal_id
+                   WHERE access.tenant_id=%s AND access.principal_id=%s
+                     AND access.permission IN ('owner','admin','read')""",
                 (tenant_id, principal_id),
             ).fetchone()
             if not access:
@@ -458,14 +466,15 @@ class BrainStore:
             conn.execute(
                 """INSERT INTO mcp_credentials(
                        id,name,token_sha256,tenant_id,principal_id,
-                       audience,scopes,expires_at
-                   ) VALUES (%s,%s,%s,%s,%s,'recall-mcp',%s,%s)""",
+                       principal_kind,audience,scopes,expires_at
+                   ) VALUES (%s,%s,%s,%s,%s,%s,'recall-mcp',%s,%s)""",
                 (
                     credential_id,
                     name,
                     digest,
                     tenant_id,
                     principal_id,
+                    principal_kind,
                     scopes,
                     expires_at,
                 ),
@@ -476,6 +485,7 @@ class BrainStore:
             "token": plaintext,
             "tenant_id": tenant_id,
             "principal_id": principal_id,
+            "principal_kind": principal_kind,
             "audience": "recall-mcp",
             "scopes": scopes,
             "expires_at": expires_at.isoformat(),
@@ -611,17 +621,284 @@ class BrainStore:
                     return None
                 return {**row, "credential_kind": "collector", "audience": None}
             mcp = conn.execute(
-                """SELECT id,name,tenant_id,NULL::text AS source_id,
-                          principal_id,NULL::text AS capture_origin,
-                          NULL::text AS webhook_privacy_mode,scopes,audience
-                   FROM mcp_credentials
-                   WHERE token_sha256=%s AND revoked_at IS NULL
-                     AND expires_at>now() AND audience='recall-mcp'""",
+                """SELECT credential.id,credential.name,credential.tenant_id,
+                          NULL::text AS source_id,
+                          credential.principal_id,NULL::text AS capture_origin,
+                          NULL::text AS webhook_privacy_mode,
+                          credential.scopes,credential.audience,
+                          credential.principal_kind,
+                          CASE
+                            WHEN membership.role='owner'
+                             AND access.permission='owner' THEN 'owner'
+                            WHEN membership.role IN ('owner','admin')
+                             AND access.permission IN ('owner','admin') THEN 'admin'
+                            ELSE 'member'
+                          END AS role
+                   FROM mcp_credentials credential
+                   JOIN brain_access_grants access
+                     ON access.tenant_id=credential.tenant_id
+                    AND access.principal_id=credential.principal_id
+                   JOIN brain_spaces space
+                     ON space.tenant_id=credential.tenant_id
+                   JOIN brain_memberships membership
+                     ON membership.organization_id=space.organization_id
+                    AND membership.principal_id=credential.principal_id
+                   WHERE credential.token_sha256=%s
+                     AND credential.revoked_at IS NULL
+                     AND credential.expires_at>now()
+                     AND credential.audience='recall-mcp'
+                     AND access.permission IN ('owner','admin','read')""",
                 (digest,),
             ).fetchone()
             if not mcp or required_scope not in mcp["scopes"]:
                 return None
             return {**mcp, "credential_kind": "mcp"}
+
+    def record_authorization_event(
+        self,
+        principal: dict[str, Any],
+        *,
+        action: str,
+        allowed: bool,
+        reason: str,
+        policy_version: str,
+    ) -> None:
+        values = (
+            principal.get("principal_kind"),
+            principal.get("principal_id"),
+            principal.get("tenant_id"),
+            action,
+            "allowed" if allowed else "denied",
+            reason,
+            policy_version,
+        )
+        if any(not isinstance(value, str) or not value for value in values):
+            raise ValueError("authorization audit identity invalid")
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO authorization_audit_events(
+                       principal_kind,principal_id,tenant_id,action,
+                       decision,reason,policy_version
+                   ) VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                values,
+            )
+
+    def resolve_external_identity(
+        self,
+        *,
+        issuer: str,
+        subject: str,
+        scopes: list[str],
+        audience: str,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        if (
+            not isinstance(issuer, str)
+            or not issuer.startswith("https://")
+            or not isinstance(subject, str)
+            or not subject
+            or not isinstance(audience, str)
+            or not audience.startswith("https://")
+            or not isinstance(scopes, list)
+            or not scopes
+            or "read" not in scopes
+            or any(not isinstance(scope, str) or not scope for scope in scopes)
+            or (
+                tenant_id is not None
+                and not V2_AUTHORITY_RE.fullmatch(tenant_id)
+            )
+        ):
+            return None
+        subject_sha256 = hashlib.sha256(subject.encode()).hexdigest()
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT binding.tenant_id,binding.principal_id,
+                          binding.principal_kind,
+                          CASE
+                            WHEN membership.role='owner'
+                             AND access.permission='owner' THEN 'owner'
+                            WHEN membership.role IN ('owner','admin')
+                             AND access.permission IN ('owner','admin') THEN 'admin'
+                            ELSE 'member'
+                          END AS role
+                   FROM external_identity_bindings binding
+                   JOIN brain_access_grants access
+                     ON access.tenant_id=binding.tenant_id
+                    AND access.principal_id=binding.principal_id
+                   JOIN brain_spaces space ON space.tenant_id=binding.tenant_id
+                   JOIN brain_memberships membership
+                     ON membership.organization_id=space.organization_id
+                    AND membership.principal_id=binding.principal_id
+                   WHERE binding.issuer=%s AND binding.subject_sha256=%s
+                     AND binding.revoked_at IS NULL
+                     AND (%s::text IS NULL OR binding.tenant_id=%s)
+                     AND access.permission IN ('owner','admin','read')""",
+                (issuer, subject_sha256, tenant_id, tenant_id),
+            ).fetchall()
+        if len(rows) != 1:
+            return None
+        row = rows[0]
+        return {
+            **row,
+            "credential_kind": "mcp",
+            "name": "external-identity",
+            "source_id": None,
+            "capture_origin": None,
+            "webhook_privacy_mode": None,
+            "audience": "recall-mcp",
+            "scopes": scopes,
+        }
+
+    def accept_external_invitation(
+        self,
+        *,
+        issuer: str,
+        subject: str,
+        email: str,
+        email_index: str,
+        scopes: list[str],
+        audience: str,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        normalized_email = normalize_verified_email(email)
+        if (
+            normalized_email is None
+            or not isinstance(email_index, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", email_index)
+            or not isinstance(issuer, str)
+            or not issuer.startswith("https://")
+            or not isinstance(subject, str)
+            or not subject
+            or not isinstance(audience, str)
+            or not audience.startswith("https://")
+            or not isinstance(scopes, list)
+            or "read" not in scopes
+            or any(not isinstance(scope, str) or not scope for scope in scopes)
+            or (
+                tenant_id is not None
+                and not V2_AUTHORITY_RE.fullmatch(tenant_id)
+            )
+        ):
+            return None
+        subject_sha256 = hashlib.sha256(subject.encode()).hexdigest()
+        email_sha256 = email_index
+        principal_id = "principal:human:" + hashlib.sha256(
+            f"{issuer}\0{subject}".encode()
+        ).hexdigest()[:32]
+        invitation_id: uuid.UUID | None = None
+        with self.connect() as conn:
+            with conn.transaction():
+                invitations = conn.execute(
+                    """SELECT invitation.id,invitation.tenant_id,
+                              invitation.role,space.organization_id
+                       FROM brain_invitations invitation
+                       JOIN brain_spaces space USING(tenant_id)
+                       WHERE invitation.email_sha256=%s
+                         AND invitation.accepted_at IS NULL
+                         AND invitation.revoked_at IS NULL
+                         AND invitation.expires_at>now()
+                         AND space.brain_kind='company'
+                         AND (%s::text IS NULL OR invitation.tenant_id=%s)
+                       ORDER BY invitation.created_at
+                       FOR UPDATE OF invitation""",
+                    (email_sha256, tenant_id, tenant_id),
+                ).fetchall()
+                if len(invitations) != 1:
+                    return None
+                invitation = invitations[0]
+                invitation_id = invitation["id"]
+                existing = conn.execute(
+                    """SELECT principal_id FROM external_identity_bindings
+                       WHERE issuer=%s AND subject_sha256=%s AND tenant_id=%s
+                       FOR UPDATE""",
+                    (issuer, subject_sha256, invitation["tenant_id"]),
+                ).fetchone()
+                if existing and existing["principal_id"] != principal_id:
+                    return None
+                permission = "admin" if invitation["role"] == "admin" else "read"
+                conn.execute(
+                    """INSERT INTO brain_principals(tenant_id,principal_id)
+                       VALUES (%s,%s) ON CONFLICT DO NOTHING""",
+                    (invitation["tenant_id"], principal_id),
+                )
+                conn.execute(
+                    """INSERT INTO brain_memberships(
+                           organization_id,principal_id,role
+                       ) VALUES (%s,%s,%s)
+                       ON CONFLICT(organization_id,principal_id)
+                       DO UPDATE SET role=excluded.role""",
+                    (invitation["organization_id"], principal_id, invitation["role"]),
+                )
+                conn.execute(
+                    """INSERT INTO brain_access_grants(
+                           tenant_id,principal_id,permission
+                       ) VALUES (%s,%s,%s)
+                       ON CONFLICT(tenant_id,principal_id)
+                       DO UPDATE SET permission=excluded.permission""",
+                    (invitation["tenant_id"], principal_id, permission),
+                )
+                conn.execute(
+                    """INSERT INTO canonical_source_grants(
+                           tenant_id,principal_id,source_id,permission
+                       ) SELECT source.tenant_id,%s,source.source_id,'read'
+                         FROM canonical_sources source
+                         JOIN brain_spaces space
+                           ON space.tenant_id=source.tenant_id
+                         JOIN brain_memberships source_membership
+                           ON source_membership.organization_id=space.organization_id
+                          AND source_membership.principal_id=source.owner_principal_id
+                        WHERE source.tenant_id=%s
+                          AND space.organization_id=%s
+                          AND space.brain_kind='company'
+                       ON CONFLICT(tenant_id,principal_id,source_id)
+                       DO UPDATE SET permission='read'""",
+                    (
+                        principal_id,
+                        invitation["tenant_id"],
+                        invitation["organization_id"],
+                    ),
+                )
+                conn.execute(
+                    """INSERT INTO external_identity_bindings(
+                           issuer,subject_sha256,tenant_id,principal_id,
+                           principal_kind,revoked_at
+                       ) VALUES (%s,%s,%s,%s,'human',NULL)
+                       ON CONFLICT(issuer,subject_sha256,tenant_id)
+                       DO UPDATE SET principal_id=excluded.principal_id,
+                                     principal_kind='human',revoked_at=NULL""",
+                    (
+                        issuer,
+                        subject_sha256,
+                        invitation["tenant_id"],
+                        principal_id,
+                    ),
+                )
+                accepted = conn.execute(
+                    """UPDATE brain_invitations
+                       SET accepted_principal_id=%s,accepted_at=now()
+                       WHERE id=%s AND accepted_at IS NULL AND revoked_at IS NULL
+                       RETURNING id""",
+                    (principal_id, invitation_id),
+                ).fetchone()
+                if not accepted:
+                    return None
+                conn.execute(
+                    """INSERT INTO control_audit_events(
+                           id,principal_id,operation,status,target_sha256
+                       ) VALUES (%s,%s,'brain.invitation.accept','success',%s)""",
+                    (
+                        uuid.uuid4(),
+                        principal_id,
+                        hashlib.sha256(str(invitation_id).encode()).hexdigest(),
+                    ),
+                )
+        return self.resolve_external_identity(
+            issuer=issuer,
+            subject=subject,
+            scopes=scopes,
+            audience=audience,
+            tenant_id=tenant_id,
+        )
 
     def authorized_source_ids(self, principal_id: str) -> list[str]:
         if not isinstance(principal_id, str) or not principal_id:
@@ -787,8 +1064,30 @@ class BrainStore:
                 metrics["embedded_items"] = 0
                 metrics["embedding_lag"] = conn.execute(
                     """SELECT count(*) AS n FROM items
-                       WHERE deleted_at IS NULL AND btrim(text_redacted) <> ''"""
+                    WHERE deleted_at IS NULL AND btrim(text_redacted) <> ''"""
                 ).fetchone()["n"]
+            agent = conn.execute(
+                """SELECT
+                       count(*) FILTER (
+                           WHERE status IN ('queued','running')
+                       ) AS active,
+                       count(*) FILTER (
+                           WHERE status IN ('complete','partial','no_answer')
+                       ) AS completed,
+                       count(*) FILTER (WHERE status='failed') AS failed,
+                       count(*) FILTER (WHERE status='cancelled') AS cancelled,
+                       count(*) FILTER (
+                           WHERE error_code='worker_lost_retryable'
+                       ) AS recovered
+                   FROM agent_runs"""
+            ).fetchone()
+            metrics.update({
+                "agent_runs_active": agent["active"],
+                "agent_runs_completed": agent["completed"],
+                "agent_runs_failed": agent["failed"],
+                "agent_runs_cancelled": agent["cancelled"],
+                "agent_runs_recovered": agent["recovered"],
+            })
             return metrics
 
     def embed_pending(

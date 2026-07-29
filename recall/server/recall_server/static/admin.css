@@ -126,7 +126,7 @@ h1 em { color: var(--blue); font-weight: 400; }
   letter-spacing: .08em;
 }
 
-.brain-strip, .switchboard, .live-routes {
+.brain-strip, .access-deck, .switchboard, .live-routes {
   padding: 74px clamp(22px, 5vw, 82px);
   border-bottom: 1px solid var(--ink);
 }
@@ -147,6 +147,39 @@ h1 em { color: var(--blue); font-weight: 400; }
 .brain-card h3 { margin: 44px 0 8px; font: 500 31px/1 "Iowan Old Style", serif; }
 .brain-card p { margin: 0; color: var(--muted); }
 .brain-kind { color: var(--blue); text-transform: uppercase; font: 800 9px monospace; letter-spacing: .16em; }
+
+.access-deck { background: var(--ink); color: var(--paper-bright); }
+.access-deck .section-heading > p { color: var(--acid); }
+.access-layout { display: grid; grid-template-columns: minmax(300px, .75fr) minmax(480px, 1.25fr); gap: 1px; background: #475047; border: 1px solid #697169; }
+.invite-card { background: #182019; padding: clamp(28px, 4vw, 54px); display: flex; flex-direction: column; }
+.card-index { color: var(--acid); font: 800 9px monospace; letter-spacing: .18em; }
+.invite-card h3 { margin: 42px 0 20px; font: 500 clamp(35px, 4.5vw, 64px)/.92 "Iowan Old Style", serif; letter-spacing: -.045em; }
+.invite-card h3 em { color: var(--acid); font-weight: 400; }
+.invite-card > p { color: #adb6ad; line-height: 1.55; max-width: 480px; margin: 0 0 35px; }
+.invite-card label { margin: 18px 0 8px; color: #adb6ad; font: 800 9px monospace; letter-spacing: .13em; text-transform: uppercase; }
+.invite-card input, .invite-card select { width: 100%; border: 0; border-bottom: 1px solid #697169; color: var(--paper-bright); background: transparent; padding: 12px 2px; font: 700 12px monospace; }
+.invite-card option { color: var(--ink); }
+.invite-card > button { margin-top: 34px; min-height: 58px; border: 0; padding: 0 20px; display: flex; align-items: center; justify-content: space-between; color: var(--ink); background: var(--acid); font: 800 10px monospace; letter-spacing: .1em; text-transform: uppercase; cursor: pointer; }
+.invite-card > button:hover { background: var(--orange); }
+.invite-card small { color: #889188; font: 10px/1.5 monospace; margin-top: 8px; }
+.endpoint-copy { display: grid; grid-template-columns: minmax(0, 1fr) auto; border-bottom: 1px solid #697169; }
+.endpoint-copy input { border: 0; min-width: 0; }
+.endpoint-copy button { border: 0; border-left: 1px solid #697169; background: transparent; color: var(--acid); padding: 0 14px; cursor: pointer; font: 800 9px monospace; text-transform: uppercase; }
+.endpoint-copy button:hover { color: var(--orange); }
+.access-ledger { background: #111712; align-self: stretch; }
+.ledger-head, .access-row { display: grid; grid-template-columns: minmax(180px, 1.4fr) .55fr .6fr auto; gap: 18px; align-items: center; }
+.ledger-head { min-height: 54px; padding: 0 25px; border-bottom: 1px solid #475047; color: #889188; font: 800 8px monospace; letter-spacing: .16em; text-transform: uppercase; }
+.access-row { min-height: 78px; padding: 0 25px; border-bottom: 1px solid #313a32; }
+.access-row strong { overflow: hidden; text-overflow: ellipsis; font-size: 14px; }
+.access-row > span { color: #adb6ad; font: 800 9px monospace; text-transform: uppercase; }
+.access-state { display: flex; align-items: center; gap: 8px; }
+.access-state i { width: 7px; height: 7px; border-radius: 50%; background: var(--orange); }
+.state-active .access-state i { background: var(--acid); box-shadow: 0 0 0 4px rgba(200,255,82,.1); }
+.state-revoked .access-state i, .state-expired .access-state i { background: #697169; }
+.access-row button { border: 1px solid #697169; color: var(--paper-bright); background: transparent; padding: 8px 10px; cursor: pointer; font: 800 8px monospace; text-transform: uppercase; }
+.access-row button:hover:not(:disabled) { border-color: var(--orange); color: var(--orange); }
+.access-row button:disabled { opacity: .25; cursor: default; }
+.access-empty { margin: 0; padding: 42px 25px; color: #889188; font: italic 17px/1.5 "Iowan Old Style", serif; }
 
 .switchboard { background: var(--paper-bright); }
 .switchboard-heading { grid-template-columns: 1fr auto; }
@@ -268,6 +301,9 @@ footer { min-height: 100px; display: flex; justify-content: space-between; align
   .integration-copy { border-right: 0; }
   .route-matrix { grid-column: 1 / -1; border-top: 1px solid; }
   .integration-grid { grid-template-columns: 1fr; }
+  .access-layout { grid-template-columns: 1fr; }
+  .ledger-head { display: none; }
+  .access-row { grid-template-columns: 1fr auto; padding: 18px; }
   .installation { grid-template-columns: 1fr 1fr; padding: 18px 0; }
 }
 

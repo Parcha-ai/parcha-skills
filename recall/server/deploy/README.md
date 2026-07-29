@@ -4,7 +4,8 @@
 
 `RenderPublicMcpAdapter` creates one digest-pinned Render `web_service` with managed HTTPS,
 `/readyz` health checks, bearer authentication, and `RECALL_HTTP_PROFILE=public-mcp`. By
-default the application exposes only `/mcp`, `/healthz`, and `/readyz`; no Tailscale gateway,
+default the application exposes only `/mcp`, its OAuth protected-resource metadata,
+`/healthz`, and `/readyz`; no Tailscale gateway,
 REST ingest route, metrics route, or doctor route is part of this profile. The separately
 gated `RECALL_ADMIN_WEB_ENABLED=1` setting adds only `/admin` assets, authenticated
 `/admin/api/v1` routes, and the one-time OAuth callback described below.
@@ -63,7 +64,7 @@ infrastructure. The example is synthetic; a live manifest belongs in a private m
 location and contains references, never credential values.
 
 The production database gate requires a standard PostgreSQL URL with
-`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 31,
+`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 38,
 pgvector 0.8.0 or newer, and a runtime role without superuser, database/role creation,
 replication, or RLS-bypass privilege:
 
@@ -167,6 +168,62 @@ archive with `python -m recall_server.cli archive-check`; the probe writes,
 replays, reads, deletes, and verifies absence using synthetic bytes, then emits
 only a content-free status.
 
+Operational raw-object and bulk-ingest manifests intentionally contain digests,
+counts, cursors, and status only. They prove replay and integrity without
+copying transcripts, secrets, or PII into logs and deployment evidence. Full
+deep-search content lives in a different projection: the canonical
+privacy-processed chunk text plus exact Recall receipts, stored in a separate
+private evidence bucket. Never mount the raw archive into an external compute
+provider.
+
+Deep inspection is hard-bound to exactly one brain tenant per service instance,
+evidence bucket credential, and Archil disk:
+
+```text
+RECALL_EVIDENCE_ENABLED=1
+RECALL_EVIDENCE_TENANT_ID=tenant:company:example
+RECALL_EVIDENCE_ARCHIVE_BACKEND=r2
+RECALL_EVIDENCE_ARCHIVE_BUCKET=recall-evidence-company-example
+RECALL_EVIDENCE_ARCHIVE_ENDPOINT_URL=https://ACCOUNT_ID.r2.cloudflarestorage.com
+RECALL_EVIDENCE_ARCHIVE_REGION=auto
+RECALL_EVIDENCE_ARCHIVE_ACCESS_KEY_ID=<injected secret>
+RECALL_EVIDENCE_ARCHIVE_SECRET_ACCESS_KEY=<injected secret>
+RECALL_EVIDENCE_ARCHIVE_NAMESPACE_KEY=<independent base64 32-byte secret>
+RECALL_DEEP_INSPECTOR=archil
+ARCHIL_API_KEY=<injected secret>
+RECALL_ARCHIL_DISK_ID=dsk_replace_me
+RECALL_ARCHIL_REGION=aws-us-west-2
+```
+
+Give the evidence R2 credential Object Read & Write access to that evidence
+bucket only, then attach only that bucket to the tenant's read-only Archil disk.
+Do not reuse a bucket or disk across personal and company brains. Validate and
+populate it before enabling the MCP tool:
+
+AWS S3 is also supported. Use `RECALL_EVIDENCE_ARCHIVE_BACKEND=s3` for a
+versioned bucket or `s3-unversioned` for a bucket without versioning, an exact
+regional endpoint such as `https://s3.us-west-2.amazonaws.com`, and the same
+bucket-scoped access-key variables. The unversioned profile preserves
+immutability with content-addressed keys and conditional writes. Archil
+serverless execution requires an Archil disk in a supported AWS region; that
+disk may mount the same S3 bucket.
+
+```bash
+python -m recall_server.cli evidence-archive-check
+python -m recall_server.cli backfill-canonical-evidence \
+  --tenant tenant:company:example --batch-size 100 --max-batches 10
+python -m recall_server.cli canonical-evidence-worker \
+  --tenant tenant:company:example
+```
+
+`recall_deep_search` first uses canonical retrieval to select authorized
+candidates, passes only opaque evidence keys and exact allowed receipts to a
+fixed server-owned inspection program, mounts the Archil disk read-only, and
+revalidates every returned receipt. The question is encoded as data and can
+never become a shell command or object path. Interactive executions are bounded
+by file, match, output-byte, and time limits. Use
+`RECALL_DEEP_INSPECTOR=local` for the same contract without third-party compute.
+
 Enable the canonical v2 write plane only after the archive probe and database
 migrations pass:
 
@@ -196,6 +253,7 @@ python -m recall_server.cli brain-provision \
   --tenant tenant:personal --slug personal --owner-principal principal:owner
 python -m recall_server.cli mcp-token-create owner-personal \
   --tenant tenant:personal --principal principal:owner \
+  --principal-kind workload \
   --scopes read,forget \
   --output /approved/private/owner-personal-mcp.json
 ```
@@ -208,6 +266,122 @@ projection. A single principal can hold separate personal and company
 credentials without gaining an implicit cross-brain view. Omit the optional
 `forget` scope for read-only agents; canonical forget also requires an owner
 grant on the exact source.
+
+The outcome-oriented answer façade is disabled by default. For a deterministic
+transport and grounding smoke test, set `RECALL_AGENT_RUNNER=scripted`. This
+exposes `use_recall` through MCP and
+`POST /v1/agent/brains/{tenant_id}/use-recall`. The scripted runner returns a
+deliberately partial receipt-backed summary; it does not call a model. Both
+transports share one domain operation, and the request cannot carry tenant,
+principal, role, source grants, credentials, budgets, or trace policy.
+
+Schema 38 adds durable agent runs. `POST /v1/agent/brains/{tenant}/runs` starts
+detached work; the corresponding run, result, and cancel routes remain bound to
+the authenticated tenant, principal, and current source grants. MCP exposes the
+same compatibility lifecycle as `recall_agent_start`, `recall_agent_status`,
+`recall_agent_result`, and `recall_agent_cancel`. Under MCP `2026-06-30`, Recall
+also advertises `io.modelcontextprotocol/tasks` and returns a native task only
+when the individual `tools/call` opts into that extension. Older or
+non-negotiating clients keep the synchronous `use_recall` result.
+
+For semantic synthesis, set `RECALL_AGENT_RUNNER=pi-ati` and run a pinned ATI
+Harness `brain-turn` artifact:
+
+```text
+RECALL_ATI_COMMAND_JSON=["node","/opt/ati/grep_ati_brain_turn.mjs"]
+RECALL_ATI_ARTIFACT_PATH=/opt/ati/grep_ati_brain_turn.mjs
+RECALL_ATI_ARTIFACT_SHA256=<lowercase-sha256>
+RECALL_AGENT_MODEL_ALIAS=gpt-oss-120b
+RECALL_AGENT_MODEL_ROUTE=direct-provider:cerebras
+RECALL_AGENT_MODEL_KEY_FILE=/etc/secrets/cerebras-api-key
+```
+
+The command is a JSON argument array and never passes through a shell. The
+Render secret file contains only the Cerebras API key. It must be a
+nonsymlinked regular file owned by the service user or root, with no write or
+execute permission for its group and no permissions for other users. Recall
+reloads it immediately before each child process. The child receives only that
+key, the fixed `https://api.cerebras.ai/v1` endpoint, explicit Cerebras route
+metadata, and a minimal process environment. The image includes the reviewed
+ATI artifact and Node runtime; the configured digest pins the artifact bytes.
+
+On a Greppy host, use the dedicated credential-owning local broker instead.
+Recall passes the literal `not-a-secret` placeholder to ATI; no model bearer
+credential enters Recall or the child:
+
+```text
+RECALL_AGENT_MODEL_ROUTE=private-broker
+RECALL_AGENT_MODEL_BASE_URL=http://<private-greppy-llm-proxy-host>:<port>
+RECALL_AGENT_MODEL_ALIAS=gemma-4-31b
+```
+
+This mode fails closed unless the exact approved URL is loopback, link-local,
+RFC1918, carrier-grade NAT, or the private Docker host gateway. Do not expose
+the broker publicly. A Render deployment outside that private network uses the
+explicit direct Cerebras route.
+
+Recall and Archil credentials remain in the host.
+
+The child can call only authorized read-only evidence tools. Semantic search is
+a hint; only receipts returned by deep inspection, exact show, or session
+context are citable. The model must finish through `evidence_finish`, and Recall
+rejects citations that were not opened in the same turn. Raw reasoning,
+questions, answers, tool arguments, source bodies, and credentials are excluded
+from durable traces.
+
+Lifecycle rows contain authority identifiers, a request hash, opaque handles,
+state, bounded redacted trace events, and terminal results. They never contain
+the original question, credentials, or source bodies. Expired worker leases become
+`worker_lost_retryable` terminal failures and are never silently rerun. Tune
+only within the validated bounds using `RECALL_AGENT_WORKERS`,
+`RECALL_AGENT_MAX_ACTIVE_PER_PRINCIPAL`, `RECALL_AGENT_LEASE_SECONDS`, and
+`RECALL_AGENT_RETENTION_SECONDS`.
+
+### Human OAuth and company-brain invitations
+
+Static MCP tokens remain the simplest machine-to-machine option. For people,
+configure one OAuth resource instead of issuing long-lived bearer tokens:
+
+```text
+RECALL_MCP_RESOURCE_URI=https://<public-host>/mcp
+RECALL_AUTHORIZATION_SERVERS=https://<authorization-server>
+RECALL_MCP_AUTH_PROVIDER=oidc
+RECALL_OIDC_ISSUER=https://<authorization-server>
+RECALL_OIDC_JWKS_URI=https://<authorization-server>/.well-known/jwks.json
+```
+
+Set the provider to `descope` for Descope and use the issuer and JWKS URLs shown
+for its MCP resource. Recall needs no Descope management key: the provider owns
+login, MFA, and account recovery; Recall owns invitations, tenant mapping,
+roles, source grants, and revocation. The access token must have the exact
+`RECALL_MCP_RESOURCE_URI` audience, a `read` scope, and a provider-verified email
+for first-time invitation acceptance.
+
+In `/admin`, create a company invitation. By default Recall displays the
+brain-specific MCP URL for manual sharing. To send an onboarding email with a
+brain-specific setup page, enable one server-side delivery provider:
+
+```text
+# Use the same isolated Descope project that authenticates Recall users.
+RECALL_INVITATION_EMAIL_PROVIDER=descope
+RECALL_DESCOPE_PROJECT_ID=P_replace_me
+RECALL_DESCOPE_MGMT_KEY=<server-side management key>
+
+# Or use a provider-neutral transactional email account.
+RECALL_INVITATION_EMAIL_PROVIDER=resend
+RECALL_INVITATION_EMAIL_FROM=Recall <recall@example.com>
+RECALL_INVITATION_EMAIL_API_KEY=<server-side API key>
+```
+
+Configuration is explicit and all-or-none. Recall never renders or logs either
+secret. A delivery failure leaves the email-bound authorization pending and is
+shown in the admin UI; re-inviting the same address safely replaces the pending
+invitation and retries delivery. The setup page contains current Codex and
+Claude Code install, MCP registration, and OAuth login commands. Their MCP
+client discovers OAuth through RFC 9728, logs them in, and activates the
+pending invitation on the first request. See
+[`docs/authorization-v1.md`](../../docs/authorization-v1.md) for the policy,
+generic OIDC contract, and revocation semantics.
 
 ## Unified connector administration
 
@@ -303,6 +477,30 @@ surface. Mount `/var/lib/recall` on persistent encrypted storage so ACK-gated
 spools survive image restarts. Every worker replica must receive the same
 database, R2, embedding, and control-encryption settings as the API service; it
 does not listen on a network port.
+
+Run canonical embeddings as a separate worker from that same immutable image:
+
+```bash
+python -m recall_server.cli canonical-embedding-worker \
+  --tenant tenant:company:example \
+  --batch-size 2000 --max-batches-per-cycle 10 --interval-seconds 5
+```
+
+Canonical ingest commits do not call an embedding provider. The worker drains
+unembedded current chunks in bounded, idempotent cycles, so provider latency or
+an outage cannot delay or fail source ingestion. Restarting the worker is safe:
+the durable canonical chunk table is the queue, the unique embedding key is the
+acknowledgement, and a runtime-scoped keyset watermark avoids rescanning the
+already-embedded prefix. The watermark wraps at the end so late-arriving chunks
+that sort before it are still repaired. Give this worker the same database and
+embedding settings as the API service, but no collector or MCP credentials.
+
+Managed providers can parallelize document batches with
+`RECALL_EMBEDDING_WORKERS=2` through `8`; the default is `1`, and the local TEI
+sidecar remains deliberately single-request. Results are reassembled in input
+order before their idempotent database write. Keep query embedding on the
+ordinary bounded path and raise worker concurrency only within the provider's
+document rate limits.
 
 `RECALL_DATABASE_URL` must be a PlanetScale application role URL with
 `sslmode=verify-full` and an explicit trust root. Prefer

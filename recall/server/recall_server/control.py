@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -20,6 +22,14 @@ import urllib.request
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from .authorization import normalize_verified_email
+from .invitation_email import (
+    InvitationEmail,
+    InvitationEmailError,
+    InvitationEmailSender,
+    invitation_urls,
+    sender_from_env,
+)
 from connectors.composio_workspace_rail import (
     ComposioWorkspaceRail,
     toolkit_for_connector,
@@ -72,6 +82,7 @@ COMPOSIO_PROBE_RETRY_DELAYS = (1.0, 2.0, 4.0, 8.0, 15.0, 15.0)
 COMPOSIO_TRANSIENT_PROBE_ERRORS = frozenset(
     {"authority_forbidden", "transport_unavailable", "upstream_error"}
 )
+LOG = logging.getLogger("recall.control")
 
 
 class ControlError(RuntimeError):
@@ -162,6 +173,15 @@ class SecretBox:
         nonce = os.urandom(12)
         ciphertext = AESGCM(self._key).encrypt(nonce, plaintext, purpose.encode())
         return b"\x01" + nonce + ciphertext
+
+    def blind_index(self, value: str, *, purpose: str) -> str:
+        if not isinstance(value, str) or not value or not isinstance(purpose, str):
+            raise ControlError("control_secret_invalid")
+        return hmac.new(
+            self._key,
+            f"{purpose}\0{value}".encode(),
+            hashlib.sha256,
+        ).hexdigest()
 
     def open(self, envelope: bytes, *, purpose: str) -> dict[str, Any]:
         if (
@@ -732,10 +752,14 @@ class ControlPlane:
         store: Any,
         secret_box: SecretBox,
         providers: dict[str, OAuthProvider],
+        invitation_email_sender: InvitationEmailSender | None = None,
+        mcp_resource_uri: str = "",
     ):
         self.store = store
         self.secret_box = secret_box
         self.providers = dict(providers)
+        self.invitation_email_sender = invitation_email_sender
+        self.mcp_resource_uri = mcp_resource_uri
 
     @classmethod
     def from_env(cls, store: Any) -> "ControlPlane":
@@ -757,7 +781,17 @@ class ControlPlane:
             providers["google"] = GoogleOAuthProvider.from_env()
         if all(composio_values):
             providers["composio"] = ComposioConnectionBroker.from_env()
-        return cls(store, SecretBox.from_env(), providers)
+        try:
+            invitation_email_sender = sender_from_env()
+        except InvitationEmailError:
+            raise ControlError("invitation_email_configuration_invalid", 500) from None
+        return cls(
+            store,
+            SecretBox.from_env(),
+            providers,
+            invitation_email_sender=invitation_email_sender,
+            mcp_resource_uri=os.environ.get("RECALL_MCP_RESOURCE_URI", ""),
+        )
 
     def create_admin_token(
         self,
@@ -902,6 +936,329 @@ class ControlPlane:
                 (principal_id,),
             ).fetchall()
 
+    def _brain_admin(
+        self,
+        connection: Any,
+        *,
+        principal_id: str,
+        tenant_id: str,
+    ) -> dict[str, Any]:
+        row = connection.execute(
+            """SELECT space.organization_id,space.brain_kind,space.slug,
+                      organization.display_name,
+                      membership.role,access.permission
+               FROM brain_spaces space
+               JOIN brain_organizations organization USING(organization_id)
+               JOIN brain_access_grants access
+                 ON access.tenant_id=space.tenant_id
+                AND access.principal_id=%s
+               JOIN brain_memberships membership
+                 ON membership.organization_id=space.organization_id
+                AND membership.principal_id=%s
+               WHERE space.tenant_id=%s""",
+            (principal_id, principal_id, tenant_id),
+        ).fetchone()
+        if (
+            row is None
+            or row["brain_kind"] != "company"
+            or row["role"] not in {"owner", "admin"}
+            or row["permission"] not in {"owner", "admin"}
+        ):
+            raise ControlError("brain_admin_forbidden", 403)
+        return row
+
+    def create_brain_invitation(
+        self,
+        *,
+        principal_id: str,
+        tenant_id: str,
+        email: str,
+        role: str,
+        expires_in_days: int = 7,
+    ) -> dict[str, Any]:
+        normalized_email = normalize_verified_email(email)
+        if (
+            not isinstance(principal_id, str)
+            or not AUTHORITY_RE.fullmatch(principal_id)
+            or not isinstance(tenant_id, str)
+            or not AUTHORITY_RE.fullmatch(tenant_id)
+            or normalized_email is None
+            or role not in {"admin", "member"}
+            or type(expires_in_days) is not int
+            or not 1 <= expires_in_days <= 30
+        ):
+            raise ControlError("brain_invitation_invalid")
+        invitation_id = uuid.uuid4()
+        expires_at = _now() + timedelta(days=expires_in_days)
+        email_sha256 = self.invitation_email_index(normalized_email)
+        encrypted_email = self.secret_box.seal(
+            {"email": normalized_email},
+            purpose=f"brain-invitation:{invitation_id}",
+        )
+        with self.store.connect() as connection:
+            with connection.transaction():
+                admin = self._brain_admin(
+                    connection,
+                    principal_id=principal_id,
+                    tenant_id=tenant_id,
+                )
+                if admin["role"] == "admin" and role != "member":
+                    raise ControlError("brain_role_forbidden", 403)
+                existing = connection.execute(
+                    """SELECT 1 FROM brain_invitations
+                       WHERE tenant_id=%s AND email_sha256=%s
+                         AND accepted_at IS NOT NULL AND revoked_at IS NULL""",
+                    (tenant_id, email_sha256),
+                ).fetchone()
+                if existing:
+                    raise ControlError("brain_member_exists", 409)
+                connection.execute(
+                    """UPDATE brain_invitations SET revoked_at=now()
+                       WHERE tenant_id=%s AND email_sha256=%s
+                         AND accepted_at IS NULL AND revoked_at IS NULL""",
+                    (tenant_id, email_sha256),
+                )
+                connection.execute(
+                    """INSERT INTO brain_invitations(
+                           id,tenant_id,email_sha256,encrypted_email,
+                           encryption_key_id,role,invited_by_principal_id,expires_at
+                       ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (
+                        invitation_id,
+                        tenant_id,
+                        email_sha256,
+                        encrypted_email,
+                        self.secret_box.key_id,
+                        role,
+                        principal_id,
+                        expires_at,
+                    ),
+                )
+                connection.execute(
+                    """INSERT INTO control_audit_events(
+                           id,principal_id,operation,status,target_sha256
+                       ) VALUES (%s,%s,'brain.invitation.create','success',%s)""",
+                    (uuid.uuid4(), principal_id, _digest(str(invitation_id))),
+                )
+        delivery = {"status": "disabled"}
+        if self.invitation_email_sender is not None:
+            try:
+                brain_url, onboarding_url = invitation_urls(
+                    self.mcp_resource_uri,
+                    tenant_id=tenant_id,
+                    invitation_id=str(invitation_id),
+                )
+                self.invitation_email_sender.send(
+                    InvitationEmail(
+                        invitation_id=str(invitation_id),
+                        recipient=normalized_email,
+                        organization_name=admin["display_name"],
+                        brain_slug=admin["slug"],
+                        role=role,
+                        expires_at=expires_at,
+                        brain_url=brain_url,
+                        onboarding_url=onboarding_url,
+                    )
+                )
+                delivery = {
+                    "status": "sent",
+                    "provider": self.invitation_email_sender.provider,
+                }
+            except InvitationEmailError:
+                LOG.error(
+                    "invitation email delivery failed provider=%s target=%s",
+                    self.invitation_email_sender.provider,
+                    _digest(str(invitation_id)),
+                )
+                delivery = {
+                    "status": "failed",
+                    "provider": self.invitation_email_sender.provider,
+                }
+        return {
+            "id": str(invitation_id),
+            "tenant_id": tenant_id,
+            "email": normalized_email,
+            "role": role,
+            "status": "pending",
+            "expires_at": expires_at.isoformat(),
+            "delivery": delivery,
+        }
+
+    def invitation_onboarding(self, invitation_id: str) -> InvitationEmail:
+        try:
+            parsed_id = uuid.UUID(invitation_id)
+        except (TypeError, ValueError, AttributeError):
+            raise ControlError("brain_invitation_not_found", 404) from None
+        with self.store.connect() as connection:
+            row = connection.execute(
+                """SELECT invitation.tenant_id,invitation.role,
+                          invitation.expires_at,invitation.accepted_at,
+                          invitation.revoked_at,space.slug,
+                          organization.display_name
+                   FROM brain_invitations invitation
+                   JOIN brain_spaces space USING(tenant_id)
+                   JOIN brain_organizations organization USING(organization_id)
+                   WHERE invitation.id=%s""",
+                (parsed_id,),
+            ).fetchone()
+        if (
+            row is None
+            or row["revoked_at"] is not None
+            or (row["accepted_at"] is None and row["expires_at"] <= _now())
+        ):
+            raise ControlError("brain_invitation_not_found", 404)
+        try:
+            brain_url, onboarding_url = invitation_urls(
+                self.mcp_resource_uri,
+                tenant_id=row["tenant_id"],
+                invitation_id=str(parsed_id),
+            )
+        except InvitationEmailError:
+            raise ControlError("invitation_email_configuration_invalid", 500) from None
+        return InvitationEmail(
+            invitation_id=str(parsed_id),
+            recipient="",
+            organization_name=row["display_name"],
+            brain_slug=row["slug"],
+            role=row["role"],
+            expires_at=row["expires_at"],
+            brain_url=brain_url,
+            onboarding_url=onboarding_url,
+        )
+
+    def invitation_email_index(self, email: str) -> str:
+        normalized_email = normalize_verified_email(email)
+        if normalized_email is None:
+            raise ControlError("brain_invitation_invalid")
+        return self.secret_box.blind_index(
+            normalized_email,
+            purpose="brain-invitation-email-v1",
+        )
+
+    def _brain_invitations(self, principal_id: str) -> list[dict[str, Any]]:
+        with self.store.connect() as connection:
+            rows = connection.execute(
+                """SELECT invitation.id,invitation.tenant_id,
+                          invitation.encrypted_email,invitation.encryption_key_id,
+                          invitation.role,invitation.expires_at,
+                          invitation.accepted_at,invitation.revoked_at
+                   FROM brain_invitations invitation
+                   JOIN brain_spaces space USING(tenant_id)
+                   JOIN brain_access_grants access
+                     ON access.tenant_id=invitation.tenant_id
+                    AND access.principal_id=%s
+                   JOIN brain_memberships membership
+                     ON membership.organization_id=space.organization_id
+                    AND membership.principal_id=%s
+                   WHERE access.permission IN ('owner','admin')
+                     AND membership.role IN ('owner','admin')
+                   ORDER BY invitation.created_at DESC""",
+                (principal_id, principal_id),
+            ).fetchall()
+        result = []
+        now = _now()
+        for row in rows:
+            if row["encryption_key_id"] != self.secret_box.key_id:
+                raise ControlError("brain_invitation_key_invalid", 500)
+            private = self.secret_box.open(
+                bytes(row["encrypted_email"]),
+                purpose=f"brain-invitation:{row['id']}",
+            )
+            email = normalize_verified_email(private.get("email"))
+            if email is None or set(private) != {"email"}:
+                raise ControlError("brain_invitation_email_invalid", 500)
+            if row["revoked_at"] is not None:
+                status = "revoked"
+            elif row["accepted_at"] is not None:
+                status = "active"
+            elif row["expires_at"] <= now:
+                status = "expired"
+            else:
+                status = "pending"
+            result.append({
+                "id": str(row["id"]),
+                "tenant_id": row["tenant_id"],
+                "email": email,
+                "role": row["role"],
+                "status": status,
+                "expires_at": row["expires_at"].isoformat(),
+            })
+        return result
+
+    def revoke_brain_invitation(
+        self,
+        *,
+        principal_id: str,
+        invitation_id: str,
+    ) -> dict[str, str]:
+        try:
+            parsed_id = uuid.UUID(invitation_id)
+        except (ValueError, TypeError):
+            raise ControlError("brain_invitation_invalid") from None
+        with self.store.connect() as connection:
+            with connection.transaction():
+                invitation = connection.execute(
+                    """SELECT invitation.tenant_id,invitation.role,
+                              invitation.accepted_principal_id,
+                              space.organization_id
+                       FROM brain_invitations invitation
+                       JOIN brain_spaces space USING(tenant_id)
+                       WHERE invitation.id=%s AND invitation.revoked_at IS NULL
+                       FOR UPDATE OF invitation""",
+                    (parsed_id,),
+                ).fetchone()
+                if invitation is None:
+                    raise ControlError("brain_invitation_not_found", 404)
+                admin = self._brain_admin(
+                    connection,
+                    principal_id=principal_id,
+                    tenant_id=invitation["tenant_id"],
+                )
+                if admin["role"] == "admin" and invitation["role"] != "member":
+                    raise ControlError("brain_role_forbidden", 403)
+                connection.execute(
+                    "UPDATE brain_invitations SET revoked_at=now() WHERE id=%s",
+                    (parsed_id,),
+                )
+                member = invitation["accepted_principal_id"]
+                if member is not None:
+                    connection.execute(
+                        """UPDATE external_identity_bindings SET revoked_at=now()
+                           WHERE tenant_id=%s AND principal_id=%s
+                             AND revoked_at IS NULL""",
+                        (invitation["tenant_id"], member),
+                    )
+                    connection.execute(
+                        """DELETE FROM canonical_source_grants
+                           WHERE tenant_id=%s AND principal_id=%s""",
+                        (invitation["tenant_id"], member),
+                    )
+                    connection.execute(
+                        """DELETE FROM brain_access_grants
+                           WHERE tenant_id=%s AND principal_id=%s""",
+                        (invitation["tenant_id"], member),
+                    )
+                    remaining = connection.execute(
+                        """SELECT 1 FROM brain_access_grants access
+                           JOIN brain_spaces space USING(tenant_id)
+                           WHERE space.organization_id=%s
+                             AND access.principal_id=%s LIMIT 1""",
+                        (invitation["organization_id"], member),
+                    ).fetchone()
+                    if not remaining:
+                        connection.execute(
+                            """DELETE FROM brain_memberships
+                               WHERE organization_id=%s AND principal_id=%s""",
+                            (invitation["organization_id"], member),
+                        )
+                connection.execute(
+                    """INSERT INTO control_audit_events(
+                           id,principal_id,operation,status,target_sha256
+                       ) VALUES (%s,%s,'brain.invitation.revoke','success',%s)""",
+                    (uuid.uuid4(), principal_id, _digest(str(parsed_id))),
+                )
+        return {"id": str(parsed_id), "status": "revoked"}
+
     def state(self, principal_id: str) -> dict[str, Any]:
         brains = self._brain_rows(principal_id)
         with self.store.connect() as connection:
@@ -953,6 +1310,7 @@ class ControlPlane:
             "mode": "connector-control-state",
             "principal": {"id": principal_id},
             "brains": brains,
+            "invitations": self._brain_invitations(principal_id),
             "providers": [
                 {"id": provider_id, "status": "available"}
                 for provider_id in sorted(self.providers)

@@ -71,6 +71,7 @@ class SemanticRuntime:
         planner_key_file: str | None = None,
         timeout_seconds: float = 15.0,
         embedding_batch_size: int = 1,
+        embedding_workers: int = 1,
         planner_samples: int = 2,
         cache_size: int = 256,
         cache_ttl_seconds: float = 900.0,
@@ -139,6 +140,13 @@ class SemanticRuntime:
                 "embedding batch size must be between 1 and "
                 f"{maximum_embedding_batch_size}"
             )
+        if (
+            type(embedding_workers) is not int
+            or not 1 <= embedding_workers <= 8
+        ):
+            raise ValueError("embedding workers must be between 1 and 8")
+        if embedding_protocol == "tei" and embedding_workers != 1:
+            raise ValueError("TEI embedding workers must be one")
         if not 1 <= planner_samples <= 3:
             raise ValueError("planner samples must be between 1 and 3")
         planner_values = (
@@ -184,6 +192,7 @@ class SemanticRuntime:
         self.planner_key_file = Path(planner_key_file) if planner_key_file else None
         self.timeout_seconds = timeout_seconds
         self.embedding_batch_size = embedding_batch_size
+        self.embedding_workers = embedding_workers
         self.planner_samples = planner_samples
         self.cache_size = max(0, cache_size)
         self.cache_ttl_seconds = max(0.0, cache_ttl_seconds)
@@ -203,6 +212,14 @@ class SemanticRuntime:
             thread_name_prefix="recall-query-embedding",
         )
         self._query_slots = threading.BoundedSemaphore(8)
+        self._document_executor = (
+            ThreadPoolExecutor(
+                max_workers=embedding_workers,
+                thread_name_prefix="recall-document-embedding",
+            )
+            if embedding_protocol != "tei" and embedding_workers > 1
+            else None
+        )
         self._plan_cache: OrderedDict[str, tuple[float, SearchPlan]] = OrderedDict()
         self._query_embedding_cache: OrderedDict[
             str, tuple[float, tuple[float, ...]]
@@ -261,6 +278,9 @@ class SemanticRuntime:
                     "RECALL_EMBEDDING_BATCH_SIZE",
                     "1" if embedding_protocol == "tei" else "64",
                 )
+            ),
+            embedding_workers=int(
+                os.environ.get("RECALL_EMBEDDING_WORKERS", "1")
             ),
             planner_samples=int(os.environ.get("RECALL_PLANNER_SAMPLES", "2")),
             cache_size=int(os.environ.get("RECALL_SEMANTIC_CACHE_SIZE", "256")),
@@ -426,9 +446,8 @@ class SemanticRuntime:
         lock = self._embedding_lock or nullcontext()
         with lock:
             self._ensure_embedding_identity()
-            result = []
-            for start in range(0, len(texts), self.embedding_batch_size):
-                batch = [
+            batches = [
+                [
                     self._document_text(
                         (
                             self.document_prefix
@@ -439,6 +458,10 @@ class SemanticRuntime:
                     )
                     for value in texts[start : start + self.embedding_batch_size]
                 ]
+                for start in range(0, len(texts), self.embedding_batch_size)
+            ]
+            result = []
+            for batch in batches:
                 if self.embedding_protocol == "tei":
                     values = self._post(
                         self.embedding_url + "/embed",
@@ -450,16 +473,32 @@ class SemanticRuntime:
                     )
                     result.extend(self._validate_vectors(values, len(batch)))
                     continue
-                headers = {}
-                if self.embedding_key_file or self.embedding_key_env:
-                    headers["Authorization"] = "Bearer " + self._read_embedding_key()
-                result.extend(
-                    self._embed_managed_batch(
-                        batch,
-                        input_type=input_type,
-                        headers=headers,
+            if self.embedding_protocol == "tei":
+                return result
+            headers = {}
+            if self.embedding_key_file or self.embedding_key_env:
+                headers["Authorization"] = "Bearer " + self._read_embedding_key()
+            if input_type != "document" or self._document_executor is None:
+                for batch in batches:
+                    result.extend(
+                        self._embed_managed_batch(
+                            batch,
+                            input_type=input_type,
+                            headers=headers,
+                        )
                     )
+                return result
+            futures = [
+                self._document_executor.submit(
+                    self._embed_managed_batch,
+                    batch,
+                    input_type=input_type,
+                    headers=headers,
                 )
+                for batch in batches
+            ]
+            for future in futures:
+                result.extend(future.result())
             return result
 
     def _embed_managed_batch(
@@ -501,7 +540,15 @@ class SemanticRuntime:
                     self._managed_embedding_endpoint, payload, headers
                 )
         except urllib.error.HTTPError as error:
-            splittable = error.code == 413 or 500 <= error.code <= 504
+            splittable = (
+                error.code == 413
+                or 500 <= error.code <= 504
+                or (
+                    self.embedding_protocol == "voyage"
+                    and input_type == "document"
+                    and error.code == 400
+                )
+            )
             if not splittable or len(batch) == 1:
                 raise
             error.close()

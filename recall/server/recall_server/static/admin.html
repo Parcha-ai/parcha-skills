@@ -39,6 +39,39 @@
       <div id="brain-list" class="brain-list" aria-live="polite"></div>
     </section>
 
+    <section class="access-deck" aria-labelledby="access-title">
+      <div class="section-heading">
+        <p>PEOPLE</p>
+        <h2 id="access-title">Company access</h2>
+      </div>
+      <div class="access-layout">
+        <form id="invite-form" class="invite-card">
+          <span class="card-index">INVITE / VERIFIED IDENTITY</span>
+          <h3>Open a door.<br><em>Not the whole house.</em></h3>
+          <p>The invite activates only when this exact verified email authenticates through your OAuth provider.</p>
+          <label for="invite-brain">Company brain</label>
+          <select id="invite-brain" required></select>
+          <label for="invite-email">Teammate email</label>
+          <input id="invite-email" type="email" autocomplete="email" placeholder="teammate@company.com" required>
+          <label for="invite-role">Role</label>
+          <select id="invite-role" required>
+            <option value="member">Member · search</option>
+          </select>
+          <label for="invite-endpoint">MCP endpoint to share</label>
+          <div class="endpoint-copy">
+            <input id="invite-endpoint" type="text" readonly aria-describedby="invite-endpoint-note">
+            <button id="copy-invite-endpoint" type="button">Copy</button>
+          </div>
+          <small id="invite-endpoint-note">Their MCP client opens OAuth. Recall activates only the matching verified email.</small>
+          <button type="submit"><span>Create invitation</span><span aria-hidden="true">→</span></button>
+        </form>
+        <div class="access-ledger">
+          <div class="ledger-head"><span>Identity</span><span>Role</span><span>State</span><span></span></div>
+          <div id="invitation-list" aria-live="polite"></div>
+        </div>
+      </div>
+    </section>
+
     <section class="switchboard" aria-labelledby="switchboard-title">
       <div class="section-heading switchboard-heading">
         <div><p>INPUTS</p><h2 id="switchboard-title">Switchboard</h2></div>

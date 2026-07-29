@@ -225,7 +225,10 @@ def main() -> None:
             raise RuntimeError("exact attachment bytes were not preserved in R2")
         retrieval = CanonicalRetrieval(store, archive).bind({
             "credential_kind": "mcp",
+            "principal_kind": "workload",
+            "role": "owner",
             "audience": "recall-mcp",
+            "scopes": ["read"],
             "tenant_id": tenant_id,
             "principal_id": principal_id,
             "authorized_sources": [source_id],

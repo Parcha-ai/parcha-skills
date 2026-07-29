@@ -2,23 +2,30 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import time
 import urllib.error
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
+from .authorization import decide
 from .canonical import CanonicalPlane
 from .db import BrainStore, SearchDeadlineExceeded, bounded_search_text
+from .deep_inspection import (
+    DeepInspectionBudget,
+    EvidenceTarget,
+)
 from .federation import SOURCE_FAMILIES
 from .projectors import legacy_engine
-
 
 AUTHORITY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._/@+-]{1,255}\Z")
 ALLOWED_FILTERS = frozenset(
     {"since", "until", "source_id", "source_family", "source_alias"}
 )
+MAX_CANONICAL_EMBEDDING_BATCH = 5000
+LOG = logging.getLogger(__name__)
 
 
 def _timestamp(value: Any) -> str:
@@ -30,9 +37,18 @@ def _timestamp(value: Any) -> str:
 class CanonicalRetrieval:
     """Tenant-keyed hybrid retrieval over only the canonical v2 projection."""
 
-    def __init__(self, store: BrainStore, archive: Any = None):
+    def __init__(
+        self,
+        store: BrainStore,
+        archive: Any = None,
+        *,
+        evidence_projector: Any = None,
+        deep_inspector: Any = None,
+    ):
         self.store = store
         self.archive = archive
+        self.evidence_projector = evidence_projector
+        self.deep_inspector = deep_inspector
 
     def bind(self, principal: dict[str, Any]) -> BoundCanonicalRetrieval:
         tenant_id = principal.get("tenant_id")
@@ -47,6 +63,8 @@ class CanonicalRetrieval:
             or not AUTHORITY_RE.fullmatch(principal_id)
         ):
             raise PermissionError("canonical MCP authority required")
+        if not decide(principal, "mcp.ping", tenant_id=tenant_id).allowed:
+            raise PermissionError("canonical MCP authority required")
         sources = tuple(principal.get("authorized_sources") or ())
         if any(
             not isinstance(source, str) or not AUTHORITY_RE.fullmatch(source)
@@ -59,6 +77,8 @@ class CanonicalRetrieval:
             principal_id=principal_id,
             authorized_sources=sources,
             archive=self.archive,
+            evidence_projector=self.evidence_projector,
+            deep_inspector=self.deep_inspector,
         )
 
     def embed_pending(
@@ -73,68 +93,259 @@ class CanonicalRetrieval:
             return {"status": "disabled", "processed": 0, "batches": 0}
         if runtime.dimensions != 512:
             raise ValueError("canonical embeddings require 512 dimensions")
-        if not 1 <= batch_size <= 500 or not 1 <= max_batches <= 100:
+        if (
+            not 1 <= batch_size <= MAX_CANONICAL_EMBEDDING_BATCH
+            or not 1 <= max_batches <= 100
+        ):
             raise ValueError("invalid canonical embedding batch")
         processed = batches = 0
-        for _ in range(max_batches):
-            with self.store.connect() as connection:
-                rows = connection.execute(
-                    """SELECT chunk.tenant_id,chunk.source_id,chunk.chunk_id,
-                              chunk.text_redacted,chunk.text_sha256
-                       FROM canonical_chunks chunk
-                       JOIN canonical_documents document
-                         USING(tenant_id,source_id,document_id)
-                       LEFT JOIN canonical_chunk_embeddings embedding
-                         ON embedding.tenant_id=chunk.tenant_id
-                        AND embedding.source_id=chunk.source_id
-                        AND embedding.chunk_id=chunk.chunk_id
-                        AND embedding.runtime_fingerprint=%s
-                       WHERE chunk.deleted_at IS NULL
-                         AND document.is_current
-                         AND document.deleted_at IS NULL
-                         AND embedding.chunk_id IS NULL
-                         AND (%s::text IS NULL OR chunk.tenant_id=%s)
-                       ORDER BY chunk.tenant_id,chunk.source_id,chunk.chunk_id
-                       LIMIT %s""",
-                    (runtime.fingerprint, tenant_id, tenant_id, batch_size),
-                ).fetchall()
-            if not rows:
-                break
-            vectors = runtime.embed_documents(
-                [row["text_redacted"] for row in rows]
-            )
-            with self.store.connect() as connection:
-                with connection.transaction():
-                    with connection.cursor() as cursor:
-                        cursor.executemany(
-                            """INSERT INTO canonical_chunk_embeddings(
-                                   tenant_id,source_id,chunk_id,model,dimensions,
-                                   content_sha256,runtime_fingerprint,embedding
-                               ) VALUES (%s,%s,%s,%s,512,%s,%s,%s::halfvec)
-                               ON CONFLICT(tenant_id,source_id,chunk_id)
-                               DO UPDATE SET
-                                 model=excluded.model,
-                                 dimensions=excluded.dimensions,
-                                 content_sha256=excluded.content_sha256,
-                                 runtime_fingerprint=excluded.runtime_fingerprint,
-                                 embedding=excluded.embedding,
-                                 embedded_at=now()""",
-                            [
-                                (
-                                    row["tenant_id"],
-                                    row["source_id"],
-                                    row["chunk_id"],
-                                    runtime.model,
-                                    row["text_sha256"],
-                                    runtime.fingerprint,
-                                    vector,
-                                )
-                                for row, vector in zip(rows, vectors, strict=True)
-                            ],
+        tenant_scope = tenant_id or ""
+        global_lock = "recall:canonical-embeddings"
+        tenant_lock = f"{global_lock}:{tenant_scope}"
+        with self.store.connect() as connection:
+            shared_global = tenant_id is not None
+            global_locked = connection.execute(
+                (
+                    "SELECT pg_try_advisory_lock_shared("
+                    "hashtextextended(%s,0)) AS value"
+                    if shared_global
+                    else "SELECT pg_try_advisory_lock("
+                    "hashtextextended(%s,0)) AS value"
+                ),
+                (global_lock,),
+            ).fetchone()["value"]
+            tenant_locked = False
+            if global_locked and shared_global:
+                tenant_locked = connection.execute(
+                    "SELECT pg_try_advisory_lock(hashtextextended(%s,0)) AS value",
+                    (tenant_lock,),
+                ).fetchone()["value"]
+            connection.commit()
+            if not global_locked or (shared_global and not tenant_locked):
+                if global_locked:
+                    connection.execute(
+                        "SELECT pg_advisory_unlock_shared(hashtextextended(%s,0))",
+                        (global_lock,),
+                    )
+                    connection.commit()
+                return {"status": "busy", "processed": 0, "batches": 0}
+            try:
+                seed = connection.execute(
+                    """SELECT tenant_id,source_id,chunk_id
+                       FROM canonical_chunk_embeddings
+                       WHERE runtime_fingerprint=%s
+                         AND (%s::text='' OR tenant_id=%s)
+                       ORDER BY tenant_id DESC,source_id DESC,chunk_id DESC
+                       LIMIT 1""",
+                    (runtime.fingerprint, tenant_scope, tenant_scope),
+                ).fetchone()
+                connection.commit()
+                connection.execute(
+                    """INSERT INTO canonical_embedding_projection_watermarks(
+                           runtime_fingerprint,tenant_scope,last_tenant_id,
+                           last_source_id,last_chunk_id
+                       ) VALUES (%s,%s,%s,%s,%s)
+                       ON CONFLICT(runtime_fingerprint,tenant_scope) DO NOTHING""",
+                    (
+                        runtime.fingerprint,
+                        tenant_scope,
+                        seed["tenant_id"] if seed else "",
+                        seed["source_id"] if seed else "",
+                        seed["chunk_id"] if seed else "",
+                    ),
+                )
+                connection.commit()
+                wrapped = False
+                while batches < max_batches:
+                    watermark = connection.execute(
+                        """SELECT last_tenant_id,last_source_id,last_chunk_id
+                           FROM canonical_embedding_projection_watermarks
+                           WHERE runtime_fingerprint=%s AND tenant_scope=%s""",
+                        (runtime.fingerprint, tenant_scope),
+                    ).fetchone()
+                    connection.commit()
+                    select_started = time.monotonic()
+                    scope_clause = (
+                        "AND tenant_id=%s" if tenant_id is not None else ""
+                    )
+                    scan_values: list[Any] = []
+                    if tenant_id is not None:
+                        scan_values.append(tenant_id)
+                    scan_values.extend(
+                        (
+                            watermark["last_tenant_id"],
+                            watermark["last_source_id"],
+                            watermark["last_chunk_id"],
+                            batch_size,
+                            runtime.fingerprint,
                         )
-            processed += len(rows)
-            batches += 1
-        return {"status": "complete", "processed": processed, "batches": batches}
+                    )
+                    window = connection.execute(
+                        f"""WITH scan_window AS MATERIALIZED (
+                                SELECT tenant_id,source_id,document_id,chunk_id,
+                                       text_redacted,text_sha256
+                                FROM canonical_chunks
+                                WHERE deleted_at IS NULL
+                                  {scope_clause}
+                                  AND (tenant_id,source_id,chunk_id)
+                                      > (%s,%s,%s)
+                                ORDER BY tenant_id,source_id,chunk_id
+                                LIMIT %s
+                            )
+                            SELECT chunk.tenant_id,chunk.source_id,chunk.chunk_id,
+                                   chunk.text_redacted,chunk.text_sha256,
+                                   COALESCE(
+                                       document.is_current
+                                       AND document.deleted_at IS NULL
+                                       AND embedding.chunk_id IS NULL,
+                                       false
+                                   ) AS eligible
+                            FROM scan_window chunk
+                            LEFT JOIN canonical_documents document
+                              USING(tenant_id,source_id,document_id)
+                            LEFT JOIN canonical_chunk_embeddings embedding
+                              ON embedding.tenant_id=chunk.tenant_id
+                             AND embedding.source_id=chunk.source_id
+                             AND embedding.chunk_id=chunk.chunk_id
+                             AND embedding.runtime_fingerprint=%s
+                            ORDER BY chunk.tenant_id,chunk.source_id,chunk.chunk_id
+                         """,
+                        tuple(scan_values),
+                    ).fetchall()
+                    connection.commit()
+                    if not window:
+                        cursor_is_set = any(
+                            watermark[key]
+                            for key in (
+                                "last_tenant_id",
+                                "last_source_id",
+                                "last_chunk_id",
+                            )
+                        )
+                        if cursor_is_set and not wrapped:
+                            connection.execute(
+                                """UPDATE canonical_embedding_projection_watermarks
+                                   SET last_tenant_id='',last_source_id='',
+                                       last_chunk_id='',updated_at=now()
+                                   WHERE runtime_fingerprint=%s
+                                     AND tenant_scope=%s""",
+                                (runtime.fingerprint, tenant_scope),
+                            )
+                            connection.commit()
+                            wrapped = True
+                            continue
+                        break
+                    window_end = window[-1]
+                    rows = [row for row in window if row["eligible"]]
+                    selected_seconds = time.monotonic() - select_started
+                    if not rows:
+                        with connection.transaction():
+                            connection.execute(
+                                """UPDATE canonical_embedding_projection_watermarks
+                                   SET last_tenant_id=%s,last_source_id=%s,
+                                       last_chunk_id=%s,updated_at=now()
+                                   WHERE runtime_fingerprint=%s
+                                     AND tenant_scope=%s""",
+                                (
+                                    window_end["tenant_id"],
+                                    window_end["source_id"],
+                                    window_end["chunk_id"],
+                                    runtime.fingerprint,
+                                    tenant_scope,
+                                ),
+                            )
+                        batches += 1
+                        LOG.info(
+                            "canonical embedding batch scanned=%s eligible=0 "
+                            "select_ms=%s embed_ms=0 persist_ms=0",
+                            len(window),
+                            round(selected_seconds * 1000),
+                        )
+                        continue
+                    embedding_started = time.monotonic()
+                    vectors = runtime.embed_documents(
+                        [row["text_redacted"] for row in rows]
+                    )
+                    embedded_seconds = time.monotonic() - embedding_started
+                    persistence_started = time.monotonic()
+                    with connection.transaction():
+                        with connection.cursor() as cursor:
+                            cursor.executemany(
+                                """INSERT INTO canonical_chunk_embeddings(
+                                       tenant_id,source_id,chunk_id,model,dimensions,
+                                       content_sha256,runtime_fingerprint,embedding
+                                   ) VALUES (%s,%s,%s,%s,512,%s,%s,%s::halfvec)
+                                   ON CONFLICT(tenant_id,source_id,chunk_id)
+                                   DO UPDATE SET
+                                       model=excluded.model,
+                                       dimensions=excluded.dimensions,
+                                       content_sha256=excluded.content_sha256,
+                                       runtime_fingerprint=excluded.runtime_fingerprint,
+                                       embedding=excluded.embedding,
+                                       embedded_at=now()""",
+                                [
+                                    (
+                                        row["tenant_id"],
+                                        row["source_id"],
+                                        row["chunk_id"],
+                                        runtime.model,
+                                        row["text_sha256"],
+                                        runtime.fingerprint,
+                                        vector,
+                                    )
+                                    for row, vector in zip(
+                                        rows, vectors, strict=True
+                                    )
+                                ],
+                            )
+                            cursor.execute(
+                                """UPDATE canonical_embedding_projection_watermarks
+                                   SET last_tenant_id=%s,last_source_id=%s,
+                                       last_chunk_id=%s,updated_at=now()
+                                   WHERE runtime_fingerprint=%s
+                                     AND tenant_scope=%s""",
+                                (
+                                    window_end["tenant_id"],
+                                    window_end["source_id"],
+                                    window_end["chunk_id"],
+                                    runtime.fingerprint,
+                                    tenant_scope,
+                                ),
+                            )
+                    persisted_seconds = time.monotonic() - persistence_started
+                    processed += len(rows)
+                    batches += 1
+                    LOG.info(
+                        "canonical embedding batch scanned=%s eligible=%s "
+                        "select_ms=%s embed_ms=%s persist_ms=%s",
+                        len(window),
+                        len(rows),
+                        round(selected_seconds * 1000),
+                        round(embedded_seconds * 1000),
+                        round(persisted_seconds * 1000),
+                    )
+                return {
+                    "status": "complete",
+                    "processed": processed,
+                    "batches": batches,
+                }
+            finally:
+                if tenant_locked:
+                    connection.execute(
+                        "SELECT pg_advisory_unlock(hashtextextended(%s,0))",
+                        (tenant_lock,),
+                    )
+                connection.execute(
+                    (
+                        "SELECT pg_advisory_unlock_shared("
+                        "hashtextextended(%s,0))"
+                        if shared_global
+                        else "SELECT pg_advisory_unlock("
+                        "hashtextextended(%s,0))"
+                    ),
+                    (global_lock,),
+                )
+                connection.commit()
 
 
 class BoundCanonicalRetrieval:
@@ -148,12 +359,16 @@ class BoundCanonicalRetrieval:
         principal_id: str,
         authorized_sources: tuple[str, ...],
         archive: Any = None,
+        evidence_projector: Any = None,
+        deep_inspector: Any = None,
     ):
         self.store = store
         self.tenant_id = tenant_id
         self.principal_id = principal_id
         self.authorized_sources = authorized_sources
         self.archive = archive
+        self.evidence_projector = evidence_projector
+        self.deep_inspector = deep_inspector
 
     @staticmethod
     def _filters(
@@ -181,6 +396,8 @@ class BoundCanonicalRetrieval:
             if value is not None:
                 if not isinstance(value, str):
                     raise ValueError("invalid temporal filter")
+                if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                    value += "T00:00:00Z"
                 parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
                 if parsed.tzinfo is None:
                     raise ValueError("invalid temporal filter")
@@ -224,8 +441,12 @@ class BoundCanonicalRetrieval:
         return {
             "source_id": row["source_id"],
             "native_id": row["native_id"],
+            "native_parent_id": row.get("native_parent_id"),
             "revision": row["revision"],
             "occurred_at": _timestamp(row["occurred_at"]),
+            "observed_at": _timestamp(row["observed_at"]),
+            "ingested_at": _timestamp(row["created_at"]),
+            "time_basis": "occurred_at",
             "text": text,
             "text_clipped": clipped,
             "receipt": row["receipt"],
@@ -285,7 +506,8 @@ class BoundCanonicalRetrieval:
             rows = self.store._execute_bounded(
                 connection,
                 """SELECT chunk.source_id,document.native_id,document.revision,
-                          event.occurred_at,chunk.text_redacted,chunk.receipt,
+                          event.native_parent_id,event.occurred_at,event.observed_at,
+                          event.created_at,chunk.text_redacted,chunk.receipt,
                           ts_rank_cd(
                             chunk.search_vector,
                             websearch_to_tsquery('simple',%s),
@@ -369,10 +591,13 @@ class BoundCanonicalRetrieval:
             except (json.JSONDecodeError, TimeoutError, urllib.error.URLError):
                 semantic_status = "unavailable"
             else:
-                with self.store.connect() as connection:
-                    semantic = connection.execute(
-                        """SELECT chunk.source_id,document.native_id,document.revision,
-                              event.occurred_at,chunk.text_redacted,chunk.receipt,
+                try:
+                    with self.store.connect() as connection:
+                        semantic = self.store._execute_bounded(
+                            connection,
+                            """SELECT chunk.source_id,document.native_id,document.revision,
+                              event.native_parent_id,event.occurred_at,event.observed_at,
+                              event.created_at,chunk.text_redacted,chunk.receipt,
                               1-(embedding.embedding <=> %s::halfvec) AS score
                        FROM canonical_chunk_embeddings embedding
                        JOIN canonical_chunks chunk
@@ -392,19 +617,22 @@ class BoundCanonicalRetrieval:
                        ORDER BY embedding.embedding <=> %s::halfvec,
                                 event.occurred_at DESC,chunk.chunk_id
                        LIMIT %s""",
-                        (
-                            vector,
-                            self.tenant_id,
-                            sources,
-                            runtime.fingerprint,
-                            since,
-                            since,
-                            until,
-                            until,
-                            vector,
-                            candidate_limit,
-                        ),
-                    ).fetchall()
+                            (
+                                vector,
+                                self.tenant_id,
+                                sources,
+                                runtime.fingerprint,
+                                since,
+                                since,
+                                until,
+                                until,
+                                vector,
+                                candidate_limit,
+                            ),
+                            lexical_deadline_at,
+                        ).fetchall()
+                except SearchDeadlineExceeded:
+                    semantic_status = "deadline-exceeded"
         combined: dict[str, tuple[dict[str, Any], float]] = {}
         for weight, rows in ((0.6, lexical), (0.4, semantic)):
             for rank, row in enumerate(rows, start=1):
@@ -430,6 +658,666 @@ class BoundCanonicalRetrieval:
             },
         }
 
+    def _receipt_event(
+        self,
+        connection: Any,
+        target: str,
+        *,
+        deadline_at: float | None = None,
+    ) -> dict[str, Any] | None:
+        redirect = self.store._execute_bounded(
+            connection,
+            """SELECT new_receipt FROM receipt_redirects
+               WHERE tenant_id=%s AND old_receipt=%s""",
+            (self.tenant_id, target),
+            deadline_at,
+        ).fetchone()
+        if redirect:
+            target = redirect["new_receipt"]
+        row = self.store._execute_bounded(
+            connection,
+            """SELECT chunk.source_id,chunk.document_id,chunk.ordinal AS anchor_ordinal,
+                      document.native_id,
+                      document.revision,event.event_id,event.native_parent_id,
+                      event.kind,event.occurred_at,event.observed_at,event.created_at,
+                      event.canonical_redacted
+               FROM canonical_chunks chunk
+               JOIN canonical_documents document
+                 USING(tenant_id,source_id,document_id)
+               JOIN canonical_events event
+                 USING(tenant_id,source_id,event_id)
+               WHERE chunk.tenant_id=%s
+                 AND chunk.source_id=ANY(%s)
+                 AND chunk.receipt=%s
+                 AND chunk.deleted_at IS NULL
+                 AND document.is_current
+                 AND document.deleted_at IS NULL
+                 AND NOT EXISTS (
+                   SELECT 1 FROM canonical_events later
+                   WHERE later.tenant_id=document.tenant_id
+                     AND later.source_id=document.source_id
+                     AND later.native_id=document.native_id
+                     AND later.revision>document.revision
+                     AND later.is_tombstone
+                 )""",
+            (self.tenant_id, list(self.authorized_sources), target),
+            deadline_at,
+        ).fetchone()
+        if row is not None:
+            row["resolved_receipt"] = target
+        return row
+
+    @staticmethod
+    def _context_event(row: dict[str, Any]) -> dict[str, Any]:
+        chunks = []
+        for chunk in row["chunks"]:
+            text, clipped = bounded_search_text(chunk["text"])
+            chunks.append({
+                "ordinal": chunk["ordinal"],
+                "text": text,
+                "text_clipped": clipped,
+                "receipt": chunk["receipt"],
+            })
+        return {
+            "source_id": row["source_id"],
+            "native_id": row["native_id"],
+            "native_parent_id": row["native_parent_id"],
+            "revision": row["revision"],
+            "kind": row["kind"],
+            "occurred_at": _timestamp(row["occurred_at"]),
+            "observed_at": _timestamp(row["observed_at"]),
+            "ingested_at": _timestamp(row["created_at"]),
+            "time_basis": "occurred_at",
+            "chunks": chunks,
+        }
+
+    def session_context(
+        self,
+        target: str,
+        *,
+        before: int = 4,
+        after: int = 4,
+        authorized_source: Any = None,
+        _deadline_at: float | None = None,
+    ) -> dict[str, Any] | None:
+        """Expand one receipt inside its source session without crossing grants."""
+        if (
+            not isinstance(target, str)
+            or not target.startswith("recall://")
+            or isinstance(before, bool)
+            or not isinstance(before, int)
+            or not 0 <= before <= 20
+            or isinstance(after, bool)
+            or not isinstance(after, int)
+            or not 0 <= after <= 20
+        ):
+            raise ValueError("invalid canonical session context request")
+        if not self.authorized_sources:
+            return None
+        with self.store.connect() as connection:
+            anchor = self._receipt_event(
+                connection,
+                target,
+                deadline_at=_deadline_at,
+            )
+            if anchor is None:
+                return None
+            parent = anchor["native_parent_id"] or anchor["native_id"]
+
+            def neighbors(direction: str, limit: int) -> list[dict[str, Any]]:
+                if limit == 0:
+                    return []
+                comparator = "<" if direction == "before" else ">"
+                ordering = "DESC" if direction == "before" else "ASC"
+                return self.store._execute_bounded(
+                    connection,
+                    f"""SELECT event.source_id,event.native_id,
+                               event.native_parent_id,document.revision,event.kind,
+                               event.occurred_at,event.observed_at,event.created_at,
+                               jsonb_agg(
+                                 jsonb_build_object(
+                                   'ordinal',chunk.ordinal,
+                                   'text',chunk.text_redacted,
+                                   'receipt',chunk.receipt
+                                 ) ORDER BY chunk.ordinal
+                               ) AS chunks
+                        FROM canonical_events event
+                        JOIN canonical_documents document
+                          USING(tenant_id,source_id,event_id)
+                        JOIN LATERAL (
+                          SELECT bounded.ordinal,bounded.text_redacted,bounded.receipt
+                          FROM canonical_chunks bounded
+                          WHERE bounded.tenant_id=document.tenant_id
+                            AND bounded.source_id=document.source_id
+                            AND bounded.document_id=document.document_id
+                            AND bounded.deleted_at IS NULL
+                          ORDER BY bounded.ordinal
+                          LIMIT 2
+                        ) chunk ON true
+                        WHERE event.tenant_id=%s
+                          AND event.source_id=%s
+                          AND COALESCE(event.native_parent_id,event.native_id)=%s
+                          AND (event.occurred_at,event.native_id)
+                              {comparator} (%s,%s)
+                          AND document.is_current
+                          AND document.deleted_at IS NULL
+                        GROUP BY event.source_id,event.native_id,
+                                 event.native_parent_id,document.revision,event.kind,
+                                 event.occurred_at,event.observed_at,event.created_at
+                        ORDER BY event.occurred_at {ordering},
+                                 event.native_id {ordering}
+                        LIMIT %s""",
+                    (
+                        self.tenant_id,
+                        anchor["source_id"],
+                        parent,
+                        anchor["occurred_at"],
+                        anchor["native_id"],
+                        limit,
+                    ),
+                    _deadline_at,
+                ).fetchall()
+
+            previous = list(reversed(neighbors("before", before)))
+            following = neighbors("after", after)
+            anchor_chunks = self.store._execute_bounded(
+                connection,
+                """SELECT ordinal,text,receipt
+                   FROM (
+                     SELECT ordinal,text_redacted AS text,receipt
+                     FROM canonical_chunks
+                     WHERE tenant_id=%s AND source_id=%s AND document_id=%s
+                       AND deleted_at IS NULL
+                     ORDER BY abs(ordinal-%s),ordinal
+                     LIMIT 3
+                   ) bounded
+                   ORDER BY ordinal""",
+                (
+                    self.tenant_id,
+                    anchor["source_id"],
+                    anchor["document_id"],
+                    anchor["anchor_ordinal"],
+                ),
+                _deadline_at,
+            ).fetchall()
+            anchor["chunks"] = anchor_chunks
+        return {
+            "session": {
+                "source_id": anchor["source_id"],
+                "native_parent_id": parent,
+                "time_basis": "occurred_at",
+            },
+            "events": [
+                self._context_event(row)
+                for row in previous + [anchor] + following
+            ],
+            "anchor_receipt": anchor["resolved_receipt"],
+            "bounds": {"before": before, "after": after},
+        }
+
+    @staticmethod
+    def _question_time_window(
+        question: str,
+        *,
+        now: datetime | None = None,
+    ) -> tuple[str | None, str | None, str]:
+        """Interpret only common relative windows; never use ingestion time."""
+        current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        lowered = question.casefold()
+        if re.search(r"\btoday\b", lowered):
+            since = current.replace(hour=0, minute=0, second=0, microsecond=0)
+            return since.isoformat(), current.isoformat(), "question:today"
+        if re.search(r"\byesterday\b", lowered):
+            until = current.replace(hour=0, minute=0, second=0, microsecond=0)
+            return (
+                (until - timedelta(days=1)).isoformat(),
+                until.isoformat(),
+                "question:yesterday",
+            )
+        match = re.search(
+            r"\b(?:past|last)\s+(\d{1,3})\s+(hour|day|week)s?\b",
+            lowered,
+        )
+        if match:
+            amount = min(int(match.group(1)), 365)
+            unit = match.group(2)
+            delta = {
+                "hour": timedelta(hours=amount),
+                "day": timedelta(days=amount),
+                "week": timedelta(weeks=amount),
+            }[unit]
+            return (
+                (current - delta).isoformat(),
+                current.isoformat(),
+                f"question:last-{amount}-{unit}s",
+            )
+        return None, None, "unbounded"
+
+    def investigate(
+        self,
+        question: str,
+        *,
+        filters: dict[str, Any] | None = None,
+        depth: str = "normal",
+        authorized_source: Any = None,
+    ) -> dict[str, Any]:
+        """Return an answer-ready, receipt-backed multi-session evidence packet."""
+        if not isinstance(question, str) or not question.strip() or len(question) > 8192:
+            raise ValueError("invalid canonical investigation question")
+        started_at = time.monotonic()
+        budgets = {
+            "quick": {
+                "families": 1,
+                "sessions": 2,
+                "context": 2,
+                "deadline_seconds": 5,
+                "max_response_bytes": 900_000,
+            },
+            "normal": {
+                "families": 4,
+                "sessions": 4,
+                "context": 4,
+                "deadline_seconds": 15,
+                "max_response_bytes": 900_000,
+            },
+            "deep": {
+                "families": 8,
+                "sessions": 6,
+                "context": 6,
+                "deadline_seconds": 30,
+                "max_response_bytes": 900_000,
+            },
+        }
+        if depth not in budgets:
+            raise ValueError("invalid canonical investigation depth")
+        budget = budgets[depth]
+        deadline_at = started_at + budget["deadline_seconds"]
+        effective_filters = dict(filters or {})
+        source_id, source_family, source_alias, _, _ = self._filters(
+            effective_filters
+        )
+        time_reason = "explicit"
+        if "since" not in effective_filters and "until" not in effective_filters:
+            since, until, time_reason = self._question_time_window(question)
+            if since is not None:
+                effective_filters["since"] = since
+                effective_filters["until"] = until
+        eligible_sources = self._sources(
+            source_id=source_id,
+            source_family=source_family,
+            source_alias=source_alias,
+        )
+
+        probes: list[dict[str, Any]] = []
+        first = self.search(question, effective_filters, 20)
+        probes.append(first)
+        if not any(
+            name in effective_filters
+            for name in ("source_id", "source_family", "source_alias")
+        ):
+            try:
+                with self.store.connect() as connection:
+                    rows = self.store._execute_bounded(
+                        connection,
+                        """SELECT family,count(*) AS source_count
+                           FROM source_profiles
+                           WHERE source_id=ANY(%s)
+                           GROUP BY family
+                           ORDER BY source_count DESC,family
+                           LIMIT %s""",
+                        (eligible_sources, budget["families"]),
+                        deadline_at,
+                    ).fetchall()
+            except SearchDeadlineExceeded:
+                rows = []
+            for row in rows:
+                if time.monotonic() - started_at >= budget["deadline_seconds"]:
+                    break
+                family_filters = {
+                    **effective_filters,
+                    "source_family": row["family"],
+                }
+                probes.append(self.search(question, family_filters, 8))
+
+        combined: dict[str, dict[str, Any]] = {}
+        for probe_index, probe in enumerate(probes):
+            for rank, result in enumerate(probe["results"], start=1):
+                receipt = result["receipt"]
+                prior = combined.get(receipt)
+                aggregate = 1.0 / (30 + rank) + 1.0 / (60 + probe_index)
+                if prior is None:
+                    combined[receipt] = {**result, "_score": aggregate}
+                else:
+                    prior["_score"] += aggregate
+        ranked = sorted(
+            combined.values(),
+            key=lambda item: (
+                item["_score"],
+                item["occurred_at"],
+                item["receipt"],
+            ),
+            reverse=True,
+        )
+        selected: list[dict[str, Any]] = []
+        seen_sessions: set[tuple[str, str]] = set()
+        for result in ranked:
+            session_id = result.get("native_parent_id") or result["native_id"]
+            session_key = (result["source_id"], session_id)
+            if session_key in seen_sessions:
+                continue
+            seen_sessions.add(session_key)
+            selected.append(result)
+            if len(selected) >= budget["sessions"]:
+                break
+
+        investigations = []
+        since_bound = (
+            datetime.fromisoformat(effective_filters["since"].replace("Z", "+00:00"))
+            if effective_filters.get("since")
+            else None
+        )
+        until_bound = (
+            datetime.fromisoformat(effective_filters["until"].replace("Z", "+00:00"))
+            if effective_filters.get("until")
+            else None
+        )
+        for result in selected:
+            if time.monotonic() - started_at >= budget["deadline_seconds"]:
+                break
+            try:
+                context = self.session_context(
+                    result["receipt"],
+                    before=budget["context"],
+                    after=budget["context"],
+                    _deadline_at=deadline_at,
+                )
+            except SearchDeadlineExceeded:
+                break
+            if context is not None:
+                context["events"] = [
+                    event
+                    for event in context["events"]
+                    if (
+                        since_bound is None
+                        or datetime.fromisoformat(
+                            event["occurred_at"].replace("Z", "+00:00")
+                        ) >= since_bound
+                    )
+                    and (
+                        until_bound is None
+                        or datetime.fromisoformat(
+                            event["occurred_at"].replace("Z", "+00:00")
+                        ) <= until_bound
+                    )
+                ]
+                investigations.append({
+                    "match": {
+                        key: value
+                        for key, value in result.items()
+                        if key != "_score"
+                    },
+                    "context": context,
+                })
+        while (
+            len(json.dumps(investigations, default=str).encode())
+            > budget["max_response_bytes"] - 100_000
+            and investigations
+        ):
+            investigations.pop()
+
+        source_ids = sorted({
+            item["match"]["source_id"] for item in investigations
+        })
+        source_families: list[str] = []
+        if source_ids:
+            try:
+                with self.store.connect() as connection:
+                    rows = self.store._execute_bounded(
+                        connection,
+                        """SELECT DISTINCT family FROM source_profiles
+                           WHERE source_id=ANY(%s) ORDER BY family""",
+                        (source_ids,),
+                        deadline_at,
+                    ).fetchall()
+            except SearchDeadlineExceeded:
+                rows = []
+            source_families = [row["family"] for row in rows]
+        try:
+            with self.store.connect() as connection:
+                configured_rows = self.store._execute_bounded(
+                    connection,
+                    """SELECT source.source_id,max(job.updated_at) AS last_activity_at
+                       FROM canonical_sources source
+                       LEFT JOIN canonical_ingest_jobs job
+                         USING(tenant_id,source_id)
+                       WHERE source.tenant_id=%s
+                         AND source.source_id=ANY(%s)
+                       GROUP BY source.source_id
+                       ORDER BY source.source_id""",
+                    (self.tenant_id, list(self.authorized_sources)),
+                    deadline_at,
+                ).fetchall()
+        except SearchDeadlineExceeded:
+            configured_rows = []
+        configured = {
+            row["source_id"]: row["last_activity_at"]
+            for row in configured_rows
+        }
+        stale_cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+        stale_sources = sorted(
+            source
+            for source in eligible_sources
+            if source in configured
+            and (
+                configured[source] is None
+                or configured[source].astimezone(timezone.utc) < stale_cutoff
+            )
+        )
+        occurred = [
+            event["occurred_at"]
+            for item in investigations
+            for event in item["context"]["events"]
+        ]
+        uncertainty = []
+        if not investigations:
+            uncertainty.append("No authorized evidence matched the question.")
+        if len(source_ids) < 2:
+            uncertainty.append(
+                "Evidence is concentrated in fewer than two authorized sources."
+            )
+        if time_reason == "unbounded":
+            uncertainty.append(
+                "The question had no explicit or recognized relative time window."
+            )
+        return {
+            "question_interpretation": {
+                "time_basis": "occurred_at",
+                "time_window": {
+                    "since": effective_filters.get("since"),
+                    "until": effective_filters.get("until"),
+                    "reason": time_reason,
+                },
+                "depth": depth,
+            },
+            "investigations": investigations,
+            "coverage": {
+                "sources": source_ids,
+                "source_families": source_families,
+                "sessions": len(investigations),
+                "earliest_occurred_at": min(occurred) if occurred else None,
+                "latest_occurred_at": max(occurred) if occurred else None,
+                "source_accounting": {
+                    "searched": eligible_sources,
+                    "stale": stale_sources,
+                    "filtered": sorted(
+                        set(self.authorized_sources) - set(eligible_sources)
+                    ),
+                    "unavailable": sorted(
+                        set(self.authorized_sources) - set(configured)
+                    ),
+                    "stale_after_seconds": 7 * 24 * 60 * 60,
+                },
+            },
+            "uncertainty": uncertainty,
+            "diagnostics": {
+                "engine": "canonical-investigator-v1",
+                "search_probes": len(probes),
+                "unique_candidates": len(combined),
+                "expanded_sessions": len(investigations),
+                "bounds": budget,
+                "elapsed_ms": round(
+                    (time.monotonic() - started_at) * 1000,
+                    3,
+                ),
+                "deadline_reached": (
+                    time.monotonic() - started_at
+                    >= budget["deadline_seconds"]
+                ),
+            },
+        }
+
+    def deep_search(
+        self,
+        question: str,
+        *,
+        filters: dict[str, Any] | None = None,
+        depth: str = "normal",
+        authorized_source: Any = None,
+    ) -> dict[str, Any]:
+        """Deepen authorized Recall candidates in full evidence objects."""
+        budgets = {
+            "quick": DeepInspectionBudget(
+                max_files=6,
+                max_matches=12,
+                max_output_bytes=32_000,
+                timeout_seconds=8,
+                concurrency=4,
+            ),
+            "normal": DeepInspectionBudget(
+                max_files=20,
+                max_matches=50,
+                max_output_bytes=96_000,
+                timeout_seconds=20,
+                concurrency=8,
+            ),
+            "deep": DeepInspectionBudget(
+                max_files=60,
+                max_matches=150,
+                max_output_bytes=128_000,
+                timeout_seconds=30,
+                concurrency=16,
+            ),
+        }
+        if depth not in budgets:
+            raise ValueError("invalid canonical deep-search depth")
+        configured_tenant = getattr(
+            self.evidence_projector,
+            "bound_tenant_id",
+            None,
+        )
+        if (
+            self.evidence_projector is None
+            or self.deep_inspector is None
+            or (
+                configured_tenant is not None
+                and configured_tenant != self.tenant_id
+            )
+        ):
+            return {
+                "status": "unavailable",
+                "question": question,
+                "findings": [],
+                "coverage": {
+                    "candidate_files": 0,
+                    "files_scanned": 0,
+                    "complete": False,
+                    "reason": (
+                        "deep_inspector_not_configured"
+                        if configured_tenant in {None, self.tenant_id}
+                        else "deep_inspector_not_configured_for_brain"
+                    ),
+                },
+                "uncertainty": [
+                    "Deep inspection is not configured for this Recall deployment."
+                ],
+            }
+        investigation = self.investigate(
+            question,
+            filters=filters,
+            depth=depth,
+            authorized_source=authorized_source,
+        )
+        receipts = tuple(
+            dict.fromkeys(
+                chunk["receipt"]
+                for item in investigation["investigations"]
+                for event in item["context"]["events"]
+                for chunk in event["chunks"]
+            )
+        )
+        budget = budgets[depth]
+        selected = self.evidence_projector.targets_for_receipts(
+            tenant_id=self.tenant_id,
+            source_ids=self.authorized_sources,
+            receipts=receipts,
+            limit=budget.max_files,
+        )
+        targets = tuple(
+            EvidenceTarget.from_reference(
+                item["reference"],
+                receipts=item["receipts"],
+            )
+            for item in selected
+        )
+        deep = self.deep_inspector.inspect(
+            tenant_id=self.tenant_id,
+            question=question,
+            targets=targets,
+            budget=budget,
+        )
+        verified = []
+        with self.store.connect() as connection:
+            for finding in deep["findings"]:
+                row = self._receipt_event(connection, finding["receipt"])
+                if (
+                    row is not None
+                    and row["source_id"] in self.authorized_sources
+                ):
+                    verified.append(finding)
+        uncertainty = list(investigation["uncertainty"])
+        if len(verified) != len(deep["findings"]):
+            uncertainty.append(
+                "One or more deep findings became unavailable during verification."
+            )
+        if not deep["complete"]:
+            uncertainty.append("Deep inspection returned partial coverage.")
+        return {
+            "status": "complete",
+            "question": question,
+            "findings": verified,
+            "coverage": {
+                "candidate_receipts": len(receipts),
+                "candidate_files": len(targets),
+                "files_scanned": deep["files_scanned"],
+                "complete": bool(deep["complete"]),
+                "stopped_reason": deep["stopped_reason"],
+                "provider": deep["provider"],
+                "recall": investigation["coverage"],
+            },
+            "uncertainty": uncertainty,
+            "diagnostics": {
+                "engine": "canonical-deep-search-v1",
+                "depth": depth,
+                "budget": {
+                    "max_files": budget.max_files,
+                    "max_matches": budget.max_matches,
+                    "max_output_bytes": budget.max_output_bytes,
+                    "timeout_seconds": budget.timeout_seconds,
+                },
+                "provider_timing": deep["timing"],
+            },
+        }
+
     def show(
         self,
         target: str,
@@ -450,37 +1338,7 @@ class BoundCanonicalRetrieval:
         if not self.authorized_sources:
             return None
         with self.store.connect() as connection:
-            redirect = connection.execute(
-                """SELECT new_receipt FROM receipt_redirects
-                   WHERE tenant_id=%s AND old_receipt=%s""",
-                (self.tenant_id, target),
-            ).fetchone()
-            if redirect:
-                target = redirect["new_receipt"]
-            row = connection.execute(
-                """SELECT chunk.source_id,chunk.document_id,document.native_id,
-                          document.revision,event.kind,event.occurred_at,
-                          event.observed_at,event.canonical_redacted
-                   FROM canonical_chunks chunk
-                   JOIN canonical_documents document
-                     USING(tenant_id,source_id,document_id)
-                   JOIN canonical_events event
-                     USING(tenant_id,source_id,event_id)
-                   WHERE chunk.tenant_id=%s
-                     AND chunk.source_id=ANY(%s)
-                     AND chunk.receipt=%s
-                     AND chunk.deleted_at IS NULL
-                     AND document.deleted_at IS NULL
-                     AND NOT EXISTS (
-                       SELECT 1 FROM canonical_events later
-                       WHERE later.tenant_id=document.tenant_id
-                         AND later.source_id=document.source_id
-                         AND later.native_id=document.native_id
-                         AND later.revision>document.revision
-                         AND later.is_tombstone
-                     )""",
-                (self.tenant_id, list(self.authorized_sources), target),
-            ).fetchone()
+            row = self._receipt_event(connection, target)
             if row is None:
                 return None
             chunks = connection.execute(
@@ -528,7 +1386,8 @@ class BoundCanonicalRetrieval:
         with self.store.connect() as connection:
             rows = connection.execute(
                 """SELECT chunk.source_id,document.native_id,document.revision,
-                          event.occurred_at,chunk.text_redacted,chunk.receipt,
+                          event.native_parent_id,event.occurred_at,event.observed_at,
+                          event.created_at,chunk.text_redacted,chunk.receipt,
                           event.canonical_redacted #>> '{provenance,cwd}' AS path,
                           event.canonical_redacted #>> '{provenance,branch}' AS branch
                    FROM canonical_chunks chunk
@@ -590,7 +1449,11 @@ class BoundCanonicalRetrieval:
         if not owner:
             raise ValueError("canonical forget receipt not found")
         now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        return CanonicalPlane(self.store, self.archive).forget(
+        return CanonicalPlane(
+            self.store,
+            self.archive,
+            self.evidence_projector,
+        ).forget(
             {
                 "contract": "recall.forget-request.v1",
                 "schema_version": 1,

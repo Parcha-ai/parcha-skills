@@ -89,6 +89,18 @@ class SchemaMigrationContractTest(unittest.TestCase):
             rendered,
         )
 
+    def test_canonical_event_foreign_key_has_a_supporting_index(self) -> None:
+        migration = (
+            SERVER
+            / "schema"
+            / "033_canonical_document_event_lookup.sql"
+        )
+        rendered = " ".join(migration.read_text().split()).casefold()
+        self.assertIn(
+            "on canonical_documents(tenant_id, source_id, event_id)",
+            rendered,
+        )
+
     def test_turn_dedupe_has_a_session_scoped_cleanup_index(self) -> None:
         migration = SERVER / "schema" / "023_turn_prompt_dedupe_index.sql"
         rendered = " ".join(migration.read_text().split()).casefold()

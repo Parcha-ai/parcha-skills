@@ -35,7 +35,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - run: pip install bandit ruff
+      - run: pip install bandit "ruff==0.15.18"
       - run: ruff check tether/runtime tether/skills/tether/scripts tether/tests
       - run: bandit -q -r tether/runtime tether/skills/tether/scripts -s B404
       - run: npm test

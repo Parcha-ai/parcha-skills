@@ -708,12 +708,23 @@ class RecallEngineTest(unittest.TestCase):
         self.assertIn("Please inspect", shown)
         doctor = self.cli("doctor")
         self.assertIn("OK FTS5 available", doctor)
+        self.assertIn("mode=local", doctor)
 
     def test_doctor_missing_db_is_read_only(self):
         self.assertFalse(self.db.exists())
         doctor = self.cli("doctor")
         self.assertIn("WARN db exists=False", doctor)
         self.assertFalse(self.db.exists())
+
+    def test_search_without_index_suggests_raw_transcript_scan(self):
+        self.assertFalse(self.db.exists())
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = engine.main(["search", "anything"])
+        self.assertEqual(code, 0)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn("scanning transcripts directly", err.getvalue())
+        self.assertIn("rg -l -i", err.getvalue())
 
 
 class RemoteHandler(BaseHTTPRequestHandler):
@@ -1006,6 +1017,7 @@ class RemoteTransportTest(unittest.TestCase):
         try:
             code, output, error = self.call(
                 "search", "deadbeef", "--limit", "5",
+                "--since", "2026-01-01", "--until", "2026-02-01",
                 "--source-family", "coding_history",
             )
             self.assertEqual((code, error), (0, ""))
@@ -1020,7 +1032,11 @@ class RemoteTransportTest(unittest.TestCase):
                 "name": "recall_search",
                 "arguments": {
                     "query": "deadbeef",
-                    "filters": {"source_family": "coding_history"},
+                    "filters": {
+                        "since": "2026-01-01T00:00:00Z",
+                        "until": "2026-02-01T00:00:00Z",
+                        "source_family": "coding_history",
+                    },
                     "limit": 5,
                 },
             })

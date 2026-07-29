@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from typing import Any, Protocol
 from urllib.parse import unquote, urlsplit
@@ -14,6 +15,7 @@ from .projectors import validate_envelope
 MAX_CANONICAL_TEXT_BYTES = 8_000_000
 MAX_CANONICAL_CHUNK_BYTES = 24_000
 MAX_LINKED_IDENTITIES = 10_000
+MAX_CANONICAL_BATCH_EVENTS = 1_000
 
 
 class CanonicalLifecycleError(RuntimeError):
@@ -204,9 +206,15 @@ class CanonicalArchiveGateway:
 class CanonicalPlane:
     """Tenant-aware v2 canonical ingest and crash-resumable authoritative forget."""
 
-    def __init__(self, store: BrainStore, archive: ArchiveLifecycle):
+    def __init__(
+        self,
+        store: BrainStore,
+        archive: ArchiveLifecycle,
+        evidence_projector: Any = None,
+    ):
         self.store = store
         self.archive = archive
+        self.evidence_projector = evidence_projector
 
     @staticmethod
     def _validate_host_identity(
@@ -258,6 +266,30 @@ class CanonicalPlane:
                DO UPDATE SET permission='owner'""",
             (tenant_id, principal_id, source_id),
         )
+        conn.execute(
+            """INSERT INTO canonical_source_grants(
+                   tenant_id,principal_id,source_id,permission
+               ) SELECT space.tenant_id,access.principal_id,%s,'read'
+                   FROM brain_spaces space
+                   JOIN brain_memberships source_membership
+                     ON source_membership.organization_id=space.organization_id
+                    AND source_membership.principal_id=%s
+                   JOIN brain_access_grants access
+                     ON access.tenant_id=space.tenant_id
+                    AND access.permission IN ('owner','admin','read')
+                   JOIN brain_invitations invitation
+                     ON invitation.tenant_id=space.tenant_id
+                    AND invitation.accepted_principal_id=access.principal_id
+                    AND invitation.accepted_at IS NOT NULL
+                    AND invitation.revoked_at IS NULL
+                  WHERE space.tenant_id=%s AND space.brain_kind='company'
+               ON CONFLICT(tenant_id,principal_id,source_id)
+               DO UPDATE SET permission=CASE
+                   WHEN canonical_source_grants.permission='owner' THEN 'owner'
+                   ELSE 'read'
+               END""",
+            (source_id, principal_id, tenant_id),
+        )
 
     def ingest_document(
         self,
@@ -268,6 +300,7 @@ class CanonicalPlane:
         artifact_ref: dict[str, Any],
         envelope: dict[str, Any],
         text_redacted: str,
+        _connection: Any | None = None,
     ) -> dict[str, Any]:
         self._validate_host_identity(tenant_id, principal_id, envelope.get("source_id"))
         if not isinstance(connector_id, str) or not IDENTITY_RE.fullmatch(connector_id):
@@ -295,8 +328,9 @@ class CanonicalPlane:
         ):
             raise CanonicalLifecycleError("canonical_lineage_invalid")
         raw_sha256 = artifact["content_sha256"]
+        event_sha256 = event["content_sha256"]
         identity_sha256 = _identity_sha256(tenant_id, source_id, native_id)
-        event_id = _opaque("evt", tenant_id, source_id, native_id, raw_sha256)
+        event_id = _opaque("evt", tenant_id, source_id, native_id, event_sha256)
         job_id = _opaque("job", tenant_id, source_id, connector_id, event_id)
         document_id = _opaque("doc", tenant_id, source_id, event_id)
         text_sha256 = hashlib.sha256(text_redacted.encode()).hexdigest()
@@ -306,8 +340,18 @@ class CanonicalPlane:
             else canonical_text_chunks(text_redacted)
         )
 
-        with self.store.connect() as conn:
-            with conn.transaction():
+        connection_context = (
+            self.store.connect()
+            if _connection is None
+            else nullcontext(_connection)
+        )
+        with connection_context as conn:
+            transaction_context = (
+                conn.transaction()
+                if _connection is None
+                else nullcontext()
+            )
+            with transaction_context:
                 self._register_source(
                     conn,
                     tenant_id=tenant_id,
@@ -367,7 +411,7 @@ class CanonicalPlane:
                     """SELECT revision FROM canonical_events
                        WHERE tenant_id=%s AND source_id=%s
                          AND native_id=%s AND content_sha256=%s""",
-                    (tenant_id, source_id, native_id, raw_sha256),
+                    (tenant_id, source_id, native_id, event_sha256),
                 ).fetchone()
                 if existing:
                     revision = existing["revision"]
@@ -406,7 +450,7 @@ class CanonicalPlane:
                     (
                         tenant_id, source_id, event_id, native_id,
                         event.get("native_parent_id"), artifact["artifact_id"], job_id,
-                        event["kind"], raw_sha256, revision, event["occurred_at"],
+                        event["kind"], event_sha256, revision, event["occurred_at"],
                         event["observed_at"], is_tombstone, json.dumps(event),
                     ),
                 )
@@ -449,7 +493,7 @@ class CanonicalPlane:
                            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,true,%s,%s)""",
                         (
                             tenant_id, source_id, document_id, event_id,
-                            artifact["artifact_id"], native_id, raw_sha256, revision,
+                            artifact["artifact_id"], native_id, event_sha256, revision,
                             text_redacted, text_sha256,
                         ),
                     )
@@ -509,28 +553,509 @@ class CanonicalPlane:
         principal_id: str,
         events: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        if not isinstance(events, list) or not 1 <= len(events) <= 500:
+        if (
+            not isinstance(events, list)
+            or not 1 <= len(events) <= MAX_CANONICAL_BATCH_EVENTS
+        ):
             raise CanonicalLifecycleError("canonical_batch_invalid")
+        if (
+            all(event.get("kind") != "tombstone" for event in events)
+            and len({event.get("native_id") for event in events}) == len(events)
+            and len({event.get("source_id") for event in events}) == 1
+        ):
+            return self._ingest_live_batch(
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                events=events,
+            )
         results = []
+        with self.store.connect() as connection:
+            with connection.transaction():
+                for envelope in events:
+                    provenance = envelope.get("provenance", {})
+                    connector_id = provenance.get("connector_id")
+                    artifact_ref = provenance.get("artifact_ref")
+                    text_redacted = json.dumps(
+                        envelope.get("content"),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    )
+                    results.append(self.ingest_document(
+                        tenant_id=tenant_id,
+                        principal_id=principal_id,
+                        connector_id=connector_id,
+                        artifact_ref=artifact_ref,
+                        envelope=envelope,
+                        text_redacted=(
+                            ""
+                            if envelope.get("kind") == "tombstone"
+                            else text_redacted
+                        ),
+                        _connection=connection,
+                    ))
+        return {
+            "status": "committed",
+            "inserted": sum(result["inserted"] for result in results),
+            "duplicate_events": sum(
+                result["duplicate_events"] for result in results
+            ),
+            "receipts": [result["receipt"] for result in results],
+            "replay": all(result["replay"] for result in results),
+        }
+
+    def _ingest_live_batch(
+        self,
+        *,
+        tenant_id: str,
+        principal_id: str,
+        events: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Commit independent live documents with set-based remote SQL.
+
+        Tombstones and duplicate native identities intentionally stay on the
+        lineage-aware sequential path. This path removes per-event database
+        round trips while preserving the same contracts, locks, revisions,
+        artifact checks, receipts, and audit records.
+        """
+        prepared: list[dict[str, Any]] = []
+        artifacts: dict[str, dict[str, Any]] = {}
+        source_ids: set[str] = set()
         for envelope in events:
             provenance = envelope.get("provenance", {})
             connector_id = provenance.get("connector_id")
             artifact_ref = provenance.get("artifact_ref")
+            if not isinstance(connector_id, str) or not IDENTITY_RE.fullmatch(
+                connector_id
+            ):
+                raise CanonicalLifecycleError("canonical_connector_invalid")
+            try:
+                artifact = validate_contract(
+                    artifact_ref,
+                    expected="recall.artifact-ref.v1",
+                )
+                event = validate_envelope(envelope)
+            except (ContractError, ValueError):
+                raise CanonicalLifecycleError("canonical_contract_invalid") from None
+            self._validate_host_identity(
+                tenant_id,
+                principal_id,
+                event.get("source_id"),
+            )
+            source_id = event["source_id"]
+            source_ids.add(source_id)
+            if (
+                artifact["tenant_id"] != tenant_id
+                or artifact["source_id"] != source_id
+                or event["principal_id"] != principal_id
+                or event.get("provenance", {}).get("artifact_ref") != artifact
+            ):
+                raise CanonicalLifecycleError("canonical_lineage_invalid")
             text_redacted = json.dumps(
-                envelope.get("content"),
+                event.get("content"),
                 sort_keys=True,
                 separators=(",", ":"),
                 ensure_ascii=False,
                 allow_nan=False,
             )
-            results.append(self.ingest_document(
-                tenant_id=tenant_id,
-                principal_id=principal_id,
-                connector_id=connector_id,
-                artifact_ref=artifact_ref,
-                envelope=envelope,
-                text_redacted="" if envelope.get("kind") == "tombstone" else text_redacted,
-            ))
+            if len(text_redacted.encode()) > MAX_CANONICAL_TEXT_BYTES:
+                raise CanonicalLifecycleError("canonical_text_invalid")
+            artifact_id = artifact["artifact_id"]
+            prior_artifact = artifacts.get(artifact_id)
+            if prior_artifact is not None and prior_artifact != artifact:
+                raise CanonicalLifecycleError("canonical_artifact_conflict")
+            artifacts[artifact_id] = artifact
+            native_id = event["native_id"]
+            event_sha256 = event["content_sha256"]
+            event_id = _opaque(
+                "evt",
+                tenant_id,
+                source_id,
+                native_id,
+                event_sha256,
+            )
+            prepared.append(
+                {
+                    "source_id": source_id,
+                    "native_id": native_id,
+                    "native_parent_id": event.get("native_parent_id"),
+                    "connector_id": connector_id,
+                    "artifact": artifact,
+                    "event": event,
+                    "event_id": event_id,
+                    "event_sha256": event_sha256,
+                    "identity_sha256": _identity_sha256(
+                        tenant_id,
+                        source_id,
+                        native_id,
+                    ),
+                    "job_id": _opaque(
+                        "job",
+                        tenant_id,
+                        source_id,
+                        connector_id,
+                        event_id,
+                    ),
+                    "document_id": _opaque(
+                        "doc",
+                        tenant_id,
+                        source_id,
+                        event_id,
+                    ),
+                    "text_redacted": text_redacted,
+                    "text_sha256": hashlib.sha256(
+                        text_redacted.encode()
+                    ).hexdigest(),
+                    "chunks": canonical_text_chunks(text_redacted),
+                }
+            )
+        if len(source_ids) != 1:
+            raise CanonicalLifecycleError("canonical_batch_invalid")
+        source_id = next(iter(source_ids))
+        native_ids = [item["native_id"] for item in prepared]
+        lock_keys = sorted(
+            f"v2\x1f{tenant_id}\x1f{source_id}\x1f{native_id}"
+            for native_id in native_ids
+        )
+
+        with self.store.connect() as connection:
+            with connection.transaction():
+                self._register_source(
+                    connection,
+                    tenant_id=tenant_id,
+                    principal_id=principal_id,
+                    source_id=source_id,
+                )
+                forgotten = connection.execute(
+                    """SELECT target_identity_sha256
+                       FROM forget_tombstones
+                       WHERE tenant_id=%s AND source_id=%s
+                         AND target_identity_sha256=ANY(%s)""",
+                    (
+                        tenant_id,
+                        source_id,
+                        [item["identity_sha256"] for item in prepared],
+                    ),
+                ).fetchone()
+                if forgotten:
+                    raise CanonicalLifecycleError("canonical_identity_forgotten")
+                connection.execute(
+                    """SELECT pg_advisory_xact_lock(hashtextextended(value,0))
+                       FROM unnest(%s::text[]) AS lock_key(value)
+                       ORDER BY value""",
+                    (lock_keys,),
+                ).fetchall()
+
+                artifact_rows = [
+                    {
+                        key: artifact[key]
+                        for key in (
+                            "artifact_id",
+                            "storage_backend",
+                            "object_key",
+                            "content_sha256",
+                            "size_bytes",
+                            "media_type",
+                            "encryption",
+                            "version_id",
+                            "created_at",
+                        )
+                    }
+                    for artifact in artifacts.values()
+                ]
+                connection.execute(
+                    """INSERT INTO raw_artifacts(
+                           tenant_id,source_id,artifact_id,storage_backend,object_key,
+                           content_sha256,size_bytes,media_type,encryption,version_id,
+                           created_at
+                       )
+                       SELECT %s,%s,row.artifact_id,row.storage_backend,row.object_key,
+                              row.content_sha256,row.size_bytes,row.media_type,
+                              row.encryption,row.version_id,row.created_at
+                       FROM jsonb_to_recordset(%s::jsonb) AS row(
+                           artifact_id text,storage_backend text,object_key text,
+                           content_sha256 char(64),size_bytes bigint,media_type text,
+                           encryption text,version_id text,created_at timestamptz
+                       )
+                       ON CONFLICT(tenant_id,source_id,artifact_id) DO NOTHING""",
+                    (
+                        tenant_id,
+                        source_id,
+                        json.dumps(artifact_rows),
+                    ),
+                )
+                stored_artifacts = connection.execute(
+                    """SELECT artifact_id,storage_backend,object_key,content_sha256,
+                              size_bytes,media_type,encryption,version_id,state
+                       FROM raw_artifacts
+                       WHERE tenant_id=%s AND source_id=%s
+                         AND artifact_id=ANY(%s)""",
+                    (
+                        tenant_id,
+                        source_id,
+                        list(artifacts),
+                    ),
+                ).fetchall()
+                stored_by_id = {
+                    row["artifact_id"]: row for row in stored_artifacts
+                }
+                for artifact_id, artifact in artifacts.items():
+                    stored = stored_by_id.get(artifact_id)
+                    if (
+                        stored is None
+                        or stored["state"] != "live"
+                        or any(
+                            stored[key] != artifact[key]
+                            for key in (
+                                "storage_backend",
+                                "object_key",
+                                "content_sha256",
+                                "size_bytes",
+                                "media_type",
+                                "encryption",
+                                "version_id",
+                            )
+                        )
+                    ):
+                        raise CanonicalLifecycleError("canonical_artifact_conflict")
+
+                prior_events = connection.execute(
+                    """SELECT native_id,content_sha256,revision
+                       FROM canonical_events
+                       WHERE tenant_id=%s AND source_id=%s
+                         AND native_id=ANY(%s)""",
+                    (tenant_id, source_id, native_ids),
+                ).fetchall()
+                exact_prior = {
+                    (row["native_id"], row["content_sha256"]): row["revision"]
+                    for row in prior_events
+                }
+                max_revision: dict[str, int] = {}
+                for row in prior_events:
+                    max_revision[row["native_id"]] = max(
+                        max_revision.get(row["native_id"], 0),
+                        int(row["revision"]),
+                    )
+                live_rows: list[dict[str, Any]] = []
+                results: list[dict[str, Any]] = []
+                for item in prepared:
+                    prior_revision = exact_prior.get(
+                        (item["native_id"], item["event_sha256"])
+                    )
+                    if prior_revision is not None:
+                        revision = int(prior_revision)
+                        results.append(
+                            {
+                                "inserted": 0,
+                                "duplicate_events": 1,
+                                "revision": revision,
+                                "receipt": (
+                                    f"recall://{source_id}/{item['native_id']}"
+                                    f"?rev={revision}#item=0"
+                                ),
+                                "replay": True,
+                            }
+                        )
+                        continue
+                    revision = max_revision.get(item["native_id"], 0) + 1
+                    item["revision"] = revision
+                    item["receipt"] = (
+                        f"recall://{source_id}/{item['native_id']}"
+                        f"?rev={revision}#item=0"
+                    )
+                    live_rows.append(item)
+                    results.append(
+                        {
+                            "inserted": 1,
+                            "duplicate_events": 0,
+                            "revision": revision,
+                            "receipt": item["receipt"],
+                            "replay": False,
+                        }
+                    )
+
+                if live_rows:
+                    connection.execute(
+                        """UPDATE canonical_documents
+                           SET is_current=false
+                           WHERE tenant_id=%s AND source_id=%s
+                             AND native_id=ANY(%s) AND is_current""",
+                        (
+                            tenant_id,
+                            source_id,
+                            [item["native_id"] for item in live_rows],
+                        ),
+                    )
+                    job_rows = [
+                        {
+                            "job_id": item["job_id"],
+                            "connector_id": item["connector_id"],
+                        }
+                        for item in live_rows
+                    ]
+                    connection.execute(
+                        """INSERT INTO canonical_ingest_jobs(
+                               tenant_id,source_id,job_id,connector_id,mode,status,
+                               attempt,created_at,updated_at
+                           )
+                           SELECT %s,%s,row.job_id,row.connector_id,
+                                  'incremental','committed',1,now(),now()
+                           FROM jsonb_to_recordset(%s::jsonb) AS row(
+                               job_id text,connector_id text
+                           )
+                           ON CONFLICT(tenant_id,source_id,job_id) DO NOTHING""",
+                        (
+                            tenant_id,
+                            source_id,
+                            json.dumps(job_rows),
+                        ),
+                    )
+                    event_rows = [
+                        {
+                            "event_id": item["event_id"],
+                            "native_id": item["native_id"],
+                            "native_parent_id": item["native_parent_id"],
+                            "artifact_id": item["artifact"]["artifact_id"],
+                            "job_id": item["job_id"],
+                            "kind": item["event"]["kind"],
+                            "content_sha256": item["event_sha256"],
+                            "revision": item["revision"],
+                            "occurred_at": item["event"]["occurred_at"],
+                            "observed_at": item["event"]["observed_at"],
+                            "canonical_redacted": item["event"],
+                        }
+                        for item in live_rows
+                    ]
+                    connection.execute(
+                        """INSERT INTO canonical_events(
+                               tenant_id,source_id,event_id,native_id,native_parent_id,
+                               artifact_id,job_id,kind,content_sha256,revision,
+                               occurred_at,observed_at,is_tombstone,canonical_redacted
+                           )
+                           SELECT %s,%s,row.event_id,row.native_id,
+                                  row.native_parent_id,row.artifact_id,row.job_id,
+                                  row.kind,row.content_sha256,row.revision,
+                                  row.occurred_at,row.observed_at,false,
+                                  row.canonical_redacted
+                           FROM jsonb_to_recordset(%s::jsonb) AS row(
+                               event_id text,native_id text,native_parent_id text,
+                               artifact_id text,job_id text,kind text,
+                               content_sha256 char(64),revision integer,
+                               occurred_at timestamptz,observed_at timestamptz,
+                               canonical_redacted jsonb
+                           )""",
+                        (
+                            tenant_id,
+                            source_id,
+                            json.dumps(event_rows),
+                        ),
+                    )
+                    document_rows = [
+                        {
+                            "document_id": item["document_id"],
+                            "event_id": item["event_id"],
+                            "artifact_id": item["artifact"]["artifact_id"],
+                            "native_id": item["native_id"],
+                            "content_sha256": item["event_sha256"],
+                            "revision": item["revision"],
+                            "text_redacted": item["text_redacted"],
+                            "text_sha256": item["text_sha256"],
+                        }
+                        for item in live_rows
+                    ]
+                    connection.execute(
+                        """INSERT INTO canonical_documents(
+                               tenant_id,source_id,document_id,event_id,artifact_id,
+                               native_id,content_sha256,revision,is_current,
+                               text_redacted,text_sha256
+                           )
+                           SELECT %s,%s,row.document_id,row.event_id,row.artifact_id,
+                                  row.native_id,row.content_sha256,row.revision,true,
+                                  row.text_redacted,row.text_sha256
+                           FROM jsonb_to_recordset(%s::jsonb) AS row(
+                               document_id text,event_id text,artifact_id text,
+                               native_id text,content_sha256 char(64),
+                               revision integer,text_redacted text,
+                               text_sha256 char(64)
+                           )""",
+                        (
+                            tenant_id,
+                            source_id,
+                            json.dumps(document_rows),
+                        ),
+                    )
+                    chunk_rows = [
+                        {
+                            "chunk_id": _opaque(
+                                "chk",
+                                tenant_id,
+                                source_id,
+                                item["document_id"],
+                                str(ordinal),
+                            ),
+                            "document_id": item["document_id"],
+                            "ordinal": ordinal,
+                            "receipt": (
+                                f"recall://{source_id}/{item['native_id']}"
+                                f"?rev={item['revision']}#item={ordinal}"
+                            ),
+                            "text_redacted": chunk_text,
+                            "text_sha256": hashlib.sha256(
+                                chunk_text.encode()
+                            ).hexdigest(),
+                        }
+                        for item in live_rows
+                        for ordinal, chunk_text in enumerate(item["chunks"])
+                    ]
+                    connection.execute(
+                        """INSERT INTO canonical_chunks(
+                               tenant_id,source_id,chunk_id,document_id,ordinal,
+                               receipt,text_redacted,text_sha256
+                           )
+                           SELECT %s,%s,row.chunk_id,row.document_id,row.ordinal,
+                                  row.receipt,row.text_redacted,row.text_sha256
+                           FROM jsonb_to_recordset(%s::jsonb) AS row(
+                               chunk_id text,document_id text,ordinal integer,
+                               receipt text,text_redacted text,text_sha256 char(64)
+                           )""",
+                        (
+                            tenant_id,
+                            source_id,
+                            json.dumps(chunk_rows),
+                        ),
+                    )
+                    audit_rows = [
+                        {
+                            "audit_id": _opaque(
+                                "audit",
+                                tenant_id,
+                                source_id,
+                                item["event_id"],
+                                "ingest",
+                            ),
+                            "subject_sha256": item["identity_sha256"],
+                            "byte_count": item["artifact"]["size_bytes"],
+                        }
+                        for item in live_rows
+                    ]
+                    connection.execute(
+                        """INSERT INTO canonical_audit_events(
+                               tenant_id,source_id,audit_id,operation,status,
+                               subject_sha256,item_count,byte_count
+                           )
+                           SELECT %s,%s,row.audit_id,'ingest.commit','success',
+                                  row.subject_sha256,1,row.byte_count
+                           FROM jsonb_to_recordset(%s::jsonb) AS row(
+                               audit_id text,subject_sha256 char(64),
+                               byte_count bigint
+                           )""",
+                        (
+                            tenant_id,
+                            source_id,
+                            json.dumps(audit_rows),
+                        ),
+                    )
         return {
             "status": "committed",
             "inserted": sum(result["inserted"] for result in results),
@@ -559,8 +1084,15 @@ class CanonicalPlane:
                  USING(tenant_id,source_id,artifact_id)
                WHERE event.tenant_id=%s AND event.source_id=%s
                  AND event.native_id=ANY(%s)
+                 AND NOT EXISTS (
+                     SELECT 1 FROM canonical_events retained
+                     WHERE retained.tenant_id=event.tenant_id
+                       AND retained.source_id=event.source_id
+                       AND retained.artifact_id=event.artifact_id
+                       AND NOT (retained.native_id=ANY(%s))
+                 )
                ORDER BY artifact.artifact_id""",
-            (tenant_id, source_id, native_ids),
+            (tenant_id, source_id, native_ids, native_ids),
         ).fetchall()
         return [
             {
@@ -625,6 +1157,7 @@ class CanonicalPlane:
                         "replay": True,
                         "raw_deleted": 0,
                         "projections_deleted": 0,
+                        "evidence_deleted": 0,
                     }
                 target = conn.execute(
                     """SELECT document.native_id
@@ -717,13 +1250,27 @@ class CanonicalPlane:
                          AND artifact.source_id=event.source_id
                          AND artifact.artifact_id=event.artifact_id
                          AND event.tenant_id=%s AND event.source_id=%s
-                         AND event.native_id=ANY(%s) AND artifact.state='live'""",
-                    (tenant_id, source_id, native_ids),
+                         AND event.native_id=ANY(%s) AND artifact.state='live'
+                         AND NOT EXISTS (
+                             SELECT 1 FROM canonical_events retained
+                             WHERE retained.tenant_id=event.tenant_id
+                               AND retained.source_id=event.source_id
+                               AND retained.artifact_id=event.artifact_id
+                               AND NOT (retained.native_id=ANY(%s))
+                         )""",
+                    (tenant_id, source_id, native_ids, native_ids),
                 )
 
+        evidence_deleted = 0
         try:
             for reference in references:
                 self.archive.delete_raw(reference)
+            if self.evidence_projector is not None:
+                evidence_deleted = self.evidence_projector.delete_native_ids(
+                    tenant_id=tenant_id,
+                    source_id=source_id,
+                    native_ids=native_ids,
+                )
         except Exception:
             with self.store.connect() as conn:
                 conn.execute(
@@ -800,4 +1347,5 @@ class CanonicalPlane:
             "replay": False,
             "raw_deleted": len(references),
             "projections_deleted": projection_count,
+            "evidence_deleted": evidence_deleted,
         }

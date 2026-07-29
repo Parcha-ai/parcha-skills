@@ -35,7 +35,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - run: pip install bandit ruff
+      - run: pip install bandit "ruff==0.15.18"
       - run: ruff check desloppify/skills/desloppify/scripts desloppify/scripts desloppify/tests
       - run: bandit -q -lll -r desloppify/skills/desloppify/scripts desloppify/scripts
       - run: npm test

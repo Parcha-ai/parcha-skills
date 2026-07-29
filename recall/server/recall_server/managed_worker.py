@@ -456,7 +456,6 @@ class ManagedConnectorWorker:
                     "error_code": code,
                 }
             embedding = self.retrieval.embed_pending(
-                tenant_id=row["tenant_id"],
                 batch_size=100,
                 max_batches=self.embedding_max_batches,
             )

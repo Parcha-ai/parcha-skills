@@ -22,8 +22,28 @@ Each scan invocation is resumably bounded to 1,000 complete JSONL records or 20
 seconds by default. Override these closed deployment bounds with
 `--max-scan-records` and `--max-scan-seconds`. A bounded slice retains its exact
 byte checkpoint and scan membership, never infers deletion from unvisited files,
-and resumes before it advances to later work. An unchanged rerun reads no record
-bodies and queues no versions.
+and resumes before it advances to later work. Newest-modified sessions are
+visited first so a fresh installation becomes useful while older history
+backfills. An unchanged rerun reads no record bodies and queues no versions.
+
+Canonical archive writes use two concurrent workers by default. Operators can
+set `RECALL_ARCHIVE_WORKERS` or pass `--archive-workers` from 1 through 16 for a
+temporary backfill, subject to the archive and ingest service capacity.
+
+For a large historical text backfill, `--bulk-manifest-archive` (or
+`RECALL_BULK_MANIFEST_ARCHIVE=1`) replaces one archive object per record with one
+content-free manifest per bounded group. Full privacy-transformed record content
+still enters the canonical event/document store; R2 holds only stable native IDs,
+digests, offsets, and format metadata for that group. This keeps exact text
+forget-capable without duplicating transcript prose into a shared object. Configure
+`RECALL_BULK_BUNDLE_RECORDS` from 1 through 10,000, plus the existing scan-record,
+scan-seconds, and interval environment variables. Open/live files may continue on
+the normal path, but both paths apply privacy before archive or spool network I/O.
+
+The canonical writer batches up to 500 events under the same 8 MB request bound.
+Bundle and event identities are deterministic: a crash or replay converges on the
+same artifact and receipts, while a shared manifest is collected only after its
+last event reference is forgotten.
 
 `doctor` reports file coverage, parse/dead-letter rate, pending/acked records,
 committed files, acknowledgement latency p95, last successful Brain ACK, bounded

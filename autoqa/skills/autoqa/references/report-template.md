@@ -12,17 +12,18 @@ release owner, no jargon invented during the run. If BLOCKED, state what failed 
 
 ## Verdict table
 
-| # | Feature | Modality | Entry point | Check | Result | Witness |
-|---|---------|----------|-------------|-------|--------|---------|
-| 1 | Health/boot | API | GET /health | → 200 | PASS | evidence/01-health.txt |
-| 2 | <feature> | UI | <button/route> | <check> | FAIL | evidence/02-<slug>.png |
-| 3 | <feature> | — | <traced> | <not run> | UNTESTED | needs <fixture> |
-| 4 | <feature> | — | none found | — | SKIPPED | unreachable (dead code) |
-| … | | | | | |
+| # | Source | Feature | Modality | Entry point | Check | Result | Witness |
+|---|--------|---------|----------|-------------|-------|--------|---------|
+| 1 | BASE | Health/boot | API | GET /health | → 200 | PASS | evidence/01-health.txt |
+| 2 | DIFF | <changed behavior> | UI | <button/route> | <check> | FAIL | evidence/02-<slug>.png |
+| 3 | BASE | <feature> | — | <traced> | <not run> | UNTESTED | needs <fixture> |
+| 4 | DIFF | <feature> | — | none found | — | SKIPPED | unreachable (dead code) |
+| … | | | | | | |
 
 Results are exactly PASS / FAIL / UNTESTED / SKIPPED. Every row has a witness path that
-resolves and shows the asserted result. State coverage arithmetic: `N discovered / M rows /
-K untested`, and whether this is full-catalog coverage or a smoke pass over headline features.
+resolves and shows the asserted result. Record the user's selected execution groups. State
+coverage arithmetic separately for baseline and diff inventories, then total it; say whether
+this is full-catalog coverage or a scoped pass.
 
 ## Failures — triage
 

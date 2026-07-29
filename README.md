@@ -1,6 +1,6 @@
-# unc-skills
+# parcha-skills
 
-Miguel's collection of portable Agent Skills for Claude Code, Codex, and pi.
+Our collection of portable Agent Skills for Claude Code, Codex, and pi.
 
 [![skills.sh](https://skills.sh/b/miguelrios/unc-skills)](https://skills.sh/miguelrios/unc-skills)
 
@@ -20,13 +20,21 @@ manifests package those same files; there are no Claude/Codex/pi forks to drift 
 
 ## Instruction snippets
 
-[`snippets/`](snippets/) contains small, harness-neutral blocks for always-loaded
-agent instruction files. Unlike skills, snippets do not depend on discovery or
-explicit invocation.
+[`snippets/`](snippets/) contains harness-neutral blocks for always-loaded agent
+instruction files (`AGENTS.md`, `CLAUDE.md`). Skills load on demand through
+discovery or invocation; a snippet applies to every session unconditionally.
+Use a snippet when a rule must hold even in sessions where no skill is loaded.
 
-- [`effective-comms`](snippets/effective-comms/) makes responses answer-first,
-  concrete, structured, and brief by default while preserving safety and
-  completeness exceptions.
+| Snippet | Purpose |
+|---|---|
+| [`effective-comms`](snippets/effective-comms/) | Makes responses answer-first, concrete, structured, and brief by default, and bans marketing rhetoric in technical writing, while preserving safety and completeness exceptions. |
+| [`evidence`](snippets/evidence/) | Ties claims to witnessed evidence and keeps sensitive evidence out of public repositories. |
+| [`control`](snippets/control/) | Preserves user control over consequential actions and gives errors a bounded recovery path. |
+| [`systems-thinking`](snippets/systems-thinking/) | Prevents local fixes from making the larger system worse without blocking bounded work. |
+
+The install commands below cover skills only. To install a snippet, paste its
+`AGENTS.md` block near the top of your root instruction file and keep the
+`<!-- name:start/end -->` markers so tooling can update the block in place.
 
 ## Install with skills.sh
 

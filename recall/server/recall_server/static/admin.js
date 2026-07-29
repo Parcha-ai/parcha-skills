@@ -47,6 +47,50 @@ function renderBrains() {
   });
 }
 
+function renderAccess() {
+  const brains = state.data.brains.filter((brain) =>
+    brain.brain_kind === "company" && ["owner", "admin"].includes(brain.permission)
+  );
+  const select = $("#invite-brain");
+  select.replaceChildren(...brains.map((brain) => {
+    const option = document.createElement("option");
+    option.value = brain.tenant_id;
+    option.textContent = brain.display_name;
+    return option;
+  }));
+  const form = $("#invite-form");
+  [...form.elements].forEach((element) => { element.disabled = !brains.length; });
+  renderInviteEndpoint();
+
+  const target = $("#invitation-list");
+  target.replaceChildren();
+  const invitations = state.data.invitations || [];
+  if (!invitations.length) {
+    target.innerHTML = '<p class="access-empty">No invitations yet. The first teammate can be here in under a minute.</p>';
+    return;
+  }
+  invitations.forEach((item) => {
+    const row = document.createElement("article");
+    row.className = `access-row state-${item.status}`;
+    const canRevoke = ["pending", "active"].includes(item.status);
+    row.innerHTML = `
+      <strong>${escapeText(item.email)}</strong>
+      <span>${escapeText(item.role)}</span>
+      <span class="access-state"><i></i>${escapeText(item.status)}</span>
+      <button type="button" data-invitation-id="${escapeText(item.id)}" ${canRevoke ? "" : "disabled"}>
+        ${item.status === "active" ? "remove" : "revoke"}
+      </button>`;
+    target.append(row);
+  });
+}
+
+function renderInviteEndpoint() {
+  const tenantId = $("#invite-brain").value;
+  $("#invite-endpoint").value = tenantId
+    ? `${window.location.origin}/mcp/brains/${tenantId}`
+    : "";
+}
+
 function escapeText(value) {
   const node = document.createElement("span");
   node.textContent = String(value);
@@ -54,8 +98,13 @@ function escapeText(value) {
 }
 
 function brainOptions() {
-  return state.data.brains.map((brain) =>
-    `<option value="${escapeText(brain.tenant_id)}">${escapeText(brain.display_name)}</option>`
+  const brains = [...state.data.brains].sort((left, right) => {
+    const leftRank = left.brain_kind === "personal" ? 0 : 1;
+    const rightRank = right.brain_kind === "personal" ? 0 : 1;
+    return leftRank - rightRank || left.display_name.localeCompare(right.display_name);
+  });
+  return brains.map((brain) =>
+    `<option value="${escapeText(brain.tenant_id)}">${escapeText(brain.display_name)} · ${escapeText(brain.brain_kind)}</option>`
   ).join("");
 }
 
@@ -172,12 +221,68 @@ function renderInstallations() {
 
 function render() {
   renderBrains();
+  renderAccess();
   renderGoogle();
   renderCatalog();
   renderInstallations();
   $(".pulse").classList.add("ready");
   $("#system-label").textContent = "CONTROL PLANE / READY";
 }
+
+$("#invite-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    const invitation = await api("/admin/api/v1/invitations", {
+      method: "POST",
+      body: JSON.stringify({
+        tenant_id: $("#invite-brain").value,
+        email: $("#invite-email").value,
+        role: $("#invite-role").value,
+      }),
+    });
+    $("#invite-email").value = "";
+    if (invitation.delivery?.status === "sent") {
+      toast("Invitation emailed. OAuth activates access automatically.");
+    } else if (invitation.delivery?.status === "failed") {
+      toast("Invitation created, but email delivery failed. Re-invite to retry.");
+    } else {
+      toast("Invitation ready. Email delivery is not configured; copy the endpoint.");
+    }
+    await load();
+  } catch (error) {
+    toast(`Invitation unchanged: ${error.message}`);
+  }
+});
+
+$("#invite-brain").addEventListener("change", renderInviteEndpoint);
+
+$("#copy-invite-endpoint").addEventListener("click", async () => {
+  const value = $("#invite-endpoint").value;
+  if (!value) return;
+  try {
+    await navigator.clipboard.writeText(value);
+    toast("Company-brain MCP endpoint copied.");
+  } catch (_error) {
+    $("#invite-endpoint").select();
+    toast("Endpoint selected. Copy it from the field.");
+  }
+});
+
+$("#invitation-list").addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-invitation-id]");
+  if (!button || button.disabled) return;
+  if (!window.confirm("Remove this company-brain access immediately?")) return;
+  try {
+    await api(`/admin/api/v1/invitations/${button.dataset.invitationId}/revoke`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    toast("Access revoked. The next MCP request will be denied.");
+    await load();
+  } catch (error) {
+    toast(`Access unchanged: ${error.message}`);
+  }
+});
 
 async function load() {
   try {
@@ -214,8 +319,17 @@ $("#google-form").addEventListener("submit", async (event) => {
       tenant_id: row.querySelector("select").value,
       privacy_mode: "scrub",
       selectors: {},
-    }));
+  }));
   if (!routes.length) return toast("Switch on at least one Google source.");
+  const brainKinds = new Map(
+    state.data.brains.map((brain) => [brain.tenant_id, brain.brain_kind])
+  );
+  if (
+    routes.some((route) => brainKinds.get(route.tenant_id) === "company")
+    && !window.confirm(
+      "Company brains are shared. Selected Google content will be available to authorized company members. Continue?"
+    )
+  ) return;
   const provider = $("#google-auth-provider").value;
   if (provider === "composio" && routes.length !== 1) {
     return toast("Hosted connections authorize one Google source at a time.");

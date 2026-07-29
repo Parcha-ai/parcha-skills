@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import gzip
 import json
 import hashlib
+import os
 import tempfile
 import threading
 import time
@@ -10,7 +12,11 @@ from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from collector.collector import Collector, CollectorRuntimeError
+from collector.collector import (
+    MAX_CANONICAL_BATCH_EVENTS,
+    Collector,
+    CollectorRuntimeError,
+)
 from privacy.policy import PrivacyPolicy
 
 
@@ -90,6 +96,34 @@ class CollectorTest(unittest.TestCase):
     def test_default_archive_concurrency_leaves_capacity_for_ingest(self) -> None:
         collector = self.collector()
         self.assertEqual(collector.archive_workers, 2)
+        collector.close()
+
+    def test_canonical_batch_size_can_reach_safe_server_cap(self) -> None:
+        collector = Collector(
+            root=self.root,
+            harness="claude",
+            source_id="claude:linux:test",
+            spool_path=self.spool,
+            endpoint=self.endpoint,
+            token="test-token-not-a-secret",
+            brain_writer=object(),
+            archive=object(),
+            tenant_id="tenant:test",
+            batch_size=MAX_CANONICAL_BATCH_EVENTS + 1,
+        )
+        self.assertEqual(collector.batch_size, MAX_CANONICAL_BATCH_EVENTS)
+        self.assertEqual(MAX_CANONICAL_BATCH_EVENTS, 1_000)
+        collector.close()
+
+    def test_discovery_prioritizes_newest_sessions_for_backfill_freshness(self) -> None:
+        older = self.root / "older.jsonl"
+        newer = self.root / "newer.jsonl"
+        older.write_text(claude_line("older"))
+        newer.write_text(claude_line("newer"))
+        os.utime(older, ns=(1_000_000_000, 1_000_000_000))
+        os.utime(newer, ns=(2_000_000_000, 2_000_000_000))
+        collector = self.collector()
+        self.assertEqual(collector.discover(), [newer, older])
         collector.close()
 
     def test_committed_cursor_waits_for_ack_and_survives_restart(self) -> None:
@@ -355,7 +389,7 @@ class CollectorTest(unittest.TestCase):
         self.assertNotIn(canary, json.dumps(AckServer.received))
         collector.close()
 
-    def test_canonical_runtime_archives_raw_before_safe_spool_and_ack(self) -> None:
+    def test_canonical_runtime_scrubs_before_archive_spool_and_ack(self) -> None:
         canary = "synthetic-canonical-collector-canary-96"
         (self.root / "session.jsonl").write_text(
             claude_line(f"keep context api_key={canary} after")
@@ -412,11 +446,333 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(collector.scan()["records_queued"], 1)
         self.assertEqual(collector.flush()["acked"], 1)
         self.assertEqual(len(archived), 1)
-        self.assertIn(canary.encode(), archived[0]["payload"])
+        self.assertNotIn(canary.encode(), archived[0]["payload"])
+        self.assertIn(b"keep context", archived[0]["payload"])
         self.assertEqual(len(ingested), 1)
         self.assertIn("artifact_ref", ingested[0]["provenance"])
         self.assertNotIn(canary, json.dumps(ingested))
         self.assertNotIn(canary.encode(), self.spool.read_bytes())
+        collector.close()
+
+    def test_bulk_manifest_archive_is_content_free_and_amortized(self) -> None:
+        (self.root / "session.jsonl").write_text(
+            "".join(claude_line(f"private-record-{index}") for index in range(120))
+        )
+        archived = []
+        ingested = []
+
+        class Archive:
+            def put_raw(self, **kwargs):
+                archived.append(kwargs)
+                digest = hashlib.sha256(kwargs["payload"]).hexdigest()
+                return {
+                    "contract": "recall.artifact-ref.v1",
+                    "schema_version": 1,
+                    "tenant_id": kwargs["tenant_id"],
+                    "source_id": kwargs["source_id"],
+                    "artifact_id": "art_" + digest[:32],
+                    "storage_backend": "s3",
+                    "object_key": "objects/aa/" + digest,
+                    "content_sha256": digest,
+                    "size_bytes": len(kwargs["payload"]),
+                    "media_type": kwargs["media_type"],
+                    "encryption": "sse-s3",
+                    "version_id": "synthetic-version",
+                    "created_at": kwargs["created_at"],
+                }
+
+        class Writer:
+            def ingest(self, events):
+                ingested.extend(events)
+                return {
+                    "status": "committed",
+                    "inserted": len(events),
+                    "duplicate_events": 0,
+                    "receipts": [
+                        f"recall://{event['source_id']}/{event['native_id']}?rev=1"
+                        for event in events
+                    ],
+                    "replay": False,
+                }
+
+        collector = Collector(
+            root=self.root,
+            harness="claude",
+            source_id="claude:linux:test",
+            spool_path=self.spool,
+            endpoint=self.endpoint,
+            token="test-token-not-a-secret",
+            principal_id="owner",
+            privacy=PrivacyPolicy(mode="scrub"),
+            brain_writer=Writer(),
+            archive=Archive(),
+            tenant_id="tenant:personal",
+            bulk_manifest_archive=True,
+            bulk_bundle_records=50,
+        )
+        self.assertEqual(collector.scan()["records_queued"], 120)
+        self.assertEqual(collector.flush()["acked"], 120)
+        self.assertEqual(len(archived), 3)
+        self.assertEqual(len(ingested), 120)
+        for item in archived:
+            self.assertEqual(
+                item["media_type"],
+                "application/vnd.recall.bulk-manifest+json",
+            )
+            self.assertNotIn(b"private-record", item["payload"])
+        artifact_ids = {
+            event["provenance"]["artifact_ref"]["artifact_id"]
+            for event in ingested
+        }
+        self.assertEqual(len(artifact_ids), 3)
+        self.assertTrue(all(
+            event["provenance"]["artifact_member"]["content_sha256"]
+            for event in ingested
+        ))
+        collector.close()
+
+    def test_canonical_writer_byte_budget_splits_base64_wrapped_batches(self) -> None:
+        (self.root / "session.jsonl").write_text(
+            "".join(claude_line("x" * 1_000) for _ in range(6))
+        )
+        ingested_batches = []
+
+        class Archive:
+            def put_raw(self, **kwargs):
+                digest = hashlib.sha256(kwargs["payload"]).hexdigest()
+                return {
+                    "contract": "recall.artifact-ref.v1",
+                    "schema_version": 1,
+                    "tenant_id": kwargs["tenant_id"],
+                    "source_id": kwargs["source_id"],
+                    "artifact_id": "art_" + digest[:32],
+                    "storage_backend": "s3",
+                    "object_key": "objects/aa/" + digest,
+                    "content_sha256": digest,
+                    "size_bytes": len(kwargs["payload"]),
+                    "media_type": kwargs["media_type"],
+                    "encryption": "sse-s3",
+                    "version_id": "synthetic-version",
+                    "created_at": kwargs["created_at"],
+                }
+
+        class Writer:
+            def max_events_payload_bytes(self):
+                return 4_000
+
+            def ingest(self, events):
+                rendered = json.dumps(
+                    events,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+                if len(rendered) > self.max_events_payload_bytes():
+                    raise ValueError("canonical ingest batch exceeds client size limit")
+                ingested_batches.append(events)
+                return {
+                    "status": "committed",
+                    "inserted": len(events),
+                    "duplicate_events": 0,
+                    "receipts": [
+                        f"recall://{event['source_id']}/{event['native_id']}?rev=1"
+                        for event in events
+                    ],
+                    "replay": False,
+                }
+
+        collector = Collector(
+            root=self.root,
+            harness="claude",
+            source_id="claude:linux:test",
+            spool_path=self.spool,
+            endpoint=self.endpoint,
+            token="test-token-not-a-secret",
+            principal_id="owner",
+            privacy=PrivacyPolicy(mode="scrub"),
+            brain_writer=Writer(),
+            archive=Archive(),
+            tenant_id="tenant:personal",
+            bulk_manifest_archive=True,
+        )
+        self.assertEqual(collector.scan()["records_queued"], 6)
+        result = collector.flush()
+        self.assertEqual(result["acked"], 6)
+        self.assertGreater(len(ingested_batches), 1)
+        self.assertTrue(all(
+            len(json.dumps(batch, sort_keys=True, separators=(",", ":")).encode())
+            <= 4_000
+            for batch in ingested_batches
+        ))
+        self.assertIsNone(
+            collector.doctor(include_dead_letters=False)["last_error_code"]
+        )
+        collector.close()
+
+    def test_local_canonical_rejection_is_not_reported_as_unavailable(self) -> None:
+        (self.root / "session.jsonl").write_text(claude_line("safe"))
+
+        class Archive:
+            def put_raw(self, **kwargs):
+                digest = hashlib.sha256(kwargs["payload"]).hexdigest()
+                return {
+                    "contract": "recall.artifact-ref.v1",
+                    "schema_version": 1,
+                    "tenant_id": kwargs["tenant_id"],
+                    "source_id": kwargs["source_id"],
+                    "artifact_id": "art_" + digest[:32],
+                    "storage_backend": "s3",
+                    "object_key": "objects/aa/" + digest,
+                    "content_sha256": digest,
+                    "size_bytes": len(kwargs["payload"]),
+                    "media_type": kwargs["media_type"],
+                    "encryption": "sse-s3",
+                    "version_id": "synthetic-version",
+                    "created_at": kwargs["created_at"],
+                }
+
+        class Writer:
+            def ingest(self, _events):
+                raise ValueError("synthetic local rejection")
+
+        collector = Collector(
+            root=self.root,
+            harness="claude",
+            source_id="claude:linux:test",
+            spool_path=self.spool,
+            endpoint=self.endpoint,
+            token="test-token-not-a-secret",
+            brain_writer=Writer(),
+            archive=Archive(),
+            tenant_id="tenant:personal",
+            privacy=PrivacyPolicy(mode="scrub"),
+        )
+        collector.scan()
+        self.assertEqual(collector.flush()["errors"], 1)
+        self.assertEqual(
+            collector.doctor(include_dead_letters=False)["last_error_code"],
+            "brain_rejected",
+        )
+        collector.close()
+
+    def test_bulk_manifest_mode_recovers_oversized_dead_payload(self) -> None:
+        transcript = self.root / "session.jsonl"
+        canary = "synthetic-secret-value-1234567890"
+        transcript.write_text(
+            claude_line(
+                "keep-start api_key=" + canary + " "
+                + ("x" * 10_000)
+                + " keep-end"
+            )
+        )
+        archived = []
+        ingested = []
+
+        class Archive:
+            def put_raw(self, **kwargs):
+                archived.append(kwargs)
+                digest = hashlib.sha256(kwargs["payload"]).hexdigest()
+                return {
+                    "contract": "recall.artifact-ref.v1",
+                    "schema_version": 1,
+                    "tenant_id": kwargs["tenant_id"],
+                    "source_id": kwargs["source_id"],
+                    "artifact_id": "art_" + digest[:32],
+                    "storage_backend": "s3",
+                    "object_key": "objects/aa/" + digest,
+                    "content_sha256": digest,
+                    "size_bytes": len(kwargs["payload"]),
+                    "media_type": kwargs["media_type"],
+                    "encryption": "sse-s3",
+                    "version_id": "synthetic-version",
+                    "created_at": kwargs["created_at"],
+                }
+
+        class Writer:
+            def ingest(self, events):
+                ingested.extend(events)
+                return {
+                    "status": "committed",
+                    "inserted": len(events),
+                    "duplicate_events": 0,
+                    "receipts": [
+                        f"recall://{event['source_id']}/{event['native_id']}?rev=1"
+                        for event in events
+                    ],
+                    "replay": False,
+                }
+
+        collector = Collector(
+            root=self.root,
+            harness="claude",
+            source_id="claude:linux:test",
+            spool_path=self.spool,
+            endpoint=self.endpoint,
+            token="test-token-not-a-secret",
+            archive=Archive(),
+            brain_writer=Writer(),
+            tenant_id="tenant:personal",
+            bulk_manifest_archive=True,
+            privacy=PrivacyPolicy(mode="scrub"),
+        )
+        collector.scan()
+        archived_before_recovery = len(archived)
+        collector.db.execute(
+            "UPDATE outbox SET state='dead',envelope_json='{}'"
+        )
+        collector.db.commit()
+
+        with (
+            mock.patch("collector.collector.MAX_BATCH_BYTES", 4_000),
+            mock.patch(
+                "collector.collector.OVERSIZED_PROJECTION_TEXT_CHARS",
+                100,
+            ),
+        ):
+            result = collector.flush()
+
+        self.assertEqual(result["recovered"], 1)
+        self.assertEqual(result["unrecoverable"], 0)
+        self.assertEqual(result["errors"], 0)
+        self.assertEqual(len(archived), archived_before_recovery + 1)
+        full = archived[-1]
+        self.assertEqual(
+            full["media_type"],
+            "application/vnd.recall.oversized-record+gzip",
+        )
+        uncompressed = gzip.decompress(full["payload"])
+        self.assertNotIn(canary.encode(), uncompressed)
+        self.assertIn(b"keep-start", uncompressed)
+        self.assertIn(b"keep-end", uncompressed)
+        self.assertEqual(len(ingested), 1)
+        event = ingested[0]
+        self.assertEqual(
+            event["content"]["contract"],
+            "recall.oversized-projection.v1",
+        )
+        self.assertIn("keep-start", event["content"]["head"])
+        self.assertIn("keep-end", event["content"]["tail"])
+        self.assertEqual(event["content"]["archive_encoding"], "gzip")
+        self.assertEqual(
+            event["content"]["full_content_sha256"],
+            hashlib.sha256(uncompressed).hexdigest(),
+        )
+        self.assertEqual(
+            event["content"]["archive_size_bytes"],
+            len(full["payload"]),
+        )
+        self.assertEqual(
+            event["provenance"]["artifact_ref"]["artifact_id"],
+            "art_" + hashlib.sha256(full["payload"]).hexdigest()[:32],
+        )
+        self.assertEqual(
+            collector.doctor(include_dead_letters=False)["dead"],
+            0,
+        )
+        active = collector.db.execute(
+            "SELECT content_sha256,receipt FROM active_records"
+        ).fetchone()
+        self.assertEqual(active["content_sha256"], event["content_sha256"])
+        self.assertIsNotNone(active["receipt"])
         collector.close()
 
     def test_canonical_flush_repairs_and_bounds_legacy_pending_rows(self) -> None:
@@ -491,7 +847,7 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(canonical.flush()["acked"], 51)
         self.assertEqual(len(archived), 51)
         self.assertEqual(len(ingested), 51)
-        self.assertEqual(batch_sizes, [50, 1])
+        self.assertEqual(batch_sizes, [51])
         self.assertTrue(all(
             "artifact_ref" in event["provenance"]
             for event in ingested

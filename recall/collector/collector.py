@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import os
@@ -18,9 +19,10 @@ from privacy.transport import open_no_redirect
 
 COLLECTOR_VERSION = 1
 MAX_BATCH_BYTES = 8_000_000
-MAX_CANONICAL_BATCH_EVENTS = 50
+MAX_CANONICAL_BATCH_EVENTS = 1_000
 DEFAULT_MAX_SCAN_RECORDS = 1_000
 DEFAULT_MAX_SCAN_SECONDS = 20.0
+OVERSIZED_PROJECTION_TEXT_CHARS = 250_000
 SENSITIVE_KEY = re.compile(r"(?:litellm.*master.*key|api[_-]?key|password|secret|authorization|bearer|access[_-]?token|refresh[_-]?token|token)$", re.I)
 SENSITIVE_LINE = re.compile(
     r"(?i)\b(LITELLM_MASTER_KEY|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|password|secret|authorization|bearer|access[_-]?token|refresh[_-]?token|token|key)"
@@ -92,7 +94,9 @@ class Collector:
                  archive: Any = None, tenant_id: str | None = None,
                  archive_workers: int = 2,
                  max_scan_records: int = DEFAULT_MAX_SCAN_RECORDS,
-                 max_scan_seconds: float = DEFAULT_MAX_SCAN_SECONDS):
+                 max_scan_seconds: float = DEFAULT_MAX_SCAN_SECONDS,
+                 bulk_manifest_archive: bool = False,
+                 bulk_bundle_records: int = 500):
         if harness not in {"claude", "codex"}:
             raise ValueError("harness must be claude or codex")
         if visibility not in {"private", "shared"}:
@@ -116,6 +120,15 @@ class Collector:
             or not 0.1 <= float(max_scan_seconds) <= 300.0
         ):
             raise ValueError("max_scan_seconds must be between 0.1 and 300")
+        if type(bulk_manifest_archive) is not bool:
+            raise ValueError("bulk_manifest_archive must be a boolean")
+        if bulk_manifest_archive and archive is None:
+            raise ValueError("bulk manifest archive requires canonical runtime")
+        if (
+            type(bulk_bundle_records) is not int
+            or not 1 <= bulk_bundle_records <= 10_000
+        ):
+            raise ValueError("bulk_bundle_records must be between 1 and 10000")
         self.root = Path(root).expanduser().resolve()
         self.harness = harness
         self.source_id = source_id
@@ -136,6 +149,8 @@ class Collector:
         self.archive_workers = archive_workers
         self.max_scan_records = max_scan_records
         self.max_scan_seconds = float(max_scan_seconds)
+        self.bulk_manifest_archive = bulk_manifest_archive
+        self.bulk_bundle_records = bulk_bundle_records
         self.shard_count = 1
         self.shard_index = 0
         self.spool_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -253,7 +268,12 @@ class Collector:
         if not self.root.exists():
             return []
         pattern = "rollout-*.jsonl" if self.harness == "codex" else "*.jsonl"
-        return sorted(path for path in self.root.rglob(pattern) if path.is_file())
+        paths = [path for path in self.root.rglob(pattern) if path.is_file()]
+        return sorted(
+            paths,
+            key=lambda path: (path.stat().st_mtime_ns, str(path)),
+            reverse=True,
+        )
 
     def _file_key(self, path: Path) -> str:
         relative = str(path.relative_to(self.root))
@@ -265,7 +285,8 @@ class Collector:
 
     def _envelope(self, path: Path, native_id: str, kind: str, content: Any,
                   occurred_at: str, start: int, end: int,
-                  artifact_ref: dict[str, Any] | None = None) -> dict:
+                  artifact_ref: dict[str, Any] | None = None,
+                  artifact_member: dict[str, Any] | None = None) -> dict:
         clean = sanitize(content)
         provenance = {
             "harness": self.harness,
@@ -279,6 +300,8 @@ class Collector:
         }
         if artifact_ref is not None:
             provenance["artifact_ref"] = artifact_ref
+        if artifact_member is not None:
+            provenance["artifact_member"] = artifact_member
         return {
             "schema_version": 1,
             "source_id": self.source_id,
@@ -301,6 +324,7 @@ class Collector:
         native_id: str,
         payload: bytes,
         occurred_at: str,
+        media_type: str = "application/x-ndjson",
     ) -> dict[str, Any] | None:
         if self.archive is None:
             return None
@@ -310,11 +334,136 @@ class Collector:
                 source_id=self.source_id,
                 native_id=native_id,
                 payload=payload,
-                media_type="application/x-ndjson",
+                media_type=media_type,
                 created_at=occurred_at,
             )
         except Exception:
             raise CollectorRuntimeError("archive_unavailable") from None
+
+    def _archive_manifest(
+        self,
+        pending: list[tuple[
+            str, dict[str, Any], str, int, int,
+            Future[dict[str, Any] | None] | None,
+            dict[str, Any] | None,
+        ]],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        records = [
+            {
+                "ordinal": ordinal,
+                "native_id": item[0],
+                "content_sha256": hashlib.sha256(
+                    canonical_json(sanitize(item[1]))
+                ).hexdigest(),
+                "byte_start": item[3],
+                "byte_end": item[4],
+            }
+            for ordinal, item in enumerate(pending)
+        ]
+        payload = canonical_json({
+            "contract": "recall.bulk-manifest.v1",
+            "schema_version": 1,
+            "privacy_policy_version": self.privacy.apply({}).policy_version,
+            "record_count": len(records),
+            "records": records,
+        })
+        digest = hashlib.sha256(payload).hexdigest()
+        reference = self._archive_raw(
+            native_id="bulk-" + digest,
+            payload=payload,
+            occurred_at=min(item[2] for item in pending),
+            media_type="application/vnd.recall.bulk-manifest+json",
+        )
+        if reference is None:
+            raise CollectorRuntimeError("archive_unavailable")
+        return reference, [
+            {
+                "contract": "recall.artifact-member.v1",
+                "schema_version": 1,
+                **record,
+                "manifest_sha256": digest,
+            }
+            for record in records
+        ]
+
+    def _bounded_record_envelope(
+        self,
+        *,
+        path: Path,
+        native_id: str,
+        content: dict[str, Any],
+        occurred_at: str,
+        start: int,
+        end: int,
+        artifact_ref: dict[str, Any] | None = None,
+        artifact_member: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        envelope = self._envelope(
+            path,
+            native_id,
+            "transcript_record",
+            content,
+            occurred_at,
+            start,
+            end,
+            artifact_ref,
+            artifact_member,
+        )
+        target_bytes = max(1_024, int(self._max_batch_bytes() * 0.9))
+        if len(canonical_json(envelope)) <= target_bytes or self.archive is None:
+            return envelope
+
+        full_payload = canonical_json(sanitize(content))
+        full_digest = hashlib.sha256(full_payload).hexdigest()
+        compressed_payload = gzip.compress(
+            full_payload,
+            compresslevel=6,
+            mtime=0,
+        )
+        full_artifact = self._archive_raw(
+            native_id=native_id + ":full",
+            payload=compressed_payload,
+            occurred_at=occurred_at,
+            media_type="application/vnd.recall.oversized-record+gzip",
+        )
+        if full_artifact is None:
+            return envelope
+
+        rendered = full_payload.decode("utf-8")
+        text_chars = min(
+            OVERSIZED_PROJECTION_TEXT_CHARS,
+            max(0, target_bytes // 4),
+        )
+        while True:
+            projection = {
+                "contract": "recall.oversized-projection.v1",
+                "schema_version": 1,
+                "_recall_collector_generation": content.get(
+                    "_recall_collector_generation",
+                    0,
+                ),
+                "content_fidelity": "head_tail",
+                "full_record_available": True,
+                "full_content_sha256": full_digest,
+                "full_size_bytes": len(full_payload),
+                "archive_encoding": "gzip",
+                "archive_size_bytes": len(compressed_payload),
+                "head": rendered[:text_chars],
+                "tail": rendered[-text_chars:] if text_chars else "",
+            }
+            candidate = self._envelope(
+                path,
+                native_id,
+                "transcript_record",
+                projection,
+                occurred_at,
+                start,
+                end,
+                full_artifact,
+            )
+            if len(canonical_json(candidate)) <= target_bytes or text_chars == 0:
+                return candidate
+            text_chars //= 2
 
     def _versioned_record_content(self, native_id: str, content: dict, *, was_active: bool) -> dict:
         clean = sanitize(content)
@@ -383,7 +532,11 @@ class Collector:
             self.flush()
         executor = (
             ThreadPoolExecutor(max_workers=self.archive_workers)
-            if self.archive is not None and self.archive_workers > 1
+            if (
+                self.archive is not None
+                and self.archive_workers > 1
+                and not self.bulk_manifest_archive
+            )
             else None
         )
         try:
@@ -426,32 +579,38 @@ class Collector:
                     dict[str, Any] | None,
                 ]] = []
 
-                def commit_pending() -> None:
+                def commit_item(
+                    item: tuple[
+                        str, dict[str, Any], str, int, int,
+                        Future[dict[str, Any] | None] | None,
+                        dict[str, Any] | None,
+                    ],
+                    *,
+                    shared_artifact: dict[str, Any] | None = None,
+                    artifact_member: dict[str, Any] | None = None,
+                ) -> None:
                     (
-                        native_id,
-                        content,
-                        occurred_at,
-                        line_start,
-                        line_end,
-                        future,
-                        artifact_ref,
-                    ) = pending.pop(0)
+                        native_id, content, occurred_at, line_start, line_end,
+                        future, artifact_ref,
+                    ) = item
                     if future is not None:
                         artifact_ref = future.result()
+                    if shared_artifact is not None:
+                        artifact_ref = shared_artifact
                     versioned_content = self._versioned_record_content(
                         native_id,
                         content,
                         was_active=native_id in old_active,
                     )
-                    envelope = self._envelope(
-                        path,
-                        native_id,
-                        "transcript_record",
-                        versioned_content,
-                        occurred_at,
-                        line_start,
-                        line_end,
-                        artifact_ref,
+                    envelope = self._bounded_record_envelope(
+                        path=path,
+                        native_id=native_id,
+                        content=versioned_content,
+                        occurred_at=occurred_at,
+                        start=line_start,
+                        end=line_end,
+                        artifact_ref=artifact_ref,
+                        artifact_member=artifact_member,
                     )
                     if self._queue(path, envelope, line_end):
                         summary["records_queued"] += 1
@@ -471,6 +630,22 @@ class Collector:
                         self.db.execute(
                             "INSERT OR IGNORE INTO scan_members(path,native_id) VALUES (?,?)",
                             (path_text, native_id),
+                        )
+
+                def commit_pending() -> None:
+                    commit_item(pending.pop(0))
+
+                def commit_bulk() -> None:
+                    if not pending:
+                        return
+                    artifact_ref, members = self._archive_manifest(pending)
+                    items = list(pending)
+                    pending.clear()
+                    for item, member in zip(items, members, strict=True):
+                        commit_item(
+                            item,
+                            shared_artifact=artifact_ref,
+                            artifact_member=member,
                         )
 
                 with path.open("rb") as source:
@@ -513,18 +688,21 @@ class Collector:
                                 self.db.execute("INSERT OR IGNORE INTO scan_members(path,native_id) VALUES (?,?)", (path_text, native_id))
                             continue
                         content = privacy.value
-                        if executor is None:
+                        if self.bulk_manifest_archive:
+                            future = None
+                            artifact_ref = None
+                        elif executor is None:
                             future = None
                             artifact_ref = self._archive_raw(
                                 native_id=native_id,
-                                payload=line,
+                                payload=canonical_json(content),
                                 occurred_at=occurred_at,
                             )
                         else:
                             future = executor.submit(
                                 self._archive_raw,
                                 native_id=native_id,
-                                payload=line,
+                                payload=canonical_json(content),
                                 occurred_at=occurred_at,
                             )
                             artifact_ref = None
@@ -539,17 +717,31 @@ class Collector:
                                 artifact_ref,
                             )
                         )
-                        if len(pending) >= self.archive_workers * 2:
+                        if (
+                            self.bulk_manifest_archive
+                            and len(pending) >= self.bulk_bundle_records
+                        ):
+                            commit_bulk()
+                        elif (
+                            not self.bulk_manifest_archive
+                            and len(pending) >= self.archive_workers * 2
+                        ):
                             commit_pending()
                         if complete_records % 1000 == 0:
-                            while pending:
-                                commit_pending()
+                            if self.bulk_manifest_archive:
+                                commit_bulk()
+                            else:
+                                while pending:
+                                    commit_pending()
                             self._save_file_progress(path_text, stat, current_fingerprint, complete_end, "scanning-" + mode, file_scan_id)
                             self.db.commit()
                             if self.brain_writer is not None:
                                 self.flush()
-                while pending:
-                    commit_pending()
+                if self.bulk_manifest_archive:
+                    commit_bulk()
+                else:
+                    while pending:
+                        commit_pending()
                 if bounded and complete_end < stat.st_size:
                     self._save_file_progress(
                         path_text,
@@ -672,19 +864,28 @@ class Collector:
                     content.get("timestamp"),
                     path.stat().st_mtime,
                 )
-                artifact_ref = self._archive_raw(
+                envelope = self._bounded_record_envelope(
+                    path=path,
                     native_id=row["native_id"],
-                    payload=raw,
+                    content=versioned,
                     occurred_at=occurred_at,
-                )
-                envelope = self._envelope(
-                    path, row["native_id"], "transcript_record", versioned,
-                    occurred_at, row["start_offset"], row["end_offset"],
-                    artifact_ref,
+                    start=row["start_offset"],
+                    end=row["end_offset"],
                 )
                 self.db.execute(
                     "UPDATE outbox SET state='pending',content_sha256=?,envelope_json=?,queued_at=?,acked_at=NULL,receipt=NULL WHERE id=?",
                     (envelope["content_sha256"], canonical_json(envelope).decode(), time.time(), row["id"]),
+                )
+                self.db.execute(
+                    """UPDATE active_records
+                       SET content_sha256=?,receipt=NULL
+                       WHERE path=? AND native_id=? AND content_sha256=?""",
+                    (
+                        envelope["content_sha256"],
+                        row["path"],
+                        row["native_id"],
+                        row["content_sha256"],
+                    ),
                 )
                 self.db.execute(
                     "DELETE FROM dead_letters WHERE path=? AND error_code='PayloadTooLarge'",
@@ -739,6 +940,7 @@ class Collector:
                     if privacy.action == "drop":
                         self.db.execute("DELETE FROM outbox WHERE id=?", (row["id"],))
                         return None
+                    raw = canonical_json(privacy.value)
                     content = envelope["content"]
                     expected_content = dict(content)
                     generation = expected_content.pop(
@@ -843,6 +1045,7 @@ class Collector:
     def flush(self) -> dict:
         recovery = self.recover_dead_payloads() if self.shard_index == 0 else {"recovered": 0, "unrecoverable": 0}
         result = {"batches": 0, "acked": 0, "replayed_batches": 0, "errors": 0, **recovery}
+        max_batch_bytes = self._max_batch_bytes()
         while True:
             raw_candidates = list(self.db.execute(
                 "SELECT * FROM outbox WHERE state='pending' AND (shard_key % ?) = ? ORDER BY id LIMIT ?",
@@ -860,16 +1063,16 @@ class Collector:
             body_size = len(b'{"events":[]}')
             for candidate in candidates:
                 event_size = len(candidate["envelope_json"].encode()) + 1
-                if not rows and event_size > MAX_BATCH_BYTES:
+                if not rows and event_size > max_batch_bytes:
                     with self.db:
                         self.db.execute("UPDATE outbox SET state='dead',envelope_json='{}' WHERE id=?", (candidate["id"],))
                         self.db.execute(
                             "INSERT OR IGNORE INTO dead_letters(path,byte_offset,error_code,error_summary,created_at) VALUES (?,?,?,?,?)",
-                            (candidate["path"], candidate["start_offset"], "PayloadTooLarge", f"sanitized envelope exceeds {MAX_BATCH_BYTES} bytes", time.time()),
+                            (candidate["path"], candidate["start_offset"], "PayloadTooLarge", f"sanitized envelope exceeds {max_batch_bytes} bytes", time.time()),
                         )
                     result["errors"] += 1
                     continue
-                if rows and body_size + event_size > MAX_BATCH_BYTES:
+                if rows and body_size + event_size > max_batch_bytes:
                     break
                 rows.append(candidate)
                 body_size += event_size
@@ -913,6 +1116,10 @@ class Collector:
                 except PermissionError:
                     result["errors"] += 1
                     self._record_error("brain_unauthorized")
+                    return result
+                except ValueError:
+                    result["errors"] += 1
+                    self._record_error("brain_rejected")
                     return result
                 except (OSError, urllib.error.URLError):
                     result["errors"] += 1
@@ -960,6 +1167,16 @@ class Collector:
             result["acked"] += len(rows)
             result["replayed_batches"] += int(bool(acknowledgement.get("replay")))
         return result
+
+    def _max_batch_bytes(self) -> int:
+        maximum = MAX_BATCH_BYTES
+        provider = getattr(self.brain_writer, "max_events_payload_bytes", None)
+        if callable(provider):
+            advertised = provider()
+            if type(advertised) is not int or advertised < 1:
+                raise ValueError("brain writer returned an invalid batch byte limit")
+            maximum = min(maximum, advertised)
+        return maximum
 
     def doctor(self, *, include_dead_letters: bool = True) -> dict:
         disk = {str(path) for path in self.discover()}

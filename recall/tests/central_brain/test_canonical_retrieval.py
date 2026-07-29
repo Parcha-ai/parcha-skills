@@ -30,7 +30,23 @@ class DeadlineStore:
         raise SearchDeadlineExceeded("synthetic canonical deadline")
 
 
+class SemanticRuntime:
+    fingerprint = "synthetic-runtime"
+
+    @staticmethod
+    def embed_query_bounded(_query):
+        return [0.0, 1.0]
+
+
 class CanonicalRetrievalDeadlineTest(unittest.TestCase):
+    def test_date_only_filters_are_normalized_to_utc_boundaries(self) -> None:
+        self.assertEqual(
+            BoundCanonicalRetrieval._filters(
+                {"since": "2026-07-23", "until": "2026-07-25"}
+            )[3:],
+            ("2026-07-23T00:00:00Z", "2026-07-25T00:00:00Z"),
+        )
+
     def test_lexical_deadline_degrades_to_optional_semantic_path(self) -> None:
         store = DeadlineStore()
         started = time.monotonic()
@@ -50,6 +66,41 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
         assert store.deadline_at is not None
         self.assertGreaterEqual(store.deadline_at, started)
         self.assertLessEqual(store.deadline_at, started + 0.1)
+
+    def test_semantic_database_query_uses_the_same_hard_deadline(self) -> None:
+        store = DeadlineStore()
+        store.semantic_runtime = SemanticRuntime()
+        retrieval = BoundCanonicalRetrieval(
+            store,
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=("codex.jsonl:test",),
+        )
+
+        result = retrieval.search("synthetic canonical deadline query")
+
+        self.assertEqual(result["results"], [])
+        self.assertEqual(result["diagnostics"]["lexical_mode"], "deadline-exceeded")
+        self.assertEqual(
+            result["diagnostics"]["semantic_status"],
+            "deadline-exceeded",
+        )
+
+    def test_session_expansion_uses_the_caller_deadline(self) -> None:
+        store = DeadlineStore()
+        retrieval = BoundCanonicalRetrieval(
+            store,
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=("codex.jsonl:test",),
+        )
+
+        with self.assertRaises(SearchDeadlineExceeded):
+            retrieval.session_context(
+                "recall://canonical/test",
+                _deadline_at=time.monotonic() + 0.025,
+            )
+        self.assertIsNotNone(store.deadline_at)
 
 
 if __name__ == "__main__":

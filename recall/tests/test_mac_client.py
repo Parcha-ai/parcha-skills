@@ -19,8 +19,11 @@ from client.mac import (
     CanonicalBrainWriter,
     CanonicalClientError,
     ExportImporter,
+    MAX_CANONICAL_INGEST_EVENTS,
+    MAX_INGEST_BYTES,
     MemoryClient,
     PrivacyError,
+    canonical_json,
     dry_run_manifest,
     load_file_token,
 )
@@ -231,6 +234,54 @@ class BrainEndpointValidationTest(unittest.TestCase):
 
 
 class CanonicalV2ClientTest(unittest.TestCase):
+    def test_writer_sends_exactly_one_thousand_events(self) -> None:
+        writer = CanonicalBrainWriter(
+            endpoint="https://brain.example.invalid",
+            token="synthetic",
+            source_id="source:personal",
+            tenant_id="tenant:personal",
+            principal_id="principal:owner",
+        )
+        events = [
+            {
+                "source_id": "source:personal",
+                "native_id": f"native:{index}",
+                "principal_id": "principal:owner",
+                "provenance": {"artifact_ref": {"artifact_id": "synthetic"}},
+            }
+            for index in range(MAX_CANONICAL_INGEST_EVENTS)
+        ]
+        requests = []
+
+        def open_request(request, **_kwargs):
+            requests.append(request)
+            return FakeResponse(201, {
+                "status": "committed",
+                "inserted": len(events),
+                "duplicate_events": 0,
+                "receipts": [
+                    f"recall://source:personal/native:{index}?rev=1"
+                    for index in range(len(events))
+                ],
+                "replay": False,
+            })
+
+        with mock.patch(
+            "client.mac.open_no_redirect",
+            side_effect=open_request,
+        ):
+            acknowledgement = writer.ingest(events)
+
+        self.assertEqual(MAX_CANONICAL_INGEST_EVENTS, 1_000)
+        self.assertEqual(acknowledgement["inserted"], 1_000)
+        body = json.loads(requests[0].data)
+        self.assertEqual(
+            len(json.loads(base64.b64decode(body["events_base64"]))),
+            1_000,
+        )
+        with self.assertRaisesRegex(ValueError, "batch is invalid"):
+            writer.ingest([*events, events[0]])
+
     def test_archive_then_canonical_writer_use_closed_tenant_scoped_routes(self) -> None:
         requests = []
         raw_payload = b'{"raw":"RAW_ARCHIVE_CANARY"}'
@@ -271,6 +322,23 @@ class CanonicalV2ClientTest(unittest.TestCase):
         }
         archive = CanonicalArchiveClient(**common)
         writer = CanonicalBrainWriter(**common)
+        maximum_events_payload = writer.max_events_payload_bytes()
+        empty_body = canonical_json({
+            "tenant_id": common["tenant_id"],
+            "principal_id": common["principal_id"],
+            "source_id": common["source_id"],
+            "events_base64": "",
+        })
+        self.assertLessEqual(
+            len(empty_body)
+            + len(base64.b64encode(b"x" * maximum_events_payload)),
+            MAX_INGEST_BYTES,
+        )
+        self.assertGreater(
+            len(empty_body)
+            + len(base64.b64encode(b"x" * (maximum_events_payload + 1))),
+            MAX_INGEST_BYTES,
+        )
         with mock.patch("client.mac.open_no_redirect", side_effect=open_request):
             reference = archive.put_raw(
                 tenant_id="tenant:personal",
