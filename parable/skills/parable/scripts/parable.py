@@ -103,7 +103,7 @@ CLAUDE_AUTO_COMPACT_PCT_ENV = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
 # leaves roughly 74k before the Codex effective window (353.4k).
 CLAUDE_AUTO_COMPACT_PCT = 75
 PARABLE_WELCOME_ENV = "PARABLE_WELCOME_MESSAGE"
-PARABLE_ACTIVE_AGENTS_ENV = "PARABLE_ACTIVE_AGENTS_JSON"
+PARABLE_AGENT_STATE_ENV = "PARABLE_AGENT_STATE_JSON"
 PARABLE_WELCOME_PLUGIN = Path(__file__).resolve().parent.parent / "runtime" / "welcome-plugin"
 PARABLE_ASCII = (
     "                        _     _            _     ",
@@ -498,13 +498,15 @@ def claude_cast_availability(cfg: dict, available: set[str],
     """Classify generated exact-model agents for this launch snapshot."""
     active: list[dict[str, str]] = []
     unavailable: list[dict[str, str]] = []
+    parent: list[dict[str, str]] = []
     for executor_id, executor in sorted(custom_claude_executors(cfg).items()):
         model = executor["model"]
-        if model == brain_model:
-            continue
         item = {"name": agent_slug(executor_id), "model": model}
+        if model == brain_model:
+            parent.append(item)
+            continue
         (active if model in available else unavailable).append(item)
-    return {"active": active, "unavailable": unavailable}
+    return {"active": active, "unavailable": unavailable, "parent": parent}
 
 
 def proxy_models_endpoint(base_url: str) -> str:
@@ -578,7 +580,7 @@ def build_claude_launch(cfg: dict, forwarded: list[str], environ: dict[str, str]
         "CLAUDE_CODE_OAUTH_TOKEN",
         "CLAUDE_CODE_SUBAGENT_MODEL",
         PARABLE_WELCOME_ENV,
-        PARABLE_ACTIVE_AGENTS_ENV,
+        PARABLE_AGENT_STATE_ENV,
     ):
         launch_env.pop(inherited, None)
     if solo:
@@ -961,13 +963,15 @@ def add_claude_welcome(argv: list[str], launch_env: dict[str, str], cfg: dict,
     ):
         raise ValueError("Parable welcome plugin is missing or unsafe; reinstall Parable")
     env = dict(launch_env)
-    active_agents = [] if solo else [
-        item["name"]
-        for item in claude_cast_availability(cfg, available, brain_model)["active"]
-    ]
-    env[PARABLE_ACTIVE_AGENTS_ENV] = json.dumps(
-        active_agents, separators=(",", ":")
+    availability = (
+        {"active": [], "unavailable": [], "parent": []}
+        if solo else claude_cast_availability(cfg, available, brain_model)
     )
+    agent_state = {
+        status: [item["name"] for item in availability[status]]
+        for status in ("active", "unavailable", "parent")
+    }
+    env[PARABLE_AGENT_STATE_ENV] = json.dumps(agent_state, separators=(",", ":"))
     if not is_print:
         env[PARABLE_WELCOME_ENV] = (
             render_claude_solo_welcome(cfg, brain_model, decision)
@@ -1032,10 +1036,10 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         print(f"parable: {exc}", file=sys.stderr)
         return 1
     cast = exact_named_cast(cfg)
-    parent_fallback = brain_model != cfg["claude"]["brain_model"]
+    configured_parent_unavailable = cfg["claude"]["brain_model"] not in available
     report = {
         "ready": True,
-        "degraded": parent_fallback or bool(availability["unavailable"]),
+        "degraded": configured_parent_unavailable or bool(availability["unavailable"]),
         "configuredParentModel": cfg["claude"]["brain_model"],
         "parentModel": brain_model,
         "agents": cast,

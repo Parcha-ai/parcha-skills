@@ -22,7 +22,7 @@ REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "skills" / "parable" / "scripts" / "parable.py"
 NODE = shutil.which("node") or "node"
 PROXY_COMMIT = "cade44b9cdee6b9328ea2648fd119129fdf11e2d"
-PROXY_PATCH_SHA256 = "6fc4938f05991926b72ed5e85e0e4011fb570fec0490dff0691e792e5cb94c8d"
+PROXY_PATCH_SHA256 = "c0b4c52d4b35040427e1aee0067c99da7068598803604c435ad591d577b2dc5d"
 
 FAKE_CODEX = """#!/usr/bin/env bash
 cat > /dev/null   # drain the plan from stdin like the real binary
@@ -51,7 +51,7 @@ capture = {
     "argv": sys.argv[1:],
     "base_url": os.environ.get("ANTHROPIC_BASE_URL"),
     "welcome_message": os.environ.get("PARABLE_WELCOME_MESSAGE"),
-    "active_agents": os.environ.get("PARABLE_ACTIVE_AGENTS_JSON"),
+    "agent_state": os.environ.get("PARABLE_AGENT_STATE_JSON"),
     "auth_token_present": bool(os.environ.get("ANTHROPIC_AUTH_TOKEN")),
     "source_token_present": any(
         key in os.environ for key in ("PARABLE_PROXY_TOKEN", "CLIPROXY_API_KEY")
@@ -299,7 +299,12 @@ class TestClaudeSubscriptionLauncher(unittest.TestCase):
             self.assertTrue(captured["auth_token_present"])
             self.assertFalse(captured["source_token_present"])
             self.assertEqual(
-                json.loads(captured["active_agents"]), ["parable-kimi"]
+                json.loads(captured["agent_state"]),
+                {
+                    "active": ["parable-kimi"],
+                    "unavailable": [],
+                    "parent": [],
+                },
             )
             self.assertEqual(
                 captured["inherited"],
@@ -333,7 +338,14 @@ class TestClaudeSubscriptionLauncher(unittest.TestCase):
                 "degraded: parable-kimi unavailable for this session", proc.stdout
             )
             captured = json.loads(capture.read_text())
-            self.assertEqual(json.loads(captured["active_agents"]), [])
+            self.assertEqual(
+                json.loads(captured["agent_state"]),
+                {
+                    "active": [],
+                    "unavailable": ["parable-kimi"],
+                    "parent": [],
+                },
+            )
             agent = repo / ".claude" / "agents" / "parable-kimi.md"
             self.assertTrue(agent.is_file())
             self.assertIn('model: "kimi-k3"', agent.read_text())
@@ -378,8 +390,12 @@ model = "claude-fable-5"
                 automatic.stdout,
             )
             self.assertEqual(
-                json.loads(json.loads(capture.read_text())["active_agents"]),
-                [],
+                json.loads(json.loads(capture.read_text())["agent_state"]),
+                {
+                    "active": [],
+                    "unavailable": ["parable-fable-exact", "parable-kimi"],
+                    "parent": ["parable-sol-exact"],
+                },
             )
             finalized = subprocess.run(
                 [
@@ -780,16 +796,16 @@ exit 0
 
 class TestClaudeAgentModelGuard(unittest.TestCase):
     def run_guard(self, payload: object,
-                  active_agents: list[str] | object | None = None
+                  state: object | None = None
                   ) -> subprocess.CompletedProcess:
         guard = (
             REPO / "skills" / "parable" / "runtime" / "welcome-plugin"
             / "scripts" / "model_guard.py"
         )
         env = dict(os.environ)
-        env.pop("PARABLE_ACTIVE_AGENTS_JSON", None)
-        if active_agents is not None:
-            env["PARABLE_ACTIVE_AGENTS_JSON"] = json.dumps(active_agents)
+        env.pop("PARABLE_AGENT_STATE_JSON", None)
+        if state is not None:
+            env["PARABLE_AGENT_STATE_JSON"] = json.dumps(state)
         return subprocess.run(
             ["python3", str(guard)],
             input=json.dumps(payload),
@@ -849,7 +865,11 @@ class TestClaudeAgentModelGuard(unittest.TestCase):
                 "prompt": "inspect",
             },
         }
-        result = self.run_guard(payload, active_agents=["parable-kimi"])
+        result = self.run_guard(payload, state={
+            "active": ["parable-kimi"],
+            "unavailable": ["parable-haiku-exact"],
+            "parent": [],
+        })
         decision = json.loads(result.stdout)["hookSpecificOutput"]
         self.assertEqual(decision["permissionDecision"], "deny")
         self.assertIn("unavailable in this Parable session",
@@ -865,7 +885,11 @@ class TestClaudeAgentModelGuard(unittest.TestCase):
                 "prompt": "build",
             },
         }
-        result = self.run_guard(payload, active_agents=["parable-kimi"])
+        result = self.run_guard(payload, state={
+            "active": ["parable-kimi"],
+            "unavailable": [],
+            "parent": [],
+        })
         decision = json.loads(result.stdout)["hookSpecificOutput"]
         self.assertEqual(decision["permissionDecision"], "allow")
         self.assertNotIn("model", decision["updatedInput"])
@@ -879,9 +903,27 @@ class TestClaudeAgentModelGuard(unittest.TestCase):
                 "prompt": "build",
             },
         }
-        result = self.run_guard(payload, active_agents={"not": "a list"})
+        result = self.run_guard(payload, state={"not": "the state schema"})
         decision = json.loads(result.stdout)["hookSpecificOutput"]
         self.assertEqual(decision["permissionDecision"], "deny")
+
+    def test_parent_model_agent_is_blocked_with_accurate_reason(self):
+        payload = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Agent",
+            "tool_input": {
+                "subagent_type": "parable-sol-exact",
+                "prompt": "delegate back",
+            },
+        }
+        result = self.run_guard(payload, state={
+            "active": [],
+            "unavailable": [],
+            "parent": ["parable-sol-exact"],
+        })
+        decision = json.loads(result.stdout)["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "deny")
+        self.assertIn("current parent model", decision["permissionDecisionReason"])
 
 
 class TestFirstRunSetup(unittest.TestCase):

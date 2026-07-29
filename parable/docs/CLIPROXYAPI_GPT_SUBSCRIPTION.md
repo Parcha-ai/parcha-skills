@@ -256,7 +256,7 @@ an existing checkout. The build stops before
 | Item | Pin |
 |---|---|
 | CLIProxyAPI base | `v7.2.103` / `cade44b9cdee6b9328ea2648fd119129fdf11e2d` |
-| Vendored patch SHA-256 | `6fc4938f05991926b72ed5e85e0e4011fb570fec0490dff0691e792e5cb94c8d` |
+| Vendored patch SHA-256 | `c0b4c52d4b35040427e1aee0067c99da7068598803604c435ad591d577b2dc5d` |
 | Verified toolchain | Go `1.26.0` |
 | Verified harness | Claude Code `2.1.220` |
 

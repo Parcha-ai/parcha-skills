@@ -185,7 +185,7 @@ class TestClaudeLaunch(unittest.TestCase):
         self.assertNotIn("ANTHROPIC_API_KEY", env)
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", env)
         self.assertNotIn("CLAUDE_CODE_SUBAGENT_MODEL", env)
-        self.assertNotIn(parable.PARABLE_ACTIVE_AGENTS_ENV, env)
+        self.assertNotIn(parable.PARABLE_AGENT_STATE_ENV, env)
         self.assertIn("CLAUDE_CODE_SUBAGENT_MODEL", source)
 
     def test_forwarded_model_override_is_rejected(self):
@@ -218,8 +218,12 @@ class TestClaudeLaunch(unittest.TestCase):
         self.assertEqual(interactive_env[parable.PARABLE_WELCOME_ENV].splitlines()[0],
                          parable.PARABLE_ASCII[0])
         self.assertEqual(
-            json.loads(interactive_env[parable.PARABLE_ACTIVE_AGENTS_ENV]),
-            ["parable-kimi"],
+            json.loads(interactive_env[parable.PARABLE_AGENT_STATE_ENV]),
+            {
+                "active": ["parable-kimi"],
+                "unavailable": [],
+                "parent": ["parable-fable-exact"],
+            },
         )
         print_argv, print_env = parable.add_claude_welcome(
             argv, {}, cfg, "claude-fable-5", "explicit fable parent", available,
@@ -234,8 +238,12 @@ class TestClaudeLaunch(unittest.TestCase):
         )
         self.assertNotIn(parable.PARABLE_WELCOME_ENV, print_env)
         self.assertEqual(
-            json.loads(print_env[parable.PARABLE_ACTIVE_AGENTS_ENV]),
-            ["parable-kimi"],
+            json.loads(print_env[parable.PARABLE_AGENT_STATE_ENV]),
+            {
+                "active": ["parable-kimi"],
+                "unavailable": [],
+                "parent": ["parable-fable-exact"],
+            },
         )
 
         degraded = parable.render_claude_welcome(
@@ -597,6 +605,7 @@ class TestClaudeLaunch(unittest.TestCase):
                 "unavailable": [
                     {"name": "parable-kimi", "model": "kimi-k3"}
                 ],
+                "parent": [],
             },
         )
 
