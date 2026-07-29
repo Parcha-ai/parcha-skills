@@ -1,6 +1,6 @@
-# unc-skills
+# parcha-skills
 
-Miguel's collection of portable Agent Skills for Claude Code, Codex, and pi.
+Our collection of portable Agent Skills for Claude Code, Codex, and pi.
 
 [![skills.sh](https://skills.sh/b/miguelrios/unc-skills)](https://skills.sh/miguelrios/unc-skills)
 
