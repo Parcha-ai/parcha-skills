@@ -51,6 +51,7 @@ capture = {
     "argv": sys.argv[1:],
     "base_url": os.environ.get("ANTHROPIC_BASE_URL"),
     "welcome_message": os.environ.get("PARABLE_WELCOME_MESSAGE"),
+    "active_agents": os.environ.get("PARABLE_ACTIVE_AGENTS_JSON"),
     "auth_token_present": bool(os.environ.get("ANTHROPIC_AUTH_TOKEN")),
     "source_token_present": any(
         key in os.environ for key in ("PARABLE_PROXY_TOKEN", "CLIPROXY_API_KEY")
@@ -298,6 +299,9 @@ class TestClaudeSubscriptionLauncher(unittest.TestCase):
             self.assertTrue(captured["auth_token_present"])
             self.assertFalse(captured["source_token_present"])
             self.assertEqual(
+                json.loads(captured["active_agents"]), ["parable-kimi"]
+            )
+            self.assertEqual(
                 captured["inherited"],
                 {
                     "ANTHROPIC_API_KEY": False,
@@ -312,7 +316,7 @@ class TestClaudeSubscriptionLauncher(unittest.TestCase):
             self.assertNotIn(token, agent.read_text())
             self.assertNotIn(token, (repo / "parable.toml").read_text())
 
-    def test_launcher_fails_closed_when_a_routed_model_is_absent(self):
+    def test_launcher_degrades_when_an_optional_routed_model_is_absent(self):
         with tempfile.TemporaryDirectory() as tmp, model_server(
             ["gpt-5.6-sol"]
         ) as (_server, base_url, token):
@@ -324,10 +328,87 @@ class TestClaudeSubscriptionLauncher(unittest.TestCase):
                 ["node", str(REPO / "bin" / "parable.js"), "claude", "--print", "hello"],
                 cwd=repo, env=env, capture_output=True, text=True, timeout=60,
             )
-            self.assertNotEqual(proc.returncode, 0)
-            self.assertIn("proxy model catalog is missing: kimi-k3", proc.stderr)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn(
+                "degraded: parable-kimi unavailable for this session", proc.stdout
+            )
+            captured = json.loads(capture.read_text())
+            self.assertEqual(json.loads(captured["active_agents"]), [])
+            agent = repo / ".claude" / "agents" / "parable-kimi.md"
+            self.assertTrue(agent.is_file())
+            self.assertIn('model: "kimi-k3"', agent.read_text())
+
+    def test_auto_falls_back_but_explicit_unavailable_parent_fails(self):
+        with tempfile.TemporaryDirectory() as tmp, model_server(
+            ["gpt-5.6-sol"]
+        ) as (_server, base_url, token):
+            bindir = fake_bin(tmp)
+            repo = self.make_claude_repo(tmp, base_url)
+            config = (repo / "parable.toml").read_text()
+            config = config.replace(
+                'brain_model = "gpt-5.6-sol"',
+                'brain_model = "claude-fable-5"',
+            )
+            config += """
+
+[executors.sol_exact]
+provider = "claude"
+model = "gpt-5.6-sol"
+
+[executors.fable_exact]
+provider = "claude"
+model = "claude-fable-5"
+"""
+            (repo / "parable.toml").write_text(config)
+            capture = Path(tmp) / "capture.json"
+            env = self.launch_env(tmp, bindir, capture, token)
+
+            automatic = subprocess.run(
+                [
+                    "node", str(REPO / "bin" / "parable.js"),
+                    "claude", "--brain", "auto", "--print", "hello",
+                ],
+                cwd=repo, env=env, capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(
+                automatic.returncode, 0, automatic.stdout + automatic.stderr
+            )
+            self.assertIn(
+                "brain: gpt-5.6-sol (Fable is unavailable; using Sol)",
+                automatic.stdout,
+            )
+            self.assertEqual(
+                json.loads(json.loads(capture.read_text())["active_agents"]),
+                [],
+            )
+            finalized = subprocess.run(
+                [
+                    "python3", str(SCRIPT), "finalize", "--json",
+                ],
+                cwd=repo, env=env, capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(
+                finalized.returncode, 0, finalized.stdout + finalized.stderr
+            )
+            report = json.loads(finalized.stdout)
+            self.assertTrue(report["degraded"])
+            self.assertEqual(report["configuredParentModel"], "claude-fable-5")
+            self.assertEqual(report["parentModel"], "gpt-5.6-sol")
+
+            capture.unlink()
+            explicit = subprocess.run(
+                [
+                    "node", str(REPO / "bin" / "parable.js"),
+                    "claude", "--brain", "fable", "--print", "hello",
+                ],
+                cwd=repo, env=env, capture_output=True, text=True, timeout=60,
+            )
+            self.assertNotEqual(explicit.returncode, 0)
+            self.assertIn(
+                "--brain fable model 'claude-fable-5' is unavailable",
+                explicit.stderr,
+            )
             self.assertFalse(capture.exists())
-            self.assertFalse((repo / ".claude" / "agents" / "parable-kimi.md").exists())
 
     def test_agent_sync_is_idempotent_cleans_stale_and_preserves_unrelated(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -502,7 +583,7 @@ exit 0
             self.assertEqual(first.stdout.count(handoff), 1)
             self.assertIn(launch, first.stdout)
 
-            installed = home / ".local" / "share" / "parable" / "0.1.21"
+            installed = home / ".local" / "share" / "parable" / "0.1.22"
             durable = home / ".local" / "bin" / "parable"
             self.assertTrue((installed / "bin" / "parable.js").is_file())
             self.assertTrue((installed / "lib" / "onboarding.js").is_file())
@@ -698,14 +779,21 @@ exit 0
 
 
 class TestClaudeAgentModelGuard(unittest.TestCase):
-    def run_guard(self, payload: object) -> subprocess.CompletedProcess:
+    def run_guard(self, payload: object,
+                  active_agents: list[str] | object | None = None
+                  ) -> subprocess.CompletedProcess:
         guard = (
             REPO / "skills" / "parable" / "runtime" / "welcome-plugin"
             / "scripts" / "model_guard.py"
         )
+        env = dict(os.environ)
+        env.pop("PARABLE_ACTIVE_AGENTS_JSON", None)
+        if active_agents is not None:
+            env["PARABLE_ACTIVE_AGENTS_JSON"] = json.dumps(active_agents)
         return subprocess.run(
             ["python3", str(guard)],
             input=json.dumps(payload),
+            env=env,
             capture_output=True,
             text=True,
             timeout=10,
@@ -751,6 +839,49 @@ class TestClaudeAgentModelGuard(unittest.TestCase):
                 })
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, "")
+
+    def test_session_snapshot_blocks_unavailable_managed_agent(self):
+        payload = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Agent",
+            "tool_input": {
+                "subagent_type": "parable-haiku-exact",
+                "prompt": "inspect",
+            },
+        }
+        result = self.run_guard(payload, active_agents=["parable-kimi"])
+        decision = json.loads(result.stdout)["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "deny")
+        self.assertIn("unavailable in this Parable session",
+                      decision["permissionDecisionReason"])
+
+    def test_active_session_agent_still_uses_frontmatter_model(self):
+        payload = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Agent",
+            "tool_input": {
+                "subagent_type": "parable-kimi",
+                "model": "haiku",
+                "prompt": "build",
+            },
+        }
+        result = self.run_guard(payload, active_agents=["parable-kimi"])
+        decision = json.loads(result.stdout)["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "allow")
+        self.assertNotIn("model", decision["updatedInput"])
+
+    def test_malformed_session_snapshot_fails_closed_for_managed_agent(self):
+        payload = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Agent",
+            "tool_input": {
+                "subagent_type": "parable-kimi",
+                "prompt": "build",
+            },
+        }
+        result = self.run_guard(payload, active_agents={"not": "a list"})
+        decision = json.loads(result.stdout)["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "deny")
 
 
 class TestFirstRunSetup(unittest.TestCase):
@@ -2204,7 +2335,9 @@ for flag, (vendor, record_type) in mapping.items():
                 {item["name"]: item["model"] for item in report["agents"]},
                 expected_agents,
             )
-            self.assertEqual(report["catalog"]["requiredCount"], 9)
+            self.assertEqual(report["catalog"]["configuredCount"], 9)
+            self.assertFalse(report["degraded"])
+            self.assertEqual(report["unavailableAgents"], [])
             self.assertEqual(
                 report["next"],
                 "parable",
@@ -2394,7 +2527,7 @@ for flag, (vendor, record_type) in mapping.items():
                 ],
             )
 
-    def test_finalize_subset_and_missing_exact_id_fail_closed_without_aliases(self):
+    def test_finalize_subset_and_missing_optional_exact_id_degrades_without_aliases(self):
         with tempfile.TemporaryDirectory() as tmp, model_server([
             "claude-fable-5", "claude-sonnet-5", "claude-opus-4-8",
             "claude-haiku-4-5-20251001",
@@ -2448,7 +2581,7 @@ for flag, (vendor, record_type) in mapping.items():
             )
             explicit_sol = self.run_cli(repo, env, "claude", "--brain", "sol")
             self.assertNotEqual(explicit_sol.returncode, 0)
-            self.assertIn("requires configured catalog model 'gpt-5.6-sol'", explicit_sol.stderr)
+            self.assertIn("requires configured model 'gpt-5.6-sol'", explicit_sol.stderr)
 
         misleading = [
             "gpt-5.6-sol",
@@ -2483,13 +2616,18 @@ for flag, (vendor, record_type) in mapping.items():
             self.assertEqual(setup.returncode, 0, setup.stdout + setup.stderr)
             server.expected_token = self.setup_token(home)
             finalized = self.run_cli(repo, env, "setup", "finalize", "--json")
-            self.assertNotEqual(finalized.returncode, 0)
-            self.assertIn("proxy model catalog is missing: grok-4.5", finalized.stderr)
-            agents = repo / ".claude" / "agents"
+            self.assertEqual(finalized.returncode, 0, finalized.stdout + finalized.stderr)
+            report = json.loads(finalized.stdout)
+            self.assertTrue(report["ready"])
+            self.assertTrue(report["degraded"])
             self.assertEqual(
-                sorted(path.name for path in agents.iterdir()),
-                ["handwritten.md", "parable-handwritten.md"],
+                report["unavailableAgents"],
+                [{"name": "parable-grok", "model": "grok-4.5"}],
             )
+            agents = repo / ".claude" / "agents"
+            self.assertTrue((agents / "parable-grok.md").is_file())
+            self.assertTrue((agents / "handwritten.md").is_file())
+            self.assertTrue((agents / "parable-handwritten.md").is_file())
             self.assertFalse(claude_capture.exists())
 
 
@@ -2705,7 +2843,7 @@ finally:
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             report = json.loads(proc.stdout)
             self.assertTrue(report["ready"])
-            self.assertEqual(report["catalog"]["requiredCount"], len(self.MODELS))
+            self.assertEqual(report["catalog"]["configuredCount"], len(self.MODELS))
             events = self.events(case)
             self.assertEqual(events[0]["argv"][-1], "--local-model")
             self.assertTrue(any(item["event"] == "signal" for item in events))

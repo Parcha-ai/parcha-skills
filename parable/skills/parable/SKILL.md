@@ -178,7 +178,11 @@ bare `parable` (multi-model mode), which selects the automatic brain policy at h
 `parable --solo <model>` (solo mode). Ordinary skill-first subscription onboarding is one
 `parable.sh` run followed by that fresh-terminal launch command. Setup delegates
 native vendor authorization; the launcher starts or reuses the loopback proxy,
-checks the exact catalog, synchronizes agents (multi-model mode only), and cleans up only a proxy it owns.
+checks the selected parent against the exact catalog, synchronizes agents (multi-model mode only),
+and cleans up only a proxy it owns. Missing optional exact-model agents degrade that launch:
+the session card marks them unavailable and the dispatch hook blocks them without deleting their
+durable agent files. Restart Parable after provider authentication recovers to refresh the
+session-scoped availability snapshot.
 `parable auth add`, `parable proxy start`, and `parable setup finalize` remain
 headless/recovery diagnostics.
 
@@ -241,7 +245,7 @@ this tool exists to prevent. The per-pool selection detail lives in `references/
   model. If there is no native agent-spawn tool, that executor is unavailable; choose a
   CLI-backed executor. In solo mode, the selected proxy model runs directly as the parent.
 - `parable [--brain auto|fable|sol|config] [--] [CLAUDE_ARGS...]` or `parable --solo <alias|exact-model> [--] [CLAUDE_ARGS...]` — safely reuse a healthy configured loopback proxy or own its
-  start/readiness/cleanup lifecycle. Multi-model mode requires the full configured cast; solo requires only its selected exact model. Multi-model mode: `auto` prefers Fable while
+  start/readiness/cleanup lifecycle. Multi-model mode requires its selected parent and tolerates unavailable optional cast members; solo requires only its selected exact model. Multi-model mode: `auto` prefers Fable while
   its pool is below the tight threshold, then falls back to Sol by live usage; `fable` and `sol`
   pin either parent, and `config` uses `brain_model`. Idempotently synchronizes Parable-owned project agents and displays the multi-model cast card. Solo mode: `--solo <model>` launches with the single selected model only; `--brain` is rejected. With no arguments, Parable uses `auto` (multi-model) and
   forwards `--effort high`. Claude flags pass through directly, so for example

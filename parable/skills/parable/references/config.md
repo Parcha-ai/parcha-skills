@@ -62,16 +62,19 @@ Optional stock-Claude-Code launcher configuration. It is required by bare `parab
 | `brain_model` | required | Exact model id for the main Claude Code session, such as `gpt-5.6-sol`. |
 | `binary` | `claude` | Optional Claude Code command name or path. |
 
-`parable` checks `/v1/models` before launch and requires the brain model plus every
-configured arbitrary-model Claude executor to be present. It then synchronizes project-local
-`.claude/agents/parable-*.md` files and launches Claude Code with per-process
+`parable` checks `/v1/models` before launch and requires the selected brain model. It classifies
+configured arbitrary-model Claude executors against that session snapshot, synchronizes every
+project-local `.claude/agents/parable-*.md` file, and launches Claude Code with per-process
 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`; it does not write global Claude settings.
+Missing optional executors are marked unavailable in the session card and rejected by the
+`PreToolUse` hook before dispatch. Restart Parable after authentication recovers to refresh
+availability; transient absence never deletes configured agent files.
 The source token variable, `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, and
 `CLAUDE_CODE_SUBAGENT_MODEL` are removed from the child environment. A forwarded `--model`
 is rejected so parent selection stays inside Parable's declared policy.
 
-The launcher-level `--brain` policy can be `config`, `fable`, `sol`, or `auto`. `config` uses
-`brain_model` verbatim. `auto` prefers configured Fable while its live Claude usage is below
+The launcher-level `--brain` policy can be `config`, `fable`, `sol`, or `auto`. `config` requires
+the configured `brain_model` to be available. `auto` prefers configured Fable while its live Claude usage is below
 80%, probes ChatGPT only when that pool is tight, and then selects Sol when it has more or
 unknown headroom. Explicit `fable` or `sol` fails unless that exact model is configured and
 present in the authenticated catalog. Bare `parable` means `--brain auto` with high effort.

@@ -103,6 +103,7 @@ CLAUDE_AUTO_COMPACT_PCT_ENV = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
 # leaves roughly 74k before the Codex effective window (353.4k).
 CLAUDE_AUTO_COMPACT_PCT = 75
 PARABLE_WELCOME_ENV = "PARABLE_WELCOME_MESSAGE"
+PARABLE_ACTIVE_AGENTS_ENV = "PARABLE_ACTIVE_AGENTS_JSON"
 PARABLE_WELCOME_PLUGIN = Path(__file__).resolve().parent.parent / "runtime" / "welcome-plugin"
 PARABLE_ASCII = (
     "                        _     _            _     ",
@@ -484,10 +485,26 @@ def sync_claude_agents(root: Path, cfg: dict) -> dict[str, list[str]]:
     return {"changed": changed, "unchanged": unchanged, "removed": removed}
 
 
-def claude_required_models(cfg: dict) -> list[str]:
+def claude_configured_models(cfg: dict) -> list[str]:
+    """Exact proxy ids that may participate in a configured Claude session."""
     models = [cfg["claude"]["brain_model"]]
     models.extend(ex["model"] for ex in custom_claude_executors(cfg).values())
     return list(dict.fromkeys(models))
+
+
+def claude_cast_availability(cfg: dict, available: set[str],
+                             brain_model: str | None = None
+                             ) -> dict[str, list[dict[str, str]]]:
+    """Classify generated exact-model agents for this launch snapshot."""
+    active: list[dict[str, str]] = []
+    unavailable: list[dict[str, str]] = []
+    for executor_id, executor in sorted(custom_claude_executors(cfg).items()):
+        model = executor["model"]
+        if model == brain_model:
+            continue
+        item = {"name": agent_slug(executor_id), "model": model}
+        (active if model in available else unavailable).append(item)
+    return {"active": active, "unavailable": unavailable}
 
 
 def proxy_models_endpoint(base_url: str) -> str:
@@ -520,7 +537,8 @@ def fetch_proxy_models(base_url: str, token: str, timeout: float = 5.0) -> set[s
 
 
 def build_claude_launch(cfg: dict, forwarded: list[str], environ: dict[str, str] | None = None,
-                        *, solo: bool = False) -> tuple[list[str], dict[str, str]]:
+                        *, solo: bool = False, available: set[str] | None = None
+                        ) -> tuple[list[str], dict[str, str]]:
     claude = cfg["claude"]
     # Separator ownership: parse_claude_launch_args consumes Parable's `--`
     # separators; every token here — including any `--` — belongs to Claude.
@@ -560,6 +578,7 @@ def build_claude_launch(cfg: dict, forwarded: list[str], environ: dict[str, str]
         "CLAUDE_CODE_OAUTH_TOKEN",
         "CLAUDE_CODE_SUBAGENT_MODEL",
         PARABLE_WELCOME_ENV,
+        PARABLE_ACTIVE_AGENTS_ENV,
     ):
         launch_env.pop(inherited, None)
     if solo:
@@ -567,7 +586,9 @@ def build_claude_launch(cfg: dict, forwarded: list[str], environ: dict[str, str]
     # Give Claude Code the real context ceiling for proxied non-Anthropic
     # models, then trigger compaction with enough room for a tool result and
     # the compacting request itself. Both user-provided values always win.
-    ceiling = claude_context_ceiling(cfg, claude["brain_model"], solo=solo)
+    ceiling = claude_context_ceiling(
+        cfg, claude["brain_model"], solo=solo, available=available
+    )
     if not source_env.get(CLAUDE_CONTEXT_ENV):
         if ceiling is not None:
             launch_env[CLAUDE_CONTEXT_ENV] = str(ceiling)
@@ -661,17 +682,25 @@ def _usage_percent(reports: list[dict], pool: str) -> float | None:
 def resolve_claude_brain(cfg: dict, mode: str, available: set[str],
                          reports: list[dict] | None = None) -> tuple[str, str]:
     """Resolve an explicit or Fable-first automatic parent from configured models."""
-    configured = set(claude_required_models(cfg))
+    configured = set(claude_configured_models(cfg))
     eligible = configured & available
     if mode == "config":
         model = cfg["claude"]["brain_model"]
+        if model not in available:
+            raise ValueError(
+                f"configured parent model {model!r} is unavailable in the proxy catalog"
+            )
         return model, "configured parent"
     if mode in CLAUDE_BRAIN_MODELS:
         model = CLAUDE_BRAIN_MODELS[mode]
-        if model not in eligible:
+        if model not in configured:
             raise ValueError(
-                f"--brain {mode} requires configured catalog model {model!r}; "
+                f"--brain {mode} requires configured model {model!r}; "
                 "rerun setup with its subscription selected"
+            )
+        if model not in available:
+            raise ValueError(
+                f"--brain {mode} model {model!r} is unavailable in the proxy catalog"
             )
         return model, f"explicit {mode} parent"
 
@@ -679,10 +708,14 @@ def resolve_claude_brain(cfg: dict, mode: str, available: set[str],
     sol = CLAUDE_BRAIN_MODELS["sol"]
     if fable not in eligible:
         if sol not in eligible:
-            raise ValueError("automatic brain selection found neither configured Fable nor Sol")
-        return sol, "Fable is not configured; using Sol"
+            raise ValueError(
+                "automatic brain selection found no available configured Fable or Sol"
+            )
+        fable_state = "not configured" if fable not in configured else "unavailable"
+        return sol, f"Fable is {fable_state}; using Sol"
     if sol not in eligible:
-        return fable, "Sol is not configured; using Fable"
+        sol_state = "not configured" if sol not in configured else "unavailable"
+        return fable, f"Sol is {sol_state}; using Fable"
 
     live_probe = reports is None
     if live_probe:
@@ -764,21 +797,26 @@ def model_context_window(cfg: dict, model: str) -> int | None:
     return MODEL_CONTEXT_WINDOWS.get(model)
 
 
-def claude_context_ceiling(cfg: dict, brain_model: str, *, solo: bool = False) -> int | None:
+def claude_context_ceiling(cfg: dict, brain_model: str, *, solo: bool = False,
+                           available: set[str] | None = None) -> int | None:
     """The CLAUDE_CODE_MAX_CONTEXT_TOKENS value for a launch, or None to not set it.
 
     Claude Code honors this env var only for models whose id does not start
     with "claude-", and it is process-wide — one value covers the parent and
     every subagent. Solo has exactly one model, so it gets that model's window.
     A multi-model launch takes the minimum window across the brain and every
-    enabled non-Claude cast model, treating unknown windows as Claude Code's
-    own 200k fallback so an unknown model never raises the assumed ceiling.
-    Anthropic models ignore the env var, so the min never handicaps them.
+    available non-Claude cast model in the launch snapshot, treating unknown
+    windows as Claude Code's own 200k fallback so an unknown model never raises
+    the assumed ceiling. Anthropic models ignore the env var, so the min never
+    handicaps them.
     """
     if solo:
         return model_context_window(cfg, brain_model)
     models = {brain_model}
-    models.update(ex["model"] for ex in custom_claude_executors(cfg).values())
+    models.update(
+        ex["model"] for ex in custom_claude_executors(cfg).values()
+        if available is None or ex["model"] in available
+    )
     non_claude = [m for m in models if not m.lower().startswith("claude-")]
     if not non_claude:
         return None
@@ -862,6 +900,19 @@ def render_claude_welcome(cfg: dict, brain_model: str, decision: str,
             f"  {_welcome_animal(label)} {label[:7]:<7} {model[:model_width]:<{model_width}}  "
             f"{_welcome_summary(use_for, summary_width)}"
         )
+    unavailable = claude_cast_availability(cfg, available, brain_model)["unavailable"]
+    if unavailable:
+        labels = ", ".join(
+            _welcome_label(
+                re.sub(
+                    r"-exact$", "",
+                    item["name"].removeprefix(PARABLE_AGENT_PREFIX),
+                ),
+                item["model"],
+            )
+            for item in unavailable
+        )
+        lines.append(f"  DEGRADED {labels} unavailable for this session")
     lines.append("  the brain carries the story · the cast carries the work")
     return "\n".join(lines)
 
@@ -910,6 +961,13 @@ def add_claude_welcome(argv: list[str], launch_env: dict[str, str], cfg: dict,
     ):
         raise ValueError("Parable welcome plugin is missing or unsafe; reinstall Parable")
     env = dict(launch_env)
+    active_agents = [] if solo else [
+        item["name"]
+        for item in claude_cast_availability(cfg, available, brain_model)["active"]
+    ]
+    env[PARABLE_ACTIVE_AGENTS_ENV] = json.dumps(
+        active_agents, separators=(",", ":")
+    )
     if not is_print:
         env[PARABLE_WELCOME_ENV] = (
             render_claude_solo_welcome(cfg, brain_model, decision)
@@ -952,16 +1010,6 @@ def cmd_agents_sync(_args: argparse.Namespace) -> int:
     return 0
 
 
-def reconcile_claude_cast(root: Path, cfg: dict, token: str
-                           ) -> tuple[set[str], dict[str, list[str]]]:
-    """Require every exact configured id before changing the project cast."""
-    available = fetch_proxy_models(cfg["claude"]["base_url"], token)
-    missing = [model for model in claude_required_models(cfg) if model not in available]
-    if missing:
-        raise ValueError(f"proxy model catalog is missing: {', '.join(missing)}")
-    return available, sync_claude_agents(root, cfg)
-
-
 def exact_named_cast(cfg: dict) -> list[dict[str, str]]:
     return [
         {"name": agent_slug(executor_id), "model": executor["model"]}
@@ -974,18 +1022,28 @@ def cmd_finalize(args: argparse.Namespace) -> int:
     try:
         cfg, _loaded, token = checked_claude_config(root)
         assert token is not None
-        available, result = reconcile_claude_cast(root, cfg, token)
+        available = fetch_proxy_models(cfg["claude"]["base_url"], token)
+        brain_model, _decision = resolve_claude_brain(
+            cfg, "auto", available, reports=[]
+        )
+        availability = claude_cast_availability(cfg, available, brain_model)
+        result = sync_claude_agents(root, cfg)
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"parable: {exc}", file=sys.stderr)
         return 1
     cast = exact_named_cast(cfg)
+    parent_fallback = brain_model != cfg["claude"]["brain_model"]
     report = {
         "ready": True,
-        "parentModel": cfg["claude"]["brain_model"],
+        "degraded": parent_fallback or bool(availability["unavailable"]),
+        "configuredParentModel": cfg["claude"]["brain_model"],
+        "parentModel": brain_model,
         "agents": cast,
+        "activeAgents": availability["active"],
+        "unavailableAgents": availability["unavailable"],
         "catalog": {
             "availableCount": len(available),
-            "requiredCount": len(claude_required_models(cfg)),
+            "configuredCount": len(claude_configured_models(cfg)),
         },
         "sync": {key: len(value) for key, value in result.items()},
         "next": "parable",
@@ -994,12 +1052,16 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         print(json.dumps(report, indent=2))
         return 0
     print(
-        f"catalog: ready ({report['catalog']['requiredCount']} required, "
-        f"{report['catalog']['availableCount']} available)"
+        f"catalog: {'degraded' if report['degraded'] else 'ready'} "
+        f"({len(report['activeAgents'])} active agents, "
+        f"{len(report['unavailableAgents'])} unavailable, "
+        f"{report['catalog']['availableCount']} models available)"
     )
     print(f"parent:  {report['parentModel']}")
     for agent in cast:
         print(f"agent:   {agent['name']} -> {agent['model']}")
+    for agent in availability["unavailable"]:
+        print(f"offline: {agent['name']} -> {agent['model']}")
     print(f"next:    {report['next']}")
     return 0
 
@@ -1017,7 +1079,7 @@ def cmd_claude(args: argparse.Namespace) -> int:
             )
             launch_cfg = config_with_claude_brain(cfg, brain_model)
             argv, launch_env = build_claude_launch(
-                launch_cfg, forwarded, solo=True
+                launch_cfg, forwarded, solo=True, available=available
             )
             argv, launch_env = add_claude_welcome(
                 argv, launch_env, cfg, brain_model, decision, available, forwarded,
@@ -1025,10 +1087,14 @@ def cmd_claude(args: argparse.Namespace) -> int:
             )
             result = None
         else:
-            available, result = reconcile_claude_cast(root, cfg, token)
+            available = fetch_proxy_models(cfg["claude"]["base_url"], token)
             brain_model, decision = resolve_claude_brain(cfg, brain_mode, available)
+            availability = claude_cast_availability(cfg, available, brain_model)
+            result = sync_claude_agents(root, cfg)
             launch_cfg = config_with_claude_brain(cfg, brain_model)
-            argv, launch_env = build_claude_launch(launch_cfg, forwarded)
+            argv, launch_env = build_claude_launch(
+                launch_cfg, forwarded, available=available
+            )
             argv, launch_env = add_claude_welcome(
                 argv, launch_env, cfg, brain_model, decision, available, forwarded
             )
@@ -1052,6 +1118,13 @@ def cmd_claude(args: argparse.Namespace) -> int:
             flush=True,
         )
         print(f"brain: {brain_model} ({decision}){context_note}", flush=True)
+        if availability["unavailable"]:
+            print(
+                "degraded: "
+                + ", ".join(item["name"] for item in availability["unavailable"])
+                + " unavailable for this session",
+                flush=True,
+            )
     try:
         os.execvpe(argv[0], argv, launch_env)
     except FileNotFoundError:

@@ -220,9 +220,11 @@ model = "kimi-k3"
 use_for = "Implementation through Kimi Code subscription OAuth."
 ```
 
-`parable` checks the authenticated loopback catalog and then
-materializes those executors as exact project agents; stock Claude Code sends child requests to
-each full model id through the same endpoint. Diagnostic `parable setup finalize` and ordinary
+`parable` checks the authenticated loopback catalog and then materializes those executors as
+exact project agents. The selected parent is mandatory; optional models absent from the launch
+snapshot remain configured but are hidden from the ready cast and blocked before dispatch.
+Stock Claude Code sends active child requests to each full model id through the same endpoint.
+Diagnostic `parable setup finalize` and ordinary
 launch obtain the private generated localhost client token without requiring a shell export,
 and never print it. The launcher strips
 `CLAUDE_CODE_SUBAGENT_MODEL`, because Claude Code gives that environment variable priority over

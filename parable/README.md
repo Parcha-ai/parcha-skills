@@ -158,8 +158,10 @@ provider sends the same `plan.md` through [Cursor CLI](https://cursor.com/docs/c
 There is also a single-harness, subscription-only path. `parable setup` builds or discovers a
 loopback CLIProxyAPI, delegates each selected user's native ChatGPT/Claude/xAI/Kimi OAuth, and writes
 an exact Sol/Terra/Luna/Fable/Sonnet/Opus/Haiku/Grok/Kimi cast. Bare `parable` starts or safely reuses the
-configured loopback proxy, waits for its authenticated catalog, requires every exact id, creates
-the project-local agents, launches stock Claude Code, and stops only the proxy process it owns.
+configured loopback proxy, waits for its authenticated catalog, requires the selected parent,
+creates the project-local agents, and launches stock Claude Code. Optional cast models missing
+from that launch snapshot are shown as unavailable and blocked before dispatch; their durable
+configuration remains intact. Parable stops only the proxy process it owns.
 No broker, shared deployment, provider API key, or copied OAuth credential is involved. See the
 [end-to-end setup guide](docs/CLIPROXYAPI_GPT_SUBSCRIPTION.md) and the generated-config
 [reference](examples/parable.claude-subscriptions.toml).

@@ -185,6 +185,7 @@ class TestClaudeLaunch(unittest.TestCase):
         self.assertNotIn("ANTHROPIC_API_KEY", env)
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", env)
         self.assertNotIn("CLAUDE_CODE_SUBAGENT_MODEL", env)
+        self.assertNotIn(parable.PARABLE_ACTIVE_AGENTS_ENV, env)
         self.assertIn("CLAUDE_CODE_SUBAGENT_MODEL", source)
 
     def test_forwarded_model_override_is_rejected(self):
@@ -208,6 +209,7 @@ class TestClaudeLaunch(unittest.TestCase):
         self.assertIn("BRAIN   FABLE · claude-fable-5", card)
         self.assertIn("KIMI", card)
         self.assertIn("Independent implementation", card)
+        self.assertNotIn("DEGRADED", card)
         argv = ["claude", "--model", "claude-fable-5"]
         interactive_argv, interactive_env = parable.add_claude_welcome(
             argv, {}, cfg, "claude-fable-5", "explicit fable parent", available, []
@@ -215,6 +217,10 @@ class TestClaudeLaunch(unittest.TestCase):
         self.assertEqual(interactive_argv[:2], ["claude", "--plugin-dir"])
         self.assertEqual(interactive_env[parable.PARABLE_WELCOME_ENV].splitlines()[0],
                          parable.PARABLE_ASCII[0])
+        self.assertEqual(
+            json.loads(interactive_env[parable.PARABLE_ACTIVE_AGENTS_ENV]),
+            ["parable-kimi"],
+        )
         print_argv, print_env = parable.add_claude_welcome(
             argv, {}, cfg, "claude-fable-5", "explicit fable parent", available,
             ["--print", "hello"],
@@ -227,6 +233,16 @@ class TestClaudeLaunch(unittest.TestCase):
             ],
         )
         self.assertNotIn(parable.PARABLE_WELCOME_ENV, print_env)
+        self.assertEqual(
+            json.loads(print_env[parable.PARABLE_ACTIVE_AGENTS_ENV]),
+            ["parable-kimi"],
+        )
+
+        degraded = parable.render_claude_welcome(
+            cfg, "gpt-5.6-sol", "explicit sol parent",
+            {"gpt-5.6-sol"}, columns=96,
+        )
+        self.assertIn("DEGRADED FABLE, KIMI unavailable for this session", degraded)
 
     def auto_cfg(self):
         cfg = self.cfg()
@@ -440,6 +456,13 @@ class TestClaudeLaunch(unittest.TestCase):
         self.assertEqual(
             parable.claude_context_ceiling(cfg_unknown, "gpt-5.6-sol"), 200_000
         )
+        # An unavailable exact-model lane does not constrain this session.
+        self.assertEqual(
+            parable.claude_context_ceiling(
+                cfg_unknown, "gpt-5.6-sol", available={"gpt-5.6-sol"}
+            ),
+            372_000,
+        )
         # parable.toml context_ktok override beats the built-in table.
         cfg_override = self.cfg()
         cfg_override["executors"]["kimi"]["context_ktok"] = 256
@@ -545,6 +568,14 @@ class TestClaudeLaunch(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "rerun setup"):
             parable.resolve_claude_brain(cfg, "fable", available)
+        with self.assertRaisesRegex(ValueError, "unavailable"):
+            parable.resolve_claude_brain(
+                self.auto_cfg(), "fable", {"gpt-5.6-sol"}
+            )
+        with self.assertRaisesRegex(ValueError, "configured parent model"):
+            parable.resolve_claude_brain(
+                self.cfg(), "config", {"kimi-k3"}
+            )
 
     def test_custom_model_agent_is_namespaced_and_exact(self):
         cfg = self.cfg()
@@ -555,7 +586,18 @@ class TestClaudeLaunch(unittest.TestCase):
         self.assertIn('effort: "high"', rendered)
         self.assertNotIn("CLIPROXY_API_KEY", rendered)
         self.assertEqual(
-            parable.claude_required_models(cfg), ["gpt-5.6-sol", "kimi-k3"]
+            parable.claude_configured_models(cfg), ["gpt-5.6-sol", "kimi-k3"]
+        )
+        self.assertEqual(
+            parable.claude_cast_availability(
+                cfg, {"gpt-5.6-sol"}, "gpt-5.6-sol"
+            ),
+            {
+                "active": [],
+                "unavailable": [
+                    {"name": "parable-kimi", "model": "kimi-k3"}
+                ],
+            },
         )
 
     def test_builtin_aliases_do_not_generate_agents(self):
