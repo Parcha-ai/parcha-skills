@@ -20,6 +20,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .boundary_identity import (
+    boundary_revision,
+    revision_is_fresh,
+    stable_boundary_identity,
+)
 from .private_holdout import _load_jsonl, _private_path
 from .retrieval import EvaluationInputError, receipt_source
 from .runner import git_dirty, git_sha
@@ -100,21 +105,6 @@ def _timestamp(value: Any) -> datetime:
     return parsed
 
 
-def _boundary_identity(value: dict[str, Any]) -> tuple[str, str]:
-    """Return migration-invariant discovery identity.
-
-    A projection rebuild may advance a logical document's revision without
-    changing which source-level document was discovered. Revision is therefore
-    scored as version freshness after a stable boundary match, not folded into
-    retrieval identity.
-    """
-
-    return (
-        value["source_id"],
-        value["logical_document_id"],
-    )
-
-
 def _validate_boundary(value: Any) -> tuple[str, str]:
     if not isinstance(value, dict) or set(value) != BOUNDARY_FIELDS:
         raise EvaluationInputError("gold boundary schema is invalid")
@@ -146,7 +136,7 @@ def _validate_boundary(value: Any) -> tuple[str, str]:
         value["last_occurred_at"]
     ):
         raise EvaluationInputError("gold boundary time order is invalid")
-    return _boundary_identity(value)
+    return stable_boundary_identity(value)
 
 
 def _validate_cases(
@@ -614,15 +604,15 @@ def score_boundary_candidates(
                 or not isinstance(candidate["authorized"], bool)
             ):
                 raise EvaluationInputError("boundary candidate is invalid")
-            identities.append(_boundary_identity(candidate))
-            revisions.append(candidate["revision"])
+            identities.append(stable_boundary_identity(candidate))
+            revisions.append(boundary_revision(candidate))
             valid_pointer_count += int(candidate["pointer_valid"])
             authorization_violation_count += int(not candidate["authorized"])
         if len(identities) != len(set(identities)):
             raise EvaluationInputError("boundary candidates contain duplicates")
 
         gold = {
-            _boundary_identity(boundary): boundary["revision"]
+            stable_boundary_identity(boundary): boundary
             for boundary in case["gold_boundaries"]
         }
         ranked = identities[:20]
@@ -652,11 +642,14 @@ def score_boundary_candidates(
                 "authorization_violation_count": authorization_violation_count,
                 "matched_boundary_count": len(matched),
                 "fresh_revision_count": sum(
-                    revision >= gold[identity]
+                    revision_is_fresh(
+                        {"revision": revision},
+                        gold[identity],
+                    )
                     for identity, revision in matched
                 ),
                 "exact_revision_count": sum(
-                    revision == gold[identity]
+                    revision == boundary_revision(gold[identity])
                     for identity, revision in matched
                 ),
                 "boundary_recall@20": (
