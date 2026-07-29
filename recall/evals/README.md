@@ -43,8 +43,10 @@ private ranking file so credentials and raw responses stay outside the evaluator
 
 The agentic evaluator freezes 60 owner-approved questions: 12 each for exact-document,
 bounded-timeline, source-specific, cross-source, and insufficient retrieval. It enforces a
-25/15/20 optimize/validation/test split and rejects any logical-document revision shared across
-splits. Gold facts and receipts remain in an owner-only file outside Git.
+25/15/20 optimize/validation/test split and rejects any stable logical document shared across
+splits, even when projection revisions differ. Discovery is scored by source plus logical
+document; revision freshness and exact revision agreement are reported separately. Gold facts
+and receipts remain in an owner-only file outside Git.
 
 ```bash
 PYTHONPATH=recall python -m evals.agentic_truth validate \

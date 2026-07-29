@@ -153,7 +153,7 @@ class AgenticTruthSetTest(unittest.TestCase):
             test["gold_boundaries"][0]["source_id"]
         )
         optimize["gold_boundaries"][0]["revision"] = (
-            test["gold_boundaries"][0]["revision"]
+            test["gold_boundaries"][0]["revision"] + 1
         )
         with tempfile.TemporaryDirectory() as temporary:
             directory = private_directory(Path(temporary))
@@ -314,8 +314,112 @@ class AgenticTruthSetTest(unittest.TestCase):
         self.assertEqual(report["aggregate"]["pointer_integrity"], 1.0)
         self.assertEqual(report["aggregate"]["authorization_violation_rate"], 0.0)
         self.assertEqual(report["aggregate"]["backend_error_rate"], 0.0)
+        self.assertEqual(report["aggregate"]["revision_freshness_on_match"], 1.0)
+        self.assertEqual(report["aggregate"]["revision_exact_on_match"], 1.0)
         self.assertNotIn("cases", report)
         self.assertNotIn("question", json.dumps(report))
+
+    def test_revision_bump_preserves_discovery_and_reports_version_separately(
+        self,
+    ) -> None:
+        cases = truth_cases()
+        results = []
+        for case in cases:
+            candidates = [
+                {
+                    "logical_document_id": boundary["logical_document_id"],
+                    "source_id": boundary["source_id"],
+                    "revision": boundary["revision"] + 1,
+                    "pointer_valid": True,
+                    "authorized": True,
+                }
+                for boundary in case["gold_boundaries"]
+            ]
+            results.append(
+                {
+                    "id": case["id"],
+                    "candidates": candidates,
+                    "latency_ms": 25.0,
+                    "backend_error": "",
+                }
+            )
+
+        report = score_boundary_candidates(cases, results)
+
+        self.assertEqual(report["aggregate"]["boundary_recall@20"], 1.0)
+        self.assertEqual(report["aggregate"]["boundary_mrr"], 1.0)
+        self.assertEqual(report["aggregate"]["revision_freshness_on_match"], 1.0)
+        self.assertEqual(report["aggregate"]["revision_exact_on_match"], 0.0)
+
+    def test_stale_revision_does_not_masquerade_as_discovery_miss(self) -> None:
+        cases = truth_cases()
+        for case in cases:
+            for boundary in case["gold_boundaries"]:
+                boundary["revision"] = 2
+        results = []
+        for case in cases:
+            candidates = [
+                {
+                    "logical_document_id": boundary["logical_document_id"],
+                    "source_id": boundary["source_id"],
+                    "revision": 1,
+                    "pointer_valid": True,
+                    "authorized": True,
+                }
+                for boundary in case["gold_boundaries"]
+            ]
+            results.append(
+                {
+                    "id": case["id"],
+                    "candidates": candidates,
+                    "latency_ms": 25.0,
+                    "backend_error": "",
+                }
+            )
+
+        report = score_boundary_candidates(cases, results)
+
+        self.assertEqual(report["aggregate"]["boundary_recall@20"], 1.0)
+        self.assertEqual(report["aggregate"]["boundary_mrr"], 1.0)
+        self.assertEqual(report["aggregate"]["revision_freshness_on_match"], 0.0)
+        self.assertEqual(report["aggregate"]["revision_exact_on_match"], 0.0)
+
+    def test_rejects_duplicate_versions_of_one_ranked_document(self) -> None:
+        cases = truth_cases()
+        for case in cases:
+            candidates = [
+                {
+                    "logical_document_id": boundary["logical_document_id"],
+                    "source_id": boundary["source_id"],
+                    "revision": boundary["revision"],
+                    "pointer_valid": True,
+                    "authorized": True,
+                }
+                for boundary in case["gold_boundaries"]
+            ]
+            if case["answerability"] == "answerable" and candidates:
+                candidates.append({**candidates[0], "revision": 2})
+                duplicate_case = case["id"]
+                break
+        results = [
+            {
+                "id": case["id"],
+                "candidates": (
+                    candidates
+                    if case["id"] == duplicate_case
+                    else []
+                ),
+                "latency_ms": 25.0,
+                "backend_error": "",
+            }
+            for case in cases
+        ]
+
+        with self.assertRaisesRegex(
+            EvaluationInputError,
+            "contain duplicates",
+        ):
+            score_boundary_candidates(cases, results)
 
 
 if __name__ == "__main__":

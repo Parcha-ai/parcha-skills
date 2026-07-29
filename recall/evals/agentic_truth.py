@@ -100,15 +100,22 @@ def _timestamp(value: Any) -> datetime:
     return parsed
 
 
-def _boundary_identity(value: dict[str, Any]) -> tuple[str, str, int]:
+def _boundary_identity(value: dict[str, Any]) -> tuple[str, str]:
+    """Return migration-invariant discovery identity.
+
+    A projection rebuild may advance a logical document's revision without
+    changing which source-level document was discovered. Revision is therefore
+    scored as version freshness after a stable boundary match, not folded into
+    retrieval identity.
+    """
+
     return (
         value["source_id"],
         value["logical_document_id"],
-        value["revision"],
     )
 
 
-def _validate_boundary(value: Any) -> tuple[str, str, int]:
+def _validate_boundary(value: Any) -> tuple[str, str]:
     if not isinstance(value, dict) or set(value) != BOUNDARY_FIELDS:
         raise EvaluationInputError("gold boundary schema is invalid")
     source_id = value["source_id"]
@@ -151,7 +158,7 @@ def _validate_cases(
         raise EvaluationInputError("agentic truth set must contain exactly 60 cases")
     ids: set[str] = set()
     questions: set[str] = set()
-    boundary_splits: dict[tuple[str, str, int], str] = {}
+    boundary_splits: dict[tuple[str, str], str] = {}
     split_counts: Counter[str] = Counter()
     stratum_counts: Counter[str] = Counter()
     intent_counts: Counter[str] = Counter()
@@ -501,6 +508,9 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, int | float]:
     authorization_violations = sum(
         row["authorization_violation_count"] for row in rows
     )
+    matched_boundaries = sum(row["matched_boundary_count"] for row in rows)
+    fresh_revisions = sum(row["fresh_revision_count"] for row in rows)
+    exact_revisions = sum(row["exact_revision_count"] for row in rows)
     return {
         "queries": len(rows),
         "answerable_queries": len(positives),
@@ -523,6 +533,16 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, int | float]:
         "pointer_integrity": valid_pointers / candidates if candidates else 1.0,
         "authorization_violation_rate": (
             authorization_violations / candidates if candidates else 0.0
+        ),
+        "revision_freshness_on_match": (
+            fresh_revisions / matched_boundaries
+            if matched_boundaries
+            else 0.0
+        ),
+        "revision_exact_on_match": (
+            exact_revisions / matched_boundaries
+            if matched_boundaries
+            else 0.0
         ),
         "backend_error_rate": statistics.fmean(
             float(bool(row["backend_error"])) for row in rows
@@ -573,7 +593,8 @@ def score_boundary_candidates(
         candidates = result["candidates"]
         if not isinstance(candidates, list) or len(candidates) > 100:
             raise EvaluationInputError("boundary candidates are invalid")
-        identities: list[tuple[str, str, int]] = []
+        identities: list[tuple[str, str]] = []
+        revisions: list[int] = []
         valid_pointer_count = 0
         authorization_violation_count = 0
         for candidate in candidates:
@@ -594,17 +615,28 @@ def score_boundary_candidates(
             ):
                 raise EvaluationInputError("boundary candidate is invalid")
             identities.append(_boundary_identity(candidate))
+            revisions.append(candidate["revision"])
             valid_pointer_count += int(candidate["pointer_valid"])
             authorization_violation_count += int(not candidate["authorized"])
         if len(identities) != len(set(identities)):
             raise EvaluationInputError("boundary candidates contain duplicates")
 
         gold = {
-            _boundary_identity(boundary)
+            _boundary_identity(boundary): boundary["revision"]
             for boundary in case["gold_boundaries"]
         }
         ranked = identities[:20]
+        ranked_revisions = revisions[:20]
         relevant = [identity in gold for identity in ranked]
+        matched = [
+            (identity, revision)
+            for identity, revision in zip(
+                ranked,
+                ranked_revisions,
+                strict=True,
+            )
+            if identity in gold
+        ]
         first = next(
             (ordinal for ordinal, value in enumerate(relevant, 1) if value),
             None,
@@ -618,6 +650,15 @@ def score_boundary_candidates(
                 "candidate_count": len(identities),
                 "valid_pointer_count": valid_pointer_count,
                 "authorization_violation_count": authorization_violation_count,
+                "matched_boundary_count": len(matched),
+                "fresh_revision_count": sum(
+                    revision >= gold[identity]
+                    for identity, revision in matched
+                ),
+                "exact_revision_count": sum(
+                    revision == gold[identity]
+                    for identity, revision in matched
+                ),
                 "boundary_recall@20": (
                     len(set(ranked).intersection(gold)) / len(gold)
                     if gold
