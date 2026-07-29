@@ -60,10 +60,14 @@ peer. A trusted peer bot must mention this bot; unrelated bots and unmentioned
 peer turns stay silent. If one message mentions two trusted bots, each app
 makes its own independent routing decision. In a bound thread, an admitted peer
 turn goes to the exact bound session; Hermes is never a second writer. The
-agent must return exactly `NO_REPLY` when no useful response is needed. Do not
+agent must end its output with a standalone `NO_REPLY` line when no useful
+response is needed. Tether suppresses that entire control output, including any
+preceding routing rationale. Do not
 send courtesy acknowledgments or keep a completed conversation alive.
 
-Completion criterion: the result is posted to the same thread, or the same thread receives a sanitized failure explaining that no alternate session was used.
+Completion criterion: one useful result is posted to the same thread, or the
+turn is intentionally silent. Delivery failures remain durable and actionable
+through `tether unresolved`; Tether does not post synthetic failure chatter.
 
 ## Attach An Existing Thread
 

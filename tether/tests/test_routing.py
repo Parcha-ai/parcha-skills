@@ -125,7 +125,10 @@ class RoutingDecisionTest(unittest.TestCase):
         self.assertEqual(a.action, RouteAction.HERMES)
         self.assertEqual(a.reason, "self_explicitly_targeted")
         self.assertEqual(b.action, RouteAction.SILENT)
-        self.assertEqual(b.reason, "another_bot_explicitly_targeted")
+        self.assertEqual(
+            b.reason,
+            "another_participant_explicitly_targeted",
+        )
 
     def test_human_can_target_two_bots_without_waking_a_third(self):
         message = self.message(bot_mentions={BOT_A, BOT_B})
@@ -241,7 +244,10 @@ class RoutingDecisionTest(unittest.TestCase):
             self.policy(BOT_A),
         )
         self.assertEqual(decision.action, RouteAction.SILENT)
-        self.assertEqual(decision.reason, "another_bot_explicitly_targeted")
+        self.assertEqual(
+            decision.reason,
+            "another_participant_explicitly_targeted",
+        )
 
     def test_binding_owner_restriction_applies_to_humans_and_peer_bots(self):
         binding = ActiveBinding(
@@ -377,14 +383,29 @@ class RoutingDecisionTest(unittest.TestCase):
                 )
                 self.assertEqual(decision.reason, "conversation_not_allowed")
 
-    def test_human_mentions_do_not_count_as_bot_targeting(self):
+    def test_human_mention_silences_ambient_bot_ownership(self):
         decision = decide_route(
             self.message(human_mentions={OTHER_HUMAN}),
             self.thread(participation=self.lease()),
             self.policy(),
         )
+        self.assertEqual(decision.action, RouteAction.SILENT)
+        self.assertEqual(
+            decision.reason,
+            "another_participant_explicitly_targeted",
+        )
+
+    def test_self_and_human_mentions_still_target_this_bot(self):
+        decision = decide_route(
+            self.message(
+                bot_mentions={BOT_A},
+                human_mentions={OTHER_HUMAN},
+            ),
+            self.thread(),
+            self.policy(),
+        )
         self.assertEqual(decision.action, RouteAction.HERMES)
-        self.assertEqual(decision.reason, "unique_participation_lease")
+        self.assertEqual(decision.reason, "self_explicitly_targeted")
 
     def test_unresolved_mention_fails_closed_unless_self_is_also_targeted(self):
         unresolved = decide_route(

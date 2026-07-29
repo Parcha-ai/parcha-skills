@@ -6844,14 +6844,35 @@ def redact_text(text: str) -> str:
     return security.redact_egress_text(text)
 
 
+SILENCE_CONTROL_LINES = frozenset({
+    "NO_REPLY",
+    "NO REPLY",
+    "[SILENT]",
+    "SILENT",
+})
+
+
+def is_silence_control_output(value: Any) -> bool:
+    """Recognize an intentional-silence marker at the output boundary.
+
+    Agents sometimes explain their routing decision before emitting the
+    documented marker. The marker controls the whole output when it is the
+    final non-empty line; prose that merely mentions NO_REPLY remains visible.
+    """
+    if not isinstance(value, str):
+        return False
+    lines = [line.strip().upper() for line in value.splitlines() if line.strip()]
+    return bool(lines) and lines[-1] in SILENCE_CONTROL_LINES
+
+
 def validate_reply_text(text: str, config: Config | None = None) -> str:
     # The configured word, character, and sentence counts are writing targets,
     # not delivery gates. A useful reply must not disappear because it needed
     # more context than the default Slack style.
     _ = config or load_config()
     cleaned = text.strip()
-    if cleaned == "NO_REPLY":
-        return cleaned
+    if is_silence_control_output(cleaned):
+        return "NO_REPLY"
     if not cleaned:
         raise ValueError("reply text is empty")
     if len(cleaned) > MAX_TEXT:

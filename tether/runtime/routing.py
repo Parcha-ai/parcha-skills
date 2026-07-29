@@ -242,10 +242,17 @@ def decide_route(
         return _decision(message, RouteAction.SILENT, "thread_identity_mismatch")
 
     self_targeted = policy.self_bot_user_id in message.mentioned_bot_user_ids
-    if message.mentioned_bot_user_ids and not self_targeted:
-        return _decision(message, RouteAction.SILENT, "another_bot_explicitly_targeted")
-    if message.unresolved_mention_user_ids and not self_targeted:
-        return _decision(message, RouteAction.SILENT, "mention_resolution_incomplete")
+    if message.mentioned_user_ids and not self_targeted:
+        reason = (
+            "mention_resolution_incomplete"
+            if message.unresolved_mention_user_ids
+            else "another_participant_explicitly_targeted"
+        )
+        return _decision(
+            message,
+            RouteAction.SILENT,
+            reason,
+        )
 
     actor = message.actor
     if actor.is_bot:

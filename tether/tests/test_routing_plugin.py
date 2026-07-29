@@ -21,6 +21,7 @@ TEAM = "T12345678"
 CHANNEL = "C12345678"
 THREAD = "1785000000.000001"
 HUMAN = "UHUMAN001"
+OTHER_HUMAN = "UHUMAN002"
 LOCAL = "UBOTAAAA1"
 LOCAL_APP = "BBOTAAAA1"
 PEER = "UBOTBBBB2"
@@ -40,6 +41,7 @@ class FakeClient:
     def __init__(self):
         self.user_types = {
             HUMAN: False,
+            OTHER_HUMAN: False,
             LOCAL: True,
             PEER: True,
             OTHER_BOT: True,
@@ -910,6 +912,43 @@ class RoutingPluginIntegrationTest(unittest.TestCase):
         self.assertEqual(outbox_count, 0)
         self.assertEqual(self.adapter.sent, [])
 
+    def test_hermes_trailing_no_reply_suppresses_routing_explanation(self):
+        raw = self.raw_event(
+            ts="1785000002.000031",
+            text=f"<@{LOCAL}> check silently",
+            thread_ts="",
+        )
+        raw.update(
+            {
+                "_tether_polled": True,
+                "_tether_test_reply": (
+                    "This belongs to another participant.\n\nNO_REPLY"
+                ),
+            }
+        )
+
+        self.assertIs(self.ingress(raw), raw)
+
+        event_id = f"slack:{TEAM}:{CHANNEL}:{raw['ts']}"
+        with self.plugin.store.connect() as database:
+            ingress = database.execute(
+                """
+                SELECT state,egress_sealed,error_code
+                FROM thread_ingress WHERE event_id=?
+                """,
+                (event_id,),
+            ).fetchone()
+            outbox_count = database.execute(
+                """
+                SELECT count(*) FROM slack_messages
+                WHERE ingress_event_id=?
+                """,
+                (event_id,),
+            ).fetchone()[0]
+        self.assertEqual(tuple(ingress), ("completed", 1, None))
+        self.assertEqual(outbox_count, 0)
+        self.assertEqual(self.adapter.sent, [])
+
     def ingress(self, event, payload=None):
         return asyncio.run(self.adapter._handle_slack_message(event, payload))
 
@@ -991,7 +1030,34 @@ class RoutingPluginIntegrationTest(unittest.TestCase):
         self.assertEqual(self.adapter.handled, [])
         decision = raw[self.plugin.ROUTING_DECISION_KEY]
         self.assertEqual(decision.action, self.plugin.routing.RouteAction.SILENT)
-        self.assertEqual(decision.reason, "another_bot_explicitly_targeted")
+        self.assertEqual(
+            decision.reason,
+            "another_participant_explicitly_targeted",
+        )
+
+    def test_human_mention_silences_owned_bound_thread(self):
+        self.make_owned_root_bridge("claude_session")
+        self.adapter._tether_user_kinds = {
+            (TEAM, HUMAN): "human",
+            (TEAM, OTHER_HUMAN): "human",
+        }
+        raw = self.raw_event(
+            text=f"<@{OTHER_HUMAN}> please investigate",
+        )
+
+        result = self.ingress(raw)
+
+        self.assertIsNone(result)
+        self.assertEqual(self.adapter.handled, [])
+        decision = raw[self.plugin.ROUTING_DECISION_KEY]
+        self.assertEqual(
+            decision.action,
+            self.plugin.routing.RouteAction.SILENT,
+        )
+        self.assertEqual(
+            decision.reason,
+            "another_participant_explicitly_targeted",
+        )
 
     def test_owned_root_routes_ambient_reply_without_history_read(self):
         bridge = self.make_owned_root_bridge("claude_session")

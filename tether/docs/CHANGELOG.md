@@ -27,3 +27,6 @@
   Slack delivery.
 - Adds a signed, exact-commit release workflow with npm OIDC provenance and
   immutable package verification.
+- Makes explicit Slack mentions authoritative across humans and bots, suppresses
+  terminal `NO_REPLY` control output, and keeps continuation failures out of
+  conversation threads.

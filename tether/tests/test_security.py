@@ -77,6 +77,7 @@ class PrivateStatePathTest(unittest.TestCase):
     def test_wrong_owner_is_rejected_before_mode_repair(self):
         directory = self.root / "state"
         directory.mkdir(mode=0o755)
+        directory.chmod(0o755)
         with self.assertRaises(security.StatePathError):
             security.secure_state_directory(
                 directory,

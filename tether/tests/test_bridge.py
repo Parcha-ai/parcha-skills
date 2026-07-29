@@ -880,6 +880,42 @@ class StoreTest(unittest.TestCase):
         self.assertTrue(result["suppressed"])
         post.assert_not_called()
 
+    def test_trailing_no_reply_suppresses_the_entire_agent_output(self):
+        bridge = self.store.bind(self.store.create(self.request()).bridge_id, "123.456")
+        self.store.enqueue_event("111.2", bridge.bridge_id, "anything else?")
+        self.store.claim_event_batch(bridge.bridge_id)
+        reply_key = self.runtime.delivery_attempt_id(
+            bridge.bridge_id, ("111.2",), bridge.binding_generation
+        )
+        self.assertTrue(self.store.prepare_delivery_attempt(
+            ["111.2"], bridge.bridge_id, bridge.binding_generation, reply_key
+        ))
+        self.assertTrue(self.store.mark_attempt_awaiting_ack(
+            reply_key, bridge.bridge_id, bridge.binding_generation
+        ))
+        broker = self.runtime.Broker(
+            "test-token",
+            self.store,
+            verified_workspace_team_id="T12345678",
+        )
+        with mock.patch.object(self.runtime, "slack_post") as post:
+            result = broker.handle({
+                "op": "reply",
+                "bridge_id": bridge.bridge_id,
+                "reply_key": reply_key,
+                "text": "This is directed at another person.\n\nNO_REPLY",
+            })
+        self.assertTrue(result["suppressed"])
+        post.assert_not_called()
+
+    def test_no_reply_in_prose_remains_a_normal_reply(self):
+        self.assertEqual(
+            self.runtime.validate_reply_text(
+                "NO_REPLY is a control token, not user-facing prose."
+            ),
+            "NO_REPLY is a control token, not user-facing prose.",
+        )
+
     def test_thread_history_stays_behind_broker_and_returns_sanitized_messages(self):
         broker = self.runtime.Broker("test-token", self.store, verified_workspace_team_id="T12345678")
         response = {

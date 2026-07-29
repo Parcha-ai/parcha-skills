@@ -1313,13 +1313,7 @@ def _hermes_send_arguments(
 def _is_silence_control_output(value: Any) -> bool:
     if not isinstance(value, str):
         return False
-    return value.strip().upper() in {
-        "",
-        "NO_REPLY",
-        "NO REPLY",
-        "[SILENT]",
-        "SILENT",
-    }
+    return not value.strip() or runtime.is_silence_control_output(value)
 
 
 def _hermes_workspace_id(

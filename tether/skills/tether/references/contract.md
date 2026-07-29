@@ -54,8 +54,9 @@ For a Zellij endpoint, Tether verifies the same process immediately before and
 after submission. A pane ID, pane title, command string, or visible keypress is
 not proof that the intended agent received the turn.
 
-Native work returns either one useful Slack reply or exactly `NO_REPLY`.
-`NO_REPLY` acknowledges the attempt without posting. Cancellation terminates
+Native work returns either one useful Slack reply or ends with a standalone
+`NO_REPLY` line. That terminal control line acknowledges the attempt without
+posting the output or any preceding routing rationale. Cancellation terminates
 the active continuation process group when possible and records the terminal
 state.
 

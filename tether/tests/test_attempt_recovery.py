@@ -836,6 +836,50 @@ class PluginAttemptRecoveryTest(unittest.TestCase):
                     attempt_state,
                 )
 
+    def test_failed_native_drain_never_posts_failure_noise_to_slack(self):
+        bridge = self._zellij_bridge("silent-failure")
+        event_id = "1785000104.900001"
+        self.assertTrue(
+            self.plugin.store.enqueue_event(
+                event_id,
+                bridge.bridge_id,
+                "continue",
+            )
+        )
+
+        class Platform:
+            value = "slack"
+
+        class Adapter:
+            def __init__(self):
+                self.sent = []
+
+            async def send(self, *args, **kwargs):
+                self.sent.append((args, kwargs))
+
+        platform = Platform()
+        adapter = Adapter()
+        gateway = types.SimpleNamespace(adapters={platform: adapter})
+        error = self.runtime.NativeContinuationError(
+            "captured pane is unavailable",
+            code="process_identity_changed",
+        )
+
+        with mock.patch.object(
+            self.plugin,
+            "deliver_zellij",
+            side_effect=error,
+        ):
+            asyncio.run(
+                self.plugin._drain_bridge(
+                    bridge.bridge_id,
+                    gateway,
+                    platform,
+                )
+            )
+
+        self.assertEqual(adapter.sent, [])
+
     def test_rebind_is_blocked_while_detached_continuation_runs(self):
         bridge = self._bridge(
             "detached-rebind",
