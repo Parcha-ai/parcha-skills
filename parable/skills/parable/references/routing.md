@@ -1,5 +1,7 @@
 # Routing playbook
 
+**Note:** This section applies to multi-model Parable mode only. When running in solo mode (`parable --solo`), routing is not applicable — the selected model handles all work directly. See `SKILL.md` Solo Mode section.
+
 ## Classifying tasks
 
 | Class | Signature | Typical executor traits |

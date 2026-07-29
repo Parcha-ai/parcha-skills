@@ -21,9 +21,10 @@ version="$(tr -d '[:space:]' < "$version_file")"
 for required in \
   "$runtime_dir/bin/parable.js" \
   "$runtime_dir/lib/onboarding.js" \
-  "$runtime_dir/patches/cliproxyapi-v7.2.88-claude-effort.patch" \
+  "$runtime_dir/patches/cliproxyapi-v7.2.103-claude-effort.patch" \
   "$runtime_dir/welcome-plugin/.claude-plugin/plugin.json" \
   "$runtime_dir/welcome-plugin/hooks/hooks.json" \
+  "$runtime_dir/welcome-plugin/scripts/model_guard.py" \
   "$runtime_dir/welcome-plugin/scripts/welcome.py" \
   "$script_dir/scripts/parable.py"; do
   [[ -f "$required" && ! -L "$required" ]] || die "the installed skill is incomplete (${required#"$script_dir/"} is missing)"
@@ -60,7 +61,7 @@ trap cleanup EXIT
 mkdir -p -- "$stage/bin" "$stage/lib" "$stage/patches" "$stage/skills"
 cp -- "$runtime_dir/bin/parable.js" "$stage/bin/parable.js"
 cp -- "$runtime_dir/lib/onboarding.js" "$stage/lib/onboarding.js"
-cp -- "$runtime_dir/patches/cliproxyapi-v7.2.88-claude-effort.patch" "$stage/patches/"
+cp -- "$runtime_dir/patches/cliproxyapi-v7.2.103-claude-effort.patch" "$stage/patches/"
 cp -R -- "$script_dir" "$stage/skills/parable"
 find "$stage" -type d -exec chmod 700 {} +
 find "$stage" -type f -exec chmod 600 {} +

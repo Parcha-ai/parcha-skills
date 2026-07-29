@@ -21,8 +21,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "skills" / "parable" / "scripts" / "parable.py"
 NODE = shutil.which("node") or "node"
-PROXY_COMMIT = "93d74a890a44802f656d7f39a573916b2611896e"
-PROXY_PATCH_SHA256 = "d35b422da321265150fe393da80a686862ef642ee45c65a3e2fb908d689d5d1f"
+PROXY_COMMIT = "cade44b9cdee6b9328ea2648fd119129fdf11e2d"
+PROXY_PATCH_SHA256 = "c0b4c52d4b35040427e1aee0067c99da7068598803604c435ad591d577b2dc5d"
 
 FAKE_CODEX = """#!/usr/bin/env bash
 cat > /dev/null   # drain the plan from stdin like the real binary
@@ -51,6 +51,7 @@ capture = {
     "argv": sys.argv[1:],
     "base_url": os.environ.get("ANTHROPIC_BASE_URL"),
     "welcome_message": os.environ.get("PARABLE_WELCOME_MESSAGE"),
+    "agent_state": os.environ.get("PARABLE_AGENT_STATE_JSON"),
     "auth_token_present": bool(os.environ.get("ANTHROPIC_AUTH_TOKEN")),
     "source_token_present": any(
         key in os.environ for key in ("PARABLE_PROXY_TOKEN", "CLIPROXY_API_KEY")
@@ -61,8 +62,11 @@ capture = {
             "ANTHROPIC_API_KEY",
             "CLAUDE_CODE_OAUTH_TOKEN",
             "CLAUDE_CODE_SUBAGENT_MODEL",
+            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS",
         )
     },
+    "max_context_tokens": os.environ.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS"),
+    "auto_compact_pct": os.environ.get("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"),
 }
 with open(os.environ["FAKE_CLAUDE_CAPTURE"], "w") as handle:
     json.dump(capture, handle)
@@ -257,6 +261,7 @@ class TestClaudeSubscriptionLauncher(unittest.TestCase):
             "ANTHROPIC_API_KEY": "must-not-survive",
             "CLAUDE_CODE_OAUTH_TOKEN": "must-not-survive",
             "CLAUDE_CODE_SUBAGENT_MODEL": "gpt-5.6-sol",
+            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
         }
 
     def test_launcher_routes_sol_forwards_args_and_scrubs_global_override(self):
@@ -280,19 +285,34 @@ class TestClaudeSubscriptionLauncher(unittest.TestCase):
             capture_text = capture.read_text()
             self.assertNotIn(token, capture_text)
             captured = json.loads(capture_text)
+            welcome_plugin = (
+                REPO / "skills" / "parable" / "runtime" / "welcome-plugin"
+            )
             self.assertEqual(
                 captured["argv"],
-                ["--model", "gpt-5.6-sol", "--print", "hello"],
+                [
+                    "--plugin-dir", str(welcome_plugin),
+                    "--model", "gpt-5.6-sol", "--print", "hello",
+                ],
             )
             self.assertEqual(captured["base_url"], base_url)
             self.assertTrue(captured["auth_token_present"])
             self.assertFalse(captured["source_token_present"])
+            self.assertEqual(
+                json.loads(captured["agent_state"]),
+                {
+                    "active": ["parable-kimi"],
+                    "unavailable": [],
+                    "parent": [],
+                },
+            )
             self.assertEqual(
                 captured["inherited"],
                 {
                     "ANTHROPIC_API_KEY": False,
                     "CLAUDE_CODE_OAUTH_TOKEN": False,
                     "CLAUDE_CODE_SUBAGENT_MODEL": False,
+                    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": True,
                 },
             )
             self.assertEqual(settings.read_bytes(), before)
@@ -301,7 +321,7 @@ class TestClaudeSubscriptionLauncher(unittest.TestCase):
             self.assertNotIn(token, agent.read_text())
             self.assertNotIn(token, (repo / "parable.toml").read_text())
 
-    def test_launcher_fails_closed_when_a_routed_model_is_absent(self):
+    def test_launcher_degrades_when_an_optional_routed_model_is_absent(self):
         with tempfile.TemporaryDirectory() as tmp, model_server(
             ["gpt-5.6-sol"]
         ) as (_server, base_url, token):
@@ -313,10 +333,98 @@ class TestClaudeSubscriptionLauncher(unittest.TestCase):
                 ["node", str(REPO / "bin" / "parable.js"), "claude", "--print", "hello"],
                 cwd=repo, env=env, capture_output=True, text=True, timeout=60,
             )
-            self.assertNotEqual(proc.returncode, 0)
-            self.assertIn("proxy model catalog is missing: kimi-k3", proc.stderr)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn(
+                "degraded: parable-kimi unavailable for this session", proc.stdout
+            )
+            captured = json.loads(capture.read_text())
+            self.assertEqual(
+                json.loads(captured["agent_state"]),
+                {
+                    "active": [],
+                    "unavailable": ["parable-kimi"],
+                    "parent": [],
+                },
+            )
+            agent = repo / ".claude" / "agents" / "parable-kimi.md"
+            self.assertTrue(agent.is_file())
+            self.assertIn('model: "kimi-k3"', agent.read_text())
+
+    def test_auto_falls_back_but_explicit_unavailable_parent_fails(self):
+        with tempfile.TemporaryDirectory() as tmp, model_server(
+            ["gpt-5.6-sol"]
+        ) as (_server, base_url, token):
+            bindir = fake_bin(tmp)
+            repo = self.make_claude_repo(tmp, base_url)
+            config = (repo / "parable.toml").read_text()
+            config = config.replace(
+                'brain_model = "gpt-5.6-sol"',
+                'brain_model = "claude-fable-5"',
+            )
+            config += """
+
+[executors.sol_exact]
+provider = "claude"
+model = "gpt-5.6-sol"
+
+[executors.fable_exact]
+provider = "claude"
+model = "claude-fable-5"
+"""
+            (repo / "parable.toml").write_text(config)
+            capture = Path(tmp) / "capture.json"
+            env = self.launch_env(tmp, bindir, capture, token)
+
+            automatic = subprocess.run(
+                [
+                    "node", str(REPO / "bin" / "parable.js"),
+                    "claude", "--brain", "auto", "--print", "hello",
+                ],
+                cwd=repo, env=env, capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(
+                automatic.returncode, 0, automatic.stdout + automatic.stderr
+            )
+            self.assertIn(
+                "brain: gpt-5.6-sol (Fable is unavailable; using Sol)",
+                automatic.stdout,
+            )
+            self.assertEqual(
+                json.loads(json.loads(capture.read_text())["agent_state"]),
+                {
+                    "active": [],
+                    "unavailable": ["parable-fable-exact", "parable-kimi"],
+                    "parent": ["parable-sol-exact"],
+                },
+            )
+            finalized = subprocess.run(
+                [
+                    "python3", str(SCRIPT), "finalize", "--json",
+                ],
+                cwd=repo, env=env, capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(
+                finalized.returncode, 0, finalized.stdout + finalized.stderr
+            )
+            report = json.loads(finalized.stdout)
+            self.assertTrue(report["degraded"])
+            self.assertEqual(report["configuredParentModel"], "claude-fable-5")
+            self.assertEqual(report["parentModel"], "gpt-5.6-sol")
+
+            capture.unlink()
+            explicit = subprocess.run(
+                [
+                    "node", str(REPO / "bin" / "parable.js"),
+                    "claude", "--brain", "fable", "--print", "hello",
+                ],
+                cwd=repo, env=env, capture_output=True, text=True, timeout=60,
+            )
+            self.assertNotEqual(explicit.returncode, 0)
+            self.assertIn(
+                "--brain fable model 'claude-fable-5' is unavailable",
+                explicit.stderr,
+            )
             self.assertFalse(capture.exists())
-            self.assertFalse((repo / ".claude" / "agents" / "parable-kimi.md").exists())
 
     def test_agent_sync_is_idempotent_cleans_stale_and_preserves_unrelated(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -420,14 +528,14 @@ exit 0
         self.assertIn("request_user_input", skill)
         self.assertIn("do not silently infer paid subscriptions", skill)
         self.assertIn("--non-interactive", skill)
-        self.assertIn("--vendors claude[,chatgpt][,xai]", skill)
+        self.assertIn("--vendors claude[,chatgpt][,xai][,kimi]", skill)
         self.assertIn("--build-proxy", skill)
         self.assertIn("Claude Code's `Bash` tool is the exception", skill)
         self.assertIn("open a new terminal and run exactly", skill)
         self.assertIn("parable auth login", skill)
         self.assertIn("Do not run it through", skill)
         self.assertIn("Do not give the user three separate `auth add` commands", skill)
-        self.assertIn("should never be handed three separate provider commands", readme)
+        self.assertIn("should never be handed separate per-provider commands", readme)
         self.assertIn("inside Claude Code", readme)
         self.assertIn("user-only", skill)
 
@@ -491,7 +599,7 @@ exit 0
             self.assertEqual(first.stdout.count(handoff), 1)
             self.assertIn(launch, first.stdout)
 
-            installed = home / ".local" / "share" / "parable" / "0.1.16"
+            installed = home / ".local" / "share" / "parable" / "0.1.22"
             durable = home / ".local" / "bin" / "parable"
             self.assertTrue((installed / "bin" / "parable.js").is_file())
             self.assertTrue((installed / "lib" / "onboarding.js").is_file())
@@ -642,7 +750,7 @@ exit 0
         self.assertEqual(welcome_manifest["version"], package["version"])
         patch = (
             REPO / "skills" / "parable" / "runtime" / "patches"
-            / "cliproxyapi-v7.2.88-claude-effort.patch"
+            / "cliproxyapi-v7.2.103-claude-effort.patch"
         )
         self.assertEqual(hashlib.sha256(patch.read_bytes()).hexdigest(), PROXY_PATCH_SHA256)
 
@@ -684,6 +792,138 @@ exit 0
             self.assertTrue((home / ".config" / "parable" / "parable.toml").is_file())
             self.assertTrue((home / ".local" / "bin" / "parable").is_symlink())
             self.assertIn("In a new terminal", proc.stdout)
+
+
+class TestClaudeAgentModelGuard(unittest.TestCase):
+    def run_guard(self, payload: object,
+                  state: object | None = None
+                  ) -> subprocess.CompletedProcess:
+        guard = (
+            REPO / "skills" / "parable" / "runtime" / "welcome-plugin"
+            / "scripts" / "model_guard.py"
+        )
+        env = dict(os.environ)
+        env.pop("PARABLE_AGENT_STATE_JSON", None)
+        if state is not None:
+            env["PARABLE_AGENT_STATE_JSON"] = json.dumps(state)
+        return subprocess.run(
+            ["python3", str(guard)],
+            input=json.dumps(payload),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    def test_generated_agent_override_is_removed_without_losing_other_input(self):
+        payload = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Agent",
+            "tool_input": {
+                "description": "Plan PoA visual profile",
+                "prompt": "Inspect the visual profile.",
+                "subagent_type": "parable-kimi",
+                "model": "haiku",
+                "run_in_background": True,
+            },
+        }
+        result = self.run_guard(payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        decision = json.loads(result.stdout)["hookSpecificOutput"]
+        self.assertEqual(decision["hookEventName"], "PreToolUse")
+        self.assertEqual(decision["permissionDecision"], "allow")
+        self.assertEqual(
+            decision["updatedInput"],
+            {
+                "description": "Plan PoA visual profile",
+                "prompt": "Inspect the visual profile.",
+                "subagent_type": "parable-kimi",
+                "run_in_background": True,
+            },
+        )
+
+    def test_unmanaged_or_already_exact_agent_input_is_untouched(self):
+        for tool_input in (
+            {"subagent_type": "Explore", "model": "haiku", "prompt": "look"},
+            {"subagent_type": "parable-kimi", "prompt": "build"},
+        ):
+            with self.subTest(tool_input=tool_input):
+                result = self.run_guard({
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Agent",
+                    "tool_input": tool_input,
+                })
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "")
+
+    def test_session_snapshot_blocks_unavailable_managed_agent(self):
+        payload = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Agent",
+            "tool_input": {
+                "subagent_type": "parable-haiku-exact",
+                "prompt": "inspect",
+            },
+        }
+        result = self.run_guard(payload, state={
+            "active": ["parable-kimi"],
+            "unavailable": ["parable-haiku-exact"],
+            "parent": [],
+        })
+        decision = json.loads(result.stdout)["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "deny")
+        self.assertIn("unavailable in this Parable session",
+                      decision["permissionDecisionReason"])
+
+    def test_active_session_agent_still_uses_frontmatter_model(self):
+        payload = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Agent",
+            "tool_input": {
+                "subagent_type": "parable-kimi",
+                "model": "haiku",
+                "prompt": "build",
+            },
+        }
+        result = self.run_guard(payload, state={
+            "active": ["parable-kimi"],
+            "unavailable": [],
+            "parent": [],
+        })
+        decision = json.loads(result.stdout)["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "allow")
+        self.assertNotIn("model", decision["updatedInput"])
+
+    def test_malformed_session_snapshot_fails_closed_for_managed_agent(self):
+        payload = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Agent",
+            "tool_input": {
+                "subagent_type": "parable-kimi",
+                "prompt": "build",
+            },
+        }
+        result = self.run_guard(payload, state={"not": "the state schema"})
+        decision = json.loads(result.stdout)["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "deny")
+
+    def test_parent_model_agent_is_blocked_with_accurate_reason(self):
+        payload = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Agent",
+            "tool_input": {
+                "subagent_type": "parable-sol-exact",
+                "prompt": "delegate back",
+            },
+        }
+        result = self.run_guard(payload, state={
+            "active": [],
+            "unavailable": [],
+            "parent": ["parable-sol-exact"],
+        })
+        decision = json.loads(result.stdout)["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "deny")
+        self.assertIn("current parent model", decision["permissionDecisionReason"])
 
 
 class TestFirstRunSetup(unittest.TestCase):
@@ -756,6 +996,7 @@ class TestFirstRunSetup(unittest.TestCase):
             self.assertIn("port: 8317", yaml)
             self.assertIn(f'auth-dir: "{auth_dir}"', yaml)
             self.assertIn(token, yaml)
+            self.assertIn("claude-code:\n  disable-cloaking-model-list: true\n", yaml)
             config = (config_dir / "parable.toml").read_text()
             self.assertIn('brain_model = "claude-fable-5"', config)
             for present in (
@@ -800,6 +1041,35 @@ class TestFirstRunSetup(unittest.TestCase):
                     before[target],
                 )
 
+    def test_setup_migrates_only_the_previous_generated_proxy_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            proxy = self.make_proxy(home / "tools")
+            first = self.run_cli(
+                home,
+                "setup", "--non-interactive", "--vendors", "claude",
+                "--proxy-bin", str(proxy), "--no-auth",
+            )
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            config = home / ".config" / "parable" / "cliproxy.yaml"
+            legacy = config.read_text().replace(
+                "claude-code:\n  disable-cloaking-model-list: true\n",
+                "",
+            )
+            config.write_text(legacy)
+            config.chmod(0o600)
+
+            migrated = self.run_cli(
+                home,
+                "setup", "--non-interactive", "--vendors", "claude", "--no-auth",
+            )
+            self.assertEqual(migrated.returncode, 0, migrated.stdout + migrated.stderr)
+            self.assertIn("updated generated proxy compatibility", migrated.stdout)
+            self.assertIn(
+                "claude-code:\n  disable-cloaking-model-list: true\n",
+                config.read_text(),
+            )
+
     def test_interactive_and_all_vendor_configs_use_exact_models(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -809,13 +1079,29 @@ class TestFirstRunSetup(unittest.TestCase):
             interactive = self.run_cli(
                 interactive_home,
                 "setup", "--proxy-bin", str(proxy), "--no-auth",
-                input_text="n\nn\n",
+                input_text="n\nn\nn\n",
             )
             self.assertEqual(interactive.returncode, 0, interactive.stdout + interactive.stderr)
+            self.assertIn("Add Kimi Code subscription (Kimi K3)?", interactive.stdout)
             interactive_manifest = json.loads(
                 (interactive_home / ".config" / "parable" / "setup.json").read_text()
             )
             self.assertEqual(interactive_manifest["vendors"], ["claude"])
+
+            interactive_kimi_home = root / "interactive-kimi"
+            interactive_kimi_home.mkdir()
+            interactive_kimi = self.run_cli(
+                interactive_kimi_home,
+                "setup", "--proxy-bin", str(proxy), "--no-auth",
+                input_text="n\nn\ny\n",
+            )
+            self.assertEqual(
+                interactive_kimi.returncode, 0, interactive_kimi.stdout + interactive_kimi.stderr,
+            )
+            interactive_kimi_manifest = json.loads(
+                (interactive_kimi_home / ".config" / "parable" / "setup.json").read_text()
+            )
+            self.assertEqual(interactive_kimi_manifest["vendors"], ["claude", "kimi"])
 
             claude_xai_home = root / "claude-xai"
             claude_xai_home.mkdir()
@@ -841,13 +1127,13 @@ class TestFirstRunSetup(unittest.TestCase):
             all_vendors = self.run_cli(
                 all_home,
                 "setup", "--non-interactive",
-                "--vendors", "xai,chatgpt,claude",
+                "--vendors", "xai,chatgpt,claude,kimi",
                 "--proxy-bin", str(proxy), "--port", "9123", "--no-auth",
             )
             self.assertEqual(all_vendors.returncode, 0, all_vendors.stdout + all_vendors.stderr)
             config_dir = all_home / ".config" / "parable"
             manifest = json.loads((config_dir / "setup.json").read_text())
-            self.assertEqual(manifest["vendors"], ["claude", "chatgpt", "xai"])
+            self.assertEqual(manifest["vendors"], ["claude", "chatgpt", "xai", "kimi"])
             self.assertEqual(manifest["port"], 9123)
             config = (config_dir / "parable.toml").read_text()
             for model in (
@@ -859,6 +1145,7 @@ class TestFirstRunSetup(unittest.TestCase):
                 "claude-opus-4-8",
                 "claude-haiku-4-5-20251001",
                 "grok-4.5",
+                "kimi-k3",
             ):
                 self.assertIn(model, config)
             self.assertIn('effort = "xhigh"', config)
@@ -872,7 +1159,8 @@ class TestFirstRunSetup(unittest.TestCase):
                 'architecture=["fable_exact","opus_exact","sol_exact"]',
                 config.replace(" ", ""),
             )
-            self.assertNotIn("kimi", config.lower())
+            self.assertNotIn("kimi", config.replace(" ", "").split("architecture=")[1].split("]")[0])
+            self.assertNotIn("kimi", claude_xai_config.lower())
 
     def test_setup_rejects_selection_binary_and_unsafe_state_without_writes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -893,7 +1181,7 @@ class TestFirstRunSetup(unittest.TestCase):
 
             proxy = self.make_proxy(root / "tools")
             for vendors, message in (("chatgpt", "must include claude"),
-                                     ("claude,kimi", "unsupported vendor")):
+                                     ("claude,glm", "unsupported vendor")):
                 home = root / vendors.replace(",", "-")
                 home.mkdir()
                 rejected = self.run_cli(
@@ -1023,6 +1311,239 @@ class TestFirstRunSetup(unittest.TestCase):
             manifest = json.loads((path_home / ".config" / "parable" / "setup.json").read_text())
             self.assertEqual(manifest["proxyBinary"], str(path_first.resolve()))
 
+    def test_add_vendors_extends_existing_setup_in_place(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            home.mkdir()
+            proxy = self.make_proxy(root / "tools")
+
+            base = self.run_cli(
+                home,
+                "setup", "--non-interactive", "--vendors", "claude,xai",
+                "--proxy-bin", str(proxy), "--no-auth",
+            )
+            self.assertEqual(base.returncode, 0, base.stdout + base.stderr)
+            setup_json = home / ".config" / "parable" / "setup.json"
+            parable_toml = home / ".config" / "parable" / "parable.toml"
+            cliproxy_yaml = home / ".config" / "parable" / "cliproxy.yaml"
+            cliproxy_env = home / ".config" / "parable" / "cliproxy.env"
+
+            # An existing OAuth credential record must survive an additive upgrade byte-
+            # for-byte and untouched on disk (add-vendors never writes to the auth dir).
+            auth_dir = home / ".cli-proxy-api"
+            auth_dir.mkdir(parents=True, exist_ok=True)
+            auth_record = auth_dir / "existing-claude.json"
+            auth_record.write_text('{"type":"claude","refresh_token":"SECRET-CLAUDE"}\n')
+            auth_record.chmod(0o600)
+
+            watched = {
+                "cliproxy.yaml": cliproxy_yaml,
+                "cliproxy.env": cliproxy_env,
+                "proxy binary": proxy,
+                "auth record": auth_record,
+            }
+            before_bytes = {name: target.read_bytes() for name, target in watched.items()}
+            before_stat = {name: target.stat() for name, target in watched.items()}
+            # Force the filesystem mtime clock forward so an accidental rewrite (even one
+            # that reproduces identical bytes) would be caught by an mtime comparison.
+            time.sleep(1.1)
+
+            added = self.run_cli(home, "setup", "--add-vendors", "kimi", "--no-auth")
+            self.assertEqual(added.returncode, 0, added.stdout + added.stderr)
+            self.assertIn("added vendors: kimi", added.stdout)
+            manifest = json.loads(setup_json.read_text())
+            self.assertEqual(manifest["vendors"], ["claude", "xai", "kimi"])
+            self.assertIn("kimi-k3", parable_toml.read_text())
+
+            # cliproxy yaml/env, the proxy binary, and the auth record must be untouched
+            # by an additive upgrade -- verified by both content bytes and mtime/inode
+            # metadata, not just a text-content comparison.
+            for name, target in watched.items():
+                self.assertEqual(target.read_bytes(), before_bytes[name], name)
+                after_stat = target.stat()
+                self.assertEqual(after_stat.st_mtime_ns, before_stat[name].st_mtime_ns, name)
+                self.assertEqual(after_stat.st_ino, before_stat[name].st_ino, name)
+
+            # Idempotent no-op: re-running with the same (now-already-included) vendor changes nothing.
+            noop = self.run_cli(home, "setup", "--add-vendors", "kimi", "--no-auth")
+            self.assertEqual(noop.returncode, 0, noop.stdout + noop.stderr)
+            self.assertIn("no-op", noop.stdout)
+            self.assertEqual(
+                json.loads(setup_json.read_text())["vendors"], ["claude", "xai", "kimi"]
+            )
+            for name, target in watched.items():
+                self.assertEqual(target.read_bytes(), before_bytes[name], name)
+
+            # After the additive upgrade, plain `--no-auth`-less runs only need to authorize
+            # providers that are actually still missing -- covered functionally by the
+            # dedicated skip-present auth test in TestVendorAuthAndProxyLifecycle.
+
+    def test_add_vendors_rejects_conflicting_flags_and_missing_setup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            proxy = self.make_proxy(root / "tools")
+
+            missing_home = root / "missing"
+            missing_home.mkdir()
+            missing = self.run_cli(missing_home, "setup", "--add-vendors", "kimi", "--no-auth")
+            self.assertNotEqual(missing.returncode, 0)
+            self.assertIn("existing complete setup", missing.stdout + missing.stderr)
+
+            home = root / "home"
+            home.mkdir()
+            base = self.run_cli(
+                home,
+                "setup", "--non-interactive", "--vendors", "claude",
+                "--proxy-bin", str(proxy), "--no-auth",
+            )
+            self.assertEqual(base.returncode, 0, base.stdout + base.stderr)
+
+            conflicts = (
+                (("--vendors", "claude,kimi"), "--vendors"),
+                (("--port", "9999"), "--port"),
+                (("--proxy-bin", str(proxy)), "--proxy-bin"),
+                (("--build-proxy",), "--build-proxy"),
+            )
+            for extra_args, flag in conflicts:
+                proc = self.run_cli(
+                    home, "setup", "--add-vendors", "kimi", "--no-auth", *extra_args
+                )
+                self.assertNotEqual(proc.returncode, 0, f"{flag} should have been rejected")
+                self.assertIn(flag, proc.stdout + proc.stderr)
+            manifest = json.loads(
+                (home / ".config" / "parable" / "setup.json").read_text()
+            )
+            self.assertEqual(manifest["vendors"], ["claude"])
+
+    def test_add_vendors_honors_config_dir_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            home.mkdir()
+            proxy = self.make_proxy(root / "tools")
+            config_dir = root / "custom-config"
+
+            base = self.run_cli(
+                home,
+                "setup", "--non-interactive", "--vendors", "claude",
+                "--proxy-bin", str(proxy), "--config-dir", str(config_dir), "--no-auth",
+            )
+            self.assertEqual(base.returncode, 0, base.stdout + base.stderr)
+            self.assertTrue((config_dir / "setup.json").exists())
+
+            added = self.run_cli(
+                home, "setup", "--add-vendors", "kimi", "--config-dir", str(config_dir), "--no-auth",
+            )
+            self.assertEqual(added.returncode, 0, added.stdout + added.stderr)
+            manifest = json.loads((config_dir / "setup.json").read_text())
+            self.assertEqual(manifest["vendors"], ["claude", "kimi"])
+            self.assertIn("kimi-k3", (config_dir / "parable.toml").read_text())
+
+    def test_add_vendors_rejects_drift_and_recovers_from_stale_half_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            proxy = self.make_proxy(root / "tools")
+
+            def fresh_claude_home(name: str) -> Path:
+                home = root / name
+                home.mkdir()
+                base = self.run_cli(
+                    home,
+                    "setup", "--non-interactive", "--vendors", "claude",
+                    "--proxy-bin", str(proxy), "--no-auth",
+                )
+                self.assertEqual(base.returncode, 0, base.stdout + base.stderr)
+                return home
+
+            # --- Arbitrary drift (not a canonical old/new pair) must still fail closed. ---
+            drift_home = fresh_claude_home("drift")
+            parable_toml = drift_home / ".config" / "parable" / "parable.toml"
+            tampered = parable_toml.read_text() + "\n# tampered\n"
+            parable_toml.write_text(tampered)
+            drifted = self.run_cli(drift_home, "setup", "--add-vendors", "kimi", "--no-auth")
+            self.assertNotEqual(drifted.returncode, 0)
+            self.assertIn("refusing to overwrite", drifted.stdout + drifted.stderr)
+            # Nothing should have been rewritten on top of the drifted content.
+            self.assertEqual(parable_toml.read_text(), tampered)
+
+            # --- Arbitrary garbage ".next" temp files (not real crash artifacts) must
+            # also fail closed rather than being treated as recoverable state. ---
+            garbage_home = fresh_claude_home("garbage")
+            garbage_config_dir = garbage_home / ".config" / "parable"
+            (garbage_config_dir / ".parable.toml.next").write_text("stale-half-write")
+            (garbage_config_dir / ".setup.json.next").write_text("stale-half-write")
+            garbage = self.run_cli(garbage_home, "setup", "--add-vendors", "kimi", "--no-auth")
+            self.assertNotEqual(garbage.returncode, 0)
+            self.assertEqual(
+                json.loads((garbage_config_dir / "setup.json").read_text())["vendors"], ["claude"],
+            )
+
+            # Produce the real canonical NEW file contents by running a genuine, complete
+            # --add-vendors upgrade once, so the half-state fixtures below use byte-exact
+            # old/new content instead of hand-authored approximations.
+            golden_home = fresh_claude_home("golden")
+            golden_config_dir = golden_home / ".config" / "parable"
+            old_toml = (golden_config_dir / "parable.toml").read_text()
+            old_manifest = (golden_config_dir / "setup.json").read_text()
+            golden_added = self.run_cli(golden_home, "setup", "--add-vendors", "kimi", "--no-auth")
+            self.assertEqual(golden_added.returncode, 0, golden_added.stdout + golden_added.stderr)
+            new_toml = (golden_config_dir / "parable.toml").read_text()
+            golden_new_manifest = (golden_config_dir / "setup.json").read_text()
+            self.assertNotEqual(old_toml, new_toml)
+            self.assertNotEqual(old_manifest, golden_new_manifest)
+
+            def new_manifest_for(config_dir: Path) -> str:
+                manifest = json.loads((config_dir / "setup.json").read_text())
+                manifest["vendors"] = ["claude", "kimi"]
+                return json.dumps(manifest, indent=2) + "\n"
+
+            # --- (a) rename completed for parable.toml (new) but not yet for setup.json
+            # (old, with its ".next" sibling still holding the new manifest content). ---
+            case_a_home = fresh_claude_home("case-a")
+            case_a_config_dir = case_a_home / ".config" / "parable"
+            case_a_new_manifest = new_manifest_for(case_a_config_dir)
+            (case_a_config_dir / "parable.toml").write_text(new_toml)
+            (case_a_config_dir / ".setup.json.next").write_text(case_a_new_manifest)
+            recovered_a = self.run_cli(case_a_home, "setup", "--add-vendors", "kimi", "--no-auth")
+            self.assertEqual(recovered_a.returncode, 0, recovered_a.stdout + recovered_a.stderr)
+            self.assertEqual((case_a_config_dir / "parable.toml").read_text(), new_toml)
+            self.assertEqual((case_a_config_dir / "setup.json").read_text(), case_a_new_manifest)
+            manifest_a = json.loads((case_a_config_dir / "setup.json").read_text())
+            self.assertEqual(manifest_a["vendors"], ["claude", "kimi"])
+            self.assertFalse((case_a_config_dir / ".parable.toml.next").exists())
+            self.assertFalse((case_a_config_dir / ".setup.json.next").exists())
+
+            # --- (b) rename completed for setup.json (new) but not yet for parable.toml
+            # (old, with its ".next" sibling still holding the new toml content). ---
+            case_b_home = fresh_claude_home("case-b")
+            case_b_config_dir = case_b_home / ".config" / "parable"
+            case_b_new_manifest = new_manifest_for(case_b_config_dir)
+            (case_b_config_dir / "setup.json").write_text(case_b_new_manifest)
+            (case_b_config_dir / ".parable.toml.next").write_text(new_toml)
+            recovered_b = self.run_cli(case_b_home, "setup", "--add-vendors", "kimi", "--no-auth")
+            self.assertEqual(recovered_b.returncode, 0, recovered_b.stdout + recovered_b.stderr)
+            self.assertEqual((case_b_config_dir / "parable.toml").read_text(), new_toml)
+            self.assertEqual((case_b_config_dir / "setup.json").read_text(), case_b_new_manifest)
+            manifest_b = json.loads((case_b_config_dir / "setup.json").read_text())
+            self.assertEqual(manifest_b["vendors"], ["claude", "kimi"])
+            self.assertFalse((case_b_config_dir / ".parable.toml.next").exists())
+            self.assertFalse((case_b_config_dir / ".setup.json.next").exists())
+
+            # --- The old canonical ".next"-files-only shape (both targets still old,
+            # both ".next" siblings hold the new content) must also still recover. ---
+            recovery_home = fresh_claude_home("recovery")
+            recovery_config_dir = recovery_home / ".config" / "parable"
+            recovery_new_manifest = new_manifest_for(recovery_config_dir)
+            (recovery_config_dir / ".parable.toml.next").write_text(new_toml)
+            (recovery_config_dir / ".setup.json.next").write_text(recovery_new_manifest)
+            recovered = self.run_cli(recovery_home, "setup", "--add-vendors", "kimi", "--no-auth")
+            self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+            manifest = json.loads((recovery_config_dir / "setup.json").read_text())
+            self.assertEqual(manifest["vendors"], ["claude", "kimi"])
+            self.assertFalse((recovery_config_dir / ".parable.toml.next").exists())
+            self.assertFalse((recovery_config_dir / ".setup.json.next").exists())
+
 
 class TestManagedProxyBuild(unittest.TestCase):
     def make_tools(self, root: Path) -> tuple[Path, Path, Path]:
@@ -1107,6 +1628,71 @@ if args and args[0] == "build":
             self.assertTrue(any("am" in call for call in git_calls))
             self.assertEqual([call[0] for call in go_calls], ["test", "test", "build"])
 
+    def test_proxy_upgrade_stages_new_binary_without_replacing_credentials(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            home.mkdir()
+            with socket.socket() as listener:
+                listener.bind(("127.0.0.1", 0))
+                port = listener.getsockname()[1]
+            data_home = root / "data"
+            old_proxy = root / "old-proxy"
+            old_proxy.write_text("#!/usr/bin/env sh\nexit 0\n")
+            old_proxy.chmod(0o755)
+            bindir, git_log, go_log = self.make_tools(root)
+            env = self.build_env(home, bindir, git_log, go_log)
+            env["XDG_DATA_HOME"] = str(data_home)
+            setup = subprocess.run(
+                [
+                    NODE, str(REPO / "bin" / "parable.js"),
+                    "setup", "--non-interactive", "--vendors", "claude",
+                    "--proxy-bin", str(old_proxy), "--port", str(port), "--no-auth",
+                ],
+                cwd=home,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(setup.returncode, 0, setup.stdout + setup.stderr)
+            config_dir = home / ".config" / "parable"
+            token_before = (config_dir / "cliproxy.env").read_bytes()
+
+            upgraded = subprocess.run(
+                [NODE, str(REPO / "bin" / "parable.js"), "proxy", "upgrade"],
+                cwd=home,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(upgraded.returncode, 0, upgraded.stdout + upgraded.stderr)
+            expected = (
+                data_home / "parable" / "cliproxyapi" / PROXY_COMMIT
+                / "parable-cliproxy-api"
+            )
+            manifest = json.loads((config_dir / "setup.json").read_text())
+            self.assertEqual(manifest["proxyBinary"], str(expected))
+            self.assertTrue(expected.is_file())
+            self.assertEqual((config_dir / "cliproxy.env").read_bytes(), token_before)
+            self.assertIn(
+                "claude-code:\n  disable-cloaking-model-list: true\n",
+                (config_dir / "cliproxy.yaml").read_text(),
+            )
+            self.assertIn("upgrade active", upgraded.stdout)
+
+            again = subprocess.run(
+                [NODE, str(REPO / "bin" / "parable.js"), "proxy", "upgrade"],
+                cwd=home,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+            self.assertIn("proxy is current", again.stdout)
+
     def test_interactive_setup_requires_consent_before_build_work(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1123,7 +1709,7 @@ if args and args[0] == "build":
                 [NODE, str(REPO / "bin" / "parable.js"), "setup", "--no-auth"],
                 cwd=home,
                 env=env,
-                input="n\nn\nn\n",
+                input="n\nn\nn\nn\n",
                 capture_output=True,
                 text=True,
                 timeout=60,
@@ -1150,7 +1736,7 @@ if args and args[0] == "build":
                 [NODE, str(REPO / "bin" / "parable.js"), "setup", "--no-auth"],
                 cwd=home,
                 env=env,
-                input="n\nn\ny\n",
+                input="n\nn\nn\ny\n",
                 capture_output=True,
                 text=True,
                 timeout=60,
@@ -1213,7 +1799,7 @@ if args and args[0] == "build":
             shutil.copytree(REPO / "skills", package / "skills")
             patch = (
                 package / "skills" / "parable" / "runtime" / "patches"
-                / "cliproxyapi-v7.2.88-claude-effort.patch"
+                / "cliproxyapi-v7.2.103-claude-effort.patch"
             )
             patch.write_text(patch.read_text() + "\n# checksum mutation\n")
             destination = root / "checksum"
@@ -1273,6 +1859,7 @@ mapping = {
     "--codex-device-login": ("chatgpt", "codex"),
     "--claude-login": ("claude", "claude"),
     "--xai-login": ("xai", "xai"),
+    "--kimi-login": ("kimi", "kimi"),
 }
 for flag, (vendor, record_type) in mapping.items():
     if flag in sys.argv and os.environ.get("FAKE_PROXY_SKIP_AUTH") != vendor:
@@ -1446,6 +2033,46 @@ raise SystemExit(int(os.environ.get("FAKE_PROXY_EXIT", "0")))
                 "In a new terminal, open your project and run:"
             ), 1)
 
+    def test_add_vendors_auth_only_authorizes_newly_missing_providers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            proxy, capture = self.make_proxy(home / "tools")
+            setup = self.setup(home, proxy, capture, vendors="claude,xai")
+            self.assertEqual(setup.returncode, 0, setup.stdout + setup.stderr)
+            # Authorize claude and xai up front so the post-upgrade auth pass has nothing
+            # to do for them, and must only reach for the newly-added kimi vendor.
+            for vendor, flag in (("claude", "--claude-login"), ("xai", "--xai-login")):
+                pre = self.run_cli(home, proxy, capture, "auth", "add", vendor)
+                self.assertEqual(pre.returncode, 0, pre.stdout + pre.stderr)
+            capture.write_text("")
+
+            added = self.run_cli(home, proxy, capture, "setup", "--add-vendors", "kimi")
+            self.assertEqual(added.returncode, 0, added.stdout + added.stderr)
+            config = home / ".config" / "parable" / "cliproxy.yaml"
+            self.assertEqual(self.calls(capture), [
+                ["--config", str(config), "--kimi-login", "--no-browser"],
+            ])
+            self.assertIn("claude: already authorized", added.stdout)
+            self.assertIn("xai: already authorized", added.stdout)
+            self.assertIn("authorization complete", added.stdout)
+            manifest = json.loads(
+                (home / ".config" / "parable" / "setup.json").read_text()
+            )
+            self.assertEqual(manifest["vendors"], ["claude", "xai", "kimi"])
+
+    def test_add_vendors_no_auth_defers_authorization(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            proxy, capture = self.make_proxy(home / "tools")
+            setup = self.setup(home, proxy, capture, vendors="claude")
+            self.assertEqual(setup.returncode, 0, setup.stdout + setup.stderr)
+            added = self.run_cli(
+                home, proxy, capture, "setup", "--add-vendors", "kimi", "--no-auth"
+            )
+            self.assertEqual(added.returncode, 0, added.stdout + added.stderr)
+            self.assertEqual(self.calls(capture), [])
+            self.assertIn("authorize each newly selected subscription", added.stdout)
+
     def test_auth_rejects_zero_exit_without_a_provider_record(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
@@ -1470,7 +2097,8 @@ raise SystemExit(int(os.environ.get("FAKE_PROXY_EXIT", "0")))
             self.assertEqual(setup.returncode, 0, setup.stdout + setup.stderr)
             rejected = (
                 (("auth", "add", "xai"), "not selected"),
-                (("auth", "add", "kimi"), "unsupported auth vendor"),
+                (("auth", "add", "kimi"), "not selected"),
+                (("auth", "add", "glm"), "unsupported auth vendor"),
                 (("auth", "add", "claude", "--device"), "only for chatgpt"),
             )
             for command, message in rejected:
@@ -1506,7 +2134,8 @@ raise SystemExit(int(os.environ.get("FAKE_PROXY_EXIT", "0")))
                                        "email": "private@example.invalid"},
                 "account-beta.json": {"type": "claude", "refresh_token": "SECRET-CLAUDE"},
                 "account-gamma.json": {"type": "xai", "id_token": "SECRET-XAI"},
-                "other.json": {"type": "kimi", "access_token": "SECRET-KIMI"},
+                "account-delta.json": {"type": "kimi", "access_token": "SECRET-KIMI"},
+                "other.json": {"type": "glm", "access_token": "SECRET-GLM"},
             }
             for name, value in records.items():
                 target = auth_dir / name
@@ -1532,10 +2161,11 @@ raise SystemExit(int(os.environ.get("FAKE_PROXY_EXIT", "0")))
                 "chatgpt": {"present": True, "recordCount": 1},
                 "claude": {"present": True, "recordCount": 1},
                 "xai": {"present": True, "recordCount": 1},
+                "kimi": {"present": True, "recordCount": 1},
             })
             self.assertEqual(status["records"], {
-                "total": 7,
-                "userOnly": 4,
+                "total": 8,
+                "userOnly": 5,
                 "invalidMode": 2,
                 "parseErrors": 1,
                 "unrecognized": 1,
@@ -1546,7 +2176,7 @@ raise SystemExit(int(os.environ.get("FAKE_PROXY_EXIT", "0")))
             self.assertEqual(stat.S_IMODE(bad_mode.stat().st_mode), 0o644)
             forbidden = [
                 "SECRET-", "private@example.invalid", "account-alpha", "bad-mode",
-                "linked.json", str(auth_dir), str(outside), "kimi",
+                "linked.json", str(auth_dir), str(outside),
             ]
             for value in forbidden:
                 self.assertNotIn(value, status_proc.stdout + status_proc.stderr)
@@ -1610,6 +2240,7 @@ mapping = {
     "--codex-login": ("chatgpt", "codex"),
     "--claude-login": ("claude", "claude"),
     "--xai-login": ("xai", "xai"),
+    "--kimi-login": ("kimi", "kimi"),
 }
 for flag, (vendor, record_type) in mapping.items():
     if flag in sys.argv:
@@ -1648,6 +2279,7 @@ for flag, (vendor, record_type) in mapping.items():
             "CLAUDE_CONFIG_DIR": str(home / ".claude-native"),
             "CODEX_HOME": str(home / ".codex-native"),
             "PARABLE_USAGE_CACHE": str(home / "usage-cache.json"),
+            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
         }
         for name in (
             "PARABLE_CONFIG",
@@ -1689,6 +2321,7 @@ for flag, (vendor, record_type) in mapping.items():
             "claude-opus-4-8",
             "claude-haiku-4-5-20251001",
             "grok-4.5",
+            "kimi-k3",
         ]
         expected_agents = {
             "parable-sol-exact": "gpt-5.6-sol",
@@ -1699,6 +2332,7 @@ for flag, (vendor, record_type) in mapping.items():
             "parable-opus-exact": "claude-opus-4-8",
             "parable-haiku-exact": "claude-haiku-4-5-20251001",
             "parable-grok": "grok-4.5",
+            "parable-kimi": "kimi-k3",
         }
         with tempfile.TemporaryDirectory() as tmp, model_server(
             exact_models + ["unrelated-model"]
@@ -1717,7 +2351,7 @@ for flag, (vendor, record_type) in mapping.items():
             setup = self.run_cli(
                 repo,
                 env,
-                "setup", "--non-interactive", "--vendors", "chatgpt,claude,xai",
+                "setup", "--non-interactive", "--vendors", "chatgpt,claude,xai,kimi",
                 "--proxy-bin", str(proxy), "--port", port,
             )
             self.assertEqual(setup.returncode, 0, setup.stdout + setup.stderr)
@@ -1729,6 +2363,7 @@ for flag, (vendor, record_type) in mapping.items():
                 ["--config", str(config_path), "--claude-login", "--no-browser"],
                 ["--config", str(config_path), "--codex-login"],
                 ["--config", str(config_path), "--xai-login", "--no-browser"],
+                ["--config", str(config_path), "--kimi-login", "--no-browser"],
             ])
 
             finalized = self.run_cli(repo, env, "setup", "finalize", "--json")
@@ -1742,7 +2377,9 @@ for flag, (vendor, record_type) in mapping.items():
                 {item["name"]: item["model"] for item in report["agents"]},
                 expected_agents,
             )
-            self.assertEqual(report["catalog"]["requiredCount"], 8)
+            self.assertEqual(report["catalog"]["configuredCount"], 9)
+            self.assertFalse(report["degraded"])
+            self.assertEqual(report["unavailableAgents"], [])
             self.assertEqual(
                 report["next"],
                 "parable",
@@ -1770,7 +2407,7 @@ for flag, (vendor, record_type) in mapping.items():
             confirmed_report = json.loads(confirmed.stdout)
             self.assertEqual(confirmed_report["sync"], {
                 "changed": 0,
-                "unchanged": 8,
+                "unchanged": 9,
                 "removed": 0,
             })
             for path, snapshot in before.items():
@@ -1782,9 +2419,15 @@ for flag, (vendor, record_type) in mapping.items():
             captured_text = claude_capture.read_text()
             self.assertNotIn(token, captured_text)
             captured = json.loads(captured_text)
+            welcome_plugin = (
+                REPO / "skills" / "parable" / "runtime" / "welcome-plugin"
+            )
             self.assertEqual(
                 captured["argv"],
-                ["--model", "claude-fable-5", "--print", "hello"],
+                [
+                    "--plugin-dir", str(welcome_plugin),
+                    "--model", "claude-fable-5", "--print", "hello",
+                ],
             )
             self.assertIsNone(captured["welcome_message"])
             self.assertTrue(captured["auth_token_present"])
@@ -1806,7 +2449,12 @@ for flag, (vendor, record_type) in mapping.items():
             )
             self.assertIn("_ __   __ _ _ __", captured["welcome_message"])
             self.assertIn("🐢  🐘  🦊", captured["welcome_message"])
-            self.assertIn("BRAIN   FABLE · claude-fable-5", captured["welcome_message"])
+            self.assertIn("BRAIN   FABLE · claude-fable-5 · 1M ctx", captured["welcome_message"])
+            # Multi-model cast: ceiling is the min across non-Claude cast
+            # models (gpt-5.6-* at 372k beat kimi-k3's 1M). Anthropic models
+            # ignore the env var, so the brain is unaffected.
+            self.assertEqual(captured["max_context_tokens"], "372000")
+            self.assertEqual(captured["auto_compact_pct"], "75")
             self.assertIn("TERRA", captured["welcome_message"])
             self.assertIn("React and frontend", captured["welcome_message"])
             self.assertNotIn(token, captured["welcome_message"])
@@ -1826,6 +2474,71 @@ for flag, (vendor, record_type) in mapping.items():
             )
             self.assertIn("explicit fable parent", captured["welcome_message"])
 
+            solo_before = {
+                path: (path.read_bytes(), path.stat().st_mtime_ns)
+                for path in agents_dir.glob("parable-*.md")
+            }
+            solo = self.run_cli(repo, env, "--solo", "kimi")
+            self.assertEqual(solo.returncode, 0, solo.stdout + solo.stderr)
+            self.assertIn("solo: kimi-k3", solo.stdout)
+            self.assertNotIn("agents:", solo.stdout)
+            captured = json.loads(claude_capture.read_text())
+            self.assertEqual(
+                captured["argv"],
+                [
+                    "--plugin-dir", str(welcome_plugin),
+                    "--model", "kimi-k3", "--disallowedTools", "Agent",
+                    "--effort", "high",
+                ],
+            )
+            self.assertFalse(
+                captured["inherited"]["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"]
+            )
+            # Solo pins the real window of the exact model so auto-compact
+            # fires before the upstream limit, not after.
+            self.assertEqual(captured["max_context_tokens"], "1000000")
+            self.assertIn("SOLO    KIMI · kimi-k3", captured["welcome_message"])
+            self.assertIn("1M ctx", captured["welcome_message"])
+            self.assertIn("You are the only agent", captured["welcome_message"])
+            self.assertNotIn("BRAIN", captured["welcome_message"])
+            self.assertNotIn("CAST", captured["welcome_message"])
+            solo_after = {
+                path: (path.read_bytes(), path.stat().st_mtime_ns)
+                for path in agents_dir.glob("parable-*.md")
+            }
+            self.assertEqual(solo_after, solo_before)
+
+            solo_exact = self.run_cli(
+                repo, env, "--solo=kimi-k3", "--print", "solo-exact"
+            )
+            self.assertEqual(
+                solo_exact.returncode, 0, solo_exact.stdout + solo_exact.stderr
+            )
+            captured = json.loads(claude_capture.read_text())
+            self.assertEqual(
+                captured["argv"],
+                [
+                    "--model", "kimi-k3", "--disallowedTools", "Agent",
+                    "--effort", "high", "--print", "solo-exact",
+                ],
+            )
+            self.assertIsNone(captured["welcome_message"])
+
+            legacy_solo = self.run_cli(
+                repo, env, "claude", "--solo", "kimi", "--", "--print", "legacy-solo"
+            )
+            self.assertEqual(
+                legacy_solo.returncode, 0, legacy_solo.stdout + legacy_solo.stderr
+            )
+            captured = json.loads(claude_capture.read_text())
+            self.assertEqual(
+                captured["argv"],
+                [
+                    "--model", "kimi-k3", "--disallowedTools", "Agent",
+                    "--print", "legacy-solo",
+                ],
+            )
+
             direct = self.run_cli(
                 repo, env, "--dangerously-skip-permissions", "--effort", "low",
                 "--print", "direct",
@@ -1835,6 +2548,7 @@ for flag, (vendor, record_type) in mapping.items():
             self.assertEqual(
                 captured["argv"],
                 [
+                    "--plugin-dir", str(welcome_plugin),
                     "--model", "claude-fable-5", "--dangerously-skip-permissions",
                     "--effort", "low", "--print", "direct",
                 ],
@@ -1849,10 +2563,13 @@ for flag, (vendor, record_type) in mapping.items():
             captured = json.loads(claude_capture.read_text())
             self.assertEqual(
                 captured["argv"],
-                ["--model", "claude-fable-5", "--print", "auto"],
+                [
+                    "--plugin-dir", str(welcome_plugin),
+                    "--model", "claude-fable-5", "--print", "auto",
+                ],
             )
 
-    def test_finalize_subset_and_missing_exact_id_fail_closed_without_aliases(self):
+    def test_finalize_subset_and_missing_optional_exact_id_degrades_without_aliases(self):
         with tempfile.TemporaryDirectory() as tmp, model_server([
             "claude-fable-5", "claude-sonnet-5", "claude-opus-4-8",
             "claude-haiku-4-5-20251001",
@@ -1894,13 +2611,19 @@ for flag, (vendor, record_type) in mapping.items():
             self.assertEqual(auto.returncode, 0, auto.stdout + auto.stderr)
             self.assertIn("brain: claude-fable-5 (Sol is not configured; using Fable)", auto.stdout)
             captured = json.loads(claude_capture.read_text())
+            welcome_plugin = (
+                REPO / "skills" / "parable" / "runtime" / "welcome-plugin"
+            )
             self.assertEqual(
                 captured["argv"],
-                ["--model", "claude-fable-5", "--print", "claude-only"],
+                [
+                    "--plugin-dir", str(welcome_plugin),
+                    "--model", "claude-fable-5", "--print", "claude-only",
+                ],
             )
             explicit_sol = self.run_cli(repo, env, "claude", "--brain", "sol")
             self.assertNotEqual(explicit_sol.returncode, 0)
-            self.assertIn("requires configured catalog model 'gpt-5.6-sol'", explicit_sol.stderr)
+            self.assertIn("requires configured model 'gpt-5.6-sol'", explicit_sol.stderr)
 
         misleading = [
             "gpt-5.6-sol",
@@ -1935,13 +2658,18 @@ for flag, (vendor, record_type) in mapping.items():
             self.assertEqual(setup.returncode, 0, setup.stdout + setup.stderr)
             server.expected_token = self.setup_token(home)
             finalized = self.run_cli(repo, env, "setup", "finalize", "--json")
-            self.assertNotEqual(finalized.returncode, 0)
-            self.assertIn("proxy model catalog is missing: grok-4.5", finalized.stderr)
-            agents = repo / ".claude" / "agents"
+            self.assertEqual(finalized.returncode, 0, finalized.stdout + finalized.stderr)
+            report = json.loads(finalized.stdout)
+            self.assertTrue(report["ready"])
+            self.assertTrue(report["degraded"])
             self.assertEqual(
-                sorted(path.name for path in agents.iterdir()),
-                ["handwritten.md", "parable-handwritten.md"],
+                report["unavailableAgents"],
+                [{"name": "parable-grok", "model": "grok-4.5"}],
             )
+            agents = repo / ".claude" / "agents"
+            self.assertTrue((agents / "parable-grok.md").is_file())
+            self.assertTrue((agents / "handwritten.md").is_file())
+            self.assertTrue((agents / "parable-handwritten.md").is_file())
             self.assertFalse(claude_capture.exists())
 
 
@@ -2157,7 +2885,7 @@ finally:
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             report = json.loads(proc.stdout)
             self.assertTrue(report["ready"])
-            self.assertEqual(report["catalog"]["requiredCount"], len(self.MODELS))
+            self.assertEqual(report["catalog"]["configuredCount"], len(self.MODELS))
             events = self.events(case)
             self.assertEqual(events[0]["argv"][-1], "--local-model")
             self.assertTrue(any(item["event"] == "signal" for item in events))
@@ -2217,7 +2945,9 @@ finally:
             proc = self.run_claude(
                 case,
                 FAKE_CLAUDE_WAIT="1",
-                FAKE_PROXY_EXIT_AFTER_MS="300",
+                # Leave enough time for the fake Claude process to install its
+                # signal handler on a busy host before the proxy exits.
+                FAKE_PROXY_EXIT_AFTER_MS="1000",
                 FAKE_PROXY_EXIT="19",
             )
             self.assertEqual(proc.returncode, 19, proc.stdout + proc.stderr)
