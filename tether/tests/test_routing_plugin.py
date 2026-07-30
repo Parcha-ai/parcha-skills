@@ -912,6 +912,91 @@ class RoutingPluginIntegrationTest(unittest.TestCase):
         self.assertEqual(outbox_count, 0)
         self.assertEqual(self.adapter.sent, [])
 
+    def test_hermes_background_dispatch_keeps_ingress_claim_until_task_finishes(self):
+        base_adapter = type(self.adapter)
+        gateway_allowed = asyncio.Event()
+        gateway_started = asyncio.Event()
+        dispatch_allowed = asyncio.Event()
+
+        class BackgroundSlackAdapter(base_adapter):
+            _tether_prefilter = False
+
+            async def _handle_slack_message(self, event, payload=None):
+                async def dispatch():
+                    await gateway_allowed.wait()
+                    gateway_event, gateway = self_test.gateway_event(event)
+                    self_test.plugin._pre_gateway_dispatch(
+                        event=gateway_event,
+                        gateway=gateway,
+                    )
+                    gateway_started.set()
+                    await dispatch_allowed.wait()
+
+                self.dispatch_task = asyncio.create_task(dispatch())
+                return event
+
+        self_test = self
+        live_module = sys.modules[
+            "hermes_plugins.slack_platform.adapter"
+        ]
+        with mock.patch.object(
+            live_module,
+            "SlackAdapter",
+            BackgroundSlackAdapter,
+        ), mock.patch.object(
+            self.plugin,
+            "_ensure_reply_poller",
+        ):
+            self.plugin._install_slack_bridge_prefilter()
+            adapter = BackgroundSlackAdapter()
+            raw = self.raw_event(
+                ts="1785000002.000032",
+                text=f"<@{LOCAL}> investigate in the background",
+                thread_ts="",
+            )
+            event_id = f"slack:{TEAM}:{CHANNEL}:{raw['ts']}"
+
+            async def exercise():
+                self.assertIs(
+                    await adapter._handle_slack_message(raw),
+                    raw,
+                )
+                with self.plugin.store.connect() as database:
+                    before_gateway = database.execute(
+                        """
+                        SELECT state,egress_sealed,error_code
+                        FROM thread_ingress WHERE event_id=?
+                        """,
+                        (event_id,),
+                    ).fetchone()
+                self.assertEqual(
+                    tuple(before_gateway),
+                    ("processing", 0, None),
+                )
+
+                gateway_allowed.set()
+                await gateway_started.wait()
+                dispatch_allowed.set()
+                await adapter.dispatch_task
+                finalizers = tuple(
+                    self.plugin.state.hermes_ingress_finalizers
+                )
+                if finalizers:
+                    await asyncio.gather(*finalizers)
+
+            asyncio.run(exercise())
+
+        with self.plugin.store.connect() as database:
+            completed = database.execute(
+                """
+                SELECT state,egress_sealed,error_code
+                FROM thread_ingress WHERE event_id=?
+                """,
+                (event_id,),
+            ).fetchone()
+        self.assertEqual(tuple(completed), ("completed", 1, None))
+        self.assertTrue(raw["_tether_ingress_dispatched"])
+
     def test_hermes_trailing_no_reply_suppresses_routing_explanation(self):
         raw = self.raw_event(
             ts="1785000002.000031",
