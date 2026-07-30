@@ -1,8 +1,8 @@
-# ChatGPT-, Claude-, and xAI-subscription-backed models in one stock Claude
-# Code session through a local Claude-compatible proxy. This file contains no
-# OAuth/provider credentials: only the NAME of the environment variable
-# holding the proxy's localhost client token. Configure and authenticate the
-# local proxy separately.
+# ChatGPT-, Claude-, xAI-, and Kimi-subscription-backed models in one stock
+# Claude Code session through a local Claude-compatible proxy. This file
+# contains no OAuth/provider credentials: only the NAME of the environment
+# variable holding the proxy's localhost client token. Configure and
+# authenticate the local proxy separately.
 
 [parable]
 version = 1
@@ -23,6 +23,14 @@ model = "grok-4.5"
 effort = "high"
 tags = ["implementer", "systems", "third-family", "subscription"]
 use_for = "Bounded terminal-heavy or systems implementation, especially Rust or C++, plus cross-family smoke testing."
+avoid_for = "Sole final factual review, orchestration, ambiguous product architecture, or reviewing its own diff."
+
+[executors.kimi]
+provider = "claude"
+model = "kimi-k3"
+effort = "high"
+tags = ["implementer", "fourth-family", "subscription"]
+use_for = "Bounded feature implementation and cross-family smoke testing outside the primary provider families."
 avoid_for = "Sole final factual review, orchestration, ambiguous product architecture, or reviewing its own diff."
 
 [executors.sol_exact]
@@ -85,10 +93,10 @@ avoid_for = "Architecture, difficult debugging, or final high-risk review."
 mechanical     = ["luna", "haiku_exact"]
 data_transform = ["luna", "terra", "sonnet_exact"]
 frontend       = ["terra", "sol_exact", "sonnet_exact"]
-feature        = ["terra", "sol_exact", "sonnet_exact", "grok"]
-refactor_wide  = ["sol_exact", "sonnet_exact", "opus_exact", "fable_exact", "grok"]
-gnarly         = ["sol_exact", "opus_exact", "fable_exact", "grok"]
+feature        = ["terra", "sol_exact", "sonnet_exact", "grok", "kimi"]
+refactor_wide  = ["sol_exact", "sonnet_exact", "opus_exact", "fable_exact", "grok", "kimi"]
+gnarly         = ["sol_exact", "opus_exact", "fable_exact", "grok", "kimi"]
 review         = ["opus_exact", "sol_exact", "terra", "sonnet_exact", "grok"]
-smoke_test     = ["grok", "sol_exact", "luna", "sonnet_exact"]
+smoke_test     = ["kimi", "grok", "sol_exact", "luna", "sonnet_exact"]
 architecture   = ["fable_exact", "opus_exact", "sol_exact"]
-escalation     = ["fable_exact", "opus_exact", "sol_exact", "grok", "terra", "sonnet_exact"]
+escalation     = ["fable_exact", "opus_exact", "sol_exact", "grok", "kimi", "terra", "sonnet_exact"]

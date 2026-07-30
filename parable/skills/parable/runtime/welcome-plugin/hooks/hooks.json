@@ -1,6 +1,19 @@
 {
-  "description": "Show the current Parable cast after Claude Code starts.",
+  "description": "Show the current Parable cast and preserve generated agents' exact models.",
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/model_guard.py"],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "SessionStart": [
       {
         "matcher": "startup|resume",

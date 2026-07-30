@@ -15,6 +15,7 @@ const {
   runFinalize,
   runProxyBuild,
   runProxyStart,
+  runProxyUpgrade,
   runSetup,
   setupClientEnvironment,
 } = require("../lib/onboarding");
@@ -151,15 +152,15 @@ function runPython(args, env = process.env) {
 function rootLaunchArgs(raw) {
   if (raw[0] === "--help" || raw[0] === "-h") return null;
 
-  let brain = ["--brain", "auto"];
+  let launch = ["--brain", "auto"];
   let forwarded;
   if (!raw.length) forwarded = [];
   else if (raw[0] === "--") forwarded = raw.slice(1);
-  else if (raw[0] === "--brain") {
-    brain = raw.slice(0, Math.min(2, raw.length));
+  else if (raw[0] === "--brain" || raw[0] === "--solo") {
+    launch = raw.slice(0, Math.min(2, raw.length));
     forwarded = raw.slice(2);
-  } else if (raw[0].startsWith("--brain=")) {
-    brain = [raw[0]];
+  } else if (raw[0].startsWith("--brain=") || raw[0].startsWith("--solo=")) {
+    launch = [raw[0]];
     forwarded = raw.slice(1);
   } else if (raw[0].startsWith("-")) forwarded = [...raw];
   else return null;
@@ -169,21 +170,25 @@ function rootLaunchArgs(raw) {
     (argument) => argument === "--effort" || argument.startsWith("--effort="),
   );
   if (!hasEffort) forwarded.unshift("--effort", "high");
-  return [...brain, "--", ...forwarded];
+  return [...launch, "--", ...forwarded];
 }
 
 function printUsage() {
   log("usage: parable [--brain auto|fable|sol|config] [--] [CLAUDE_ARGS...]");
+  log("       parable --solo <alias|exact-model> [--] [CLAUDE_ARGS...]");
   log("       parable <install|setup|doctor|auth|proxy|claude|agents sync> [options]");
   log("  (no command)       start the normal auto-brain Claude Code session; flags pass to Claude");
+  log("  --solo MODEL       launch one exact proxy model with Agent delegation disabled");
   log("  install            copy the skill to ~/.claude/skills (or ./.claude/skills with --project)");
   log("  setup              configure subscriptions and offer a pinned proxy build");
+  log("  setup --add-vendors kimi   add Kimi to an existing complete setup in place");
   log("  setup finalize     diagnostic exact-catalog check and agent synchronization");
   log("  doctor             check python/codex/config health");
   log("  auth login         interactively authorize every selected missing vendor");
-  log("  auth add VENDOR    authorize chatgpt, claude, or xai through CLIProxyAPI");
+  log("  auth add VENDOR    authorize chatgpt, claude, xai, or kimi through CLIProxyAPI");
   log("  auth status        show credential-safe provider presence and record counts");
   log("  proxy build        build the pinned, patched CLIProxyAPI source");
+  log("  proxy upgrade      stage the current pinned proxy without interrupting sessions");
   log("  proxy start        diagnostic foreground CLIProxyAPI process");
   log("  claude [...]       backward-compatible explicit launcher alias");
   log("  agents sync        synchronize project-local parable-* custom agents");
@@ -216,6 +221,10 @@ async function main() {
   }
   if (raw[0] === "proxy" && raw[1] === "build") {
     await runProxyBuild(raw.slice(2), log);
+    return;
+  }
+  if (raw[0] === "proxy" && raw[1] === "upgrade") {
+    await runProxyUpgrade(raw.slice(2), log);
     return;
   }
   if (raw[0] === "proxy" && raw[1] === "start") {

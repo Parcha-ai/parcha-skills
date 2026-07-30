@@ -1,13 +1,13 @@
-# parable
+# parable.sh
 
 <p align="center">
-  <img src="assets/hero.jpeg" alt="parable" width="400">
+  <img src="assets/hero.jpeg" alt="parable.sh" width="400">
 </p>
 
 
 [![skills.sh](https://skills.sh/b/miguelrios/unc-skills)](https://skills.sh/miguelrios/unc-skills/parable)
 
-**Multi-model coding orchestration for Claude Code, Codex, and pi.**
+**Multi-model coding orchestration for Claude Code, Codex, and pi—or explicit solo execution with one exact model and no delegation.**
 
 ## Install Parable
 
@@ -25,12 +25,12 @@ npx skills add miguelrios/unc-skills --skill parable --global --agent claude-cod
 > complete and Parable prints the new-terminal `parable` command.
 
 Claude is always the baseline subscription. The onboarding questions make ChatGPT
-(Sol/Terra/Luna and optional Sol fallback) and xAI (Grok 4.5) opt-in. If no compatible proxy is
-installed, onboarding separately asks permission to build Parable's pinned patched proxy.
+(Sol/Terra/Luna and optional Sol fallback), xAI (Grok 4.5), and Kimi opt-in. If no compatible
+proxy is installed, onboarding separately asks permission to build Parable's pinned patched proxy.
 Claude Code then tells the user to open a new terminal and run `parable auth login`, because its
 Bash tool cannot inject later OAuth callbacks into a running process and its command view may clip
 long authorization URLs. That single command connects every selected missing provider; users
-should never be handed three separate provider commands.
+should never be handed separate per-provider commands.
 
 It is Tuesday. You ask Fable to extract a helper and add a test. Three hundred lines later, the
 helper has its own module and two new dependencies. The model is pleased with itself. You open
@@ -156,10 +156,12 @@ provider sends the same `plan.md` through [Cursor CLI](https://cursor.com/docs/c
 [Cursor example](examples/parable.cursor.toml), and the other configs in `examples/`.
 
 There is also a single-harness, subscription-only path. `parable setup` builds or discovers a
-loopback CLIProxyAPI, delegates each selected user's native ChatGPT/Claude/xAI OAuth, and writes
-an exact Sol/Terra/Luna/Fable/Sonnet/Opus/Haiku/Grok cast. Bare `parable` starts or safely reuses the
-configured loopback proxy, waits for its authenticated catalog, requires every exact id, creates
-the project-local agents, launches stock Claude Code, and stops only the proxy process it owns.
+loopback CLIProxyAPI, delegates each selected user's native ChatGPT/Claude/xAI/Kimi OAuth, and writes
+an exact Sol/Terra/Luna/Fable/Sonnet/Opus/Haiku/Grok/Kimi cast. Bare `parable` starts or safely reuses the
+configured loopback proxy, waits for its authenticated catalog, requires the selected parent,
+creates the project-local agents, and launches stock Claude Code. Optional cast models missing
+from that launch snapshot are shown as unavailable and blocked before dispatch; their durable
+configuration remains intact. Parable stops only the proxy process it owns.
 No broker, shared deployment, provider API key, or copied OAuth credential is involved. See the
 [end-to-end setup guide](docs/CLIPROXYAPI_GPT_SUBSCRIPTION.md) and the generated-config
 [reference](examples/parable.claude-subscriptions.toml).
@@ -170,10 +172,18 @@ and moves the parent to Sol when that pool becomes tight. `parable --brain fable
 `parable --dangerously-skip-permissions`; `--` remains an optional separator. `parable claude`
 remains a compatibility alias. Permission bypass is never enabled implicitly.
 
-Interactive launches add a session-scoped startup hook that renders Parable ASCII art, the live
+**Solo mode:** `parable --solo <alias>` or `parable --solo <exact-model-id>` (for example, `parable --solo kimi` or `parable --solo kimi-k3`) runs Claude Code with a single exact model from the configured loopback proxy—no casting, no delegation, no load-balancing. The selected model becomes the brain and does the implementation. Solo is **explicit only**; it never infers from pool count or vendor configuration. Solo requires `[claude]` configured in `parable.toml` and only works with exact models exposed through the loopback proxy (not codex, pi, or cursor executors). Use solo when you intentionally want to spend one subscription lane, skip routing overhead, or run reproducible single-model tests. Solo startup skips `parable-config.sh` routing, agent setup, and the multi-model card; solo sessions refuse all Agent tool calls and subagent spawning. Conflicts with `--brain` and `--model` flags.
+
+For safe existing-install upgrades, run `parable setup --add-vendors kimi --no-auth` followed by the ordinary new-terminal
+`parable auth login` — existing providers are skipped.
+
+Multi-model launches add a session-scoped plugin that preserves each generated
+`parable-*` agent's exact frontmatter model even if an Agent call supplies a conflicting model.
+Interactive launches also render Parable ASCII art, the live
 brain decision, and every routed model with its task guidance inside Claude Code. The card is a
 user-only `systemMessage`: it creates no prompt and consumes no model context. Headless `--print`
-and `--bare` launches stay clean.
+launches load the guard without showing a card; `--bare` loads neither. Solo launches show a
+user-only SOLO startup card instead.
 
 The generated cast gives the parent evidence-informed stage directions: Fable for ambiguous
 planning and architecture; Sol for long implementation, difficult debugging, and high-recall
@@ -250,8 +260,8 @@ npx skills add miguelrios/unc-skills --skill parable
 ```
 
 The skill uses Claude Code's `AskUserQuestion`, Codex's `request_user_input` when the active mode
-permits it, or the current harness's equivalent structured UI to choose optional ChatGPT and xAI
-subscriptions; it falls back to one concise question when structured input is unavailable.
+permits it, or the current harness's equivalent structured UI to choose optional ChatGPT, xAI, and
+Kimi subscriptions; it falls back to one concise question when structured input is unavailable.
 Claude is the baseline pool because the harness is Claude Code. ChatGPT adds Sol/Terra/Luna and
 enables Sol as an automatic fallback; without ChatGPT, `auto` stays on Fable. After those choices,
 the skill runs its bundled installer once and delegates each selected provider's native OAuth flow.
@@ -292,8 +302,8 @@ parable
 
 Interactive setup offers the pinned proxy build when no executable is installed. For a headless
 ChatGPT device flow, use
-`parable.sh --non-interactive --vendors claude,chatgpt,xai --build-proxy --no-auth`, then run
-`parable auth add chatgpt --device` plus the selected Claude/xAI auth commands. The
+`parable.sh --non-interactive --vendors claude,chatgpt,xai,kimi --build-proxy --no-auth`, then run
+`parable auth add chatgpt --device` plus the selected Claude/xAI/Kimi auth commands. The
 [subscription guide](docs/CLIPROXYAPI_GPT_SUBSCRIPTION.md) covers every command, generated file,
 exact model, and failure rule.
 
