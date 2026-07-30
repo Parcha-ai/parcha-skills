@@ -1,6 +1,7 @@
 import json
 import re
 import unittest
+import ast
 from pathlib import Path
 
 
@@ -63,6 +64,21 @@ class PortablePackagingTest(unittest.TestCase):
             self.assertTrue(skill_root.is_dir())
             self.assertTrue(any(skill_root.glob("*/SKILL.md")))
 
+    def test_clean_home_proof_covers_every_canonical_skill(self):
+        tree = ast.parse((ROOT / "scripts/prove_portability.py").read_text())
+        assignment = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "SKILLS"
+                for target in node.targets
+            )
+        )
+        self.assertEqual(tuple(ast.literal_eval(assignment.value)), SKILLS)
+        proof = (ROOT / "scripts/prove_portability.py").read_text()
+        self.assertIn('"smoke-autoqa"', proof)
+
     def test_skill_local_references_exist(self):
         reference_pattern = re.compile(r"(?<!https:)(?<!http:)(?:scripts|references|assets|agents)/[A-Za-z0-9_./-]+")
         for skill_file in ROOT.glob("*/skills/*/SKILL.md"):
@@ -102,7 +118,11 @@ class PortablePackagingTest(unittest.TestCase):
         root_readme = (ROOT / "README.md").read_text()
         self.assertIn("https://skills.sh/miguelrios/unc-skills", root_readme)
         self.assertIn("npx skills add miguelrios/unc-skills", root_readme)
-        self.assertIn("github:miguelrios/unc-skills#main tether setup", root_readme)
+        self.assertIn(
+            "npx --yes --package=@parcha/tether@0.2.0-beta.1",
+            root_readme,
+        )
+        self.assertIn("Do not install Tether", root_readme)
 
         for name in SKILLS:
             package_readme = (ROOT / name / "README.md").read_text()

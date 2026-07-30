@@ -4,7 +4,11 @@
   "plugins": [
     {
       "name": "tether",
-      "source": {"source": "url", "url": "https://github.com/miguelrios/unc-skills.git", "ref": "main"},
+      "source": {
+        "source": "url",
+        "url": "https://github.com/Parcha-ai/parcha-skills.git",
+        "ref": "f5990ce984d064c4c477c9bba55710a7c33e630a"
+      },
       "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
       "category": "Developer Tools"
     }

@@ -1,5 +1,6 @@
 # Optional non-secret overrides. By default Tether reuses Hermes's
 # SLACK_HOME_CHANNEL and SLACK_ALLOWED_USERS settings.
+config_version = 1
 default_channel = ""
 # Empty means every explicitly allowlisted Hermes operator may reply.
 default_owner = ""
@@ -7,11 +8,14 @@ team_id = ""
 allowed_users = []
 
 native_timeout_seconds = 1800
-# Slack is a coordination surface, not a run log. Tether rejects longer
-# bound-session replies so agents must rewrite instead of flooding a thread.
+# Slack is a coordination surface, not a run log. These are writing targets,
+# not delivery gates: a complete or safety-critical answer may exceed them.
 max_reply_words = 50
 max_reply_chars = 500
 max_reply_sentences = 3
+# Completed event bodies and idempotency records are retained for this many
+# days. Active bindings and unresolved deliveries are never expired.
+retention_days = 30
 codex_binary = "codex"
 claude_binary = "claude"
 codex_resume_args = []
