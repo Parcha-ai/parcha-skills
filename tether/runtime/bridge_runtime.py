@@ -728,7 +728,34 @@ def slack_upload(token: str, channel: str, text: str, file_path: str, thread_ts:
             for share in (item.get("shares") or {}).get(visibility, {}).get(channel, []):
                 if share.get("ts"):
                     return str(share["ts"])
+    file_ids = {str(item.get("id")) for item in files if item.get("id")}
+    recovered = _recover_upload_ts(token, channel, file_ids)
+    if recovered:
+        return recovered
     raise RuntimeError("Slack upload succeeded without a root timestamp")
+
+
+def _recover_upload_ts(token: str, channel: str, file_ids: set[str]) -> str | None:
+    """Find the timestamp of an upload whose share block came back unpopulated.
+
+    Slack sometimes returns a completed upload before the share metadata is
+    attached, so the file is posted but the response carries no timestamp. The
+    message exists either way, and re-posting would duplicate it, so recover the
+    timestamp with a read instead of a write.
+    """
+    if not file_ids:
+        return None
+    try:
+        result = _slack_call(token, "conversations.history", {"channel": channel, "limit": 10})
+    except Exception:
+        return None
+    for message in result.get("messages") or []:
+        if not isinstance(message, dict) or not message.get("ts"):
+            continue
+        for attached in message.get("files") or []:
+            if isinstance(attached, dict) and str(attached.get("id")) in file_ids:
+                return str(message["ts"])
+    return None
 
 
 class Broker:

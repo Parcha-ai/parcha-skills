@@ -1669,5 +1669,100 @@ class InstallerAndPackageTest(unittest.TestCase):
         self.assertIn(f"version: {package['version']}", plugin_manifest)
 
 
+class SlackUploadTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.home = pathlib.Path(self.temp.name)
+        self.runtime = load_runtime(self.home)
+        self.attachment = self.home / "preview.png"
+        self.attachment.write_bytes(b"png-bytes")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _upload(self, upload_result, history_result=None):
+        calls = []
+
+        class Client:
+            def __init__(self, token=None):
+                pass
+
+            def files_upload_v2(self, **kwargs):
+                return upload_result
+
+        def slack_call(token, method, payload):
+            calls.append((method, payload))
+            if history_result is None:
+                raise AssertionError(f"unexpected Slack call: {method}")
+            return history_result
+
+        slack_sdk = types.ModuleType("slack_sdk")
+        slack_sdk.WebClient = Client
+        with mock.patch.dict(sys.modules, {"slack_sdk": slack_sdk}):
+            with mock.patch.object(self.runtime, "_slack_call", slack_call):
+                ts = self.runtime.slack_upload(
+                    "token", "C12345678", "hello", str(self.attachment)
+                )
+        return ts, calls
+
+    def test_share_timestamp_is_used_without_extra_slack_calls(self):
+        upload_result = {
+            "ok": True,
+            "files": [
+                {"id": "F1", "shares": {"public": {"C12345678": [{"ts": "111.222"}]}}},
+            ],
+        }
+        ts, calls = self._upload(upload_result)
+        self.assertEqual(ts, "111.222")
+        self.assertEqual(calls, [])
+
+    def test_unpopulated_share_block_recovers_timestamp_by_reading_history(self):
+        upload_result = {"ok": True, "files": [{"id": "F1", "shares": {}}]}
+        history = {
+            "messages": [
+                {"ts": "999.000", "text": "unrelated"},
+                {"ts": "333.444", "files": [{"id": "F1"}]},
+            ]
+        }
+        ts, calls = self._upload(upload_result, history)
+        self.assertEqual(ts, "333.444")
+        self.assertEqual([method for method, _ in calls], ["conversations.history"])
+
+    def test_recovery_never_reposts_the_message(self):
+        upload_result = {"ok": True, "files": [{"id": "F1", "shares": {}}]}
+        history = {"messages": [{"ts": "333.444", "files": [{"id": "F1"}]}]}
+        _, calls = self._upload(upload_result, history)
+        self.assertNotIn("chat.postMessage", [method for method, _ in calls])
+
+    def test_upload_without_a_matching_message_still_raises(self):
+        upload_result = {"ok": True, "files": [{"id": "F1", "shares": {}}]}
+        history = {"messages": [{"ts": "999.000", "files": [{"id": "F-other"}]}]}
+        with self.assertRaises(RuntimeError):
+            self._upload(upload_result, history)
+
+    def test_history_failure_during_recovery_raises_the_original_error(self):
+        upload_result = {"ok": True, "files": [{"id": "F1", "shares": {}}]}
+
+        class Client:
+            def __init__(self, token=None):
+                pass
+
+            def files_upload_v2(self, **kwargs):
+                return upload_result
+
+        def slack_call(token, method, payload):
+            raise RuntimeError("slack is down")
+
+        slack_sdk = types.ModuleType("slack_sdk")
+        slack_sdk.WebClient = Client
+        with mock.patch.dict(sys.modules, {"slack_sdk": slack_sdk}):
+            with mock.patch.object(self.runtime, "_slack_call", slack_call):
+                with self.assertRaises(RuntimeError) as caught:
+                    self.runtime.slack_upload(
+                        "token", "C12345678", "hello", str(self.attachment)
+                    )
+        self.assertIn("without a root timestamp", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
