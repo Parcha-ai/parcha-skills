@@ -284,12 +284,19 @@ function verifyManagedInstall() {
       const [target, expectedMode, expectedHash] = fields;
       seen.add(target);
       const info = fs.lstatSync(target);
-      const actualMode = (info.mode & 0o777).toString(8);
+      const actualModeBits = info.mode & 0o777;
+      const expectedModeBits = Number.parseInt(expectedMode, 8);
+      const modeExpanded = (actualModeBits & ~expectedModeBits) !== 0;
+      const ownerCannotRead = (actualModeBits & 0o400) === 0;
+      const ownerCannotExecute =
+        (expectedModeBits & 0o100) !== 0 && (actualModeBits & 0o100) === 0;
       if (
         info.isSymbolicLink() ||
         !info.isFile() ||
         (typeof process.getuid === "function" && info.uid !== process.getuid()) ||
-        actualMode !== expectedMode.replace(/^0+/, "") ||
+        modeExpanded ||
+        ownerCannotRead ||
+        ownerCannotExecute ||
         fileSha256(target) !== expectedHash
       ) {
         drifted += 1;

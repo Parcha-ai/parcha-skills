@@ -819,6 +819,60 @@ class TetherCliTest(unittest.TestCase):
             result.stdout,
         )
 
+    def test_doctor_accepts_more_restrictive_managed_modes(self) -> None:
+        _, candidates = self.write_managed_install(harness="codex")
+        plugin_manifest = self.root / "hermes" / "plugins" / "tether" / "plugin.yaml"
+        skill = self.home / ".codex" / "skills" / "tether" / "SKILL.md"
+        self.assertEqual(candidates[plugin_manifest], 0o644)
+        self.assertEqual(candidates[skill], 0o644)
+        plugin_manifest.chmod(0o600)
+        skill.chmod(0o400)
+
+        with FakeBroker(
+            self.root,
+            lambda _request: self.response(
+                {
+                    "ok": True,
+                    "implementation": "tether",
+                    "protocol_version": 5,
+                    "allowed_user_count": 1,
+                    "owner_configured": True,
+                    "slack_transport_connected": True,
+                    "peer_uid_enforced": True,
+                    "root_refused": True,
+                }
+            ),
+        ) as broker:
+            result = self.run_cli("doctor", socket_path=broker.path)
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("ok managed install integrity verified", result.stdout)
+
+    def test_doctor_rejects_removed_owner_execute_permission(self) -> None:
+        self.write_managed_install(harness="codex")
+        notifier = self.root / "data" / "tether" / "tether_notify.py"
+        notifier.chmod(0o600)
+
+        with FakeBroker(
+            self.root,
+            lambda _request: self.response(
+                {
+                    "ok": True,
+                    "implementation": "tether",
+                    "protocol_version": 5,
+                    "allowed_user_count": 1,
+                    "owner_configured": True,
+                    "slack_transport_connected": True,
+                    "peer_uid_enforced": True,
+                    "root_refused": True,
+                }
+            ),
+        ) as broker:
+            result = self.run_cli("doctor", socket_path=broker.path)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("FAIL managed install drift detected", result.stdout)
+
     def test_doctor_validates_both_harnesses_and_declared_legacy_shim(self) -> None:
         self.write_managed_install(harness="both", legacy=("codex",))
         with FakeBroker(
