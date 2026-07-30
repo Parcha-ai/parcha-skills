@@ -138,6 +138,7 @@ class PluginState:
     recovery_wake_counter: int = 0
     recovery_lock: threading.Lock = field(default_factory=threading.Lock)
     reply_poller: asyncio.Task | None = None
+    hermes_ingress_finalizers: set[asyncio.Task] = field(default_factory=set)
     poll_cursor: int = 0
     joined_channels: set[tuple[str, str]] = field(default_factory=set)
     slack_transport_connected: bool | None = None
@@ -1124,6 +1125,124 @@ async def _renew_thread_ingress_lease(event_id: str, lease_id: str) -> None:
             return
 
 
+def _finalize_hermes_ingress_claim(
+    event: Mapping[str, Any],
+    ingress_claim: tuple[str, str, int],
+    egress_context: Mapping[str, Any] | None,
+) -> None:
+    gateway_started = bool(event.get("_tether_gateway_dispatch_started"))
+    egress_failed = str((egress_context or {}).get("failed") or "")
+    sealed = store.seal_thread_ingress_egress(
+        *ingress_claim,
+        allow_empty=gateway_started and not egress_failed,
+    )
+    if sealed in {"completed", "pending"}:
+        if isinstance(event, dict):
+            event["_tether_ingress_dispatched"] = True
+    elif sealed == "empty" and gateway_started:
+        if not store.mark_thread_ingress_uncertain(
+            *ingress_claim,
+            error_code=(
+                egress_failed
+                or "hermes_egress_reservation_failed"
+            ),
+        ):
+            log.error(
+                "Tether could not fence failed Hermes egress; "
+                "operator review is required"
+            )
+    elif sealed == "empty":
+        store.release_thread_ingress(
+            ingress_claim[0],
+            ingress_claim[1],
+            error_code="hermes_gateway_not_started",
+        )
+    else:
+        log.error(
+            "Tether could not seal Hermes ingress egress; "
+            "the event will not be blindly retried"
+        )
+
+
+async def _finalize_deferred_hermes_ingress(
+    event: dict[str, Any],
+    ingress_claim: tuple[str, str, int],
+    egress_context: dict[str, Any] | None,
+    heartbeat: asyncio.Task | None,
+) -> None:
+    """Finalize ingress after Hermes's spawned background task finishes.
+
+    Hermes's platform handler intentionally returns immediately after creating
+    the per-session processing task. Finalizing at that foreground return
+    races the gateway hook and releases the durable claim before the task can
+    use it. Keep the claim lease alive until the exact task that crossed the
+    authoritative hook completes.
+    """
+
+    timeout_seconds = _bounded_env_int(
+        "TETHER_HERMES_DISPATCH_START_TIMEOUT_SECONDS",
+        3600,
+        30,
+        86400,
+    )
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    dispatch_task: asyncio.Task | None = None
+    try:
+        while loop.time() < deadline:
+            candidate = event.get("_tether_gateway_dispatch_task")
+            if isinstance(candidate, asyncio.Task):
+                dispatch_task = candidate
+                break
+            await asyncio.sleep(0.01)
+        if dispatch_task is None:
+            store.release_thread_ingress(
+                ingress_claim[0],
+                ingress_claim[1],
+                error_code="hermes_gateway_start_timeout",
+            )
+            return
+        try:
+            await asyncio.shield(dispatch_task)
+        except asyncio.CancelledError:
+            if not dispatch_task.cancelled():
+                raise
+            store.mark_thread_ingress_uncertain(
+                *ingress_claim,
+                error_code="hermes_background_cancelled",
+            )
+            return
+        except Exception as exc:
+            store.mark_thread_ingress_uncertain(
+                *ingress_claim,
+                error_code=type(exc).__name__,
+            )
+            return
+        _finalize_hermes_ingress_claim(
+            event,
+            ingress_claim,
+            egress_context,
+        )
+    except asyncio.CancelledError:
+        if event.get("_tether_gateway_dispatch_started"):
+            store.mark_thread_ingress_uncertain(
+                *ingress_claim,
+                error_code="hermes_finalizer_cancelled",
+            )
+        else:
+            store.release_thread_ingress(
+                ingress_claim[0],
+                ingress_claim[1],
+                error_code="hermes_gateway_not_started",
+            )
+        raise
+    finally:
+        if heartbeat is not None:
+            heartbeat.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat
+
+
 def _hermes_ingress_payload(
     event: Mapping[str, Any],
     mutation: Mapping[str, Any] | None = None,
@@ -1863,37 +1982,34 @@ def _install_slack_bridge_prefilter():
                 gateway_started = bool(
                     event.get("_tether_gateway_dispatch_started")
                 )
-                egress_failed = str(
-                    (egress_context or {}).get("failed") or ""
+                dispatch_task = event.get(
+                    "_tether_gateway_dispatch_task"
                 )
-                sealed = store.seal_thread_ingress_egress(
-                    *ingress_claim,
-                    allow_empty=gateway_started and not egress_failed,
+                current_handler_task = asyncio.current_task()
+                background_running = (
+                    isinstance(dispatch_task, asyncio.Task)
+                    and dispatch_task is not current_handler_task
+                    and not dispatch_task.done()
                 )
-                if sealed in {"completed", "pending"}:
-                    event["_tether_ingress_dispatched"] = True
-                elif sealed == "empty" and gateway_started:
-                    if not store.mark_thread_ingress_uncertain(
-                        *ingress_claim,
-                        error_code=(
-                            egress_failed
-                            or "hermes_egress_reservation_failed"
-                        ),
-                    ):
-                        log.error(
-                            "Tether could not fence failed Hermes egress; "
-                            "operator review is required"
+                if not gateway_started or background_running:
+                    finalizer = asyncio.create_task(
+                        _finalize_deferred_hermes_ingress(
+                            event,
+                            ingress_claim,
+                            egress_context,
+                            heartbeat,
                         )
-                elif sealed == "empty":
-                    store.release_thread_ingress(
-                        ingress_claim[0],
-                        ingress_claim[1],
-                        error_code="hermes_gateway_not_started",
                     )
+                    state.hermes_ingress_finalizers.add(finalizer)
+                    finalizer.add_done_callback(
+                        state.hermes_ingress_finalizers.discard
+                    )
+                    heartbeat = None
                 else:
-                    log.error(
-                        "Tether could not seal Hermes ingress egress; "
-                        "the event will not be blindly retried"
+                    _finalize_hermes_ingress_claim(
+                        event,
+                        ingress_claim,
+                        egress_context,
                     )
             return result
         finally:
@@ -2996,6 +3112,11 @@ def _dispatch_hermes_gateway(
     if not store.mark_thread_ingress_dispatched(*ingress_claim):
         return {"action": "skip", "reason": "tether-ingress-lease-lost"}
     raw_message["_tether_gateway_dispatch_started"] = True
+    dispatch_task = None
+    with contextlib.suppress(RuntimeError):
+        dispatch_task = asyncio.current_task()
+    if dispatch_task is not None:
+        raw_message["_tether_gateway_dispatch_task"] = dispatch_task
     if decision.bridge_id is None:
         return {"action": "allow"}
     run_id = str(
