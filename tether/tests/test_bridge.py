@@ -3135,6 +3135,18 @@ class PluginRoutingTest(unittest.TestCase):
         self.assertEqual(adapter.events[0]["text"], "did you see this?")
         self.assertTrue(adapter.events[0]["_tether_polled"])
 
+    def test_reply_poller_skips_participation_without_workspace(self):
+        self.plugin.store.mark_participation(
+            "", "C12345678", "123.456",
+        )
+
+        class Adapter:
+            def _get_client(self, _channel, team_id=None):
+                raise AssertionError("incomplete participation must not be polled")
+
+        recovered = asyncio.run(self.plugin._poll_recent_replies(Adapter()))
+        self.assertEqual(recovered, 0)
+
     def test_reply_poller_recovers_peer_bot_thread_turns_when_enabled(self):
         bridge = self.make_bridge(owner="*")
         messages = [

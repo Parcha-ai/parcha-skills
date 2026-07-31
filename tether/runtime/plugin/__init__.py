@@ -2398,11 +2398,15 @@ async def _poll_recent_replies(adapter) -> int:
     hours = _bounded_env_int("TETHER_REPLY_RECOVERY_HOURS", 24, 1, 168)
     workspace_limit = _bounded_env_int("TETHER_REPLY_POLL_BATCH", 10, 1, 25)
     max_pages = _bounded_env_int("TETHER_REPLY_POLL_MAX_PAGES", 25, 1, 100)
-    bridges = store.active_bridges()
+    bridges = [
+        bridge
+        for bridge in store.active_bridges()
+        if bridge.team_id and bridge.channel_id and bridge.thread_ts
+    ]
     bridge_keys = {(bridge.team_id, bridge.channel_id, bridge.thread_ts) for bridge in bridges}
     participating = [
         item for item in store.recent_participating_threads(hours=max(hours, 168), limit=500)
-        if item[:3] not in bridge_keys
+        if all(item[:3]) and item[:3] not in bridge_keys
     ]
     targets = [
         (bridge, bridge.team_id, bridge.channel_id, str(bridge.thread_ts), None)
@@ -2560,7 +2564,12 @@ async def _poll_recent_replies(adapter) -> int:
         except Exception as exc:
             failures += 1
             target = bridge.bridge_id if bridge is not None else f"{channel_id}:{thread_ts}"
-            log.warning("Could not poll Tether thread %s: %s", target, type(exc).__name__)
+            detail = (
+                str(exc)
+                if isinstance(exc, hermes_compat.HermesCompatibilityError)
+                else type(exc).__name__
+            )
+            log.warning("Could not poll Tether thread %s: %s", target, detail)
             continue
         if not page.page.complete:
             store.save_reply_poll_page_state(
