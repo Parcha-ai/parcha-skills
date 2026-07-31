@@ -8552,7 +8552,7 @@ class Broker:
         with self._notify_lock:
             for bridge_id in self.store.pending_root_ids():
                 bridge = self.store.get(bridge_id)
-                if bridge is None:
+                if bridge is None or bridge.status == "closed":
                     continue
                 try:
                     self._deliver_staged_root(bridge)

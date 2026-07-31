@@ -517,6 +517,29 @@ class OutboxRecoveryTest(unittest.TestCase):
         self.assertEqual(store.root_record(bridge.bridge_id)["state"], "complete")
         self.assertEqual(store.get(bridge.bridge_id).status, "active")
 
+    def test_closed_legacy_bridge_does_not_retry_uncertain_root(self):
+        request = self._notify_request("closed-legacy-root")
+        bridge = self.store.create(request)
+        self.store.reserve_root(bridge.bridge_id, request["text"], "")
+        with self.store.connect() as database:
+            database.execute(
+                "UPDATE bridges SET status='closed' WHERE bridge_id=?",
+                (bridge.bridge_id,),
+            )
+            database.execute(
+                "UPDATE bridge_roots SET state='uncertain' WHERE bridge_id=?",
+                (bridge.bridge_id,),
+            )
+
+        broker = self.runtime.Broker(
+            "test-token",
+            self.store,
+            verified_workspace_team_id="T12345678",
+        )
+        with mock.patch.object(broker, "_deliver_staged_root") as deliver:
+            self.assertEqual(broker.recover_roots(), 0)
+        deliver.assert_not_called()
+
     def test_accepted_root_file_is_reconciled_after_completion_crash(self):
         uploads = self.home / "uploads"
         uploads.mkdir()
