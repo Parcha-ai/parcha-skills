@@ -130,6 +130,18 @@ context window of the proxied non-Anthropic models in play and sets
 does not recognize, then waits until about 95% to compact; that leaves too little room for Sol
 tool results before the upstream limit. Details and override knobs: `references/config.md`.
 
+An explicit CLI resume into a smaller window (`--continue`, `--resume <name-or-id>`, or
+`--from-pr <value>`) gets a pre-launch guard. Parable asks Claude Code's native `/context`
+command for the resumed size using Sonnet 5's 1M context at low effort and zero model tokens. If
+the existing context is already beyond the target launch's 75% safe point, the same Sonnet
+session runs native `/compact` before Parable starts the selected brain. The selector is then
+replaced by the resolved session id so the check, compaction, and launch cannot drift to
+different "latest" sessions. A bare `--resume` picker and `--fork-session` cannot be safely
+pre-compacted before Claude resolves or creates their session; the launcher reports that it
+skipped the guard. SessionStart hooks cannot implement this guard because Claude Code defines
+them as non-blocking context/UI hooks, not a place to invoke built-in commands before loading a
+model.
+
 ### Solo requires `[claude]` configuration
 
 Solo mode **requires** `parable.toml` to have `[claude]` configured (subscription-only mode with a loopback proxy). Solo cannot run with codex, pi, cursor, or other provider-backed executors. When launching with `parable --solo <model>`:

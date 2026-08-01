@@ -5,6 +5,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 SCRIPT = Path(__file__).resolve().parent.parent / "skills" / "parable" / "scripts" / "parable.py"
 spec = importlib.util.spec_from_file_location("parable", SCRIPT)
@@ -210,6 +211,7 @@ class TestClaudeLaunch(unittest.TestCase):
         self.assertIn("KIMI", card)
         self.assertIn("Independent implementation", card)
         self.assertNotIn("DEGRADED", card)
+        self.assertNotIn("carries the work", card)
         argv = ["claude", "--model", "claude-fable-5"]
         interactive_argv, interactive_env = parable.add_claude_welcome(
             argv, {}, cfg, "claude-fable-5", "explicit fable parent", available, []
@@ -251,6 +253,155 @@ class TestClaudeLaunch(unittest.TestCase):
             {"gpt-5.6-sol"}, columns=96,
         )
         self.assertIn("DEGRADED FABLE, KIMI unavailable for this session", degraded)
+
+    def test_resume_selector_handles_explicit_forms_and_not_prompt_text(self):
+        cases = (
+            (["--continue"], (0, 1, ["--continue"])),
+            (["-c", "prompt"], (0, 1, ["--continue"])),
+            (["--resume=session-name"], (0, 1, ["--resume", "session-name"])),
+            (["-r", "session-id", "prompt"], (0, 2, ["--resume", "session-id"])),
+            (["--from-pr", "123"], (0, 2, ["--from-pr", "123"])),
+            (["--resume", "--print"], (0, 1, [])),
+        )
+        for forwarded, expected in cases:
+            with self.subTest(forwarded=forwarded):
+                self.assertEqual(parable.claude_resume_selector(forwarded), expected)
+        self.assertIsNone(
+            parable.claude_resume_selector(["--print", "--", "--resume", "literal"])
+        )
+
+    def test_resume_preflight_resolves_low_context_without_compacting(self):
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append((argv, kwargs))
+            payload = {
+                "type": "result",
+                "is_error": False,
+                "session_id": "resolved-session",
+                "result": "**Tokens:** 42.5k / 967k (4%)",
+            }
+            return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+        forwarded, note = parable.prepare_claude_resume(
+            ["--continue", "--print", "hello"],
+            "claude-custom",
+            {
+                "ANTHROPIC_AUTH_TOKEN": "sentinel",
+                parable.CLAUDE_CONTEXT_ENV: "372000",
+                parable.CLAUDE_AUTO_COMPACT_PCT_ENV: "75",
+            },
+            {"claude-sonnet-5"},
+            run=run,
+        )
+        self.assertEqual(
+            forwarded,
+            ["--resume", "resolved-session", "--print", "hello"],
+        )
+        self.assertIn("42,500 tokens fit", note)
+        self.assertEqual(len(calls), 1)
+        argv, kwargs = calls[0]
+        self.assertEqual(argv[-2:], ["--continue", "/context"])
+        self.assertIn("claude-sonnet-5[1m]", argv)
+        self.assertNotIn(parable.CLAUDE_CONTEXT_ENV, kwargs["env"])
+        self.assertNotIn(parable.CLAUDE_AUTO_COMPACT_PCT_ENV, kwargs["env"])
+
+    def test_resume_preflight_compacts_oversized_context_with_sonnet(self):
+        calls = []
+        results = [
+            {
+                "type": "result",
+                "is_error": False,
+                "session_id": "large-session",
+                "result": "## Context Usage\n\n**Tokens:** 321.4k / 967k (33%)",
+            },
+            {
+                "type": "result",
+                "is_error": False,
+                "session_id": "large-session",
+                "result": "",
+            },
+        ]
+
+        def run(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(results.pop(0)),
+                stderr="",
+            )
+
+        forwarded, note = parable.prepare_claude_resume(
+            ["--resume", "my-session", "--effort", "high"],
+            "claude",
+            {parable.CLAUDE_CONTEXT_ENV: "372000"},
+            {"claude-sonnet-5"},
+            run=run,
+        )
+        self.assertEqual(
+            forwarded,
+            ["--resume", "large-session", "--effort", "high"],
+        )
+        self.assertEqual(
+            note,
+            "compacted 321,400 tokens with Sonnet 5 before the 372,000-token launch",
+        )
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][0][-3:], ["--resume", "my-session", "/context"])
+        self.assertEqual(
+            calls[1][0][-3:],
+            ["--resume", "large-session", parable.CLAUDE_RESUME_COMPACT_PROMPT],
+        )
+
+    def test_resume_preflight_skips_picker_fork_and_full_window(self):
+        def should_not_run(*_args, **_kwargs):
+            self.fail("preflight subprocess should not run")
+
+        picker, picker_note = parable.prepare_claude_resume(
+            ["--resume", "--print"], "claude",
+            {parable.CLAUDE_CONTEXT_ENV: "372000"}, {"claude-sonnet-5"},
+            run=should_not_run,
+        )
+        self.assertEqual(picker, ["--resume", "--print"])
+        self.assertIn("picker selected", picker_note)
+        forked, forked_note = parable.prepare_claude_resume(
+            ["--resume", "id", "--fork-session"], "claude",
+            {parable.CLAUDE_CONTEXT_ENV: "372000"}, {"claude-sonnet-5"},
+            run=should_not_run,
+        )
+        self.assertEqual(forked, ["--resume", "id", "--fork-session"])
+        self.assertIn("forked resume", forked_note)
+        full, full_note = parable.prepare_claude_resume(
+            ["--continue"], "claude",
+            {parable.CLAUDE_CONTEXT_ENV: "1000000"}, {"claude-sonnet-5"},
+            run=should_not_run,
+        )
+        self.assertEqual(full, ["--continue"])
+        self.assertIsNone(full_note)
+
+    def test_resume_preflight_fails_closed_when_compaction_does_not_finish(self):
+        results = [
+            {
+                "type": "result", "is_error": False, "session_id": "id",
+                "result": "**Tokens:** 300k / 967k (31%)",
+            },
+            {
+                "type": "result", "is_error": False, "session_id": "id",
+                "result": "Error during compaction: Conversation too long",
+            },
+        ]
+
+        def run(_argv, **_kwargs):
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps(results.pop(0)), stderr=""
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "compaction did not complete"):
+            parable.prepare_claude_resume(
+                ["--continue"], "claude",
+                {parable.CLAUDE_CONTEXT_ENV: "372000"}, {"claude-sonnet-5"},
+                run=run,
+            )
 
     def auto_cfg(self):
         cfg = self.cfg()

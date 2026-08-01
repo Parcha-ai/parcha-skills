@@ -333,6 +333,11 @@ runtime difference.
   with per-invocation provider injection, drives Cursor through `cursor-agent`, and reports
   compact run summaries the brain can read for pennies. Global Claude settings,
   `~/.codex/config.toml`, and `~/.pi` are never modified.
+- Explicit Claude session resumes are checked before launch when the selected model has a
+  smaller context window. Parable uses native `/context` at zero model tokens and, only when
+  needed, native `/compact` with low-effort Sonnet 5 in its 1M window before starting the
+  requested brain. Use `--continue` or `--resume <name-or-id>`; Claude's bare resume picker does
+  not reveal its selection early enough for a pre-launch guard.
 - `skills/parable/references/`: config schema, provider recipes, routing playbook, reviewer
   rubric, and a commented example config. `examples/` holds minimal Fireworks, OpenRouter,
   LiteLLM, pi-Fireworks, [Claude subscriptions](examples/parable.claude-subscriptions.toml),
