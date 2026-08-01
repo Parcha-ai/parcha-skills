@@ -677,7 +677,7 @@ exit 0
             self.assertEqual(first.stdout.count(handoff), 1)
             self.assertIn(launch, first.stdout)
 
-            installed = home / ".local" / "share" / "parable" / "0.1.24"
+            installed = home / ".local" / "share" / "parable" / "0.1.25"
             durable = home / ".local" / "bin" / "parable"
             self.assertTrue((installed / "bin" / "parable.js").is_file())
             self.assertTrue((installed / "lib" / "onboarding.js").is_file())
@@ -1010,6 +1010,89 @@ class TestClaudeAgentModelGuard(unittest.TestCase):
         decision = json.loads(result.stdout)["hookSpecificOutput"]
         self.assertEqual(decision["permissionDecision"], "deny")
         self.assertIn("current parent model", decision["permissionDecisionReason"])
+
+
+class TestClaudeAgentAuthFailure(unittest.TestCase):
+    def run_hook(self, payload: object) -> subprocess.CompletedProcess[str]:
+        hook = (
+            REPO / "skills" / "parable" / "runtime" / "welcome-plugin"
+            / "scripts" / "auth_failure.py"
+        )
+        return subprocess.run(
+            ["python3", str(hook)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    def test_auth_unavailable_names_recovery_command_for_user_and_parent(self):
+        error = (
+            "API Error: 503 auth_unavailable: no auth available "
+            "(providers=claude, model=claude-opus-5)"
+        )
+        result = self.run_hook({
+            "hook_event_name": "PostToolUseFailure",
+            "tool_name": "Agent",
+            "tool_input": {"subagent_type": "Explore"},
+            "error": error,
+            "is_interrupt": False,
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout)
+        self.assertIn("Claude authentication is unavailable", output["systemMessage"])
+        self.assertIn("parable auth add claude", output["systemMessage"])
+        self.assertIn("Retry once in a moment", output["systemMessage"])
+        context = output["hookSpecificOutput"]
+        self.assertEqual(context["hookEventName"], "PostToolUseFailure")
+        self.assertIn("Repeated agent retries", context["additionalContext"])
+
+    def test_auth_not_found_maps_codex_provider_to_chatgpt_login(self):
+        result = self.run_hook({
+            "hook_event_name": "PostToolUseFailure",
+            "tool_name": "Agent",
+            "error": "auth_not_found (providers=codex, model=gpt-5.6-terra)",
+        })
+        output = json.loads(result.stdout)
+        self.assertIn("ChatGPT authentication is unavailable", output["systemMessage"])
+        self.assertIn("parable auth add chatgpt", output["systemMessage"])
+        self.assertNotIn("Retry once", output["systemMessage"])
+
+    def test_model_cooldown_does_not_recommend_reauthentication(self):
+        result = self.run_hook({
+            "hook_event_name": "PostToolUseFailure",
+            "tool_name": "Agent",
+            "error": "model_cooldown (provider=claude, model=claude-opus-5)",
+        })
+        output = json.loads(result.stdout)
+        self.assertIn("cooling down", output["systemMessage"])
+        self.assertIn("reauthentication is not required", output["systemMessage"])
+        self.assertNotIn("parable auth add", output["systemMessage"])
+
+    def test_unrelated_interrupted_and_non_agent_failures_are_silent(self):
+        payloads = (
+            {
+                "hook_event_name": "PostToolUseFailure",
+                "tool_name": "Agent",
+                "error": "ordinary tool failure",
+            },
+            {
+                "hook_event_name": "PostToolUseFailure",
+                "tool_name": "Agent",
+                "error": "auth_unavailable (providers=claude)",
+                "is_interrupt": True,
+            },
+            {
+                "hook_event_name": "PostToolUseFailure",
+                "tool_name": "Bash",
+                "error": "auth_unavailable (providers=claude)",
+            },
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                result = self.run_hook(payload)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "")
 
 
 class TestFirstRunSetup(unittest.TestCase):
