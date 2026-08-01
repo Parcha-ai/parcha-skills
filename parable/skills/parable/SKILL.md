@@ -142,6 +142,13 @@ skipped the guard. SessionStart hooks cannot implement this guard because Claude
 them as non-blocking context/UI hooks, not a place to invoke built-in commands before loading a
 model.
 
+If an Agent call fails after launch with `auth_unavailable` or `auth_not_found`, Parable's
+`PostToolUseFailure` hook shows the user the affected subscription and exact
+`parable auth add <vendor>` recovery command while giving the parent agent the same context.
+`auth_unavailable` may be a short transient state, so the notice recommends one delayed retry
+before reauthorization; `auth_not_found` goes directly to reauthorization. A distinct
+`model_cooldown` notice says to wait or route elsewhere and explicitly does not recommend OAuth.
+
 ### Solo requires `[claude]` configuration
 
 Solo mode **requires** `parable.toml` to have `[claude]` configured (subscription-only mode with a loopback proxy). Solo cannot run with codex, pi, cursor, or other provider-backed executors. When launching with `parable --solo <model>`:

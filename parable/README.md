@@ -338,6 +338,9 @@ runtime difference.
   needed, native `/compact` with low-effort Sonnet 5 in its 1M window before starting the
   requested brain. Use `--continue` or `--resume <name-or-id>`; Claude's bare resume picker does
   not reveal its selection early enough for a pre-launch guard.
+- Agent authentication failures include a visible recovery notice. A missing or persistently
+  unavailable subscription names the exact `parable auth add <vendor>` command; a model cooldown
+  instead says to wait or route elsewhere, so users do not repeat OAuth unnecessarily.
 - `skills/parable/references/`: config schema, provider recipes, routing playbook, reviewer
   rubric, and a commented example config. `examples/` holds minimal Fireworks, OpenRouter,
   LiteLLM, pi-Fireworks, [Claude subscriptions](examples/parable.claude-subscriptions.toml),
