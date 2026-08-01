@@ -16,10 +16,13 @@ sensitive workflow. The allowlist remains mandatory in both cases.
 
 ```bash
 python ~/.codex/skills/hermes-slack-bridge/scripts/hermes_notify.py notify \
-  --text "Done: <outcome and evidence>" \
-  --idempotency-key "<stable-key>"
+  --idempotency-key "<stable-key>" \
+  --text-stdin <<'TETHER_MESSAGE'
+Done: <outcome and evidence>
+TETHER_MESSAGE
 ```
 
-Use `--run-id` for a durable headless run. Use the exact `reply` command supplied
-to a resumed native session. Do not call Slack APIs directly, expose credentials,
-or invent a replacement session when the bound source is stale.
+Use `--run-id` only for a genuinely headless run. It is not a fallback for a
+failed Codex, Claude Code, or Zellij capture. Use the exact `reply` command
+supplied to a resumed native session. Do not call Slack APIs directly, expose
+credentials, or invent a replacement session when the bound source is stale.
