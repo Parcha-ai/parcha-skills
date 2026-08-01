@@ -319,7 +319,13 @@ class TestClaudeLaunch(unittest.TestCase):
                 "type": "result",
                 "is_error": False,
                 "session_id": "large-session",
-                "result": "",
+                "result": "Compaction complete",
+            },
+            {
+                "type": "result",
+                "is_error": False,
+                "session_id": "large-session",
+                "result": "**Tokens:** 42k / 967k (4%)",
             },
         ]
 
@@ -344,13 +350,17 @@ class TestClaudeLaunch(unittest.TestCase):
         )
         self.assertEqual(
             note,
-            "compacted 321,400 tokens with Sonnet 5 before the 372,000-token launch",
+            "compacted 321,400 to 42,000 tokens with Sonnet 5 before the "
+            "372,000-token launch",
         )
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 3)
         self.assertEqual(calls[0][0][-3:], ["--resume", "my-session", "/context"])
         self.assertEqual(
             calls[1][0][-3:],
             ["--resume", "large-session", parable.CLAUDE_RESUME_COMPACT_PROMPT],
+        )
+        self.assertEqual(
+            calls[2][0][-3:], ["--resume", "large-session", "/context"]
         )
 
     def test_resume_preflight_skips_picker_fork_and_full_window(self):
@@ -389,6 +399,10 @@ class TestClaudeLaunch(unittest.TestCase):
                 "type": "result", "is_error": False, "session_id": "id",
                 "result": "Error during compaction: Conversation too long",
             },
+            {
+                "type": "result", "is_error": False, "session_id": "id",
+                "result": "**Tokens:** 300k / 967k (31%)",
+            },
         ]
 
         def run(_argv, **_kwargs):
@@ -396,7 +410,7 @@ class TestClaudeLaunch(unittest.TestCase):
                 returncode=0, stdout=json.dumps(results.pop(0)), stderr=""
             )
 
-        with self.assertRaisesRegex(RuntimeError, "compaction did not complete"):
+        with self.assertRaisesRegex(RuntimeError, "did not reduce the session"):
             parable.prepare_claude_resume(
                 ["--continue"], "claude",
                 {parable.CLAUDE_CONTEXT_ENV: "372000"}, {"claude-sonnet-5"},

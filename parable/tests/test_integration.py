@@ -75,7 +75,16 @@ if calls_path:
     with open(calls_path, "a") as handle:
         handle.write(json.dumps(capture) + "\\n")
 if sys.argv[-1:] == ["/context"]:
-    tokens = os.environ.get("FAKE_CLAUDE_CONTEXT_TOKENS", "42000")
+    resumed_exactly = (
+        "--resume" in sys.argv
+        and sys.argv[sys.argv.index("--resume") + 1] == "resolved-resume-session"
+    )
+    token_env = (
+        "FAKE_CLAUDE_POST_COMPACT_TOKENS"
+        if resumed_exactly
+        else "FAKE_CLAUDE_CONTEXT_TOKENS"
+    )
+    tokens = os.environ.get(token_env, "42000")
     print(json.dumps({
         "type": "result", "is_error": False,
         "session_id": "resolved-resume-session",
@@ -362,10 +371,10 @@ class TestClaudeSubscriptionLauncher(unittest.TestCase):
 
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertIn(
-                "resume: compacted 321,400 tokens with Sonnet 5", proc.stdout
+                "resume: compacted 321,400 to 42,000 tokens with Sonnet 5", proc.stdout
             )
             recorded = [json.loads(line) for line in calls.read_text().splitlines()]
-            self.assertEqual(len(recorded), 3)
+            self.assertEqual(len(recorded), 4)
             self.assertIn("claude-sonnet-5[1m]", recorded[0]["argv"])
             self.assertEqual(recorded[0]["argv"][-2:], ["--continue", "/context"])
             self.assertIsNone(recorded[0]["max_context_tokens"])
@@ -378,13 +387,17 @@ class TestClaudeSubscriptionLauncher(unittest.TestCase):
                 ],
             )
             self.assertEqual(
-                recorded[2]["argv"][-5:],
+                recorded[2]["argv"][-3:],
+                ["--resume", "resolved-resume-session", "/context"],
+            )
+            self.assertEqual(
+                recorded[3]["argv"][-5:],
                 [
                     "gpt-5.6-sol", "--resume", "resolved-resume-session",
                     "--print", "finish",
                 ],
             )
-            self.assertEqual(recorded[2]["max_context_tokens"], "372000")
+            self.assertEqual(recorded[3]["max_context_tokens"], "372000")
 
     def test_launcher_degrades_when_an_optional_routed_model_is_absent(self):
         with tempfile.TemporaryDirectory() as tmp, model_server(

@@ -33,6 +33,7 @@ import sys
 import textwrap
 import time
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -734,7 +735,7 @@ def prepare_claude_resume(
     launch_env: dict[str, str],
     available: set[str],
     *,
-    run=subprocess.run,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> tuple[list[str], str | None]:
     """Compact an oversized resumed session before a smaller model loads it.
 
@@ -819,11 +820,17 @@ def prepare_claude_resume(
         "--resume", session_id,
         CLAUDE_RESUME_COMPACT_PROMPT,
     ])
-    compact_result = str(compact.get("result") or "")
-    if compact_result:
-        raise RuntimeError(f"Claude resume compaction did not complete: {compact_result[:300]}")
+    compact_result = str(compact.get("result") or "").strip()
+    after = invoke([*common, "--resume", session_id, "/context"])
+    remaining_tokens = _context_token_count(str(after.get("result") or ""))
+    if remaining_tokens >= safe_tokens:
+        detail = compact_result or "session remains above the safe start threshold"
+        raise RuntimeError(
+            "Claude resume compaction did not reduce the session below "
+            f"{safe_tokens:,} tokens: {detail[:300]}"
+        )
     return exact, (
-        f"compacted {used_tokens:,} tokens with Sonnet 5 before the "
+        f"compacted {used_tokens:,} to {remaining_tokens:,} tokens with Sonnet 5 before the "
         f"{target_ceiling:,}-token launch"
     )
 
