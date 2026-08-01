@@ -70,6 +70,33 @@ capture = {
 }
 with open(os.environ["FAKE_CLAUDE_CAPTURE"], "w") as handle:
     json.dump(capture, handle)
+calls_path = os.environ.get("FAKE_CLAUDE_CALLS")
+if calls_path:
+    with open(calls_path, "a") as handle:
+        handle.write(json.dumps(capture) + "\\n")
+if sys.argv[-1:] == ["/context"]:
+    resumed_exactly = (
+        "--resume" in sys.argv
+        and sys.argv[sys.argv.index("--resume") + 1] == "resolved-resume-session"
+    )
+    token_env = (
+        "FAKE_CLAUDE_POST_COMPACT_TOKENS"
+        if resumed_exactly
+        else "FAKE_CLAUDE_CONTEXT_TOKENS"
+    )
+    tokens = os.environ.get(token_env, "42000")
+    print(json.dumps({
+        "type": "result", "is_error": False,
+        "session_id": "resolved-resume-session",
+        "result": "**Tokens:** " + tokens + " / 967k (33%)",
+    }))
+    raise SystemExit(0)
+if sys.argv[-1:] and sys.argv[-1].startswith("/compact "):
+    print(json.dumps({
+        "type": "result", "is_error": False,
+        "session_id": "resolved-resume-session", "result": "",
+    }))
+    raise SystemExit(0)
 if os.environ.get("FAKE_CLAUDE_WAIT"):
     def stop(signum, _frame):
         target = os.environ.get("FAKE_CLAUDE_SIGNAL_CAPTURE")
@@ -320,6 +347,57 @@ class TestClaudeSubscriptionLauncher(unittest.TestCase):
             self.assertIn('model: "kimi-k3"', agent.read_text())
             self.assertNotIn(token, agent.read_text())
             self.assertNotIn(token, (repo / "parable.toml").read_text())
+
+    def test_launcher_compacts_large_resume_with_sonnet_before_sol(self):
+        with tempfile.TemporaryDirectory() as tmp, model_server(
+            ["gpt-5.6-sol", "claude-sonnet-5", "kimi-k3"]
+        ) as (_server, base_url, token):
+            bindir = fake_bin(tmp)
+            repo = self.make_claude_repo(tmp, base_url)
+            capture = Path(tmp) / "capture.json"
+            calls = Path(tmp) / "claude-calls.jsonl"
+            env = self.launch_env(tmp, bindir, capture, token) | {
+                "FAKE_CLAUDE_CALLS": str(calls),
+                "FAKE_CLAUDE_CONTEXT_TOKENS": "321400",
+            }
+
+            proc = subprocess.run(
+                [
+                    "node", str(REPO / "bin" / "parable.js"),
+                    "claude", "--continue", "--print", "finish",
+                ],
+                cwd=repo, env=env, capture_output=True, text=True, timeout=60,
+            )
+
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn(
+                "resume: compacted 321,400 to 42,000 tokens with Sonnet 5", proc.stdout
+            )
+            recorded = [json.loads(line) for line in calls.read_text().splitlines()]
+            self.assertEqual(len(recorded), 4)
+            self.assertIn("claude-sonnet-5[1m]", recorded[0]["argv"])
+            self.assertEqual(recorded[0]["argv"][-2:], ["--continue", "/context"])
+            self.assertIsNone(recorded[0]["max_context_tokens"])
+            self.assertEqual(
+                recorded[1]["argv"][-3:],
+                [
+                    "--resume", "resolved-resume-session",
+                    "/compact preserve the active task, user requirements, decisions, "
+                    "changed files, remaining work, and verification evidence",
+                ],
+            )
+            self.assertEqual(
+                recorded[2]["argv"][-3:],
+                ["--resume", "resolved-resume-session", "/context"],
+            )
+            self.assertEqual(
+                recorded[3]["argv"][-5:],
+                [
+                    "gpt-5.6-sol", "--resume", "resolved-resume-session",
+                    "--print", "finish",
+                ],
+            )
+            self.assertEqual(recorded[3]["max_context_tokens"], "372000")
 
     def test_launcher_degrades_when_an_optional_routed_model_is_absent(self):
         with tempfile.TemporaryDirectory() as tmp, model_server(
@@ -599,7 +677,7 @@ exit 0
             self.assertEqual(first.stdout.count(handoff), 1)
             self.assertIn(launch, first.stdout)
 
-            installed = home / ".local" / "share" / "parable" / "0.1.23"
+            installed = home / ".local" / "share" / "parable" / "0.1.24"
             durable = home / ".local" / "bin" / "parable"
             self.assertTrue((installed / "bin" / "parable.js").is_file())
             self.assertTrue((installed / "lib" / "onboarding.js").is_file())
@@ -743,6 +821,14 @@ exit 0
         package = json.loads((REPO / "package.json").read_text())
         version = (REPO / "skills" / "parable" / "runtime" / "VERSION").read_text().strip()
         self.assertEqual(version, package["version"])
+        plugin_manifest = json.loads((
+            REPO / ".claude-plugin" / "plugin.json"
+        ).read_text())
+        self.assertEqual(plugin_manifest["version"], package["version"])
+        marketplace = json.loads((
+            REPO / ".claude-plugin" / "marketplace.json"
+        ).read_text())
+        self.assertEqual(marketplace["plugins"][0]["version"], package["version"])
         welcome_manifest = json.loads((
             REPO / "skills" / "parable" / "runtime" / "welcome-plugin"
             / ".claude-plugin" / "plugin.json"

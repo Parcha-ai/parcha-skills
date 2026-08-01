@@ -33,6 +33,7 @@ import sys
 import textwrap
 import time
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -102,6 +103,13 @@ CLAUDE_AUTO_COMPACT_PCT_ENV = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
 # sessions have been rejected as early as ~321k, so 75% triggers near 279k and
 # leaves roughly 74k before the Codex effective window (353.4k).
 CLAUDE_AUTO_COMPACT_PCT = 75
+CLAUDE_RESUME_COMPACT_MODEL = "claude-sonnet-5[1m]"
+CLAUDE_RESUME_COMPACT_BASE_MODEL = "claude-sonnet-5"
+CLAUDE_RESUME_COMPACT_WINDOW = 1_000_000
+CLAUDE_RESUME_COMPACT_PROMPT = (
+    "/compact preserve the active task, user requirements, decisions, changed files, "
+    "remaining work, and verification evidence"
+)
 PARABLE_WELCOME_ENV = "PARABLE_WELCOME_MESSAGE"
 PARABLE_AGENT_STATE_ENV = "PARABLE_AGENT_STATE_JSON"
 PARABLE_WELCOME_PLUGIN = Path(__file__).resolve().parent.parent / "runtime" / "welcome-plugin"
@@ -669,6 +677,164 @@ def parse_claude_brain_args(forwarded: list[str]) -> tuple[str, list[str]]:
     return mode, args
 
 
+def claude_resume_selector(forwarded: list[str]) -> tuple[int, int, list[str]] | None:
+    """Locate a CLI resume selector before Claude's argument terminator.
+
+    The returned slice can be replaced with an exact ``--resume <session-id>``
+    after Claude resolves ``--continue``, a session name, or a PR selector.
+    An empty selector list means the caller requested an interactive picker,
+    whose eventual session id is not available to a pre-launch process.
+    """
+    limit = forwarded.index("--") if "--" in forwarded else len(forwarded)
+    index = 0
+    while index < limit:
+        argument = forwarded[index]
+        if argument in ("-c", "--continue"):
+            return index, index + 1, ["--continue"]
+        for option in ("--resume", "--from-pr"):
+            prefix = option + "="
+            if argument.startswith(prefix):
+                value = argument[len(prefix):]
+                return index, index + 1, [option, value] if value else []
+        if argument in ("-r", "--resume", "--from-pr"):
+            if index + 1 < limit and not forwarded[index + 1].startswith("-"):
+                option = "--resume" if argument in ("-r", "--resume") else argument
+                return index, index + 2, [option, forwarded[index + 1]]
+            return index, index + 1, []
+        index += 1
+    return None
+
+
+def _claude_result(stdout: str) -> dict:
+    """Read Claude's final structured result while tolerating startup notices."""
+    for line in reversed(stdout.splitlines()):
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and payload.get("type") == "result":
+            return payload
+    raise RuntimeError("Claude resume preflight returned no structured result")
+
+
+def _context_token_count(report: str) -> int:
+    match = re.search(
+        r"\*\*Tokens:\*\*\s*([0-9][0-9,.]*)\s*([kKmM]?)\s*/",
+        report,
+    )
+    if not match:
+        raise RuntimeError("Claude resume preflight could not read /context usage")
+    value = float(match.group(1).replace(",", ""))
+    scale = {"": 1, "k": 1_000, "m": 1_000_000}[match.group(2).lower()]
+    return round(value * scale)
+
+
+def prepare_claude_resume(
+    forwarded: list[str],
+    binary: str,
+    launch_env: dict[str, str],
+    available: set[str],
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> tuple[list[str], str | None]:
+    """Compact an oversized resumed session before a smaller model loads it.
+
+    Claude Code's SessionStart hook cannot block startup or invoke built-in
+    commands. For an explicit CLI resume, use Sonnet 5's 1M window to query
+    ``/context`` without model tokens, compact only above the target launch's
+    safe threshold, then replace the selector with the resolved session id.
+    """
+    located = claude_resume_selector(forwarded)
+    if located is None:
+        return forwarded, None
+    start, end, selector = located
+    if not selector:
+        return forwarded, (
+            "picker selected; pre-compaction requires --continue or "
+            "--resume <name-or-session-id>"
+        )
+    scan = forwarded[:forwarded.index("--")] if "--" in forwarded else forwarded
+    if "--fork-session" in scan:
+        return forwarded, "forked resume selected; pre-compaction skipped"
+    raw_ceiling = launch_env.get(CLAUDE_CONTEXT_ENV)
+    try:
+        target_ceiling = int(raw_ceiling) if raw_ceiling else None
+    except ValueError as exc:
+        raise RuntimeError(f"invalid {CLAUDE_CONTEXT_ENV}={raw_ceiling!r}") from exc
+    if target_ceiling is None or target_ceiling >= CLAUDE_RESUME_COMPACT_WINDOW:
+        return forwarded, None
+    if CLAUDE_RESUME_COMPACT_BASE_MODEL not in available:
+        raise RuntimeError(
+            f"resume needs {CLAUDE_RESUME_COMPACT_BASE_MODEL} to check a session before "
+            f"loading it into a {target_ceiling:,}-token window"
+        )
+
+    preflight_env = dict(launch_env)
+    for name in (
+        CLAUDE_CONTEXT_ENV,
+        CLAUDE_AUTO_COMPACT_PCT_ENV,
+        "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+    ):
+        preflight_env.pop(name, None)
+    common = [
+        binary,
+        "--bare",
+        "--model", CLAUDE_RESUME_COMPACT_MODEL,
+        "--effort", "low",
+        "--print",
+        "--output-format", "json",
+    ]
+
+    def invoke(command: list[str]) -> dict:
+        try:
+            completed = run(
+                command,
+                env=preflight_env,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("Claude resume preflight timed out") from exc
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "unknown error").strip()
+            raise RuntimeError(f"Claude resume preflight failed: {detail[:300]}")
+        result = _claude_result(completed.stdout)
+        if result.get("is_error"):
+            detail = str(result.get("result") or result.get("api_error_status") or "unknown error")
+            raise RuntimeError(f"Claude resume preflight failed: {detail[:300]}")
+        return result
+
+    context = invoke([*common, *selector, "/context"])
+    session_id = context.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        raise RuntimeError("Claude resume preflight did not resolve a session id")
+    exact = [*forwarded[:start], "--resume", session_id, *forwarded[end:]]
+    used_tokens = _context_token_count(str(context.get("result") or ""))
+    safe_tokens = target_ceiling * CLAUDE_AUTO_COMPACT_PCT // 100
+    if used_tokens < safe_tokens:
+        return exact, f"{used_tokens:,} tokens fit the {safe_tokens:,}-token safe start"
+
+    compact = invoke([
+        *common,
+        "--resume", session_id,
+        CLAUDE_RESUME_COMPACT_PROMPT,
+    ])
+    compact_result = str(compact.get("result") or "").strip()
+    after = invoke([*common, "--resume", session_id, "/context"])
+    remaining_tokens = _context_token_count(str(after.get("result") or ""))
+    if remaining_tokens >= safe_tokens:
+        detail = compact_result or "session remains above the safe start threshold"
+        raise RuntimeError(
+            "Claude resume compaction did not reduce the session below "
+            f"{safe_tokens:,} tokens: {detail[:300]}"
+        )
+    return exact, (
+        f"compacted {used_tokens:,} to {remaining_tokens:,} tokens with Sonnet 5 before the "
+        f"{target_ceiling:,}-token launch"
+    )
+
+
 def _usage_percent(reports: list[dict], pool: str) -> float | None:
     report = next((item for item in reports if item.get("pool") == pool), None)
     if not report or report.get("status") != "ok":
@@ -915,7 +1081,6 @@ def render_claude_welcome(cfg: dict, brain_model: str, decision: str,
             for item in unavailable
         )
         lines.append(f"  DEGRADED {labels} unavailable for this session")
-    lines.append("  the brain carries the story · the cast carries the work")
     return "\n".join(lines)
 
 
@@ -1085,6 +1250,12 @@ def cmd_claude(args: argparse.Namespace) -> int:
             argv, launch_env = build_claude_launch(
                 launch_cfg, forwarded, solo=True, available=available
             )
+            forwarded, resume_note = prepare_claude_resume(
+                forwarded, argv[0], launch_env, available
+            )
+            argv, launch_env = build_claude_launch(
+                launch_cfg, forwarded, solo=True, available=available
+            )
             argv, launch_env = add_claude_welcome(
                 argv, launch_env, cfg, brain_model, decision, available, forwarded,
                 solo=True,
@@ -1096,6 +1267,12 @@ def cmd_claude(args: argparse.Namespace) -> int:
             availability = claude_cast_availability(cfg, available, brain_model)
             result = sync_claude_agents(root, cfg)
             launch_cfg = config_with_claude_brain(cfg, brain_model)
+            argv, launch_env = build_claude_launch(
+                launch_cfg, forwarded, available=available
+            )
+            forwarded, resume_note = prepare_claude_resume(
+                forwarded, argv[0], launch_env, available
+            )
             argv, launch_env = build_claude_launch(
                 launch_cfg, forwarded, available=available
             )
@@ -1129,6 +1306,8 @@ def cmd_claude(args: argparse.Namespace) -> int:
                 + " unavailable for this session",
                 flush=True,
             )
+    if resume_note:
+        print(f"resume: {resume_note}", flush=True)
     try:
         os.execvpe(argv[0], argv, launch_env)
     except FileNotFoundError:
