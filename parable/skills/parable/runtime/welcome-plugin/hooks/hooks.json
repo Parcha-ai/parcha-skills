@@ -1,6 +1,19 @@
 {
-  "description": "Show the current Parable cast and preserve generated agents' exact models.",
+  "description": "Show the current Parable cast, preserve exact agent models, and explain authentication failures.",
   "hooks": {
+    "PostToolUseFailure": [
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/auth_failure.py"],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Agent",
