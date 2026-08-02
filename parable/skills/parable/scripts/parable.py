@@ -1768,15 +1768,29 @@ def cmd_list(_args: argparse.Namespace) -> int:
 POOL_FOR_PROVIDER_TYPE = {"subagent": "claude", "codex-native": "codex", "cursor": "cursor"}
 
 
+# Every loopback-proxy executor is `subagent`-typed, so provider type alone would
+# bill kimi-k3 against the Claude plan. Non-Anthropic lanes on that proxy own a
+# separate subscription, so their pool comes from the MODEL, checked first.
+POOL_FOR_MODEL_PREFIX = (("kimi", "kimi"),)
+
+
+def pool_for_executor(cfg: dict, ex: dict) -> str | None:
+    model = str(ex.get("model") or "").lower()
+    for prefix, pool in POOL_FOR_MODEL_PREFIX:
+        if model.startswith(prefix):
+            return pool
+    ptype = cfg.get("providers", {}).get(ex.get("provider"), {}).get("type")
+    return POOL_FOR_PROVIDER_TYPE.get(ptype)
+
+
 def pools_in_config(cfg: dict) -> list[str]:
     """The subscription pools this cast actually routes to, in a stable order."""
     seen: set[str] = set()
     for ex in cfg.get("executors", {}).values():
-        ptype = cfg.get("providers", {}).get(ex.get("provider"), {}).get("type")
-        pool = POOL_FOR_PROVIDER_TYPE.get(ptype)
+        pool = pool_for_executor(cfg, ex)
         if pool:
             seen.add(pool)
-    return [p for p in ("claude", "codex", "cursor") if p in seen]
+    return [p for p in ("claude", "codex", "cursor", "kimi") if p in seen]
 
 
 def cursor_env_key_in_config(cfg: dict) -> str:
@@ -1798,7 +1812,7 @@ def cmd_usage(args: argparse.Namespace) -> int:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         import parable_usage  # noqa: E402
     cfg, _ = load_config(git_root())
-    pools = ["claude", "codex", "cursor"] if args.all else pools_in_config(cfg)
+    pools = ["claude", "codex", "cursor", "kimi"] if args.all else pools_in_config(cfg)
     if not pools:
         print("parable usage — no subscription-covered pools in this cast (nothing to probe)")
         return 0
