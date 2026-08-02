@@ -1,0 +1,27 @@
+# Gitleaks configuration for this repository.
+#
+# The test suites intentionally contain credential-shaped canary strings
+# (they exercise the redaction/scrubbing engines), and the parable evidence
+# receipts contain bare hex digests that trip the generic-api-key rule.
+# Everything allowlisted here was individually reviewed in the 2026-08-02
+# security audit and confirmed synthetic.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Reviewed synthetic fixtures and content-free digests"
+regexTarget = "secret"
+regexes = [
+  # bare git-commit / sha256 hex digests (evidence receipts, provenance pins)
+  '''^[a-f0-9]{40}$''',
+  '''^[a-f0-9]{64}$''',
+]
+paths = [
+  # redaction/scrubbing test suites built around synthetic canary secrets
+  '''tether/tests/.*''',
+  '''recall/tests/.*''',
+  '''recall/server/tests/.*''',
+  '''recap/tests/.*''',
+  '''desloppify/tests/.*''',
+]
