@@ -137,11 +137,10 @@ command for the resumed size using Sonnet 5's 1M context at low effort and zero 
 the existing context is already beyond the target launch's 75% safe point, the same Sonnet
 session runs native `/compact` before Parable starts the selected brain. The selector is then
 replaced by the resolved session id so the check, compaction, and launch cannot drift to
-different "latest" sessions. A bare `--resume` picker and `--fork-session` cannot be safely
-pre-compacted before Claude resolves or creates their session; the launcher reports that it
-skipped the guard. SessionStart hooks cannot implement this guard because Claude Code defines
-them as non-blocking context/UI hooks, not a place to invoke built-in commands before loading a
-model.
+different "latest" sessions. For a bare `parable --resume`, the managed launcher lets Claude's
+picker resolve the exact session, catches that UUID from `SessionStart`, stops the picker process,
+and runs the same Sonnet preflight before accepting the first prompt. A forked explicit resume is
+still skipped because it creates a new session rather than selecting an existing destination.
 
 If native auto-compaction still misses and the main interactive turn ends with the exact
 context-window API error, Parable's managed supervisor performs one recovery. A StopFailure

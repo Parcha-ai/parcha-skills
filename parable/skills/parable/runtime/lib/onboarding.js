@@ -39,6 +39,7 @@ const DEFAULT_PROXY_READY_TIMEOUT_MS = 15_000;
 const PROXY_PROBE_TIMEOUT_MS = 750;
 const PROXY_STOP_TIMEOUT_MS = 2_000;
 const CONTEXT_RECOVERY_ENV = "PARABLE_CONTEXT_RECOVERY_FILE";
+const CONTEXT_RESUME_PICKER_ENV = "PARABLE_CONTEXT_RESUME_PICKER";
 const CONTEXT_RECOVERY_POLL_MS = 50;
 const CONTEXT_RECOVERY_MAX_ATTEMPTS = 1;
 const VENDOR_ORDER = Object.freeze(["claude", "chatgpt", "xai", "kimi"]);
@@ -145,6 +146,7 @@ function consumeContextRecoveryRequest(requestPath) {
       !payload
       || Array.isArray(payload)
       || payload.version !== 1
+      || !["context_failure", "resume_picker"].includes(payload.reason)
       || typeof payload.session_id !== "string"
       || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
         payload.session_id,
@@ -152,7 +154,7 @@ function consumeContextRecoveryRequest(requestPath) {
     ) {
       return null;
     }
-    return { sessionId: payload.session_id };
+    return { sessionId: payload.session_id, reason: payload.reason };
   } catch {
     return null;
   } finally {
@@ -203,6 +205,18 @@ function claudeContextRecoverySupported(argv) {
   return !argv.slice(start, end).some(
     (argument) => argument.split("=", 1)[0] === "--no-session-persistence",
   );
+}
+
+function claudeResumePickerRequested(argv) {
+  const { start, end } = claudeArgumentBounds(argv);
+  for (let index = start; index < end; index += 1) {
+    const argument = argv[index];
+    if (argument === "--resume=") return true;
+    if (argument === "-r" || argument === "--resume") {
+      return index + 1 >= end || argv[index + 1].startsWith("-");
+    }
+  }
+  return false;
 }
 
 function withExactClaudeResume(argv, sessionId) {
@@ -1846,10 +1860,17 @@ async function runManagedClient(
       }
       if (winner.owner === "recovery") {
         recoveryAttempts += 1;
-        log(
-          "context: limit reached; compacting with Sonnet 5, then resuming "
-            + `${winner.request.sessionId}`,
-        );
+        if (winner.request.reason === "resume_picker") {
+          log(
+            "context: resume selected; checking with Sonnet 5, then resuming "
+              + `${winner.request.sessionId}`,
+          );
+        } else {
+          log(
+            "context: limit reached; compacting with Sonnet 5, then resuming "
+              + `${winner.request.sessionId}`,
+          );
+        }
         await stopObservedChild(client);
         client = spawnClient(winner.request);
         continue;
@@ -1907,15 +1928,22 @@ async function runClaude(argv, log) {
     ...process.env,
     CLIPROXY_API_KEY: token,
   };
+  delete env[CONTEXT_RECOVERY_ENV];
+  delete env[CONTEXT_RESUME_PICKER_ENV];
   if (recovery) env[CONTEXT_RECOVERY_ENV] = recovery.requestPath;
+  if (recovery && claudeResumePickerRequested(argv)) {
+    env[CONTEXT_RESUME_PICKER_ENV] = "1";
+  }
   try {
     return await runManagedClient(
       context,
       token,
-      (request) => spawnClaude(
-        request ? withExactClaudeResume(argv, request.sessionId) : argv,
-        env,
-      ),
+      (request) => {
+        if (!request) return spawnClaude(argv, env);
+        const resumeEnv = { ...env };
+        delete resumeEnv[CONTEXT_RESUME_PICKER_ENV];
+        return spawnClaude(withExactClaudeResume(argv, request.sessionId), resumeEnv);
+      },
       "Claude",
       log,
       recovery && {

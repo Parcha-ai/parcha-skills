@@ -124,10 +124,9 @@ Code's native `/context` under `claude-sonnet-5[1m]` at low effort. This inspect
 model tokens. At or above 75% of the target ceiling, Parable invokes native `/compact` in that
 same resolved session with Sonnet, then launches the requested model on the compacted history.
 If inspection or compaction fails, Parable fails closed instead of opening a model that cannot
-hold the session. Interactive `--resume` pickers and `--fork-session` are reported but skipped:
-the exact destination does not exist early enough for a safe pre-launch mutation. Use
-`--continue` or an explicit session name/id when moving a large conversation to a smaller
-window.
+hold the session. With plain `parable --resume`, Claude first resolves the interactive picker;
+the managed launcher then stops that process and runs the same exact-session guard before the
+first prompt. A forked explicit resume remains skipped because its destination is a new session.
 
 The managed interactive launcher also has a one-shot fallback for a missed native compaction.
 On the exact main-session context-window StopFailure, its private hook request tells the Node

@@ -336,8 +336,9 @@ runtime difference.
 - Explicit Claude session resumes are checked before launch when the selected model has a
   smaller context window. Parable uses native `/context` at zero model tokens and, only when
   needed, native `/compact` with low-effort Sonnet 5 in its 1M window before starting the
-  requested brain. Use `--continue` or `--resume <name-or-id>`; Claude's bare resume picker does
-  not reveal its selection early enough for a pre-launch guard.
+  requested brain. `parable --continue` and `parable --resume <name-or-id>` are checked before
+  launch. With plain `parable --resume`, Parable waits for the picker selection, then checks the
+  exact selected session before accepting the first prompt.
 - Live sessions use Claude Code's explicit auto-compact window as well as the model ceiling.
   If Claude Code still returns a context-window API error, the managed supervisor stops the
   stranded child, compacts that exact session with low-effort Sonnet 5, and resumes the

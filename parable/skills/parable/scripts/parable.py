@@ -754,6 +754,8 @@ def prepare_claude_resume(
         return forwarded, None
     start, end, selector = located
     if not selector:
+        if launch_env.get("PARABLE_CONTEXT_RESUME_PICKER") == "1":
+            return forwarded, "picker selected; exact session will be checked after selection"
         return forwarded, (
             "picker selected; pre-compaction requires --continue or "
             "--resume <name-or-session-id>"

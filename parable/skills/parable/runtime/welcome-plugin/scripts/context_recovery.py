@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ask Parable's supervisor to recover a context-window API failure."""
+"""Ask Parable's supervisor to preflight or recover one exact session."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import sys
 
 
 RECOVERY_FILE_ENV = "PARABLE_CONTEXT_RECOVERY_FILE"
+RESUME_PICKER_ENV = "PARABLE_CONTEXT_RESUME_PICKER"
 CONTEXT_ERROR = re.compile(
     r"input exceeds the context window|context window of this model|prompt is too long",
     re.IGNORECASE,
@@ -18,11 +19,26 @@ CONTEXT_ERROR = re.compile(
 
 
 def recovery_request(event: object) -> dict[str, object] | None:
-    if not isinstance(event, dict) or event.get("hook_event_name") != "StopFailure":
+    if not isinstance(event, dict):
         return None
     # Plugin hooks also run in subagents. Only the main interactive session is
     # owned by the Parable supervisor and can be restarted safely.
     if event.get("agent_id") is not None:
+        return None
+    session_id = event.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    if (
+        event.get("hook_event_name") == "SessionStart"
+        and event.get("source") in {"resume", "fork"}
+        and os.environ.get(RESUME_PICKER_ENV) == "1"
+    ):
+        return {
+            "version": 1,
+            "reason": "resume_picker",
+            "session_id": session_id,
+        }
+    if event.get("hook_event_name") != "StopFailure":
         return None
     if event.get("error") not in {"invalid_request", "unknown"}:
         return None
@@ -33,10 +49,11 @@ def recovery_request(event: object) -> dict[str, object] | None:
     )
     if not CONTEXT_ERROR.search(detail):
         return None
-    session_id = event.get("session_id")
-    if not isinstance(session_id, str) or not session_id:
-        return None
-    return {"version": 1, "session_id": session_id}
+    return {
+        "version": 1,
+        "reason": "context_failure",
+        "session_id": session_id,
+    }
 
 
 def write_request(target: Path, request: dict[str, object]) -> None:
@@ -74,8 +91,8 @@ def main() -> None:
     try:
         write_request(Path(target), request)
     except OSError:
-        # StopFailure ignores hook output. The original API error remains
-        # visible, and the user can still recover manually or on next resume.
+        # Hook output cannot safely replace the supervisor channel. The
+        # original session remains visible and can still be resumed manually.
         return
 
 

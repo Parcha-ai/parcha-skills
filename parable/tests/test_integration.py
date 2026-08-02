@@ -71,6 +71,7 @@ capture = {
     "context_recovery_enabled": bool(
         os.environ.get("PARABLE_CONTEXT_RECOVERY_FILE")
     ),
+    "resume_picker_recovery": os.environ.get("PARABLE_CONTEXT_RESUME_PICKER") == "1",
 }
 with open(os.environ["FAKE_CLAUDE_CAPTURE"], "w") as handle:
     json.dump(capture, handle)
@@ -79,6 +80,16 @@ if calls_path:
     with open(calls_path, "a") as handle:
         handle.write(json.dumps(capture) + "\\n")
 recovery_path = os.environ.get("PARABLE_CONTEXT_RECOVERY_FILE")
+picker_session = os.environ.get("FAKE_CLAUDE_RESUME_PICKER_SESSION")
+arguments = sys.argv[1:]
+bare_resume = any(
+    argument == "--resume="
+    or (
+        argument in {"-r", "--resume"}
+        and (index + 1 == len(arguments) or arguments[index + 1].startswith("-"))
+    )
+    for index, argument in enumerate(arguments)
+)
 selected_model = (
     sys.argv[sys.argv.index("--model") + 1] if "--model" in sys.argv else None
 )
@@ -97,8 +108,18 @@ context_failure = context_failure or (
     os.environ.get("FAKE_CLAUDE_CONTEXT_FAILURE_ALWAYS")
     and selected_model != "claude-sonnet-5[1m]"
 )
-if recovery_path and context_failure:
-    request = {"version": 1, "session_id": "12345678-1234-4234-9234-123456789abc"}
+picker_recovery = bool(
+    recovery_path
+    and picker_session
+    and bare_resume
+    and os.environ.get("PARABLE_CONTEXT_RESUME_PICKER") == "1"
+)
+if recovery_path and (context_failure or picker_recovery):
+    request = {
+        "version": 1,
+        "reason": "resume_picker" if picker_recovery else "context_failure",
+        "session_id": picker_session if picker_recovery else "12345678-1234-4234-9234-123456789abc",
+    }
     descriptor = os.open(recovery_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(descriptor, "w") as handle:
         json.dump(request, handle)
@@ -724,7 +745,7 @@ exit 0
             self.assertEqual(first.stdout.count(handoff), 1)
             self.assertIn(launch, first.stdout)
 
-            installed = home / ".local" / "share" / "parable" / "0.1.25"
+            installed = home / ".local" / "share" / "parable" / "0.1.26"
             durable = home / ".local" / "bin" / "parable"
             self.assertTrue((installed / "bin" / "parable.js").is_file())
             self.assertTrue((installed / "lib" / "onboarding.js").is_file())
@@ -1060,13 +1081,20 @@ class TestClaudeAgentModelGuard(unittest.TestCase):
 
 
 class TestClaudeContextRecoveryHook(unittest.TestCase):
-    def run_hook(self, payload: object, target: Path) -> subprocess.CompletedProcess:
+    def run_hook(
+        self,
+        payload: object,
+        target: Path,
+        env_extra: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess:
         hook = (
             REPO / "skills" / "parable" / "runtime" / "welcome-plugin"
             / "scripts" / "context_recovery.py"
         )
         env = dict(os.environ)
         env["PARABLE_CONTEXT_RECOVERY_FILE"] = str(target)
+        if env_extra:
+            env.update(env_extra)
         result = subprocess.run(
             ["python3", str(hook)],
             input=json.dumps(payload),
@@ -1091,9 +1119,36 @@ class TestClaudeContextRecoveryHook(unittest.TestCase):
             self.assertEqual(result.stdout, "")
             self.assertEqual(json.loads(target.read_text()), {
                 "version": 1,
+                "reason": "context_failure",
                 "session_id": "12345678-1234-4234-9234-123456789abc",
             })
             self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+    def test_resume_picker_selection_requests_exact_session_preflight(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "request.json"
+            result = self.run_hook({
+                "hook_event_name": "SessionStart",
+                "source": "resume",
+                "session_id": "12345678-1234-4234-9234-123456789abc",
+            }, target, {"PARABLE_CONTEXT_RESUME_PICKER": "1"})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(target.read_text()), {
+                "version": 1,
+                "reason": "resume_picker",
+                "session_id": "12345678-1234-4234-9234-123456789abc",
+            })
+
+    def test_ordinary_resume_session_start_does_not_request_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "request.json"
+            result = self.run_hook({
+                "hook_event_name": "SessionStart",
+                "source": "resume",
+                "session_id": "12345678-1234-4234-9234-123456789abc",
+            }, target)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(target.exists())
 
     def test_unrelated_and_subagent_failures_do_not_request_restart(self):
         events = [
@@ -3154,6 +3209,63 @@ finally:
             self.assertTrue(any(item["event"] == "signal" for item in events))
             self.assert_pid_gone(events[0]["pid"])
 
+    def test_resume_picker_selection_preflights_before_first_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            case = self.setup_case(tmp)
+            calls = Path(tmp) / "claude-calls.jsonl"
+            compact_state = Path(tmp) / "compact-finished"
+            session_id = "12345678-1234-4234-9234-123456789abc"
+            env = case["env"] | {
+                "FAKE_CLAUDE_CALLS": str(calls),
+                "FAKE_CLAUDE_RESUME_PICKER_SESSION": session_id,
+                "FAKE_CLAUDE_CONTEXT_TOKENS": "321400",
+                "FAKE_CLAUDE_POST_COMPACT_TOKENS": "42000",
+                "FAKE_CLAUDE_COMPACT_STATE": str(compact_state),
+            }
+            proc = subprocess.run(
+                [NODE, str(REPO / "bin" / "parable.js"), "--resume"],
+                cwd=case["repo"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn(
+                f"context: resume selected; checking with Sonnet 5, then resuming {session_id}",
+                proc.stdout,
+            )
+            self.assertIn(
+                "resume: compacted 321,400 to 42,000 tokens with Sonnet 5",
+                proc.stdout,
+            )
+            captured_calls = [
+                json.loads(line) for line in calls.read_text().splitlines()
+            ]
+            self.assertEqual(len(captured_calls), 5)
+            initial = captured_calls[0]
+            self.assertTrue(initial["resume_picker_recovery"])
+            self.assertEqual(initial["argv"].count("--resume"), 1)
+            self.assertEqual(initial["argv"][-1], "--resume")
+            for call in captured_calls[1:]:
+                self.assertFalse(call["resume_picker_recovery"])
+                resume_at = call["argv"].index("--resume")
+                self.assertEqual(call["argv"][resume_at + 1], session_id)
+            self.assertTrue(all(
+                call["argv"][call["argv"].index("--model") + 1]
+                == "claude-sonnet-5[1m]"
+                for call in captured_calls[1:4]
+            ))
+            self.assertEqual(
+                captured_calls[-1]["argv"][
+                    captured_calls[-1]["argv"].index("--model") + 1
+                ],
+                "gpt-5.6-sol",
+            )
+            events = self.events(case)
+            self.assertTrue(any(item["event"] == "signal" for item in events))
+            self.assert_pid_gone(events[0]["pid"])
+
     def test_context_recovery_is_capped_at_one_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
             case = self.setup_case(tmp)
@@ -3241,7 +3353,10 @@ finally:
                     "hello",
                 ],
                 cwd=case["repo"],
-                env=case["env"],
+                env=case["env"] | {
+                    "PARABLE_CONTEXT_RECOVERY_FILE": str(Path(tmp) / "forged-request.json"),
+                    "PARABLE_CONTEXT_RESUME_PICKER": "1",
+                },
                 capture_output=True,
                 text=True,
                 timeout=20,
@@ -3249,6 +3364,7 @@ finally:
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             captured = json.loads(case["claude_capture"].read_text())
             self.assertFalse(captured["context_recovery_enabled"])
+            self.assertFalse(captured["resume_picker_recovery"])
 
     def test_wrong_listener_fails_closed_before_proxy_or_claude(self):
         with tempfile.TemporaryDirectory() as tmp, model_server(self.MODELS) as (

@@ -29,6 +29,17 @@
     ],
     "SessionStart": [
       {
+        "matcher": "resume|fork",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/context_recovery.py"],
+            "timeout": 5
+          }
+        ]
+      },
+      {
         "matcher": "startup|resume",
         "hooks": [
           {
