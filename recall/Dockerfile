@@ -28,16 +28,9 @@ COPY --chown=10001:10001 privacy /opt/recall/privacy
 COPY --chown=10001:10001 scripts/install_gws.py /opt/recall/scripts/install_gws.py
 COPY --chown=10001:10001 skills/recall/scripts/recall.py /opt/skills/recall/scripts/recall.py
 COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
-# The proprietary brain-turn bundle is not committed; scripts/fetch_ati_bundle.sh
-# places it in server/vendor/ati/ before a publish build. Without it the image
-# ships only the README and the ATI agent stays disabled (env-gated at runtime).
-COPY server/vendor/ati/ /opt/ati/
-
 RUN python /opt/recall/scripts/install_gws.py \
       --target x86_64-unknown-linux-gnu \
-      --prefix /opt/recall/vendor/gws/0.22.5 \
-    && chmod 0555 /opt/ati \
-    && find /opt/ati -type f -exec chmod 0444 {} +
+      --prefix /opt/recall/vendor/gws/0.22.5
 
 USER 10001
 EXPOSE 8788

@@ -394,11 +394,8 @@ class ContainerContractTest(unittest.TestCase):
             r"FROM node:22\.23\.1-bookworm-slim@sha256:[0-9a-f]{64} "
             r"AS node-runtime",
         )
-        self.assertIn("COPY server/vendor/ati/ /opt/ati/", dockerfile)
-        self.assertNotIn(
-            "COPY server/vendor/ati/grep_ati_brain_turn.mjs",
-            dockerfile,
-        )
+        self.assertNotIn("vendor/ati", dockerfile)
+        self.assertNotIn("/opt/ati", dockerfile)
         self.assertIn("USER 10001", dockerfile)
         self.assertIn("usermod -a -G 1000 recall", dockerfile)
         self.assertIn(
@@ -426,7 +423,7 @@ class ContainerContractTest(unittest.TestCase):
                 str(RECALL.parent),
                 "ls-files",
                 "--",
-                "recall/server/vendor/ati/grep_ati_brain_turn.mjs",
+                "recall/server/vendor/ati/",
             ],
             capture_output=True,
             text=True,
@@ -434,11 +431,7 @@ class ContainerContractTest(unittest.TestCase):
         ).stdout.strip()
         self.assertEqual(tracked, "")
         ignored = (RECALL.parent / ".gitignore").read_text()
-        self.assertIn("recall/server/vendor/ati/grep_ati_brain_turn.mjs", ignored)
-        provenance = (SERVER / "vendor" / "ati" / "README.md").read_text()
-        self.assertNotIn("github.com/", provenance)
-        self.assertNotIn("Parcha-ai/", provenance)
-        self.assertIn("RECALL_ATI_ARTIFACT_SHA256", provenance)
+        self.assertIn("recall/server/vendor/ati/", ignored)
 
     def test_build_context_excludes_private_and_development_surfaces(self) -> None:
         ignored = (RECALL / ".dockerignore").read_text()

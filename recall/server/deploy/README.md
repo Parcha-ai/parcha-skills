@@ -284,12 +284,14 @@ also advertises `io.modelcontextprotocol/tasks` and returns a native task only
 when the individual `tools/call` opts into that extension. Older or
 non-negotiating clients keep the synchronous `use_recall` result.
 
-For semantic synthesis, set `RECALL_AGENT_RUNNER=pi-ati` and run a pinned ATI
-Harness `brain-turn` artifact:
+For semantic synthesis, set `RECALL_AGENT_RUNNER=pi-ati` and run a pinned
+`brain-turn` artifact. The artifact is not part of this repository or its
+published images; the deployment mounts it into the container and the runtime
+verifies its digest before every agent turn:
 
 ```text
-RECALL_ATI_COMMAND_JSON=["node","/opt/ati/grep_ati_brain_turn.mjs"]
-RECALL_ATI_ARTIFACT_PATH=/opt/ati/grep_ati_brain_turn.mjs
+RECALL_ATI_COMMAND_JSON=["node","<mounted-artifact-path>"]
+RECALL_ATI_ARTIFACT_PATH=<mounted-artifact-path>
 RECALL_ATI_ARTIFACT_SHA256=<lowercase-sha256>
 RECALL_AGENT_MODEL_ALIAS=gpt-oss-120b
 RECALL_AGENT_MODEL_ROUTE=direct-provider:cerebras
