@@ -745,7 +745,7 @@ exit 0
             self.assertEqual(first.stdout.count(handoff), 1)
             self.assertIn(launch, first.stdout)
 
-            installed = home / ".local" / "share" / "parable" / "0.1.26"
+            installed = home / ".local" / "share" / "parable" / "0.1.27"
             durable = home / ".local" / "bin" / "parable"
             self.assertTrue((installed / "bin" / "parable.js").is_file())
             self.assertTrue((installed / "lib" / "onboarding.js").is_file())
@@ -3184,6 +3184,11 @@ finally:
                 "resume: compacted 321,400 to 42,000 tokens with Sonnet 5",
                 proc.stdout,
             )
+            self.assertIn(
+                "resume: compacting 321,400 tokens with Sonnet 5; "
+                "this can take several minutes",
+                proc.stdout,
+            )
             captured_calls = [
                 json.loads(line) for line in calls.read_text().splitlines()
             ]
@@ -3239,6 +3244,13 @@ finally:
                 "resume: compacted 321,400 to 42,000 tokens with Sonnet 5",
                 proc.stdout,
             )
+            progress = (
+                "resume: compacting 321,400 tokens with Sonnet 5; "
+                "this can take several minutes"
+            )
+            complete = "resume: compacted 321,400 to 42,000 tokens with Sonnet 5"
+            self.assertIn(progress, proc.stdout)
+            self.assertLess(proc.stdout.index(progress), proc.stdout.index(complete))
             captured_calls = [
                 json.loads(line) for line in calls.read_text().splitlines()
             ]

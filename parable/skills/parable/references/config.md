@@ -126,7 +126,9 @@ same resolved session with Sonnet, then launches the requested model on the comp
 If inspection or compaction fails, Parable fails closed instead of opening a model that cannot
 hold the session. With plain `parable --resume`, Claude first resolves the interactive picker;
 the managed launcher then stops that process and runs the same exact-session guard before the
-first prompt. A forked explicit resume remains skipped because its destination is a new session.
+first prompt. The launcher prints before a long Sonnet compaction begins and again when it starts
+verification, so the terminal does not appear idle. A forked explicit resume remains skipped
+because its destination is a new session.
 
 The managed interactive launcher also has a one-shot fallback for a missed native compaction.
 On the exact main-session context-window StopFailure, its private hook request tells the Node

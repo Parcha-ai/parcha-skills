@@ -308,6 +308,7 @@ class TestClaudeLaunch(unittest.TestCase):
 
     def test_resume_preflight_compacts_oversized_context_with_sonnet(self):
         calls = []
+        reports = []
         results = [
             {
                 "type": "result",
@@ -343,6 +344,7 @@ class TestClaudeLaunch(unittest.TestCase):
             {parable.CLAUDE_CONTEXT_ENV: "372000"},
             {"claude-sonnet-5"},
             run=run,
+            report=reports.append,
         )
         self.assertEqual(
             forwarded,
@@ -362,6 +364,104 @@ class TestClaudeLaunch(unittest.TestCase):
         self.assertEqual(
             calls[2][0][-3:], ["--resume", "large-session", "/context"]
         )
+        self.assertEqual(reports, [
+            "checking resumed session context with Sonnet 5",
+            "compacting 321,400 tokens with Sonnet 5; this can take several minutes",
+            "compaction finished; verifying the reduced context",
+        ])
+        self.assertEqual(
+            calls[0][1]["timeout"], parable.CLAUDE_RESUME_CHECK_TIMEOUT_SECONDS
+        )
+        self.assertEqual(
+            calls[1][1]["timeout"], parable.CLAUDE_RESUME_COMPACT_TIMEOUT_SECONDS
+        )
+        self.assertEqual(
+            calls[2][1]["timeout"], parable.CLAUDE_RESUME_CHECK_TIMEOUT_SECONDS
+        )
+
+    def test_resume_compaction_has_a_distinct_long_timeout(self):
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append((argv, kwargs))
+            if len(calls) == 1:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "type": "result",
+                        "is_error": False,
+                        "session_id": "large-session",
+                        "result": "**Tokens:** 321.4k / 967k (33%)",
+                    }),
+                    stderr="",
+                )
+            raise parable.subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "Claude resume compaction timed out after 15 minutes",
+        ):
+            parable.prepare_claude_resume(
+                ["--resume", "large-session"],
+                "claude",
+                {parable.CLAUDE_CONTEXT_ENV: "372000"},
+                {"claude-sonnet-5"},
+                run=run,
+            )
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            calls[1][1]["timeout"], parable.CLAUDE_RESUME_COMPACT_TIMEOUT_SECONDS
+        )
+
+    def test_resume_compaction_reports_heartbeats_while_waiting(self):
+        reports = []
+        results = [
+            {
+                "type": "result",
+                "is_error": False,
+                "session_id": "large-session",
+                "result": "**Tokens:** 321.4k / 967k (33%)",
+            },
+            {
+                "type": "result",
+                "is_error": False,
+                "session_id": "large-session",
+                "result": "Compaction complete",
+            },
+            {
+                "type": "result",
+                "is_error": False,
+                "session_id": "large-session",
+                "result": "**Tokens:** 42k / 967k (4%)",
+            },
+        ]
+
+        def run(_argv, **_kwargs):
+            if len(results) == 2:
+                parable.time.sleep(0.04)
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(results.pop(0)),
+                stderr="",
+            )
+
+        original_interval = parable.CLAUDE_RESUME_HEARTBEAT_SECONDS
+        parable.CLAUDE_RESUME_HEARTBEAT_SECONDS = 0.01
+        try:
+            parable.prepare_claude_resume(
+                ["--resume", "large-session"],
+                "claude",
+                {parable.CLAUDE_CONTEXT_ENV: "372000"},
+                {"claude-sonnet-5"},
+                run=run,
+                report=reports.append,
+            )
+        finally:
+            parable.CLAUDE_RESUME_HEARTBEAT_SECONDS = original_interval
+        self.assertTrue(any(
+            message.startswith("still compacting with Sonnet 5")
+            for message in reports
+        ), reports)
 
     def test_resume_preflight_skips_picker_fork_and_full_window(self):
         def should_not_run(*_args, **_kwargs):
