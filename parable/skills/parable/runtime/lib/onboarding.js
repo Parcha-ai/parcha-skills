@@ -40,8 +40,10 @@ const PROXY_PROBE_TIMEOUT_MS = 750;
 const PROXY_STOP_TIMEOUT_MS = 2_000;
 const CONTEXT_RECOVERY_ENV = "PARABLE_CONTEXT_RECOVERY_FILE";
 const CONTEXT_RESUME_PICKER_ENV = "PARABLE_CONTEXT_RESUME_PICKER";
+const TEAMMATE_RECOVERY_ACTIVE_ENV = "PARABLE_TEAMMATE_RECOVERY_ACTIVE";
 const CONTEXT_RECOVERY_POLL_MS = 50;
 const CONTEXT_RECOVERY_MAX_ATTEMPTS = 1;
+const TEAMMATE_RECOVERY_MAX_ATTEMPTS = 1;
 const VENDOR_ORDER = Object.freeze(["claude", "chatgpt", "xai", "kimi"]);
 const AUTH_FLAGS = Object.freeze({
   chatgpt: Object.freeze({ browser: "--codex-login", device: "--codex-device-login" }),
@@ -146,7 +148,7 @@ function consumeContextRecoveryRequest(requestPath) {
       !payload
       || Array.isArray(payload)
       || payload.version !== 1
-      || !["context_failure", "resume_picker"].includes(payload.reason)
+      || !["context_failure", "resume_picker", "teammate_interrupt"].includes(payload.reason)
       || typeof payload.session_id !== "string"
       || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
         payload.session_id,
@@ -219,7 +221,7 @@ function claudeResumePickerRequested(argv) {
   return false;
 }
 
-function withExactClaudeResume(argv, sessionId) {
+function withExactClaudeResume(argv, sessionId, replyOnResume = false) {
   const { start, end } = claudeArgumentBounds(argv);
   const noValue = new Set([
     "-c",
@@ -253,6 +255,7 @@ function withExactClaudeResume(argv, sessionId) {
     ...cleaned,
     "--resume",
     sessionId,
+    ...(replyOnResume ? ["--reply-on-resume"] : []),
     ...argv.slice(end),
   ];
 }
@@ -537,6 +540,21 @@ function renderProxyYaml(port, authDir, token) {
     "api-keys:",
     `  - "${token}"`,
     "debug: false",
+    "transient-error-cooldown-seconds: -1",
+    "claude-code:",
+    "  disable-cloaking-model-list: true",
+    "",
+  ].join("\n");
+}
+
+function renderPreviousProxyYaml(port, authDir, token) {
+  return [
+    'host: "127.0.0.1"',
+    `port: ${port}`,
+    `auth-dir: ${yamlString(authDir)}`,
+    "api-keys:",
+    `  - "${token}"`,
+    "debug: false",
     "claude-code:",
     "  disable-cloaking-model-list: true",
     "",
@@ -771,7 +789,10 @@ function validateExistingSetup(configDir, authDir, paths, desired, options = {})
     const legacyProxyConfig = (
       options.acceptLegacyProxyConfig === true
       && target === paths.proxyConfig
-      && actual === renderLegacyProxyYaml(desired.port, authDir, token)
+      && [
+        renderPreviousProxyYaml(desired.port, authDir, token),
+        renderLegacyProxyYaml(desired.port, authDir, token),
+      ].includes(actual)
     );
     if (actual !== content && !legacyProxyConfig) {
       throw new OnboardingError(`generated setup file has changed; refusing to overwrite: ${target}`);
@@ -787,12 +808,32 @@ function migrateLegacyProxyConfig(paths, desired, authDir) {
   const current = renderProxyYaml(desired.port, authDir, token);
   const actual = fs.readFileSync(paths.proxyConfig, "utf8");
   if (actual === current) return false;
-  if (actual !== renderLegacyProxyYaml(desired.port, authDir, token)) {
+  if (![
+    renderPreviousProxyYaml(desired.port, authDir, token),
+    renderLegacyProxyYaml(desired.port, authDir, token),
+  ].includes(actual)) {
     throw new OnboardingError(
       `generated setup file has changed; refusing to overwrite: ${paths.proxyConfig}`,
     );
   }
   replacePrivateFileSet([[paths.proxyConfig, current]]);
+  return true;
+}
+
+function activateGeneratedProxyConfig(context, log) {
+  const migrated = migrateLegacyProxyConfig(
+    context.paths,
+    context.manifest,
+    context.authDir,
+  );
+  if (!migrated) return false;
+  validateExistingSetup(
+    context.configDir,
+    context.authDir,
+    context.paths,
+    context.manifest,
+  );
+  log(`proxy: updated generated retry policy -> ${context.paths.proxyConfig}`);
   return true;
 }
 
@@ -806,6 +847,7 @@ function validateExistingSetupEnvelope(configDir, authDir, paths, manifest) {
   const expected = new Map([
     [paths.proxyConfig, [
       renderProxyYaml(manifest.port, authDir, token),
+      renderPreviousProxyYaml(manifest.port, authDir, token),
       renderLegacyProxyYaml(manifest.port, authDir, token),
     ]],
     [paths.proxyEnv, renderProxyEnv(token)],
@@ -1579,6 +1621,7 @@ async function runProxyStart(argv, log) {
     return 0;
   }
   const context = loadSetupContext();
+  activateGeneratedProxyConfig(context, log);
   const child = spawn(
     context.manifest.proxyBinary,
     ["--config", context.paths.proxyConfig, "--local-model"],
@@ -1805,6 +1848,7 @@ function spawnFinalize(argv, env) {
 async function runManagedClient(
   context, token, spawnClient, clientLabel, log, recovery = null,
 ) {
+  activateGeneratedProxyConfig(context, log);
   const initialProbe = await probeModels(context.manifest.port, token);
   if (initialProbe.kind === "occupied") {
     throw new OnboardingError(
@@ -1829,7 +1873,7 @@ async function runManagedClient(
     }
 
     let client = spawnClient(null);
-    let recoveryAttempts = 0;
+    const recoveryAttempts = { context: 0, teammate: 0 };
     while (true) {
       let forwardedSignal = null;
       const signalTargets = ownedProxy
@@ -1845,7 +1889,13 @@ async function runManagedClient(
           ownedProxy.done.then((outcome) => ({ owner: "proxy", outcome })),
         );
       }
-      if (recovery && recoveryAttempts < recovery.maxAttempts) {
+      if (
+        recovery
+        && (
+          recoveryAttempts.context < recovery.maxContextAttempts
+          || recoveryAttempts.teammate < recovery.maxTeammateAttempts
+        )
+      ) {
         contestants.push(
           waitForContextRecovery(client, recovery.requestPath).then(
             (request) => ({ owner: "recovery", request }),
@@ -1859,10 +1909,20 @@ async function runManagedClient(
         stopForwarding();
       }
       if (winner.owner === "recovery") {
-        recoveryAttempts += 1;
+        const recoveryKind = winner.request.reason === "teammate_interrupt"
+          ? "teammate" : "context";
+        const recoveryLimit = recoveryKind === "teammate"
+          ? recovery.maxTeammateAttempts : recovery.maxContextAttempts;
+        if (recoveryAttempts[recoveryKind] >= recoveryLimit) continue;
+        recoveryAttempts[recoveryKind] += 1;
         if (winner.request.reason === "resume_picker") {
           log(
             "context: resume selected; checking with Sonnet 5, then resuming "
+              + `${winner.request.sessionId}`,
+          );
+        } else if (winner.request.reason === "teammate_interrupt") {
+          log(
+            "session: teammate update interrupted the active turn; resuming "
               + `${winner.request.sessionId}`,
           );
         } else {
@@ -1930,6 +1990,7 @@ async function runClaude(argv, log) {
   };
   delete env[CONTEXT_RECOVERY_ENV];
   delete env[CONTEXT_RESUME_PICKER_ENV];
+  delete env[TEAMMATE_RECOVERY_ACTIVE_ENV];
   if (recovery) env[CONTEXT_RECOVERY_ENV] = recovery.requestPath;
   if (recovery && claudeResumePickerRequested(argv)) {
     env[CONTEXT_RESUME_PICKER_ENV] = "1";
@@ -1942,13 +2003,24 @@ async function runClaude(argv, log) {
         if (!request) return spawnClaude(argv, env);
         const resumeEnv = { ...env };
         delete resumeEnv[CONTEXT_RESUME_PICKER_ENV];
-        return spawnClaude(withExactClaudeResume(argv, request.sessionId), resumeEnv);
+        if (request.reason === "teammate_interrupt") {
+          resumeEnv[TEAMMATE_RECOVERY_ACTIVE_ENV] = "1";
+        }
+        return spawnClaude(
+          withExactClaudeResume(
+            argv,
+            request.sessionId,
+            request.reason === "teammate_interrupt",
+          ),
+          resumeEnv,
+        );
       },
       "Claude",
       log,
       recovery && {
         requestPath: recovery.requestPath,
-        maxAttempts: CONTEXT_RECOVERY_MAX_ATTEMPTS,
+        maxContextAttempts: CONTEXT_RECOVERY_MAX_ATTEMPTS,
+        maxTeammateAttempts: TEAMMATE_RECOVERY_MAX_ATTEMPTS,
       },
     );
   } finally {
