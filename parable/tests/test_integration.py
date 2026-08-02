@@ -66,6 +66,7 @@ capture = {
         )
     },
     "max_context_tokens": os.environ.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS"),
+    "auto_compact_window": os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW"),
     "auto_compact_pct": os.environ.get("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"),
 }
 with open(os.environ["FAKE_CLAUDE_CAPTURE"], "w") as handle:
@@ -74,24 +75,56 @@ calls_path = os.environ.get("FAKE_CLAUDE_CALLS")
 if calls_path:
     with open(calls_path, "a") as handle:
         handle.write(json.dumps(capture) + "\\n")
+recovery_path = os.environ.get("PARABLE_CONTEXT_RECOVERY_FILE")
+selected_model = (
+    sys.argv[sys.argv.index("--model") + 1] if "--model" in sys.argv else None
+)
+context_failure = (
+    os.environ.get("FAKE_CLAUDE_CONTEXT_FAILURE_ONCE") and "--resume" not in sys.argv
+) or (
+    os.environ.get("FAKE_CLAUDE_CONTEXT_FAILURE_ALWAYS")
+    and selected_model != "claude-sonnet-5[1m]"
+)
+if recovery_path and context_failure:
+    request = {"version": 1, "session_id": "12345678-1234-4234-9234-123456789abc"}
+    descriptor = os.open(recovery_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w") as handle:
+        json.dump(request, handle)
+    if os.environ.get("FAKE_CLAUDE_CONTEXT_FAILURE_ALWAYS") and "--resume" in sys.argv:
+        raise SystemExit(int(os.environ.get("FAKE_CLAUDE_EXIT", "44")))
+    def recover_stop(signum, _frame):
+        raise SystemExit(128 + signum)
+    signal.signal(signal.SIGTERM, recover_stop)
+    while True:
+        time.sleep(0.05)
 if sys.argv[-1:] == ["/context"]:
+    requested_session = (
+        sys.argv[sys.argv.index("--resume") + 1]
+        if "--resume" in sys.argv else "resolved-resume-session"
+    )
     resumed_exactly = (
         "--resume" in sys.argv
-        and sys.argv[sys.argv.index("--resume") + 1] == "resolved-resume-session"
+        and requested_session in {"resolved-resume-session", "12345678-1234-4234-9234-123456789abc"}
     )
+    compact_state = os.environ.get("FAKE_CLAUDE_COMPACT_STATE")
+    compact_finished = bool(compact_state and os.path.exists(compact_state))
     token_env = (
         "FAKE_CLAUDE_POST_COMPACT_TOKENS"
-        if resumed_exactly
+        if resumed_exactly and (requested_session == "resolved-resume-session" or compact_finished)
         else "FAKE_CLAUDE_CONTEXT_TOKENS"
     )
     tokens = os.environ.get(token_env, "42000")
     print(json.dumps({
         "type": "result", "is_error": False,
-        "session_id": "resolved-resume-session",
+        "session_id": requested_session,
         "result": "**Tokens:** " + tokens + " / 967k (33%)",
     }))
     raise SystemExit(0)
 if sys.argv[-1:] and sys.argv[-1].startswith("/compact "):
+    compact_state = os.environ.get("FAKE_CLAUDE_COMPACT_STATE")
+    if compact_state:
+        with open(compact_state, "w") as handle:
+            handle.write("done\\n")
     print(json.dumps({
         "type": "result", "is_error": False,
         "session_id": "resolved-resume-session", "result": "",
@@ -378,6 +411,7 @@ class TestClaudeSubscriptionLauncher(unittest.TestCase):
             self.assertIn("claude-sonnet-5[1m]", recorded[0]["argv"])
             self.assertEqual(recorded[0]["argv"][-2:], ["--continue", "/context"])
             self.assertIsNone(recorded[0]["max_context_tokens"])
+            self.assertIsNone(recorded[0]["auto_compact_window"])
             self.assertEqual(
                 recorded[1]["argv"][-3:],
                 [
@@ -398,6 +432,7 @@ class TestClaudeSubscriptionLauncher(unittest.TestCase):
                 ],
             )
             self.assertEqual(recorded[3]["max_context_tokens"], "372000")
+            self.assertEqual(recorded[3]["auto_compact_window"], "372000")
 
     def test_launcher_degrades_when_an_optional_routed_model_is_absent(self):
         with tempfile.TemporaryDirectory() as tmp, model_server(
@@ -677,7 +712,7 @@ exit 0
             self.assertEqual(first.stdout.count(handoff), 1)
             self.assertIn(launch, first.stdout)
 
-            installed = home / ".local" / "share" / "parable" / "0.1.24"
+            installed = home / ".local" / "share" / "parable" / "0.1.25"
             durable = home / ".local" / "bin" / "parable"
             self.assertTrue((installed / "bin" / "parable.js").is_file())
             self.assertTrue((installed / "lib" / "onboarding.js").is_file())
@@ -1010,6 +1045,66 @@ class TestClaudeAgentModelGuard(unittest.TestCase):
         decision = json.loads(result.stdout)["hookSpecificOutput"]
         self.assertEqual(decision["permissionDecision"], "deny")
         self.assertIn("current parent model", decision["permissionDecisionReason"])
+
+
+class TestClaudeContextRecoveryHook(unittest.TestCase):
+    def run_hook(self, payload: object, target: Path) -> subprocess.CompletedProcess:
+        hook = (
+            REPO / "skills" / "parable" / "runtime" / "welcome-plugin"
+            / "scripts" / "context_recovery.py"
+        )
+        env = dict(os.environ)
+        env["PARABLE_CONTEXT_RECOVERY_FILE"] = str(target)
+        result = subprocess.run(
+            ["python3", str(hook)],
+            input=json.dumps(payload),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return result
+
+    def test_main_context_failure_requests_private_exact_session_recovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "request.json"
+            result = self.run_hook({
+                "hook_event_name": "StopFailure",
+                "error": "invalid_request",
+                "error_details": "400 Your input exceeds the context window of this model.",
+                "last_assistant_message": "API Error: input exceeds the context window",
+                "session_id": "12345678-1234-4234-9234-123456789abc",
+            }, target)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(json.loads(target.read_text()), {
+                "version": 1,
+                "session_id": "12345678-1234-4234-9234-123456789abc",
+            })
+            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+    def test_unrelated_and_subagent_failures_do_not_request_restart(self):
+        events = [
+            {
+                "hook_event_name": "StopFailure",
+                "error": "server_error",
+                "error_details": "503 overloaded",
+                "session_id": "12345678-1234-4234-9234-123456789abc",
+            },
+            {
+                "hook_event_name": "StopFailure",
+                "error": "invalid_request",
+                "error_details": "input exceeds the context window",
+                "session_id": "12345678-1234-4234-9234-123456789abc",
+                "agent_id": "agent-1",
+            },
+        ]
+        for event in events:
+            with self.subTest(event=event), tempfile.TemporaryDirectory() as tmp:
+                target = Path(tmp) / "request.json"
+                result = self.run_hook(event, target)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(target.exists())
 
 
 class TestFirstRunSetup(unittest.TestCase):
@@ -2540,6 +2635,7 @@ for flag, (vendor, record_type) in mapping.items():
             # models (gpt-5.6-* at 372k beat kimi-k3's 1M). Anthropic models
             # ignore the env var, so the brain is unaffected.
             self.assertEqual(captured["max_context_tokens"], "372000")
+            self.assertEqual(captured["auto_compact_window"], "372000")
             self.assertEqual(captured["auto_compact_pct"], "75")
             self.assertIn("TERRA", captured["welcome_message"])
             self.assertIn("React and frontend", captured["welcome_message"])
@@ -2583,6 +2679,7 @@ for flag, (vendor, record_type) in mapping.items():
             # Solo pins the real window of the exact model so auto-compact
             # fires before the upstream limit, not after.
             self.assertEqual(captured["max_context_tokens"], "1000000")
+            self.assertEqual(captured["auto_compact_window"], "1000000")
             self.assertIn("SOLO    KIMI · kimi-k3", captured["welcome_message"])
             self.assertIn("1M ctx", captured["welcome_message"])
             self.assertIn("You are the only agent", captured["welcome_message"])
@@ -2989,6 +3086,88 @@ finally:
             self.assertIn("proxy: reusing healthy configured endpoint", proc.stdout)
             self.assertTrue(server.authorization_ok)
             self.assertEqual(self.events(case), [])
+
+    def test_context_failure_compacts_with_sonnet_and_resumes_exact_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            case = self.setup_case(tmp)
+            calls = Path(tmp) / "claude-calls.jsonl"
+            compact_state = Path(tmp) / "compact-finished"
+            env = case["env"] | {
+                "FAKE_CLAUDE_CALLS": str(calls),
+                "FAKE_CLAUDE_CONTEXT_FAILURE_ONCE": "1",
+                "FAKE_CLAUDE_CONTEXT_TOKENS": "321400",
+                "FAKE_CLAUDE_POST_COMPACT_TOKENS": "42000",
+                "FAKE_CLAUDE_COMPACT_STATE": str(compact_state),
+            }
+            proc = subprocess.run(
+                [NODE, str(REPO / "bin" / "parable.js")],
+                cwd=case["repo"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            session_id = "12345678-1234-4234-9234-123456789abc"
+            self.assertIn(
+                f"context: limit reached; compacting with Sonnet 5, then resuming {session_id}",
+                proc.stdout,
+            )
+            self.assertIn(
+                "resume: compacted 321,400 to 42,000 tokens with Sonnet 5",
+                proc.stdout,
+            )
+            captured_calls = [
+                json.loads(line) for line in calls.read_text().splitlines()
+            ]
+            self.assertEqual(len(captured_calls), 5)
+            self.assertNotIn("--resume", captured_calls[0]["argv"])
+            for call in captured_calls[1:]:
+                self.assertIn("--resume", call["argv"])
+                resume_at = call["argv"].index("--resume")
+                self.assertEqual(call["argv"][resume_at + 1], session_id)
+            preflight = captured_calls[1:4]
+            self.assertTrue(all(
+                call["argv"][call["argv"].index("--model") + 1]
+                == "claude-sonnet-5[1m]"
+                for call in preflight
+            ))
+            final = captured_calls[-1]
+            self.assertEqual(
+                final["argv"][final["argv"].index("--model") + 1],
+                "gpt-5.6-sol",
+            )
+            self.assertEqual(final["auto_compact_window"], "372000")
+            events = self.events(case)
+            self.assertTrue(any(item["event"] == "signal" for item in events))
+            self.assert_pid_gone(events[0]["pid"])
+
+    def test_context_recovery_is_capped_at_one_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            case = self.setup_case(tmp)
+            calls = Path(tmp) / "claude-calls.jsonl"
+            env = case["env"] | {
+                "FAKE_CLAUDE_CALLS": str(calls),
+                "FAKE_CLAUDE_CONTEXT_FAILURE_ALWAYS": "1",
+                "FAKE_CLAUDE_CONTEXT_TOKENS": "321400",
+                "FAKE_CLAUDE_POST_COMPACT_TOKENS": "42000",
+                "FAKE_CLAUDE_COMPACT_STATE": str(Path(tmp) / "compact-finished"),
+                "FAKE_CLAUDE_EXIT": "44",
+            }
+            proc = subprocess.run(
+                [NODE, str(REPO / "bin" / "parable.js")],
+                cwd=case["repo"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            self.assertEqual(proc.returncode, 44, proc.stdout + proc.stderr)
+            self.assertEqual(proc.stdout.count("context: limit reached"), 1)
+            captured_calls = [
+                json.loads(line) for line in calls.read_text().splitlines()
+            ]
+            self.assertEqual(len(captured_calls), 5)
 
     def test_wrong_listener_fails_closed_before_proxy_or_claude(self):
         with tempfile.TemporaryDirectory() as tmp, model_server(self.MODELS) as (

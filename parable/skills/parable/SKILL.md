@@ -124,11 +124,12 @@ Inside a solo session:
 
 Solo refusals are **hard fails** — a solo session does not silently degrade to multi-model or skip Agent invocations. If you need agents or multi-model casting, use normal Parable mode (`parable` or `parable --brain`).
 
-Every launch (solo and multi-model) also pins `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the real
-context window of the proxied non-Anthropic models in play and sets
-`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=75`. Claude Code otherwise guesses 200k or 1M for models it
-does not recognize, then waits until about 95% to compact; that leaves too little room for Sol
-tool results before the upstream limit. Details and override knobs: `references/config.md`.
+Every launch (solo and multi-model) pins both `CLAUDE_CODE_MAX_CONTEXT_TOKENS` and Claude
+Code's separate `CLAUDE_CODE_AUTO_COMPACT_WINDOW` to the real context window of the proxied
+non-Anthropic models in play, then sets `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=75`. Claude Code
+otherwise guesses 200k or 1M for models it does not recognize, and setting only the request
+ceiling does not reliably arm its auto-compaction calculation. Details and override knobs:
+`references/config.md`.
 
 An explicit CLI resume into a smaller window (`--continue`, `--resume <name-or-id>`, or
 `--from-pr <value>`) gets a pre-launch guard. Parable asks Claude Code's native `/context`
@@ -141,6 +142,13 @@ pre-compacted before Claude resolves or creates their session; the launcher repo
 skipped the guard. SessionStart hooks cannot implement this guard because Claude Code defines
 them as non-blocking context/UI hooks, not a place to invoke built-in commands before loading a
 model.
+
+If native auto-compaction still misses and the main interactive turn ends with the exact
+context-window API error, Parable's managed supervisor performs one recovery. A StopFailure
+hook writes a private exact-session request; the supervisor stops the stranded Claude child,
+reuses the resume preflight above to compact with low-effort Sonnet 5, and relaunches the
+original Parable command on that session. It never restarts subagents or unrelated API
+failures, and the one-attempt ceiling prevents recovery loops.
 
 ### Solo requires `[claude]` configuration
 

@@ -648,25 +648,30 @@ class TestClaudeLaunch(unittest.TestCase):
         source = {"CLIPROXY_API_KEY": "x"}
         _argv, env = parable.build_claude_launch(cfg, [], source, solo=True)
         self.assertEqual(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "1000000")
+        self.assertEqual(env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "1000000")
         self.assertEqual(env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], "75")
         # Multi-model launch takes the min across the non-Claude cast.
         multi = parable.config_with_claude_brain(self.cfg(), "gpt-5.6-sol")
         _argv, env = parable.build_claude_launch(multi, [], source)
         self.assertEqual(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "372000")
+        self.assertEqual(env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "372000")
         self.assertEqual(env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], "75")
         # A user's own values are never clobbered.
         user = {
             "CLIPROXY_API_KEY": "x",
             "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "123000",
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "111000",
             "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "68",
         }
         _argv, env = parable.build_claude_launch(cfg, [], user, solo=True)
         self.assertEqual(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "123000")
+        self.assertEqual(env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "111000")
         self.assertEqual(env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], "68")
         # Unknown solo model: the env is left unset, not guessed.
         unknown = parable.config_with_claude_brain(self.cfg(), "mystery-model")
         _argv, env = parable.build_claude_launch(unknown, [], source, solo=True)
         self.assertNotIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS", env)
+        self.assertNotIn("CLAUDE_CODE_AUTO_COMPACT_WINDOW", env)
         self.assertNotIn("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", env)
         # An explicit ceiling for an unknown custom model still gets safe
         # compaction unless the user also supplies their own percentage.
@@ -675,6 +680,7 @@ class TestClaudeLaunch(unittest.TestCase):
             "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "256000",
         }
         _argv, env = parable.build_claude_launch(unknown, [], explicit, solo=True)
+        self.assertEqual(env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "256000")
         self.assertEqual(env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], "75")
 
     def test_context_ktok_config_field_is_validated(self):

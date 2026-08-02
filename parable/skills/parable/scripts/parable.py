@@ -96,6 +96,7 @@ MODEL_CONTEXT_WINDOWS = {
 # cast model's window is unknown so we never raise the assumed ceiling blindly.
 CLAUDE_DEFAULT_CONTEXT_WINDOW = 200_000
 CLAUDE_CONTEXT_ENV = "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
+CLAUDE_AUTO_COMPACT_WINDOW_ENV = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
 CLAUDE_AUTO_COMPACT_PCT_ENV = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
 # Claude Code's default auto-compact point is about 95%. That leaves too little
 # room for a tool result between turns when a proxied model has a smaller input
@@ -593,17 +594,21 @@ def build_claude_launch(cfg: dict, forwarded: list[str], environ: dict[str, str]
         launch_env.pop(inherited, None)
     if solo:
         launch_env.pop("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", None)
-    # Give Claude Code the real context ceiling for proxied non-Anthropic
-    # models, then trigger compaction with enough room for a tool result and
-    # the compacting request itself. Both user-provided values always win.
+    # Give Claude Code both the request ceiling and the separate window it
+    # uses for auto-compaction calculations. The percentage override is
+    # applied to the latter; setting only MAX_CONTEXT does not reliably arm
+    # compaction for an unrecognized proxied model. User values always win.
     ceiling = claude_context_ceiling(
         cfg, claude["brain_model"], solo=solo, available=available
     )
     if not source_env.get(CLAUDE_CONTEXT_ENV):
         if ceiling is not None:
             launch_env[CLAUDE_CONTEXT_ENV] = str(ceiling)
+    effective_ceiling = launch_env.get(CLAUDE_CONTEXT_ENV)
+    if effective_ceiling and not source_env.get(CLAUDE_AUTO_COMPACT_WINDOW_ENV):
+        launch_env[CLAUDE_AUTO_COMPACT_WINDOW_ENV] = effective_ceiling
     if (
-        (ceiling is not None or source_env.get(CLAUDE_CONTEXT_ENV))
+        effective_ceiling
         and not source_env.get(CLAUDE_AUTO_COMPACT_PCT_ENV)
     ):
         launch_env[CLAUDE_AUTO_COMPACT_PCT_ENV] = str(CLAUDE_AUTO_COMPACT_PCT)
@@ -773,7 +778,7 @@ def prepare_claude_resume(
     for name in (
         CLAUDE_CONTEXT_ENV,
         CLAUDE_AUTO_COMPACT_PCT_ENV,
-        "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+        CLAUDE_AUTO_COMPACT_WINDOW_ENV,
     ):
         preflight_env.pop(name, None)
     common = [
@@ -1120,7 +1125,7 @@ def add_claude_welcome(argv: list[str], launch_env: dict[str, str], cfg: dict,
     hook = PARABLE_WELCOME_PLUGIN / "hooks" / "hooks.json"
     scripts = [
         PARABLE_WELCOME_PLUGIN / "scripts" / name
-        for name in ("welcome.py", "model_guard.py")
+        for name in ("welcome.py", "model_guard.py", "context_recovery.py")
     ]
     if not all(
         path.is_file() and not path.is_symlink()
