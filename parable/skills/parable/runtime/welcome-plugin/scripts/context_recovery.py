@@ -14,6 +14,7 @@ import sys
 
 RECOVERY_FILE_ENV = "PARABLE_CONTEXT_RECOVERY_FILE"
 RESUME_PICKER_ENV = "PARABLE_CONTEXT_RESUME_PICKER"
+TEAMMATE_RECOVERY_ACTIVE_ENV = "PARABLE_TEAMMATE_RECOVERY_ACTIVE"
 CONTEXT_ERROR = re.compile(
     r"input exceeds the context window|context window of this model|prompt is too long",
     re.IGNORECASE,
@@ -159,16 +160,26 @@ def recovery_request(event: object) -> dict[str, object] | None:
     session_id = event.get("session_id")
     if not isinstance(session_id, str) or not session_id:
         return None
-    if (
-        event.get("hook_event_name") == "SessionStart"
-        and event.get("source") in {"resume", "fork"}
-        and os.environ.get(RESUME_PICKER_ENV) == "1"
-    ):
-        return {
-            "version": 1,
-            "reason": "resume_picker",
-            "session_id": session_id,
-        }
+    if event.get("hook_event_name") == "SessionStart":
+        if (
+            event.get("source") == "resume"
+            and os.environ.get(TEAMMATE_RECOVERY_ACTIVE_ENV) != "1"
+            and teammate_delivery_interrupted_turn(event.get("transcript_path"))
+        ):
+            return {
+                "version": 1,
+                "reason": "teammate_interrupt",
+                "session_id": session_id,
+            }
+        if (
+            event.get("source") in {"resume", "fork"}
+            and os.environ.get(RESUME_PICKER_ENV) == "1"
+        ):
+            return {
+                "version": 1,
+                "reason": "resume_picker",
+                "session_id": session_id,
+            }
     if (
         event.get("hook_event_name") == "Notification"
         and event.get("notification_type") == "idle_prompt"

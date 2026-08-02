@@ -40,6 +40,7 @@ const PROXY_PROBE_TIMEOUT_MS = 750;
 const PROXY_STOP_TIMEOUT_MS = 2_000;
 const CONTEXT_RECOVERY_ENV = "PARABLE_CONTEXT_RECOVERY_FILE";
 const CONTEXT_RESUME_PICKER_ENV = "PARABLE_CONTEXT_RESUME_PICKER";
+const TEAMMATE_RECOVERY_ACTIVE_ENV = "PARABLE_TEAMMATE_RECOVERY_ACTIVE";
 const CONTEXT_RECOVERY_POLL_MS = 50;
 const CONTEXT_RECOVERY_MAX_ATTEMPTS = 1;
 const TEAMMATE_RECOVERY_MAX_ATTEMPTS = 1;
@@ -1989,6 +1990,7 @@ async function runClaude(argv, log) {
   };
   delete env[CONTEXT_RECOVERY_ENV];
   delete env[CONTEXT_RESUME_PICKER_ENV];
+  delete env[TEAMMATE_RECOVERY_ACTIVE_ENV];
   if (recovery) env[CONTEXT_RECOVERY_ENV] = recovery.requestPath;
   if (recovery && claudeResumePickerRequested(argv)) {
     env[CONTEXT_RESUME_PICKER_ENV] = "1";
@@ -2001,6 +2003,9 @@ async function runClaude(argv, log) {
         if (!request) return spawnClaude(argv, env);
         const resumeEnv = { ...env };
         delete resumeEnv[CONTEXT_RESUME_PICKER_ENV];
+        if (request.reason === "teammate_interrupt") {
+          resumeEnv[TEAMMATE_RECOVERY_ACTIVE_ENV] = "1";
+        }
         return spawnClaude(
           withExactClaudeResume(
             argv,

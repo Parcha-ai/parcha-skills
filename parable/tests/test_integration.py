@@ -72,6 +72,7 @@ capture = {
         os.environ.get("PARABLE_CONTEXT_RECOVERY_FILE")
     ),
     "resume_picker_recovery": os.environ.get("PARABLE_CONTEXT_RESUME_PICKER") == "1",
+    "teammate_recovery_active": os.environ.get("PARABLE_TEAMMATE_RECOVERY_ACTIVE") == "1",
 }
 with open(os.environ["FAKE_CLAUDE_CAPTURE"], "w") as handle:
     json.dump(capture, handle)
@@ -762,7 +763,7 @@ exit 0
             self.assertEqual(first.stdout.count(handoff), 1)
             self.assertIn(launch, first.stdout)
 
-            installed = home / ".local" / "share" / "parable" / "0.1.28"
+            installed = home / ".local" / "share" / "parable" / "0.1.29"
             durable = home / ".local" / "bin" / "parable"
             self.assertTrue((installed / "bin" / "parable.js").is_file())
             self.assertTrue((installed / "lib" / "onboarding.js").is_file())
@@ -1249,6 +1250,46 @@ class TestClaudeContextRecoveryHook(unittest.TestCase):
                 "reason": "teammate_interrupt",
                 "session_id": "12345678-1234-4234-9234-123456789abc",
             })
+
+    def test_resuming_stranded_teammate_turn_requests_immediate_reply_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "session.jsonl"
+            target = root / "request.json"
+            self.write_transcript(transcript, [
+                {
+                    "type": "user",
+                    "timestamp": "2026-08-02T21:50:37.659Z",
+                    "message": {
+                        "role": "user",
+                        "content": "[Request interrupted by user]",
+                    },
+                },
+                {
+                    "type": "user",
+                    "timestamp": "2026-08-02T21:50:37.696Z",
+                    "message": {
+                        "role": "user",
+                        "content": "Another Claude session sent a message:\n<teammate-message />",
+                    },
+                },
+            ])
+            event = self.notification_event(transcript) | {
+                "hook_event_name": "SessionStart",
+                "source": "resume",
+            }
+            first = self.run_hook(event, target)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(json.loads(target.read_text())["reason"], "teammate_interrupt")
+
+            target.unlink()
+            guarded = self.run_hook(
+                event,
+                target,
+                {"PARABLE_TEAMMATE_RECOVERY_ACTIVE": "1"},
+            )
+            self.assertEqual(guarded.returncode, 0, guarded.stderr)
+            self.assertFalse(target.exists())
 
     def test_idle_after_manual_interrupt_does_not_resume_against_user_intent(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3393,6 +3434,7 @@ finally:
             resume_at = final.index("--resume")
             self.assertEqual(final[resume_at + 1], session_id)
             self.assertIn("--reply-on-resume", final)
+            self.assertTrue(captured_calls[-1]["teammate_recovery_active"])
 
     def test_context_failure_compacts_with_sonnet_and_resumes_exact_session(self):
         with tempfile.TemporaryDirectory() as tmp:
