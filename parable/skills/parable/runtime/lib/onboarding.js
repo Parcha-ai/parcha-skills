@@ -186,35 +186,61 @@ function waitForContextRecovery(client, requestPath) {
   });
 }
 
-function withExactClaudeResume(argv, sessionId) {
-  const args = [...argv];
+function claudeArgumentBounds(argv) {
   let start = 0;
-  if (args[0] === "--brain" || args[0] === "--solo") start = 2;
-  else if (args[0]?.startsWith("--brain=") || args[0]?.startsWith("--solo=")) start = 1;
-  if (args[start] === "--") start += 1;
-  const terminator = args.indexOf("--", start);
-  const end = terminator === -1 ? args.length : terminator;
-  let index = start;
-  while (index < end) {
-    const argument = args[index];
-    if (argument === "-c" || argument === "--continue") {
-      args.splice(index, 1);
-      break;
+  if (argv[0] === "--brain" || argv[0] === "--solo") start = 2;
+  else if (argv[0]?.startsWith("--brain=") || argv[0]?.startsWith("--solo=")) start = 1;
+  if (argv[start] === "--") start += 1;
+  const terminator = argv.indexOf("--", start);
+  return {
+    start,
+    end: terminator === -1 ? argv.length : terminator,
+  };
+}
+
+function claudeContextRecoverySupported(argv) {
+  const { start, end } = claudeArgumentBounds(argv);
+  return !argv.slice(start, end).some(
+    (argument) => argument.split("=", 1)[0] === "--no-session-persistence",
+  );
+}
+
+function withExactClaudeResume(argv, sessionId) {
+  const { start, end } = claudeArgumentBounds(argv);
+  const noValue = new Set([
+    "-c",
+    "--continue",
+    "--fork-session",
+    "--reply-on-resume",
+  ]);
+  const withValue = new Set([
+    "-r",
+    "--resume",
+    "--from-pr",
+    "--session-id",
+    "--resume-session-at",
+    "--rewind-files",
+  ]);
+  const cleaned = [];
+  for (let index = start; index < end; index += 1) {
+    const argument = argv[index];
+    const option = argument.split("=", 1)[0];
+    if (noValue.has(option)) continue;
+    if (withValue.has(option)) {
+      if (!argument.includes("=") && index + 1 < end && !argv[index + 1].startsWith("-")) {
+        index += 1;
+      }
+      continue;
     }
-    if (argument.startsWith("--resume=") || argument.startsWith("--from-pr=")) {
-      args.splice(index, 1);
-      break;
-    }
-    if (argument === "-r" || argument === "--resume" || argument === "--from-pr") {
-      const count = index + 1 < end && !args[index + 1].startsWith("-") ? 2 : 1;
-      args.splice(index, count);
-      break;
-    }
-    index += 1;
+    cleaned.push(argument);
   }
-  const insertion = args.indexOf("--", start);
-  args.splice(insertion === -1 ? args.length : insertion, 0, "--resume", sessionId);
-  return args;
+  return [
+    ...argv.slice(0, start),
+    ...cleaned,
+    "--resume",
+    sessionId,
+    ...argv.slice(end),
+  ];
 }
 
 function requirePrivateDirectory(target, label) {
@@ -1875,12 +1901,13 @@ async function runClaude(argv, log) {
 
   const context = loadSetupContext();
   const token = readExistingToken(context.paths);
-  const recovery = createContextRecoveryChannel();
+  const recovery = claudeContextRecoverySupported(argv)
+    ? createContextRecoveryChannel() : null;
   const env = {
     ...process.env,
     CLIPROXY_API_KEY: token,
-    [CONTEXT_RECOVERY_ENV]: recovery.requestPath,
   };
+  if (recovery) env[CONTEXT_RECOVERY_ENV] = recovery.requestPath;
   try {
     return await runManagedClient(
       context,
@@ -1891,7 +1918,7 @@ async function runClaude(argv, log) {
       ),
       "Claude",
       log,
-      {
+      recovery && {
         requestPath: recovery.requestPath,
         maxAttempts: CONTEXT_RECOVERY_MAX_ATTEMPTS,
       },

@@ -68,6 +68,9 @@ capture = {
     "max_context_tokens": os.environ.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS"),
     "auto_compact_window": os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW"),
     "auto_compact_pct": os.environ.get("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"),
+    "context_recovery_enabled": bool(
+        os.environ.get("PARABLE_CONTEXT_RECOVERY_FILE")
+    ),
 }
 with open(os.environ["FAKE_CLAUDE_CAPTURE"], "w") as handle:
     json.dump(capture, handle)
@@ -79,9 +82,18 @@ recovery_path = os.environ.get("PARABLE_CONTEXT_RECOVERY_FILE")
 selected_model = (
     sys.argv[sys.argv.index("--model") + 1] if "--model" in sys.argv else None
 )
-context_failure = (
-    os.environ.get("FAKE_CLAUDE_CONTEXT_FAILURE_ONCE") and "--resume" not in sys.argv
-) or (
+failure_once = os.environ.get("FAKE_CLAUDE_CONTEXT_FAILURE_ONCE")
+failure_state = os.environ.get("FAKE_CLAUDE_CONTEXT_FAILURE_STATE")
+if failure_once and failure_state:
+    context_failure = not os.path.exists(failure_state)
+    if context_failure:
+        descriptor = os.open(
+            failure_state, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+        )
+        os.close(descriptor)
+else:
+    context_failure = bool(failure_once and "--resume" not in sys.argv)
+context_failure = context_failure or (
     os.environ.get("FAKE_CLAUDE_CONTEXT_FAILURE_ALWAYS")
     and selected_model != "claude-sonnet-5[1m]"
 )
@@ -3168,6 +3180,75 @@ finally:
                 json.loads(line) for line in calls.read_text().splitlines()
             ]
             self.assertEqual(len(captured_calls), 5)
+
+    def test_context_recovery_normalizes_forked_explicit_session_launch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            case = self.setup_case(tmp)
+            calls = Path(tmp) / "claude-calls.jsonl"
+            compact_state = Path(tmp) / "compact-finished"
+            failure_state = Path(tmp) / "context-failed"
+            original_session = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+            recovered_session = "12345678-1234-4234-9234-123456789abc"
+            env = case["env"] | {
+                "FAKE_CLAUDE_CALLS": str(calls),
+                "FAKE_CLAUDE_CONTEXT_FAILURE_ONCE": "1",
+                "FAKE_CLAUDE_CONTEXT_FAILURE_STATE": str(failure_state),
+                "FAKE_CLAUDE_CONTEXT_TOKENS": "321400",
+                "FAKE_CLAUDE_POST_COMPACT_TOKENS": "42000",
+                "FAKE_CLAUDE_COMPACT_STATE": str(compact_state),
+            }
+            proc = subprocess.run(
+                [
+                    NODE,
+                    str(REPO / "bin" / "parable.js"),
+                    "--resume",
+                    "seed-session",
+                    "--fork-session",
+                    "--session-id",
+                    original_session,
+                ],
+                cwd=case["repo"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            captured_calls = [
+                json.loads(line) for line in calls.read_text().splitlines()
+            ]
+            self.assertEqual(len(captured_calls), 5)
+            initial = captured_calls[0]["argv"]
+            self.assertIn("--fork-session", initial)
+            self.assertIn("--session-id", initial)
+            for call in captured_calls[1:]:
+                argv = call["argv"]
+                self.assertNotIn("--fork-session", argv)
+                self.assertNotIn("--session-id", argv)
+                self.assertIn("--resume", argv)
+                resume_at = argv.index("--resume")
+                self.assertEqual(argv[resume_at + 1], recovered_session)
+
+    def test_non_persistent_launch_does_not_offer_impossible_recovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            case = self.setup_case(tmp)
+            proc = subprocess.run(
+                [
+                    NODE,
+                    str(REPO / "bin" / "parable.js"),
+                    "--print",
+                    "--no-session-persistence",
+                    "hello",
+                ],
+                cwd=case["repo"],
+                env=case["env"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            captured = json.loads(case["claude_capture"].read_text())
+            self.assertFalse(captured["context_recovery_enabled"])
 
     def test_wrong_listener_fails_closed_before_proxy_or_claude(self):
         with tempfile.TemporaryDirectory() as tmp, model_server(self.MODELS) as (
