@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -96,6 +97,7 @@ MODEL_CONTEXT_WINDOWS = {
 # cast model's window is unknown so we never raise the assumed ceiling blindly.
 CLAUDE_DEFAULT_CONTEXT_WINDOW = 200_000
 CLAUDE_CONTEXT_ENV = "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
+CLAUDE_AUTO_COMPACT_WINDOW_ENV = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
 CLAUDE_AUTO_COMPACT_PCT_ENV = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
 # Claude Code's default auto-compact point is about 95%. That leaves too little
 # room for a tool result between turns when a proxied model has a smaller input
@@ -106,6 +108,9 @@ CLAUDE_AUTO_COMPACT_PCT = 75
 CLAUDE_RESUME_COMPACT_MODEL = "claude-sonnet-5[1m]"
 CLAUDE_RESUME_COMPACT_BASE_MODEL = "claude-sonnet-5"
 CLAUDE_RESUME_COMPACT_WINDOW = 1_000_000
+CLAUDE_RESUME_CHECK_TIMEOUT_SECONDS = 180
+CLAUDE_RESUME_COMPACT_TIMEOUT_SECONDS = 900
+CLAUDE_RESUME_HEARTBEAT_SECONDS = 60
 CLAUDE_RESUME_COMPACT_PROMPT = (
     "/compact preserve the active task, user requirements, decisions, changed files, "
     "remaining work, and verification evidence"
@@ -593,17 +598,21 @@ def build_claude_launch(cfg: dict, forwarded: list[str], environ: dict[str, str]
         launch_env.pop(inherited, None)
     if solo:
         launch_env.pop("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", None)
-    # Give Claude Code the real context ceiling for proxied non-Anthropic
-    # models, then trigger compaction with enough room for a tool result and
-    # the compacting request itself. Both user-provided values always win.
+    # Give Claude Code both the request ceiling and the separate window it
+    # uses for auto-compaction calculations. The percentage override is
+    # applied to the latter; setting only MAX_CONTEXT does not reliably arm
+    # compaction for an unrecognized proxied model. User values always win.
     ceiling = claude_context_ceiling(
         cfg, claude["brain_model"], solo=solo, available=available
     )
     if not source_env.get(CLAUDE_CONTEXT_ENV):
         if ceiling is not None:
             launch_env[CLAUDE_CONTEXT_ENV] = str(ceiling)
+    effective_ceiling = launch_env.get(CLAUDE_CONTEXT_ENV)
+    if effective_ceiling and not source_env.get(CLAUDE_AUTO_COMPACT_WINDOW_ENV):
+        launch_env[CLAUDE_AUTO_COMPACT_WINDOW_ENV] = effective_ceiling
     if (
-        (ceiling is not None or source_env.get(CLAUDE_CONTEXT_ENV))
+        effective_ceiling
         and not source_env.get(CLAUDE_AUTO_COMPACT_PCT_ENV)
     ):
         launch_env[CLAUDE_AUTO_COMPACT_PCT_ENV] = str(CLAUDE_AUTO_COMPACT_PCT)
@@ -736,6 +745,7 @@ def prepare_claude_resume(
     available: set[str],
     *,
     run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    report: Callable[[str], None] | None = None,
 ) -> tuple[list[str], str | None]:
     """Compact an oversized resumed session before a smaller model loads it.
 
@@ -749,6 +759,8 @@ def prepare_claude_resume(
         return forwarded, None
     start, end, selector = located
     if not selector:
+        if launch_env.get("PARABLE_CONTEXT_RESUME_PICKER") == "1":
+            return forwarded, "picker selected; exact session will be checked after selection"
         return forwarded, (
             "picker selected; pre-compaction requires --continue or "
             "--resume <name-or-session-id>"
@@ -773,7 +785,7 @@ def prepare_claude_resume(
     for name in (
         CLAUDE_CONTEXT_ENV,
         CLAUDE_AUTO_COMPACT_PCT_ENV,
-        "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+        CLAUDE_AUTO_COMPACT_WINDOW_ENV,
     ):
         preflight_env.pop(name, None)
     common = [
@@ -785,17 +797,45 @@ def prepare_claude_resume(
         "--output-format", "json",
     ]
 
-    def invoke(command: list[str]) -> dict:
+    def invoke(
+        command: list[str],
+        *,
+        operation: str = "preflight",
+        timeout: int = CLAUDE_RESUME_CHECK_TIMEOUT_SECONDS,
+        heartbeat: str | None = None,
+    ) -> dict:
+        heartbeat_stop = threading.Event()
+        heartbeat_thread = None
+        if heartbeat and report:
+            def report_heartbeat() -> None:
+                elapsed = CLAUDE_RESUME_HEARTBEAT_SECONDS
+                while not heartbeat_stop.wait(CLAUDE_RESUME_HEARTBEAT_SECONDS):
+                    report(f"{heartbeat} ({elapsed}s elapsed)")
+                    elapsed += CLAUDE_RESUME_HEARTBEAT_SECONDS
+
+            heartbeat_thread = threading.Thread(
+                target=report_heartbeat,
+                name="parable-resume-heartbeat",
+                daemon=True,
+            )
+            heartbeat_thread.start()
         try:
             completed = run(
                 command,
                 env=preflight_env,
                 capture_output=True,
                 text=True,
-                timeout=180,
+                timeout=timeout,
             )
         except subprocess.TimeoutExpired as exc:
-            raise RuntimeError("Claude resume preflight timed out") from exc
+            minutes = timeout // 60
+            raise RuntimeError(
+                f"Claude resume {operation} timed out after {minutes} minutes"
+            ) from exc
+        finally:
+            heartbeat_stop.set()
+            if heartbeat_thread:
+                heartbeat_thread.join()
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout or "unknown error").strip()
             raise RuntimeError(f"Claude resume preflight failed: {detail[:300]}")
@@ -805,6 +845,8 @@ def prepare_claude_resume(
             raise RuntimeError(f"Claude resume preflight failed: {detail[:300]}")
         return result
 
+    if report:
+        report("checking resumed session context with Sonnet 5")
     context = invoke([*common, *selector, "/context"])
     session_id = context.get("session_id")
     if not isinstance(session_id, str) or not session_id:
@@ -815,12 +857,20 @@ def prepare_claude_resume(
     if used_tokens < safe_tokens:
         return exact, f"{used_tokens:,} tokens fit the {safe_tokens:,}-token safe start"
 
-    compact = invoke([
-        *common,
-        "--resume", session_id,
-        CLAUDE_RESUME_COMPACT_PROMPT,
-    ])
+    if report:
+        report(
+            f"compacting {used_tokens:,} tokens with Sonnet 5; "
+            "this can take several minutes"
+        )
+    compact = invoke(
+        [*common, "--resume", session_id, CLAUDE_RESUME_COMPACT_PROMPT],
+        operation="compaction",
+        timeout=CLAUDE_RESUME_COMPACT_TIMEOUT_SECONDS,
+        heartbeat="still compacting with Sonnet 5",
+    )
     compact_result = str(compact.get("result") or "").strip()
+    if report:
+        report("compaction finished; verifying the reduced context")
     after = invoke([*common, "--resume", session_id, "/context"])
     remaining_tokens = _context_token_count(str(after.get("result") or ""))
     if remaining_tokens >= safe_tokens:
@@ -1120,7 +1170,7 @@ def add_claude_welcome(argv: list[str], launch_env: dict[str, str], cfg: dict,
     hook = PARABLE_WELCOME_PLUGIN / "hooks" / "hooks.json"
     scripts = [
         PARABLE_WELCOME_PLUGIN / "scripts" / name
-        for name in ("welcome.py", "model_guard.py")
+        for name in ("welcome.py", "model_guard.py", "context_recovery.py")
     ]
     if not all(
         path.is_file() and not path.is_symlink()
@@ -1251,7 +1301,8 @@ def cmd_claude(args: argparse.Namespace) -> int:
                 launch_cfg, forwarded, solo=True, available=available
             )
             forwarded, resume_note = prepare_claude_resume(
-                forwarded, argv[0], launch_env, available
+                forwarded, argv[0], launch_env, available,
+                report=lambda message: print(f"resume: {message}", flush=True),
             )
             argv, launch_env = build_claude_launch(
                 launch_cfg, forwarded, solo=True, available=available
@@ -1271,7 +1322,8 @@ def cmd_claude(args: argparse.Namespace) -> int:
                 launch_cfg, forwarded, available=available
             )
             forwarded, resume_note = prepare_claude_resume(
-                forwarded, argv[0], launch_env, available
+                forwarded, argv[0], launch_env, available,
+                report=lambda message: print(f"resume: {message}", flush=True),
             )
             argv, launch_env = build_claude_launch(
                 launch_cfg, forwarded, available=available

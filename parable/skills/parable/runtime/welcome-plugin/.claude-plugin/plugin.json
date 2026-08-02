@@ -1,5 +1,5 @@
 {
   "name": "parable-welcome",
   "description": "Render Parable's multi-model cast or solo contract inside Claude Code at session start.",
-  "version": "0.1.24"
+  "version": "0.1.27"
 }

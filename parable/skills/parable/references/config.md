@@ -94,7 +94,8 @@ Claude Code does not know the real context window of models it does not recogniz
 200k, or 1M when the parent carries a `[1m]`/long-context marker — and for a proxied non-Anthropic
 model both guesses are wrong, so auto-compact fires far too late and the session dies with an
 upstream `400 Your input exceeds the context window` error. Parable fixes this at launch by
-setting `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the real ceiling and
+setting both `CLAUDE_CODE_MAX_CONTEXT_TOKENS` and the independently evaluated
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW` to the real ceiling, plus
 `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=75` to leave room for tool results and the compaction request:
 
 - **Solo mode** uses the selected model's exact window.
@@ -105,9 +106,11 @@ setting `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the real ceiling and
 - Built-in windows come from the pinned proxy's own model registry (gpt-5.6-sol/terra/luna
   372k, grok-4.5 500k, kimi-k3 1M via upstream `k3` normalization, Claude 5-class 1M). Override
   or extend per executor with `context_ktok`.
-- A `CLAUDE_CODE_MAX_CONTEXT_TOKENS` already present in your environment always wins; Parable
-  never overwrites it. The same rule applies to `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`. An unknown
-  solo model leaves both variables unset unless you explicitly provide a context ceiling.
+- User-provided values always win independently. When you provide only
+  `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, Parable uses that value for the auto-compact window too;
+  an explicit `CLAUDE_CODE_AUTO_COMPACT_WINDOW` or `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` is never
+  overwritten. An unknown solo model leaves all three variables unset unless you explicitly
+  provide a context ceiling.
 
 The launch line reports both controls (`context ceiling 372,000 tokens; auto-compact 75%`) and
 the startup card shows each model's real window (`· 372k ctx`). For Sol, 75% starts compaction
@@ -121,10 +124,18 @@ Code's native `/context` under `claude-sonnet-5[1m]` at low effort. This inspect
 model tokens. At or above 75% of the target ceiling, Parable invokes native `/compact` in that
 same resolved session with Sonnet, then launches the requested model on the compacted history.
 If inspection or compaction fails, Parable fails closed instead of opening a model that cannot
-hold the session. Interactive `--resume` pickers and `--fork-session` are reported but skipped:
-the exact destination does not exist early enough for a safe pre-launch mutation. Use
-`--continue` or an explicit session name/id when moving a large conversation to a smaller
-window.
+hold the session. With plain `parable --resume`, Claude first resolves the interactive picker;
+the managed launcher then stops that process and runs the same exact-session guard before the
+first prompt. The launcher prints before a long Sonnet compaction begins and again when it starts
+verification, so the terminal does not appear idle. A forked explicit resume remains skipped
+because its destination is a new session.
+
+The managed interactive launcher also has a one-shot fallback for a missed native compaction.
+On the exact main-session context-window StopFailure, its private hook request tells the Node
+supervisor to stop the stranded Claude child. The ordinary resume preflight then compacts that
+same session under low-effort `claude-sonnet-5[1m]` and relaunches the original command with an
+exact `--resume <session-id>`. Subagent and unrelated API failures do not trigger recovery, and
+a second context failure remains visible for manual intervention rather than looping.
 
 For a custom executor id such as `kimi`, `parable agents sync` creates the native Claude agent
 name `parable-kimi` with the exact configured model id. Only files carrying Parable's generated

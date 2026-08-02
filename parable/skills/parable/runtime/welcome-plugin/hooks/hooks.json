@@ -1,6 +1,19 @@
 {
   "description": "Show the current Parable cast and preserve generated agents' exact models.",
   "hooks": {
+    "StopFailure": [
+      {
+        "matcher": "invalid_request|unknown",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/context_recovery.py"],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Agent",
@@ -15,6 +28,17 @@
       }
     ],
     "SessionStart": [
+      {
+        "matcher": "resume|fork",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/context_recovery.py"],
+            "timeout": 5
+          }
+        ]
+      },
       {
         "matcher": "startup|resume",
         "hooks": [

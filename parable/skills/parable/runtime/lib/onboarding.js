@@ -38,6 +38,10 @@ const PROXY_BINARY_NAME = "parable-cliproxy-api";
 const DEFAULT_PROXY_READY_TIMEOUT_MS = 15_000;
 const PROXY_PROBE_TIMEOUT_MS = 750;
 const PROXY_STOP_TIMEOUT_MS = 2_000;
+const CONTEXT_RECOVERY_ENV = "PARABLE_CONTEXT_RECOVERY_FILE";
+const CONTEXT_RESUME_PICKER_ENV = "PARABLE_CONTEXT_RESUME_PICKER";
+const CONTEXT_RECOVERY_POLL_MS = 50;
+const CONTEXT_RECOVERY_MAX_ATTEMPTS = 1;
 const VENDOR_ORDER = Object.freeze(["claude", "chatgpt", "xai", "kimi"]);
 const AUTH_FLAGS = Object.freeze({
   chatgpt: Object.freeze({ browser: "--codex-login", device: "--codex-device-login" }),
@@ -108,6 +112,149 @@ function lstatOrNull(target) {
     if (error.code === "ENOENT") return null;
     throw error;
   }
+}
+
+function createContextRecoveryChannel() {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "parable-context-recovery-"));
+  fs.chmodSync(directory, 0o700);
+  return {
+    directory,
+    requestPath: path.join(directory, "request.json"),
+  };
+}
+
+function removeContextRecoveryChannel(channel) {
+  if (!channel) return;
+  fs.rmSync(channel.directory, { recursive: true, force: true });
+}
+
+function consumeContextRecoveryRequest(requestPath) {
+  const stat = lstatOrNull(requestPath);
+  if (!stat) return null;
+  try {
+    if (
+      stat.isSymbolicLink()
+      || !stat.isFile()
+      || modeOf(stat) !== 0o600
+      || stat.size > 4096
+      || (typeof process.getuid === "function" && stat.uid !== process.getuid())
+    ) {
+      return null;
+    }
+    const payload = JSON.parse(fs.readFileSync(requestPath, "utf8"));
+    if (
+      !payload
+      || Array.isArray(payload)
+      || payload.version !== 1
+      || !["context_failure", "resume_picker"].includes(payload.reason)
+      || typeof payload.session_id !== "string"
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+        payload.session_id,
+      )
+    ) {
+      return null;
+    }
+    return { sessionId: payload.session_id, reason: payload.reason };
+  } catch {
+    return null;
+  } finally {
+    try { fs.unlinkSync(requestPath); } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+}
+
+function waitForContextRecovery(client, requestPath) {
+  return new Promise((resolve) => {
+    let timer = null;
+    let settled = false;
+    const finish = (request) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (request) resolve(request);
+    };
+    const poll = () => {
+      if (settled) return;
+      const request = consumeContextRecoveryRequest(requestPath);
+      if (request) {
+        finish(request);
+        return;
+      }
+      timer = setTimeout(poll, CONTEXT_RECOVERY_POLL_MS);
+    };
+    client.done.finally(() => finish(null));
+    poll();
+  });
+}
+
+function claudeArgumentBounds(argv) {
+  let start = 0;
+  if (argv[0] === "--brain" || argv[0] === "--solo") start = 2;
+  else if (argv[0]?.startsWith("--brain=") || argv[0]?.startsWith("--solo=")) start = 1;
+  if (argv[start] === "--") start += 1;
+  const terminator = argv.indexOf("--", start);
+  return {
+    start,
+    end: terminator === -1 ? argv.length : terminator,
+  };
+}
+
+function claudeContextRecoverySupported(argv) {
+  const { start, end } = claudeArgumentBounds(argv);
+  return !argv.slice(start, end).some(
+    (argument) => argument.split("=", 1)[0] === "--no-session-persistence",
+  );
+}
+
+function claudeResumePickerRequested(argv) {
+  const { start, end } = claudeArgumentBounds(argv);
+  for (let index = start; index < end; index += 1) {
+    const argument = argv[index];
+    if (argument === "--resume=") return true;
+    if (argument === "-r" || argument === "--resume") {
+      return index + 1 >= end || argv[index + 1].startsWith("-");
+    }
+  }
+  return false;
+}
+
+function withExactClaudeResume(argv, sessionId) {
+  const { start, end } = claudeArgumentBounds(argv);
+  const noValue = new Set([
+    "-c",
+    "--continue",
+    "--fork-session",
+    "--reply-on-resume",
+  ]);
+  const withValue = new Set([
+    "-r",
+    "--resume",
+    "--from-pr",
+    "--session-id",
+    "--resume-session-at",
+    "--rewind-files",
+  ]);
+  const cleaned = [];
+  for (let index = start; index < end; index += 1) {
+    const argument = argv[index];
+    const option = argument.split("=", 1)[0];
+    if (noValue.has(option)) continue;
+    if (withValue.has(option)) {
+      if (!argument.includes("=") && index + 1 < end && !argv[index + 1].startsWith("-")) {
+        index += 1;
+      }
+      continue;
+    }
+    cleaned.push(argument);
+  }
+  return [
+    ...argv.slice(0, start),
+    ...cleaned,
+    "--resume",
+    sessionId,
+    ...argv.slice(end),
+  ];
 }
 
 function requirePrivateDirectory(target, label) {
@@ -1655,7 +1802,9 @@ function spawnFinalize(argv, env) {
   return observedChild(child, "python3");
 }
 
-async function runManagedClient(context, token, spawnClient, clientLabel, log) {
+async function runManagedClient(
+  context, token, spawnClient, clientLabel, log, recovery = null,
+) {
   const initialProbe = await probeModels(context.manifest.port, token);
   if (initialProbe.kind === "occupied") {
     throw new OnboardingError(
@@ -1679,23 +1828,53 @@ async function runManagedClient(context, token, spawnClient, clientLabel, log) {
       );
     }
 
-    const client = spawnClient();
-    let forwardedSignal = null;
-    const signalTargets = ownedProxy
-      ? [client.child, ownedProxy.child] : [client.child];
-    const stopForwarding = forwardSignals(signalTargets, (signal) => {
-      forwardedSignal = signal;
-    });
-    try {
-      if (!ownedProxy) {
-        const outcome = await client.done;
-        if (client.error) throw client.error;
-        return forwardedSignal ? signalExitCode(forwardedSignal) : childExitCode(outcome);
-      }
-      const winner = await Promise.race([
+    let client = spawnClient(null);
+    let recoveryAttempts = 0;
+    while (true) {
+      let forwardedSignal = null;
+      const signalTargets = ownedProxy
+        ? [client.child, ownedProxy.child] : [client.child];
+      const stopForwarding = forwardSignals(signalTargets, (signal) => {
+        forwardedSignal = signal;
+      });
+      const contestants = [
         client.done.then((outcome) => ({ owner: "client", outcome })),
-        ownedProxy.done.then((outcome) => ({ owner: "proxy", outcome })),
-      ]);
+      ];
+      if (ownedProxy) {
+        contestants.push(
+          ownedProxy.done.then((outcome) => ({ owner: "proxy", outcome })),
+        );
+      }
+      if (recovery && recoveryAttempts < recovery.maxAttempts) {
+        contestants.push(
+          waitForContextRecovery(client, recovery.requestPath).then(
+            (request) => ({ owner: "recovery", request }),
+          ),
+        );
+      }
+      let winner;
+      try {
+        winner = await Promise.race(contestants);
+      } finally {
+        stopForwarding();
+      }
+      if (winner.owner === "recovery") {
+        recoveryAttempts += 1;
+        if (winner.request.reason === "resume_picker") {
+          log(
+            "context: resume selected; checking with Sonnet 5, then resuming "
+              + `${winner.request.sessionId}`,
+          );
+        } else {
+          log(
+            "context: limit reached; compacting with Sonnet 5, then resuming "
+              + `${winner.request.sessionId}`,
+          );
+        }
+        await stopObservedChild(client);
+        client = spawnClient(winner.request);
+        continue;
+      }
       if (winner.owner === "client") {
         if (client.error) throw client.error;
         return forwardedSignal ? signalExitCode(forwardedSignal) : childExitCode(winner.outcome);
@@ -1708,8 +1887,6 @@ async function runManagedClient(context, token, spawnClient, clientLabel, log) {
         `managed CLIProxyAPI exited ${outcomeDescription(winner.outcome)} while ${clientLabel} was running`,
         status === 0 ? 1 : status,
       );
-    } finally {
-      stopForwarding();
     }
   } finally {
     await stopObservedChild(ownedProxy);
@@ -1745,8 +1922,38 @@ async function runClaude(argv, log) {
 
   const context = loadSetupContext();
   const token = readExistingToken(context.paths);
-  const env = { ...process.env, CLIPROXY_API_KEY: token };
-  return runManagedClient(context, token, () => spawnClaude(argv, env), "Claude", log);
+  const recovery = claudeContextRecoverySupported(argv)
+    ? createContextRecoveryChannel() : null;
+  const env = {
+    ...process.env,
+    CLIPROXY_API_KEY: token,
+  };
+  delete env[CONTEXT_RECOVERY_ENV];
+  delete env[CONTEXT_RESUME_PICKER_ENV];
+  if (recovery) env[CONTEXT_RECOVERY_ENV] = recovery.requestPath;
+  if (recovery && claudeResumePickerRequested(argv)) {
+    env[CONTEXT_RESUME_PICKER_ENV] = "1";
+  }
+  try {
+    return await runManagedClient(
+      context,
+      token,
+      (request) => {
+        if (!request) return spawnClaude(argv, env);
+        const resumeEnv = { ...env };
+        delete resumeEnv[CONTEXT_RESUME_PICKER_ENV];
+        return spawnClaude(withExactClaudeResume(argv, request.sessionId), resumeEnv);
+      },
+      "Claude",
+      log,
+      recovery && {
+        requestPath: recovery.requestPath,
+        maxAttempts: CONTEXT_RECOVERY_MAX_ATTEMPTS,
+      },
+    );
+  } finally {
+    removeContextRecoveryChannel(recovery);
+  }
 }
 
 // `parable setup --add-vendors kimi [--no-auth]`: extends an already-complete, canonical
