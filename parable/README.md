@@ -162,6 +162,10 @@ configured loopback proxy, waits for its authenticated catalog, requires the sel
 creates the project-local agents, and launches stock Claude Code. Optional cast models missing
 from that launch snapshot are shown as unavailable and blocked before dispatch; their durable
 configuration remains intact. Parable stops only the proxy process it owns.
+The generated proxy config leaves auth and quota cooldowns intact but disables CLIProxyAPI's
+60-second cooldown for transient upstream 408/5xx responses. Claude Code therefore receives the
+real transient error and owns its normal retry backoff instead of seeing a cascade of synthetic
+`auth_unavailable` responses. Existing generated configs migrate on the next ordinary launch.
 No broker, shared deployment, provider API key, or copied OAuth credential is involved. See the
 [end-to-end setup guide](docs/CLIPROXYAPI_GPT_SUBSCRIPTION.md) and the generated-config
 [reference](examples/parable.claude-subscriptions.toml).
@@ -344,6 +348,9 @@ runtime difference.
   If Claude Code still returns a context-window API error, the managed supervisor stops the
   stranded child, compacts that exact session with low-effort Sonnet 5, and resumes the
   original Parable launch once. Other API failures and subagent failures are untouched.
+- If an automatically delivered agent-team message interrupts the lead request and leaves it
+  idle, Parable recognizes that exact transcript sequence and resumes the turn once. Manual user
+  interrupts, later user prompts, and sessions that already resumed useful work are untouched.
 - `skills/parable/references/`: config schema, provider recipes, routing playbook, reviewer
   rubric, and a commented example config. `examples/` holds minimal Fireworks, OpenRouter,
   LiteLLM, pi-Fireworks, [Claude subscriptions](examples/parable.claude-subscriptions.toml),

@@ -149,6 +149,13 @@ reuses the resume preflight above to compact with low-effort Sonnet 5, and relau
 original Parable command on that session. It never restarts subagents or unrelated API
 failures, and the one-attempt ceiling prevents recovery loops.
 
+Claude agent-team delivery can itself interrupt the lead request and leave the session idle.
+When the main session reaches `idle_prompt`, Parable inspects only the private tail of that exact
+transcript. If it proves that an automatic teammate message immediately followed the interrupt,
+and finds no later user prompt or completed assistant work, the supervisor resumes that session
+once with Claude Code's native `--reply-on-resume`. A plain user interrupt is never restarted.
+This recovery has its own one-attempt ceiling, independent of context recovery.
+
 ### Solo requires `[claude]` configuration
 
 Solo mode **requires** `parable.toml` to have `[claude]` configured (subscription-only mode with a loopback proxy). Solo cannot run with codex, pi, cursor, or other provider-backed executors. When launching with `parable --solo <model>`:

@@ -114,10 +114,27 @@ picker_recovery = bool(
     and bare_resume
     and os.environ.get("PARABLE_CONTEXT_RESUME_PICKER") == "1"
 )
-if recovery_path and (context_failure or picker_recovery):
+teammate_once = os.environ.get("FAKE_CLAUDE_TEAMMATE_INTERRUPT_ONCE")
+teammate_state = os.environ.get("FAKE_CLAUDE_TEAMMATE_INTERRUPT_STATE")
+teammate_recovery = bool(
+    recovery_path
+    and teammate_once
+    and teammate_state
+    and not os.path.exists(teammate_state)
+)
+if teammate_recovery:
+    descriptor = os.open(
+        teammate_state, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+    )
+    os.close(descriptor)
+if recovery_path and (context_failure or picker_recovery or teammate_recovery):
     request = {
         "version": 1,
-        "reason": "resume_picker" if picker_recovery else "context_failure",
+        "reason": (
+            "resume_picker" if picker_recovery
+            else "teammate_interrupt" if teammate_recovery
+            else "context_failure"
+        ),
         "session_id": picker_session if picker_recovery else "12345678-1234-4234-9234-123456789abc",
     }
     descriptor = os.open(recovery_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -1173,6 +1190,125 @@ class TestClaudeContextRecoveryHook(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertFalse(target.exists())
 
+    def write_transcript(self, target: Path, records: list[object]) -> None:
+        target.write_text("".join(json.dumps(record) + "\n" for record in records))
+        target.chmod(0o600)
+
+    def notification_event(self, transcript: Path) -> dict[str, object]:
+        return {
+            "hook_event_name": "Notification",
+            "notification_type": "idle_prompt",
+            "session_id": "12345678-1234-4234-9234-123456789abc",
+            "transcript_path": str(transcript),
+        }
+
+    def test_idle_after_automatic_teammate_interruption_requests_exact_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "session.jsonl"
+            target = root / "request.json"
+            self.write_transcript(transcript, [
+                {
+                    "type": "user",
+                    "timestamp": "2026-08-02T21:50:37.659Z",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "[Request interrupted by user]"}],
+                    },
+                },
+                {
+                    "type": "user",
+                    "timestamp": "2026-08-02T21:50:37.696Z",
+                    "message": {
+                        "role": "user",
+                        "content": "Another Claude session sent a message:\n<teammate-message>done</teammate-message>",
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "timestamp": "2026-08-02T21:50:41.590Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "thinking", "thinking": "resume work"}],
+                    },
+                },
+                {
+                    "type": "user",
+                    "timestamp": "2026-08-02T21:50:43.467Z",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "[Request interrupted by user]"}],
+                    },
+                },
+                {"type": "system", "subtype": "away_summary"},
+            ])
+            result = self.run_hook(self.notification_event(transcript), target)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(target.read_text()), {
+                "version": 1,
+                "reason": "teammate_interrupt",
+                "session_id": "12345678-1234-4234-9234-123456789abc",
+            })
+
+    def test_idle_after_manual_interrupt_does_not_resume_against_user_intent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "session.jsonl"
+            target = root / "request.json"
+            self.write_transcript(transcript, [{
+                "type": "user",
+                "timestamp": "2026-08-02T21:50:37.659Z",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "[Request interrupted by user]"}],
+                },
+            }])
+            result = self.run_hook(self.notification_event(transcript), target)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(target.exists())
+
+    def test_later_user_prompt_or_assistant_progress_suppresses_teammate_recovery(self):
+        endings = [
+            {
+                "type": "user",
+                "message": {"role": "user", "content": "stop; I want to change direction"},
+            },
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "name": "Bash", "input": {}}],
+                },
+            },
+        ]
+        for ending in endings:
+            with self.subTest(ending=ending), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                transcript = root / "session.jsonl"
+                target = root / "request.json"
+                self.write_transcript(transcript, [
+                    {
+                        "type": "user",
+                        "timestamp": "2026-08-02T21:50:37.659Z",
+                        "message": {
+                            "role": "user",
+                            "content": "[Request interrupted by user]",
+                        },
+                    },
+                    {
+                        "type": "user",
+                        "timestamp": "2026-08-02T21:50:37.696Z",
+                        "message": {
+                            "role": "user",
+                            "content": "Another Claude session sent a message:\n<teammate-message />",
+                        },
+                    },
+                    ending,
+                ])
+                result = self.run_hook(self.notification_event(transcript), target)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(target.exists())
+
 
 class TestFirstRunSetup(unittest.TestCase):
     def make_proxy(self, root: Path, name: str = "proxy") -> Path:
@@ -1244,6 +1380,7 @@ class TestFirstRunSetup(unittest.TestCase):
             self.assertIn("port: 8317", yaml)
             self.assertIn(f'auth-dir: "{auth_dir}"', yaml)
             self.assertIn(token, yaml)
+            self.assertIn("transient-error-cooldown-seconds: -1\n", yaml)
             self.assertIn("claude-code:\n  disable-cloaking-model-list: true\n", yaml)
             config = (config_dir / "parable.toml").read_text()
             self.assertIn('brain_model = "claude-fable-5"', config)
@@ -1290,33 +1427,43 @@ class TestFirstRunSetup(unittest.TestCase):
                 )
 
     def test_setup_migrates_only_the_previous_generated_proxy_config(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            home = Path(tmp)
-            proxy = self.make_proxy(home / "tools")
-            first = self.run_cli(
-                home,
-                "setup", "--non-interactive", "--vendors", "claude",
-                "--proxy-bin", str(proxy), "--no-auth",
-            )
-            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-            config = home / ".config" / "parable" / "cliproxy.yaml"
-            legacy = config.read_text().replace(
-                "claude-code:\n  disable-cloaking-model-list: true\n",
-                "",
-            )
-            config.write_text(legacy)
-            config.chmod(0o600)
+        for oldest in (False, True):
+            with self.subTest(oldest=oldest), tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp)
+                proxy = self.make_proxy(home / "tools")
+                first = self.run_cli(
+                    home,
+                    "setup", "--non-interactive", "--vendors", "claude",
+                    "--proxy-bin", str(proxy), "--no-auth",
+                )
+                self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+                config = home / ".config" / "parable" / "cliproxy.yaml"
+                legacy = config.read_text().replace(
+                    "transient-error-cooldown-seconds: -1\n",
+                    "",
+                )
+                if oldest:
+                    legacy = legacy.replace(
+                        "claude-code:\n  disable-cloaking-model-list: true\n",
+                        "",
+                    )
+                config.write_text(legacy)
+                config.chmod(0o600)
 
-            migrated = self.run_cli(
-                home,
-                "setup", "--non-interactive", "--vendors", "claude", "--no-auth",
-            )
-            self.assertEqual(migrated.returncode, 0, migrated.stdout + migrated.stderr)
-            self.assertIn("updated generated proxy compatibility", migrated.stdout)
-            self.assertIn(
-                "claude-code:\n  disable-cloaking-model-list: true\n",
-                config.read_text(),
-            )
+                migrated = self.run_cli(
+                    home,
+                    "setup", "--non-interactive", "--vendors", "claude", "--no-auth",
+                )
+                self.assertEqual(migrated.returncode, 0, migrated.stdout + migrated.stderr)
+                self.assertIn("updated generated proxy compatibility", migrated.stdout)
+                self.assertIn(
+                    "transient-error-cooldown-seconds: -1\n",
+                    config.read_text(),
+                )
+                self.assertIn(
+                    "claude-code:\n  disable-cloaking-model-list: true\n",
+                    config.read_text(),
+                )
 
     def test_interactive_and_all_vendor_configs_use_exact_models(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2452,6 +2599,11 @@ raise SystemExit(int(os.environ.get("FAKE_PROXY_EXIT", "0")))
             setup = self.setup(home, proxy, capture)
             self.assertEqual(setup.returncode, 0, setup.stdout + setup.stderr)
             config = home / ".config" / "parable" / "cliproxy.yaml"
+            config.write_text(config.read_text().replace(
+                "transient-error-cooldown-seconds: -1\n",
+                "",
+            ))
+            config.chmod(0o600)
             proc = self.run_cli(
                 home,
                 proxy,
@@ -2465,6 +2617,11 @@ raise SystemExit(int(os.environ.get("FAKE_PROXY_EXIT", "0")))
                 [["--config", str(config), "--local-model"]],
             )
             self.assertIn("native-proxy-output", proc.stdout)
+            self.assertIn("proxy: updated generated retry policy", proc.stdout)
+            self.assertIn(
+                "transient-error-cooldown-seconds: -1\n",
+                config.read_text(),
+            )
 
             capture.unlink()
             proxy.unlink()
@@ -3153,6 +3310,62 @@ finally:
             self.assertIn("proxy: reusing healthy configured endpoint", proc.stdout)
             self.assertTrue(server.authorization_ok)
             self.assertEqual(self.events(case), [])
+
+    def test_plain_launch_migrates_previous_retry_policy_before_proxy_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            case = self.setup_case(tmp)
+            config = case["home"] / ".config" / "parable" / "cliproxy.yaml"
+            config.write_text(config.read_text().replace(
+                "transient-error-cooldown-seconds: -1\n",
+                "",
+            ))
+            config.chmod(0o600)
+
+            proc = self.run_claude(case)
+
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("proxy: updated generated retry policy", proc.stdout)
+            self.assertIn(
+                "transient-error-cooldown-seconds: -1\n",
+                config.read_text(),
+            )
+
+    def test_teammate_interruption_resumes_exact_session_and_replies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            case = self.setup_case(tmp)
+            calls = Path(tmp) / "claude-calls.jsonl"
+            state = Path(tmp) / "teammate-interrupted"
+            session_id = "12345678-1234-4234-9234-123456789abc"
+            env = case["env"] | {
+                "FAKE_CLAUDE_CALLS": str(calls),
+                "FAKE_CLAUDE_TEAMMATE_INTERRUPT_ONCE": "1",
+                "FAKE_CLAUDE_TEAMMATE_INTERRUPT_STATE": str(state),
+            }
+
+            proc = subprocess.run(
+                [NODE, str(REPO / "bin" / "parable.js")],
+                cwd=case["repo"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn(
+                f"session: teammate update interrupted the active turn; resuming {session_id}",
+                proc.stdout,
+            )
+            captured_calls = [
+                json.loads(line) for line in calls.read_text().splitlines()
+            ]
+            self.assertEqual(len(captured_calls), 3)
+            self.assertNotIn("--resume", captured_calls[0]["argv"])
+            self.assertEqual(captured_calls[1]["argv"][-1], "/context")
+            final = captured_calls[-1]["argv"]
+            resume_at = final.index("--resume")
+            self.assertEqual(final[resume_at + 1], session_id)
+            self.assertIn("--reply-on-resume", final)
 
     def test_context_failure_compacts_with_sonnet_and_resumes_exact_session(self):
         with tempfile.TemporaryDirectory() as tmp:
