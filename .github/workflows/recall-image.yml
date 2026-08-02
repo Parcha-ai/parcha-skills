@@ -35,18 +35,6 @@ jobs:
       - name: Compute lowercase image name
         id: image
         run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/recall-core" >> "$GITHUB_OUTPUT"
-      - name: Fetch proprietary ATI brain-turn bundle
-        env:
-          ATI_BUNDLE_REPO: ${{ secrets.ATI_BUNDLE_REPO }}
-          ATI_BUNDLE_REF: ${{ secrets.ATI_BUNDLE_REF }}
-          ATI_BUNDLE_SHA256: ${{ secrets.ATI_BUNDLE_SHA256 }}
-          ATI_BUNDLE_TOKEN: ${{ secrets.ATI_BUNDLE_TOKEN }}
-        run: |
-          if [ -z "$ATI_BUNDLE_TOKEN" ]; then
-            echo "::warning::ATI_BUNDLE_* secrets are not configured; publishing image without the ATI brain-turn bundle."
-          else
-            bash recall/scripts/fetch_ati_bundle.sh recall/server/vendor/ati/grep_ati_brain_turn.mjs
-          fi
       - uses: docker/build-push-action@v6
         with:
           context: recall
