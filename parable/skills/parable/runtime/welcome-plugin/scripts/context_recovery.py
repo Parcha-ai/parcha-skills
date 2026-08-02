@@ -52,9 +52,12 @@ def _timestamp(record: object) -> datetime | None:
     if not isinstance(value, str):
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(
+            value[:-1] + "+00:00" if value.endswith("Z") else value
+        )
     except ValueError:
         return None
+    return parsed if parsed.tzinfo is not None else None
 
 
 def _read_transcript_tail(target: Path) -> list[dict[str, object]]:
@@ -71,11 +74,13 @@ def _read_transcript_tail(target: Path) -> list[dict[str, object]]:
     with target.open("rb") as handle:
         start = max(0, metadata.st_size - TRANSCRIPT_TAIL_BYTES)
         handle.seek(start)
-        if start:
-            handle.readline()
-        lines = handle.readlines()
+        transcript = handle.read(TRANSCRIPT_TAIL_BYTES)
+    if start:
+        _partial, separator, transcript = transcript.partition(b"\n")
+        if not separator:
+            return []
     records = []
-    for line in lines:
+    for line in transcript.splitlines():
         try:
             record = json.loads(line)
         except (json.JSONDecodeError, UnicodeDecodeError):

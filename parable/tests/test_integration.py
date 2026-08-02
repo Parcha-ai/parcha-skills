@@ -762,7 +762,7 @@ exit 0
             self.assertEqual(first.stdout.count(handoff), 1)
             self.assertIn(launch, first.stdout)
 
-            installed = home / ".local" / "share" / "parable" / "0.1.27"
+            installed = home / ".local" / "share" / "parable" / "0.1.28"
             durable = home / ".local" / "bin" / "parable"
             self.assertTrue((installed / "bin" / "parable.js").is_file())
             self.assertTrue((installed / "lib" / "onboarding.js").is_file())
@@ -1263,6 +1263,33 @@ class TestClaudeContextRecoveryHook(unittest.TestCase):
                     "content": [{"type": "text", "text": "[Request interrupted by user]"}],
                 },
             }])
+            result = self.run_hook(self.notification_event(transcript), target)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(target.exists())
+
+    def test_mixed_timezone_timestamps_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "session.jsonl"
+            target = root / "request.json"
+            self.write_transcript(transcript, [
+                {
+                    "type": "user",
+                    "timestamp": "2026-08-02T21:50:37.659",
+                    "message": {
+                        "role": "user",
+                        "content": "[Request interrupted by user]",
+                    },
+                },
+                {
+                    "type": "user",
+                    "timestamp": "2026-08-02T21:50:37.696Z",
+                    "message": {
+                        "role": "user",
+                        "content": "Another Claude session sent a message:\n<teammate-message />",
+                    },
+                },
+            ])
             result = self.run_hook(self.notification_event(transcript), target)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse(target.exists())
