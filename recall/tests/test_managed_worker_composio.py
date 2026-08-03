@@ -9,10 +9,69 @@ from unittest.mock import patch
 
 from connectors.composio_workspace_rail import ComposioWorkspaceRail
 from server.recall_server.control import ControlError
-from server.recall_server.managed_worker import ManagedConnectorWorker, _private_root
+from server.recall_server.managed_worker import (
+    ManagedConnectorWorker,
+    _private_root,
+    _run_projection_cycle,
+)
+
+
+class FakeLogicalProjector:
+    def __init__(self):
+        self.calls = []
+
+    def project_pending(self, **kwargs):
+        self.calls.append(kwargs)
+        return {"documents": 2, "records": 8}
+
+
+class FakePassageProjector:
+    def __init__(self):
+        self.project_calls = []
+        self.embed_calls = []
+
+    def project_pending(self, **kwargs):
+        self.project_calls.append(kwargs)
+        return {"documents": 2, "passages": 5}
+
+    def embed_pending(self, **kwargs):
+        self.embed_calls.append(kwargs)
+        return {"processed": 5}
 
 
 class ManagedWorkerComposioTests(unittest.TestCase):
+    def test_managed_projection_cycle_drains_logical_passages_and_embeddings(self):
+        logical = FakeLogicalProjector()
+        passages = FakePassageProjector()
+        result = _run_projection_cycle(
+            logical,
+            passages,
+        )
+        self.assertEqual(
+            result,
+            {
+                "status": "complete",
+                "logical_documents": 2,
+                "logical_records": 8,
+                "passage_documents": 2,
+                "passages": 5,
+                "passage_embeddings": 5,
+            },
+        )
+        self.assertEqual(
+            logical.calls,
+            [
+                {
+                    "tenant_id": None,
+                    "batch_size": 2,
+                    "max_batches": 1,
+                    "upload_concurrency": 2,
+                }
+            ],
+        )
+        self.assertEqual(passages.project_calls[0]["tenant_id"], None)
+        self.assertEqual(passages.embed_calls[0]["batch_size"], 100)
+
     def test_private_root_normalizes_provider_mount_mode_without_following_links(
         self,
     ):
