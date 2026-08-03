@@ -522,6 +522,13 @@ one installation disables only that routed source, while disconnecting Google
 revokes provider authority for every dependent route. Uninstall removes the
 route from the active map.
 
+If the provider reports an expired or forbidden connected account, the managed
+worker marks the provider `degraded`, returns each enabled dependent route to
+`configured`, and stops retrying. `/admin` then reports that Google must be
+authorized again. A successful authorization binds the replacement connection,
+re-enables the selected route, and resumes its retained ACK checkpoint. Generic
+transport failures remain bounded retries and never masquerade as a reconnect.
+
 Native clients use the same versioned `/admin/api/v1` session, state, OAuth, and
 lifecycle contract. They must store the bootstrap or browser-session authority
 in the operating-system credential store and must not copy provider tokens out

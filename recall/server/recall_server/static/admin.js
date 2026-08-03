@@ -146,19 +146,25 @@ function renderGoogle() {
   const connected = state.data.connections.filter((item) =>
     item.provider === "google" || item.provider === "composio"
   );
+  const active = connected.filter((item) => item.status === "connected");
+  const degraded = connected.filter((item) => item.status === "degraded");
   const connection = $("#google-connection");
   connection.replaceChildren();
-  connection.append(connected.length
-    ? `${connected.length} connection${connected.length === 1 ? "" : "s"} · authority bound server-side`
+  connection.append(active.length
+    ? `${active.length} connection${active.length === 1 ? "" : "s"} · authority bound server-side`
+    : degraded.length
+      ? "Connection expired · authorize the source again"
     : available ? "Not connected" : "No connection provider configured");
   connected.forEach((item) => {
     const disconnect = document.createElement("button");
     disconnect.type = "button";
     disconnect.dataset.connectionId = item.id;
-    disconnect.textContent = `Disconnect ${item.provider}`;
+    disconnect.textContent = item.status === "degraded"
+      ? `Remove expired ${item.provider}`
+      : `Disconnect ${item.provider}`;
     connection.append(disconnect);
   });
-  connection.classList.toggle("connected", connected.length > 0);
+  connection.classList.toggle("connected", active.length > 0);
   $("#google-form button[type=submit]").disabled = !available;
 }
 
