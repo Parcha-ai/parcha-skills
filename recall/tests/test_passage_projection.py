@@ -124,6 +124,16 @@ class PassageProjectionTests(unittest.TestCase):
             "check (dimensions in (512, 1536, 3072))",
             native_sql,
         )
+        self.assertIn(
+            "drop constraint if exists "
+            "canonical_passage_repr_dimensions_check",
+            native_sql,
+        )
+        self.assertIn(
+            "drop constraint if exists "
+            "canonical_passage_repr_vector_dimensions_check",
+            native_sql,
+        )
 
     def test_builds_lossless_overlapping_passages_without_crossing_documents(
         self,

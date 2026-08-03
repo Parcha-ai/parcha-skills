@@ -9,7 +9,11 @@ ALTER TABLE canonical_passage_embedding_representations
 
 ALTER TABLE canonical_passage_embedding_representations
     DROP CONSTRAINT IF EXISTS
-        canonical_passage_embedding_representations_dimensions_check;
+        canonical_passage_embedding_representations_dimensions_check,
+    DROP CONSTRAINT IF EXISTS
+        canonical_passage_repr_dimensions_check,
+    DROP CONSTRAINT IF EXISTS
+        canonical_passage_repr_vector_dimensions_check;
 
 ALTER TABLE canonical_passage_embedding_representations
     ADD CONSTRAINT canonical_passage_repr_dimensions_check
