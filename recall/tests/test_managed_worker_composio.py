@@ -63,13 +63,15 @@ class ManagedWorkerComposioTests(unittest.TestCase):
             [
                 {
                     "tenant_id": None,
-                    "batch_size": 2,
+                    "batch_size": 20,
                     "max_batches": 1,
-                    "upload_concurrency": 2,
+                    "upload_concurrency": 4,
                 }
             ],
         )
         self.assertEqual(passages.project_calls[0]["tenant_id"], None)
+        self.assertEqual(passages.project_calls[0]["batch_size"], 20)
+        self.assertEqual(passages.project_calls[0]["concurrency"], 4)
         self.assertEqual(passages.embed_calls[0]["batch_size"], 100)
 
     def test_private_root_normalizes_provider_mount_mode_without_following_links(

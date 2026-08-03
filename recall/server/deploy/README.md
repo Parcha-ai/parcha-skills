@@ -557,10 +557,11 @@ does not listen on a network port.
 The same process can own the existing full-document and lossless-passage queues
 without adding another service. Set `RECALL_MANAGED_PROJECTIONS_ENABLED=1` and
 give the worker the evidence-archive settings already used by deep inspection.
-Each cycle drains a bounded logical-document batch, then its passage batch and
-passage embeddings with fixed conservative bounds. Leave the flag unset when an
-operator runs dedicated logical-evidence and passage workers instead; never run
-both owners for steady-state scheduling.
+Each cycle drains at most 20 logical documents and 20 passage documents across
+four streams, then embeds at most 100 passages. Keep the worker database pool at
+eight or higher so those fixed bounds retain headroom. Leave the flag unset when
+an operator runs dedicated logical-evidence and passage workers instead; never
+run both owners for steady-state scheduling.
 
 Run canonical embeddings as a separate worker from that same immutable image:
 
