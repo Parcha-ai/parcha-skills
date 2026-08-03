@@ -643,6 +643,55 @@ def main():
         if emitted == 0:
             print('{"matches":0}')
         return
+    # The managed execution image is intentionally minimal and does not
+    # guarantee ripgrep. Pi's public `find` tool is literal and record-local,
+    # so execute that contract in this dependency-free helper itself.
+    if args.fixed and args.context == 0:
+        needles = tuple(value.casefold() for value in patterns)
+        emitted = 0
+        emitted_bytes = 0
+        emitted_records = set()
+        for document_id, path in selected_files:
+            try:
+                stream = open(path, encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            with stream:
+                for line in stream:
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    content = json.dumps(
+                        record.get("content"),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).casefold()
+                    if not any(needle in content for needle in needles):
+                        continue
+                    projection = render_record(
+                        record,
+                        document_id,
+                        patterns=patterns,
+                        excerpt_chars=args.excerpt_chars,
+                    )
+                    if projection is None:
+                        continue
+                    record_identity, rendered = projection
+                    if record_identity in emitted_records:
+                        continue
+                    rendered_bytes = len(rendered.encode())
+                    if emitted_bytes + rendered_bytes > OUTPUT_BYTES:
+                        break
+                    emitted_records.add(record_identity)
+                    sys.stdout.write(rendered)
+                    emitted_bytes += rendered_bytes
+                    emitted += 1
+                    if emitted >= args.limit:
+                        return
+        if emitted == 0:
+            print('{"matches":0}')
+        return
     command = [
         "rg",
         "--json",

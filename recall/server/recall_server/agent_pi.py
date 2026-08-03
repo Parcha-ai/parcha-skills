@@ -113,7 +113,13 @@ AGENT_INVESTIGATOR_GUIDANCE = (
     "covers each material evidence need. Before exec, issue only the missing "
     "connector-specific or atomic queries; do not repeat the same search. Then "
     "transition to find, open, or exec over admitted full documents for "
-    "precise evidence. Continue until evidence is sufficient or a precise gap "
+    "precise evidence. Treat each matching range as an exact record pointer: "
+    "open the strongest suggested record from each plausible candidate before "
+    "searching whole documents, and do not substitute a nearby record merely "
+    "because it is topically related. If two distinct searches plus three "
+    "opened records still provide no direct support, stop and report the "
+    "precise evidence gap instead of wandering. Continue until evidence is "
+    "sufficient or a precise gap "
     "is identified. If two search formulations yield no matching ranges, stop "
     "reformulating and inspect the already admitted full documents with "
     "distinctive literal terms or a bounded shell program. Stay within the "
@@ -133,18 +139,18 @@ def _model_tool_error_message(error: AgentExecutionError) -> str:
             "Use evidence already returned and finish."
         ),
         "agent_finish_invalid": (
-            "Submit finish with exactly status, answer, claims, "
-            "citations, and gaps. The gaps field means missing evidence only, "
+            "Submit finish with exactly status, answer, claims, and gaps. "
+            "The host derives citations from claim receipts. The gaps field "
+            "means missing evidence only, "
             "not project blockers: complete requires gaps=[], partial requires "
             "at least one evidence gap, and no_answer requires empty answer, "
-            "claims, and citations plus at least one evidence gap."
+            "claims, plus at least one evidence gap."
         ),
         "agent_citation_not_opened": (
-            "Cite only receipts opened by find, open, or exec output."
+            "Use only receipts opened by find, open, or exec in claims."
         ),
         "agent_claim_not_grounded": (
-            "Every citation must support at least one claim, and every claim "
-            "receipt must be included in citations."
+            "Every claim must carry at least one opened receipt."
         ),
         "agent_query_scope_violation": (
             "Copy the request's exact filters and depth; do not widen or "
@@ -1036,8 +1042,11 @@ def _tool_definitions(
                 "at the document start. To open any other exact record exposed "
                 "in a search matching range, pass its record_ordinal with "
                 "cursor=null. Prefer page_bytes=32768 for an exact suggested "
-                "record so short and medium records arrive complete. Pass "
-                "next_cursor unchanged with record_ordinal=null until "
+                "record so short and medium records arrive complete. "
+                "A matching range's receipts describe its listed spans "
+                "collectively; when a plausible range lists multiple spans, "
+                "open each listed record before rejecting that range. "
+                "Pass next_cursor unchanged with record_ordinal=null until "
                 "complete=true. Pass 0:0:0 explicitly to restart from the "
                 "beginning. Pages preserve record ordinals, exact content "
                 "slices, timestamps, and verified receipts. Use this when the "
@@ -1114,11 +1123,12 @@ def _tool_definitions(
             "name": "finish",
             "description": (
                 "Stop investigating and submit the final answer once. "
-                f"{AGENT_FINISH_GUIDANCE} Every citation and every claim "
+                f"{AGENT_FINISH_GUIDANCE} Every claim "
                 "receipt must have appeared in prior find, open, or exec output. "
+                "The host derives citations from those claim receipts. "
                 "gaps means missing evidence, not unresolved project blockers: "
                 "complete requires []; partial requires a nonempty list; no_answer "
-                "requires empty answer, claims, and citations plus a nonempty gap."
+                "requires empty answer and claims plus a nonempty gap."
             ),
             "input_schema": _object_schema(
                 {
@@ -1147,18 +1157,13 @@ def _tool_definitions(
                             ["statement", "receipts"],
                         ),
                     },
-                    "citations": {
-                        "type": "array",
-                        "maxItems": 256,
-                        "items": receipt,
-                    },
                     "gaps": {
                         "type": "array",
                         "maxItems": 64,
                         "items": {"type": "string", "maxLength": 1024},
                     },
                 },
-                ["status", "answer", "claims", "citations", "gaps"],
+                ["status", "answer", "claims", "gaps"],
             ),
             "terminate_turn": True,
             **common,
@@ -1240,12 +1245,12 @@ class PiRunner:
                 except AgentExecutionError as error:
                     if error.code == "agent_citation_not_opened":
                         error.model_guidance = (
-                            "Cite only this exact opened receipt allowlist: "
+                            "Use only this exact opened receipt allowlist in claims: "
                             + json.dumps(
                                 list(tools.citable_receipts)[:32],
                                 separators=(",", ":"),
                             )
-                                + ". Remove every other citation and claim receipt, "
+                                + ". Remove every other claim receipt, "
                                 "then submit finish once."
                         )
                     raise
@@ -1275,7 +1280,7 @@ class PiRunner:
                 {
                     "query": request["question"],
                     "filters": request_filters,
-                    "limit": 20,
+                    "limit": 8,
                 },
             ))
         except AgentExecutionError as error:
@@ -1525,7 +1530,7 @@ class PiRunner:
         tools: ConstrainedAgentTools,
         context: DelegationContext,
     ) -> dict[str, Any]:
-        required = {"status", "answer", "claims", "citations", "gaps"}
+        required = {"status", "answer", "claims", "gaps"}
         if not isinstance(value, dict) or set(value) != required:
             raise AgentExecutionError(
                 "agent finish payload is invalid",
@@ -1546,7 +1551,6 @@ class PiRunner:
         status = value["status"]
         answer = value["answer"]
         claims = value["claims"]
-        citations = value["citations"]
         gaps = value["gaps"]
         if (
             status not in {"complete", "partial", "no_answer"}
@@ -1554,34 +1558,22 @@ class PiRunner:
             or len(answer) > 64_000
             or not isinstance(claims, list)
             or len(claims) > 128
-            or not isinstance(citations, list)
-            or len(citations) > 256
             or not isinstance(gaps, list)
             or len(gaps) > 64
             or any(
                 not isinstance(item, str)
                 or not item
                 or len(item) > limit
-                for values, limit in ((citations, 2048), (gaps, 1024))
+                for values, limit in ((gaps, 1024),)
                 for item in values
             )
-            or len(citations) != len(set(citations))
             or len(gaps) != len(set(gaps))
         ):
             raise AgentExecutionError(
                 "agent finish payload is invalid",
                 code="agent_finish_invalid",
             )
-        opened = set(tools.citable_receipts)
-        granted = set(context.authorized_sources)
-        if (
-            not set(citations) <= opened
-            or any(urlsplit(item).netloc not in granted for item in citations)
-        ):
-            raise AgentExecutionError(
-                "agent cited evidence it did not open",
-                code="agent_citation_not_opened",
-            )
+        citations: list[str] = []
         for claim in claims:
             if (
                 not isinstance(claim, dict)
@@ -1599,21 +1591,30 @@ class PiRunner:
                     for receipt in claim["receipts"]
                 )
                 or len(claim["receipts"]) != len(set(claim["receipts"]))
-                or not set(claim["receipts"]) <= set(citations)
             ):
                 raise AgentExecutionError(
                     "agent claim is not grounded",
                     code="agent_claim_not_grounded",
                 )
-        claimed_receipts = {
+        citations = list(dict.fromkeys(
             receipt
             for claim in claims
             for receipt in claim["receipts"]
-        }
-        if claimed_receipts != set(citations):
+        ))
+        if len(citations) > 256:
             raise AgentExecutionError(
-                "agent citations are disconnected from its claims",
+                "agent claim is not grounded",
                 code="agent_claim_not_grounded",
+            )
+        opened = set(tools.citable_receipts)
+        granted = set(context.authorized_sources)
+        if (
+            not set(citations) <= opened
+            or any(urlsplit(item).netloc not in granted for item in citations)
+        ):
+            raise AgentExecutionError(
+                "agent cited evidence it did not open",
+                code="agent_citation_not_opened",
             )
         if status in {"complete", "partial"} and (
             not answer or not claims or not citations
@@ -1631,7 +1632,7 @@ class PiRunner:
                 code="agent_finish_invalid",
             )
         if status == "no_answer" and (
-            answer or claims or citations or not gaps
+            answer or claims or not gaps
         ):
             raise AgentExecutionError(
                 "agent no-answer payload is invalid",

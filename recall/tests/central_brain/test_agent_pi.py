@@ -69,11 +69,13 @@ class SyntheticRetrieval:
     def __init__(self, *, fail_deep: bool = False):
         self.calls: list[str] = []
         self.filters: list[dict] = []
+        self.limits: list[int] = []
         self.fail_deep = fail_deep
 
     def passage_hints(self, query, *, filters, limit):
         self.calls.append("recall_hints")
         self.filters.append(dict(filters))
+        self.limits.append(limit)
         return {
             "results": [
                 {
@@ -257,7 +259,6 @@ def success_script():
                         "receipts": [IMPLEMENTATION],
                     },
                 ],
-                "citations": [DECISION, IMPLEMENTATION],
                 "gaps": [],
             },
         ),
@@ -319,6 +320,7 @@ class SimpleAgentKernelTest(unittest.TestCase):
             ],
         )
         self.assertEqual(bundle["result"]["status"], "complete")
+        self.assertEqual(retrieval.limits[0], 8)
         self.assertEqual(
             bundle["result"]["citations"],
             [DECISION, IMPLEMENTATION],
@@ -467,7 +469,6 @@ class SimpleAgentKernelTest(unittest.TestCase):
                         "statement": "Aurora selected the bounded bridge.",
                         "receipts": [DECISION],
                     }],
-                    "citations": [DECISION],
                     "gaps": [],
                 },
             ),
@@ -493,7 +494,6 @@ class SimpleAgentKernelTest(unittest.TestCase):
                 "status": "complete",
                 "answer": "A hint is not proof.",
                 "claims": [{"statement": "Hint claim", "receipts": [HINT]}],
-                "citations": [HINT],
                 "gaps": [],
             },
         )
@@ -634,7 +634,6 @@ class PiSubprocessBoundaryTest(unittest.TestCase):
                             "statement": "Aurora selected the bounded bridge.",
                             "receipts": [DECISION],
                         }],
-                        "citations": [DECISION],
                         "gaps": [],
                     }
                 if index != 1:

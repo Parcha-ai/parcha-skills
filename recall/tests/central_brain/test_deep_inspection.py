@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -132,6 +133,7 @@ class DeepInspectionContractTests(unittest.TestCase):
             helper.chmod(0o500)
             result = subprocess.run(
                 [
+                    sys.executable,
                     str(helper),
                     "--document",
                     document_id,
@@ -221,6 +223,7 @@ class DeepInspectionContractTests(unittest.TestCase):
             }
             scoped = subprocess.run(
                 [
+                    sys.executable,
                     str(helper),
                     "--document",
                     document_id,
@@ -293,6 +296,7 @@ class DeepInspectionContractTests(unittest.TestCase):
             )
             result = subprocess.run(
                 [
+                    sys.executable,
                     str(helper),
                     "--document",
                     document_id,
@@ -308,7 +312,11 @@ class DeepInspectionContractTests(unittest.TestCase):
                 check=False,
                 capture_output=True,
                 text=True,
-                env={**os.environ, "RECALL_EVIDENCE_ROOT": str(root)},
+                env={
+                    **os.environ,
+                    "PATH": "/no-external-tools",
+                    "RECALL_EVIDENCE_ROOT": str(root),
+                },
                 timeout=5,
             )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -816,6 +824,10 @@ class DeepInspectionContractTests(unittest.TestCase):
             command,
         )
         self.assertIn("mount --bind /tmp/recall-docs /docs", command)
+        self.assertIn(
+            "rm -rf /tmp/recall-authorized /tmp/recall-agent /tmp/recall-docs",
+            command,
+        )
         self.assertIn("mount -o remount,bind,ro /docs", command)
         self.assertNotIn("synthetic-key", json.dumps(call["body"]))
 

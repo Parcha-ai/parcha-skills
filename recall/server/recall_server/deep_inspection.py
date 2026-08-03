@@ -387,7 +387,9 @@ for document_id,alias in aliases.items():
     return "\n".join([
         "set -eu",
         "umask 077",
-        "rm -rf /tmp/recall-authorized /tmp/recall-agent",
+        # Archil may reuse an execution host. Remove every per-run staging
+        # directory so a prior alias cannot make the next mkdir fail.
+        "rm -rf /tmp/recall-authorized /tmp/recall-agent /tmp/recall-docs",
         "mkdir -p /tmp/recall-agent",
         (
             "printf '%s' "
