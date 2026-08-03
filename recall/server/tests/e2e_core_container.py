@@ -186,9 +186,15 @@ def main() -> None:
         else:
             raise RuntimeError("unauthenticated container request was accepted")
         source_id = f"synthetic:core-e2e:{os.getpid()}"
-        credential = BrainStore(dsn).create_collector_token(
-            f"core-e2e-{os.getpid()}", source_id, ["read", "write", "metrics"],
-        )
+        client_store = BrainStore(dsn)
+        try:
+            credential = client_store.create_collector_token(
+                f"core-e2e-{os.getpid()}",
+                source_id,
+                ["read", "write", "metrics"],
+            )
+        finally:
+            client_store.close()
         marker = f"synthetic-container-marker-{os.getpid()}"
         content = {"role": "user", "text": marker}
         event = {
