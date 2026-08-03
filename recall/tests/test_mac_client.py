@@ -234,6 +234,30 @@ class BrainEndpointValidationTest(unittest.TestCase):
 
 
 class CanonicalV2ClientTest(unittest.TestCase):
+    def test_source_status_uses_audit_timeout_and_closed_scope(self) -> None:
+        writer = CanonicalBrainWriter(
+            endpoint="https://brain.example.invalid",
+            token="synthetic",
+            source_id="source:company",
+            tenant_id="tenant:company",
+            principal_id="principal:owner",
+        )
+        with mock.patch.object(
+            writer,
+            "_request",
+            return_value={"status": "ok"},
+        ) as request:
+            self.assertEqual(writer.status(), {"status": "ok"})
+        request.assert_called_once_with(
+            "/v2/ingest/status",
+            body={
+                "tenant_id": "tenant:company",
+                "principal_id": "principal:owner",
+                "source_id": "source:company",
+            },
+            timeout=300,
+        )
+
     def test_writer_sends_exactly_one_thousand_events(self) -> None:
         writer = CanonicalBrainWriter(
             endpoint="https://brain.example.invalid",
