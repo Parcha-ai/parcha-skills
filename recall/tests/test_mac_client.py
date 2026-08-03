@@ -234,6 +234,29 @@ class BrainEndpointValidationTest(unittest.TestCase):
 
 
 class CanonicalV2ClientTest(unittest.TestCase):
+    def test_writer_allows_bounded_remote_commit_time(self) -> None:
+        writer = CanonicalBrainWriter(
+            endpoint="https://brain.example.invalid",
+            token="synthetic",
+            source_id="source:company",
+            tenant_id="tenant:company",
+            principal_id="principal:owner",
+        )
+        event = {
+            "source_id": "source:company",
+            "native_id": "native:one",
+            "principal_id": "principal:owner",
+            "provenance": {"artifact_ref": {"artifact_id": "synthetic"}},
+        }
+        with mock.patch.object(
+            writer,
+            "_request",
+            return_value={"status": "committed"},
+        ) as request:
+            self.assertEqual(writer.ingest([event]), {"status": "committed"})
+        request.assert_called_once()
+        self.assertEqual(request.call_args.kwargs["timeout"], 300)
+
     def test_source_status_uses_audit_timeout_and_closed_scope(self) -> None:
         writer = CanonicalBrainWriter(
             endpoint="https://brain.example.invalid",

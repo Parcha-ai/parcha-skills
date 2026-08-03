@@ -579,6 +579,7 @@ class CanonicalBrainWriter(_CanonicalClient):
             "/v2/ingest/canonical",
             body=body,
             idempotency_key=key,
+            timeout=300,
         )
 
 
