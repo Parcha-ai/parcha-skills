@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 import socket
@@ -399,11 +398,11 @@ class ContainerContractTest(unittest.TestCase):
             r"FROM node:22\.23\.1-bookworm-slim@sha256:[0-9a-f]{64} "
             r"AS node-runtime",
         )
-        self.assertIn(
-            "server/vendor/ati/grep_ati_brain_turn.mjs "
-            "/opt/ati/grep_ati_brain_turn.mjs",
-            dockerfile,
-        )
+        self.assertIn("FROM node-runtime AS pi-agent-build", dockerfile)
+        self.assertIn("server/pi-agent/package-lock.json", dockerfile)
+        self.assertIn("npm ci --ignore-scripts", dockerfile)
+        self.assertIn("/opt/recall-pi", dockerfile)
+        self.assertNotIn("vendor/ati", dockerfile)
         self.assertIn("USER 10001", dockerfile)
         self.assertIn("usermod -a -G 1000 recall", dockerfile)
         self.assertIn(
@@ -423,19 +422,16 @@ class ContainerContractTest(unittest.TestCase):
         self.assertNotIn("ENV RECALL_AUTH_REQUIRED", dockerfile)
         self.assertNotRegex(dockerfile, re.compile(r"COPY\s+\.\s+\.", re.IGNORECASE))
 
-    def test_vendored_ati_artifact_has_exact_public_provenance(self) -> None:
-        artifact = SERVER / "vendor" / "ati" / "grep_ati_brain_turn.mjs"
-        provenance = (SERVER / "vendor" / "ati" / "README.md").read_text()
-        digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
-        self.assertEqual(
-            digest,
-            "ad0edf7a920915c156f159ee7f1d91142ed89aa50e67c71e87df51670aec4be7",
-        )
-        self.assertIn(digest, provenance)
-        self.assertIn(
-            "1ae4f224144676dfb2ef0791bb7be85a1fcc7352",
-            provenance,
-        )
+    def test_direct_pi_dependencies_are_lockfile_pinned(self) -> None:
+        package = json.loads((SERVER / "pi-agent" / "package.json").read_text())
+        lock = json.loads((SERVER / "pi-agent" / "package-lock.json").read_text())
+        self.assertEqual(package["dependencies"], {
+            "@earendil-works/pi-agent-core": "0.83.0",
+            "@earendil-works/pi-ai": "0.83.0",
+        })
+        self.assertEqual(lock["lockfileVersion"], 3)
+        self.assertFalse((SERVER / "vendor" / "ati" / "README.md").exists())
+        self.assertFalse((SERVER / "vendor" / "ati" / "grep_ati_brain_turn.mjs").exists())
 
     def test_build_context_excludes_private_and_development_surfaces(self) -> None:
         ignored = (RECALL / ".dockerignore").read_text()

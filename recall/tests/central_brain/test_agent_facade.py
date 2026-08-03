@@ -14,6 +14,7 @@ from unittest import mock
 
 SERVER = Path(__file__).resolve().parents[2] / "server"
 sys.path.insert(0, str(SERVER))
+sys.path.insert(0, str(SERVER / "tests"))
 
 from recall_server.agent import (  # noqa: E402
     AgentBudget,
@@ -21,10 +22,10 @@ from recall_server.agent import (  # noqa: E402
     ConstrainedAgentTools,
     DelegationContext,
     RecallAgentService,
-    ScriptedAgentRunner,
     service_from_env,
 )
 from recall_server.app import Handler  # noqa: E402
+from agent_fakes import ScriptedAgentRunner  # noqa: E402
 
 
 TENANT = "tenant:synthetic:company"
@@ -272,10 +273,8 @@ class AgentFacadeUnitTest(unittest.TestCase):
 
     def test_runner_configuration_is_explicit_and_fail_closed(self) -> None:
         self.assertIsNone(service_from_env({}))
-        self.assertIsInstance(
-            service_from_env({"RECALL_AGENT_RUNNER": "scripted"}),
-            RecallAgentService,
-        )
+        with self.assertRaisesRegex(RuntimeError, "unsupported"):
+            service_from_env({"RECALL_AGENT_RUNNER": "scripted"})
         with self.assertRaisesRegex(RuntimeError, "unsupported"):
             service_from_env({"RECALL_AGENT_RUNNER": "unknown"})
 

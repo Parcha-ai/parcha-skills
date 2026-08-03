@@ -62,7 +62,7 @@ The host:
   semantic judgment that the evidence is sufficient for the map objective;
 - never puts questions, answers, source bodies, or credentials in the trace.
 
-The outer π/ATI agent is both planner and reducer. Its closed tool catalog keeps
+The outer Pi agent is both planner and reducer. Its closed tool catalog keeps
 all storage credentials and authorization in Recall.
 
 ## Why this shape

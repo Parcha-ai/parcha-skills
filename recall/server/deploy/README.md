@@ -342,12 +342,9 @@ credentials without gaining an implicit cross-brain view. Omit the optional
 `forget` scope for read-only agents; canonical forget also requires an owner
 grant on the exact source.
 
-The outcome-oriented answer façade is disabled by default. For a deterministic
-transport and grounding smoke test, set `RECALL_AGENT_RUNNER=scripted`. This
-exposes `use_recall` through MCP and
-`POST /v1/agent/brains/{tenant_id}/use-recall`. The scripted runner returns a
-deliberately partial receipt-backed summary; it does not call a model. Both
-transports share one domain operation, and the request cannot carry tenant,
+The outcome-oriented answer façade is disabled by default. Enabling the direct
+Pi runner exposes `use_recall` through MCP and
+`POST /v1/agent/brains/{tenant_id}/use-recall`. The request cannot carry tenant,
 principal, role, source grants, credentials, budgets, or trace policy.
 
 Schema 38 adds durable agent runs. `POST /v1/agent/brains/{tenant}/runs` starts
@@ -359,15 +356,13 @@ also advertises `io.modelcontextprotocol/tasks` and returns a native task only
 when the individual `tools/call` opts into that extension. Older or
 non-negotiating clients keep the synchronous `use_recall` result.
 
-For semantic synthesis, set `RECALL_AGENT_RUNNER=pi-ati` and run a pinned ATI
-Harness `brain-turn` artifact:
+For semantic synthesis, enable the direct open-source Pi worker included in the
+image and configure one explicit OpenAI-compatible endpoint:
 
 ```text
-RECALL_ATI_COMMAND_JSON=["node","/opt/ati/grep_ati_brain_turn.mjs"]
-RECALL_ATI_ARTIFACT_PATH=/opt/ati/grep_ati_brain_turn.mjs
-RECALL_ATI_ARTIFACT_SHA256=<lowercase-sha256>
+RECALL_AGENT_RUNNER=pi
+RECALL_AGENT_MODEL_BASE_URL=https://api.cerebras.ai/v1
 RECALL_AGENT_MODEL_ALIAS=gpt-oss-120b
-RECALL_AGENT_MODEL_ROUTE=direct-provider:cerebras
 RECALL_AGENT_MODEL_KEY_FILE=/etc/secrets/cerebras-api-key
 ```
 
@@ -376,30 +371,29 @@ Render secret file contains only the Cerebras API key. It must be a
 nonsymlinked regular file owned by the service user or root, with no write or
 execute permission for its group and no permissions for other users. Recall
 reloads it immediately before each child process. The child receives only that
-key, the fixed `https://api.cerebras.ai/v1` endpoint, explicit Cerebras route
-metadata, and a minimal process environment. The image includes the reviewed
-ATI artifact and Node runtime; the configured digest pins the artifact bytes.
+key, the explicit endpoint, and a minimal process environment. Pi source and
+dependencies are built from the checked-in lockfile; no opaque runtime artifact
+is vendored.
 
 On a Greppy host, use the dedicated credential-owning local broker instead.
-Recall passes the literal `not-a-secret` placeholder to ATI; no model bearer
+Recall passes the literal `not-a-secret` placeholder to Pi; no model bearer
 credential enters Recall or the child:
 
 ```text
-RECALL_AGENT_MODEL_ROUTE=private-broker
 RECALL_AGENT_MODEL_BASE_URL=http://<private-greppy-llm-proxy-host>:<port>
 RECALL_AGENT_MODEL_ALIAS=gemma-4-31b
 ```
 
 This mode fails closed unless the exact approved URL is loopback, link-local,
 RFC1918, carrier-grade NAT, or the private Docker host gateway. Do not expose
-the broker publicly. A Render deployment outside that private network uses the
-explicit direct Cerebras route.
+the broker publicly. A deployment outside that private network supplies an
+HTTPS endpoint and a private model-key file.
 
 Recall and Archil credentials remain in the host.
 
 The child can call only authorized read-only evidence tools. Semantic search is
 a hint; only receipts returned by deep inspection, exact show, or session
-context are citable. The model must finish through `evidence_finish`, and Recall
+context are citable. The model must finish through `finish`, and Recall
 rejects citations that were not opened in the same turn. Raw reasoning,
 questions, answers, tool arguments, source bodies, and credentials are excluded
 from durable traces.

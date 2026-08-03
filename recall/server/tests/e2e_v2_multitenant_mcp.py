@@ -17,14 +17,18 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
-sys.path[:0] = [str(ROOT / "recall"), str(ROOT / "recall/server")]
+sys.path[:0] = [
+    str(ROOT / "recall"),
+    str(ROOT / "recall/server"),
+    str(ROOT / "recall/server/tests"),
+]
 
 from client.mac import canonical_envelope
 from recall_server.agent import (
     DelegationContext,
     RecallAgentService,
-    ScriptedAgentRunner,
 )
+from agent_fakes import ScriptedAgentRunner
 from recall_server.agent_runs import (
     AgentRunCoordinator,
     AgentRunNotFound,
