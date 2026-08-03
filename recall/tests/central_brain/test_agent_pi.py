@@ -597,6 +597,34 @@ class PiSubprocessBoundaryTest(unittest.TestCase):
                         "record_ordinal": 80,
                         "page_bytes": 32768,
                     }
+                elif index == 1:
+                    chunks = [
+                        {
+                            "id": f"chatcmpl-{index}",
+                            "object": "chat.completion.chunk",
+                            "created": 1,
+                            "model": "gemma-4-31b",
+                            "choices": [{
+                                "index": 0,
+                                "delta": {
+                                    "role": "assistant",
+                                    "content": "The evidence is sufficient.",
+                                },
+                                "finish_reason": None,
+                            }],
+                        },
+                        {
+                            "id": f"chatcmpl-{index}",
+                            "object": "chat.completion.chunk",
+                            "created": 1,
+                            "model": "gemma-4-31b",
+                            "choices": [{
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": "stop",
+                            }],
+                        },
+                    ]
                 else:
                     name = "finish"
                     arguments = {
@@ -609,41 +637,42 @@ class PiSubprocessBoundaryTest(unittest.TestCase):
                         "citations": [DECISION],
                         "gaps": [],
                     }
-                chunks = [
-                    {
-                        "id": f"chatcmpl-{index}",
-                        "object": "chat.completion.chunk",
-                        "created": 1,
-                        "model": "gemma-4-31b",
-                        "choices": [{
-                            "index": 0,
-                            "delta": {
-                                "role": "assistant",
-                                "tool_calls": [{
-                                    "index": 0,
-                                    "id": f"call-{index}",
-                                    "type": "function",
-                                    "function": {
-                                        "name": name,
-                                        "arguments": json.dumps(arguments),
-                                    },
-                                }],
-                            },
-                            "finish_reason": None,
-                        }],
-                    },
-                    {
-                        "id": f"chatcmpl-{index}",
-                        "object": "chat.completion.chunk",
-                        "created": 1,
-                        "model": "gemma-4-31b",
-                        "choices": [{
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": "tool_calls",
-                        }],
-                    },
-                ]
+                if index != 1:
+                    chunks = [
+                        {
+                            "id": f"chatcmpl-{index}",
+                            "object": "chat.completion.chunk",
+                            "created": 1,
+                            "model": "gemma-4-31b",
+                            "choices": [{
+                                "index": 0,
+                                "delta": {
+                                    "role": "assistant",
+                                    "tool_calls": [{
+                                        "index": 0,
+                                        "id": f"call-{index}",
+                                        "type": "function",
+                                        "function": {
+                                            "name": name,
+                                            "arguments": json.dumps(arguments),
+                                        },
+                                    }],
+                                },
+                                "finish_reason": None,
+                            }],
+                        },
+                        {
+                            "id": f"chatcmpl-{index}",
+                            "object": "chat.completion.chunk",
+                            "created": 1,
+                            "model": "gemma-4-31b",
+                            "choices": [{
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": "tool_calls",
+                            }],
+                        },
+                    ]
                 body = "".join(
                     f"data: {json.dumps(chunk)}\n\n" for chunk in chunks
                 ) + "data: [DONE]\n\n"
@@ -678,7 +707,11 @@ class PiSubprocessBoundaryTest(unittest.TestCase):
             server.server_close()
         self.assertEqual(result["result"]["status"], "complete")
         self.assertEqual(result["result"]["citations"], [DECISION])
-        self.assertEqual(calls, ["/v1/chat/completions", "/v1/chat/completions"])
+        self.assertEqual(calls, [
+            "/v1/chat/completions",
+            "/v1/chat/completions",
+            "/v1/chat/completions",
+        ])
 
     def test_render_managed_secret_symlink_is_narrowly_accepted(self):
         with tempfile.TemporaryDirectory() as directory:

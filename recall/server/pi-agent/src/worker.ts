@@ -1,5 +1,10 @@
 import { Agent, type AgentTool, type StreamFn } from "@earendil-works/pi-agent-core";
-import type { Model } from "@earendil-works/pi-ai";
+import {
+  createAssistantMessageEventStream,
+  type Api,
+  type AssistantMessage,
+  type Model,
+} from "@earendil-works/pi-ai";
 import { streamSimple } from "@earendil-works/pi-ai/api/openai-completions";
 import { createInterface } from "node:readline";
 import type { TSchema } from "typebox";
@@ -8,12 +13,40 @@ import { modelEnvironment, openAiCompatibleModel, PROTOCOL } from "./model.js";
 
 const MAX_FRAME_BYTES = 1_000_000;
 
-const streamOpenAiCompletions: StreamFn = (model, context, options) => {
+function failedModelStream(model: Model<Api>, message: string) {
+  const stream = createAssistantMessageEventStream();
+  const error: AssistantMessage = {
+    role: "assistant",
+    content: [],
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "error",
+    errorMessage: message,
+    timestamp: Date.now(),
+  };
+  stream.push({ type: "error", reason: "error", error });
+  return stream;
+}
+
+export const streamOpenAiCompletions: StreamFn = (model, context, options) => {
   if (model.api !== "openai-completions") {
-    throw new Error("Recall Pi received a non-OpenAI-compatible model");
+    return failedModelStream(model, "Recall Pi received an unsupported model API");
   }
   return streamSimple(model as Model<"openai-completions">, context, options);
 };
+
+export function executionModeForTool(name: string): "parallel" | "sequential" {
+  return name === "finish" ? "sequential" : "parallel";
+}
 
 type JsonObject = Record<string, unknown>;
 type InputFrame = {
@@ -151,6 +184,7 @@ class Worker {
   private turnId = "unknown";
   private pending = new Map<string, PendingTool>();
   private finished = false;
+  private terminal = false;
   private agent: Agent | undefined;
 
   send(type: string, data: JsonObject): void {
@@ -221,6 +255,7 @@ class Worker {
       label: definition.name,
       description: definition.description,
       parameters: definition.input_schema as TSchema,
+      executionMode: executionModeForTool(definition.name),
       execute: async (toolCallId: string, params: unknown) => {
         const result = await this.invoke(definition, toolCallId, params);
         if (result.status === "error") {
@@ -255,12 +290,21 @@ class Worker {
     );
     agent.state.thinkingLevel = level;
     agent.state.tools = this.tools(start.tools);
+    agent.followUp({
+      role: "user",
+      content: (
+        "Before ending, call finish with the grounded answer or precise evidence gap. "
+        + "Do not answer only in plain text."
+      ),
+      timestamp: Date.now(),
+    });
 
     try {
       await agent.prompt(promptText(start));
       await agent.waitForIdle();
       if (!this.finished) throw new Error("agent ended without a grounded finish");
       if (this.pending.size !== 0) throw new Error("agent ended with unresolved tool calls");
+      this.terminal = true;
       this.send("terminal.complete", {
         status: "complete",
         unresolved_call_ids: [],
@@ -274,6 +318,7 @@ class Worker {
     } catch (error) {
       for (const pending of this.pending.values()) pending.reject(new Error("turn terminated"));
       this.pending.clear();
+      this.terminal = true;
       this.send("terminal.failed", {
         status: "failed",
         unresolved_call_ids: [],
@@ -289,6 +334,10 @@ class Worker {
     this.agent?.abort();
     for (const pending of this.pending.values()) pending.reject(new Error("turn interrupted"));
     this.pending.clear();
+  }
+
+  isTerminal(): boolean {
+    return this.terminal;
   }
 }
 
@@ -316,6 +365,13 @@ export function main(): void {
       process.exitCode = 1;
       input.close();
     });
+  });
+  input.once("close", () => {
+    if (failed || worker.isTerminal()) return;
+    failed = true;
+    process.stderr.write("recall-pi protocol error: stdin closed before terminal\n");
+    worker.abort();
+    process.exitCode = 1;
   });
   process.once("SIGTERM", () => worker.abort());
   process.once("SIGINT", () => worker.abort());
