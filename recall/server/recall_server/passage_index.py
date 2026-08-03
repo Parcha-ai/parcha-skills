@@ -170,6 +170,9 @@ class CanonicalPassageProjector:
                             WHERE (%s::text IS NULL
                                    OR candidate_queue.tenant_id=%s)
                             ORDER BY (
+                                candidate_queue.changed_at <
+                                clock_timestamp()-interval '5 minutes'
+                            ) DESC,(
                                 SELECT coalesce(sum(size_part.size_bytes),0)
                                   FROM canonical_evidence_document_parts
                                        size_part

@@ -687,7 +687,7 @@ class PassageProjectionTests(unittest.TestCase):
         self.assertIn("SELECT DISTINCT ON (", source)
         self.assertIn("passage.logical_document_id", source)
 
-    def test_backfill_is_idempotent_and_avoids_large_head_of_line_blocking(
+    def test_backfill_is_idempotent_fast_first_and_starvation_bounded(
         self,
     ) -> None:
         seed = inspect.getsource(CanonicalPassageProjector.seed_backfill)
@@ -697,6 +697,7 @@ class PassageProjectionTests(unittest.TestCase):
         self.assertIn("DO NOTHING", seed)
         self.assertNotIn("generation+1", seed)
         self.assertIn("sum(size_part.size_bytes)", pending)
+        self.assertIn("interval '5 minutes'", pending)
 
     def test_worker_projects_then_embeds_in_one_bounded_cycle(self) -> None:
         class Projector:
