@@ -1,128 +1,250 @@
 # Tether
 
-> Slack threads that stay attached to your agents.
+Tether binds a Slack thread to the Codex, Claude Code, Zellij, Hermes, or
+headless run that created it. Hermes owns the Slack credential. Local clients
+use an owner-only Unix socket and do not receive that credential.
 
-Your coding agent says “done” in Slack. You reply “one more thing.” The same agent, in the same session, picks it back up.
+`0.2.0-beta.1` is a pre-release. It uses BindingV2 and database schema 15.
+Read [Compatibility](docs/COMPATIBILITY.md) before upgrading an existing host.
 
-That is Tether.
+## Supported boundary
 
-It connects a Slack thread to the exact Codex, Claude Code, Zellij, Hermes, or headless run that created it. No mystery relay agent. No pasted context. No Slack token in your coding session.
+| Component | Supported |
+| --- | --- |
+| Operating system | Linux on x86-64 or arm64 |
+| Python | 3.11 through 3.14 |
+| Node.js | Maintained LTS 22 or 24 |
+| Hermes Agent | Exactly 0.19.0; tested commit `b9ba7c78e41b5d187e2c8fb446655c4b71c42aa5` |
+| Native continuation | Codex and Claude Code |
+| Terminal continuation | Zellij on Linux with `/proc` process identity |
+| Slack ingress | Slack Events API through Hermes Socket Mode |
+| Headless publication | Explicit `--run-id`; no native-session resume |
 
-## Level 1: make it work
+macOS and Windows are unsupported.
 
-You need [Hermes Agent](https://github.com/NousResearch/hermes-agent) and Node 18+.
-
-```bash
-npx --yes --package=github:miguelrios/unc-skills#main tether setup --harness=both
-```
-
-Tether installs its Codex and Claude Code skill, adds an external Hermes plugin, opens Hermes's Slack setup, restarts the gateway, and checks the live connection.
-
-Slack's website is the one unavoidable pit stop: create or update the app from the generated manifest, install it to the workspace, and create the Socket Mode app token. Tether joins public destinations before posting so their replies remain readable; invite the bot to private channels explicitly.
-
-When setup finishes:
-
-```bash
-tether doctor
-```
-
-Every line should be `ok` (a missing default channel is only a warning).
-
-## Level 2: let the magic happen
-
-Inside Codex or Claude Code, say:
-
-> Let me know in Slack when this is done.
-
-The agent uses Tether to publish the result. The root message includes a compact origin such as:
+## How it works
 
 ```text
-Origin: Codex a1b2c3d4 in Zellij api-work / pane 7 · my-project
+Slack Events API / Socket Mode
+  -> identity, authorization, and one-writer routing
+  -> durable ingress record
+  -> Hermes or one exact native binding
+
+Local CLI
+  -> owner-only Unix socket
+  -> durable Slack outbox
+  -> Slack API
 ```
 
-Reply in that thread without mentioning the bot. Hermes verifies the workspace, channel, thread, and user allowlist, then continues the captured session. Shared channels accept every explicitly allowlisted operator by default; private workflows can set one owner. When the notification came from a live Zellij pane, Tether verifies and steers that pane instead of launching a competing background resume. The answer returns to the same thread.
+Each bridge stores one source, one continuation endpoint, one Slack thread, an
+operator policy, and a monotonic binding generation. Rebind and close increment
+the generation, which fences stale ingress and delivery attempts.
 
-Tether uses Socket Mode for immediate delivery and a bounded, persistent-dedupe poller for recent active threads. If Slack's websocket drops during a reply, the recovery path picks up the missed message and sends it through the same authorization and session routing exactly once.
+A Tether-created thread root is durable local proof that the bridge owns that
+thread for ambient replies. `tether attach` binds an existing thread but does
+not claim its root; unmentioned replies there fail closed unless ownership can
+be established by the routing rules.
 
-Say `cancel`, `stop`, `nvm`, or `never mind` to stop an active native continuation.
+Slack Events API delivery is authoritative ingress. The
+`conversations.replies` poller is bounded, best-effort recovery for events
+missed during a disconnect. It can be rate-limited or unavailable to bot tokens
+for channel threads, so a healthy poller is not a replacement for healthy
+Socket Mode.
 
-## Level 3: wire a cron
+See [Architecture](docs/ARCHITECTURE.md) and
+[Security Model](docs/SECURITY_MODEL.md).
 
-A process that may exit needs a durable run identity:
+## Install
+
+Install an immutable published version:
 
 ```bash
-python3 ~/.local/share/tether/tether_notify.py notify \
-  --run-id "security-sweep-$RUN_ID" \
-  --idempotency-key "security-sweep-$RUN_ID" \
-  --text "Sweep complete: 0 critical findings."
+npx --yes --package=@parcha/tether@0.2.0-beta.1 \
+  tether setup --harness=both
 ```
 
-Replies continue as a durable Hermes operator conversation, even after the original process is gone. Reusing the idempotency key for a retry reuses the same Slack thread.
+Use `--harness=codex` or `--harness=claude-code` for one harness. Setup requires
+Hermes 0.19.0, an explicit Slack operator allowlist, and a Slack app configured
+for Socket Mode.
 
-You can also add `--channel C…`, `--owner U…`, or `--file /absolute/path/report.png`. Keep destinations in operator config and secrets out of message text.
-
-## Level 4: understand the trick
-
-```text
-Codex / Claude / Zellij / cron
-              │ local 0600 Unix socket
-              ▼
-        Hermes + Tether broker
-              │ owns Slack credentials
-              ▼
-       one exact Slack thread
-              │ authorized reply
-              ▼
-      the original bound session
-```
-
-Each bridge persists one source capability, one Slack workspace/channel/thread, one owner policy, and one idempotency key. Replies are deduplicated and serialized. Prompts go to native agents on stdin, not command arguments. Child processes get a scrubbed environment and never inherit Hermes's Slack credentials.
-
-A Zellij-only bridge fingerprints an allowlisted agent command when the message is created and checks it again before every reply. If that pane has returned to a shell or started a different process, Tether refuses to type into it.
-
-Tether fails closed. If the original session is stale, the sender is unauthorized, or the adapter is incompatible, it will not guess another session.
-
-## Level 5: run it your way
-
-Tether automatically reuses Hermes's `SLACK_ALLOWED_USERS`, `GATEWAY_ALLOWED_USERS`, and `SLACK_HOME_CHANNEL`. Optional overrides live at `${XDG_CONFIG_HOME:-~/.config}/tether/config.toml` with mode `0600`.
-
-For scoped native-agent credentials, configure `credential_command` and `credential_env_allowlist`. The helper reads non-secret bridge metadata on stdin and returns short-lived environment values as JSON. Tether rejects undeclared keys and all Slack credentials.
-
-For headless installation:
+For a source install, use the full 40-character commit from the matching
+release:
 
 ```bash
-npx --yes --package=github:miguelrios/unc-skills#main tether setup \
-  --harness=both \
-  --non-interactive
+TETHER_COMMIT="<verified-release-commit-sha>"
+npx --yes \
+  --package="github:Parcha-ai/parcha-skills#$TETHER_COMMIT" \
+  tether setup --harness=both
 ```
 
-Then finish `hermes gateway setup`, start the gateway, and run `tether doctor`.
+Do not install from a moving branch.
 
-## Updates without drama
-
-Hermes and Tether update independently. After a Hermes update, rerun the setup command. Tether replaces only its own code, preserves bridge state and config, restarts Hermes, and checks the Slack adapter compatibility surface.
-
-Use `#main` for transparent latest updates or pin a release tag for reproducible production installs.
-
-`tether setup` enables the Tether Hermes plugin and disables the legacy pre-release `session-bridge` plugin when present. `tether doctor` verifies the live broker protocol and reply-ingress health; a plugin file merely existing on disk is not considered ready.
-
-## Skill-only install
+To install only the portable instruction skill:
 
 ```bash
 npx skills add miguelrios/unc-skills --skill tether
 ```
 
-This teaches an agent how to use Tether but does not install the external Hermes runtime. Use the setup command for end-to-end routing. Browse the skill at [skills.sh/miguelrios/unc-skills/tether](https://skills.sh/miguelrios/unc-skills/tether).
+Browse the skill on
+[skills.sh](https://skills.sh/miguelrios/unc-skills/tether).
 
-Stock pi can publish with `--run-id`; native session resume currently targets Codex and Claude Code.
+The skill-only command does not install the Hermes plugin or local broker.
 
-## Build it, break it, prove it
+Verify the live installation:
 
 ```bash
+export PATH="$HOME/.local/bin:$PATH"
+tether version
+tether doctor
+```
+
+For production operation, `doctor` should report a private broker, compatible
+Hermes, an explicit operator allowlist, and connected Socket Mode ingress.
+
+## Use
+
+From Codex or Claude Code:
+
+> Let me know in Slack when this is done.
+
+For a process that may exit, provide a durable run identity and pass text over
+standard input:
+
+```bash
+printf '%s\n' 'Sweep complete: 0 critical findings.' |
+  tether notify \
+    --run-id "security-sweep-$RUN_ID" \
+    --idempotency-key "security-sweep-$RUN_ID" \
+    --text-stdin
+```
+
+Use `--text-fd FD` when another inherited private file descriptor is more
+appropriate. `--text` remains deprecated because it exposes content in process
+arguments.
+
+Inspect a thread without loading a Slack token:
+
+```bash
+tether thread --channel C12345678 --thread-ts 1234567890.123456
+```
+
+Tether asks agents to default to 50 words and three sentences. Those values,
+including configurable word, character, and sentence targets, are writing
+guidance rather than delivery gates. A complete or safety-critical answer may
+exceed them. The enforced text transport limit is 35,000 characters.
+
+### Attachments
+
+`--file` is disabled until the gateway receives
+`TETHER_UPLOAD_APPROVED_ROOTS`, a colon-separated list of absolute private
+directories owned by the Hermes user and mode `0700`. Optional controls are
+`TETHER_UPLOAD_STAGING_DIRECTORY` and `TETHER_UPLOAD_MAX_BYTES`.
+
+Tether accepts an owner-matching regular file beneath an approved root. It
+rejects symlinks, hard links, oversized or changed files, and content matching
+its known-secret policy. Hermes local media paths use the same private staging
+guard. This is not general data classification or DLP.
+
+## Delivery and recovery
+
+One routing decision selects `SILENT`, `HERMES`, or `NATIVE`, and the selected
+writer is persisted before execution. Native events are transferred to their
+queue in the same SQLite transaction that completes ingress.
+
+Slack roots, native replies, generic thread replies, and Hermes text posts and
+edits use durable immutable outboxes and leases. Posts use stable client IDs
+and paginated reconciliation; edits retry the same payload against the same
+message. This reduces duplicates but does not make Slack exactly once.
+
+Slack ephemeral notices and native media APIs are guarded and redacted but
+remain best-effort because Slack does not expose a recoverable idempotency
+boundary for those operations. A `tether notify --file` root upload uses
+Tether's durable staged upload protocol.
+
+Ambiguous Hermes ingress or native delivery is retained as `uncertain` and is
+not blindly replayed. Inspect it and resolve it explicitly:
+
+```bash
+tether unresolved --team T12345678
+tether resolve \
+  --team T12345678 \
+  --kind attempt \
+  --id att_example \
+  --action retry
+```
+
+Actions are `retry`, `complete`, or `abandon`. Choose one only after checking
+whether the original operation ran.
+
+## Lifecycle
+
+Upgrade:
+
+```bash
+npx --yes --package=@parcha/tether@0.2.0-beta.1 \
+  tether upgrade --harness=both --restart
+```
+
+Restore the immediately previous managed payload:
+
+```bash
+tether rollback --restart
+```
+
+Install and upgrade take a lifecycle lock, stage a complete payload, snapshot
+managed files and plugin state, and maintain a crash-recovery journal. A failed
+commit or requested gateway restart restores the previous managed state.
+
+Rollback does not downgrade `bridges.db` or undo Slack settings. Uninstall
+retains config, bridge state, snapshots, and locally modified managed files:
+
+```bash
+tether uninstall
+```
+
+See [Operations](docs/OPERATIONS.md) for backup, rollback, diagnostics,
+retention, and irreversible state removal.
+
+## Security boundary
+
+Run Hermes and Tether as one dedicated non-root Unix user. The broker refuses
+UID 0, creates a mode-`0600` socket, and accepts only peers with the broker UID.
+Native child environments are allowlisted and do not inherit Slack
+credentials.
+
+The Unix account is the local authority boundary. Tether does not isolate
+processes that share that UID and does not sandbox agent tools. Put mutually
+untrusted agents in separate accounts or hosts.
+
+Slack humans and trusted peer bots require explicit allowlists. Channel
+membership alone is not authorization.
+
+See the repository [Security Policy](../.github/SECURITY.md) for private
+reporting.
+
+## Diagnostics
+
+```bash
+tether status
+tether doctor
+tether unresolved --team T12345678
+tether maintenance
+```
+
+| Symptom | Action |
+| --- | --- |
+| Broker unavailable | Restart Hermes, then run `tether doctor`. |
+| Socket Mode disconnected | Restore Socket Mode; do not rely on polling alone. |
+| Native binding stale | Rebind from the intended live session. |
+| Zellij delivery uncertain | Inspect that exact pane, then use `tether resolve`. |
+| Upgrade failed | Review automatic rollback; run `tether rollback --restart` if needed. |
+
+## Development
+
+```bash
+npm ci
 npm test
 npm run pack:check
 ```
 
-The suite covers exact-thread routing, unauthorized replies, deduplication, queue serialization, cancellation, restart recovery, credential isolation, secret redaction, private socket permissions, installation, and package leak checks.
-
-The precise security and routing rules live in [`skills/tether/references/contract.md`](skills/tether/references/contract.md). Setup details live in [`skills/tether/references/setup.md`](skills/tether/references/setup.md).
+Release controls are documented in [RELEASE.md](docs/RELEASE.md).

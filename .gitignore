@@ -1,4 +1,5 @@
 .parable/
+recall/server/vendor/ati/
 .cascade/
 docs/evidence/
 docs/LOOP_CHAIN_*.md

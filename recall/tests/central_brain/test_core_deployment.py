@@ -403,6 +403,7 @@ class ContainerContractTest(unittest.TestCase):
         self.assertIn("npm ci --ignore-scripts", dockerfile)
         self.assertIn("/opt/recall-pi", dockerfile)
         self.assertNotIn("vendor/ati", dockerfile)
+        self.assertNotIn("/opt/ati", dockerfile)
         self.assertIn("USER 10001", dockerfile)
         self.assertIn("usermod -a -G 1000 recall", dockerfile)
         self.assertIn(
@@ -433,6 +434,24 @@ class ContainerContractTest(unittest.TestCase):
         self.assertEqual(lock["lockfileVersion"], 3)
         self.assertFalse((SERVER / "vendor" / "ati" / "README.md").exists())
         self.assertFalse((SERVER / "vendor" / "ati" / "grep_ati_brain_turn.mjs").exists())
+
+    def test_proprietary_ati_bundle_is_not_committed(self) -> None:
+        tracked = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(RECALL.parent),
+                "ls-files",
+                "--",
+                "recall/server/vendor/ati/",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        self.assertEqual(tracked, "")
+        ignored = (RECALL.parent / ".gitignore").read_text()
+        self.assertIn("recall/server/vendor/ati/", ignored)
 
     def test_build_context_excludes_private_and_development_surfaces(self) -> None:
         ignored = (RECALL / ".dockerignore").read_text()

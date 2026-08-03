@@ -1,12 +1,12 @@
 {
   "name": "@parcha/parable",
-  "version": "0.1.16",
-  "description": "Multi-model coding orchestration skill for Claude Code, Codex, and pi.",
+  "version": "0.1.29",
+  "description": "Multi-model and solo coding orchestration for Claude Code, Codex, and pi.",
   "bin": {
     "parable": "bin/parable.js"
   },
   "scripts": {
-    "test": "python3 -m unittest discover -s tests -v && python3 -m py_compile skills/parable/scripts/parable.py skills/parable/scripts/parable_usage.py && python3 -m json.tool .claude-plugin/plugin.json >/dev/null && python3 -m json.tool .claude-plugin/marketplace.json >/dev/null && python3 -m json.tool .codex-plugin/plugin.json >/dev/null && node --check bin/parable.js && node --check lib/onboarding.js && node --check skills/parable/runtime/bin/parable.js && node --check skills/parable/runtime/lib/onboarding.js && bash -n skills/parable/parable.sh && bash -n install.sh",
+    "test": "python3 -m unittest discover -s tests -v && python3 -m py_compile skills/parable/scripts/parable.py skills/parable/scripts/parable_usage.py skills/parable/runtime/welcome-plugin/scripts/context_recovery.py skills/parable/runtime/welcome-plugin/scripts/model_guard.py skills/parable/runtime/welcome-plugin/scripts/welcome.py && python3 -m json.tool .claude-plugin/plugin.json >/dev/null && python3 -m json.tool .claude-plugin/marketplace.json >/dev/null && python3 -m json.tool .codex-plugin/plugin.json >/dev/null && node --check bin/parable.js && node --check lib/onboarding.js && node --check skills/parable/runtime/bin/parable.js && node --check skills/parable/runtime/lib/onboarding.js && bash -n skills/parable/parable.sh && bash -n install.sh",
     "pack:check": "npm pack --dry-run"
   },
   "files": [

@@ -366,14 +366,13 @@ RECALL_AGENT_MODEL_ALIAS=gpt-oss-120b
 RECALL_AGENT_MODEL_KEY_FILE=/etc/secrets/cerebras-api-key
 ```
 
-The command is a JSON argument array and never passes through a shell. The
-Render secret file contains only the Cerebras API key. It must be a
+The Render secret file contains only the Cerebras API key. It must be a
 nonsymlinked regular file owned by the service user or root, with no write or
 execute permission for its group and no permissions for other users. Recall
 reloads it immediately before each child process. The child receives only that
-key, the explicit endpoint, and a minimal process environment. Pi source and
-dependencies are built from the checked-in lockfile; no opaque runtime artifact
-is vendored.
+key, the explicit endpoint, and a minimal process environment. The worker and
+Pi dependencies are built from the checked-in lockfile; no opaque runtime
+artifact is vendored.
 
 On a Greppy host, use the dedicated credential-owning local broker instead.
 Recall passes the literal `not-a-secret` placeholder to Pi; no model bearer

@@ -5,6 +5,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 SCRIPT = Path(__file__).resolve().parent.parent / "skills" / "parable" / "scripts" / "parable.py"
 spec = importlib.util.spec_from_file_location("parable", SCRIPT)
@@ -169,11 +170,15 @@ class TestClaudeLaunch(unittest.TestCase):
             "CLAUDE_CODE_OAUTH_TOKEN": "native-token",
             "CLAUDE_CODE_SUBAGENT_MODEL": "gpt-5.6-sol",
         }
+        # Separator ownership: the parser has already consumed Parable's `--`
+        # separators, so any `--` reaching the builder is Claude's own
+        # terminator and is forwarded untouched.
         argv, env = parable.build_claude_launch(
-            self.cfg(), ["--", "--print", "hello"], source
+            self.cfg(), ["--print", "hello", "--", "--model"], source
         )
         self.assertEqual(
-            argv, ["claude", "--model", "gpt-5.6-sol", "--print", "hello"]
+            argv,
+            ["claude", "--model", "gpt-5.6-sol", "--print", "hello", "--", "--model"],
         )
         self.assertEqual(env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8317")
         self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "local-token")
@@ -181,6 +186,7 @@ class TestClaudeLaunch(unittest.TestCase):
         self.assertNotIn("ANTHROPIC_API_KEY", env)
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", env)
         self.assertNotIn("CLAUDE_CODE_SUBAGENT_MODEL", env)
+        self.assertNotIn(parable.PARABLE_AGENT_STATE_ENV, env)
         self.assertIn("CLAUDE_CODE_SUBAGENT_MODEL", source)
 
     def test_forwarded_model_override_is_rejected(self):
@@ -204,6 +210,8 @@ class TestClaudeLaunch(unittest.TestCase):
         self.assertIn("BRAIN   FABLE · claude-fable-5", card)
         self.assertIn("KIMI", card)
         self.assertIn("Independent implementation", card)
+        self.assertNotIn("DEGRADED", card)
+        self.assertNotIn("carries the work", card)
         argv = ["claude", "--model", "claude-fable-5"]
         interactive_argv, interactive_env = parable.add_claude_welcome(
             argv, {}, cfg, "claude-fable-5", "explicit fable parent", available, []
@@ -211,12 +219,303 @@ class TestClaudeLaunch(unittest.TestCase):
         self.assertEqual(interactive_argv[:2], ["claude", "--plugin-dir"])
         self.assertEqual(interactive_env[parable.PARABLE_WELCOME_ENV].splitlines()[0],
                          parable.PARABLE_ASCII[0])
+        self.assertEqual(
+            json.loads(interactive_env[parable.PARABLE_AGENT_STATE_ENV]),
+            {
+                "active": ["parable-kimi"],
+                "unavailable": [],
+                "parent": ["parable-fable-exact"],
+            },
+        )
         print_argv, print_env = parable.add_claude_welcome(
             argv, {}, cfg, "claude-fable-5", "explicit fable parent", available,
             ["--print", "hello"],
         )
-        self.assertEqual(print_argv, argv)
+        self.assertEqual(
+            print_argv,
+            [
+                "claude", "--plugin-dir", str(parable.PARABLE_WELCOME_PLUGIN),
+                "--model", "claude-fable-5",
+            ],
+        )
         self.assertNotIn(parable.PARABLE_WELCOME_ENV, print_env)
+        self.assertEqual(
+            json.loads(print_env[parable.PARABLE_AGENT_STATE_ENV]),
+            {
+                "active": ["parable-kimi"],
+                "unavailable": [],
+                "parent": ["parable-fable-exact"],
+            },
+        )
+
+        degraded = parable.render_claude_welcome(
+            cfg, "gpt-5.6-sol", "explicit sol parent",
+            {"gpt-5.6-sol"}, columns=96,
+        )
+        self.assertIn("DEGRADED FABLE, KIMI unavailable for this session", degraded)
+
+    def test_resume_selector_handles_explicit_forms_and_not_prompt_text(self):
+        cases = (
+            (["--continue"], (0, 1, ["--continue"])),
+            (["-c", "prompt"], (0, 1, ["--continue"])),
+            (["--resume=session-name"], (0, 1, ["--resume", "session-name"])),
+            (["-r", "session-id", "prompt"], (0, 2, ["--resume", "session-id"])),
+            (["--from-pr", "123"], (0, 2, ["--from-pr", "123"])),
+            (["--resume", "--print"], (0, 1, [])),
+        )
+        for forwarded, expected in cases:
+            with self.subTest(forwarded=forwarded):
+                self.assertEqual(parable.claude_resume_selector(forwarded), expected)
+        self.assertIsNone(
+            parable.claude_resume_selector(["--print", "--", "--resume", "literal"])
+        )
+
+    def test_resume_preflight_resolves_low_context_without_compacting(self):
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append((argv, kwargs))
+            payload = {
+                "type": "result",
+                "is_error": False,
+                "session_id": "resolved-session",
+                "result": "**Tokens:** 42.5k / 967k (4%)",
+            }
+            return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+        forwarded, note = parable.prepare_claude_resume(
+            ["--continue", "--print", "hello"],
+            "claude-custom",
+            {
+                "ANTHROPIC_AUTH_TOKEN": "sentinel",
+                parable.CLAUDE_CONTEXT_ENV: "372000",
+                parable.CLAUDE_AUTO_COMPACT_PCT_ENV: "75",
+            },
+            {"claude-sonnet-5"},
+            run=run,
+        )
+        self.assertEqual(
+            forwarded,
+            ["--resume", "resolved-session", "--print", "hello"],
+        )
+        self.assertIn("42,500 tokens fit", note)
+        self.assertEqual(len(calls), 1)
+        argv, kwargs = calls[0]
+        self.assertEqual(argv[-2:], ["--continue", "/context"])
+        self.assertIn("claude-sonnet-5[1m]", argv)
+        self.assertNotIn(parable.CLAUDE_CONTEXT_ENV, kwargs["env"])
+        self.assertNotIn(parable.CLAUDE_AUTO_COMPACT_PCT_ENV, kwargs["env"])
+
+    def test_resume_preflight_compacts_oversized_context_with_sonnet(self):
+        calls = []
+        reports = []
+        results = [
+            {
+                "type": "result",
+                "is_error": False,
+                "session_id": "large-session",
+                "result": "## Context Usage\n\n**Tokens:** 321.4k / 967k (33%)",
+            },
+            {
+                "type": "result",
+                "is_error": False,
+                "session_id": "large-session",
+                "result": "Compaction complete",
+            },
+            {
+                "type": "result",
+                "is_error": False,
+                "session_id": "large-session",
+                "result": "**Tokens:** 42k / 967k (4%)",
+            },
+        ]
+
+        def run(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(results.pop(0)),
+                stderr="",
+            )
+
+        forwarded, note = parable.prepare_claude_resume(
+            ["--resume", "my-session", "--effort", "high"],
+            "claude",
+            {parable.CLAUDE_CONTEXT_ENV: "372000"},
+            {"claude-sonnet-5"},
+            run=run,
+            report=reports.append,
+        )
+        self.assertEqual(
+            forwarded,
+            ["--resume", "large-session", "--effort", "high"],
+        )
+        self.assertEqual(
+            note,
+            "compacted 321,400 to 42,000 tokens with Sonnet 5 before the "
+            "372,000-token launch",
+        )
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[0][0][-3:], ["--resume", "my-session", "/context"])
+        self.assertEqual(
+            calls[1][0][-3:],
+            ["--resume", "large-session", parable.CLAUDE_RESUME_COMPACT_PROMPT],
+        )
+        self.assertEqual(
+            calls[2][0][-3:], ["--resume", "large-session", "/context"]
+        )
+        self.assertEqual(reports, [
+            "checking resumed session context with Sonnet 5",
+            "compacting 321,400 tokens with Sonnet 5; this can take several minutes",
+            "compaction finished; verifying the reduced context",
+        ])
+        self.assertEqual(
+            calls[0][1]["timeout"], parable.CLAUDE_RESUME_CHECK_TIMEOUT_SECONDS
+        )
+        self.assertEqual(
+            calls[1][1]["timeout"], parable.CLAUDE_RESUME_COMPACT_TIMEOUT_SECONDS
+        )
+        self.assertEqual(
+            calls[2][1]["timeout"], parable.CLAUDE_RESUME_CHECK_TIMEOUT_SECONDS
+        )
+
+    def test_resume_compaction_has_a_distinct_long_timeout(self):
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append((argv, kwargs))
+            if len(calls) == 1:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "type": "result",
+                        "is_error": False,
+                        "session_id": "large-session",
+                        "result": "**Tokens:** 321.4k / 967k (33%)",
+                    }),
+                    stderr="",
+                )
+            raise parable.subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "Claude resume compaction timed out after 15 minutes",
+        ):
+            parable.prepare_claude_resume(
+                ["--resume", "large-session"],
+                "claude",
+                {parable.CLAUDE_CONTEXT_ENV: "372000"},
+                {"claude-sonnet-5"},
+                run=run,
+            )
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            calls[1][1]["timeout"], parable.CLAUDE_RESUME_COMPACT_TIMEOUT_SECONDS
+        )
+
+    def test_resume_compaction_reports_heartbeats_while_waiting(self):
+        reports = []
+        results = [
+            {
+                "type": "result",
+                "is_error": False,
+                "session_id": "large-session",
+                "result": "**Tokens:** 321.4k / 967k (33%)",
+            },
+            {
+                "type": "result",
+                "is_error": False,
+                "session_id": "large-session",
+                "result": "Compaction complete",
+            },
+            {
+                "type": "result",
+                "is_error": False,
+                "session_id": "large-session",
+                "result": "**Tokens:** 42k / 967k (4%)",
+            },
+        ]
+
+        def run(_argv, **_kwargs):
+            if len(results) == 2:
+                parable.time.sleep(0.04)
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(results.pop(0)),
+                stderr="",
+            )
+
+        original_interval = parable.CLAUDE_RESUME_HEARTBEAT_SECONDS
+        parable.CLAUDE_RESUME_HEARTBEAT_SECONDS = 0.01
+        try:
+            parable.prepare_claude_resume(
+                ["--resume", "large-session"],
+                "claude",
+                {parable.CLAUDE_CONTEXT_ENV: "372000"},
+                {"claude-sonnet-5"},
+                run=run,
+                report=reports.append,
+            )
+        finally:
+            parable.CLAUDE_RESUME_HEARTBEAT_SECONDS = original_interval
+        self.assertTrue(any(
+            message.startswith("still compacting with Sonnet 5")
+            for message in reports
+        ), reports)
+
+    def test_resume_preflight_skips_picker_fork_and_full_window(self):
+        def should_not_run(*_args, **_kwargs):
+            self.fail("preflight subprocess should not run")
+
+        picker, picker_note = parable.prepare_claude_resume(
+            ["--resume", "--print"], "claude",
+            {parable.CLAUDE_CONTEXT_ENV: "372000"}, {"claude-sonnet-5"},
+            run=should_not_run,
+        )
+        self.assertEqual(picker, ["--resume", "--print"])
+        self.assertIn("picker selected", picker_note)
+        forked, forked_note = parable.prepare_claude_resume(
+            ["--resume", "id", "--fork-session"], "claude",
+            {parable.CLAUDE_CONTEXT_ENV: "372000"}, {"claude-sonnet-5"},
+            run=should_not_run,
+        )
+        self.assertEqual(forked, ["--resume", "id", "--fork-session"])
+        self.assertIn("forked resume", forked_note)
+        full, full_note = parable.prepare_claude_resume(
+            ["--continue"], "claude",
+            {parable.CLAUDE_CONTEXT_ENV: "1000000"}, {"claude-sonnet-5"},
+            run=should_not_run,
+        )
+        self.assertEqual(full, ["--continue"])
+        self.assertIsNone(full_note)
+
+    def test_resume_preflight_fails_closed_when_compaction_does_not_finish(self):
+        results = [
+            {
+                "type": "result", "is_error": False, "session_id": "id",
+                "result": "**Tokens:** 300k / 967k (31%)",
+            },
+            {
+                "type": "result", "is_error": False, "session_id": "id",
+                "result": "Error during compaction: Conversation too long",
+            },
+            {
+                "type": "result", "is_error": False, "session_id": "id",
+                "result": "**Tokens:** 300k / 967k (31%)",
+            },
+        ]
+
+        def run(_argv, **_kwargs):
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps(results.pop(0)), stderr=""
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "did not reduce the session"):
+            parable.prepare_claude_resume(
+                ["--continue"], "claude",
+                {parable.CLAUDE_CONTEXT_ENV: "372000"}, {"claude-sonnet-5"},
+                run=run,
+            )
 
     def auto_cfg(self):
         cfg = self.cfg()
@@ -242,6 +541,271 @@ class TestClaudeLaunch(unittest.TestCase):
             parable.parse_claude_brain_args(
                 ["--", "--print", "hello", "--brain", "fable"]
             )
+
+    def test_solo_parser_is_explicit_and_mutually_exclusive(self):
+        self.assertEqual(
+            parable.parse_claude_launch_args(
+                ["--", "--solo", "kimi", "--", "--print", "hello"]
+            ),
+            ("config", "kimi", ["--print", "hello"]),
+        )
+        self.assertEqual(
+            parable.parse_claude_launch_args(["--solo=kimi-k3", "--effort", "high"]),
+            ("config", "kimi-k3", ["--effort", "high"]),
+        )
+        with self.assertRaisesRegex(ValueError, "--solo requires"):
+            parable.parse_claude_launch_args(["--solo"])
+        for args in (
+            ["--solo", "kimi", "--brain", "fable"],
+            ["--brain", "fable", "--solo", "kimi"],
+        ):
+            with self.subTest(args=args), self.assertRaisesRegex(ValueError, "mutually exclusive"):
+                parable.parse_claude_launch_args(args)
+
+    def test_parser_treats_post_terminator_tokens_as_literal_prompt_text(self):
+        # After Claude's own `--` terminator, option-shaped tokens are prompt
+        # text, never misplaced Parable options.
+        self.assertEqual(
+            parable.parse_claude_launch_args(
+                ["--solo", "kimi", "--print", "--", "--solo"]
+            ),
+            ("config", "kimi", ["--print", "--", "--solo"]),
+        )
+        self.assertEqual(
+            parable.parse_claude_launch_args(
+                ["--brain", "fable", "--print", "--", "--brain=sol"]
+            ),
+            ("fable", None, ["--print", "--", "--brain=sol"]),
+        )
+        # Before the terminator they are still misplaced.
+        with self.assertRaisesRegex(ValueError, "place Parable's --solo option"):
+            parable.parse_claude_launch_args(["--print", "hi", "--solo", "kimi"])
+
+    def test_parser_forwards_claude_terminator_after_parable_options(self):
+        # Consecutive separators: Parable's region-closing `--` is consumed,
+        # Claude's terminator survives, and literal prompt text after it —
+        # even option-shaped — reaches Claude unmodified.
+        self.assertEqual(
+            parable.parse_claude_launch_args(
+                ["--solo", "kimi", "--", "--", "--fallback-model"]
+            ),
+            ("config", "kimi", ["--", "--fallback-model"]),
+        )
+        # With no Parable option consumed, a second leading `--` is Claude's.
+        self.assertEqual(
+            parable.parse_claude_launch_args(["--", "--", "--solo"]),
+            ("config", None, ["--", "--solo"]),
+        )
+        self.assertEqual(
+            parable.parse_claude_launch_args(["--brain=fable", "--", "--", "--brain"]),
+            ("fable", None, ["--", "--brain"]),
+        )
+        # The forwarded Claude terminator survives the solo builder too.
+        cfg = parable.config_with_claude_brain(self.cfg(), "kimi-k3")
+        argv, _ = parable.build_claude_launch(
+            cfg, ["--", "--fallback-model"], {"CLIPROXY_API_KEY": "x"}, solo=True
+        )
+        self.assertEqual(
+            argv,
+            [
+                "claude", "--model", "kimi-k3", "--disallowedTools", "Agent",
+                "--", "--fallback-model",
+            ],
+        )
+
+    def test_solo_model_resolution_accepts_aliases_and_exact_ids(self):
+        cfg = self.auto_cfg()
+        cfg["executors"]["sol_exact"] = {
+            "provider": "claude", "model": "gpt-5.6-sol",
+        }
+        available = {"gpt-5.6-sol", "claude-fable-5", "kimi-k3"}
+        self.assertEqual(parable.resolve_solo_model(cfg, "kimi", available)[0], "kimi-k3")
+        self.assertEqual(parable.resolve_solo_model(cfg, "kimi-k3", available)[0], "kimi-k3")
+        self.assertEqual(parable.resolve_solo_model(cfg, "sol", available)[0], "gpt-5.6-sol")
+        self.assertEqual(
+            parable.resolve_solo_model(cfg, "sol_exact", available)[0], "gpt-5.6-sol"
+        )
+        with self.assertRaisesRegex(ValueError, "unknown"):
+            parable.resolve_solo_model(cfg, "not-a-model", available)
+        with self.assertRaisesRegex(ValueError, "catalog is missing"):
+            parable.resolve_solo_model(cfg, "kimi", {"gpt-5.6-sol"})
+        cfg["executors"]["kimi_exact"] = {
+            "provider": "claude", "model": "other-kimi-model",
+        }
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            parable.resolve_solo_model(
+                cfg, "kimi", {"kimi-k3", "other-kimi-model"}
+            )
+
+    def test_solo_alias_covers_any_subagent_provider_not_just_claude_id(self):
+        # SKILL.md promises aliases for enabled exact-model executors whose
+        # provider has type = "subagent", whatever the provider id is.
+        cfg = self.auto_cfg()
+        cfg["providers"]["custom_lane"] = {"type": "subagent"}
+        cfg["executors"]["lane"] = {
+            "provider": "custom_lane", "model": "lane-model-1",
+        }
+        self.assertEqual(
+            parable.resolve_solo_model(cfg, "lane", {"lane-model-1"})[0],
+            "lane-model-1",
+        )
+        # Non-subagent providers never contribute aliases.
+        cfg["providers"]["metered"] = {"type": "codex"}
+        cfg["executors"]["metered_lane"] = {
+            "provider": "metered", "model": "metered-model",
+        }
+        with self.assertRaisesRegex(ValueError, "unknown"):
+            parable.resolve_solo_model(cfg, "metered_lane", {"metered-model"})
+
+    def test_solo_launch_disables_agent_delegation_and_teams(self):
+        source = {
+            "CLIPROXY_API_KEY": "local-token",
+            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+        }
+        cfg = parable.config_with_claude_brain(self.cfg(), "kimi-k3")
+        argv, env = parable.build_claude_launch(
+            cfg, ["--effort", "high", "--print", "hello"], source, solo=True
+        )
+        self.assertEqual(
+            argv,
+            [
+                "claude", "--model", "kimi-k3", "--disallowedTools", "Agent",
+                "--effort", "high", "--print", "hello",
+            ],
+        )
+        self.assertNotIn("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", env)
+        for option in (
+            "--agent", "--agents", "--allowedTools", "--allowed-tools",
+            "--disallowedTools", "--disallowed-tools", "--fallback-model",
+        ):
+            with self.subTest(option=option), self.assertRaisesRegex(
+                ValueError, "owns model selection and agent isolation"
+            ):
+                parable.build_claude_launch(
+                    cfg, [option, "value"], source, solo=True
+                )
+        # Option-shaped prompt text after Claude's `--` terminator passes through.
+        argv, _ = parable.build_claude_launch(
+            cfg, ["--print", "--", "--fallback-model", "--agent"], source, solo=True
+        )
+        self.assertEqual(
+            argv,
+            [
+                "claude", "--model", "kimi-k3", "--disallowedTools", "Agent",
+                "--print", "--", "--fallback-model", "--agent",
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "remove --model"):
+            parable.build_claude_launch(
+                cfg, ["--print", "--model"], source, solo=True
+            )
+
+    def test_context_ceiling_tracks_real_windows_for_non_anthropic_models(self):
+        cfg = self.cfg()
+        # Solo: exactly the selected model's known window.
+        self.assertEqual(
+            parable.claude_context_ceiling(cfg, "kimi-k3", solo=True), 1_000_000
+        )
+        self.assertEqual(
+            parable.claude_context_ceiling(cfg, "gpt-5.6-sol", solo=True), 372_000
+        )
+        # Solo on an unknown model: no override rather than a guess.
+        self.assertIsNone(
+            parable.claude_context_ceiling(cfg, "mystery-model", solo=True)
+        )
+        # Multi-model: minimum across brain + non-Claude cast models.
+        self.assertEqual(parable.claude_context_ceiling(cfg, "gpt-5.6-sol"), 372_000)
+        # Anthropic-only cast (kimi disabled): env should not be set at all.
+        cfg_claude_only = self.cfg()
+        cfg_claude_only["executors"]["kimi"]["enabled"] = False
+        self.assertIsNone(
+            parable.claude_context_ceiling(cfg_claude_only, "claude-fable-5")
+        )
+        # An unknown cast model clamps to Claude Code's own 200k fallback.
+        cfg_unknown = self.cfg()
+        cfg_unknown["executors"]["mystery"] = {
+            "provider": "claude", "model": "mystery-model",
+        }
+        self.assertEqual(
+            parable.claude_context_ceiling(cfg_unknown, "gpt-5.6-sol"), 200_000
+        )
+        # An unavailable exact-model lane does not constrain this session.
+        self.assertEqual(
+            parable.claude_context_ceiling(
+                cfg_unknown, "gpt-5.6-sol", available={"gpt-5.6-sol"}
+            ),
+            372_000,
+        )
+        # parable.toml context_ktok override beats the built-in table.
+        cfg_override = self.cfg()
+        cfg_override["executors"]["kimi"]["context_ktok"] = 256
+        self.assertEqual(
+            parable.claude_context_ceiling(cfg_override, "kimi-k3", solo=True), 256_000
+        )
+
+    def test_launch_sets_context_env_and_respects_user_override(self):
+        cfg = parable.config_with_claude_brain(self.cfg(), "kimi-k3")
+        source = {"CLIPROXY_API_KEY": "x"}
+        _argv, env = parable.build_claude_launch(cfg, [], source, solo=True)
+        self.assertEqual(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "1000000")
+        self.assertEqual(env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "1000000")
+        self.assertEqual(env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], "75")
+        # Multi-model launch takes the min across the non-Claude cast.
+        multi = parable.config_with_claude_brain(self.cfg(), "gpt-5.6-sol")
+        _argv, env = parable.build_claude_launch(multi, [], source)
+        self.assertEqual(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "372000")
+        self.assertEqual(env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "372000")
+        self.assertEqual(env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], "75")
+        # A user's own values are never clobbered.
+        user = {
+            "CLIPROXY_API_KEY": "x",
+            "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "123000",
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "111000",
+            "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "68",
+        }
+        _argv, env = parable.build_claude_launch(cfg, [], user, solo=True)
+        self.assertEqual(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "123000")
+        self.assertEqual(env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "111000")
+        self.assertEqual(env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], "68")
+        # Unknown solo model: the env is left unset, not guessed.
+        unknown = parable.config_with_claude_brain(self.cfg(), "mystery-model")
+        _argv, env = parable.build_claude_launch(unknown, [], source, solo=True)
+        self.assertNotIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS", env)
+        self.assertNotIn("CLAUDE_CODE_AUTO_COMPACT_WINDOW", env)
+        self.assertNotIn("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", env)
+        # An explicit ceiling for an unknown custom model still gets safe
+        # compaction unless the user also supplies their own percentage.
+        explicit = {
+            "CLIPROXY_API_KEY": "x",
+            "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "256000",
+        }
+        _argv, env = parable.build_claude_launch(unknown, [], explicit, solo=True)
+        self.assertEqual(env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "256000")
+        self.assertEqual(env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], "75")
+
+    def test_context_ktok_config_field_is_validated(self):
+        cfg = self.cfg()
+        cfg["executors"]["kimi"]["context_ktok"] = 256
+        self.assertEqual(parable.validate_config(cfg), [])
+        for bad in (0, -5, "256", 1.5, True):
+            cfg["executors"]["kimi"]["context_ktok"] = bad
+            problems = parable.validate_config(cfg)
+            self.assertTrue(
+                any("context_ktok" in p for p in problems),
+                f"expected context_ktok problem for {bad!r}: {problems}",
+            )
+
+    def test_solo_welcome_has_no_cast_or_delegation_cues(self):
+        card = parable.render_claude_solo_welcome(
+            self.cfg(), "kimi-k3", "configured solo alias kimi"
+        )
+        self.assertTrue(card.startswith(parable.PARABLE_ASCII[0]))
+        self.assertIn("SOLO    KIMI · kimi-k3", card)
+        self.assertIn("You are the only agent", card)
+        self.assertIn("Do not invoke Agent", card)
+        self.assertNotIn("BRAIN", card)
+        self.assertNotIn("CAST", card)
+        self.assertNotIn("the road ahead", card)
 
     def test_auto_brain_is_fable_first_then_falls_back_on_usage(self):
         cfg = self.auto_cfg()
@@ -283,6 +847,14 @@ class TestClaudeLaunch(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "rerun setup"):
             parable.resolve_claude_brain(cfg, "fable", available)
+        with self.assertRaisesRegex(ValueError, "unavailable"):
+            parable.resolve_claude_brain(
+                self.auto_cfg(), "fable", {"gpt-5.6-sol"}
+            )
+        with self.assertRaisesRegex(ValueError, "configured parent model"):
+            parable.resolve_claude_brain(
+                self.cfg(), "config", {"kimi-k3"}
+            )
 
     def test_custom_model_agent_is_namespaced_and_exact(self):
         cfg = self.cfg()
@@ -293,7 +865,19 @@ class TestClaudeLaunch(unittest.TestCase):
         self.assertIn('effort: "high"', rendered)
         self.assertNotIn("CLIPROXY_API_KEY", rendered)
         self.assertEqual(
-            parable.claude_required_models(cfg), ["gpt-5.6-sol", "kimi-k3"]
+            parable.claude_configured_models(cfg), ["gpt-5.6-sol", "kimi-k3"]
+        )
+        self.assertEqual(
+            parable.claude_cast_availability(
+                cfg, {"gpt-5.6-sol"}, "gpt-5.6-sol"
+            ),
+            {
+                "active": [],
+                "unavailable": [
+                    {"name": "parable-kimi", "model": "kimi-k3"}
+                ],
+                "parent": [],
+            },
         )
 
     def test_builtin_aliases_do_not_generate_agents(self):

@@ -26,28 +26,36 @@ const PARABLE_PY = path.join(
   PACKAGE_ROOT, "skills", "parable", "scripts", "parable.py",
 );
 const PATCH_PATH = path.join(
-  path.resolve(__dirname, ".."), "patches", "cliproxyapi-v7.2.88-claude-effort.patch",
+  path.resolve(__dirname, ".."), "patches", "cliproxyapi-v7.2.103-claude-effort.patch",
 );
 
 const SETUP_SCHEMA_VERSION = 1;
 const DEFAULT_PORT = 8317;
 const PROXY_REPOSITORY = "https://github.com/router-for-me/CLIProxyAPI.git";
-const PROXY_COMMIT = "93d74a890a44802f656d7f39a573916b2611896e";
-const PROXY_PATCH_SHA256 = "d35b422da321265150fe393da80a686862ef642ee45c65a3e2fb908d689d5d1f";
+const PROXY_COMMIT = "cade44b9cdee6b9328ea2648fd119129fdf11e2d";
+const PROXY_PATCH_SHA256 = "c0b4c52d4b35040427e1aee0067c99da7068598803604c435ad591d577b2dc5d";
 const PROXY_BINARY_NAME = "parable-cliproxy-api";
 const DEFAULT_PROXY_READY_TIMEOUT_MS = 15_000;
 const PROXY_PROBE_TIMEOUT_MS = 750;
 const PROXY_STOP_TIMEOUT_MS = 2_000;
-const VENDOR_ORDER = Object.freeze(["claude", "chatgpt", "xai"]);
+const CONTEXT_RECOVERY_ENV = "PARABLE_CONTEXT_RECOVERY_FILE";
+const CONTEXT_RESUME_PICKER_ENV = "PARABLE_CONTEXT_RESUME_PICKER";
+const TEAMMATE_RECOVERY_ACTIVE_ENV = "PARABLE_TEAMMATE_RECOVERY_ACTIVE";
+const CONTEXT_RECOVERY_POLL_MS = 50;
+const CONTEXT_RECOVERY_MAX_ATTEMPTS = 1;
+const TEAMMATE_RECOVERY_MAX_ATTEMPTS = 1;
+const VENDOR_ORDER = Object.freeze(["claude", "chatgpt", "xai", "kimi"]);
 const AUTH_FLAGS = Object.freeze({
   chatgpt: Object.freeze({ browser: "--codex-login", device: "--codex-device-login" }),
   claude: Object.freeze({ browser: "--claude-login", extra: "--no-browser" }),
   xai: Object.freeze({ browser: "--xai-login", extra: "--no-browser" }),
+  kimi: Object.freeze({ browser: "--kimi-login", extra: "--no-browser" }),
 });
 const AUTH_RECORD_TYPES = Object.freeze({
   chatgpt: "codex",
   claude: "claude",
   xai: "xai",
+  kimi: "kimi",
 });
 const VENDORS = Object.freeze({
   chatgpt: Object.freeze({
@@ -62,6 +70,7 @@ const VENDORS = Object.freeze({
     ]),
   }),
   xai: Object.freeze({ models: Object.freeze(["grok-4.5"]) }),
+  kimi: Object.freeze({ models: Object.freeze(["kimi-k3"]) }),
 });
 
 class OnboardingError extends Error {
@@ -105,6 +114,150 @@ function lstatOrNull(target) {
     if (error.code === "ENOENT") return null;
     throw error;
   }
+}
+
+function createContextRecoveryChannel() {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "parable-context-recovery-"));
+  fs.chmodSync(directory, 0o700);
+  return {
+    directory,
+    requestPath: path.join(directory, "request.json"),
+  };
+}
+
+function removeContextRecoveryChannel(channel) {
+  if (!channel) return;
+  fs.rmSync(channel.directory, { recursive: true, force: true });
+}
+
+function consumeContextRecoveryRequest(requestPath) {
+  const stat = lstatOrNull(requestPath);
+  if (!stat) return null;
+  try {
+    if (
+      stat.isSymbolicLink()
+      || !stat.isFile()
+      || modeOf(stat) !== 0o600
+      || stat.size > 4096
+      || (typeof process.getuid === "function" && stat.uid !== process.getuid())
+    ) {
+      return null;
+    }
+    const payload = JSON.parse(fs.readFileSync(requestPath, "utf8"));
+    if (
+      !payload
+      || Array.isArray(payload)
+      || payload.version !== 1
+      || !["context_failure", "resume_picker", "teammate_interrupt"].includes(payload.reason)
+      || typeof payload.session_id !== "string"
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+        payload.session_id,
+      )
+    ) {
+      return null;
+    }
+    return { sessionId: payload.session_id, reason: payload.reason };
+  } catch {
+    return null;
+  } finally {
+    try { fs.unlinkSync(requestPath); } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+}
+
+function waitForContextRecovery(client, requestPath) {
+  return new Promise((resolve) => {
+    let timer = null;
+    let settled = false;
+    const finish = (request) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (request) resolve(request);
+    };
+    const poll = () => {
+      if (settled) return;
+      const request = consumeContextRecoveryRequest(requestPath);
+      if (request) {
+        finish(request);
+        return;
+      }
+      timer = setTimeout(poll, CONTEXT_RECOVERY_POLL_MS);
+    };
+    client.done.finally(() => finish(null));
+    poll();
+  });
+}
+
+function claudeArgumentBounds(argv) {
+  let start = 0;
+  if (argv[0] === "--brain" || argv[0] === "--solo") start = 2;
+  else if (argv[0]?.startsWith("--brain=") || argv[0]?.startsWith("--solo=")) start = 1;
+  if (argv[start] === "--") start += 1;
+  const terminator = argv.indexOf("--", start);
+  return {
+    start,
+    end: terminator === -1 ? argv.length : terminator,
+  };
+}
+
+function claudeContextRecoverySupported(argv) {
+  const { start, end } = claudeArgumentBounds(argv);
+  return !argv.slice(start, end).some(
+    (argument) => argument.split("=", 1)[0] === "--no-session-persistence",
+  );
+}
+
+function claudeResumePickerRequested(argv) {
+  const { start, end } = claudeArgumentBounds(argv);
+  for (let index = start; index < end; index += 1) {
+    const argument = argv[index];
+    if (argument === "--resume=") return true;
+    if (argument === "-r" || argument === "--resume") {
+      return index + 1 >= end || argv[index + 1].startsWith("-");
+    }
+  }
+  return false;
+}
+
+function withExactClaudeResume(argv, sessionId, replyOnResume = false) {
+  const { start, end } = claudeArgumentBounds(argv);
+  const noValue = new Set([
+    "-c",
+    "--continue",
+    "--fork-session",
+    "--reply-on-resume",
+  ]);
+  const withValue = new Set([
+    "-r",
+    "--resume",
+    "--from-pr",
+    "--session-id",
+    "--resume-session-at",
+    "--rewind-files",
+  ]);
+  const cleaned = [];
+  for (let index = start; index < end; index += 1) {
+    const argument = argv[index];
+    const option = argument.split("=", 1)[0];
+    if (noValue.has(option)) continue;
+    if (withValue.has(option)) {
+      if (!argument.includes("=") && index + 1 < end && !argv[index + 1].startsWith("-")) {
+        index += 1;
+      }
+      continue;
+    }
+    cleaned.push(argument);
+  }
+  return [
+    ...argv.slice(0, start),
+    ...cleaned,
+    "--resume",
+    sessionId,
+    ...(replyOnResume ? ["--reply-on-resume"] : []),
+    ...argv.slice(end),
+  ];
 }
 
 function requirePrivateDirectory(target, label) {
@@ -169,7 +322,7 @@ function parseOptions(argv, valueNames, booleanNames) {
 function parseSetupOptions(argv) {
   const options = parseOptions(
     argv,
-    new Set(["--vendors", "--proxy-bin", "--config-dir", "--port"]),
+    new Set(["--vendors", "--proxy-bin", "--config-dir", "--port", "--add-vendors"]),
     new Set(["--build-proxy", "--no-auth", "--non-interactive", "--help"]),
   );
   if (options._.length) {
@@ -177,6 +330,20 @@ function parseSetupOptions(argv) {
   }
   if (options.proxy_bin && options.build_proxy) {
     throw new OnboardingError("--proxy-bin and --build-proxy are mutually exclusive");
+  }
+  if (options.add_vendors !== undefined) {
+    if (options.vendors !== undefined) {
+      throw new OnboardingError("--add-vendors and --vendors are mutually exclusive");
+    }
+    if (options.port !== undefined) {
+      throw new OnboardingError("--add-vendors and --port are mutually exclusive");
+    }
+    if (options.proxy_bin !== undefined) {
+      throw new OnboardingError("--add-vendors and --proxy-bin are mutually exclusive");
+    }
+    if (options.build_proxy) {
+      throw new OnboardingError("--add-vendors and --build-proxy are mutually exclusive");
+    }
   }
   if (options.port !== undefined) {
     if (!/^[0-9]+$/.test(options.port)) {
@@ -204,15 +371,20 @@ function parseBuildOptions(argv) {
 
 function setupUsage() {
   return [
-    "usage: parable setup [--vendors claude[,chatgpt][,xai]] [--proxy-bin PATH]",
+    "usage: parable setup [--vendors claude[,chatgpt][,xai][,kimi]] [--proxy-bin PATH]",
     "                     [--config-dir DIR] [--port PORT] [--build-proxy]",
     "                     [--no-auth] [--non-interactive]",
+    "       parable setup --add-vendors kimi [--config-dir DIR] [--no-auth]",
     "       parable setup finalize [--json]",
     "",
     "Create a private, loopback-only Parable + CLIProxyAPI configuration.",
     "Claude is the baseline subscription for the Claude Code harness.",
     "ChatGPT adds optional Sol/Terra/Luna models and the Sol fallback parent.",
+    "xAI adds the Grok 4.5 subscription; Kimi adds the Kimi K3 subscription.",
     "Interactive setup offers the pinned managed build when no proxy is installed.",
+    "--add-vendors extends an existing complete setup in place without touching",
+    "its proxy token, binary, or credentials; it cannot combine with --vendors,",
+    "--port, --proxy-bin, or --build-proxy, but does support --config-dir.",
     "Ordinary next step: run `parable` in the working repository.",
   ].join("\n");
 }
@@ -222,6 +394,15 @@ function proxyBuildUsage() {
     "usage: parable proxy build [--install-dir DIR]",
     "",
     "Build the pinned, patched CLIProxyAPI in a new managed directory.",
+  ].join("\n");
+}
+
+function proxyUpgradeUsage() {
+  return [
+    "usage: parable proxy upgrade",
+    "",
+    "Build the pinned proxy and atomically stage it for the next Parable launch.",
+    "An already-running proxy is not interrupted.",
   ].join("\n");
 }
 
@@ -244,6 +425,25 @@ function parseVendors(raw) {
   return VENDOR_ORDER.filter((vendor) => unique.has(vendor));
 }
 
+// Like parseVendors, but for `--add-vendors`: the list names vendors to graft onto an
+// existing setup, so it must not require "claude" (claude is already present in any
+// complete setup) and must reject vendors that are not real supported vendor ids.
+function parseAddVendors(raw) {
+  const parts = String(raw).split(",").map((value) => value.trim()).filter(Boolean);
+  if (!parts.length) throw new OnboardingError("--add-vendors cannot be empty");
+  const unique = new Set();
+  for (const vendor of parts) {
+    if (!Object.hasOwn(VENDORS, vendor)) {
+      throw new OnboardingError(
+        `unsupported vendor '${vendor}' (supported: ${VENDOR_ORDER.join(", ")})`,
+      );
+    }
+    if (unique.has(vendor)) throw new OnboardingError(`duplicate vendor '${vendor}'`);
+    unique.add(vendor);
+  }
+  return VENDOR_ORDER.filter((vendor) => unique.has(vendor));
+}
+
 async function askYesNo(prompt, question) {
   const answer = (await prompt.ask(`${question} [y/N] `)).trim().toLowerCase();
   return answer === "y" || answer === "yes";
@@ -260,6 +460,7 @@ async function selectVendors(options, existingManifest, prompt) {
     vendors.push("chatgpt");
   }
   if (await askYesNo(prompt, "Add xAI Grok 4.5 subscription?")) vendors.push("xai");
+  if (await askYesNo(prompt, "Add Kimi Code subscription (Kimi K3)?")) vendors.push("kimi");
   return VENDOR_ORDER.filter((vendor) => vendors.includes(vendor));
 }
 
@@ -332,6 +533,35 @@ function yamlString(value) {
 }
 
 function renderProxyYaml(port, authDir, token) {
+  return [
+    'host: "127.0.0.1"',
+    `port: ${port}`,
+    `auth-dir: ${yamlString(authDir)}`,
+    "api-keys:",
+    `  - "${token}"`,
+    "debug: false",
+    "transient-error-cooldown-seconds: -1",
+    "claude-code:",
+    "  disable-cloaking-model-list: true",
+    "",
+  ].join("\n");
+}
+
+function renderPreviousProxyYaml(port, authDir, token) {
+  return [
+    'host: "127.0.0.1"',
+    `port: ${port}`,
+    `auth-dir: ${yamlString(authDir)}`,
+    "api-keys:",
+    `  - "${token}"`,
+    "debug: false",
+    "claude-code:",
+    "  disable-cloaking-model-list: true",
+    "",
+  ].join("\n");
+}
+
+function renderLegacyProxyYaml(port, authDir, token) {
   return [
     'host: "127.0.0.1"',
     `port: ${port}`,
@@ -440,6 +670,15 @@ function renderParableToml(port, vendors) {
       ),
     );
   }
+  if (selected.has("kimi")) {
+    lines.push(
+      ...executorBlock(
+        "kimi", "kimi-k3", "high", ["implementer", "fourth-family", "subscription"],
+        "Bounded feature implementation and cross-family smoke testing outside the primary provider families.",
+        "Sole final factual review, orchestration, ambiguous product architecture, or reviewing its own diff.",
+      ),
+    );
+  }
 
   const mechanical = hasChatGPT ? ["luna", "haiku_exact"] : ["haiku_exact"];
   const dataTransform = hasChatGPT
@@ -449,19 +688,23 @@ function renderParableToml(port, vendors) {
   const feature = hasChatGPT
     ? ["terra", "sol_exact", "sonnet_exact"] : ["sonnet_exact"];
   if (selected.has("xai")) feature.push("grok");
+  if (selected.has("kimi")) feature.push("kimi");
   const refactorWide = hasChatGPT
     ? ["sol_exact", "sonnet_exact", "opus_exact", "fable_exact"]
     : ["sonnet_exact", "opus_exact", "fable_exact"];
   if (selected.has("xai")) refactorWide.push("grok");
+  if (selected.has("kimi")) refactorWide.push("kimi");
   const gnarly = hasChatGPT
     ? ["sol_exact", "opus_exact", "fable_exact"] : ["opus_exact", "fable_exact"];
   if (selected.has("xai")) gnarly.push("grok");
+  if (selected.has("kimi")) gnarly.push("kimi");
   const review = hasChatGPT
     ? [reviewer, "sol_exact", "terra", "sonnet_exact"]
     : [reviewer, "sonnet_exact"];
   if (selected.has("xai")) review.push("grok");
   const smoke = hasChatGPT ? ["sol_exact", "luna", "sonnet_exact"] : ["sonnet_exact"];
   if (selected.has("xai")) smoke.unshift("grok");
+  if (selected.has("kimi")) smoke.unshift("kimi");
   const architecture = hasChatGPT
     ? ["fable_exact", "opus_exact", "sol_exact"] : ["fable_exact", "opus_exact"];
   lines.push(
@@ -542,13 +785,80 @@ function validateExistingSetup(configDir, authDir, paths, desired, options = {})
     [paths.manifest, renderManifest(desired)],
   ]);
   for (const [target, content] of expected) {
-    if (fs.readFileSync(target, "utf8") !== content) {
+    const actual = fs.readFileSync(target, "utf8");
+    const legacyProxyConfig = (
+      options.acceptLegacyProxyConfig === true
+      && target === paths.proxyConfig
+      && [
+        renderPreviousProxyYaml(desired.port, authDir, token),
+        renderLegacyProxyYaml(desired.port, authDir, token),
+      ].includes(actual)
+    );
+    if (actual !== content && !legacyProxyConfig) {
       throw new OnboardingError(`generated setup file has changed; refusing to overwrite: ${target}`);
     }
   }
   if (options.requireProxy !== false) {
     requireExecutable(desired.proxyBinary, "configured proxy binary");
   }
+}
+
+function migrateLegacyProxyConfig(paths, desired, authDir) {
+  const token = readExistingToken(paths);
+  const current = renderProxyYaml(desired.port, authDir, token);
+  const actual = fs.readFileSync(paths.proxyConfig, "utf8");
+  if (actual === current) return false;
+  if (![
+    renderPreviousProxyYaml(desired.port, authDir, token),
+    renderLegacyProxyYaml(desired.port, authDir, token),
+  ].includes(actual)) {
+    throw new OnboardingError(
+      `generated setup file has changed; refusing to overwrite: ${paths.proxyConfig}`,
+    );
+  }
+  replacePrivateFileSet([[paths.proxyConfig, current]]);
+  return true;
+}
+
+function activateGeneratedProxyConfig(context, log) {
+  const migrated = migrateLegacyProxyConfig(
+    context.paths,
+    context.manifest,
+    context.authDir,
+  );
+  if (!migrated) return false;
+  validateExistingSetup(
+    context.configDir,
+    context.authDir,
+    context.paths,
+    context.manifest,
+  );
+  log(`proxy: updated generated retry policy -> ${context.paths.proxyConfig}`);
+  return true;
+}
+
+// Validate the setup surfaces that never change during an additive vendor upgrade.
+// The two replaceable files are checked separately against explicit old/new candidates.
+function validateExistingSetupEnvelope(configDir, authDir, paths, manifest) {
+  requirePrivateDirectory(configDir, "configuration directory");
+  requirePrivateDirectory(authDir, "CLIProxyAPI auth directory");
+  for (const [name, target] of Object.entries(paths)) requirePrivateFile(target, name);
+  const token = readExistingToken(paths);
+  const expected = new Map([
+    [paths.proxyConfig, [
+      renderProxyYaml(manifest.port, authDir, token),
+      renderPreviousProxyYaml(manifest.port, authDir, token),
+      renderLegacyProxyYaml(manifest.port, authDir, token),
+    ]],
+    [paths.proxyEnv, renderProxyEnv(token)],
+  ]);
+  for (const [target, content] of expected) {
+    const accepted = Array.isArray(content) ? content : [content];
+    if (!accepted.includes(fs.readFileSync(target, "utf8"))) {
+      throw new OnboardingError(`generated setup file has changed; refusing to overwrite: ${target}`);
+    }
+  }
+  requireExecutable(manifest.proxyBinary, "configured proxy binary");
 }
 
 function writePrivateFileSet(entries) {
@@ -585,6 +895,110 @@ function writePrivateFileSet(entries) {
       try { fs.unlinkSync(temp); } catch { /* already linked or best-effort cleanup */ }
     }
   }
+}
+
+function replacementTempPath(target) {
+  return path.join(path.dirname(target), `.${path.basename(target)}.next`);
+}
+
+// Atomically replaces each existing target's content in place (mode 0600), used by
+// `parable setup --add-vendors` to rewrite only parable.toml + setup.json while leaving
+// every other setup file (proxy config/token/binary, OAuth credentials) untouched.
+//
+// Recovery contract: each target's temp sibling has a fixed canonical name
+// (".<basename>.next"), not a pid/random one, so a process that crashes between writing
+// the temp file and renaming it over the target leaves exactly one recognizable artifact
+// per target. A later run of the same operation always starts by discarding any leftover
+// ".next" files for its own targets (removeReplacementArtifacts) before writing fresh
+// ones, so it always recovers from that one canonical half-transition shape. Any other
+// unexpected file in the config directory is left alone and is never treated as
+// recoverable state.
+function removeReplacementArtifacts(entries) {
+  for (const [target] of entries) {
+    try { fs.unlinkSync(replacementTempPath(target)); } catch { /* nothing to clean up */ }
+  }
+}
+
+// Durably commit directory-entry changes (temp creation, rename, cleanup) so a
+// host crash after a rename cannot resurface a state the recovery contract does
+// not recognize. Best-effort on platforms that reject directory fsync.
+function fsyncDirectory(directory) {
+  let descriptor;
+  try {
+    descriptor = fs.openSync(directory, "r");
+  } catch {
+    return;
+  }
+  try {
+    fs.fsyncSync(descriptor);
+  } catch { /* some platforms cannot fsync directories */ } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function replacePrivateFileSet(entries) {
+  const directories = new Set(entries.map(([target]) => path.dirname(target)));
+  removeReplacementArtifacts(entries);
+  const temporary = [];
+  try {
+    for (const [target, content] of entries) {
+      const temp = replacementTempPath(target);
+      const descriptor = fs.openSync(temp, "wx", 0o600);
+      try {
+        fs.writeFileSync(descriptor, content, "utf8");
+        fs.fsyncSync(descriptor);
+      } finally {
+        fs.closeSync(descriptor);
+      }
+      fs.chmodSync(temp, 0o600);
+      temporary.push(temp);
+    }
+    directories.forEach(fsyncDirectory);
+    entries.forEach(([target], index) => {
+      fs.renameSync(temporary[index], target);
+      fsyncDirectory(path.dirname(target));
+    });
+  } finally {
+    removeReplacementArtifacts(entries);
+    directories.forEach(fsyncDirectory);
+  }
+}
+
+// A `replacePrivateFileSet` batch renames one target at a time, so a crash between the
+// first and last rename can leave targets split between the old and new canonical content.
+// A target that has not yet been renamed may also retain its exact new content in the
+// fixed `.next` sibling. Return null for any content outside that closed old/new set.
+function inspectReplacementState(oldEntries, newEntries) {
+  const oldByTarget = new Map(oldEntries);
+  const newByTarget = new Map(newEntries);
+  let sawNew = false;
+  let sawOld = false;
+  let sawNext = false;
+  for (const [target] of newEntries) {
+    const oldContent = oldByTarget.get(target);
+    const newContent = newByTarget.get(target);
+    const actual = fs.readFileSync(target, "utf8");
+    const nextPath = replacementTempPath(target);
+    const nextContent = lstatOrNull(nextPath) ? fs.readFileSync(nextPath, "utf8") : null;
+    if (nextContent !== null) {
+      sawNext = true;
+      if (nextContent !== newContent) return null;
+    }
+    if (actual === oldContent) sawOld = true;
+    else if (actual === newContent) sawNew = true;
+    else return null;
+  }
+  return { sawNew, sawOld, sawNext };
+}
+
+function reconcileReplacementHalfState(oldEntries, newEntries) {
+  const state = inspectReplacementState(oldEntries, newEntries);
+  if (!state) {
+    throw new OnboardingError("generated setup replacement state is not canonical; refusing to overwrite");
+  }
+  if (!state.sawNew && !state.sawNext) return "current";
+  replacePrivateFileSet(newEntries);
+  return "recovered";
 }
 
 function validateParableConfig(configPath, configDir) {
@@ -723,6 +1137,90 @@ async function runProxyBuild(argv, log) {
   buildProxy(options, log);
 }
 
+async function runProxyUpgrade(argv, log) {
+  const options = parseOptions(argv, new Set(), new Set(["--help"]));
+  if (options._.length) {
+    throw new OnboardingError(`unexpected proxy upgrade argument: ${options._[0]}`);
+  }
+  if (options.help) {
+    log(proxyUpgradeUsage());
+    return;
+  }
+
+  const context = loadSetupContext();
+  const destination = defaultBuildDirectory();
+  const nextBinary = path.join(destination, PROXY_BINARY_NAME);
+  if (context.manifest.proxyBinary === nextBinary) {
+    const migrated = migrateLegacyProxyConfig(
+      context.paths,
+      context.manifest,
+      context.authDir,
+    );
+    validateExistingSetup(
+      context.configDir,
+      context.authDir,
+      context.paths,
+      context.manifest,
+    );
+    log(
+      migrated
+        ? `proxy is current; updated generated compatibility -> ${context.paths.proxyConfig}`
+        : `proxy is current -> ${nextBinary}`,
+    );
+    return;
+  }
+  if (lstatOrNull(destination)) {
+    throw new OnboardingError(
+      `current pinned build directory already exists but is not configured: ${destination}`,
+    );
+  }
+
+  const builtBinary = buildProxy({}, log);
+  const token = readExistingToken(context.paths);
+  const nextManifest = manifestFor(
+    context.configDir,
+    context.authDir,
+    context.paths,
+    context.vendors,
+    builtBinary,
+    context.manifest.port,
+  );
+  const previousEntries = [
+    [context.paths.proxyConfig, fs.readFileSync(context.paths.proxyConfig, "utf8")],
+    [context.paths.manifest, fs.readFileSync(context.paths.manifest, "utf8")],
+  ];
+  const nextEntries = [
+    [
+      context.paths.proxyConfig,
+      renderProxyYaml(context.manifest.port, context.authDir, token),
+    ],
+    [context.paths.manifest, renderManifest(nextManifest)],
+  ];
+  try {
+    replacePrivateFileSet(nextEntries);
+    validateExistingSetup(
+      context.configDir,
+      context.authDir,
+      context.paths,
+      nextManifest,
+    );
+  } catch (error) {
+    replacePrivateFileSet(previousEntries);
+    fs.rmSync(destination, { recursive: true, force: true });
+    throw error;
+  }
+
+  const listener = await probeModels(context.manifest.port, token);
+  if (listener.kind === "ready") {
+    log("upgrade staged; the running proxy was not interrupted");
+    log("the next managed proxy start will use the new binary");
+  } else if (listener.kind === "absent") {
+    log("upgrade active; the next Parable session will start the new binary");
+  } else {
+    log(`upgrade staged; configured endpoint is currently unhealthy (${listener.detail})`);
+  }
+}
+
 function existingManifestSkeleton(configDir, paths) {
   if (stateOf(paths) !== "complete") return null;
   requirePrivateDirectory(configDir, "configuration directory");
@@ -771,7 +1269,13 @@ function loadSetupContext(options = {}) {
     manifest.proxyBinary,
     manifest.port,
   );
-  validateExistingSetup(configDir, authDir, paths, desired, options);
+  validateExistingSetup(
+    configDir,
+    authDir,
+    paths,
+    desired,
+    { ...options, acceptLegacyProxyConfig: true },
+  );
   return { configDir, authDir, paths, manifest: desired, vendors };
 }
 
@@ -793,6 +1297,7 @@ function authUsage() {
     "       parable auth add chatgpt [--device]",
     "       parable auth add claude",
     "       parable auth add xai",
+    "       parable auth add kimi",
     "       parable auth status [--json]",
   ].join("\n");
 }
@@ -866,7 +1371,9 @@ async function runAuthAdd(argv, log) {
     return;
   }
   if (options._.length !== 1) {
-    throw new OnboardingError("auth add requires exactly one vendor: chatgpt, claude, or xai");
+    throw new OnboardingError(
+      `auth add requires exactly one vendor: ${VENDOR_ORDER.join(", ")}`,
+    );
   }
   const vendor = options._[0];
   if (!Object.hasOwn(AUTH_FLAGS, vendor)) {
@@ -890,6 +1397,7 @@ function emptyAuthStatus(directoryModeValid) {
       chatgpt: { present: false, recordCount: 0 },
       claude: { present: false, recordCount: 0 },
       xai: { present: false, recordCount: 0 },
+      kimi: { present: false, recordCount: 0 },
     },
     records: {
       total: 0,
@@ -977,7 +1485,7 @@ function scanAuthStatus(authDir) {
     status.scanned = false;
     return status;
   }
-  const providerByType = { codex: "chatgpt", claude: "claude", xai: "xai" };
+  const providerByType = { codex: "chatgpt", claude: "claude", xai: "xai", kimi: "kimi" };
   for (const entry of fs.readdirSync(authDir, { withFileTypes: true })) {
     if (!entry.name.endsWith(".json")) continue;
     status.records.total += 1;
@@ -1113,6 +1621,7 @@ async function runProxyStart(argv, log) {
     return 0;
   }
   const context = loadSetupContext();
+  activateGeneratedProxyConfig(context, log);
   const child = spawn(
     context.manifest.proxyBinary,
     ["--config", context.paths.proxyConfig, "--local-model"],
@@ -1336,7 +1845,10 @@ function spawnFinalize(argv, env) {
   return observedChild(child, "python3");
 }
 
-async function runManagedClient(context, token, spawnClient, clientLabel, log) {
+async function runManagedClient(
+  context, token, spawnClient, clientLabel, log, recovery = null,
+) {
+  activateGeneratedProxyConfig(context, log);
   const initialProbe = await probeModels(context.manifest.port, token);
   if (initialProbe.kind === "occupied") {
     throw new OnboardingError(
@@ -1360,23 +1872,69 @@ async function runManagedClient(context, token, spawnClient, clientLabel, log) {
       );
     }
 
-    const client = spawnClient();
-    let forwardedSignal = null;
-    const signalTargets = ownedProxy
-      ? [client.child, ownedProxy.child] : [client.child];
-    const stopForwarding = forwardSignals(signalTargets, (signal) => {
-      forwardedSignal = signal;
-    });
-    try {
-      if (!ownedProxy) {
-        const outcome = await client.done;
-        if (client.error) throw client.error;
-        return forwardedSignal ? signalExitCode(forwardedSignal) : childExitCode(outcome);
-      }
-      const winner = await Promise.race([
+    let client = spawnClient(null);
+    const recoveryAttempts = { context: 0, teammate: 0 };
+    while (true) {
+      let forwardedSignal = null;
+      const signalTargets = ownedProxy
+        ? [client.child, ownedProxy.child] : [client.child];
+      const stopForwarding = forwardSignals(signalTargets, (signal) => {
+        forwardedSignal = signal;
+      });
+      const contestants = [
         client.done.then((outcome) => ({ owner: "client", outcome })),
-        ownedProxy.done.then((outcome) => ({ owner: "proxy", outcome })),
-      ]);
+      ];
+      if (ownedProxy) {
+        contestants.push(
+          ownedProxy.done.then((outcome) => ({ owner: "proxy", outcome })),
+        );
+      }
+      if (
+        recovery
+        && (
+          recoveryAttempts.context < recovery.maxContextAttempts
+          || recoveryAttempts.teammate < recovery.maxTeammateAttempts
+        )
+      ) {
+        contestants.push(
+          waitForContextRecovery(client, recovery.requestPath).then(
+            (request) => ({ owner: "recovery", request }),
+          ),
+        );
+      }
+      let winner;
+      try {
+        winner = await Promise.race(contestants);
+      } finally {
+        stopForwarding();
+      }
+      if (winner.owner === "recovery") {
+        const recoveryKind = winner.request.reason === "teammate_interrupt"
+          ? "teammate" : "context";
+        const recoveryLimit = recoveryKind === "teammate"
+          ? recovery.maxTeammateAttempts : recovery.maxContextAttempts;
+        if (recoveryAttempts[recoveryKind] >= recoveryLimit) continue;
+        recoveryAttempts[recoveryKind] += 1;
+        if (winner.request.reason === "resume_picker") {
+          log(
+            "context: resume selected; checking with Sonnet 5, then resuming "
+              + `${winner.request.sessionId}`,
+          );
+        } else if (winner.request.reason === "teammate_interrupt") {
+          log(
+            "session: teammate update interrupted the active turn; resuming "
+              + `${winner.request.sessionId}`,
+          );
+        } else {
+          log(
+            "context: limit reached; compacting with Sonnet 5, then resuming "
+              + `${winner.request.sessionId}`,
+          );
+        }
+        await stopObservedChild(client);
+        client = spawnClient(winner.request);
+        continue;
+      }
       if (winner.owner === "client") {
         if (client.error) throw client.error;
         return forwardedSignal ? signalExitCode(forwardedSignal) : childExitCode(winner.outcome);
@@ -1389,8 +1947,6 @@ async function runManagedClient(context, token, spawnClient, clientLabel, log) {
         `managed CLIProxyAPI exited ${outcomeDescription(winner.outcome)} while ${clientLabel} was running`,
         status === 0 ? 1 : status,
       );
-    } finally {
-      stopForwarding();
     }
   } finally {
     await stopObservedChild(ownedProxy);
@@ -1426,8 +1982,206 @@ async function runClaude(argv, log) {
 
   const context = loadSetupContext();
   const token = readExistingToken(context.paths);
-  const env = { ...process.env, CLIPROXY_API_KEY: token };
-  return runManagedClient(context, token, () => spawnClaude(argv, env), "Claude", log);
+  const recovery = claudeContextRecoverySupported(argv)
+    ? createContextRecoveryChannel() : null;
+  const env = {
+    ...process.env,
+    CLIPROXY_API_KEY: token,
+  };
+  delete env[CONTEXT_RECOVERY_ENV];
+  delete env[CONTEXT_RESUME_PICKER_ENV];
+  delete env[TEAMMATE_RECOVERY_ACTIVE_ENV];
+  if (recovery) env[CONTEXT_RECOVERY_ENV] = recovery.requestPath;
+  if (recovery && claudeResumePickerRequested(argv)) {
+    env[CONTEXT_RESUME_PICKER_ENV] = "1";
+  }
+  try {
+    return await runManagedClient(
+      context,
+      token,
+      (request) => {
+        if (!request) return spawnClaude(argv, env);
+        const resumeEnv = { ...env };
+        delete resumeEnv[CONTEXT_RESUME_PICKER_ENV];
+        if (request.reason === "teammate_interrupt") {
+          resumeEnv[TEAMMATE_RECOVERY_ACTIVE_ENV] = "1";
+        }
+        return spawnClaude(
+          withExactClaudeResume(
+            argv,
+            request.sessionId,
+            request.reason === "teammate_interrupt",
+          ),
+          resumeEnv,
+        );
+      },
+      "Claude",
+      log,
+      recovery && {
+        requestPath: recovery.requestPath,
+        maxContextAttempts: CONTEXT_RECOVERY_MAX_ATTEMPTS,
+        maxTeammateAttempts: TEAMMATE_RECOVERY_MAX_ATTEMPTS,
+      },
+    );
+  } finally {
+    removeContextRecoveryChannel(recovery);
+  }
+}
+
+// `parable setup --add-vendors kimi [--no-auth]`: extends an already-complete, canonical
+// setup with additional vendors without touching the proxy token, binary, or any OAuth
+// credential file. Only parable.toml and setup.json are rewritten, and only via an atomic
+// replace (see replacePrivateFileSet). Requires an existing complete setup that matches its
+// own recorded manifest byte-for-byte (validateExistingSetup) before anything is written,
+// so arbitrary drift is rejected the same way the ordinary `parable setup` re-run is.
+//
+// --config-dir is honored the same way plain `parable setup` honors it (an explicit
+// override of the active setup directory); when absent, the active directory is resolved
+// from PARABLE_CONFIG / the default ~/.config/parable exactly as activeSetupDirectory does.
+async function runSetupAddVendors(options, log) {
+  const configDir = path.resolve(options.config_dir || activeSetupDirectory());
+  const authDir = path.resolve(path.join(os.homedir(), ".cli-proxy-api"));
+  const paths = setupPaths(configDir);
+  if (stateOf(paths) !== "complete") {
+    throw new OnboardingError("--add-vendors requires an existing complete setup; run `parable setup` first");
+  }
+
+  const addVendors = parseAddVendors(options.add_vendors);
+  const manifestOnDisk = existingManifestSkeleton(configDir, paths);
+  let vendorsOnDisk;
+  try {
+    vendorsOnDisk = parseVendors(manifestOnDisk.vendors.join(","));
+  } catch {
+    throw new OnboardingError("setup.json contains an invalid vendor selection");
+  }
+  if (manifestOnDisk.port < 1 || manifestOnDisk.port > 65535) {
+    throw new OnboardingError("setup.json contains an invalid proxy port");
+  }
+
+  const manifestForVendors = (vendors) => manifestFor(
+    configDir, authDir, paths, vendors, manifestOnDisk.proxyBinary, manifestOnDisk.port,
+  );
+  const entriesForVendors = (vendors) => [
+    [paths.parableConfig, renderParableToml(manifestOnDisk.port, vendors)],
+    [paths.manifest, renderManifest(manifestForVendors(vendors))],
+  ];
+  const currentDesired = manifestForVendors(vendorsOnDisk);
+  const currentEntries = entriesForVendors(vendorsOnDisk);
+  const nextVendors = VENDOR_ORDER.filter(
+    (vendor) => vendorsOnDisk.includes(vendor) || addVendors.includes(vendor),
+  );
+  const nextDesired = manifestForVendors(nextVendors);
+  const nextEntries = entriesForVendors(nextVendors);
+
+  // The ordinary state is checked first. If it is canonical, any `.next` artifacts
+  // must also match this exact requested upgrade before they may be completed or removed.
+  let currentValidationError = null;
+  try {
+    validateExistingSetup(
+      configDir,
+      authDir,
+      paths,
+      currentDesired,
+      { acceptLegacyProxyConfig: true },
+    );
+    migrateLegacyProxyConfig(paths, currentDesired, authDir);
+    validateExistingSetup(configDir, authDir, paths, currentDesired);
+  } catch (error) {
+    currentValidationError = error;
+  }
+  if (!currentValidationError) {
+    const outcome = reconcileReplacementHalfState(currentEntries, nextEntries);
+    if (outcome === "recovered") {
+      validateExistingSetup(configDir, authDir, paths, nextDesired);
+      validateParableConfig(paths.parableConfig, configDir);
+      log(`setup already includes: ${nextVendors.join(", ")}`);
+      log(`no-op -> ${configDir}`);
+      return { configDir, authDir, paths, manifest: nextDesired, vendors: nextVendors };
+    }
+    validateParableConfig(paths.parableConfig, configDir);
+    if (nextVendors.length === vendorsOnDisk.length) {
+      log(`setup already includes: ${vendorsOnDisk.join(", ")}`);
+      log(`no-op -> ${configDir}`);
+      return { configDir, authDir, paths, manifest: currentDesired, vendors: vendorsOnDisk };
+    }
+  } else {
+    // A process can stop after either target rename. Validate the invariant envelope,
+    // then accept only a byte-exact old/new pair for this requested additive operation.
+    validateExistingSetupEnvelope(configDir, authDir, paths, manifestOnDisk);
+    const candidates = [];
+    if (nextVendors.length !== vendorsOnDisk.length) {
+      candidates.push({
+        oldVendors: vendorsOnDisk,
+        newVendors: nextVendors,
+        oldEntries: currentEntries,
+        newEntries: nextEntries,
+      });
+    }
+
+    // If setup.json was renamed first, it already lists the final vendors. Enumerate
+    // which requested vendors were newly added and find the unique prior TOML by exact
+    // generated bytes. The vendor set is bounded, so exhaustive subsets stay trivial.
+    const removable = addVendors.filter(
+      (vendor) => vendor !== "claude" && vendorsOnDisk.includes(vendor),
+    );
+    for (let mask = 1; mask < (1 << removable.length); mask += 1) {
+      const removed = new Set(
+        removable.filter((_vendor, index) => (mask & (1 << index)) !== 0),
+      );
+      const oldVendors = VENDOR_ORDER.filter(
+        (vendor) => vendorsOnDisk.includes(vendor) && !removed.has(vendor),
+      );
+      if (!oldVendors.includes("claude")) continue;
+      candidates.push({
+        oldVendors,
+        newVendors: vendorsOnDisk,
+        oldEntries: entriesForVendors(oldVendors),
+        newEntries: currentEntries,
+      });
+    }
+
+    const recoverable = candidates.filter((candidate) => {
+      const state = inspectReplacementState(candidate.oldEntries, candidate.newEntries);
+      return state && (state.sawNew || state.sawNext);
+    });
+    const uniqueFinals = new Map();
+    for (const candidate of recoverable) {
+      const key = candidate.newEntries.map(([, content]) => content).join("\u0000");
+      uniqueFinals.set(key, candidate);
+    }
+    if (uniqueFinals.size !== 1) throw currentValidationError;
+
+    const recovered = [...uniqueFinals.values()][0];
+    replacePrivateFileSet(recovered.newEntries);
+    const recoveredDesired = manifestForVendors(recovered.newVendors);
+    validateExistingSetup(configDir, authDir, paths, recoveredDesired);
+    validateParableConfig(paths.parableConfig, configDir);
+    log(`setup already includes: ${recovered.newVendors.join(", ")}`);
+    log(`no-op -> ${configDir}`);
+    return {
+      configDir,
+      authDir,
+      paths,
+      manifest: recoveredDesired,
+      vendors: recovered.newVendors,
+    };
+  }
+
+  replacePrivateFileSet(nextEntries);
+  try {
+    validateExistingSetup(configDir, authDir, paths, nextDesired);
+    validateParableConfig(paths.parableConfig, configDir);
+  } catch (error) {
+    // Roll back to the last-known-good, still-canonical state rather than leaving a
+    // parable.toml that fails validation on disk.
+    replacePrivateFileSet(currentEntries);
+    throw error;
+  }
+  const added = nextVendors.filter((vendor) => !vendorsOnDisk.includes(vendor));
+  log(`updated private setup -> ${configDir}`);
+  log(`added vendors: ${added.join(", ")}`);
+  log(`selected vendors: ${nextVendors.join(", ")}`);
+  return { configDir, authDir, paths, manifest: nextDesired, vendors: nextVendors };
 }
 
 async function runSetup(argv, log) {
@@ -1435,6 +2189,24 @@ async function runSetup(argv, log) {
   if (options.help) {
     log(setupUsage());
     return;
+  }
+  if (options.add_vendors !== undefined) {
+    const context = await runSetupAddVendors(options, log);
+    if (!options.no_auth) {
+      let status = scanAuthStatus(context.authDir);
+      for (const vendor of context.vendors) {
+        if (status.providers[vendor].present) {
+          log(`${vendor}: already authorized`);
+          continue;
+        }
+        runNativeAuth(context, vendor, false, log);
+        status = scanAuthStatus(context.authDir);
+      }
+      log("authorization complete; next: parable");
+    } else {
+      log("next: authorize each newly selected subscription, then run parable");
+    }
+    return context;
   }
   const configDir = path.resolve(options.config_dir || path.join(os.homedir(), ".config", "parable"));
   const authDir = path.resolve(path.join(os.homedir(), ".cli-proxy-api"));
@@ -1474,9 +2246,21 @@ async function runSetup(argv, log) {
     const desired = manifestFor(configDir, authDir, paths, vendors, proxyBinary, port);
 
     if (existing) {
+      validateExistingSetup(
+        configDir,
+        authDir,
+        paths,
+        desired,
+        { acceptLegacyProxyConfig: true },
+      );
+      const migratedProxyConfig = migrateLegacyProxyConfig(paths, desired, authDir);
       validateExistingSetup(configDir, authDir, paths, desired);
       validateParableConfig(paths.parableConfig, configDir);
-      log(`setup is valid and unchanged -> ${configDir}`);
+      log(
+        migratedProxyConfig
+          ? `updated generated proxy compatibility -> ${paths.proxyConfig}`
+          : `setup is valid and unchanged -> ${configDir}`,
+      );
     } else {
       const configCreated = createPrivateDirectory(configDir, "configuration directory");
       const authCreated = createPrivateDirectory(authDir, "CLIProxyAPI auth directory");
@@ -1537,4 +2321,6 @@ module.exports = {
   setupClientEnvironment,
   setupUsage,
   proxyBuildUsage,
+  proxyUpgradeUsage,
+  runProxyUpgrade,
 };

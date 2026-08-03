@@ -1,5 +1,21 @@
 # parable.toml schema reference
 
+## Multi-model mode vs. solo mode
+
+This schema reference covers **multi-model Parable mode**. When running in solo mode (`parable --solo`), many config sections are ignored. **Solo requires `[claude]` configured and only works with loopback proxy models** (not codex, pi, cursor). See the table below.
+
+| Section | Multi-model | Solo | Notes |
+|---------|-----------|------|-------|
+| `[parable]` | Used | Used | Except `default_executor`, `default_reviewer` |
+| `[claude]` | Used | **Required** | Proxy and catalog checks required; solo exits if missing |
+| `[providers.*]` | Used | Validated; subagent types aid aliases* | Codex/pi/cursor providers are not dispatched in solo |
+| `[executors.*]` | Used | Validated; enabled exact subagent models aid aliases* | No executor is dispatched and no agent file is written |
+| `[checks.*]` | Used | Used | Verification still runs |
+| `[research]` | Used | Used | If in-session research tools are invoked |
+| `[routing]` | **Used** | Ignored | Solo has no routing logic |
+
+*The complete merged config is still parsed and validated. Solo reads enabled exact-model executors only to resolve friendly names, then launches the selected model directly.
+
 ## Resolution and merging
 
 Files load lowest-precedence first; later files win:
@@ -46,16 +62,19 @@ Optional stock-Claude-Code launcher configuration. It is required by bare `parab
 | `brain_model` | required | Exact model id for the main Claude Code session, such as `gpt-5.6-sol`. |
 | `binary` | `claude` | Optional Claude Code command name or path. |
 
-`parable` checks `/v1/models` before launch and requires the brain model plus every
-configured arbitrary-model Claude executor to be present. It then synchronizes project-local
-`.claude/agents/parable-*.md` files and launches Claude Code with per-process
+`parable` checks `/v1/models` before launch and requires the selected brain model. It classifies
+configured arbitrary-model Claude executors against that session snapshot, synchronizes every
+project-local `.claude/agents/parable-*.md` file, and launches Claude Code with per-process
 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`; it does not write global Claude settings.
+Missing optional executors are marked unavailable in the session card and rejected by the
+`PreToolUse` hook before dispatch. Restart Parable after authentication recovers to refresh
+availability; transient absence never deletes configured agent files.
 The source token variable, `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, and
 `CLAUDE_CODE_SUBAGENT_MODEL` are removed from the child environment. A forwarded `--model`
 is rejected so parent selection stays inside Parable's declared policy.
 
-The launcher-level `--brain` policy can be `config`, `fable`, `sol`, or `auto`. `config` uses
-`brain_model` verbatim. `auto` prefers configured Fable while its live Claude usage is below
+The launcher-level `--brain` policy can be `config`, `fable`, `sol`, or `auto`. `config` requires
+the configured `brain_model` to be available. `auto` prefers configured Fable while its live Claude usage is below
 80%, probes ChatGPT only when that pool is tight, and then selects Sol when it has more or
 unknown headroom. Explicit `fable` or `sol` fails unless that exact model is configured and
 present in the authenticated catalog. Bare `parable` means `--brain auto` with high effort.
@@ -63,6 +82,60 @@ Claude flags pass through directly; use `parable --dangerously-skip-permissions`
 brain with `parable --brain fable --effort high`. An optional `--` can separate Parable's brain
 option from Claude arguments. Interactive sessions show this selection and the usable executor
 cast in Claude Code via a user-only startup system message; the model does not receive the card.
+
+`parable --solo <alias|exact-model>` instead requires only the selected exact catalog id, skips
+agent synchronization, launches that model as the parent, removes agent-team enablement, and passes
+`--disallowedTools Agent` to Claude Code. It rejects `--brain`, `--model`, `--agent`, `--agents`,
+and caller-supplied allowed/disallowed-tool overrides so the single-agent contract cannot be weakened.
+
+### Context ceiling for proxied non-Anthropic models
+
+Claude Code does not know the real context window of models it does not recognize: it assumes
+200k, or 1M when the parent carries a `[1m]`/long-context marker — and for a proxied non-Anthropic
+model both guesses are wrong, so auto-compact fires far too late and the session dies with an
+upstream `400 Your input exceeds the context window` error. Parable fixes this at launch by
+setting both `CLAUDE_CODE_MAX_CONTEXT_TOKENS` and the independently evaluated
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW` to the real ceiling, plus
+`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=75` to leave room for tool results and the compaction request:
+
+- **Solo mode** uses the selected model's exact window.
+- **Multi-model mode** uses the minimum window across the brain and every enabled non-Claude
+  proxy model in the cast (Claude Code applies the variable only to non-`claude-` models, so
+  Anthropic parents and subagents are never handicapped). An unknown model counts as Claude
+  Code's own 200k fallback rather than raising the ceiling blindly.
+- Built-in windows come from the pinned proxy's own model registry (gpt-5.6-sol/terra/luna
+  372k, grok-4.5 500k, kimi-k3 1M via upstream `k3` normalization, Claude 5-class 1M). Override
+  or extend per executor with `context_ktok`.
+- User-provided values always win independently. When you provide only
+  `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, Parable uses that value for the auto-compact window too;
+  an explicit `CLAUDE_CODE_AUTO_COMPACT_WINDOW` or `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` is never
+  overwritten. An unknown solo model leaves all three variables unset unless you explicitly
+  provide a context ceiling.
+
+The launch line reports both controls (`context ceiling 372,000 tokens; auto-compact 75%`) and
+the startup card shows each model's real window (`· 372k ctx`). For Sol, 75% starts compaction
+near 279k instead of waiting until roughly 353k; this leaves about 74k of headroom below the
+Codex route's 353.4k effective input window.
+
+Those environment controls protect future turns, but they cannot repair a saved conversation
+that is already larger than a newly selected model's window. On explicit CLI resumes
+(`--continue`, `--resume <name-or-id>`, and `--from-pr <value>`), Parable first runs Claude
+Code's native `/context` under `claude-sonnet-5[1m]` at low effort. This inspection uses zero
+model tokens. At or above 75% of the target ceiling, Parable invokes native `/compact` in that
+same resolved session with Sonnet, then launches the requested model on the compacted history.
+If inspection or compaction fails, Parable fails closed instead of opening a model that cannot
+hold the session. With plain `parable --resume`, Claude first resolves the interactive picker;
+the managed launcher then stops that process and runs the same exact-session guard before the
+first prompt. The launcher prints before a long Sonnet compaction begins and again when it starts
+verification, so the terminal does not appear idle. A forked explicit resume remains skipped
+because its destination is a new session.
+
+The managed interactive launcher also has a one-shot fallback for a missed native compaction.
+On the exact main-session context-window StopFailure, its private hook request tells the Node
+supervisor to stop the stranded Claude child. The ordinary resume preflight then compacts that
+same session under low-effort `claude-sonnet-5[1m]` and relaunches the original command with an
+exact `--resume <session-id>`. Subagent and unrelated API failures do not trigger recovery, and
+a second context failure remains visible for manual intervention rather than looping.
 
 For a custom executor id such as `kimi`, `parable agents sync` creates the native Claude agent
 name `parable-kimi` with the exact configured model id. Only files carrying Parable's generated
@@ -94,7 +167,7 @@ Unknown `type` values fail validation loudly (future harnesses will extend this 
 | `reasoning` | true | pi only: the generated model entry's reasoning flag |
 | `model_overrides` | `{}` | pi only: raw fields merged into the generated model entry last (`maxTokens`, model-level `compat`, …) — pi's analog of `extra_config` |
 | `cost` | — | `{ in, out, cache_in }` $/Mtok; informational + tie-breaks |
-| `context_ktok` | — | context window, thousands of tokens |
+| `context_ktok` | — | context window, thousands of tokens. For Claude-proxy (`subagent`-typed) executors this also overrides Parable's built-in window table when computing the launch context ceiling (see below) |
 | `tags` | `[]` | routing hints |
 | `use_for` / `avoid_for` | — | prose the brain reads verbatim when routing |
 | `max_minutes` | 20 | wall-clock kill for `run`/`resume` (reported TIMEOUT) |
@@ -118,7 +191,9 @@ Unknown `type` values fail validation loudly (future harnesses will extend this 
 |---|---|---|
 | `provider` | `grep.ai` | `grep.ai` or `claude`. What it governs and the scope boundary live in SKILL.md's research section. Whole-table merge, repo wins. |
 
-## `[routing]`
+## `[routing]` (Multi-model mode only)
+
+**This section is ignored in solo mode.** It is used only when running Parable in multi-model mode (bare `parable` or `parable --brain`).
 
 Keys are task classes such as `mechanical`, `data_transform`, `frontend`, `feature`,
 `refactor_wide`, `gnarly`, `review`, `smoke_test`, and `architecture`. Their executor-id lists

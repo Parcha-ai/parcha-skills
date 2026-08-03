@@ -1,6 +1,6 @@
-# unc-skills
+# parcha-skills
 
-Miguel's collection of portable Agent Skills for Claude Code, Codex, and pi.
+Our collection of portable Agent Skills for Claude Code, Codex, and pi.
 
 [![skills.sh](https://skills.sh/b/miguelrios/unc-skills)](https://skills.sh/miguelrios/unc-skills)
 
@@ -65,8 +65,13 @@ required.
 Tether also needs its external Hermes runtime. Install the complete bridge with:
 
 ```bash
-npx --yes --package=github:miguelrios/unc-skills#main tether setup --harness=both
+npx --yes --package=@parcha/tether@0.2.0-beta.1 \
+  tether setup --harness=both
 ```
+
+That command installs an immutable published package. Do not install Tether
+from a moving branch. The package README documents source installs pinned to a
+verified 40-character release commit.
 
 ## Install for Claude Code
 

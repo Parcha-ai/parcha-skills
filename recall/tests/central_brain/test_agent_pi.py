@@ -17,8 +17,6 @@ sys.path.insert(0, str(SERVER))
 
 from recall_server.agent import (  # noqa: E402
     AgentExecutionError,
-    ConstrainedAgentTools,
-    DelegationContext,
     RecallAgentService,
     service_from_env,
 )
@@ -29,7 +27,6 @@ from recall_server.agent_pi import (  # noqa: E402
     ProviderKey,
     SubprocessPiTransport,
     _load_provider_key,
-    _tool_definitions,
 )
 from recall_server.federation import SOURCE_FAMILIES  # noqa: E402
 

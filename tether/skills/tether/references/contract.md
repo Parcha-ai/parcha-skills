@@ -1,51 +1,94 @@
-# Bridge contract
+# Binding and delivery contract
 
-## Boundary
+This contract describes the persisted routing boundary. Security, installation,
+retention, and operator recovery are documented in the README and Operations.
 
-The Hermes gateway owns the Slack credential and a mode-`0600` Unix socket. Local publishers send newline-delimited JSON to that socket. They never load a Slack token.
+## BindingV2
 
-One bridge binds:
+Each active bridge records:
 
-- one source capability: `codex_session`, `claude_session`, `zellij_pane`, `hermes_session`, or `headless_run`;
-- one Slack workspace/channel/thread tuple;
-- one owner (`*` means any allowlisted operator and is the shared-channel default);
-- one idempotency key.
+- one source: Codex session, Claude Code session, verified Zellij pane, Hermes
+  session, or explicit headless run;
+- one endpoint: detached native resume, verified Zellij process, or Hermes
+  continuation;
+- one Slack workspace, channel, and thread;
+- one operator policy and idempotency key; and
+- one binding generation.
 
-A trusted local launcher may silently attach an existing Slack thread only after it has captured a concrete native session ID. When that session already runs in Zellij, attach must also capture and fingerprint the exact pane; otherwise Tether would create a parallel resume process. Attach is idempotent and refuses to replace an active binding; it is not a semantic router or stale-session fallback.
+Codex and Claude Code require a concrete native session ID and working
+directory. A native session running in Zellij also records the session, pane,
+adapter, host boot ID, PID, kernel start time, TTY ancestry, and executable
+identity. A Zellij-only bridge requires equivalent process evidence.
 
-An explicit run ID always creates `headless_run`, even inside Codex or Claude Code. Native sessions remain the source when those agents run inside Zellij, but the captured and fingerprinted live pane is their delivery endpoint.
+A headless bridge exists only when the caller supplies `--run-id`. It continues
+as a durable Hermes conversation after the original process exits. Ambient
+agent or Zellij variables never create a headless source.
 
-## Inbound routing
+Legacy or incomplete native records become `rebind_required`. Tether never
+infers missing process identity, converts a native binding to Hermes, or chooses
+a replacement session.
 
-Resolve the exact persisted thread before bypassing Slack's mention gate. Then apply the global allowlist and any explicit per-bridge owner restriction. Shared channels accept every allowlisted operator by default; use one owner only for an intentionally private bridge. Fail closed at every missing field. Deduplicate by Slack message timestamp.
+## Routing
 
-By default, owner restrictions are accepted only for DMs. A public/private
-shared channel rejects an owner-restricted bridge unless the deployment opts in
-with `allow_channel_owner_restrictions = true`. A rejected handoff must not keep
-Hermes's processing or success reaction.
+An inbound Slack event is normalized with its workspace, channel, thread,
+message identity, actor identity, and mentions. Tether then applies:
 
-Socket Mode is the primary inbound transport. Tether also polls a bounded batch of recently active threads through Hermes's existing Slack client. Polled events re-enter the normal adapter and gateway pipeline; a persistent ingress ledger prevents duplicate execution across live delivery, polling, and gateway restarts. Polling never weakens workspace, channel, allowlist, or bridge-owner checks.
+1. configured workspace and channel policy;
+2. the explicit human or trusted-peer-bot allowlist;
+3. direct-message, exact-mention, or locally owned-thread routing;
+4. the persisted bridge and binding generation; and
+5. durable ingress deduplication and one-writer serialization.
 
-Peer-agent collaboration is agentic. Hermes may admit peer messages in threads where the agent is participating; Tether applies the same configured transport policy during reply recovery and routes trusted turns to the exact bound session when one exists. Hermes is not a second writer for a bound thread. Code handles identity, self-echo prevention, and deduplication. The agent decides from conversation context whether a response is warranted and returns exactly `NO_REPLY` when it is not; Hermes suppresses that marker before Slack delivery.
+A bot may participate only when its Slack member ID or bot ID is explicitly
+trusted. Another bot's presence in a thread does not transfer ownership.
+Hermes is not a second writer for a thread bound to a native session.
 
-Queue and serialize native replies per bridge. Strip synthetic Slack thread history before native resume because prior bridge turns already exist in the bound agent session. Terminate the whole continuation process group on cancellation or timeout.
+## Delivery
 
-Never forward the gateway's Slack credential environment to a native agent process. Pass prompts on stdin rather than command arguments. Accept credential-helper output only for explicitly allowlisted environment keys. Treat resume flags as administrator configuration, never Slack-controlled data.
+Each admitted event receives an attempt identity derived from the event, not
+its text. Repeated text is therefore separate work. An attempt records the
+binding generation before submission and checks it again before acknowledgment.
+A rebind increments the generation and fences older work.
 
-## Outcomes
+For a Zellij endpoint, Tether verifies the same process immediately before and
+after submission. A pane ID, pane title, command string, or visible keypress is
+not proof that the intended agent received the turn.
 
-Post native output back to the same Slack thread. When Claude or Codex has a captured Zellij pane, capture its allowlisted agent command and process fingerprint, recheck both before every delivery, inject the operator instruction into that exact pane, verify the text is visible, press Enter, and verify the same agent process remains active. Detached native resume is allowed only when no live pane was captured. Never write into a shell or a pane whose process changed. Continue headless work as a durable Hermes conversation using the root report and thread history as context.
+Native work returns either one useful Slack reply or ends with a standalone
+`NO_REPLY` line. That terminal control line acknowledges the attempt without
+posting the output or any preceding routing rationale. Cancellation terminates
+the active continuation process group when possible and records the terminal
+state.
 
-Display compact origin metadata in the root message without exposing full session IDs or absolute paths. Apply high-confidence credential redaction at Slack egress, sanitize stored and posted errors, and require agents to omit sensitive content that cannot be detected mechanically. Never route to a replacement session after a stale-source failure.
+Slack posting is at least once. Stable client message IDs and a durable outbox
+reduce duplicates, but ambiguous network acceptance remains possible.
 
-## Automation checklist
+## Failure behavior
 
-Before migrating a cron or automation, verify all of the following:
+Tether fails closed when:
 
-- the direct Slack call and token access are removed;
-- `--run-id` is unique per scheduled occurrence;
-- the idempotency key is stable across retries of that occurrence;
-- destination channel, owner, and workspace come from explicit config;
-- message text contains no credential or sensitive raw payload;
-- a real thread reply reaches the intended durable Hermes context;
-- unauthorized and duplicate replies produce no execution.
+- a workspace, channel, actor, or bot is unauthorized;
+- the source or process identity is missing, changed, or ambiguous;
+- the binding generation changes during delivery;
+- the exact native session cannot resume;
+- Hermes is incompatible;
+- the local peer UID differs from the broker UID; or
+- delivery acceptance cannot be determined safely.
+
+Failures contain a typed code and next action but exclude raw session IDs,
+commands, prompts, credentials, and absolute paths. Common codes include:
+
+| Code | Required response |
+| --- | --- |
+| `binding_rebind_required` | Rebind from the intended live session. |
+| `binding_generation_changed` | Retry against the latest verified generation. |
+| `process_identity_missing` | Start the agent in the intended pane, then rebind. |
+| `process_identity_changed` | Rebind; do not reuse the stale endpoint. |
+| `process_identity_ambiguous` | Select one process, then rebind. |
+| `adapter_pane_mismatch` | Rebind from a pane running the intended adapter. |
+| `ack_timeout` | Inspect the bound session before retrying. |
+| `terminal_submit_uncertain` | Inspect the session; do not submit blindly. |
+| `peer_uid_mismatch` | Run the client under the broker's dedicated non-root user. |
+| `broker_busy` | Retry after current local broker work finishes. |
+
+Unknown or malformed state must not trigger a weaker fallback.

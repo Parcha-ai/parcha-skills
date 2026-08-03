@@ -1,21 +1,26 @@
-# GPT, Claude, and Grok subscriptions in one Claude Code session
+# GPT, Claude, Grok, and Kimi subscriptions in one Claude Code session
 
 Parable can run stock Claude Code with exact Fable or `gpt-5.6-sol` as the parent and
-exact GPT, Claude, and Grok named agents through one user-owned, loopback-only
+exact GPT, Claude, Grok, and Kimi named agents through one user-owned, loopback-only
 CLIProxyAPI process.
+
+You can also run in **solo mode** (`parable --solo <model>`) to launch with a single exact model from the loopback proxy — no multi-model casting, no agent delegation. Solo requires `[claude]` configured and only works with exact models exposed through the loopback proxy (not external providers like codex, pi, or cursor). It disables all Agent tool calls and agent synchronization.
 
 ```text
                                       ┌→ this user's ChatGPT subscription
 stock Claude Code → localhost proxy ──┼→ this user's Claude subscription
-                                      └→ this user's xAI subscription
+                                      ├→ this user's xAI subscription
+                                      └→ this user's Kimi Code subscription
 ```
 
 There is no broker, shared deployment, provider API key, or copied Claude Code
 credential in this mode. CLIProxyAPI owns each native OAuth flow and record.
-Parable creates local configuration, delegates to those native flows, checks
-the authenticated model catalog, and generates exact project agents.
+Parable creates local configuration, delegates to those native flows, and checks
+the authenticated model catalog. Normal multi-model launches generate exact project agents;
+solo launches skip agent generation and require only their selected model.
 
-Kimi is paused and is not a setup option.
+Kimi is supported as a first-class subscription through the existing loopback proxy,
+distinct from metered Moonshot/Kimi API-key routes via Fireworks or OpenRouter.
 
 ## Start here
 
@@ -38,12 +43,13 @@ It does not download CLI code.
 
 Before running the shell bootstrap, the skill uses the harness's native structured-question
 UI—`AskUserQuestion` in Claude Code, `request_user_input` when the active Codex mode permits it,
-or the equivalent elsewhere—to ask whether to add ChatGPT and xAI. It falls back to one concise
-question when structured input is unavailable. Claude is the baseline pool. ChatGPT optionally
-adds Sol/Terra/Luna and enables Sol as an automatic fallback; without it, `auto` stays on Fable. If no proxy is
-available, it asks once for consent to install missing build prerequisites and build the pinned,
-patched proxy. It then passes those decisions to one non-interactive `parable.sh` invocation, so
-the user never answers the same question again in a terminal prompt.
+or the equivalent elsewhere—to ask whether to add ChatGPT, xAI, and Kimi subscriptions. It falls
+back to one concise question when structured input is unavailable. Claude is the baseline pool.
+ChatGPT optionally adds Sol/Terra/Luna and enables Sol as an automatic fallback; without it,
+`auto` stays on Fable. xAI and Kimi are independent subscriptions. If no proxy is available, it
+asks once for consent to install missing build prerequisites and build the pinned, patched proxy.
+It then passes those decisions to one non-interactive `parable.sh` invocation, so the user never
+answers the same question again in a terminal prompt.
 
 Claude Code's Bash tool cannot write a later callback into a running command's stdin, and its
 command view may clip long authorization URLs. In that harness only, the skill stages setup with
@@ -92,6 +98,20 @@ ChatGPT pool has more or unknown headroom; if both are tight, it takes the less
 used pool. Unknown Claude usage keeps the preferred Fable parent. Use
 `parable --brain fable` or `parable --brain sol` to pin one explicitly.
 
+To run a single model with no cast and no delegation, use solo mode:
+
+```bash
+parable --solo kimi        # friendly alias
+parable --solo kimi-k3     # exact catalog id
+```
+
+Solo launches stock Claude Code with that one exact model as the only agent. It
+rejects `--model` and any agent/tool flag, disables the `Agent` tool
+(`--disallowedTools Agent`), unsets the experimental agent-teams variable, and
+writes no project agent files. The launch card shows a `SOLO` layout with no
+cast, procession, or delegation cues, so the harness never tries to spawn a peer.
+`--solo` and `--brain` are mutually exclusive.
+
 After Claude Code mounts, an in-UI Parable launch card shows the selected brain and every routed
 model with its `use_for` guidance. Parable supplies it through a session-scoped `SessionStart`
 hook as a user-only system message, so it does not enter model context or create a conversation
@@ -112,18 +132,19 @@ and connect each selected vendor explicitly:
 ```bash
 bash /path/to/installed/parable/parable.sh \
   --non-interactive \
-  --vendors claude,chatgpt,xai \
+  --vendors claude,chatgpt,xai,kimi \
   --build-proxy \
   --no-auth
 parable auth add chatgpt --device
 parable auth add claude
 parable auth add xai
+parable auth add kimi
 parable auth status
 cd /path/to/your/project
 parable
 ```
 
-Only run the Claude/xAI commands if you selected those vendors. Claude auth
+Only run the Claude/xAI/Kimi commands if you selected those vendors. Claude auth
 prints an SSH-forward reminder for callback port `54545`; keep that same
 command alive until its newly issued callback completes. Old authorization
 URLs cannot complete a new PKCE process.
@@ -151,10 +172,22 @@ Automation must state its vendor selection and include Claude:
 ```bash
 bash /path/to/installed/parable/parable.sh \
   --non-interactive \
-  --vendors claude,chatgpt,xai \
+  --vendors claude,chatgpt,xai,kimi \
   --build-proxy \
   --no-auth
 ```
+
+To add Kimi to a complete setup without replacing the local proxy token, binary,
+or existing OAuth records:
+
+```bash
+parable setup --add-vendors kimi --no-auth
+parable auth login
+```
+
+The additive command validates the current generated setup before replacing only
+`parable.toml` and `setup.json`. The login command skips providers that already
+have private credential records.
 
 Supported selections are:
 
@@ -163,7 +196,10 @@ Supported selections are:
 | `claude` | Fable parent plus exact Fable 5, Sonnet 5, Opus 4.8, and Haiku 4.5 agents |
 | `claude,chatgpt` | Claude cast plus exact Sol, Terra, and Luna; Sol becomes an eligible fallback parent |
 | `claude,xai` | Claude cast plus exact Grok 4.5 |
-| `claude,chatgpt,xai` | all eight exact models |
+| `claude,kimi` | Claude cast plus exact Kimi Code through native Kimi OAuth |
+| `claude,chatgpt,xai` | Claude, GPT, and Grok casts (eight models) |
+| `claude,chatgpt,kimi` | Claude and GPT casts, plus Kimi (eight models) |
+| `claude,chatgpt,xai,kimi` | all nine exact models with subscriptions |
 
 Unknown vendors, a selection without Claude, missing executables, partial
 state, changed generated content, unsafe modes, or symlinks all fail without
@@ -200,6 +236,7 @@ Parable adds no OAuth implementation. Its commands become exactly:
 | `auth add chatgpt --device` | `--config … --codex-device-login` |
 | `auth add claude` | `--config … --claude-login --no-browser` |
 | `auth add xai` | `--config … --xai-login --no-browser` |
+| `auth add kimi` | `--config … --kimi-login` |
 | `proxy start` | `--config … --local-model` |
 | `claude` when the endpoint is absent | `--config … --local-model`, supervised |
 
@@ -218,22 +255,29 @@ an existing checkout. The build stops before
 
 | Item | Pin |
 |---|---|
-| CLIProxyAPI base | `v7.2.88` / `93d74a890a44802f656d7f39a573916b2611896e` |
-| Vendored patch SHA-256 | `d35b422da321265150fe393da80a686862ef642ee45c65a3e2fb908d689d5d1f` |
-| Verified toolchain | Go `1.26.5` |
-| Verified harness | Claude Code `2.1.215` |
+| CLIProxyAPI base | `v7.2.103` / `cade44b9cdee6b9328ea2648fd119129fdf11e2d` |
+| Vendored patch SHA-256 | `c0b4c52d4b35040427e1aee0067c99da7068598803604c435ad591d577b2dc5d` |
+| Verified toolchain | Go `1.26.0` |
+| Verified harness | Claude Code `2.1.220` |
 
 The builder applies the vendored effort-translation patch, runs the focused Go
-test slices, and emits a mode-`0700` `parable-cliproxy-api` executable. A
-pre-existing destination is refused rather than reused or deleted.
+test slices, and emits a mode-`0700` `parable-cliproxy-api` executable. An
+existing destination is refused rather than reused or deleted.
+
+For an existing setup, `parable proxy upgrade` builds this pin in a new
+versioned directory and atomically points future launches at it. It never
+interrupts a proxy that is already serving a session. Re-running the command
+after the manifest points at the current pin is a no-op.
 
 Prerequisites are Node 18+, Python 3.11+, Git, Go, and stock Claude Code.
 
 ## Exact proved cast and effort behavior
 
-The live proof covered all 30 parent/child cells: five Sol parent effort values
+The existing live proof covered 30 parent/child cells: five Sol parent effort values
 times six exact named children. Every child used Bash and the parent consumed
-its result.
+its result. Kimi Code now uses the same exact-model route through `kimi-k3`, but
+it is not part of that earlier proof set; complete the authenticated Kimi sentinel
+before claiming live effort fidelity.
 
 | Exact child | Subscription | `low` | `medium` | `high` | `xhigh` | `max` |
 |---|---|---|---|---|---|---|
@@ -243,6 +287,10 @@ its result.
 | `claude-sonnet-5` | Claude | adaptive exact | adaptive exact | adaptive exact | adaptive exact | adaptive exact |
 | `claude-opus-4-8` | Claude | adaptive exact | adaptive exact | adaptive exact | adaptive exact | adaptive exact |
 | `claude-haiku-4-5-20251001` | Claude | → enabled/31,999 | → enabled/31,999 | → enabled/31,999 | → enabled/31,999 | → enabled/31,999 |
+
+The pinned proxy registry advertises `low`, `high`, and `max` thinking levels for
+`kimi-k3`. Parable requests `high` by default and does not claim behavior for
+unverified Kimi effort values.
 
 The authenticated catalog is entitlement truth. A similarly named id, display
 alias, different case, or `-latest` suffix never substitutes for a missing

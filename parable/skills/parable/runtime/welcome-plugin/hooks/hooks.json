@@ -1,7 +1,57 @@
 {
-  "description": "Show the current Parable cast after Claude Code starts.",
+  "description": "Show the Parable cast, preserve exact agent models, and recover stranded main turns.",
   "hooks": {
+    "Notification": [
+      {
+        "matcher": "idle_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/context_recovery.py"],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "matcher": "invalid_request|unknown",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/context_recovery.py"],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/model_guard.py"],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "SessionStart": [
+      {
+        "matcher": "resume|fork",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/context_recovery.py"],
+            "timeout": 5
+          }
+        ]
+      },
       {
         "matcher": "startup|resume",
         "hooks": [

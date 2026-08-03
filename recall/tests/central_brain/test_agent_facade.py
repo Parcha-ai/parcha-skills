@@ -455,7 +455,6 @@ class AgentFacadeUnitTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, "agent_open_invalid")
 
     def test_find_rejects_two_hundred_unadmitted_aliases(self) -> None:
-        admitted = "ldoc_0123456789abcdef0123456789abcdef"
         for index in range(200):
             with self.subTest(index=index):
                 tools = ConstrainedAgentTools(
@@ -497,7 +496,6 @@ class AgentFacadeUnitTest(unittest.TestCase):
                     "complete": True,
                 }
 
-        document_id = "ldoc_0123456789abcdef0123456789abcdef"
         for index in range(200):
             with self.subTest(index=index):
                 tools = ConstrainedAgentTools(

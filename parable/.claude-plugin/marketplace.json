@@ -5,14 +5,14 @@
     "url": "https://parcha.com"
   },
   "metadata": {
-    "description": "Multi-model coding orchestration — the brain tells the story, the cast performs it."
+    "description": "Multi-model orchestration or explicit solo execution with one exact model."
   },
   "plugins": [
     {
       "name": "parable",
       "source": "./",
-      "version": "0.1.16",
-      "description": "Multi-model coding orchestration: plan, route to the cheapest capable executor model, verify with code, review with fresh eyes.",
+      "version": "0.1.29",
+      "description": "Multi-model orchestration or explicit solo execution with one exact model and delegation disabled.",
       "author": {
         "name": "Parcha Labs",
         "url": "https://parcha.com"
