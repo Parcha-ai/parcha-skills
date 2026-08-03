@@ -196,7 +196,13 @@ function renderInstallations() {
   state.data.installations.forEach((item) => {
     const row = document.createElement("article");
     row.className = "installation";
-    const action = item.state === "enabled"
+    const reconnectRequired = [
+      "connector_authority_revoked",
+      "connector_authority_forbidden",
+    ].includes(item.last_error_code);
+    const action = reconnectRequired
+      ? null
+      : item.state === "enabled"
       ? "pause"
       : item.state === "paused"
         ? "resume"
@@ -206,10 +212,9 @@ function renderInstallations() {
     const revoke = item.state === "revoked"
       ? ""
       : `<button data-action="revoke" data-id="${item.id}">revoke</button>`;
-    const reconnectRequired = [
-      "connector_authority_revoked",
-      "connector_authority_forbidden",
-    ].includes(item.last_error_code);
+    const transition = action
+      ? `<button data-action="${action}" data-id="${item.id}">${action}</button>`
+      : "";
     const runtime = reconnectRequired
       ? "reconnect Google to resume"
       : item.last_error_code
@@ -224,7 +229,7 @@ function renderInstallations() {
       <span>${escapeText(brains.get(item.tenant_id) || item.tenant_id)}</span>
       <span class="state">${escapeText(runtime)}</span>
       <div class="installation-actions">
-        <button data-action="${action}" data-id="${item.id}">${action}</button>
+        ${transition}
         ${revoke}
       </div>`;
     target.append(row);
