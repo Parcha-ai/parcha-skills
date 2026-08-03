@@ -151,6 +151,7 @@ class DeepInspectionContractTests(unittest.TestCase):
                 text=True,
                 env={
                     **os.environ,
+                    "PATH": "",
                     "RECALL_EVIDENCE_ROOT": str(root),
                 },
                 timeout=5,

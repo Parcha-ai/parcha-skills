@@ -6,9 +6,9 @@ import json
 import os
 import pathlib
 import re
-import subprocess
 import sys
 import tempfile
+from collections import deque
 
 ROOT = pathlib.Path(
     os.environ.get("RECALL_EVIDENCE_ROOT", "/mnt/archil/evidence")
@@ -604,12 +604,6 @@ def main():
             one_record=args.one_record,
         )
         return
-    files = [path for _, path in selected_files]
-    document_by_path = {
-        str(pathlib.Path(path)): document_id
-        for document_id, path in selected_files
-        if document_id is not None
-    }
     if args.all:
         emitted = 0
         emitted_bytes = 0
@@ -692,72 +686,59 @@ def main():
         if emitted == 0:
             print('{"matches":0}')
         return
-    command = [
-        "rg",
-        "--json",
-        "--ignore-case",
-        "--max-columns",
-        "8000000",
-        "--max-count",
-        str(args.limit),
-        "--context",
-        str(args.context),
-    ]
-    if args.all:
-        command.append("--text")
-    command.extend(["--", pattern, *files])
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        errors="replace",
-    )
+    try:
+        matcher = re.compile(pattern, re.IGNORECASE)
+    except re.error:
+        raise SystemExit(64) from None
     emitted = 0
     emitted_bytes = 0
     emitted_records = set()
-    try:
-        for line in process.stdout or ():
-            try:
-                event = json.loads(line)
-                if event.get("type") not in {"match", "context"}:
-                    continue
-                record = json.loads(event["data"]["lines"]["text"])
-            except (
-                KeyError,
-                TypeError,
-                UnicodeDecodeError,
-                json.JSONDecodeError,
-            ):
-                continue
-            try:
-                matched_path = event["data"]["path"]["text"]
-            except (KeyError, TypeError):
-                matched_path = ""
-            projection = render_record(
-                record,
-                document_by_path.get(str(pathlib.Path(matched_path))),
-                patterns=patterns,
-                excerpt_chars=args.excerpt_chars,
-            )
-            if projection is None:
-                continue
-            record_identity, rendered = projection
-            if record_identity in emitted_records:
-                continue
-            emitted_records.add(record_identity)
-            rendered_bytes = len(rendered.encode())
-            if emitted_bytes + rendered_bytes > OUTPUT_BYTES:
-                break
-            sys.stdout.write(rendered)
-            emitted_bytes += rendered_bytes
-            emitted += 1
-            if emitted >= args.limit:
-                break
-    finally:
-        if process.poll() is None:
-            process.terminate()
-        process.wait()
+    for document_id, path in selected_files:
+        before = deque(maxlen=args.context)
+        trailing = 0
+        try:
+            stream = open(path, encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with stream:
+            for line in stream:
+                matched = matcher.search(line) is not None
+                candidates = []
+                if matched:
+                    candidates.extend(before)
+                    candidates.append(line)
+                    trailing = args.context
+                elif trailing > 0:
+                    candidates.append(line)
+                    trailing -= 1
+                before.append(line)
+                for candidate in candidates:
+                    try:
+                        record = json.loads(candidate)
+                    except json.JSONDecodeError:
+                        continue
+                    projection = render_record(
+                        record,
+                        document_id,
+                        patterns=patterns,
+                        excerpt_chars=args.excerpt_chars,
+                    )
+                    if projection is None:
+                        continue
+                    record_identity, rendered = projection
+                    if record_identity in emitted_records:
+                        continue
+                    rendered_bytes = len(rendered.encode())
+                    if emitted_bytes + rendered_bytes > OUTPUT_BYTES:
+                        break
+                    emitted_records.add(record_identity)
+                    sys.stdout.write(rendered)
+                    emitted_bytes += rendered_bytes
+                    emitted += 1
+                    if emitted >= args.limit:
+                        return
+                if emitted_bytes >= OUTPUT_BYTES:
+                    break
     if emitted == 0:
         print('{"matches":0}')
 
