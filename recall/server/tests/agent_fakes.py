@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from urllib.parse import urlsplit
 
 from contracts.agent_v1 import derive_run_id
@@ -77,3 +78,45 @@ class ScriptedAgentRunner:
             "completed_at": _timestamp(now),
         }
         return {"run": run, "trace": trace, "result": result}
+
+
+class ScriptedExecInspector:
+    """Keep transport E2Es synthetic while exercising receipt verification."""
+
+    def __init__(self, inspector):
+        self.inspector = inspector
+
+    def inspect(self, **arguments):
+        return self.inspector.inspect(**arguments)
+
+    def execute(self, **arguments):
+        records = []
+        receipts = []
+        for document_id, values in arguments["routing_receipts"].items():
+            candidates = list(dict.fromkeys(values))
+            if not candidates:
+                continue
+            # Model the agent selecting exact supporting evidence after opening
+            # a broader routed document instead of citing every routing hint.
+            selected = candidates[-1:]
+            receipts.extend(selected)
+            records.append({
+                "logical_document_id": document_id,
+                "content": "synthetic transport evidence",
+                "event_native_id": "synthetic-event",
+                "occurred_at": "2026-07-23T00:00:00Z",
+                "ordinal": 0,
+                "receipts": selected,
+            })
+        receipts = list(dict.fromkeys(receipts))
+        lines = [json.dumps(record) for record in records]
+        lines.extend(f"RECALL_EVIDENCE {receipt}" for receipt in receipts)
+        return {
+            "provider": "synthetic-exec",
+            "stdout": "\n".join(lines),
+            "stderr": "",
+            "exit_code": 0,
+            "complete": True,
+            "stopped_reason": "completed",
+            "timing": None,
+        }
