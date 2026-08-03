@@ -967,8 +967,8 @@ def service_from_env(environment: dict[str, str]) -> RecallAgentService | None:
         return None
     if runner == "scripted":
         return RecallAgentService(ScriptedAgentRunner())
-    if runner == "pi-ati":
-        from .agent_pi_ati import runner_from_env
+    if runner == "pi":
+        from .agent_pi import runner_from_env
 
         return RecallAgentService(runner_from_env(environment))
     raise RuntimeError("unsupported Recall agent runner")

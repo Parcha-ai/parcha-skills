@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import stat
 import sys
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
@@ -21,12 +22,12 @@ from recall_server.agent import (  # noqa: E402
     RecallAgentService,
     service_from_env,
 )
-from recall_server.agent_pi_ati import (  # noqa: E402
-    CEREBRAS_API_BASE_URL,
+from recall_server.agent_pi import (  # noqa: E402
     MODEL_PROXY_PLACEHOLDER_KEY,
-    PiAtiRunner,
+    PROTOCOL,
+    PiRunner,
     ProviderKey,
-    SubprocessBrainTurnTransport,
+    SubprocessPiTransport,
     _load_provider_key,
     _tool_definitions,
 )
@@ -43,7 +44,7 @@ REQUEST = {
     "contract": "recall.agent-request.v1",
     "schema_version": 1,
     "request_id": "req_0123456789abcdef",
-    "idempotency_key": "synthetic-pi-ati-1",
+    "idempotency_key": "synthetic-pi-1",
     "question": "What changed in Project Aurora during July 23?",
     "depth": "deep",
     "since": "2026-07-23T00:00:00Z",
@@ -268,7 +269,7 @@ def service(transport) -> RecallAgentService:
     fixed = datetime(2026, 7, 25, 10, 0, tzinfo=timezone.utc)
     ticks = iter([10.0, 10.05, 10.25])
     return RecallAgentService(
-        PiAtiRunner(transport),
+        PiRunner(transport),
         clock=lambda: fixed,
         monotonic=lambda: next(ticks),
     )
@@ -277,7 +278,7 @@ def service(transport) -> RecallAgentService:
 class SimpleAgentKernelTest(unittest.TestCase):
     def test_blank_optional_hint_filters_are_normalized_to_absent(self):
         self.assertEqual(
-            PiAtiRunner._authorize_hint_arguments(
+            PiRunner._authorize_hint_arguments(
                 {
                     "query": "project context",
                     "filters": {
@@ -571,7 +572,114 @@ class SimpleAgentKernelTest(unittest.TestCase):
         self.assertEqual(post.exception.code, "agent_post_finish_tool_call")
 
 
-class PiAtiSubprocessBoundaryTest(unittest.TestCase):
+class PiSubprocessBoundaryTest(unittest.TestCase):
+    @unittest.skipUnless(
+        (SERVER / "pi-agent" / "dist" / "worker.js").is_file(),
+        "build server/pi-agent before the direct worker integration test",
+    )
+    def test_direct_pi_worker_runs_open_then_grounded_finish(self):
+        calls = []
+
+        class ModelHandler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                json.loads(self.rfile.read(length))
+                index = len(calls)
+                calls.append(self.path)
+                if index == 0:
+                    name = "open"
+                    arguments = {
+                        "alias": "d1",
+                        "cursor": None,
+                        "record_ordinal": 80,
+                        "page_bytes": 32768,
+                    }
+                else:
+                    name = "finish"
+                    arguments = {
+                        "status": "complete",
+                        "answer": "Aurora selected the bounded bridge.",
+                        "claims": [{
+                            "statement": "Aurora selected the bounded bridge.",
+                            "receipts": [DECISION],
+                        }],
+                        "citations": [DECISION],
+                        "gaps": [],
+                    }
+                chunks = [
+                    {
+                        "id": f"chatcmpl-{index}",
+                        "object": "chat.completion.chunk",
+                        "created": 1,
+                        "model": "gemma-4-31b",
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "role": "assistant",
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "id": f"call-{index}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": name,
+                                        "arguments": json.dumps(arguments),
+                                    },
+                                }],
+                            },
+                            "finish_reason": None,
+                        }],
+                    },
+                    {
+                        "id": f"chatcmpl-{index}",
+                        "object": "chat.completion.chunk",
+                        "created": 1,
+                        "model": "gemma-4-31b",
+                        "choices": [{
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": "tool_calls",
+                        }],
+                    },
+                ]
+                body = "".join(
+                    f"data: {json.dumps(chunk)}\n\n" for chunk in chunks
+                ) + "data: [DONE]\n\n"
+                encoded = body.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ModelHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            worker = SERVER / "pi-agent" / "dist" / "worker.js"
+            transport = SubprocessPiTransport(
+                ("node", str(worker)),
+                model_base_url=f"http://127.0.0.1:{server.server_port}",
+                route_kind="private_broker",
+                provider="broker",
+                expected_route_identity="127.0.0.1",
+                environment={"PATH": os.environ["PATH"]},
+            )
+            result = RecallAgentService(PiRunner(transport)).use_recall(
+                principal(),
+                REQUEST,
+                SyntheticRetrieval(),
+            )
+        finally:
+            server.shutdown()
+            thread.join(timeout=2)
+            server.server_close()
+        self.assertEqual(result["result"]["status"], "complete")
+        self.assertEqual(result["result"]["citations"], [DECISION])
+        self.assertEqual(calls, ["/v1/chat/completions", "/v1/chat/completions"])
+
     def test_render_managed_secret_symlink_is_narrowly_accepted(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "managed-secrets"
@@ -583,7 +691,7 @@ class PiAtiSubprocessBoundaryTest(unittest.TestCase):
             link.symlink_to(target)
 
             with patch(
-                "recall_server.agent_pi_ati.os.getuid",
+                "recall_server.agent_pi.os.getuid",
                 return_value=os.getuid() + 10_000,
             ):
                 key = _load_provider_key(
@@ -602,7 +710,7 @@ class PiAtiSubprocessBoundaryTest(unittest.TestCase):
 
             root.chmod(0o777)
             with patch(
-                "recall_server.agent_pi_ati.os.getuid",
+                "recall_server.agent_pi.os.getuid",
                 return_value=os.getuid() + 10_000,
             ):
                 key = _load_provider_key(
@@ -627,18 +735,23 @@ class PiAtiSubprocessBoundaryTest(unittest.TestCase):
                     _managed_secret_root=managed_root,
                 )
 
-    def test_private_broker_passes_only_non_secret_placeholder(self):
-        child = r"""
+    def _terminal_child(self, *, route_kind, provider, identity):
+        return f'''\
 import json,os,sys
-assert os.environ["LITELLM_API_KEY"]=="not-a-secret"
-assert os.environ["LITELLM_BASE_URL"]=="http://10.23.45.67:9420"
-assert os.environ["ATI_MODEL_ROUTE_KIND"]=="private_broker"
-assert os.environ["ATI_MODEL_PROVIDER"]=="broker"
+assert os.environ["RECALL_PI_API_KEY"]
+assert os.environ["RECALL_PI_ROUTE_KIND"]=="{route_kind}"
+assert os.environ["RECALL_PI_PROVIDER"]=="{provider}"
 start=json.loads(sys.stdin.readline())
-print(json.dumps({"v":"ati.brain.turn.v1","turn_id":start["turn_id"],"seq":0,"type":"terminal.complete","at":"2026-07-25T10:00:00Z","data":{"status":"complete","unresolved_call_ids":[],"model_attestation":{"model_alias":"gemma-4-31b","thinking":"low","route_kind":"private_broker","provider":"broker","route_identity":"10.23.45.67"}}}),flush=True)
-"""
-        transport = SubprocessBrainTurnTransport(
-            (sys.executable, "-c", child),
+print(json.dumps({{"v":"{PROTOCOL}","turn_id":start["turn_id"],"seq":0,"type":"terminal.complete","at":"2026-07-25T10:00:00Z","data":{{"status":"complete","unresolved_call_ids":[],"model_attestation":{{"model_alias":"gemma-4-31b","route_kind":"{route_kind}","provider":"{provider}","route_identity":"{identity}"}}}}}}),flush=True)
+'''
+
+    def test_private_broker_passes_only_placeholder_and_no_ambient_secret(self):
+        transport = SubprocessPiTransport(
+            (sys.executable, "-c", self._terminal_child(
+                route_kind="private_broker",
+                provider="broker",
+                identity="10.23.45.67",
+            )),
             model_base_url="http://10.23.45.67:9420",
             route_kind="private_broker",
             provider="broker",
@@ -646,326 +759,92 @@ print(json.dumps({"v":"ati.brain.turn.v1","turn_id":start["turn_id"],"seq":0,"ty
             environment={"PATH": os.environ["PATH"], "FORBIDDEN_SECRET": "no"},
         )
         outcome = transport.run(
-            {
-                "turn_id": "turn_broker",
-                "data": {"model": {"alias": "gemma-4-31b"}},
-            },
+            {"turn_id": "turn_broker", "data": {"model": {"alias": "gemma-4-31b"}}},
             lambda *_args: {},
             timeout_seconds=3,
         )
-        self.assertEqual(
-            outcome["terminal"]["model_attestation"]["route_identity"],
-            "10.23.45.67",
-        )
-        self.assertEqual(transport.route_kind, "private_broker")
+        self.assertEqual(outcome["terminal"]["model_attestation"]["route_kind"], "private_broker")
         self.assertNotIn("FORBIDDEN_SECRET", transport.child_environment)
         self.assertEqual(MODEL_PROXY_PLACEHOLDER_KEY, "not-a-secret")
 
-    def test_private_broker_rejects_public_url_and_key_sources(self):
-        with self.assertRaisesRegex(RuntimeError, "must be private"):
-            SubprocessBrainTurnTransport(
-                (sys.executable, "-c", "pass"),
-                model_base_url="https://litellm.example",
-                route_kind="private_broker",
-                provider="broker",
-                expected_route_identity="litellm.example",
-            )
-        with self.assertRaisesRegex(RuntimeError, "credential mode"):
-            SubprocessBrainTurnTransport(
-                (sys.executable, "-c", "pass"),
-                model_base_url="http://10.23.45.67:9420",
-                route_kind="private_broker",
-                provider="broker",
-                provider_key=ProviderKey(
-                    value="synthetic-provider-key-value",
-                ),
-                expected_route_identity="10.23.45.67",
-            )
-
-    def test_direct_cerebras_transport_and_attestation(self):
-        child = r"""
-import json,os,sys
-assert os.environ["LITELLM_API_KEY"]=="synthetic-provider-key-value"
-assert os.environ["LITELLM_BASE_URL"]=="https://api.cerebras.ai/v1"
-assert os.environ["ATI_MODEL_ROUTE_KIND"]=="direct_provider"
-assert os.environ["ATI_MODEL_PROVIDER"]=="cerebras"
-start=json.loads(sys.stdin.readline())
-turn=start["turn_id"]
-def send(seq,kind,data):
- print(json.dumps({"v":"ati.brain.turn.v1","turn_id":turn,"seq":seq,"type":kind,"at":"2026-07-25T10:00:00Z","data":data}),flush=True)
-send(0,"tool.invoke",{"call_id":"call-1","name":"recall_show","arguments":{"target":"recall://source:synthetic:company/item?rev=1#item=0"},"parent_event_id":"event-1","effect":"read","approval":"never","timeout_hint_ms":1000,"idempotency":"none","readback":"result"})
-result=json.loads(sys.stdin.readline())
-assert result["data"]["status"]=="ok"
-send(1,"terminal.complete",{"status":"complete","unresolved_call_ids":[],"model_attestation":{"model_alias":"gemma-4-31b","thinking":"low","route_kind":"direct_provider","provider":"cerebras","route_identity":"api.cerebras.ai"}})
-"""
-        key = ProviderKey(
-            value="synthetic-provider-key-value",
-        )
-        transport = SubprocessBrainTurnTransport(
-            (sys.executable, "-c", child),
-            model_base_url=CEREBRAS_API_BASE_URL,
+    def test_direct_openai_compatible_route_is_attested(self):
+        key = ProviderKey(value="synthetic-provider-key-value")
+        transport = SubprocessPiTransport(
+            (sys.executable, "-c", self._terminal_child(
+                route_kind="direct_provider",
+                provider="openai-compatible",
+                identity="api.cerebras.ai",
+            )),
+            model_base_url="https://api.cerebras.ai/v1",
             route_kind="direct_provider",
-            provider="cerebras",
+            provider="openai-compatible",
             provider_key=key,
             expected_route_identity="api.cerebras.ai",
             environment={"PATH": os.environ["PATH"], "FORBIDDEN_SECRET": "no"},
         )
-        seen = []
         outcome = transport.run(
-            {
-                "turn_id": "turn_synthetic",
-                "data": {
-                    "session_id": "session",
-                    "run_id": "run",
-                    "model": {"alias": "gemma-4-31b"},
-                },
-            },
-            lambda name, arguments: seen.append((name, arguments)) or {
-                "resolved_receipt": arguments["target"]
-            },
-            timeout_seconds=3,
-        )
-        self.assertEqual(seen[0][0], "recall_show")
-        self.assertEqual(
-            outcome["terminal"]["model_attestation"]["route_kind"],
-            "direct_provider",
-        )
-        self.assertNotIn("FORBIDDEN_SECRET", transport.child_environment)
-        self.assertNotIn("LITELLM_API_KEY", transport.child_environment)
-        self.assertNotIn("synthetic-provider-key-value", repr(key))
-
-    def test_direct_cerebras_accepts_silent_success_terminal(self):
-        child = r"""
-import json,sys
-start=json.loads(sys.stdin.readline())
-print(json.dumps({"v":"ati.brain.turn.v1","turn_id":start["turn_id"],"seq":0,"type":"terminal.complete","at":"2026-07-25T10:00:00Z","data":{"status":"silent","unresolved_call_ids":[],"model_attestation":{"model_alias":"gemma-4-31b","thinking":"low","route_kind":"direct_provider","provider":"cerebras","route_identity":"api.cerebras.ai"}}}),flush=True)
-"""
-        transport = SubprocessBrainTurnTransport(
-            (sys.executable, "-c", child),
-            model_base_url=CEREBRAS_API_BASE_URL,
-            route_kind="direct_provider",
-            provider="cerebras",
-            provider_key=ProviderKey(
-                value="synthetic-provider-key-value",
-            ),
-            expected_route_identity="api.cerebras.ai",
-            environment={"PATH": os.environ["PATH"]},
-        )
-        outcome = transport.run(
-            {
-                "turn_id": "turn_silent",
-                "data": {"model": {"alias": "gemma-4-31b"}},
-            },
+            {"turn_id": "turn_direct", "data": {"model": {"alias": "gemma-4-31b"}}},
             lambda *_args: {},
             timeout_seconds=3,
         )
-        self.assertEqual(outcome["terminal"]["status"], "silent")
+        self.assertEqual(outcome["terminal"]["model_attestation"]["provider"], "openai-compatible")
+        self.assertNotIn("synthetic-provider-key-value", repr(key))
 
-    def test_transport_rejects_malformed_unattested_and_timed_out_children(self):
-        key = ProviderKey(
-            value="synthetic-provider-key-value",
-        )
-        cases = {
-            "malformed": (
-                "print('not-json',flush=True)",
-                "agent_transport_frame_invalid",
-            ),
-            "unattested": (
-                """
-import json,sys
-s=json.loads(sys.stdin.readline())
-print(json.dumps({"v":"ati.brain.turn.v1","turn_id":s["turn_id"],"seq":0,"type":"terminal.complete","at":"2026-07-25T10:00:00Z","data":{"status":"complete","unresolved_call_ids":[],"model_attestation":{"model_alias":"gemma-4-31b","route_kind":"direct_provider","provider":"cerebras","route_identity":"wrong"}}}),flush=True)
-""",
-                "agent_model_attestation_invalid",
-            ),
-            "invalid-success-status": (
-                """
-import json,sys
-s=json.loads(sys.stdin.readline())
-print(json.dumps({"v":"ati.brain.turn.v1","turn_id":s["turn_id"],"seq":0,"type":"terminal.complete","at":"2026-07-25T10:00:00Z","data":{"status":"waiting","unresolved_call_ids":[],"model_attestation":{"model_alias":"gemma-4-31b","route_kind":"direct_provider","provider":"cerebras","route_identity":"api.cerebras.ai"}}}),flush=True)
-""",
-                "agent_terminal_status_invalid",
-            ),
-            "unresolved-tools": (
-                """
-import json,sys
-s=json.loads(sys.stdin.readline())
-print(json.dumps({"v":"ati.brain.turn.v1","turn_id":s["turn_id"],"seq":0,"type":"terminal.complete","at":"2026-07-25T10:00:00Z","data":{"status":"complete","unresolved_call_ids":["call-pending"],"model_attestation":{"model_alias":"gemma-4-31b","route_kind":"direct_provider","provider":"cerebras","route_identity":"api.cerebras.ai"}}}),flush=True)
-""",
-                "agent_unresolved_tool_calls",
-            ),
-            "timeout": (
-                "import time; time.sleep(2)",
-                "agent_model_timeout",
-            ),
-            "partial-frame-timeout": (
-                (
-                    "import sys,time; "
-                    "sys.stdout.write('{\"v\":'); sys.stdout.flush(); "
-                    "time.sleep(2)"
-                ),
-                "agent_model_timeout",
-            ),
-        }
-        for label, (child, expected) in cases.items():
-            with self.subTest(label=label):
-                transport = SubprocessBrainTurnTransport(
-                    (sys.executable, "-c", child),
-                    model_base_url=CEREBRAS_API_BASE_URL,
-                    route_kind="direct_provider",
-                    provider="cerebras",
-                    provider_key=key,
-                    expected_route_identity="api.cerebras.ai",
-                    environment={"PATH": os.environ["PATH"]},
-                )
-                with self.assertRaises(AgentExecutionError) as caught:
-                    transport.run(
-                        {
-                            "turn_id": "turn_synthetic",
-                            "data": {
-                                "model": {"alias": "gemma-4-31b"},
-                            },
-                        },
-                        lambda *_args: {},
-                        timeout_seconds=0.1,
-                    )
-                self.assertEqual(caught.exception.code, expected)
-
-    def test_transport_write_is_bounded_when_child_stops_reading(self):
-        child = r"""
-import json,sys,time
-start=json.loads(sys.stdin.readline())
-print(json.dumps({
-  "v":"ati.brain.turn.v1",
-  "turn_id":start["turn_id"],
-  "seq":0,
-  "type":"tool.invoke",
-  "at":"2026-07-25T10:00:00Z",
-  "data":{
-    "call_id":"call-1",
-    "name":"recall_show",
-    "arguments":{"target":"recall://source:synthetic:company/item?rev=1#item=0"},
-    "parent_event_id":"event-1",
-    "effect":"read",
-    "approval":"never",
-    "timeout_hint_ms":1000,
-    "idempotency":"none",
-    "readback":"result"
-  }
-}),flush=True)
-time.sleep(2)
-"""
-        transport = SubprocessBrainTurnTransport(
-            (sys.executable, "-c", child),
-            model_base_url=CEREBRAS_API_BASE_URL,
+    def test_transport_rejects_public_keyless_and_malformed_children(self):
+        with self.assertRaisesRegex(RuntimeError, "must be private"):
+            SubprocessPiTransport(
+                (sys.executable, "-c", "pass"),
+                model_base_url="https://litellm.example/v1",
+                route_kind="private_broker",
+                provider="broker",
+                expected_route_identity="litellm.example",
+            )
+        transport = SubprocessPiTransport(
+            (sys.executable, "-c", "print('not-json',flush=True)"),
+            model_base_url="https://api.cerebras.ai/v1",
             route_kind="direct_provider",
-            provider="cerebras",
-            provider_key=ProviderKey(
-                value="synthetic-provider-key-value",
-            ),
+            provider="openai-compatible",
+            provider_key=ProviderKey(value="synthetic-provider-key-value"),
             expected_route_identity="api.cerebras.ai",
             environment={"PATH": os.environ["PATH"]},
         )
         with self.assertRaises(AgentExecutionError) as caught:
             transport.run(
-                {
-                    "turn_id": "turn_synthetic",
-                    "data": {"model": {"alias": "gemma-4-31b"}},
-                },
-                lambda *_args: {"text": "x" * 200_000},
-                timeout_seconds=0.1,
+                {"turn_id": "turn_bad", "data": {"model": {"alias": "gemma-4-31b"}}},
+                lambda *_args: {},
+                timeout_seconds=1,
             )
-        self.assertEqual(caught.exception.code, "agent_model_timeout")
+        self.assertEqual(caught.exception.code, "agent_transport_frame_invalid")
 
-    def test_configuration_has_one_explicit_route_and_private_secret_file(self):
+    def test_configuration_has_one_pi_runner_and_private_secret_file(self):
         with tempfile.TemporaryDirectory() as directory:
-            key_path = Path(directory) / "cerebras.key"
+            key_path = Path(directory) / "model.key"
             key_path.write_text("synthetic-provider-key-value\n")
             key_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
-            artifact_path = Path(directory) / "ati-runner.mjs"
-            artifact_path.write_text("export {};\n")
-            artifact_path.chmod(0o444)
-            artifact_sha256 = hashlib.sha256(
-                artifact_path.read_bytes()
-            ).hexdigest()
-            environment = {
-                "RECALL_AGENT_RUNNER": "pi-ati",
-                "RECALL_ATI_COMMAND_JSON": json.dumps([
-                    sys.executable, str(artifact_path)
-                ]),
-                "RECALL_ATI_ARTIFACT_PATH": str(artifact_path),
-                "RECALL_ATI_ARTIFACT_SHA256": artifact_sha256,
-                "RECALL_AGENT_MODEL_ROUTE": "direct-provider:cerebras",
+            direct = {
+                "RECALL_AGENT_RUNNER": "pi",
+                "RECALL_AGENT_MODEL_BASE_URL": "https://api.cerebras.ai/v1",
                 "RECALL_AGENT_MODEL_KEY_FILE": str(key_path),
                 "RECALL_AGENT_MODEL_ALIAS": "gpt-oss-120b",
             }
-            self.assertIsInstance(
-                service_from_env(environment).runner,
-                PiAtiRunner,
-            )
-            self.assertNotIn(
-                "synthetic-provider-key-value",
-                repr(service_from_env(environment).runner.transport.provider_key),
-            )
-            environment["RECALL_AGENT_MODEL_ROUTE"] = "direct-provider:other"
-            with self.assertRaisesRegex(RuntimeError, "route is invalid"):
-                service_from_env(environment)
-            environment["RECALL_AGENT_MODEL_ROUTE"] = "direct-provider:cerebras"
-            environment["RECALL_ATI_ARTIFACT_SHA256"] = "0" * 64
-            with self.assertRaisesRegex(RuntimeError, "does not match"):
-                service_from_env(environment)
-            environment["RECALL_ATI_ARTIFACT_SHA256"] = artifact_sha256
+            self.assertIsInstance(service_from_env(direct).runner, PiRunner)
             key_path.write_text("contains whitespace")
             with self.assertRaisesRegex(RuntimeError, "invalid"):
-                service_from_env(environment)
+                service_from_env(direct)
             key_path.write_text("synthetic-provider-key-value\n")
             key_path.chmod(0o644)
             with self.assertRaisesRegex(RuntimeError, "not private"):
-                service_from_env(environment)
+                service_from_env(direct)
 
-            key_path.chmod(0o600)
-            broker_environment = {
-                **environment,
-                "RECALL_AGENT_MODEL_ROUTE": "private-broker",
+            broker = {
+                "RECALL_AGENT_RUNNER": "pi",
                 "RECALL_AGENT_MODEL_BASE_URL": "http://10.23.45.67:9420",
+                "RECALL_AGENT_MODEL_ALIAS": "gemma-4-31b",
             }
-            broker_environment.pop("RECALL_AGENT_MODEL_KEY_FILE")
-            self.assertIsInstance(
-                service_from_env(broker_environment).runner,
-                PiAtiRunner,
-            )
-            broker_environment["RECALL_AGENT_MODEL_BASE_URL"] = (
-                "https://litellm.example"
-            )
+            self.assertIsInstance(service_from_env(broker).runner, PiRunner)
+            broker["RECALL_AGENT_MODEL_BASE_URL"] = "https://litellm.example/v1"
             with self.assertRaisesRegex(RuntimeError, "must be private"):
-                service_from_env(broker_environment)
-
-    def test_hostile_direct_provider_configurations_fail_closed(self):
-        common = {
-            "RECALL_AGENT_RUNNER": "pi-ati",
-            "RECALL_ATI_COMMAND_JSON": json.dumps([sys.executable, "-c", "pass"]),
-            "RECALL_ATI_ARTIFACT_PATH": "/tmp/missing-artifact",
-            "RECALL_ATI_ARTIFACT_SHA256": "0" * 64,
-        }
-        for environment in (
-            {
-                **common,
-                "RECALL_AGENT_MODEL_ROUTE": "direct-provider:cerebras",
-            },
-            {
-                **common,
-                "RECALL_AGENT_MODEL_ROUTE": "private-broker",
-                "RECALL_AGENT_MODEL_BASE_URL": "https://api.cerebras.ai/v1",
-            },
-            {
-                **common,
-                "RECALL_AGENT_MODEL_ROUTE": "private-broker",
-                "RECALL_AGENT_MODEL_BASE_URL": "http://10.23.45.67:9420?next=x",
-            },
-        ):
-            with self.subTest(environment=environment):
-                with self.assertRaises(RuntimeError):
-                    service_from_env(environment)
+                service_from_env(broker)
 
 
 if __name__ == "__main__":

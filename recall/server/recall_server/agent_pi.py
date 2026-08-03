@@ -1,14 +1,13 @@
-"""π/ATI answer runner over the bounded ``ati.brain.turn.v1`` process seam.
+"""Direct Pi answer runner over Recall's bounded process seam.
 
 Recall owns authorization, evidence access, Archil credentials, and the final
-grounding decision. The child owns semantic planning only and receives a
-closed native-tool catalog plus exactly one explicit model route: a private
-credential-owning broker or the Cerebras API with a deployment secret.
+grounding decision. The child runs the open-source Pi agent directly and
+receives a closed native-tool catalog plus one explicit OpenAI-compatible
+model route.
 """
 
 from __future__ import annotations
 
-import hashlib
 import ipaddress
 import json
 import logging
@@ -17,7 +16,7 @@ import re
 import select
 import signal
 import stat
-# Subprocess is the explicit ATI protocol boundary: closed argv, no shell, and
+# Subprocess is the explicit Pi boundary: closed argv, no shell, and
 # a minimal allowlisted environment.
 import subprocess  # nosec B404
 import time
@@ -39,7 +38,7 @@ from .agent import (
 from .federation import SOURCE_FAMILIES
 
 
-PROTOCOL = "ati.brain.turn.v1"
+PROTOCOL = "recall.pi-run.v1"
 MODEL_TOOL_NAMES = {
     "search": "recall.hints",
     "find": "recall.find",
@@ -59,8 +58,8 @@ SAFE_CHILD_ENV = (
     "SSL_CERT_DIR",
 )
 MODEL_PROXY_PLACEHOLDER_KEY = "not-a-secret"
-CEREBRAS_API_BASE_URL = "https://api.cerebras.ai/v1"
 MODEL_ROUTE_KINDS = {"private_broker", "direct_provider"}
+DEFAULT_PI_WORKER_PATH = "/opt/recall-pi/worker.js"
 LOG = logging.getLogger(__name__)
 
 # These four behavioral text blocks are the only A1 optimization surface.
@@ -162,7 +161,7 @@ def _model_tool_error_message(error: AgentExecutionError) -> str:
     )
 
 
-class BrainTurnTransport(Protocol):
+class PiTransport(Protocol):
     def run(
         self,
         start: dict[str, Any],
@@ -282,8 +281,8 @@ def _load_provider_key(
     return ProviderKey(value=value)
 
 
-class SubprocessBrainTurnTransport:
-    """One isolated ATI child per turn; no shell and no ambient credentials."""
+class SubprocessPiTransport:
+    """One isolated direct-Pi child per turn; no shell or ambient credentials."""
 
     def __init__(
         self,
@@ -295,8 +294,6 @@ class SubprocessBrainTurnTransport:
         provider_key: ProviderKey | None = None,
         provider_key_file: str | None = None,
         expected_route_identity: str,
-        artifact_path: str | None = None,
-        expected_artifact_sha256: str | None = None,
         max_frame_bytes: int = 1_000_000,
         environment: dict[str, str] | None = None,
     ):
@@ -347,12 +344,9 @@ class SubprocessBrainTurnTransport:
                 raise RuntimeError(
                     "Recall private broker URL must be private"
                 )
-        elif (
-            provider != "cerebras"
-            or model_base_url.rstrip("/") != CEREBRAS_API_BASE_URL
-        ):
+        elif provider != "openai-compatible" or parsed.scheme != "https":
             raise RuntimeError(
-                "Recall direct provider must be Cerebras at its approved API URL"
+                "Recall direct provider must use an HTTPS OpenAI-compatible URL"
             )
         if (
             not command
@@ -360,7 +354,7 @@ class SubprocessBrainTurnTransport:
             or not 64_000 <= max_frame_bytes <= 1_000_000
             or expected_route_identity != parsed.hostname
         ):
-            raise RuntimeError("Recall ATI process configuration is invalid")
+            raise RuntimeError("Recall Pi process configuration is invalid")
         key_source_count = sum(
             source is not None for source in (provider_key, provider_key_file)
         )
@@ -371,18 +365,6 @@ class SubprocessBrainTurnTransport:
             raise RuntimeError(
                 "Recall agent model credential mode is invalid"
             )
-        if (artifact_path is None) != (expected_artifact_sha256 is None):
-            raise RuntimeError("Recall ATI artifact pin is incomplete")
-        if artifact_path is not None and artifact_path not in command:
-            raise RuntimeError("Recall ATI artifact is absent from the command")
-        if expected_artifact_sha256 is not None and (
-            len(expected_artifact_sha256) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in expected_artifact_sha256
-            )
-        ):
-            raise RuntimeError("Recall ATI artifact digest is invalid")
         self.command = command
         self.model_base_url = model_base_url.rstrip("/")
         self.route_kind = route_kind
@@ -390,41 +372,11 @@ class SubprocessBrainTurnTransport:
         self.provider_key = provider_key
         self.provider_key_file = provider_key_file
         self.expected_route_identity = expected_route_identity
-        self.artifact_path = artifact_path
-        self.expected_artifact_sha256 = expected_artifact_sha256
         self.max_frame_bytes = max_frame_bytes
         source = environment if environment is not None else os.environ
         self.child_environment = {
             key: source[key] for key in SAFE_CHILD_ENV if source.get(key)
         }
-        self._verify_artifact()
-
-    def _verify_artifact(self) -> None:
-        if self.artifact_path is None:
-            return
-        try:
-            descriptor = os.open(
-                self.artifact_path,
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-            )
-        except OSError as error:
-            raise RuntimeError("Recall ATI artifact is unavailable") from error
-        try:
-            metadata = os.fstat(descriptor)
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_size > 64 * 1024 * 1024
-                or stat.S_IMODE(metadata.st_mode) & 0o022
-            ):
-                raise RuntimeError("Recall ATI artifact is not immutable")
-            with os.fdopen(descriptor, "rb") as stream:
-                descriptor = -1
-                digest = hashlib.file_digest(stream, "sha256").hexdigest()
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
-        if digest != self.expected_artifact_sha256:
-            raise RuntimeError("Recall ATI artifact digest does not match")
 
     def _current_key(self) -> ProviderKey:
         key = (
@@ -445,7 +397,7 @@ class SubprocessBrainTurnTransport:
     ) -> None:
         if process.stdin is None:
             raise AgentExecutionError(
-                "ATI input stream is unavailable",
+                "Pi input stream is unavailable",
                 code="agent_transport_unavailable",
             )
         payload = json.dumps(
@@ -456,7 +408,7 @@ class SubprocessBrainTurnTransport:
         ).encode() + b"\n"
         if len(payload) > self.max_frame_bytes:
             raise AgentExecutionError(
-                "ATI input frame exceeds its bound",
+                "Pi input frame exceeds its bound",
                 code="agent_transport_frame_invalid",
             )
         descriptor = process.stdin.fileno()
@@ -465,13 +417,13 @@ class SubprocessBrainTurnTransport:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise AgentExecutionError(
-                    "ATI turn timed out",
+                    "Pi turn timed out",
                     code="agent_model_timeout",
                 )
             _, ready, _ = select.select([], [descriptor], [], remaining)
             if not ready:
                 raise AgentExecutionError(
-                    "ATI turn timed out",
+                    "Pi turn timed out",
                     code="agent_model_timeout",
                 )
             try:
@@ -480,12 +432,12 @@ class SubprocessBrainTurnTransport:
                 continue
             except (BrokenPipeError, OSError) as error:
                 raise AgentExecutionError(
-                    "ATI input stream is unavailable",
+                    "Pi input stream is unavailable",
                     code="agent_transport_unavailable",
                 ) from error
             if written <= 0:
                 raise AgentExecutionError(
-                    "ATI input stream is unavailable",
+                    "Pi input stream is unavailable",
                     code="agent_transport_unavailable",
                 )
             offset += written
@@ -499,7 +451,7 @@ class SubprocessBrainTurnTransport:
     ) -> bytes:
         if process.stdout is None:
             raise AgentExecutionError(
-                "ATI output stream is unavailable",
+                "Pi output stream is unavailable",
                 code="agent_transport_unavailable",
             )
         descriptor = process.stdout.fileno()
@@ -508,7 +460,7 @@ class SubprocessBrainTurnTransport:
             if newline >= 0:
                 if newline + 1 > self.max_frame_bytes:
                     raise AgentExecutionError(
-                        "ATI output frame is invalid",
+                        "Pi output frame is invalid",
                         code="agent_transport_frame_invalid",
                     )
                 line = bytes(buffer[:newline + 1])
@@ -516,19 +468,19 @@ class SubprocessBrainTurnTransport:
                 return line
             if len(buffer) >= self.max_frame_bytes:
                 raise AgentExecutionError(
-                    "ATI output frame is invalid",
+                    "Pi output frame is invalid",
                     code="agent_transport_frame_invalid",
                 )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise AgentExecutionError(
-                    "ATI turn timed out",
+                    "Pi turn timed out",
                     code="agent_model_timeout",
                 )
             ready, _, _ = select.select([descriptor], [], [], remaining)
             if not ready:
                 raise AgentExecutionError(
-                    "ATI turn timed out",
+                    "Pi turn timed out",
                     code="agent_model_timeout",
                 )
             try:
@@ -540,17 +492,17 @@ class SubprocessBrainTurnTransport:
                 continue
             except OSError as error:
                 raise AgentExecutionError(
-                    "ATI output stream is unavailable",
+                    "Pi output stream is unavailable",
                     code="agent_transport_unavailable",
                 ) from error
             if not chunk:
                 if buffer:
                     raise AgentExecutionError(
-                        "ATI output frame is invalid",
+                        "Pi output frame is invalid",
                         code="agent_transport_frame_invalid",
                     )
                 raise AgentExecutionError(
-                    "ATI process ended without a terminal",
+                    "Pi process ended without a terminal",
                     code="agent_transport_eof",
                 )
             buffer.extend(chunk)
@@ -563,7 +515,6 @@ class SubprocessBrainTurnTransport:
         timeout_seconds: float,
     ) -> dict[str, Any]:
         turn_id = start["turn_id"]
-        self._verify_artifact()
         api_key = (
             MODEL_PROXY_PLACEHOLDER_KEY
             if self.route_kind == "private_broker"
@@ -571,15 +522,10 @@ class SubprocessBrainTurnTransport:
         )
         child_environment = {
             **self.child_environment,
-            # pi-ai currently consumes this OpenAI-compatible route through
-            # its LITELLM_* compatibility seam. The explicit route metadata
-            # below determines whether the value is a private broker or the
-            # one approved direct provider.
-            "ATI_MODEL_ROUTE_KIND": self.route_kind,
-            "ATI_MODEL_PROVIDER": self.provider,
-            "LITELLM_BASE_URL": self.model_base_url,
-            "LITELLM_API_KEY": api_key,
-            "GREP_DISABLE_STATUS_PUBLISH": "1",
+            "RECALL_PI_ROUTE_KIND": self.route_kind,
+            "RECALL_PI_PROVIDER": self.provider,
+            "RECALL_PI_MODEL_BASE_URL": self.model_base_url,
+            "RECALL_PI_API_KEY": api_key,
         }
         # The operator-supplied command is a closed JSON argv array. It never
         # crosses a shell, and the child receives a minimal allowlisted env.
@@ -596,7 +542,7 @@ class SubprocessBrainTurnTransport:
             )
         except OSError as error:
             raise AgentExecutionError(
-                "ATI process is unavailable",
+                "Pi process is unavailable",
                 code="agent_transport_unavailable",
             ) from error
         input_sequence = 0
@@ -611,7 +557,7 @@ class SubprocessBrainTurnTransport:
         try:
             if process.stdin is None or process.stdout is None:
                 raise AgentExecutionError(
-                    "ATI process streams are unavailable",
+                    "Pi process streams are unavailable",
                     code="agent_transport_unavailable",
                 )
             os.set_blocking(process.stdin.fileno(), False)
@@ -631,7 +577,7 @@ class SubprocessBrainTurnTransport:
                     frame = json.loads(line)
                 except (UnicodeDecodeError, json.JSONDecodeError) as error:
                     raise AgentExecutionError(
-                        "ATI output frame is malformed",
+                        "Pi output frame is malformed",
                         code="agent_transport_frame_invalid",
                     ) from error
                 if (
@@ -643,7 +589,7 @@ class SubprocessBrainTurnTransport:
                     or not isinstance(frame["data"], dict)
                 ):
                     raise AgentExecutionError(
-                        "ATI output frame violated the protocol",
+                        "Pi output frame violated the protocol",
                         code="agent_transport_protocol_violation",
                     )
                 output_sequence += 1
@@ -676,7 +622,7 @@ class SubprocessBrainTurnTransport:
                         or data["approval"] != "never"
                     ):
                         raise AgentExecutionError(
-                            "ATI tool invocation violated the protocol",
+                            "Pi tool invocation violated the protocol",
                             code="agent_transport_protocol_violation",
                         )
                     seen_call_ids.add(data["call_id"])
@@ -686,7 +632,7 @@ class SubprocessBrainTurnTransport:
                         value = invoke(data["name"], data["arguments"])
                         if time.monotonic() > deadline:
                             raise AgentExecutionError(
-                                "ATI turn timed out",
+                                "Pi turn timed out",
                                 code="agent_model_timeout",
                             )
                         result = {
@@ -747,7 +693,7 @@ class SubprocessBrainTurnTransport:
                     )
                     continue
                 raise AgentExecutionError(
-                    "ATI emitted an unsupported frame",
+                    "Pi emitted an unsupported frame",
                     code="agent_transport_protocol_violation",
                 )
             if terminal["type"] != "terminal.complete":
@@ -757,7 +703,7 @@ class SubprocessBrainTurnTransport:
                     "terminal.failed": "agent_model_failed",
                 }[terminal["type"]]
                 error = AgentExecutionError(
-                    "ATI turn did not complete",
+                    "Pi turn did not complete",
                     code=terminal_code,
                 )
                 reason = terminal.get("data", {}).get("reason")
@@ -783,12 +729,12 @@ class SubprocessBrainTurnTransport:
             attestation = data.get("model_attestation")
             if data.get("status") not in {"complete", "silent"}:
                 raise AgentExecutionError(
-                    "ATI completed with an invalid success status",
+                    "Pi completed with an invalid success status",
                     code="agent_terminal_status_invalid",
                 )
             if data.get("unresolved_call_ids") != []:
                 raise AgentExecutionError(
-                    "ATI completed with unresolved tool calls",
+                    "Pi completed with unresolved tool calls",
                     code="agent_unresolved_tool_calls",
                 )
             if (
@@ -801,7 +747,7 @@ class SubprocessBrainTurnTransport:
                 != start["data"]["model"]["alias"]
             ):
                 raise AgentExecutionError(
-                    "ATI model route was not attested",
+                    "Pi model route was not attested",
                     code="agent_model_attestation_invalid",
                 )
             return {"terminal": data, "usage": usage}
@@ -1229,10 +1175,10 @@ def _tool_definitions(
     ]
 
 
-class PiAtiRunner:
+class PiRunner:
     def __init__(
         self,
-        transport: BrainTurnTransport,
+        transport: PiTransport,
         *,
         model_alias: str = "gemma-4-31b",
         thinking: str = "low",
@@ -1712,7 +1658,7 @@ class PiAtiRunner:
     ) -> list[dict[str, Any]]:
         events: list[tuple[str, str, list[str], int, int, str, float]] = [
             ("authorize", "recall.authorization", [], 0, 0, "ok", 0.0),
-            ("plan", "ati.pi", [], 0, 0, "ok", 0.0),
+            ("plan", "pi", [], 0, 0, "ok", 0.0),
         ]
         for observation in observations:
             tool = observation["tool"]
@@ -1732,7 +1678,7 @@ class PiAtiRunner:
                 float(observation["elapsed_ms"]),
             ))
         events.extend([
-            ("synthesize", "ati.pi", citations, len({
+            ("synthesize", "pi", citations, len({
                 urlsplit(item).netloc for item in citations
             }), 0, "ok" if status == "complete" else "degraded", 0.0),
             ("verify", "recall.grounding", citations, len({
@@ -1778,43 +1724,25 @@ class PiAtiRunner:
         return trace
 
 
-def runner_from_env(environment: dict[str, str]) -> PiAtiRunner:
+def runner_from_env(environment: dict[str, str]) -> PiRunner:
     try:
-        command_value = json.loads(environment["RECALL_ATI_COMMAND_JSON"])
-        if not isinstance(command_value, list):
-            raise TypeError
-        command = tuple(command_value)
-        route = environment["RECALL_AGENT_MODEL_ROUTE"].strip()
+        base_url = environment["RECALL_AGENT_MODEL_BASE_URL"].rstrip("/")
         key_file = environment.get("RECALL_AGENT_MODEL_KEY_FILE")
-        if route == "direct-provider:cerebras":
+        if key_file:
             route_kind = "direct_provider"
-            provider = "cerebras"
-            base_url = CEREBRAS_API_BASE_URL
-            if not key_file:
-                raise RuntimeError("Recall Cerebras key file is required")
+            provider = "openai-compatible"
             _load_provider_key(key_file)
-        elif route == "private-broker":
+        else:
             route_kind = "private_broker"
             provider = "broker"
-            base_url = environment["RECALL_AGENT_MODEL_BASE_URL"].rstrip("/")
-            if key_file:
-                raise RuntimeError(
-                    "Recall private broker cannot receive a provider key"
-                )
-        else:
-            raise RuntimeError("Recall agent model route is invalid")
         expected_route_identity = urlsplit(base_url).hostname or ""
-        artifact_path = environment["RECALL_ATI_ARTIFACT_PATH"]
-        artifact_sha256 = environment["RECALL_ATI_ARTIFACT_SHA256"]
-        transport = SubprocessBrainTurnTransport(
-            command,
+        transport = SubprocessPiTransport(
+            ("node", DEFAULT_PI_WORKER_PATH),
             model_base_url=base_url,
             route_kind=route_kind,
             provider=provider,
             provider_key_file=key_file if route_kind == "direct_provider" else None,
             expected_route_identity=expected_route_identity,
-            artifact_path=artifact_path,
-            expected_artifact_sha256=artifact_sha256,
             environment=environment,
         )
         model = environment.get("RECALL_AGENT_MODEL_ALIAS")
@@ -1823,10 +1751,10 @@ def runner_from_env(environment: dict[str, str]) -> PiAtiRunner:
         if not model or len(model) > 160:
             raise RuntimeError("Recall agent model alias is invalid")
         thinking = environment.get("RECALL_AGENT_THINKING", "low")
-        return PiAtiRunner(
+        return PiRunner(
             transport,
             model_alias=model,
             thinking=thinking,
         )
     except KeyError as error:
-        raise RuntimeError("Recall π/ATI agent configuration is incomplete") from error
+        raise RuntimeError("Recall Pi agent configuration is incomplete") from error
