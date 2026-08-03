@@ -394,6 +394,42 @@ class ManagedConnectorWorker:
                     (delay, error_code, installation_id, self.worker_id),
                 )
 
+    def _degrade_authority(
+        self,
+        row: dict[str, Any],
+        *,
+        error_code: str,
+    ) -> None:
+        """Stop retrying revoked authority until an operator reconnects it."""
+
+        connection_id = row.get("connection_id")
+        with self.store.connect() as connection:
+            with connection.transaction():
+                if connection_id is not None:
+                    connection.execute(
+                        """UPDATE provider_connections
+                           SET status='degraded',updated_at=now()
+                           WHERE id=%s AND status='connected'""",
+                        (connection_id,),
+                    )
+                    connection.execute(
+                        """UPDATE connector_installations
+                           SET state='configured',lease_owner=NULL,
+                               lease_expires_at=NULL,last_error_code=%s,
+                               failure_count=failure_count+1,updated_at=now()
+                           WHERE connection_id=%s AND state='enabled'""",
+                        (error_code, connection_id),
+                    )
+                else:
+                    connection.execute(
+                        """UPDATE connector_installations
+                           SET state='configured',lease_owner=NULL,
+                               lease_expires_at=NULL,last_error_code=%s,
+                               failure_count=failure_count+1,updated_at=now()
+                           WHERE id=%s AND lease_owner=%s""",
+                        (error_code, row["id"], self.worker_id),
+                    )
+
     def run_once(self) -> dict[str, Any]:
         row = self._claim()
         if row is None:
@@ -478,15 +514,21 @@ class ManagedConnectorWorker:
             }
         except Exception as error:
             code = self._safe_error(error)
-            self._finish(
-                row["id"],
-                success=False,
-                error_code=code,
-                retry_after_seconds=min(
-                    3600,
-                    self.interval_seconds * 2,
-                ),
-            )
+            if code in {
+                "connector_authority_revoked",
+                "connector_authority_forbidden",
+            }:
+                self._degrade_authority(row, error_code=code)
+            else:
+                self._finish(
+                    row["id"],
+                    success=False,
+                    error_code=code,
+                    retry_after_seconds=min(
+                        3600,
+                        self.interval_seconds * 2,
+                    ),
+                )
             return {
                 "schema_version": 1,
                 "status": "failed",

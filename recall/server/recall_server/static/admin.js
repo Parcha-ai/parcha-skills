@@ -200,8 +200,14 @@ function renderInstallations() {
     const revoke = item.state === "revoked"
       ? ""
       : `<button data-action="revoke" data-id="${item.id}">revoke</button>`;
-    const runtime = item.last_error_code
-      ? `attention · ${item.last_error_code}`
+    const reconnectRequired = [
+      "connector_authority_revoked",
+      "connector_authority_forbidden",
+    ].includes(item.last_error_code);
+    const runtime = reconnectRequired
+      ? "reconnect Google to resume"
+      : item.last_error_code
+        ? `attention · ${item.last_error_code}`
       : item.last_success_at
         ? "synced"
         : item.execution === "remote_worker" && item.state === "enabled"

@@ -53,6 +53,13 @@ class FakeClient:
         return self.session
 
 
+class FakeSDKError(RuntimeError):
+    def __init__(self, *, status_code, provider_code):
+        self.status_code = status_code
+        self.body = {"error": {"code": provider_code}}
+        super().__init__("synthetic provider detail that must not escape")
+
+
 class DirectRail:
     def __init__(self, operations):
         self.operations = operations
@@ -114,6 +121,33 @@ class ComposioWorkspaceRailTests(unittest.TestCase):
                 "calendar.events.list",
                 {"calendarId": "primary", "maxResults": 1},
             )
+
+    def test_expired_connected_account_maps_to_stable_revoked_authority(self):
+        rail, _client, _session = self.rail(
+            "google.gmail",
+            {
+                ("gmail", "/gmail/v1/users/me/profile"): [
+                    FakeSDKError(status_code=400, provider_code=4302)
+                ]
+            },
+        )
+        with self.assertRaisesRegex(WorkspaceRailError, "authority_revoked"):
+            rail.run("gmail.users.getProfile", {"userId": "me"})
+
+    def test_generic_bad_request_does_not_impersonate_revoked_authority(self):
+        rail, _client, _session = self.rail(
+            "google.gmail",
+            {
+                ("gmail", "/gmail/v1/users/me/profile"): [
+                    FakeSDKError(status_code=400, provider_code=9999)
+                ]
+            },
+        )
+        with self.assertRaisesRegex(
+            WorkspaceRailError,
+            "upstream_invalid_request",
+        ):
+            rail.run("gmail.users.getProfile", {"userId": "me"})
 
     def test_only_closed_read_operations_and_parameters_reach_proxy(self):
         rail, _client, session = self.rail(
