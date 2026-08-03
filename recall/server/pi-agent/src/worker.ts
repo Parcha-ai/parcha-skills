@@ -1,10 +1,19 @@
-import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
+import { Agent, type AgentTool, type StreamFn } from "@earendil-works/pi-agent-core";
+import type { Model } from "@earendil-works/pi-ai";
 import { streamSimple } from "@earendil-works/pi-ai/api/openai-completions";
 import { createInterface } from "node:readline";
+import type { TSchema } from "typebox";
 
 import { modelEnvironment, openAiCompatibleModel, PROTOCOL } from "./model.js";
 
 const MAX_FRAME_BYTES = 1_000_000;
+
+const streamOpenAiCompletions: StreamFn = (model, context, options) => {
+  if (model.api !== "openai-completions") {
+    throw new Error("Recall Pi received a non-OpenAI-compatible model");
+  }
+  return streamSimple(model as Model<"openai-completions">, context, options);
+};
 
 type JsonObject = Record<string, unknown>;
 type InputFrame = {
@@ -63,7 +72,13 @@ function parseFrame(line: string): InputFrame {
   if (Buffer.byteLength(line) + 1 > MAX_FRAME_BYTES) {
     throw new Error("input frame exceeds its bound");
   }
-  const frame = object(JSON.parse(line), "frame");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    throw new Error("input frame is not valid JSON");
+  }
+  const frame = object(parsed, "frame");
   if (
     frame.v !== PROTOCOL
     || !Number.isSafeInteger(frame.seq)
@@ -200,12 +215,12 @@ class Worker {
     pending.resolve(data);
   }
 
-  private tools(definitions: ToolDefinition[]): AgentTool<any>[] {
+  private tools(definitions: ToolDefinition[]): AgentTool<TSchema, unknown>[] {
     return definitions.map((definition) => ({
       name: definition.name,
       label: definition.name,
       description: definition.description,
-      parameters: definition.input_schema as any,
+      parameters: definition.input_schema as TSchema,
       execute: async (toolCallId: string, params: unknown) => {
         const result = await this.invoke(definition, toolCallId, params);
         if (result.status === "error") {
@@ -226,7 +241,7 @@ class Worker {
     const agent = new Agent({
       sessionId: start.session_id,
       getApiKey: () => environment.apiKey,
-      streamFn: streamSimple as any,
+      streamFn: streamOpenAiCompletions,
       afterToolCall: async ({ toolCall }) => (
         toolCall.name === "finish" && this.finished ? { terminate: true } : undefined
       ),
@@ -277,7 +292,7 @@ class Worker {
   }
 }
 
-export async function main(): Promise<void> {
+export function main(): void {
   const worker = new Worker();
   const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
   let failed = false;

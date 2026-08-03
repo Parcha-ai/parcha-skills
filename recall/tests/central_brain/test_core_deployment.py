@@ -428,6 +428,7 @@ class ContainerContractTest(unittest.TestCase):
         self.assertEqual(package["dependencies"], {
             "@earendil-works/pi-agent-core": "0.83.0",
             "@earendil-works/pi-ai": "0.83.0",
+            "typebox": "1.3.7",
         })
         self.assertEqual(lock["lockfileVersion"], 3)
         self.assertFalse((SERVER / "vendor" / "ati" / "README.md").exists())
