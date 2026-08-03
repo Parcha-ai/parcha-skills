@@ -563,6 +563,14 @@ eight or higher so those fixed bounds retain headroom. Leave the flag unset when
 an operator runs dedicated logical-evidence and passage workers instead; never
 run both owners for steady-state scheduling.
 
+Treat a one-time high-concurrency backfill as maintenance, not free background
+capacity. Do not run it beside managed projections unless the database session
+budget leaves both services headroom and health/readiness stay green for a
+complete canary batch. Stop on the first readiness failure; the durable queues
+make resumption safe. On a 50-session database with an eight-connection API pool
+and eight-connection managed-worker pool, prefer the managed worker itself over
+a sustained external drain.
+
 Run canonical embeddings as a separate worker from that same immutable image:
 
 ```bash
