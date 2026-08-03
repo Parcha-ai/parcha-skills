@@ -7,6 +7,7 @@ import unittest
 from typing import Any
 
 from server.recall_server.logical_evidence import (
+    LogicalEvidenceError,
     DEFAULT_PART_BYTES,
     LogicalEvidenceProjectionStore,
     LogicalEvidenceRecord,
@@ -99,6 +100,17 @@ def _records(count: int) -> tuple[LogicalEvidenceRecord, ...]:
 
 
 class LogicalPartUploadTests(unittest.TestCase):
+    def test_backfill_rejects_an_invalid_exact_source_before_database_access(
+        self,
+    ) -> None:
+        projector = CanonicalLogicalEvidenceProjector(None, None)
+
+        with self.assertRaisesRegex(
+            LogicalEvidenceError,
+            "logical_evidence_rebuild_invalid",
+        ):
+            projector.seed_backfill(source_id="not a source")
+
     def test_projection_preserves_receipts_from_the_ingested_revision(self) -> None:
         projector = CanonicalLogicalEvidenceProjector(None, None)
         receipt = "recall://source:parallel/event-existing?rev=1#item=0"

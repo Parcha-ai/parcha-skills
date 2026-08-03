@@ -136,6 +136,10 @@ def main() -> None:
     canonical_evidence_worker.add_argument("--once", action="store_true")
     logical_evidence = sub.add_parser("backfill-logical-evidence")
     logical_evidence.add_argument("--tenant", required=True)
+    logical_evidence.add_argument(
+        "--source",
+        help="queue only this exact source within the tenant",
+    )
     logical_evidence.add_argument("--batch-size", type=int, default=25)
     logical_evidence.add_argument("--max-batches", type=int, default=10)
     logical_evidence.add_argument("--upload-concurrency", type=int, default=2)
@@ -571,6 +575,7 @@ def main() -> None:
         if args.command == "backfill-logical-evidence":
             seeded = projector.seed_backfill(
                 tenant_id=args.tenant,
+                source_id=args.source,
                 include_existing=args.rebuild_existing,
             )
             result = projector.project_pending(

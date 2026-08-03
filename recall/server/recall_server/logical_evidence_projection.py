@@ -20,6 +20,7 @@ from .logical_evidence import (
     ROLE_RE,
     logical_document_id,
 )
+from .projectors import SOURCE_ID_RE
 
 OVERSIZED_MEDIA_TYPE = "application/vnd.recall.oversized-record+gzip"
 MAX_RESTORED_RECORD_BYTES = 256 * 1024 * 1024
@@ -458,11 +459,14 @@ class CanonicalLogicalEvidenceProjector:
         self,
         *,
         tenant_id: str | None = None,
+        source_id: str | None = None,
         include_existing: bool = False,
     ) -> int:
         """Queue missing projections, or every current logical document on request."""
 
         tenant_id = self._tenant(tenant_id)
+        if source_id is not None and not SOURCE_ID_RE.fullmatch(source_id):
+            raise LogicalEvidenceError("logical_evidence_rebuild_invalid")
         if not isinstance(include_existing, bool):
             raise LogicalEvidenceError("logical_evidence_rebuild_invalid")
         with self.store.connect() as connection:
@@ -476,13 +480,14 @@ class CanonicalLogicalEvidenceProjector:
                               evidence.native_parent_id,
                               1,'backfill',clock_timestamp()
                          FROM canonical_evidence_documents evidence
-                        WHERE %s::text IS NULL OR evidence.tenant_id=%s
+                        WHERE (%s::text IS NULL OR evidence.tenant_id=%s)
+                          AND (%s::text IS NULL OR evidence.source_id=%s)
                        ON CONFLICT(tenant_id,source_id,native_parent_id)
                        DO UPDATE SET
                            generation=canonical_evidence_document_queue.generation+1,
                            reason='backfill',
                            changed_at=clock_timestamp()""",
-                    (tenant_id, tenant_id),
+                    (tenant_id, tenant_id, source_id, source_id),
                 )
                 return max(0, result.rowcount)
             result = connection.execute(
@@ -507,6 +512,10 @@ class CanonicalLogicalEvidenceProjector:
                                   %s::text IS NULL
                                   OR document.tenant_id=%s
                               )
+                              AND (
+                                  %s::text IS NULL
+                                  OR document.source_id=%s
+                              )
                               AND NOT EXISTS (
                                   SELECT 1
                                     FROM canonical_evidence_documents evidence
@@ -518,7 +527,7 @@ class CanonicalLogicalEvidenceProjector:
                               )
                      ) missing
                    ON CONFLICT DO NOTHING""",
-                (tenant_id, tenant_id),
+                (tenant_id, tenant_id, source_id, source_id),
             )
         return max(0, result.rowcount)
 

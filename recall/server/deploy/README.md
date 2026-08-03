@@ -232,7 +232,8 @@ Populate it without removing the prior projection:
 
 ```bash
 python -m recall_server.cli backfill-logical-evidence \
-  --tenant tenant:company:example --batch-size 100 --max-batches 100 \
+  --tenant tenant:company:example --source source:google.gmail:example \
+  --batch-size 100 --max-batches 100 \
   --upload-concurrency 2
 python -m recall_server.cli logical-evidence-worker \
   --tenant tenant:company:example --upload-concurrency 2
