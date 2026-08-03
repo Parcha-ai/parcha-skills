@@ -64,7 +64,7 @@ infrastructure. The example is synthetic; a live manifest belongs in a private m
 location and contains references, never credential values.
 
 The production database gate requires a standard PostgreSQL URL with
-`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 41,
+`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 43,
 pgvector 0.8.0 or newer, and a runtime role without superuser, database/role creation,
 replication, or RLS-bypass privilege:
 
@@ -278,6 +278,18 @@ python -m recall_server.cli lossless-passage-worker \
 The passage policy is versioned by fingerprint. Evaluate alternative target and
 overlap values on a shadow database; production keeps one policy and deletes
 losing variants after cutover.
+
+Migration 42 adds fingerprinted shadow passage representations for retrieval
+experiments. Each arm remains tenant- and source-scoped, points back to the
+same lossless canonical passage, and can be removed by fingerprint. Contextual
+text and provider vectors are derived projections; they do not replace or
+truncate canonical evidence. Provider inputs use a fingerprinted 7,000-byte
+head/tail excerpt so one unusual code token cannot exceed a managed model's
+context window; a retrieval hit still resolves to the complete canonical
+passage and S3 document. Do not route production retrieval to a shadow arm
+until its private optimize and validation gates pass.
+Large resumable backfills may be split into deterministic, non-overlapping
+passage-ID shards without changing representation fingerprints.
 
 `recall_deep_search` first uses canonical retrieval to select authorized
 candidates, passes only opaque evidence keys and exact allowed receipts to a

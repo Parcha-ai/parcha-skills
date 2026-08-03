@@ -24,7 +24,7 @@ EVENT_KIND_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,159}\Z")
 
 PART_MEDIA_TYPE = "application/vnd.recall.logical-document-part+jsonl"
 MANIFEST_MEDIA_TYPE = "application/vnd.recall.logical-document-manifest+json"
-DEFAULT_PART_BYTES = 32 * 1024 * 1024
+DEFAULT_PART_BYTES = 4 * 1024 * 1024
 MAX_PART_BYTES = 64 * 1024 * 1024
 MAX_RECORD_BYTES = 16 * 1024 * 1024
 MAX_DOCUMENT_RECORDS = 5_000_000
@@ -481,7 +481,7 @@ def prepare_logical_document(
         ):
             raise LogicalEvidenceError("logical_evidence_document_invalid")
         encoded = record.encode(source_id=source_id)
-        if len(encoded) > part_bytes:
+        if len(encoded) > MAX_RECORD_BYTES:
             raise LogicalEvidenceError("logical_evidence_record_too_large")
         if part_payload and len(part_payload) + len(encoded) > part_bytes:
             close_part(record.ordinal - 1)
@@ -498,6 +498,8 @@ def prepare_logical_document(
         part_record_count += 1
         part_receipt_count += len(record.receipts)
         document_digest.update(encoded)
+        if len(encoded) > part_bytes:
+            close_part(record.ordinal)
         occurred = _parsed_timestamp(record.occurred_at)
         if first_time is None or occurred < first_time:
             first_time = occurred
@@ -791,7 +793,7 @@ class LogicalEvidenceProjectionStore:
                         "logical_evidence_document_invalid"
                     )
                 encoded = record.encode(source_id=source_id)
-                if len(encoded) > part_bytes:
+                if len(encoded) > MAX_RECORD_BYTES:
                     raise LogicalEvidenceError(
                         "logical_evidence_record_too_large"
                     )
@@ -815,6 +817,8 @@ class LogicalEvidenceProjectionStore:
                 if last_time is None or occurred > last_time:
                     last_time = occurred
                     last_occurred = record.occurred_at
+                if len(encoded) > part_bytes:
+                    close_part(record.ordinal)
             if record_count == 0:
                 raise LogicalEvidenceError("logical_evidence_document_empty")
             if receipt_count == 0:

@@ -510,6 +510,17 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, int | float]:
         )
         if positives
         else 0.0,
+        "boundary_recall@50": statistics.fmean(
+            row["boundary_recall@50"] for row in positives
+        )
+        if positives
+        else 0.0,
+        "case_hit_rate@50": statistics.fmean(
+            float(row["matched_boundary_count@50"] > 0)
+            for row in positives
+        )
+        if positives
+        else 0.0,
         "boundary_mrr": statistics.fmean(
             row["reciprocal_rank"] for row in positives
         )
@@ -551,8 +562,14 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, int | float]:
 def score_boundary_candidates(
     cases: list[dict[str, Any]],
     results: list[dict[str, Any]],
+    *,
+    split: str | None = None,
 ) -> dict[str, Any]:
     _validate_cases(cases)
+    if split is not None:
+        if split not in SPLIT_COUNTS:
+            raise EvaluationInputError("boundary scoring split is invalid")
+        cases = [case for case in cases if case["split"] == split]
     case_by_id = {case["id"]: case for case in cases}
     if (
         not isinstance(results, list)
@@ -618,6 +635,8 @@ def score_boundary_candidates(
         ranked = identities[:20]
         ranked_revisions = revisions[:20]
         relevant = [identity in gold for identity in ranked]
+        ranked_50 = identities[:50]
+        matched_50 = set(ranked_50).intersection(gold)
         matched = [
             (identity, revision)
             for identity, revision in zip(
@@ -641,6 +660,7 @@ def score_boundary_candidates(
                 "valid_pointer_count": valid_pointer_count,
                 "authorization_violation_count": authorization_violation_count,
                 "matched_boundary_count": len(matched),
+                "matched_boundary_count@50": len(matched_50),
                 "fresh_revision_count": sum(
                     revision_is_fresh(
                         {"revision": revision},
@@ -657,6 +677,11 @@ def score_boundary_candidates(
                     if gold
                     else 0.0
                 ),
+                "boundary_recall@50": (
+                    len(matched_50) / len(gold)
+                    if gold
+                    else 0.0
+                ),
                 "reciprocal_rank": 0.0 if first is None else 1.0 / first,
                 "latency_ms": float(latency),
                 "backend_error": result["backend_error"],
@@ -668,7 +693,7 @@ def score_boundary_candidates(
     for row in rows:
         by_stratum[row["stratum"]].append(row)
         by_split[row["split"]].append(row)
-    return {
+    report = {
         "schema_version": SCHEMA_VERSION,
         "aggregate": _aggregate(rows),
         "strata": {
@@ -680,6 +705,9 @@ def score_boundary_candidates(
             for key, value in sorted(by_split.items())
         },
     }
+    if split is not None:
+        report["evaluated_split"] = split
+    return report
 
 
 def score_boundary_files(
@@ -689,6 +717,7 @@ def score_boundary_files(
     *,
     repo_root: Path,
     run_id: str,
+    split: str | None = None,
 ) -> dict[str, Any]:
     if not isinstance(run_id, str) or not run_id or len(run_id) > 160:
         raise EvaluationInputError("boundary run id is invalid")
@@ -705,7 +734,7 @@ def score_boundary_files(
         )
     cases, truth_payload = _load_jsonl(truth)
     result_rows, result_payload = _load_jsonl(results)
-    report = score_boundary_candidates(cases, result_rows)
+    report = score_boundary_candidates(cases, result_rows, split=split)
     report["run_id"] = run_id
     report["pins"] = {
         "truth_sha256": hashlib.sha256(truth_payload).hexdigest(),
@@ -738,6 +767,10 @@ def parser() -> argparse.ArgumentParser:
     score.add_argument("--output", required=True)
     score.add_argument("--repo-root", required=True)
     score.add_argument("--run-id", required=True)
+    score.add_argument(
+        "--split",
+        choices=tuple(SPLIT_COUNTS),
+    )
     return value
 
 
@@ -762,6 +795,7 @@ def main() -> None:
                 Path(args.output),
                 repo_root=Path(args.repo_root),
                 run_id=args.run_id,
+                split=args.split,
             )
     except EvaluationInputError as error:
         raise SystemExit(f"agentic truth rejected: {error}") from None

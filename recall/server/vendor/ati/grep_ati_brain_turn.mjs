@@ -73076,7 +73076,7 @@ function buildParams2(model, context, options, compat = getCompat(model), cacheR
     params.temperature = options.temperature;
   }
   if (context.tools && context.tools.length > 0) {
-    params.tools = convertTools2(context.tools, compat, model);
+    params.tools = convertTools2(context.tools, compat);
     if (compat.zaiToolStream) {
       params.tool_stream = true;
     }
@@ -73442,59 +73442,16 @@ function convertMessages2(model, context, compat) {
   }
   return params;
 }
-var CEREBRAS_STRICT_SCHEMA_KEYS = /* @__PURE__ */ new Set([
-  "type",
-  "properties",
-  "required",
-  "additionalProperties",
-  "enum",
-  "items",
-  "anyOf",
-  "$defs",
-  "$ref",
-  "prefixItems",
-  "minimum",
-  "maximum",
-  "exclusiveMinimum",
-  "exclusiveMaximum",
-  "multipleOf"
-]);
-function normalizeCerebrasStrictSchema(schema) {
-  if (Array.isArray(schema)) {
-    return schema.map((item) => normalizeCerebrasStrictSchema(item));
-  }
-  if (!schema || typeof schema !== "object") {
-    return schema;
-  }
-  const normalized = {};
-  for (const [key, value] of Object.entries(schema)) {
-    if (!CEREBRAS_STRICT_SCHEMA_KEYS.has(key)) {
-      continue;
-    }
-    if (key === "properties" || key === "$defs") {
-      normalized[key] = Object.fromEntries(Object.entries(value).map(([name, child]) => [
-        name,
-        normalizeCerebrasStrictSchema(child)
-      ]));
-    } else if (key === "items" || key === "anyOf" || key === "prefixItems") {
-      normalized[key] = normalizeCerebrasStrictSchema(value);
-    } else {
-      normalized[key] = value;
-    }
-  }
-  return normalized;
-}
-function convertTools2(tools, compat, model) {
-  const cerebrasStrict = compat.supportsStrictMode !== false && model.baseUrl.includes("api.cerebras.ai");
+function convertTools2(tools, compat) {
   return tools.map((tool) => ({
     type: "function",
     function: {
       name: tool.name,
       description: tool.description,
-      parameters: cerebrasStrict ? normalizeCerebrasStrictSchema(tool.parameters) : tool.parameters,
+      parameters: tool.parameters,
       // TypeBox already generates JSON Schema
       // Only include strict if provider supports it. Some reject unknown fields.
-      ...compat.supportsStrictMode !== false && { strict: true }
+      ...compat.supportsStrictMode !== false && { strict: false }
     }
   }));
 }
@@ -84289,6 +84246,26 @@ var RuntimeEventQueue = class {
 function textFromAssistant(message) {
   return (message?.content || []).filter((block) => block?.type === "text").map((block) => block.text || "").join("").trim();
 }
+function modelRequestContext(model, messages) {
+  if (model.reasoning !== false) return messages;
+  return messages.map((message) => {
+    if (message?.role !== "assistant" || !Array.isArray(message.content)) return message;
+    let changed = false;
+    const content = message.content.flatMap((block) => {
+      if (block?.type === "thinking" || block?.type === "reasoning") {
+        changed = true;
+        return [];
+      }
+      if (block?.type === "toolCall" && block.thoughtSignature !== void 0) {
+        changed = true;
+        const { thoughtSignature: _providerReasoning, ...toolCall } = block;
+        return [toolCall];
+      }
+      return [block];
+    });
+    return changed ? { ...message, content } : message;
+  });
+}
 function beginNextParagraph(visibleText, delta) {
   const priorAlreadySeparates = visibleText.at(-1)?.trim() === "";
   const nextAlreadySeparates = delta[0]?.trim() === "";
@@ -84540,6 +84517,7 @@ var PiConversationRuntime = class {
           // provider credential merely because the model's provider is Anthropic.
           getApiKey: options.getApiKey || (() => process.env.LITELLM_API_KEY || void 0),
           streamFn: configuredStream,
+          transformContext: (messages) => modelRequestContext(agent.state.model, messages),
           afterToolCall: ({ toolCall, args, isError }) => {
             if (isError) return void 0;
             const definition = definitionsById.get(toolCall.name);

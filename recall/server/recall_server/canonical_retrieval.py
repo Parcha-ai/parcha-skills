@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import re
+import shlex
 import time
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
@@ -19,7 +20,7 @@ from .deep_inspection import (
     DeepInspectionBudget,
     DeepInspectionError,
     EvidenceTarget,
-    RECEIPT_TOKEN_RE,
+    agent_evidence_receipts,
 )
 from .federation import SOURCE_FAMILIES
 from .projectors import legacy_engine
@@ -34,7 +35,14 @@ UUID_RE = re.compile(
     re.IGNORECASE,
 )
 ALLOWED_FILTERS = frozenset(
-    {"since", "until", "source_id", "source_family", "source_alias"}
+    {
+        "since",
+        "until",
+        "source_id",
+        "source_family",
+        "source_alias",
+        "source_connector",
+    }
 )
 MAX_CANONICAL_EMBEDDING_BATCH = 5000
 MAX_AGENTIC_MAPS = 5
@@ -468,7 +476,14 @@ class BoundCanonicalRetrieval:
     @staticmethod
     def _filters(
         filters: dict[str, Any],
-    ) -> tuple[str | None, str | None, str | None, str | None, str | None]:
+    ) -> tuple[
+        str | None,
+        str | None,
+        str | None,
+        str | None,
+        str | None,
+        str | None,
+    ]:
         if not isinstance(filters, dict) or set(filters) - ALLOWED_FILTERS:
             raise ValueError("unsupported canonical search filter")
         source_id = filters.get("source_id")
@@ -485,6 +500,15 @@ class BoundCanonicalRetrieval:
             or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{1,63}", source_alias)
         ):
             raise ValueError("invalid source_alias filter")
+        source_connector = filters.get("source_connector")
+        if source_connector is not None and (
+            not isinstance(source_connector, str)
+            or not re.fullmatch(
+                r"[a-z0-9][a-z0-9._-]{1,63}",
+                source_connector,
+            )
+        ):
+            raise ValueError("invalid source_connector filter")
         values: list[str | None] = []
         for name in ("since", "until"):
             value = filters.get(name)
@@ -497,7 +521,14 @@ class BoundCanonicalRetrieval:
                 if parsed.tzinfo is None:
                     raise ValueError("invalid temporal filter")
             values.append(value)
-        return source_id, source_family, source_alias, values[0], values[1]
+        return (
+            source_id,
+            source_family,
+            source_alias,
+            source_connector,
+            values[0],
+            values[1],
+        )
 
     def _sources(
         self,
@@ -505,11 +536,18 @@ class BoundCanonicalRetrieval:
         source_id: str | None,
         source_family: str | None,
         source_alias: str | None,
+        source_connector: str | None,
     ) -> list[str]:
         """Resolve convenience routes only within the bound canonical grants."""
         sources = set(self.authorized_sources)
         if source_id is not None:
             sources &= {source_id}
+        if source_connector is not None:
+            sources = {
+                source
+                for source in sources
+                if source.partition(":")[0] == source_connector
+            }
         if not sources or (source_family is None and source_alias is None):
             return sorted(sources)
         with self.store.connect() as connection:
@@ -559,13 +597,19 @@ class BoundCanonicalRetrieval:
             raise ValueError("invalid canonical search query")
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 20:
             raise ValueError("invalid canonical search limit")
-        source_id, source_family, source_alias, since, until = self._filters(
-            filters or {}
-        )
+        (
+            source_id,
+            source_family,
+            source_alias,
+            source_connector,
+            since,
+            until,
+        ) = self._filters(filters or {})
         sources = self._sources(
             source_id=source_id,
             source_family=source_family,
             source_alias=source_alias,
+            source_connector=source_connector,
         )
         if not sources:
             return {
@@ -799,13 +843,19 @@ class BoundCanonicalRetrieval:
             or not 1 <= limit <= 20
         ):
             raise ValueError("invalid passage hint limit")
-        source_id, source_family, source_alias, since, until = self._filters(
-            filters or {}
-        )
+        (
+            source_id,
+            source_family,
+            source_alias,
+            source_connector,
+            since,
+            until,
+        ) = self._filters(filters or {})
         sources = self._sources(
             source_id=source_id,
             source_family=source_family,
             source_alias=source_alias,
+            source_connector=source_connector,
         )
         if not sources:
             return {
@@ -835,7 +885,10 @@ class BoundCanonicalRetrieval:
         program: str,
         *,
         logical_document_ids: tuple[str, ...],
+        record_spans: dict[str, tuple[tuple[int, int], ...]],
+        routing_receipts: dict[str, tuple[str, ...]],
         timeout_seconds: int,
+        document_aliases: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Execute beside only the immutable documents admitted by prior hints."""
 
@@ -852,6 +905,67 @@ class BoundCanonicalRetrieval:
                 not isinstance(item, str)
                 or not re.fullmatch(r"ldoc_[0-9a-f]{32}", item)
                 for item in logical_document_ids
+            )
+        ):
+            raise DeepInspectionError("deep_inspector_target_invalid")
+        if (
+            not isinstance(routing_receipts, dict)
+            or not set(routing_receipts).issubset(logical_document_ids)
+            or any(
+                not isinstance(document_id, str)
+                or not re.fullmatch(r"ldoc_[0-9a-f]{32}", document_id)
+                or not isinstance(receipts, tuple)
+                or len(receipts) > 256
+                or any(
+                    not isinstance(receipt, str)
+                    or not receipt.startswith("recall://")
+                    or len(receipt) > 2048
+                    or urlsplit(receipt).netloc
+                    not in self.authorized_sources
+                    for receipt in receipts
+                )
+                for document_id, receipts in routing_receipts.items()
+            )
+        ):
+            raise DeepInspectionError("deep_inspector_target_invalid")
+        if (
+            not isinstance(record_spans, dict)
+            or not set(record_spans).issubset(logical_document_ids)
+            or any(
+                not isinstance(document_id, str)
+                or not re.fullmatch(r"ldoc_[0-9a-f]{32}", document_id)
+                or not isinstance(spans, tuple)
+                or len(spans) > 256
+                or any(
+                    not isinstance(span, tuple)
+                    or len(span) != 2
+                    or isinstance(span[0], bool)
+                    or not isinstance(span[0], int)
+                    or span[0] < 0
+                    or isinstance(span[1], bool)
+                    or not isinstance(span[1], int)
+                    or not 1 <= span[1] <= 10_000
+                    for span in spans
+                )
+                for document_id, spans in record_spans.items()
+            )
+        ):
+            raise DeepInspectionError("deep_inspector_target_invalid")
+        aliases = document_aliases or {
+            document_id: f"d{ordinal}"
+            for ordinal, document_id in enumerate(
+                logical_document_ids,
+                start=1,
+            )
+        }
+        if (
+            not isinstance(aliases, dict)
+            or set(aliases) != set(logical_document_ids)
+            or len(set(aliases.values())) != len(aliases)
+            or any(
+                not isinstance(alias, str)
+                or re.fullmatch(r"d[1-9][0-9]?", alias) is None
+                for alias in aliases.values()
             )
         ):
             raise DeepInspectionError("deep_inspector_target_invalid")
@@ -884,7 +998,10 @@ class BoundCanonicalRetrieval:
         admitted_documents = {
             row["logical_document_id"] for row in rows
         }
-        if not admitted_documents or len(rows) > 512:
+        if (
+            admitted_documents != set(logical_document_ids)
+            or len(rows) > 512
+        ):
             raise DeepInspectionError("deep_inspector_target_invalid")
         objects = tuple(
             AgentExecObject(
@@ -897,12 +1014,18 @@ class BoundCanonicalRetrieval:
             tenant_id=self.tenant_id,
             program=program,
             objects=objects,
+            document_aliases=aliases,
+            record_spans=record_spans,
+            routing_receipts=routing_receipts,
             timeout_seconds=timeout_seconds,
         )
         stdout = result.get("stdout")
         if not isinstance(stdout, str):
             raise DeepInspectionError("deep_inspector_result_invalid_execution")
-        mentioned = list(dict.fromkeys(RECEIPT_TOKEN_RE.findall(stdout)))
+        # Full-document prose may itself mention recall:// URLs. Only an
+        # explicit line-oriented evidence emission can become citation
+        # authority; arbitrary rg context remains untrusted document text.
+        mentioned = agent_evidence_receipts(stdout)
         if mentioned:
             with self.store.connect() as connection:
                 verified_rows = connection.execute(
@@ -942,6 +1065,456 @@ class BoundCanonicalRetrieval:
             "opened_receipts": mentioned,
             "documents_available": len(admitted_documents),
             "objects_available": len(objects),
+        }
+
+    @staticmethod
+    def _project_agent_records(
+        result: dict[str, Any],
+        *,
+        requested: set[str],
+        aliases: dict[str, str],
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        opened = set(result.get("opened_receipts", ()))
+        matches: list[dict[str, Any]] = []
+        visible_receipts: list[str] = []
+        stdout = result.get("stdout", "")
+        for line in stdout.splitlines() if isinstance(stdout, str) else ():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            document_id = (
+                record.get("logical_document_id")
+                if isinstance(record, dict)
+                else None
+            )
+            receipts = (
+                record.get("receipts")
+                if isinstance(record, dict)
+                else None
+            )
+            if (
+                document_id not in requested
+                or document_id not in aliases
+                or not isinstance(receipts, list)
+                or not isinstance(record.get("content"), str)
+                or not isinstance(record.get("ordinal"), int)
+                or isinstance(record.get("ordinal"), bool)
+                or record["ordinal"] < 0
+            ):
+                continue
+            authoritative = [
+                receipt
+                for receipt in receipts
+                if isinstance(receipt, str) and receipt in opened
+            ]
+            if not authoritative:
+                continue
+            for receipt in authoritative:
+                if receipt not in visible_receipts:
+                    visible_receipts.append(receipt)
+            projected = {
+                "document_alias": aliases[document_id],
+                "record_ordinal": record["ordinal"],
+                "event_native_id": record.get("event_native_id"),
+                "occurred_at": record.get("occurred_at"),
+                "content": record["content"],
+                "content_start": record.get("content_start", 0),
+                "content_end": record.get("content_end"),
+                "content_length": record.get("content_length"),
+                "content_byte_start": record.get("content_byte_start"),
+                "content_byte_end": record.get("content_byte_end"),
+                "content_length_bytes": record.get("content_length_bytes"),
+                "content_complete": bool(
+                    record.get("content_complete", False)
+                ),
+                "receipts": authoritative,
+            }
+            matches.append(projected)
+            if len(matches) >= limit:
+                break
+        return matches, visible_receipts
+
+    def find_documents(
+        self,
+        *,
+        logical_document_ids: tuple[str, ...],
+        document_aliases: dict[str, str],
+        patterns: tuple[str, ...],
+        context_chars: int,
+        limit: int,
+        record_spans: dict[str, tuple[tuple[int, int], ...]],
+        routing_receipts: dict[str, tuple[str, ...]],
+        timeout_seconds: int,
+    ) -> dict[str, Any]:
+        """Find agent-authored literal needles with match-centered excerpts."""
+
+        if (
+            not isinstance(logical_document_ids, tuple)
+            or not 1 <= len(logical_document_ids) <= 20
+            or len(logical_document_ids) != len(set(logical_document_ids))
+            or not isinstance(patterns, tuple)
+            or not 1 <= len(patterns) <= 5
+            or any(
+                not isinstance(pattern, str)
+                or not pattern.strip()
+                or len(pattern) > 512
+                for pattern in patterns
+            )
+            or sum(len(pattern) for pattern in patterns) > 2_000
+            or isinstance(context_chars, bool)
+            or not isinstance(context_chars, int)
+            or not 200 <= context_chars <= 4_000
+            or isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 20
+        ):
+            raise DeepInspectionError("deep_inspector_find_invalid")
+        command = ["recall-scan"]
+        for document_id in logical_document_ids:
+            command.extend(("--document", document_id))
+        for pattern in patterns:
+            command.extend(("--pattern", pattern))
+        command.extend((
+            "--fixed",
+            "--broad",
+            "--excerpt-chars",
+            str(context_chars),
+            "--limit",
+            str(limit),
+        ))
+        result = self.execute_agent_program(
+            shlex.join(command),
+            logical_document_ids=logical_document_ids,
+            document_aliases=document_aliases,
+            record_spans={
+                document_id: tuple(record_spans.get(document_id, ()))
+                for document_id in logical_document_ids
+            },
+            routing_receipts={
+                document_id: tuple(
+                    routing_receipts.get(document_id, ())
+                )
+                for document_id in logical_document_ids
+            },
+            timeout_seconds=timeout_seconds,
+        )
+        if result.get("exit_code") not in {None, 0}:
+            raise DeepInspectionError("deep_inspector_find_failed")
+        matches, visible_receipts = self._project_agent_records(
+            result,
+            requested=set(logical_document_ids),
+            aliases=document_aliases,
+            limit=limit,
+        )
+        return {
+            "provider": result.get("provider"),
+            "matches": matches,
+            "opened_receipts": visible_receipts,
+            "complete": bool(result.get("complete")),
+            "stopped_reason": result.get("stopped_reason"),
+            "timing": result.get("timing"),
+            "documents_available": result.get("documents_available"),
+            "objects_available": result.get("objects_available"),
+        }
+
+    def open_document(
+        self,
+        *,
+        logical_document_id: str,
+        document_alias: str,
+        cursor: str | None,
+        record_ordinal: int | None,
+        page_bytes: int,
+        record_spans: dict[str, tuple[tuple[int, int], ...]],
+        routing_receipts: dict[str, tuple[str, ...]],
+        timeout_seconds: int,
+    ) -> dict[str, Any]:
+        """Open one complete document through deterministic cursor pages."""
+
+        if (
+            not isinstance(logical_document_id, str)
+            or re.fullmatch(
+                r"ldoc_[0-9a-f]{32}",
+                logical_document_id,
+            )
+            is None
+            or not isinstance(document_alias, str)
+            or re.fullmatch(r"d[1-9][0-9]?", document_alias) is None
+            or (
+                cursor is not None
+                and (
+                    not isinstance(cursor, str)
+                    or re.fullmatch(
+                        r"\d{1,6}:\d{1,12}:\d{1,12}",
+                        cursor,
+                    )
+                    is None
+                )
+            )
+            or (
+                record_ordinal is not None
+                and (
+                    isinstance(record_ordinal, bool)
+                    or not isinstance(record_ordinal, int)
+                    or record_ordinal < 0
+                )
+            )
+            or (cursor is not None and record_ordinal is not None)
+            or isinstance(page_bytes, bool)
+            or not isinstance(page_bytes, int)
+            or not 1_024 <= page_bytes <= 32_768
+        ):
+            raise DeepInspectionError("deep_inspector_open_invalid")
+        command = [
+            "recall-scan",
+            "--document",
+            logical_document_id,
+            "--all",
+            "--broad",
+            "--cursor",
+            cursor or "0:0:0",
+            "--page-bytes",
+            str(page_bytes),
+            "--limit",
+            "50",
+        ]
+        hinted_spans = tuple(record_spans.get(logical_document_id, ()))
+        hinted_start = (
+            hinted_spans[0][0]
+            if cursor is None
+            and record_ordinal is None
+            and hinted_spans
+            else None
+        )
+        selected_start = (
+            record_ordinal
+            if cursor is None and record_ordinal is not None
+            else hinted_start
+        )
+        if selected_start is not None:
+            command.extend(("--start-record", str(selected_start)))
+        if record_ordinal is not None:
+            command.append("--one-record")
+        result = self.execute_agent_program(
+            shlex.join(command),
+            logical_document_ids=(logical_document_id,),
+            document_aliases={logical_document_id: document_alias},
+            record_spans={
+                logical_document_id: tuple(
+                    record_spans.get(logical_document_id, ())
+                )
+            },
+            routing_receipts={
+                logical_document_id: tuple(
+                    routing_receipts.get(logical_document_id, ())
+                )
+            },
+            timeout_seconds=timeout_seconds,
+        )
+        if result.get("exit_code") not in {None, 0}:
+            raise DeepInspectionError("deep_inspector_open_failed")
+        records, visible_receipts = self._project_agent_records(
+            result,
+            requested={logical_document_id},
+            aliases={logical_document_id: document_alias},
+            limit=50,
+        )
+        page = None
+        stdout = result.get("stdout", "")
+        for line in stdout.splitlines() if isinstance(stdout, str) else ():
+            if not line.startswith("RECALL_PAGE "):
+                continue
+            try:
+                candidate = json.loads(line.removeprefix("RECALL_PAGE "))
+            except json.JSONDecodeError:
+                continue
+            if (
+                isinstance(candidate, dict)
+                and set(candidate)
+                == {"complete", "emitted_bytes", "next_cursor"}
+                and isinstance(candidate["complete"], bool)
+                and isinstance(candidate["emitted_bytes"], int)
+                and (
+                    candidate["next_cursor"] is None
+                    or (
+                        isinstance(candidate["next_cursor"], str)
+                        and re.fullmatch(
+                            r"\d{1,6}:\d{1,12}:\d{1,12}",
+                            candidate["next_cursor"],
+                        )
+                    )
+                )
+            ):
+                page = candidate
+                break
+        if page is None:
+            raise DeepInspectionError("deep_inspector_open_result_invalid")
+        return {
+            "provider": result.get("provider"),
+            "document_alias": document_alias,
+            "records": records,
+            "opened_receipts": visible_receipts,
+            "next_cursor": page["next_cursor"],
+            "complete": page["complete"],
+            "start_basis": (
+                "record"
+                if record_ordinal is not None
+                else "hint"
+                if hinted_start is not None
+                else "beginning"
+                if cursor is None
+                else "cursor"
+            ),
+            "page_bytes": page["emitted_bytes"],
+            "timing": result.get("timing"),
+            "documents_available": result.get("documents_available"),
+            "objects_available": result.get("objects_available"),
+        }
+
+    def inspect_documents(
+        self,
+        *,
+        logical_document_ids: tuple[str, ...],
+        query: str | None,
+        scope: str,
+        literal: bool,
+        context: int,
+        limit: int,
+        record_spans: dict[str, tuple[tuple[int, int], ...]],
+        routing_receipts: dict[str, tuple[str, ...]],
+        timeout_seconds: int,
+    ) -> dict[str, Any]:
+        """Run one structured, agent-authored search over admitted documents."""
+
+        if (
+            not isinstance(logical_document_ids, tuple)
+            or not 1 <= len(logical_document_ids) <= 20
+            or len(logical_document_ids) != len(set(logical_document_ids))
+            or any(
+                not isinstance(document_id, str)
+                or re.fullmatch(r"ldoc_[0-9a-f]{32}", document_id) is None
+                for document_id in logical_document_ids
+            )
+            or (
+                query is not None
+                and (
+                    not isinstance(query, str)
+                    or not query.strip()
+                    or len(query) > 4_000
+                )
+            )
+            or scope not in {"pointers", "full_documents"}
+            or not isinstance(literal, bool)
+            or isinstance(context, bool)
+            or not isinstance(context, int)
+            or not 0 <= context <= 5
+            or isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 20
+        ):
+            raise DeepInspectionError("deep_inspector_inspect_invalid")
+        if scope == "pointers" and not any(
+            record_spans.get(document_id)
+            for document_id in logical_document_ids
+        ):
+            return {
+                "provider": "canonical",
+                "scope": scope,
+                "matches": [],
+                "opened_receipts": [],
+                "complete": True,
+                "stopped_reason": "no_pointer_windows",
+            }
+        command = ["recall-scan"]
+        for document_id in logical_document_ids:
+            command.extend(("--document", document_id))
+        if query is None:
+            command.append("--all")
+        else:
+            command.extend(("--pattern", query))
+            if literal:
+                command.append("--fixed")
+        if scope == "full_documents":
+            command.append("--broad")
+        command.extend(("--context", str(context), "--limit", str(limit)))
+        result = self.execute_agent_program(
+            shlex.join(command),
+            logical_document_ids=logical_document_ids,
+            record_spans={
+                document_id: tuple(record_spans.get(document_id, ()))
+                for document_id in logical_document_ids
+            },
+            routing_receipts={
+                document_id: tuple(
+                    routing_receipts.get(document_id, ())
+                )
+                for document_id in logical_document_ids
+            },
+            timeout_seconds=timeout_seconds,
+        )
+        if result.get("exit_code") not in {None, 0}:
+            raise DeepInspectionError("deep_inspector_inspect_failed")
+        opened = set(result.get("opened_receipts", ()))
+        requested = set(logical_document_ids)
+        matches: list[dict[str, Any]] = []
+        visible_receipts: list[str] = []
+        stdout = result.get("stdout", "")
+        for line in stdout.splitlines() if isinstance(stdout, str) else ():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            document_id = (
+                record.get("logical_document_id")
+                if isinstance(record, dict)
+                else None
+            )
+            receipts = (
+                record.get("receipts")
+                if isinstance(record, dict)
+                else None
+            )
+            if (
+                document_id not in requested
+                or not isinstance(receipts, list)
+                or not isinstance(record.get("content"), str)
+                or not isinstance(record.get("ordinal"), int)
+                or isinstance(record.get("ordinal"), bool)
+                or record["ordinal"] < 0
+            ):
+                continue
+            authoritative = [
+                receipt
+                for receipt in receipts
+                if isinstance(receipt, str) and receipt in opened
+            ]
+            if not authoritative:
+                continue
+            for receipt in authoritative:
+                if receipt not in visible_receipts:
+                    visible_receipts.append(receipt)
+            matches.append({
+                "logical_document_id": document_id,
+                "record_ordinal": record["ordinal"],
+                "event_native_id": record.get("event_native_id"),
+                "occurred_at": record.get("occurred_at"),
+                "content": record["content"],
+                "receipts": authoritative,
+            })
+            if len(matches) >= limit:
+                break
+        return {
+            "provider": result.get("provider"),
+            "scope": scope,
+            "matches": matches,
+            "opened_receipts": visible_receipts,
+            "complete": bool(result.get("complete")),
+            "stopped_reason": result.get("stopped_reason"),
+            "timing": result.get("timing"),
+            "documents_available": result.get("documents_available"),
+            "objects_available": result.get("objects_available"),
         }
 
     def _receipt_event(
@@ -1219,7 +1792,7 @@ class BoundCanonicalRetrieval:
         budget = budgets[depth]
         deadline_at = started_at + budget["deadline_seconds"]
         effective_filters = dict(filters or {})
-        source_id, source_family, source_alias, _, _ = self._filters(
+        source_id, source_family, source_alias, source_connector, _, _ = self._filters(
             effective_filters
         )
         time_reason = "explicit"
@@ -1232,6 +1805,7 @@ class BoundCanonicalRetrieval:
             source_id=source_id,
             source_family=source_family,
             source_alias=source_alias,
+            source_connector=source_connector,
         )
 
         probes: list[dict[str, Any]] = []
@@ -1239,7 +1813,12 @@ class BoundCanonicalRetrieval:
         probes.append(first)
         if not any(
             name in effective_filters
-            for name in ("source_id", "source_family", "source_alias")
+            for name in (
+                "source_id",
+                "source_family",
+                "source_alias",
+                "source_connector",
+            )
         ):
             try:
                 with self.store.connect() as connection:
@@ -1477,7 +2056,7 @@ class BoundCanonicalRetrieval:
         ):
             return ()
         search_query = " OR ".join(f'"{term}"' for term in terms)
-        _, _, _, since, until = self._filters(filters or {})
+        _, _, _, _, since, until = self._filters(filters or {})
         deadline_at = time.monotonic() + self.store.search_deadline_ms / 1000
         try:
             with self.store.connect() as connection:
@@ -1650,11 +2229,19 @@ class BoundCanonicalRetrieval:
                 )
             ):
                 raise ValueError("invalid canonical map seed")
-            _, source_family, source_alias, since, until = self._filters(filters or {})
+            (
+                _,
+                source_family,
+                source_alias,
+                source_connector,
+                since,
+                until,
+            ) = self._filters(filters or {})
             eligible_sources = set(self._sources(
                 source_id=(filters or {}).get("source_id"),
                 source_family=source_family,
                 source_alias=source_alias,
+                source_connector=source_connector,
             ))
             since_bound = (
                 datetime.fromisoformat(since.replace("Z", "+00:00"))

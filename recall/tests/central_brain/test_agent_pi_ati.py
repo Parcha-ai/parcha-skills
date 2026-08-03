@@ -16,6 +16,8 @@ sys.path.insert(0, str(SERVER))
 
 from recall_server.agent import (  # noqa: E402
     AgentExecutionError,
+    ConstrainedAgentTools,
+    DelegationContext,
     RecallAgentService,
     service_from_env,
 )
@@ -26,7 +28,9 @@ from recall_server.agent_pi_ati import (  # noqa: E402
     ProviderKey,
     SubprocessBrainTurnTransport,
     _load_provider_key,
+    _tool_definitions,
 )
+from recall_server.federation import SOURCE_FAMILIES  # noqa: E402
 
 
 TENANT = "tenant:synthetic:company"
@@ -77,7 +81,16 @@ class SyntheticRetrieval:
                         "ldoc_0123456789abcdef0123456789abcdef"
                     ),
                     "matching_ranges": [
-                        {"text": "Aurora bridge decision", "receipts": [HINT]}
+                        {
+                            "text": "Aurora bridge decision",
+                            "receipts": [HINT],
+                            "passage_ordinal": 12,
+                            "spans": [{
+                                "record_ordinal": 80,
+                                "record_count": 4,
+                                "source_byte_start": 10,
+                            }],
+                        }
                     ],
                 },
                 {
@@ -101,7 +114,10 @@ class SyntheticRetrieval:
         program,
         *,
         logical_document_ids,
+        record_spans,
+        routing_receipts,
         timeout_seconds,
+        document_aliases=None,
     ):
         self.calls.append("recall_exec")
         if self.fail_deep:
@@ -120,6 +136,47 @@ class SyntheticRetrieval:
             "stopped_reason": "completed",
             "opened_receipts": [DECISION, IMPLEMENTATION],
             "timing": {"totalMs": 80, "queueMs": 10, "executeMs": 70},
+        }
+
+    def find_documents(self, **arguments):
+        self.calls.append("recall_find")
+        return {
+            "provider": "synthetic-archil",
+            "matches": [{
+                "document_alias": next(iter(
+                    arguments["document_aliases"].values()
+                )),
+                "record_ordinal": 80,
+                "occurred_at": "2026-07-23T00:00:00Z",
+                "content": '{"message":"bounded agent bridge selected"}',
+                "receipts": [DECISION],
+            }],
+            "opened_receipts": [DECISION],
+            "complete": True,
+        }
+
+    def open_document(self, **arguments):
+        self.calls.append("recall_open")
+        return {
+            "provider": "synthetic-archil",
+            "document_alias": arguments["document_alias"],
+            "records": [{
+                "document_alias": arguments["document_alias"],
+                "record_ordinal": 80,
+                "occurred_at": "2026-07-23T00:00:00Z",
+                "content": '{"message":"bounded agent bridge selected"}',
+                "content_start": 0,
+                "content_end": 43,
+                "content_length": 43,
+                "content_byte_start": 0,
+                "content_byte_end": 43,
+                "content_length_bytes": 43,
+                "content_complete": True,
+                "receipts": [DECISION],
+            }],
+            "opened_receipts": [DECISION],
+            "next_cursor": None,
+            "complete": True,
         }
 
 
@@ -152,10 +209,11 @@ def success_script():
         "since": REQUEST["since"],
         "until": REQUEST["until"],
         "source_family": None,
+        "source_connector": None,
     }
     return [
         (
-            "recall_hints",
+            "search",
             {
                 "query": "Project Aurora bridge decision",
                 "filters": filters,
@@ -163,7 +221,7 @@ def success_script():
             },
         ),
         (
-            "recall_hints",
+            "search",
             {
                 "query": "Project Aurora grounding verification",
                 "filters": filters,
@@ -175,7 +233,7 @@ def success_script():
             {
                 "program": (
                     "rg -n 'bounded agent bridge|grounding check' "
-                    "/mnt/archil/evidence"
+                    "/docs/d1 /docs/d2"
                 ),
                 "timeout_seconds": 20,
             },
@@ -208,7 +266,7 @@ def success_script():
 
 def service(transport) -> RecallAgentService:
     fixed = datetime(2026, 7, 25, 10, 0, tzinfo=timezone.utc)
-    ticks = iter([10.0, 10.25])
+    ticks = iter([10.0, 10.05, 10.25])
     return RecallAgentService(
         PiAtiRunner(transport),
         clock=lambda: fixed,
@@ -217,6 +275,31 @@ def service(transport) -> RecallAgentService:
 
 
 class SimpleAgentKernelTest(unittest.TestCase):
+    def test_blank_optional_hint_filters_are_normalized_to_absent(self):
+        self.assertEqual(
+            PiAtiRunner._authorize_hint_arguments(
+                {
+                    "query": "project context",
+                    "filters": {
+                        "since": "",
+                        "until": " ",
+                        "source_family": "",
+                        "source_connector": "",
+                    },
+                    "limit": 10,
+                },
+                REQUEST,
+            ),
+            {
+                "query": "project context",
+                "filters": {
+                    "since": REQUEST["since"],
+                    "until": REQUEST["until"],
+                },
+                "limit": 10,
+            },
+        )
+
     def test_two_agent_chosen_queries_exec_and_grounded_finish(self):
         transport = ScriptedTransport(success_script())
         retrieval = SyntheticRetrieval()
@@ -227,7 +310,12 @@ class SimpleAgentKernelTest(unittest.TestCase):
         )
         self.assertEqual(
             retrieval.calls,
-            ["recall_hints", "recall_hints", "recall_exec"],
+            [
+                "recall_hints",
+                "recall_hints",
+                "recall_hints",
+                "recall_exec",
+            ],
         )
         self.assertEqual(bundle["result"]["status"], "complete")
         self.assertEqual(
@@ -236,16 +324,82 @@ class SimpleAgentKernelTest(unittest.TestCase):
         )
         self.assertEqual(
             [tool["name"] for tool in transport.start["data"]["tools"]],
-            ["recall_hints", "exec", "finish"],
+            ["search", "find", "open", "exec", "finish"],
+        )
+        hint_tool = next(
+            tool
+            for tool in transport.start["data"]["tools"]
+            if tool["name"] == "search"
+        )
+        find_tool = next(
+            tool
+            for tool in transport.start["data"]["tools"]
+            if tool["name"] == "find"
+        )
+        open_tool = next(
+            tool
+            for tool in transport.start["data"]["tools"]
+            if tool["name"] == "open"
+        )
+        self.assertIn(
+            "literal",
+            find_tool["description"],
+        )
+        self.assertIn("actual match", find_tool["description"])
+        self.assertIn("record_ordinal", open_tool["description"])
+        self.assertIn(
+            "record_ordinal",
+            open_tool["input_schema"]["properties"],
         )
         self.assertEqual(
-            [event["stage"] for event in bundle["trace"]][2:5],
-            ["retrieve", "retrieve", "inspect"],
+            open_tool["input_schema"]["properties"]["page_bytes"]["maximum"],
+            32_768,
+        )
+        family_schema = hint_tool["input_schema"]["properties"]["filters"][
+            "properties"
+        ]["source_family"]["anyOf"][0]
+        self.assertEqual(
+            set(family_schema["enum"]),
+            set(SOURCE_FAMILIES),
+        )
+        connector_schema = hint_tool["input_schema"]["properties"]["filters"][
+            "properties"
+        ]["source_connector"]["anyOf"][0]
+        self.assertIn("pattern", connector_schema)
+        self.assertEqual(
+            [event["stage"] for event in bundle["trace"]][2:6],
+            ["retrieve", "retrieve", "retrieve", "inspect"],
         )
         system = transport.start["data"]["prompt_sections"][0]["content"]
-        self.assertIn("whatever shell", system)
+        self.assertIn("/docs/dN", system)
+        self.assertIn("literal match-centered search", system)
         self.assertNotIn("classify the question", system)
         self.assertNotIn("map_reduce", system)
+        seed_packet = json.loads(
+            transport.start["data"]["prompt_sections"][2]["content"]
+        )
+        self.assertEqual(seed_packet["query_basis"], "verbatim_user_question")
+        self.assertFalse(seed_packet["evidence"])
+        self.assertEqual(len(seed_packet["results"]), 2)
+        self.assertEqual(seed_packet["results"][0]["alias"], "d1")
+        self.assertNotIn(
+            "logical_document_id",
+            seed_packet["results"][0],
+        )
+        self.assertEqual(
+            seed_packet["results"][0]["matching_ranges"][0]["spans"],
+            [{"record_ordinal": 80, "record_count": 4}],
+        )
+        self.assertEqual(
+            seed_packet["results"][0]["matching_ranges"][0][
+                "routing_receipts"
+            ],
+            [HINT],
+        )
+        self.assertNotIn(
+            "manifest_object_key",
+            json.dumps(seed_packet),
+        )
         for tool in transport.start["data"]["tools"]:
             stack = [tool["input_schema"]]
             while stack:
@@ -269,6 +423,7 @@ class SimpleAgentKernelTest(unittest.TestCase):
             "since": "2020-01-01T00:00:00Z",
             "until": "2030-01-01T00:00:00Z",
             "source_family": None,
+            "source_connector": None,
         }
         retrieval = SyntheticRetrieval()
         service(ScriptedTransport(script)).use_recall(
@@ -281,15 +436,52 @@ class SimpleAgentKernelTest(unittest.TestCase):
             {"since": REQUEST["since"], "until": REQUEST["until"]},
         )
 
-    def test_exec_requires_hints(self):
+    def test_exec_can_use_host_seed_hints(self):
         script = success_script()[2:]
-        with self.assertRaises(AgentExecutionError) as caught:
-            service(ScriptedTransport(script)).use_recall(
-                principal(),
-                REQUEST,
-                SyntheticRetrieval(),
-            )
-        self.assertEqual(caught.exception.code, "agent_exec_without_hints")
+        retrieval = SyntheticRetrieval()
+        service(ScriptedTransport(script)).use_recall(
+            principal(),
+            REQUEST,
+            retrieval,
+        )
+        self.assertEqual(retrieval.calls, ["recall_hints", "recall_exec"])
+
+    def test_find_can_use_host_seed_hints_and_ground_finish(self):
+        script = [
+            (
+                "find",
+                {
+                    "aliases": ["d1"],
+                    "patterns": ["bounded agent bridge"],
+                    "context_chars": 800,
+                    "limit": 6,
+                },
+            ),
+            (
+                "finish",
+                {
+                    "status": "complete",
+                    "answer": "Aurora selected the bounded bridge.",
+                    "claims": [{
+                        "statement": "Aurora selected the bounded bridge.",
+                        "receipts": [DECISION],
+                    }],
+                    "citations": [DECISION],
+                    "gaps": [],
+                },
+            ),
+        ]
+        retrieval = SyntheticRetrieval()
+        result = service(ScriptedTransport(script)).use_recall(
+            principal(),
+            REQUEST,
+            retrieval,
+        )
+        self.assertEqual(
+            retrieval.calls,
+            ["recall_hints", "recall_find"],
+        )
+        self.assertEqual(result["result"]["citations"], [DECISION])
 
     def test_hints_are_not_citable(self):
         script = success_script()

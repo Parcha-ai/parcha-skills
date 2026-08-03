@@ -30,10 +30,11 @@ from .retrieval import EvaluationInputError
 from .runner import git_dirty, git_sha
 
 
-SCHEMA_VERSION = "recall.agentic-boundary-rankings.v1"
+SCHEMA_VERSION = "recall.agentic-boundary-rankings.v2"
 AUTHORITY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._/@+-]{1,255}\Z")
 MAX_CASES = 500
-MAX_CANDIDATES = 20
+DEFAULT_CANDIDATES = 20
+MAX_CANDIDATES = 100
 
 
 def _percentile(values: list[float], quantile: float) -> float:
@@ -92,6 +93,52 @@ def _questions(
     return cases, payload
 
 
+def _query_bundles(
+    path: Path,
+    *,
+    repo_root: Path,
+    case_ids: set[str],
+) -> tuple[dict[str, tuple[str, ...]], bytes]:
+    source = _private_path(path, exists=True)
+    _outside_repository(source, repo_root)
+    payload = source.read_bytes()
+    try:
+        value = json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise EvaluationInputError(
+            "private candidate query bundle is invalid"
+        ) from error
+    rows = value.get("private_rows") if isinstance(value, dict) else None
+    if not isinstance(rows, list):
+        raise EvaluationInputError("private candidate query bundle is invalid")
+    bundles: dict[str, tuple[str, ...]] = {}
+    for row in rows:
+        case_id = row.get("id") if isinstance(row, dict) else None
+        queries = row.get("queries") if isinstance(row, dict) else None
+        if (
+            not isinstance(case_id, str)
+            or case_id not in case_ids
+            or case_id in bundles
+            or not isinstance(queries, list)
+            or len(queries) > 7
+            or any(
+                not isinstance(query, str)
+                or not query.strip()
+                or len(query) > 2048
+                for query in queries
+            )
+        ):
+            raise EvaluationInputError(
+                "private candidate query bundle is invalid"
+            )
+        bundles[case_id] = tuple(query.strip() for query in queries)
+    if set(bundles) != case_ids:
+        raise EvaluationInputError(
+            "private candidate query bundle coverage is invalid"
+        )
+    return bundles, payload
+
+
 def resolve_logical_boundaries(
     results: list[dict[str, Any]],
     *,
@@ -101,6 +148,7 @@ def resolve_logical_boundaries(
         [tuple[tuple[str, str], ...]],
         dict[tuple[str, str], dict[str, Any]],
     ],
+    max_candidates: int = DEFAULT_CANDIDATES,
 ) -> list[dict[str, Any]]:
     """Collapse ranked event hits to current logical-document boundaries."""
 
@@ -129,7 +177,7 @@ def resolve_logical_boundaries(
         if key not in seen:
             seen.add(key)
             keys.append(key)
-        if len(keys) == MAX_CANDIDATES:
+        if len(keys) == max_candidates:
             break
     catalog = lookup(tuple(keys))
     candidates: list[dict[str, Any]] = []
@@ -170,6 +218,7 @@ def resolve_passage_boundaries(
         [tuple[tuple[str, str], ...]],
         dict[tuple[str, str], dict[str, Any]],
     ],
+    max_candidates: int = DEFAULT_CANDIDATES,
 ) -> list[dict[str, Any]]:
     """Validate document-level passage hints against the current catalog."""
 
@@ -203,7 +252,7 @@ def resolve_passage_boundaries(
             continue
         seen.add(key)
         ranked.append((key, document_id, revision))
-        if len(ranked) == MAX_CANDIDATES:
+        if len(ranked) == max_candidates:
             break
     catalog = lookup(tuple(value[0] for value in ranked))
     authorized = set(authorized_sources)
@@ -246,8 +295,12 @@ def _logical_document_id(
     return logical_document_id(tenant_id, source_id, native_parent_id)
 
 
-def _validated_candidates(value: Any) -> list[dict[str, Any]]:
-    if not isinstance(value, list) or len(value) > MAX_CANDIDATES:
+def _validated_candidates(
+    value: Any,
+    *,
+    max_candidates: int = DEFAULT_CANDIDATES,
+) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or len(value) > max_candidates:
         raise EvaluationInputError("boundary candidates are invalid")
     for candidate in value:
         if (
@@ -294,6 +347,26 @@ def _retrieval_error(response: Any) -> str:
     return ""
 
 
+def _select_arm(response: dict[str, Any], arm: str) -> dict[str, Any]:
+    """Select one measured arm without inheriting unrelated arm failures."""
+
+    if arm == "fused":
+        return response
+    status_name = {
+        "dense": "dense_status",
+        "passage-lexical": "passage_lexical_status",
+        "sparse-exact": "sparse_status",
+    }[arm]
+    return {
+        **response,
+        "results": response["arms"][arm],
+        "diagnostics": {
+            "engine": response["diagnostics"]["engine"],
+            status_name: response["diagnostics"][status_name],
+        },
+    }
+
+
 def rank_private_questions(
     input_path: Path,
     output_path: Path,
@@ -304,6 +377,7 @@ def rank_private_questions(
     run_id: str,
     workers: int = 4,
     expected_cases: int = 60,
+    candidate_depth: int = DEFAULT_CANDIDATES,
 ) -> dict[str, Any]:
     """Run private questions and persist only closed-schema boundary rankings."""
 
@@ -313,8 +387,11 @@ def rank_private_questions(
         isinstance(workers, bool)
         or not isinstance(workers, int)
         or not 1 <= workers <= 8
+        or isinstance(candidate_depth, bool)
+        or not isinstance(candidate_depth, int)
+        or not 1 <= candidate_depth <= MAX_CANDIDATES
     ):
-        raise EvaluationInputError("private ranking worker count is invalid")
+        raise EvaluationInputError("private ranking execution bound is invalid")
     cases, input_payload = _questions(
         input_path,
         repo_root=repo_root,
@@ -333,7 +410,10 @@ def rank_private_questions(
         try:
             response = search(case["question"])
             results = response.get("results") if isinstance(response, dict) else None
-            candidates = _validated_candidates(resolve(results))
+            candidates = _validated_candidates(
+                resolve(results),
+                max_candidates=candidate_depth,
+            )
             error = _retrieval_error(response)
         except Exception as failure:
             candidates = []
@@ -377,6 +457,7 @@ def rank_private_questions(
         "run_id": run_id,
         "case_count": len(rows),
         "candidate_count": candidates,
+        "candidate_depth": candidate_depth,
         "backend_error_count": errors,
         "backend_error_rate": errors / len(rows),
         "pointer_integrity": valid / candidates if candidates else 1.0,
@@ -408,10 +489,16 @@ def _live_rankings(
     retrieval_mode: str,
     target_tokens: int,
     overlap_tokens: int,
+    candidate_depth: int,
+    expected_cases: int,
+    arm: str,
+    query_bundle_path: Path | None,
 ) -> dict[str, Any]:
     from recall_server.canonical_retrieval import BoundCanonicalRetrieval
+    from recall_server.canonical_retrieval import _informative_query_terms
     from recall_server.db import BrainStore
     from recall_server.passage_projection import PassagePolicy
+    from recall_server.passage_retrieval import PassageHintRetrieval
     from recall_server.semantic import SemanticRuntime
 
     if (
@@ -426,24 +513,73 @@ def _live_rankings(
         semantic_runtime=SemanticRuntime.from_env(),
         pool_max_size=max(4, workers * 2),
     )
+    policy = PassagePolicy(
+        target_tokens=target_tokens,
+        overlap_tokens=overlap_tokens,
+    )
     retrieval = BoundCanonicalRetrieval(
         store,
         tenant_id=tenant_id,
         principal_id="private-eval",
         authorized_sources=source_ids,
-        passage_policy=PassagePolicy(
-            target_tokens=target_tokens,
-            overlap_tokens=overlap_tokens,
-        ),
+        passage_policy=policy,
+    )
+    passage_retrieval = PassageHintRetrieval(
+        store,
+        tenant_id=tenant_id,
+        sources=list(source_ids),
+        policy_fingerprint=policy.fingerprint,
     )
 
     if retrieval_mode not in {"event", "passage"}:
         raise EvaluationInputError("private ranking retrieval mode is invalid")
+    if arm not in {"fused", "dense", "passage-lexical", "sparse-exact"}:
+        raise EvaluationInputError("private ranking arm is invalid")
+    if retrieval_mode == "event" and (
+        candidate_depth != DEFAULT_CANDIDATES
+        or arm != "fused"
+        or query_bundle_path is not None
+    ):
+        raise EvaluationInputError(
+            "event rankings do not support candidate-generation controls"
+        )
+
+    cases, _input_payload = _questions(
+        input_path,
+        repo_root=repo_root,
+        expected_cases=expected_cases,
+    )
+    case_id_by_question = {
+        case["question"]: case["id"]
+        for case in cases
+    }
+    bundle_payload = b""
+    bundles: dict[str, tuple[str, ...]] = {}
+    if query_bundle_path is not None:
+        bundles, bundle_payload = _query_bundles(
+            query_bundle_path,
+            repo_root=repo_root,
+            case_ids={case["id"] for case in cases},
+        )
 
     def search(question: str) -> dict[str, Any]:
         if retrieval_mode == "passage":
-            return retrieval.passage_hints(question, limit=MAX_CANDIDATES)
-        return retrieval.search(question, limit=MAX_CANDIDATES)
+            case_id = case_id_by_question[question]
+            queries = (question, *bundles.get(case_id, ()))
+            response = passage_retrieval.search_bundle(
+                queries,
+                lexical_queries=tuple(
+                    " ".join(_informative_query_terms(query))
+                    for query in queries
+                ),
+                since=None,
+                until=None,
+                limit=candidate_depth,
+            )
+            if arm != "fused":
+                response = _select_arm(response, arm)
+            return response
+        return retrieval.search(question, limit=DEFAULT_CANDIDATES)
 
     def lookup(
         keys: tuple[tuple[str, str], ...],
@@ -486,6 +622,7 @@ def _live_rankings(
             tenant_id=tenant_id,
             authorized_sources=source_ids,
             lookup=lookup,
+            max_candidates=candidate_depth,
         )
 
     try:
@@ -497,10 +634,18 @@ def _live_rankings(
             repo_root=repo_root,
             run_id=run_id,
             workers=workers,
+            expected_cases=expected_cases,
+            candidate_depth=candidate_depth,
         )
         return {
             **report,
             "retrieval_mode": retrieval_mode,
+            "arm": arm,
+            "query_bundle_sha256": (
+                hashlib.sha256(bundle_payload).hexdigest()
+                if bundle_payload
+                else None
+            ),
             "passage_policy": {
                 "target_tokens": target_tokens,
                 "overlap_tokens": overlap_tokens,
@@ -521,6 +666,18 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--source", action="append", required=True)
     value.add_argument("--dsn-env", default="RECALL_DATABASE_URL")
     value.add_argument("--workers", type=int, default=4)
+    value.add_argument(
+        "--candidate-depth",
+        type=int,
+        default=DEFAULT_CANDIDATES,
+    )
+    value.add_argument("--expected-cases", type=int, default=60)
+    value.add_argument(
+        "--arm",
+        choices=("fused", "dense", "passage-lexical", "sparse-exact"),
+        default="fused",
+    )
+    value.add_argument("--query-bundle")
     value.add_argument(
         "--retrieval-mode",
         choices=("event", "passage"),
@@ -549,6 +706,14 @@ def main() -> None:
             retrieval_mode=args.retrieval_mode,
             target_tokens=args.target_tokens,
             overlap_tokens=args.overlap_tokens,
+            candidate_depth=args.candidate_depth,
+            expected_cases=args.expected_cases,
+            arm=args.arm,
+            query_bundle_path=(
+                Path(args.query_bundle)
+                if args.query_bundle
+                else None
+            ),
         )
     except EvaluationInputError as error:
         raise SystemExit(f"agentic rankings rejected: {error}") from None

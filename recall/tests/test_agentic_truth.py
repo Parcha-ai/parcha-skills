@@ -5,6 +5,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from evals.agentic_candidate_matrix import (
+    ARMS,
+    score_candidate_matrix,
+)
 from evals.agentic_truth import (
     EvaluationInputError,
     build_owner_review_packet,
@@ -109,6 +113,160 @@ def truth_cases() -> list[dict]:
 
 
 class AgenticTruthSetTest(unittest.TestCase):
+    def test_candidate_attribution_accepts_named_shadow_arms(self) -> None:
+        cases = truth_cases()
+        validation = [
+            case for case in cases if case["split"] == "validation"
+        ]
+        matrix = []
+        for case in validation:
+            candidates = [
+                {
+                    "logical_document_id": boundary[
+                        "logical_document_id"
+                    ],
+                    "source_id": boundary["source_id"],
+                    "revision": boundary["revision"],
+                    "pointer_valid": True,
+                    "authorized": True,
+                }
+                for boundary in case["gold_boundaries"]
+            ]
+            arms = {
+                "baseline": [],
+                "experimental": candidates,
+            }
+            matrix.append({
+                "id": case["id"],
+                "queries": [{
+                    "ordinal": 0,
+                    "arms": arms,
+                    "statuses": {
+                        arm: "ok" for arm in arms
+                    },
+                    "latency_ms": 1.0,
+                }],
+                "bundle_rankings": arms,
+            })
+
+        with tempfile.TemporaryDirectory() as temporary:
+            private = private_directory(Path(temporary))
+            truth = private / "truth.jsonl"
+            rankings = private / "matrix.jsonl"
+            output = private / "score.json"
+            private_write(truth, cases)
+            private_write(rankings, matrix)
+
+            report = score_candidate_matrix(
+                truth,
+                rankings,
+                output,
+                repo_root=Path(__file__).resolve().parents[2],
+                run_id="shadow-attribution",
+                split="validation",
+                availability_arms=("experimental",),
+                fused_arm="baseline",
+            )
+
+        self.assertEqual(
+            report["aggregate"]["availability_union_recall@100"],
+            1.0,
+        )
+        self.assertEqual(report["verdict"], "fusion-ranking")
+        self.assertEqual(
+            report["availability_arms"],
+            ["experimental"],
+        )
+
+    def test_candidate_attribution_is_exhaustive_and_reproducible(self) -> None:
+        cases = truth_cases()
+        validation = [
+            case for case in cases if case["split"] == "validation"
+        ]
+        matrix = []
+        answerable_ordinal = 0
+        for case in validation:
+            candidates = [
+                {
+                    "logical_document_id": boundary["logical_document_id"],
+                    "source_id": boundary["source_id"],
+                    "revision": boundary["revision"],
+                    "pointer_valid": True,
+                    "authorized": True,
+                }
+                for boundary in case["gold_boundaries"]
+            ]
+            arms = {arm: [] for arm in ARMS}
+            bundle_rankings = {arm: [] for arm in ARMS}
+            if case["answerability"] == "answerable":
+                mode = answerable_ordinal % 3
+                answerable_ordinal += 1
+                if mode == 0:
+                    arms["dense"] = candidates
+                    arms["fused"] = candidates
+                    bundle_rankings["dense"] = candidates
+                    bundle_rankings["fused"] = candidates
+                elif mode == 1:
+                    arms["passage-lexical"] = candidates
+                    bundle_rankings["passage-lexical"] = candidates
+            matrix.append({
+                "id": case["id"],
+                "queries": [{
+                    "ordinal": 0,
+                    "arms": arms,
+                    "statuses": {arm: "ok" for arm in ARMS},
+                    "latency_ms": 1.0,
+                }],
+                "bundle_rankings": bundle_rankings,
+            })
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            private = private_directory(root)
+            truth = private / "truth.jsonl"
+            rankings = private / "matrix.jsonl"
+            first = private / "score-1.json"
+            second = private / "score-2.json"
+            repo = Path(__file__).resolve().parents[2]
+            private_write(truth, cases)
+            private_write(rankings, matrix)
+
+            report_1 = score_candidate_matrix(
+                truth,
+                rankings,
+                first,
+                repo_root=repo,
+                run_id="attribution-1",
+                split="validation",
+            )
+            report_2 = score_candidate_matrix(
+                truth,
+                rankings,
+                second,
+                repo_root=repo,
+                run_id="attribution-2",
+                split="validation",
+            )
+
+        counts = report_1["aggregate"]["classification_counts"]
+        self.assertEqual(
+            sum(counts.values()),
+            report_1["aggregate"]["gold_documents"],
+        )
+        self.assertGreater(counts["available_in_fused_50"], 0)
+        self.assertGreater(
+            counts["available_in_union_100_but_dropped"],
+            0,
+        )
+        self.assertGreater(counts["absent_from_union_100"], 0)
+        self.assertEqual(report_1["verdict"], "retrieval-availability")
+        self.assertEqual(
+            report_1["analysis_sha256"],
+            report_2["analysis_sha256"],
+        )
+        self.assertLess(report_1["elapsed_ms"], 2000)
+        self.assertLess(report_2["elapsed_ms"], 2000)
+
     def test_validates_frozen_stratified_truth_without_rendering_content(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = private_directory(Path(temporary))
@@ -350,6 +508,79 @@ class AgenticTruthSetTest(unittest.TestCase):
         self.assertEqual(report["aggregate"]["boundary_mrr"], 1.0)
         self.assertEqual(report["aggregate"]["revision_freshness_on_match"], 1.0)
         self.assertEqual(report["aggregate"]["revision_exact_on_match"], 0.0)
+
+    def test_depth_fifty_counts_gold_beyond_the_public_hint_window(self) -> None:
+        cases = truth_cases()
+        target = next(
+            case for case in cases
+            if case["answerability"] == "answerable"
+            and len(case["gold_boundaries"]) == 1
+        )
+        gold = target["gold_boundaries"][0]
+        distractors = []
+        ordinal = 1
+        while len(distractors) < 20:
+            document_id = f"ldoc_{ordinal:032x}"
+            ordinal += 1
+            if document_id == gold["logical_document_id"]:
+                continue
+            distractors.append({
+                "logical_document_id": document_id,
+                "source_id": gold["source_id"],
+                "revision": 1,
+                "pointer_valid": True,
+                "authorized": True,
+            })
+        candidates = [
+            *distractors,
+            {
+                "logical_document_id": gold["logical_document_id"],
+                "source_id": gold["source_id"],
+                "revision": gold["revision"],
+                "pointer_valid": True,
+                "authorized": True,
+            },
+        ]
+        results = [
+            {
+                "id": case["id"],
+                "candidates": candidates if case["id"] == target["id"] else [],
+                "latency_ms": 25.0,
+                "backend_error": "",
+            }
+            for case in cases
+        ]
+
+        report = score_boundary_candidates(cases, results)
+
+        self.assertEqual(report["aggregate"]["boundary_recall@20"], 0.0)
+        self.assertGreater(report["aggregate"]["boundary_recall@50"], 0.0)
+        self.assertGreater(report["aggregate"]["case_hit_rate@50"], 0.0)
+
+    def test_scores_only_the_requested_frozen_split(self) -> None:
+        cases = truth_cases()
+        validation = [
+            case for case in cases if case["split"] == "validation"
+        ]
+        results = [
+            {
+                "id": case["id"],
+                "candidates": [],
+                "latency_ms": 25.0,
+                "backend_error": "",
+            }
+            for case in validation
+        ]
+
+        report = score_boundary_candidates(
+            cases,
+            results,
+            split="validation",
+        )
+
+        self.assertEqual(report["evaluated_split"], "validation")
+        self.assertEqual(report["aggregate"]["queries"], 15)
+        self.assertEqual(set(report["splits"]), {"validation"})
 
     def test_stale_revision_does_not_masquerade_as_discovery_miss(self) -> None:
         cases = truth_cases()

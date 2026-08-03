@@ -100,14 +100,19 @@ def _explicit_roles(values: Any) -> tuple[str, ...]:
     if not isinstance(values, list):
         raise LogicalEvidenceError("logical_evidence_state_invalid")
     allowed = {"user", "assistant", "system", "developer", "tool"}
+    aliases = {
+        "agent_message": "assistant",
+        "assistant_message": "assistant",
+        "user_message": "user",
+    }
     return tuple(
         sorted(
             {
-                value
+                aliases.get(value, value)
                 for value in values
                 if isinstance(value, str)
-                and value in allowed
                 and ROLE_RE.fullmatch(value)
+                and aliases.get(value, value) in allowed
             }
         )
     )

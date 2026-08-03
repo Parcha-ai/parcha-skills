@@ -7,6 +7,7 @@ import unittest
 from typing import Any
 
 from server.recall_server.logical_evidence import (
+    DEFAULT_PART_BYTES,
     LogicalEvidenceProjectionStore,
     LogicalEvidenceRecord,
 )
@@ -95,6 +96,50 @@ def _records(count: int) -> tuple[LogicalEvidenceRecord, ...]:
 
 
 class LogicalPartUploadTests(unittest.TestCase):
+    def test_default_part_size_is_bounded_for_interactive_scans(self) -> None:
+        self.assertEqual(DEFAULT_PART_BYTES, 4 * 1024 * 1024)
+
+    def test_indivisible_large_record_gets_its_own_bounded_part(self) -> None:
+        archive = _ConcurrentArchive()
+        projection = LogicalEvidenceProjectionStore(archive)
+        source = "source:parallel"
+        records = tuple(
+            LogicalEvidenceRecord(
+                ordinal=ordinal,
+                event_native_id=f"event:large:{ordinal}",
+                event_kind="transcript_record",
+                occurred_at="2026-07-27T00:00:00Z",
+                roles=("assistant",),
+                receipts=(
+                    f"recall://{source}/event-large-{ordinal}"
+                    f"?rev=1#item=0",
+                ),
+                segment_ordinal=0,
+                segment_count=1,
+                text=text,
+            )
+            for ordinal, text in enumerate(
+                ("small", "x" * (DEFAULT_PART_BYTES + 1_024), "small")
+            )
+        )
+
+        upload = projection.put_records(
+            tenant_id="tenant:parallel",
+            source_id=source,
+            native_parent_id="session:large",
+            revision=1,
+            records=records,
+        )
+
+        sizes = [
+            reference["size_bytes"]
+            for reference in upload.part_references
+        ]
+        self.assertEqual(len(sizes), 3)
+        self.assertLessEqual(sizes[0], DEFAULT_PART_BYTES)
+        self.assertGreater(sizes[1], DEFAULT_PART_BYTES)
+        self.assertLessEqual(sizes[2], DEFAULT_PART_BYTES)
+
     def test_parts_upload_concurrently_and_keep_manifest_order(self) -> None:
         archive = _ConcurrentArchive()
         projection = LogicalEvidenceProjectionStore(

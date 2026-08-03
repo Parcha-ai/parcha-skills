@@ -126,21 +126,39 @@ class ConstrainedAgentTools:
 
     TOOL_NAMES = (
         "recall.hints",
+        "recall.find",
+        "recall.open",
         "recall.exec",
     )
     TOOL_CALL_LIMITS = {
         "recall.hints": 6,
+        "recall.find": 6,
+        "recall.open": 10,
         "recall.exec": 6,
     }
 
-    def __init__(self, retrieval: Any, context: DelegationContext):
+    def __init__(
+        self,
+        retrieval: Any,
+        context: DelegationContext,
+        *,
+        monotonic: Callable[[], float] | None = None,
+    ):
         self._retrieval = retrieval
         self._context = context
+        self._monotonic = monotonic or time.monotonic
+        self._deadline_at = (
+            self._monotonic() + context.budget.deadline_seconds
+        )
         self._calls = 0
         self._calls_by_tool: dict[str, int] = {}
         self._opened_receipts: list[str] = []
         self._citable_receipts: list[str] = []
         self._hinted_documents: list[str] = []
+        self._document_ids_by_alias: dict[str, str] = {}
+        self._aliases_by_document: dict[str, str] = {}
+        self._hinted_record_spans: dict[str, list[tuple[int, int]]] = {}
+        self._hinted_routing_receipts: dict[str, list[str]] = {}
         self._observations: list[dict[str, Any]] = []
         self._output_bytes = 0
 
@@ -176,7 +194,7 @@ class ConstrainedAgentTools:
         if not isinstance(arguments, dict):
             raise AgentExecutionError("agent tool arguments are invalid")
         self._calls += 1
-        started_at = time.monotonic()
+        started_at = self._monotonic()
         try:
             tool_calls = self._calls_by_tool.get(name, 0)
             tool_limit = self.TOOL_CALL_LIMITS.get(name)
@@ -217,8 +235,249 @@ class ConstrainedAgentTools:
                         and document_id not in self._hinted_documents
                     ):
                         self._hinted_documents.append(document_id)
+                        alias = f"d{len(self._hinted_documents)}"
+                        self._document_ids_by_alias[alias] = document_id
+                        self._aliases_by_document[document_id] = alias
+                    if isinstance(document_id, str):
+                        spans = self._hinted_record_spans.setdefault(
+                            document_id,
+                            [],
+                        )
+                        routing_receipts = (
+                            self._hinted_routing_receipts.setdefault(
+                                document_id,
+                                [],
+                            )
+                        )
+                        for matching_range in item.get(
+                            "matching_ranges",
+                            [],
+                        )[:2]:
+                            if not isinstance(matching_range, dict):
+                                continue
+                            for receipt in matching_range.get("receipts", []):
+                                if (
+                                    isinstance(receipt, str)
+                                    and receipt.startswith("recall://")
+                                    and len(receipt) <= 2048
+                                    and receipt not in routing_receipts
+                                    and len(routing_receipts) < 256
+                                ):
+                                    routing_receipts.append(receipt)
+                            for span in matching_range.get("spans", []):
+                                if not isinstance(span, dict):
+                                    continue
+                                start = span.get("record_ordinal")
+                                count = span.get("record_count")
+                                candidate = (start, count)
+                                if (
+                                    isinstance(start, int)
+                                    and not isinstance(start, bool)
+                                    and start >= 0
+                                    and isinstance(count, int)
+                                    and not isinstance(count, bool)
+                                    and 1 <= count <= 10_000
+                                    and candidate not in spans
+                                    and len(spans) < 64
+                                ):
+                                    spans.append(candidate)
                 if len(self._hinted_documents) > 80:
                     self._hinted_documents = self._hinted_documents[:80]
+                    admitted = set(self._hinted_documents)
+                    self._hinted_record_spans = {
+                        key: value
+                        for key, value in self._hinted_record_spans.items()
+                        if key in admitted
+                    }
+                    self._hinted_routing_receipts = {
+                        key: value
+                        for key, value in self._hinted_routing_receipts.items()
+                        if key in admitted
+                    }
+                    self._document_ids_by_alias = {
+                        alias: document_id
+                        for alias, document_id
+                        in self._document_ids_by_alias.items()
+                        if document_id in admitted
+                    }
+                    self._aliases_by_document = {
+                        document_id: alias
+                        for document_id, alias
+                        in self._aliases_by_document.items()
+                        if document_id in admitted
+                    }
+                result = {
+                    **result,
+                    "results": [
+                        {
+                            **{
+                                key: value
+                                for key, value in item.items()
+                                if key != "logical_document_id"
+                            },
+                            "alias": self._aliases_by_document[document_id],
+                        }
+                        for item in results
+                        if isinstance(item, dict)
+                        and isinstance(
+                            document_id := item.get("logical_document_id"),
+                            str,
+                        )
+                        and document_id in self._aliases_by_document
+                    ],
+                }
+            elif name == "recall.find":
+                aliases = arguments.get("aliases")
+                patterns = arguments.get("patterns")
+                if (
+                    set(arguments)
+                    != {
+                        "aliases",
+                        "patterns",
+                        "context_chars",
+                        "limit",
+                    }
+                    or not isinstance(aliases, list)
+                    or not 1 <= len(aliases) <= 20
+                    or len(aliases) != len(set(aliases))
+                    or any(
+                        not isinstance(alias, str)
+                        or alias not in self._document_ids_by_alias
+                        for alias in aliases
+                    )
+                    or not isinstance(patterns, list)
+                    or not 1 <= len(patterns) <= 5
+                    or any(
+                        not isinstance(pattern, str)
+                        or not pattern.strip()
+                        or len(pattern) > 512
+                        for pattern in patterns
+                    )
+                    or sum(len(pattern) for pattern in patterns) > 2_000
+                    or isinstance(arguments["context_chars"], bool)
+                    or not isinstance(arguments["context_chars"], int)
+                    or not 200 <= arguments["context_chars"] <= 4_000
+                    or isinstance(arguments["limit"], bool)
+                    or not isinstance(arguments["limit"], int)
+                    or not 1 <= arguments["limit"] <= 20
+                ):
+                    raise AgentExecutionError(
+                        "agent find arguments are invalid",
+                        code="agent_find_invalid",
+                    )
+                remaining = self._deadline_at - self._monotonic()
+                executable_seconds = int(remaining) - 6
+                if executable_seconds < 1:
+                    raise AgentExecutionError(
+                        "agent turn has no time remaining for evidence search",
+                        code="agent_tool_deadline_exhausted",
+                    )
+                document_ids = tuple(
+                    self._document_ids_by_alias[alias]
+                    for alias in aliases
+                )
+                result = self._retrieval.find_documents(
+                    logical_document_ids=tuple(document_ids),
+                    document_aliases={
+                        document_id: self._aliases_by_document[document_id]
+                        for document_id in document_ids
+                    },
+                    patterns=tuple(patterns),
+                    context_chars=arguments["context_chars"],
+                    limit=arguments["limit"],
+                    record_spans={
+                        document_id: tuple(
+                            self._hinted_record_spans.get(document_id, ())
+                        )
+                        for document_id in document_ids
+                    },
+                    routing_receipts={
+                        document_id: tuple(
+                            self._hinted_routing_receipts.get(
+                                document_id,
+                                (),
+                            )
+                        )
+                        for document_id in document_ids
+                    },
+                    timeout_seconds=min(20, executable_seconds),
+                )
+            elif name == "recall.open":
+                if (
+                    set(arguments)
+                    != {
+                        "alias",
+                        "cursor",
+                        "record_ordinal",
+                        "page_bytes",
+                    }
+                    or not isinstance(arguments["alias"], str)
+                    or arguments["alias"]
+                    not in self._document_ids_by_alias
+                    or (
+                        arguments["cursor"] is not None
+                        and (
+                            not isinstance(arguments["cursor"], str)
+                            or re.fullmatch(
+                                r"\d{1,6}:\d{1,12}:\d{1,12}",
+                                arguments["cursor"],
+                            )
+                            is None
+                        )
+                    )
+                    or isinstance(arguments["page_bytes"], bool)
+                    or not isinstance(arguments["page_bytes"], int)
+                    or not 1_024 <= arguments["page_bytes"] <= 32_768
+                    or (
+                        arguments["record_ordinal"] is not None
+                        and (
+                            isinstance(arguments["record_ordinal"], bool)
+                            or not isinstance(
+                                arguments["record_ordinal"],
+                                int,
+                            )
+                            or arguments["record_ordinal"] < 0
+                        )
+                    )
+                    or (
+                        arguments["cursor"] is not None
+                        and arguments["record_ordinal"] is not None
+                    )
+                ):
+                    raise AgentExecutionError(
+                        "agent open arguments are invalid",
+                        code="agent_open_invalid",
+                    )
+                remaining = self._deadline_at - self._monotonic()
+                executable_seconds = int(remaining) - 6
+                if executable_seconds < 1:
+                    raise AgentExecutionError(
+                        "agent turn has no time remaining for evidence open",
+                        code="agent_tool_deadline_exhausted",
+                    )
+                alias = arguments["alias"]
+                document_id = self._document_ids_by_alias[alias]
+                result = self._retrieval.open_document(
+                    logical_document_id=document_id,
+                    document_alias=alias,
+                    cursor=arguments["cursor"],
+                    record_ordinal=arguments["record_ordinal"],
+                    page_bytes=arguments["page_bytes"],
+                    record_spans={
+                        document_id: tuple(
+                            self._hinted_record_spans.get(document_id, ())
+                        )
+                    },
+                    routing_receipts={
+                        document_id: tuple(
+                            self._hinted_routing_receipts.get(
+                                document_id,
+                                (),
+                            )
+                        )
+                    },
+                    timeout_seconds=min(20, executable_seconds),
+                )
             elif name == "recall.exec":
                 if (
                     set(arguments) != {"program", "timeout_seconds"}
@@ -235,10 +494,44 @@ class ConstrainedAgentTools:
                         "agent execution requires at least one prior hint",
                         code="agent_exec_without_hints",
                     )
+                # Archil's HTTP boundary adds up to four seconds around the
+                # sandbox timeout. Reserve that transport allowance plus two
+                # seconds for the model's grounded finish, so one synchronous
+                # exec can never consume more than the turn's remaining wall
+                # budget.
+                remaining = self._deadline_at - self._monotonic()
+                executable_seconds = int(remaining) - 6
+                if executable_seconds < 1:
+                    raise AgentExecutionError(
+                        "agent turn has no time remaining for evidence execution",
+                        code="agent_tool_deadline_exhausted",
+                    )
                 result = self._retrieval.execute_agent_program(
                     arguments["program"],
                     logical_document_ids=tuple(self._hinted_documents),
-                    timeout_seconds=arguments["timeout_seconds"],
+                    document_aliases={
+                        document_id: self._aliases_by_document[document_id]
+                        for document_id in self._hinted_documents
+                    },
+                    record_spans={
+                        document_id: tuple(
+                            self._hinted_record_spans.get(document_id, ())
+                        )
+                        for document_id in self._hinted_documents
+                    },
+                    routing_receipts={
+                        document_id: tuple(
+                            self._hinted_routing_receipts.get(
+                                document_id,
+                                (),
+                            )
+                        )
+                        for document_id in self._hinted_documents
+                    },
+                    timeout_seconds=min(
+                        arguments["timeout_seconds"],
+                        executable_seconds,
+                    ),
                 )
             else:
                 raise AgentExecutionError("agent tool is not authorized")
@@ -263,7 +556,8 @@ class ConstrainedAgentTools:
                 )
             receipts = (
                 _receipts(result)
-                if name == "recall.exec"
+                if name
+                in {"recall.find", "recall.open", "recall.exec"}
                 else []
             )
             granted = set(self._context.authorized_sources)
@@ -296,7 +590,7 @@ class ConstrainedAgentTools:
                 "tool": name,
                 "outcome": "ok",
                 "elapsed_ms": round(
-                    max(0.0, time.monotonic() - started_at) * 1000,
+                    max(0.0, self._monotonic() - started_at) * 1000,
                     3,
                 ),
                 "receipts": receipts,
@@ -333,7 +627,7 @@ class ConstrainedAgentTools:
             "tool": name,
             "outcome": "failed",
             "elapsed_ms": round(
-                max(0.0, time.monotonic() - started_at) * 1000,
+                max(0.0, self._monotonic() - started_at) * 1000,
                 3,
             ),
             "receipts": [],

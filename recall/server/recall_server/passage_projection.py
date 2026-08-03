@@ -14,7 +14,7 @@ import orjson
 from .logical_evidence import LogicalEvidenceError, LogicalEvidenceRecord
 
 
-PASSAGE_CONTRACT = "recall.lossless-message-passage.v2"
+PASSAGE_CONTRACT = "recall.lossless-message-passage.v3"
 PASSAGE_SEPARATOR = "\n"
 MAX_PASSAGE_TOKEN_BYTES = 64
 VISIBLE_DENSE_ROLES = frozenset({"user", "assistant"})
@@ -22,6 +22,57 @@ IDENTITY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._/@+=-]{0,511}\Z")
 LOGICAL_DOCUMENT_ID_RE = re.compile(r"ldoc_[0-9a-f]{32}\Z")
 RECEIPT_RE = re.compile(r"recall://[^\s]{1,2040}\Z")
 TOKEN_RE = re.compile(r"\S+")
+
+
+def _text_blocks(value: object) -> tuple[str, ...]:
+    """Extract only explicitly visible text blocks from a message value."""
+
+    if isinstance(value, str):
+        return (value,) if value.strip() else ()
+    if isinstance(value, list):
+        return tuple(
+            text
+            for item in value
+            for text in _text_blocks(item)
+        )
+    if not isinstance(value, dict):
+        return ()
+    text = value.get("text")
+    if isinstance(text, str) and text.strip():
+        return (text,)
+    content = value.get("content")
+    return _text_blocks(content) if content is not None else ()
+
+
+def visible_message_text(text: str) -> str | None:
+    """Project harness envelopes to their exact human-visible message text."""
+
+    try:
+        value = orjson.loads(text)
+    except orjson.JSONDecodeError:
+        return text if text.strip() else None
+    if isinstance(value, str):
+        return value if value.strip() else None
+    if not isinstance(value, dict):
+        return None
+
+    candidates: list[object] = []
+    payload = value.get("payload")
+    if isinstance(payload, dict):
+        candidates.extend((payload.get("message"), payload.get("content")))
+    message = value.get("message")
+    if isinstance(message, dict):
+        candidates.append(message.get("content"))
+    else:
+        candidates.append(message)
+    candidates.extend((value.get("content"), value.get("text")))
+    blocks = tuple(dict.fromkeys(
+        block
+        for candidate in candidates
+        if candidate is not None
+        for block in _text_blocks(candidate)
+    ))
+    return "\n".join(blocks) if blocks else None
 
 
 @dataclass(frozen=True)
@@ -481,13 +532,18 @@ def visible_messages(
             or not set(first.roles) <= VISIBLE_DENSE_ROLES
         ):
             continue
+        text = visible_message_text(
+            "".join(record.text for record in group)
+        )
+        if text is None:
+            continue
         message = PassageMessage(
             record_ordinal=first.ordinal,
             record_count=len(group),
             occurred_at=first.occurred_at,
             roles=first.roles,
             receipts=first.receipts,
-            text="".join(record.text for record in group),
+            text=text,
         )
         message.validate()
         messages.append(message)

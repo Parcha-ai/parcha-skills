@@ -6,10 +6,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
+import orjson
+
 from recall_server import SCHEMA_VERSION
 from recall_server.logical_evidence import LogicalEvidenceRecord
 from recall_server.logical_evidence_projection import (
     CanonicalLogicalEvidenceProjector,
+    _explicit_roles,
 )
 from recall_server.passage_index import (
     CanonicalPassageProjector,
@@ -28,11 +31,20 @@ from recall_server.passage_projection import (
 from recall_server.passage_retrieval import (
     PassageHintRetrieval,
     collapse_document_candidates,
+    fuse_document_rankings,
 )
 from recall_server.passage_worker import run_passage_worker
 
 
 class PassageProjectionTests(unittest.TestCase):
+    def test_codex_message_types_normalize_to_visible_roles(self) -> None:
+        self.assertEqual(_explicit_roles(["agent_message"]), ("assistant",))
+        self.assertEqual(_explicit_roles(["user_message"]), ("user",))
+        self.assertEqual(
+            _explicit_roles(["agent_message", "tool"]),
+            ("assistant", "tool"),
+        )
+
     def test_schema_is_one_document_linked_passage_path(self) -> None:
         migration = (
             Path(__file__).resolve().parents[1]
@@ -42,7 +54,7 @@ class PassageProjectionTests(unittest.TestCase):
         )
         rendered = " ".join(migration.read_text().split()).casefold()
 
-        self.assertEqual(SCHEMA_VERSION, 41)
+        self.assertEqual(SCHEMA_VERSION, 43)
         self.assertIn(
             "create table if not exists canonical_passage_documents",
             rendered,
@@ -68,6 +80,50 @@ class PassageProjectionTests(unittest.TestCase):
         )
         self.assertNotIn("summary", rendered)
         self.assertNotIn("synthetic_question", rendered)
+
+        representations = (
+            Path(__file__).resolve().parents[1]
+            / "server"
+            / "schema"
+            / "042_passage_retrieval_representations.sql"
+        )
+        represented = " ".join(
+            representations.read_text().split()
+        ).casefold()
+        self.assertIn(
+            "create table if not exists canonical_passage_contexts",
+            represented,
+        )
+        self.assertIn(
+            "create table if not exists "
+            "canonical_passage_embedding_representations",
+            represented,
+        )
+        self.assertIn(
+            "primary key( tenant_id, source_id, passage_id, "
+            "representation_fingerprint )",
+            represented,
+        )
+        self.assertIn(
+            "references canonical_passages(tenant_id, source_id, passage_id) "
+            "on delete cascade",
+            represented,
+        )
+        self.assertNotIn("summary", represented)
+
+        native = (
+            Path(__file__).resolve().parents[1]
+            / "server"
+            / "schema"
+            / "043_native_passage_representations.sql"
+        )
+        native_sql = " ".join(native.read_text().split()).casefold()
+        self.assertIn("embedding_1536 halfvec(1536)", native_sql)
+        self.assertIn("embedding_3072 halfvec(3072)", native_sql)
+        self.assertIn(
+            "check (dimensions in (512, 1536, 3072))",
+            native_sql,
+        )
 
     def test_builds_lossless_overlapping_passages_without_crossing_documents(
         self,
@@ -218,7 +274,7 @@ class PassageProjectionTests(unittest.TestCase):
             policy=policy,
         )
 
-        self.assertEqual(PASSAGE_CONTRACT.rsplit(".", 1)[-1], "v2")
+        self.assertEqual(PASSAGE_CONTRACT.rsplit(".", 1)[-1], "v3")
         self.assertGreater(len(passages), 1)
         self.assertTrue(all(
             len(passage.text.encode())
@@ -295,6 +351,85 @@ class PassageProjectionTests(unittest.TestCase):
                 ),
             ),
         )
+
+    def test_visible_messages_strip_harness_envelopes_without_summarizing(self):
+        records = (
+            LogicalEvidenceRecord(
+                ordinal=0,
+                event_native_id="native:claude",
+                event_kind="assistant",
+                occurred_at="2026-07-27T00:00:00Z",
+                roles=("assistant",),
+                receipts=("recall://source:test/claude?rev=1#item=0",),
+                segment_ordinal=0,
+                segment_count=1,
+                text=orjson.dumps({
+                    "cwd": "/private/noise",
+                    "message": {
+                        "content": [
+                            {"type": "text", "text": "exact visible answer"},
+                            {
+                                "type": "tool_use",
+                                "name": "Read",
+                                "input": {"path": "/private/noise"},
+                            },
+                        ],
+                        "model": "noise-model",
+                        "role": "assistant",
+                    },
+                    "sessionId": "noise-session",
+                }).decode(),
+            ),
+            LogicalEvidenceRecord(
+                ordinal=1,
+                event_native_id="native:codex",
+                event_kind="event_msg",
+                occurred_at="2026-07-27T00:00:01Z",
+                roles=("user",),
+                receipts=("recall://source:test/codex?rev=1#item=0",),
+                segment_ordinal=0,
+                segment_count=1,
+                text=orjson.dumps({
+                    "payload": {
+                        "message": "exact user request",
+                        "phase": "commentary",
+                        "type": "user_message",
+                    },
+                    "timestamp": "noise-timestamp",
+                    "type": "event_msg",
+                }).decode(),
+            ),
+            LogicalEvidenceRecord(
+                ordinal=2,
+                event_native_id="native:tool-only",
+                event_kind="assistant",
+                occurred_at="2026-07-27T00:00:02Z",
+                roles=("assistant",),
+                receipts=("recall://source:test/tool-only?rev=1#item=0",),
+                segment_ordinal=0,
+                segment_count=1,
+                text=orjson.dumps({
+                    "message": {
+                        "content": [{
+                            "type": "tool_use",
+                            "name": "Read",
+                            "input": {"path": "/private/noise"},
+                        }],
+                        "role": "assistant",
+                    },
+                }).decode(),
+            ),
+        )
+
+        messages = visible_messages(records)
+
+        self.assertEqual(
+            [message.text for message in messages],
+            ["exact visible answer", "exact user request"],
+        )
+        self.assertNotIn("noise", "\n".join(
+            message.text for message in messages
+        ))
 
     def test_trusted_archive_decode_validates_without_reserializing(self) -> None:
         record = LogicalEvidenceRecord(
@@ -539,6 +674,8 @@ class PassageProjectionTests(unittest.TestCase):
         self.assertNotIn("canonical_passages", nearest)
         self.assertIn("passage.last_occurred_at>=%s", source)
         self.assertIn("passage.first_occurred_at<=%s", source)
+        self.assertIn("SELECT DISTINCT ON (", source)
+        self.assertIn("passage.logical_document_id", source)
 
     def test_backfill_is_idempotent_and_avoids_large_head_of_line_blocking(
         self,
@@ -657,6 +794,105 @@ class PassageProjectionTests(unittest.TestCase):
         self.assertEqual(len(results[0]["matching_ranges"]), 3)
         self.assertNotIn("_score", results[0])
         self.assertNotIn("_ranges", results[0])
+
+    def test_hybrid_ranges_preserve_passage_pointer_when_sparse_scores_crowd(
+        self,
+    ) -> None:
+        base = {
+            "source_id": "source:test",
+            "logical_document_id": (
+                "ldoc_0123456789abcdef0123456789abcdef"
+            ),
+            "revision": 1,
+            "native_parent_id": "session:test",
+            "first_occurred_at": "2026-07-27T00:00:00Z",
+            "last_occurred_at": "2026-07-27T00:10:00Z",
+            "manifest_object_key": "objects/01/" + "a" * 64,
+            "manifest_content_sha256": "b" * 64,
+        }
+        dense = {
+            **base,
+            "passage_id": "psg_" + "1" * 32,
+            "passage_ordinal": 3,
+            "spans": [{"record_ordinal": 7}],
+            "receipts": ["recall://source:test/a?rev=1#item=0"],
+            "text_redacted": "semantic pointer",
+            "score": 0.40,
+        }
+        sparse = [
+            {
+                **base,
+                "receipt": f"recall://source:test/exact-{index}?rev=1#item=0",
+                "text_redacted": f"exact pointer {index}",
+                "score": 1.0 - index / 100,
+            }
+            for index in range(4)
+        ]
+
+        result = collapse_document_candidates(
+            (
+                ("dense", 0.55, [dense]),
+                ("sparse-exact", 0.15, sparse),
+            ),
+            limit=20,
+        )[0]
+
+        self.assertIn(
+            "dense",
+            {item["kind"] for item in result["matching_ranges"]},
+        )
+        self.assertTrue(any(
+            item.get("spans") == [{"record_ordinal": 7}]
+            for item in result["matching_ranges"]
+        ))
+
+    def test_query_rankings_fuse_at_stable_document_boundaries(self) -> None:
+        def candidate(document_id: str, score: float, kind: str) -> dict:
+            return {
+                "source_id": "source:test",
+                "logical_document_id": document_id,
+                "revision": 1,
+                "native_parent_id": document_id,
+                "first_occurred_at": "2026-07-27T00:00:00Z",
+                "last_occurred_at": "2026-07-27T00:10:00Z",
+                "manifest_object_key": "objects/01/" + "a" * 64,
+                "manifest_content_sha256": "b" * 64,
+                "rank": score,
+                "reasons": [kind],
+                "matching_ranges": [{
+                    "kind": kind,
+                    "score": score,
+                    "text": document_id,
+                    "text_clipped": False,
+                    "receipts": [],
+                }],
+            }
+
+        repeated = "ldoc_" + "1" * 32
+        first_only = "ldoc_" + "2" * 32
+        second_only = "ldoc_" + "3" * 32
+        results = fuse_document_rankings(
+            (
+                [
+                    candidate(first_only, 0.9, "dense"),
+                    candidate(repeated, 0.8, "dense"),
+                ],
+                [
+                    candidate(second_only, 0.9, "passage-lexical"),
+                    candidate(repeated, 0.8, "passage-lexical"),
+                ],
+            ),
+            limit=3,
+        )
+
+        self.assertEqual(results[0]["logical_document_id"], repeated)
+        self.assertEqual(len({
+            result["logical_document_id"] for result in results
+        }), 3)
+        self.assertEqual(
+            results[0]["reasons"],
+            ["dense", "passage-lexical"],
+        )
 
     def test_rejects_hidden_roles_and_invalid_policy(self) -> None:
         hidden = PassageMessage(

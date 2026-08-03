@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import sys
+import struct
 import tempfile
 import threading
 import time
@@ -123,7 +125,7 @@ class SemanticRuntimeContractTest(unittest.TestCase):
                 {
                     "model": "synthetic-embedding",
                     "input": ["one", "two"],
-                    "encoding_format": "float",
+                    "encoding_format": "base64",
                     "dimensions": 512,
                 },
             )
@@ -134,6 +136,37 @@ class SemanticRuntimeContractTest(unittest.TestCase):
             os.chmod(key, 0o644)
             with self.assertRaisesRegex(PermissionError, "owner-only"):
                 runtime.embed_documents(["must not leave"])
+
+    def test_openai_base64_vectors_decode_in_provider_order(self) -> None:
+        runtime = SemanticRuntime(
+            embedding_protocol="openai",
+            embedding_url="https://embeddings.example",
+            embedding_approved_url="https://embeddings.example",
+            embedding_key_env="OPENAI_API_KEY",
+            model="synthetic-embedding",
+            revision="managed-v1",
+            dimensions=64,
+        )
+        first = [float(value) for value in range(64)]
+        second = [float(value + 64) for value in range(64)]
+        response = {
+            "data": [
+                {
+                    "index": 1,
+                    "embedding": base64.b64encode(
+                        struct.pack("<64f", *second)
+                    ).decode(),
+                },
+                {
+                    "index": 0,
+                    "embedding": base64.b64encode(
+                        struct.pack("<64f", *first)
+                    ).decode(),
+                },
+            ]
+        }
+
+        self.assertEqual(runtime._openai_vectors(response, 2), [first, second])
 
     def test_voyage_protocol_distinguishes_documents_and_queries(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -501,6 +534,104 @@ class SemanticRuntimeContractTest(unittest.TestCase):
             self.assertRaises(urllib.error.HTTPError),
         ):
             runtime.embed_documents(["irreducible"])
+
+    def test_openai_document_400_splits_oversized_batches(self) -> None:
+        runtime = SemanticRuntime(
+            embedding_protocol="openai",
+            embedding_url="https://openai.example",
+            embedding_approved_url="https://openai.example",
+            embedding_key_env="OPENAI_API_KEY",
+            model="text-embedding-synthetic",
+            revision="text-embedding-synthetic-v1",
+            dimensions=512,
+            embedding_batch_size=4,
+        )
+        batch_sizes: list[int] = []
+
+        def limited_upstream(url, payload, headers):
+            batch_sizes.append(len(payload["input"]))
+            if len(payload["input"]) > 2:
+                raise urllib.error.HTTPError(
+                    url,
+                    400,
+                    "synthetic",
+                    {},
+                    None,
+                )
+            return {
+                "data": [
+                    {
+                        "index": index,
+                        "embedding": [float(index)] * 512,
+                    }
+                    for index in range(len(payload["input"]))
+                ]
+            }
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"OPENAI_API_KEY": "synthetic-scoped-key"},
+                clear=True,
+            ),
+            mock.patch.object(
+                runtime,
+                "_post",
+                side_effect=limited_upstream,
+            ),
+        ):
+            vectors = runtime.embed_documents(
+                ["one", "two", "three", "four"]
+            )
+
+        self.assertEqual(len(vectors), 4)
+        self.assertEqual(batch_sizes, [4, 2, 2])
+
+    def test_openai_document_429_honors_bounded_retry_after(self) -> None:
+        runtime = SemanticRuntime(
+            embedding_protocol="openai",
+            embedding_url="https://openai.example",
+            embedding_approved_url="https://openai.example",
+            embedding_key_env="OPENAI_API_KEY",
+            model="text-embedding-synthetic",
+            revision="text-embedding-synthetic-v1",
+            dimensions=64,
+        )
+        limited = urllib.error.HTTPError(
+            runtime.embedding_url,
+            429,
+            "synthetic",
+            {"Retry-After": "2"},
+            None,
+        )
+        response = {
+            "data": [
+                {
+                    "index": 0,
+                    "embedding": [0.0] * 64,
+                }
+            ]
+        }
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"OPENAI_API_KEY": "synthetic-scoped-key"},
+                clear=True,
+            ),
+            mock.patch.object(
+                runtime,
+                "_post",
+                side_effect=[limited, response],
+            ) as post,
+            mock.patch("recall_server.semantic.time.sleep") as sleep,
+        ):
+            self.assertEqual(
+                runtime.embed_documents(["rate limited"]),
+                [[0.0] * 64],
+            )
+        self.assertEqual(post.call_count, 2)
+        sleep.assert_called_once_with(2.0)
 
     def test_managed_key_may_come_from_a_named_secret_environment_variable(
         self,

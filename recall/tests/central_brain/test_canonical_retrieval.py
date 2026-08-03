@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import time
 import unittest
@@ -131,9 +132,19 @@ class RecordingExecInspector:
 
     def execute(self, **arguments):
         self.calls.append(arguments)
+        record = {
+            "content": {"message": "verified"},
+            "event_native_id": "event",
+            "occurred_at": "2026-07-23T00:00:00Z",
+            "ordinal": 1,
+            "receipts": [self.receipt],
+        }
         return {
             "provider": "synthetic-archil",
-            "stdout": f"verified {self.receipt}",
+            "stdout": (
+                json.dumps(record)
+                + f"\nRECALL_EVIDENCE {self.receipt}"
+            ),
             "stderr": "",
             "exit_code": 0,
             "complete": True,
@@ -165,8 +176,31 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
         self.assertEqual(
             BoundCanonicalRetrieval._filters(
                 {"since": "2026-07-23", "until": "2026-07-25"}
-            )[3:],
+            )[-2:],
             ("2026-07-23T00:00:00Z", "2026-07-25T00:00:00Z"),
+        )
+
+    def test_source_connector_narrows_only_the_authorized_source_set(self):
+        store = RecordingStore()
+        retrieval = BoundCanonicalRetrieval(
+            store,
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=(
+                "codex:linux:test",
+                "codex:mac:test",
+                "claude:linux:test",
+            ),
+        )
+
+        self.assertEqual(
+            retrieval._sources(
+                source_id=None,
+                source_family=None,
+                source_alias=None,
+                source_connector="codex",
+            ),
+            ["codex:linux:test", "codex:mac:test"],
         )
 
     def test_lexical_deadline_degrades_to_optional_semantic_path(self) -> None:
@@ -356,6 +390,8 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
         result = retrieval.execute_agent_program(
             "rg -n verified /mnt/archil/evidence",
             logical_document_ids=(document_id,),
+            record_spans={document_id: ((4, 2),)},
+            routing_receipts={document_id: (receipt,)},
             timeout_seconds=7,
         )
 
@@ -365,6 +401,8 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
         call = inspector.calls[0]
         self.assertEqual(call["tenant_id"], "tenant:test")
         self.assertEqual(call["timeout_seconds"], 7)
+        self.assertEqual(call["record_spans"], {document_id: ((4, 2),)})
+        self.assertEqual(call["routing_receipts"], {document_id: (receipt,)})
         self.assertEqual(len(call["objects"]), 2)
         self.assertEqual(
             store.calls[0][1],
@@ -377,6 +415,296 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
                 [document_id],
             ),
         )
+
+    def test_find_and_open_project_only_verified_alias_records(self):
+        source = "codex.jsonl:test"
+        receipt = f"recall://{source}/event?rev=1#item=0"
+        document_id = "ldoc_0123456789abcdef0123456789abcdef"
+
+        class AciInspector(RecordingExecInspector):
+            def execute(self, **arguments):
+                self.calls.append(arguments)
+                record = {
+                    "logical_document_id": document_id,
+                    "content": "centered verified evidence",
+                    "content_start": 900,
+                    "content_end": 926,
+                    "content_complete": False,
+                    "event_native_id": "event",
+                    "occurred_at": "2026-07-23T00:00:00Z",
+                    "ordinal": 7,
+                    "receipts": [receipt],
+                }
+                page = (
+                    "\nRECALL_PAGE "
+                    + json.dumps({
+                        "complete": True,
+                        "emitted_bytes": 400,
+                        "next_cursor": None,
+                    })
+                    if "--cursor" in arguments["program"]
+                    else ""
+                )
+                return {
+                    "provider": "synthetic-archil",
+                    "stdout": (
+                        json.dumps(record)
+                        + f"\nRECALL_EVIDENCE {receipt}"
+                        + page
+                    ),
+                    "stderr": "",
+                    "exit_code": 0,
+                    "complete": True,
+                    "stopped_reason": "completed",
+                }
+
+        inspector = AciInspector(receipt)
+        retrieval = BoundCanonicalRetrieval(
+            AgentExecStore(receipt),
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=(source,),
+            deep_inspector=inspector,
+        )
+        common = {
+            "record_spans": {document_id: ((4, 2),)},
+            "routing_receipts": {document_id: (receipt,)},
+            "timeout_seconds": 7,
+        }
+        found = retrieval.find_documents(
+            logical_document_ids=(document_id,),
+            document_aliases={document_id: "d1"},
+            patterns=("verified evidence",),
+            context_chars=800,
+            limit=6,
+            **common,
+        )
+        opened = retrieval.open_document(
+            logical_document_id=document_id,
+            document_alias="d1",
+            cursor=None,
+            record_ordinal=None,
+            page_bytes=4_000,
+            **common,
+        )
+        opened_explicit = retrieval.open_document(
+            logical_document_id=document_id,
+            document_alias="d1",
+            cursor=None,
+            record_ordinal=19,
+            page_bytes=4_000,
+            **common,
+        )
+
+        self.assertEqual(found["opened_receipts"], [receipt])
+        self.assertEqual(found["matches"][0]["document_alias"], "d1")
+        self.assertNotIn("logical_document_id", found["matches"][0])
+        self.assertEqual(found["matches"][0]["content_start"], 900)
+        self.assertEqual(opened["opened_receipts"], [receipt])
+        self.assertEqual(opened["document_alias"], "d1")
+        self.assertEqual(opened["records"][0]["content"], "centered verified evidence")
+        self.assertTrue(opened["complete"])
+        self.assertIsNone(opened["next_cursor"])
+        self.assertEqual(opened["start_basis"], "hint")
+        self.assertEqual(opened_explicit["start_basis"], "record")
+        self.assertIn("--fixed", inspector.calls[0]["program"])
+        self.assertIn("--broad", inspector.calls[0]["program"])
+        self.assertIn("--cursor 0:0:0", inspector.calls[1]["program"])
+        self.assertIn("--start-record 4", inspector.calls[1]["program"])
+        self.assertIn("--start-record 19", inspector.calls[2]["program"])
+        self.assertNotIn("--one-record", inspector.calls[1]["program"])
+        self.assertIn("--one-record", inspector.calls[2]["program"])
+
+    def test_agent_exec_fails_when_any_requested_document_is_absent(self):
+        source = "codex.jsonl:test"
+        receipt = f"recall://{source}/event?rev=1#item=0"
+        retrieval = BoundCanonicalRetrieval(
+            AgentExecStore(receipt),
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=(source,),
+            deep_inspector=RecordingExecInspector(receipt),
+        )
+        with self.assertRaisesRegex(
+            DeepInspectionError,
+            "target_invalid",
+        ):
+            retrieval.execute_agent_program(
+                "true",
+                logical_document_ids=(
+                    "ldoc_0123456789abcdef0123456789abcdef",
+                    "ldoc_fedcba9876543210fedcba9876543210",
+                ),
+                record_spans={},
+                routing_receipts={},
+                timeout_seconds=7,
+            )
+
+    def test_native_inspect_projects_verified_records_without_paths(self):
+        source = "codex.jsonl:test"
+        receipt = f"recall://{source}/event?rev=1#item=0"
+        document_id = "ldoc_0123456789abcdef0123456789abcdef"
+
+        class InspectingInspector(RecordingExecInspector):
+            def execute(self, **arguments):
+                self.calls.append(arguments)
+                record = {
+                    "logical_document_id": document_id,
+                    "content": '{"message":"verified synthetic decision"}',
+                    "event_native_id": "event",
+                    "occurred_at": "2026-07-23T00:00:00Z",
+                    "ordinal": 7,
+                    "receipts": [receipt],
+                }
+                return {
+                    "provider": "synthetic-archil",
+                    "stdout": (
+                        json.dumps(record)
+                        + f"\nRECALL_EVIDENCE {receipt}"
+                    ),
+                    "stderr": "",
+                    "exit_code": 0,
+                    "complete": True,
+                    "stopped_reason": "completed",
+                }
+
+        inspector = InspectingInspector(receipt)
+        retrieval = BoundCanonicalRetrieval(
+            AgentExecStore(receipt),
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=(source,),
+            deep_inspector=inspector,
+        )
+        result = retrieval.inspect_documents(
+            logical_document_ids=(document_id,),
+            query="synthetic decision",
+            scope="full_documents",
+            literal=True,
+            context=2,
+            limit=6,
+            record_spans={document_id: ((4, 2),)},
+            routing_receipts={document_id: (receipt,)},
+            timeout_seconds=7,
+        )
+
+        self.assertEqual(result["opened_receipts"], [receipt])
+        self.assertEqual(result["matches"], [{
+            "logical_document_id": document_id,
+            "record_ordinal": 7,
+            "event_native_id": "event",
+            "occurred_at": "2026-07-23T00:00:00Z",
+            "content": '{"message":"verified synthetic decision"}',
+            "receipts": [receipt],
+        }])
+        program = inspector.calls[0]["program"]
+        self.assertIn("recall-scan", program)
+        self.assertIn("--broad", program)
+        self.assertNotIn("/mnt/archil", program)
+
+    def test_native_pointer_inspect_reports_absent_windows_without_exec(self):
+        source = "codex.jsonl:test"
+        receipt = f"recall://{source}/event?rev=1#item=0"
+        inspector = RecordingExecInspector(receipt)
+        retrieval = BoundCanonicalRetrieval(
+            AgentExecStore(receipt),
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=(source,),
+            deep_inspector=inspector,
+        )
+        result = retrieval.inspect_documents(
+            logical_document_ids=(
+                "ldoc_0123456789abcdef0123456789abcdef",
+            ),
+            query=None,
+            scope="pointers",
+            literal=False,
+            context=0,
+            limit=6,
+            record_spans={},
+            routing_receipts={},
+            timeout_seconds=7,
+        )
+        self.assertEqual(result["stopped_reason"], "no_pointer_windows")
+        self.assertEqual(result["matches"], [])
+        self.assertEqual(inspector.calls, [])
+
+    def test_agent_exec_does_not_treat_document_prose_as_receipt_authority(self):
+        source = "codex.jsonl:test"
+        receipt = f"recall://{source}/event?rev=1#item=0"
+
+        class ProseInspector(RecordingExecInspector):
+            def execute(self, **arguments):
+                self.calls.append(arguments)
+                return {
+                    "provider": "synthetic-archil",
+                    "stdout": f"Document prose quoted {receipt}",
+                    "stderr": "",
+                    "exit_code": 0,
+                    "complete": True,
+                }
+
+        retrieval = BoundCanonicalRetrieval(
+            AgentExecStore(receipt),
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=(source,),
+            deep_inspector=ProseInspector(receipt),
+        )
+        result = retrieval.execute_agent_program(
+            "rg -n verified /mnt/archil/evidence",
+            logical_document_ids=(
+                "ldoc_0123456789abcdef0123456789abcdef",
+            ),
+            record_spans={},
+            routing_receipts={},
+            timeout_seconds=7,
+        )
+        self.assertEqual(result["opened_receipts"], [])
+
+    def test_agent_exec_accepts_authoritative_jsonl_record_receipts(self):
+        source = "codex.jsonl:test"
+        receipt = f"recall://{source}/event?rev=1#item=0"
+
+        class JsonlInspector(RecordingExecInspector):
+            def execute(self, **arguments):
+                self.calls.append(arguments)
+                record = {
+                    "content": {"message": "Verified synthetic change"},
+                    "event_native_id": "event",
+                    "occurred_at": "2026-07-23T00:00:00Z",
+                    "ordinal": 1,
+                    "receipts": [receipt],
+                }
+                return {
+                    "provider": "synthetic-archil",
+                    "stdout": (
+                        "/mnt/archil/evidence/object:7:"
+                        + json.dumps(record)
+                    ),
+                    "stderr": "",
+                    "exit_code": 0,
+                    "complete": True,
+                }
+
+        retrieval = BoundCanonicalRetrieval(
+            AgentExecStore(receipt),
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=(source,),
+            deep_inspector=JsonlInspector(receipt),
+        )
+        result = retrieval.execute_agent_program(
+            "rg -n verified /mnt/archil/evidence",
+            logical_document_ids=(
+                "ldoc_0123456789abcdef0123456789abcdef",
+            ),
+            record_spans={},
+            routing_receipts={},
+            timeout_seconds=7,
+        )
+        self.assertEqual(result["opened_receipts"], [receipt])
 
     def test_agent_exec_rejects_a_receipt_not_proven_by_admitted_documents(self):
         source = "codex.jsonl:test"
@@ -399,6 +727,8 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
                 logical_document_ids=(
                     "ldoc_0123456789abcdef0123456789abcdef",
                 ),
+                record_spans={},
+                routing_receipts={},
                 timeout_seconds=7,
             )
 
