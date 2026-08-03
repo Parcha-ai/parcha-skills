@@ -21,7 +21,19 @@ def token_from_file(path: str) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Acknowledgement-gated Recall history collector")
-    parser.add_argument("command", choices=("scan", "flush", "run", "watch", "doctor", "locate", "recover"))
+    parser.add_argument(
+        "command",
+        choices=(
+            "scan",
+            "flush",
+            "run",
+            "watch",
+            "doctor",
+            "status",
+            "locate",
+            "recover",
+        ),
+    )
     parser.add_argument("--harness", choices=("claude", "codex"), required=True)
     parser.add_argument("--root", required=True)
     parser.add_argument("--source-id", required=True)
@@ -74,7 +86,9 @@ def main() -> None:
     parser.add_argument("--privacy-judge-model", default=os.environ.get("RECALL_PRIVACY_JUDGE_MODEL"))
     parser.add_argument("--privacy-judge-failure", choices=("drop", "ignore"), default="drop")
     args = parser.parse_args()
-    if args.command in {"flush", "run", "watch"} and (not args.endpoint or not args.token_file):
+    if args.command in {"flush", "run", "watch", "status"} and (
+        not args.endpoint or not args.token_file
+    ):
         parser.error("--endpoint and --token-file are required for network commands")
     judge_values = (args.privacy_judge_base_url, args.privacy_judge_key_file, args.privacy_judge_model)
     if any(judge_values) and not all(judge_values):
@@ -142,6 +156,10 @@ def main() -> None:
             }, sort_keys=True))
         elif args.command == "doctor":
             print(json.dumps(collector.doctor(), sort_keys=True))
+        elif args.command == "status":
+            if canonical is None:
+                parser.error("status requires canonical collector configuration")
+            print(json.dumps(canonical[0].status(), sort_keys=True))
         elif args.command == "recover":
             print(json.dumps(collector.recover_dead_payloads(), sort_keys=True))
         elif args.command == "locate":

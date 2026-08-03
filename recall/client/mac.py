@@ -540,6 +540,17 @@ class CanonicalBrainWriter(_CanonicalClient):
         available_base64_bytes = MAX_INGEST_BYTES - len(empty_body)
         return 3 * (available_base64_bytes // 4)
 
+    def status(self) -> dict[str, Any]:
+        """Read content-free source and projection parity under write scope."""
+        return self._request(
+            "/v2/ingest/status",
+            body={
+                "tenant_id": self.tenant_id,
+                "principal_id": self.principal_id,
+                "source_id": self.source_id,
+            },
+        )
+
     def ingest(self, events: list[dict[str, Any]]) -> dict[str, Any]:
         if not events or len(events) > MAX_CANONICAL_INGEST_EVENTS:
             raise ValueError("canonical ingest batch is invalid")

@@ -676,5 +676,36 @@ class PrivacyPreviewTest(unittest.TestCase):
         self.assertNotIn(canary, output.getvalue())
 
 
+class CanonicalCollectorCliTest(unittest.TestCase):
+    def test_canonical_collection_uses_bulk_archive_manifests(self) -> None:
+        collector = mock.Mock()
+        collector.scan.return_value = {"scan_complete": True}
+        collector.flush.return_value = {"acked": 0}
+        collector.doctor.return_value = {"pending": 0}
+        arguments = [
+            "recall-brain", "collect",
+            "--endpoint", "https://brain.example.invalid",
+            "--source-id", "codex:mac:synthetic",
+            "--principal-id", "principal:owner",
+            "--visibility", "private",
+            "--harness", "codex",
+            "--root", "/synthetic/codex",
+            "--spool", "/synthetic/state.db",
+            "--token-file", "/synthetic/token.json",
+            "--privacy-mode", "scrub",
+        ]
+        canonical = (mock.sentinel.writer, mock.sentinel.archive, "tenant:company")
+        output = io.StringIO()
+        with mock.patch("sys.argv", arguments), \
+             mock.patch("client.cli.load_file_token", return_value="synthetic-token"), \
+             mock.patch("client.cli._canonical_clients", return_value=canonical), \
+             mock.patch("client.cli.Collector", return_value=collector) as collector_type, \
+             contextlib.redirect_stdout(output):
+            client_cli.main()
+
+        self.assertTrue(collector_type.call_args.kwargs["bulk_manifest_archive"])
+        collector.close.assert_called_once_with()
+
+
 if __name__ == "__main__":
     unittest.main()

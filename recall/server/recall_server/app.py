@@ -654,7 +654,11 @@ class Handler(BaseHTTPRequestHandler):
         if os.environ.get("RECALL_CANONICAL_INGEST_PUBLIC") == "1":
             allowed = allowed or (
                 method == "POST"
-                and path in {"/v2/archive/objects", "/v2/ingest/canonical"}
+                and path in {
+                    "/v2/archive/objects",
+                    "/v2/ingest/canonical",
+                    "/v2/ingest/status",
+                }
             )
         if allowed:
             return False
@@ -1158,6 +1162,43 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 LOG.error("canonical ingest failed type=%s", type(exc).__name__)
                 self.send_json(500, {"error": "canonical ingest failed"})
+            return
+        if path == "/v2/ingest/status":
+            principal = self.require("write")
+            if not principal:
+                return
+            length = self.body_length(MAX_BODY_BYTES)
+            if length is None:
+                return
+            try:
+                body = json.loads(self.rfile.read(length))
+                authority = self.canonical_authority(principal, body)
+                if authority is None:
+                    return
+                tenant_id, principal_id, source_id = authority
+                if self.canonical_plane is None:
+                    self.send_json(503, {"error": "canonical plane unavailable"})
+                    return
+                self.send_json(
+                    200,
+                    self.canonical_plane.source_status(
+                        tenant_id=tenant_id,
+                        principal_id=principal_id,
+                        source_id=source_id,
+                    ),
+                )
+            except (json.JSONDecodeError, TypeError, ValueError):
+                self.send_json(400, {"error": "canonical status request invalid"})
+            except CanonicalLifecycleError as exc:
+                status = (
+                    403
+                    if exc.error_code == "canonical_authority_forbidden"
+                    else 400
+                )
+                self.send_json(status, {"error": exc.error_code})
+            except Exception as exc:
+                LOG.error("canonical status failed type=%s", type(exc).__name__)
+                self.send_json(503, {"error": "canonical status unavailable"})
             return
         if path == WEBHOOK_PATH:
             principal = self.require("webhook")
