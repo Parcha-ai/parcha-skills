@@ -11,6 +11,9 @@ from server.recall_server.logical_evidence import (
     LogicalEvidenceProjectionStore,
     LogicalEvidenceRecord,
 )
+from server.recall_server.logical_evidence_projection import (
+    CanonicalLogicalEvidenceProjector,
+)
 
 
 class _ConcurrentArchive:
@@ -96,6 +99,32 @@ def _records(count: int) -> tuple[LogicalEvidenceRecord, ...]:
 
 
 class LogicalPartUploadTests(unittest.TestCase):
+    def test_projection_preserves_receipts_from_the_ingested_revision(self) -> None:
+        projector = CanonicalLogicalEvidenceProjector(None, None)
+        receipt = "recall://source:parallel/event-existing?rev=1#item=0"
+        records = tuple(
+            projector._record_stream(
+                [
+                    {
+                        "event_text": "x" * 25_000,
+                        "document_revision": 1,
+                        "fallback_type_values": [],
+                        "fallback_role_values": ["assistant"],
+                        "raw_media_type": "application/json",
+                        "source_id": "source:parallel",
+                        "native_id": "event:existing",
+                        "kind": "transcript_record",
+                        "occurred_at": "2026-07-27T00:00:00Z",
+                        "chunk_count": 1,
+                        "chunk_receipts": [receipt],
+                    }
+                ]
+            )
+        )
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].receipts, (receipt,))
+
     def test_default_part_size_is_bounded_for_interactive_scans(self) -> None:
         self.assertEqual(DEFAULT_PART_BYTES, 4 * 1024 * 1024)
 

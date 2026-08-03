@@ -12,7 +12,6 @@ from typing import Any
 
 import orjson
 
-from .canonical_text import canonical_text_chunks
 from .logical_evidence import (
     LogicalEvidenceError,
     LogicalEvidenceProjectionStore,
@@ -21,7 +20,6 @@ from .logical_evidence import (
     ROLE_RE,
     logical_document_id,
 )
-from .projectors import item_receipt
 
 OVERSIZED_MEDIA_TYPE = "application/vnd.recall.oversized-record+gzip"
 MAX_RESTORED_RECORD_BYTES = 256 * 1024 * 1024
@@ -379,15 +377,7 @@ class CanonicalLogicalEvidenceProjector:
                     if candidate_bytes == source_bytes:
                         canonical_content_bytes = candidate_bytes
             row["explicit_role_values"] = list(structural_roles)
-            receipts = [
-                item_receipt(
-                    row["source_id"],
-                    row["native_id"],
-                    revision,
-                    ordinal,
-                )
-                for ordinal, _chunk in enumerate(canonical_text_chunks(text))
-            ]
+            receipts = list(row["chunk_receipts"])
             records = tuple(
                 self._event_records(
                     row,
@@ -639,6 +629,7 @@ class CanonicalLogicalEvidenceProjector:
                               document.text_redacted AS event_text,
                               document.revision AS document_revision,
                               source_record.chunk_count,
+                              source_record.chunk_receipts,
                               artifact.artifact_id AS raw_artifact_id,
                               artifact.storage_backend AS raw_storage_backend,
                               artifact.object_key AS raw_object_key,
@@ -666,7 +657,10 @@ class CanonicalLogicalEvidenceProjector:
                           AND artifact.source_id=event.source_id
                           AND artifact.artifact_id=event.artifact_id
                          JOIN LATERAL (
-                              SELECT count(*)::integer AS chunk_count
+                              SELECT count(*)::integer AS chunk_count,
+                                     array_agg(
+                                         chunk.receipt ORDER BY chunk.ordinal
+                                     ) AS chunk_receipts
                                 FROM canonical_chunks chunk
                                WHERE chunk.tenant_id=document.tenant_id
                                  AND chunk.source_id=document.source_id
