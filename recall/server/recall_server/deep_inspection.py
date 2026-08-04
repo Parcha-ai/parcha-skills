@@ -10,17 +10,36 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from .agent_scan import AGENT_SCAN_SCRIPT
 from .evidence_projection import EvidenceProjectionStore
 
 OBJECT_KEY_RE = re.compile(r"objects/[0-9a-f]{2}/[0-9a-f]{64}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 DISK_ID_RE = re.compile(r"dsk-[0-9a-f]{16}\Z")
+LOGICAL_DOCUMENT_ID_RE = re.compile(r"ldoc_[0-9a-f]{32}\Z")
 REGION_ENDPOINTS = {
     "aws-us-east-1": "https://control.green.us-east-1.aws.prod.archil.com",
     "aws-us-west-2": "https://control.green.us-west-2.aws.prod.archil.com",
     "aws-eu-west-1": "https://control.green.eu-west-1.aws.prod.archil.com",
 }
 MAX_TRANSPORT_BYTES = 256 * 1024
+MAX_AGENT_PROGRAM_BYTES = 16_000
+MAX_AGENT_EXEC_OUTPUT_BYTES = 40_000
+RECEIPT_TOKEN_PATTERN = (
+    r"recall://[A-Za-z0-9:._@+-]+/[^\s\"'<>()[\]{},;]{1,1900}"
+)
+RECEIPT_TOKEN_RE = re.compile(RECEIPT_TOKEN_PATTERN)
+AGENT_EVIDENCE_LINE_RE = re.compile(
+    rf"^RECALL_EVIDENCE[ \t]+({RECEIPT_TOKEN_PATTERN})[ \t]*$",
+    re.MULTILINE,
+)
+EVIDENCE_RECORD_KEYS = frozenset({
+    "content",
+    "event_native_id",
+    "occurred_at",
+    "ordinal",
+    "receipts",
+})
 
 
 class DeepInspectionError(RuntimeError):
@@ -93,6 +112,42 @@ class UrllibTransport:
         if not isinstance(value, dict):
             raise DeepInspectionError("deep_inspector_response_invalid")
         return value
+
+
+def agent_evidence_receipts(stdout: str) -> list[str]:
+    """Extract agent-selected receipts only from authoritative output shapes."""
+
+    selected = {
+        match.group(1)
+        for match in AGENT_EVIDENCE_LINE_RE.finditer(stdout)
+    }
+    found: list[str] = []
+    for line in stdout.splitlines():
+        object_start = line.find("{")
+        if object_start < 0:
+            continue
+        try:
+            record = json.loads(line[object_start:])
+        except json.JSONDecodeError:
+            continue
+        if (
+            not isinstance(record, dict)
+            or not EVIDENCE_RECORD_KEYS.issubset(record)
+            or not isinstance(record["receipts"], list)
+        ):
+            continue
+        found.extend(
+            receipt
+            for receipt in record["receipts"]
+            if isinstance(receipt, str)
+            and RECEIPT_TOKEN_RE.fullmatch(receipt)
+        )
+    authoritative = list(dict.fromkeys(found))
+    if selected:
+        return [
+            receipt for receipt in authoritative if receipt in selected
+        ]
+    return authoritative
 
 
 @dataclass(frozen=True)
@@ -173,6 +228,194 @@ class EvidenceTarget:
             )
         except KeyError:
             raise DeepInspectionError("deep_inspector_target_invalid") from None
+
+
+@dataclass(frozen=True)
+class AgentExecObject:
+    """One immutable object admitted into an agent execution sandbox."""
+
+    object_key: str
+    content_sha256: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.object_key, str)
+            or not OBJECT_KEY_RE.fullmatch(self.object_key)
+            or not isinstance(self.content_sha256, str)
+            or not SHA256_RE.fullmatch(self.content_sha256)
+        ):
+            raise DeepInspectionError("deep_inspector_target_invalid")
+
+
+def _agent_exec_command(
+    *,
+    program: str,
+    objects: tuple[AgentExecObject, ...],
+    document_aliases: dict[str, str],
+    record_spans: dict[str, tuple[tuple[int, int], ...]],
+    routing_receipts: dict[str, tuple[str, ...]],
+    timeout_seconds: int,
+) -> str:
+    """Build a content-addressed, no-network view for an agent-authored program."""
+
+    payload = base64.b64encode(
+        json.dumps(
+            [
+                {
+                    "object_key": item.object_key,
+                    "content_sha256": item.content_sha256,
+                }
+                for item in objects
+            ],
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    ).decode()
+    encoded_program = base64.b64encode(program.encode()).decode()
+    encoded_scan = base64.b64encode(AGENT_SCAN_SCRIPT.encode()).decode()
+    encoded_aliases = base64.b64encode(
+        json.dumps(
+            document_aliases,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    ).decode()
+    encoded_pointers = base64.b64encode(
+        json.dumps(
+            {
+                document_id: {
+                    "spans": [
+                        {"record_ordinal": start, "record_count": count}
+                        for start, count in spans
+                    ],
+                    "routing_receipts": list(
+                        routing_receipts.get(document_id, ())
+                    ),
+                }
+                for document_id, spans in record_spans.items()
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    ).decode()
+    stage_script = r"""
+import base64,json,pathlib,re,subprocess,sys
+items=json.loads(base64.b64decode(sys.argv[1]))
+aliases=json.loads(base64.b64decode(sys.argv[2]))
+source=pathlib.Path("/mnt/archil/evidence").resolve()
+target=pathlib.Path("/tmp/recall-authorized").resolve()
+docs=pathlib.Path("/tmp/recall-docs").resolve()
+target.mkdir(mode=0o700,parents=True,exist_ok=True)
+docs.mkdir(mode=0o700,parents=True,exist_ok=True)
+for item in items:
+    relative=pathlib.PurePosixPath(item["object_key"])
+    if relative.is_absolute() or ".." in relative.parts:
+        raise SystemExit(64)
+    src=(source/pathlib.Path(*relative.parts)).resolve()
+    if source not in src.parents or not src.is_file():
+        raise SystemExit(66)
+    dst=(target/pathlib.Path(*relative.parts)).resolve()
+    if target not in dst.parents:
+        raise SystemExit(64)
+    dst.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+    dst.touch(mode=0o400,exist_ok=False)
+    subprocess.run(["mount","--bind",str(src),str(dst)],check=True)
+    subprocess.run(["mount","-o","remount,bind,ro",str(dst)],check=True)
+manifest_by_document={}
+for path in target.rglob("*"):
+    if not path.is_file() or path.stat().st_size > 100000:
+        continue
+    try:
+        manifest=json.loads(path.read_text())
+    except (OSError,UnicodeDecodeError,json.JSONDecodeError):
+        continue
+    document_id=manifest.get("logical_document_id")
+    if document_id in aliases and isinstance(manifest.get("parts"),list):
+        manifest_by_document[document_id]=(path,manifest)
+if set(manifest_by_document)!=set(aliases):
+    raise SystemExit(66)
+for document_id,alias in aliases.items():
+    if not re.fullmatch(r"d[1-9][0-9]?",alias):
+        raise SystemExit(64)
+    manifest_path,manifest=manifest_by_document[document_id]
+    document_dir=docs/alias
+    document_dir.mkdir(mode=0o700,exist_ok=False)
+    (document_dir/"manifest.json").symlink_to(
+        "/mnt/archil/evidence/"+str(manifest_path.relative_to(target))
+    )
+    for ordinal,part in enumerate(manifest["parts"]):
+        object_key=part.get("object_key") if isinstance(part,dict) else None
+        if not isinstance(object_key,str) or not re.fullmatch(
+            r"objects/[0-9a-f]{2}/[0-9a-f]{64}",object_key
+        ):
+            raise SystemExit(66)
+        part_path=(target/pathlib.Path(object_key)).resolve()
+        if target not in part_path.parents or not part_path.is_file():
+            raise SystemExit(66)
+        (document_dir/f"part-{ordinal:05d}.jsonl").symlink_to(
+            "/mnt/archil/evidence/"+object_key
+        )
+""".strip()
+    inner_command = " && ".join([
+        (
+            "python3 -c "
+            + shlex.quote(stage_script)
+            + " "
+            + shlex.quote(payload)
+            + " "
+            + shlex.quote(encoded_aliases)
+        ),
+        "mount --rbind /tmp/recall-authorized /mnt/archil/evidence",
+        "mount -o remount,bind,ro /mnt/archil/evidence",
+        "mkdir -p /docs",
+        "mount --bind /tmp/recall-docs /docs",
+        "mount -o remount,bind,ro /docs",
+        (
+            "exec env -i HOME=/tmp "
+            "PATH=/tmp/recall-agent:/usr/local/bin:/usr/bin:/bin "
+            "RECALL_POINTERS_PATH=/tmp/recall-agent/pointers.json "
+            "LC_ALL=C bash -c "
+            + shlex.quote(
+                "set -o pipefail; "
+                "bash /tmp/recall-agent/program.sh | "
+                f"head -c {MAX_AGENT_EXEC_OUTPUT_BYTES}; "
+                "code=${PIPESTATUS[0]}; "
+                "[ \"$code\" -eq 141 ] && exit 0; exit \"$code\""
+            )
+        ),
+    ])
+    return "\n".join([
+        "set -eu",
+        "umask 077",
+        # Archil may reuse an execution host. Remove every per-run staging
+        # directory so a prior alias cannot make the next mkdir fail.
+        "rm -rf /tmp/recall-authorized /tmp/recall-agent /tmp/recall-docs",
+        "mkdir -p /tmp/recall-agent",
+        (
+            "printf '%s' "
+            + shlex.quote(encoded_program)
+            + " | base64 -d > /tmp/recall-agent/program.sh"
+        ),
+        (
+            "printf '%s' "
+            + shlex.quote(encoded_scan)
+            + " | base64 -d > /tmp/recall-agent/recall-scan"
+        ),
+        (
+            "printf '%s' "
+            + shlex.quote(encoded_pointers)
+            + " | base64 -d > /tmp/recall-agent/pointers.json"
+        ),
+        "chmod 0500 /tmp/recall-agent/program.sh",
+        "chmod 0500 /tmp/recall-agent/recall-scan",
+        "chmod 0400 /tmp/recall-agent/pointers.json",
+        (
+            f"timeout --signal=KILL {timeout_seconds}s "
+            "unshare --user --map-root-user --net --mount --pid --fork "
+            "--mount-proc sh -c "
+            + shlex.quote(inner_command)
+        ),
+    ])
 
 
 def _terms(question: str) -> tuple[str, ...]:
@@ -286,51 +529,10 @@ class LocalDeepInspector:
         }
 
 
-ARCHIL_INSPECT_SCRIPT = r"""
-import base64,json,pathlib,re,sys
-p=json.loads(base64.b64decode(sys.argv[1]))
-root=pathlib.Path("/mnt/archil/evidence").resolve()
-terms=[]
-for term in re.findall(r"[\w.-]{3,}",p["question"].casefold()):
-    if term not in terms:
-        terms.append(term)
-terms=terms[:32]
-allowed=set(p["allowed_receipts"])
-out=[]
-scanned=0
-for key in p["object_keys"]:
-    path=(root/key).resolve()
-    if root not in path.parents:
-        continue
-    try:
-        value=json.loads(path.read_text())
-    except Exception:
-        continue
-    scanned+=1
-    for chunk in value.get("chunks",[]):
-        receipt=chunk.get("receipt")
-        text=chunk.get("text")
-        if receipt not in allowed or not isinstance(text,str):
-            continue
-        lowered=text.casefold()
-        score=sum(lowered.count(term) for term in terms)
-        if terms and score==0:
-            continue
-        out.append({"receipt":receipt,"text":text[:8192],"line":int(chunk.get("ordinal",0))+1,"object_key":key,"_score":score})
-out.sort(key=lambda x:(x["_score"],x["receipt"]),reverse=True)
-findings=[]
-for item in out:
-    item.pop("_score",None)
-    candidate=findings+[item]
-    if len(candidate)>p["max_matches"] or len(json.dumps(candidate,ensure_ascii=False).encode())>p["max_output_bytes"]:
-        break
-    findings.append(item)
-print(json.dumps({"findings":findings,"complete":scanned==len(p["object_keys"]),"files_scanned":scanned},ensure_ascii=False,separators=(",",":")))
-""".strip()
 
 
 class ArchilDeepInspector:
-    """Archil serverless execution with a fixed script and read-only disk mount."""
+    """Archil serverless execution over immutable, tenant-selected objects."""
 
     def __init__(
         self,
@@ -354,47 +556,91 @@ class ArchilDeepInspector:
         self.region = region
         self.transport = transport or UrllibTransport()
 
-    def inspect(
+    def execute(
         self,
         *,
         tenant_id: str,
-        question: str,
-        targets: tuple[EvidenceTarget, ...],
-        budget: DeepInspectionBudget,
+        program: str,
+        objects: tuple[AgentExecObject, ...],
+        record_spans: dict[str, tuple[tuple[int, int], ...]],
+        routing_receipts: dict[str, tuple[str, ...]],
+        timeout_seconds: int,
+        document_aliases: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        _terms(question)
-        if not targets:
-            return {
-                "provider": "archil",
-                "findings": [],
-                "complete": True,
-                "files_scanned": 0,
-                "stopped_reason": "completed",
-                "timing": None,
-            }
-        selected = targets[: budget.max_files]
-        if any(target.tenant_id != tenant_id for target in selected):
-            raise DeepInspectionError("deep_inspector_target_invalid")
-        object_keys = [target.object_key for target in selected]
-        allowed_receipts = sorted(
-            {receipt for target in selected for receipt in target.receipts}
-        )
-        payload = {
-            "question": question,
-            "object_keys": object_keys,
-            "allowed_receipts": allowed_receipts,
-            "max_matches": budget.max_matches,
-            "max_output_bytes": budget.max_output_bytes,
+        """Run arbitrary agent-authored shell against only admitted objects."""
+
+        if (
+            not isinstance(tenant_id, str)
+            or not tenant_id
+            or not isinstance(program, str)
+            or not program.strip()
+            or len(program.encode()) > MAX_AGENT_PROGRAM_BYTES
+            or not isinstance(objects, tuple)
+            or not 1 <= len(objects) <= 512
+            or any(not isinstance(item, AgentExecObject) for item in objects)
+            or (
+                document_aliases is not None
+                and (
+                    not isinstance(document_aliases, dict)
+                    or not 1 <= len(document_aliases) <= 80
+                    or set(document_aliases) != set(record_spans)
+                    or len(set(document_aliases.values()))
+                    != len(document_aliases)
+                    or any(
+                        not isinstance(document_id, str)
+                        or not LOGICAL_DOCUMENT_ID_RE.fullmatch(document_id)
+                        or not isinstance(alias, str)
+                        or re.fullmatch(r"d[1-9][0-9]?", alias) is None
+                        for document_id, alias in document_aliases.items()
+                    )
+                )
+            )
+            or not isinstance(record_spans, dict)
+            or len(record_spans) > 80
+            or any(
+                not isinstance(document_id, str)
+                or not LOGICAL_DOCUMENT_ID_RE.fullmatch(document_id)
+                or not isinstance(spans, tuple)
+                or len(spans) > 256
+                or any(
+                    not isinstance(span, tuple)
+                    or len(span) != 2
+                    or isinstance(span[0], bool)
+                    or not isinstance(span[0], int)
+                    or span[0] < 0
+                    or isinstance(span[1], bool)
+                    or not isinstance(span[1], int)
+                    or not 1 <= span[1] <= 10_000
+                    for span in spans
+                )
+                for document_id, spans in record_spans.items()
+            )
+            or not isinstance(routing_receipts, dict)
+            or set(routing_receipts) - set(record_spans)
+            or any(
+                not isinstance(receipts, tuple)
+                or len(receipts) > 256
+                or any(
+                    not isinstance(receipt, str)
+                    or not receipt.startswith("recall://")
+                    or len(receipt) > 2048
+                    for receipt in receipts
+                )
+                for receipts in routing_receipts.values()
+            )
+            or isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, int)
+            or not 1 <= timeout_seconds <= 30
+        ):
+            raise DeepInspectionError("deep_inspector_exec_invalid")
+        unique = tuple({
+            (item.object_key, item.content_sha256): item
+            for item in objects
+        }.values())
+        aliases = document_aliases or {
+            document_id: f"d{ordinal}"
+            for ordinal, document_id in enumerate(record_spans, start=1)
         }
-        encoded = base64.b64encode(
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
-        ).decode()
-        command = (
-            "python3 -c "
-            + shlex.quote(ARCHIL_INSPECT_SCRIPT)
-            + " "
-            + shlex.quote(encoded)
-        )
         response = self.transport.post(
             url=REGION_ENDPOINTS[self.region] + "/api/exec",
             headers={"Authorization": self.api_key},
@@ -405,30 +651,17 @@ class ArchilDeepInspector:
                         "readOnly": True,
                     }
                 },
-                "command": command,
+                "command": _agent_exec_command(
+                    program=program,
+                    objects=unique,
+                    document_aliases=aliases,
+                    record_spans=record_spans,
+                    routing_receipts=routing_receipts,
+                    timeout_seconds=timeout_seconds,
+                ),
             },
-            timeout=budget.timeout_seconds + 2,
+            timeout=timeout_seconds + 4,
         )
-        result = self._validate_response(
-            response,
-            selected=selected,
-            budget=budget,
-        )
-        result["provider"] = "archil"
-        result["stopped_reason"] = (
-            "completed"
-            if result["complete"] and len(targets) <= budget.max_files
-            else "partial"
-        )
-        return result
-
-    @staticmethod
-    def _validate_response(
-        response: dict[str, Any],
-        *,
-        selected: tuple[EvidenceTarget, ...],
-        budget: DeepInspectionBudget,
-    ) -> dict[str, Any]:
         if (
             not isinstance(response, dict)
             or response.get("success") is not True
@@ -437,55 +670,46 @@ class ArchilDeepInspector:
             raise DeepInspectionError("deep_inspector_unavailable")
         data = response["data"]
         stdout = data.get("stdout")
+        stderr = data.get("stderr", "")
+        exit_code = data.get("exitCode")
+        timing = data.get("timing")
         if (
-            data.get("exitCode") != 0
-            or not isinstance(stdout, str)
-            or len(stdout.encode()) > budget.max_output_bytes + 16_384
-            or not isinstance(data.get("timing"), dict)
+            not isinstance(stdout, str)
+            or not isinstance(stderr, str)
+            or isinstance(exit_code, bool)
+            or not isinstance(exit_code, int)
+            or not isinstance(timing, dict)
         ):
-            raise DeepInspectionError("deep_inspector_result_invalid")
-        try:
-            value = json.loads(stdout)
-        except json.JSONDecodeError:
-            raise DeepInspectionError("deep_inspector_result_invalid") from None
-        if (
-            not isinstance(value, dict)
-            or set(value) != {"findings", "complete", "files_scanned"}
-            or not isinstance(value["findings"], list)
-            or len(value["findings"]) > budget.max_matches
-            or not isinstance(value["complete"], bool)
-            or isinstance(value["files_scanned"], bool)
-            or not isinstance(value["files_scanned"], int)
-            or not 0 <= value["files_scanned"] <= len(selected)
-        ):
-            raise DeepInspectionError("deep_inspector_result_invalid")
-        allowed_pairs = {
-            (target.object_key, receipt)
-            for target in selected
-            for receipt in target.receipts
-        }
-        for finding in value["findings"]:
-            if (
-                not isinstance(finding, dict)
-                or set(finding) != {"receipt", "text", "line", "object_key"}
-                or (
-                    finding.get("object_key"),
-                    finding.get("receipt"),
-                )
-                not in allowed_pairs
-                or not isinstance(finding.get("text"), str)
-                or len(finding["text"].encode()) > 8_192
-                or isinstance(finding.get("line"), bool)
-                or not isinstance(finding.get("line"), int)
-                or finding["line"] < 1
-            ):
-                raise DeepInspectionError("deep_inspector_result_invalid")
-        if len(json.dumps(value["findings"], ensure_ascii=False).encode()) > budget.max_output_bytes:
-            raise DeepInspectionError("deep_inspector_result_invalid")
+            raise DeepInspectionError("deep_inspector_result_invalid_execution")
+        stdout_bytes = stdout.encode()
+        stderr_bytes = stderr.encode()
+        truncated = (
+            len(stdout_bytes) > MAX_AGENT_EXEC_OUTPUT_BYTES
+            or len(stderr_bytes) > 8_000
+        )
+        bounded_stdout = stdout_bytes[:MAX_AGENT_EXEC_OUTPUT_BYTES].decode(
+            errors="ignore"
+        )
+        bounded_stderr = stderr_bytes[:8_000].decode(errors="ignore")
+        timed_out = exit_code in {124, 137}
         return {
-            **value,
+            "provider": "archil",
+            "stdout": bounded_stdout,
+            "stderr": bounded_stderr,
+            "exit_code": exit_code,
+            "complete": exit_code == 0 and not truncated,
+            "stopped_reason": (
+                "timeout"
+                if timed_out
+                else "output_limit"
+                if truncated
+                else "completed"
+                if exit_code == 0
+                else "nonzero_exit"
+            ),
+            "output_truncated": truncated,
             "timing": {
-                key: data["timing"].get(key)
+                key: timing.get(key)
                 for key in ("totalMs", "queueMs", "executeMs")
             },
         }

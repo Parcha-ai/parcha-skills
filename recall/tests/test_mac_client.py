@@ -234,6 +234,53 @@ class BrainEndpointValidationTest(unittest.TestCase):
 
 
 class CanonicalV2ClientTest(unittest.TestCase):
+    def test_writer_allows_bounded_remote_commit_time(self) -> None:
+        writer = CanonicalBrainWriter(
+            endpoint="https://brain.example.invalid",
+            token="synthetic",
+            source_id="source:company",
+            tenant_id="tenant:company",
+            principal_id="principal:owner",
+        )
+        event = {
+            "source_id": "source:company",
+            "native_id": "native:one",
+            "principal_id": "principal:owner",
+            "provenance": {"artifact_ref": {"artifact_id": "synthetic"}},
+        }
+        with mock.patch.object(
+            writer,
+            "_request",
+            return_value={"status": "committed"},
+        ) as request:
+            self.assertEqual(writer.ingest([event]), {"status": "committed"})
+        request.assert_called_once()
+        self.assertEqual(request.call_args.kwargs["timeout"], 300)
+
+    def test_source_status_uses_audit_timeout_and_closed_scope(self) -> None:
+        writer = CanonicalBrainWriter(
+            endpoint="https://brain.example.invalid",
+            token="synthetic",
+            source_id="source:company",
+            tenant_id="tenant:company",
+            principal_id="principal:owner",
+        )
+        with mock.patch.object(
+            writer,
+            "_request",
+            return_value={"status": "ok"},
+        ) as request:
+            self.assertEqual(writer.status(), {"status": "ok"})
+        request.assert_called_once_with(
+            "/v2/ingest/status",
+            body={
+                "tenant_id": "tenant:company",
+                "principal_id": "principal:owner",
+                "source_id": "source:company",
+            },
+            timeout=300,
+        )
+
     def test_writer_sends_exactly_one_thousand_events(self) -> None:
         writer = CanonicalBrainWriter(
             endpoint="https://brain.example.invalid",
@@ -674,6 +721,37 @@ class PrivacyPreviewTest(unittest.TestCase):
         receipt = json.loads(output.getvalue())
         self.assertEqual(receipt["action"], "scrub")
         self.assertNotIn(canary, output.getvalue())
+
+
+class CanonicalCollectorCliTest(unittest.TestCase):
+    def test_canonical_collection_uses_bulk_archive_manifests(self) -> None:
+        collector = mock.Mock()
+        collector.scan.return_value = {"scan_complete": True}
+        collector.flush.return_value = {"acked": 0}
+        collector.doctor.return_value = {"pending": 0}
+        arguments = [
+            "recall-brain", "collect",
+            "--endpoint", "https://brain.example.invalid",
+            "--source-id", "codex:mac:synthetic",
+            "--principal-id", "principal:owner",
+            "--visibility", "private",
+            "--harness", "codex",
+            "--root", "/synthetic/codex",
+            "--spool", "/synthetic/state.db",
+            "--token-file", "/synthetic/token.json",
+            "--privacy-mode", "scrub",
+        ]
+        canonical = (mock.sentinel.writer, mock.sentinel.archive, "tenant:company")
+        output = io.StringIO()
+        with mock.patch("sys.argv", arguments), \
+             mock.patch("client.cli.load_file_token", return_value="synthetic-token"), \
+             mock.patch("client.cli._canonical_clients", return_value=canonical), \
+             mock.patch("client.cli.Collector", return_value=collector) as collector_type, \
+             contextlib.redirect_stdout(output):
+            client_cli.main()
+
+        self.assertTrue(collector_type.call_args.kwargs["bulk_manifest_archive"])
+        collector.close.assert_called_once_with()
 
 
 if __name__ == "__main__":

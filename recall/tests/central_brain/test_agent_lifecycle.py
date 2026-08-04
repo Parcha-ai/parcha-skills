@@ -279,6 +279,25 @@ class DurableConfigurationTest(unittest.TestCase):
                 raise AgentExecutionError(
                     "provider body is not durable",
                     code="agent_model_timeout",
+                    trace=[{
+                        "contract": "recall.agent-trace-event.v1",
+                        "schema_version": 1,
+                        "trace_id": (
+                            "trc_0123456789abcdef0123456789abcdef"
+                        ),
+                        "run_id": RUN_ID,
+                        "sequence": 0,
+                        "occurred_at": CREATED,
+                        "stage": "complete",
+                        "outcome": "failed",
+                        "elapsed_ms": 100.0,
+                        "receipts": [],
+                        "receipt_count": 0,
+                        "source_count": 0,
+                        "session_count": 0,
+                        "tool": "recall.agent",
+                        "error_code": "agent_model_timeout",
+                    }],
                 )
 
         class Backend:
@@ -317,7 +336,11 @@ class DurableConfigurationTest(unittest.TestCase):
             backend.failure["error_code"],
             "agent_model_timeout",
         )
-        self.assertEqual(backend.failure["trace"], [])
+        self.assertEqual(
+            backend.failure["trace"][0]["error_code"],
+            "agent_model_timeout",
+        )
+        self.assertEqual(backend.failure["trace"][0]["receipts"], [])
 
     def test_execution_error_normalizes_unsafe_failure_code(self) -> None:
         error = AgentExecutionError(

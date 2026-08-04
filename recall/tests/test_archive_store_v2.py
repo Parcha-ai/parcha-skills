@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from server.recall_server.archive import (
     ArchiveCorruption,
@@ -48,6 +49,9 @@ class FakeS3:
     def __init__(self):
         self.objects: dict[tuple[str, str, str], dict] = {}
         self.put_calls: list[dict] = []
+        self.get_calls: list[dict] = []
+        self.head_calls: list[dict] = []
+        self.delete_calls: list[dict] = []
         self.version = 0
 
     def put_object(self, **kwargs):
@@ -58,18 +62,34 @@ class FakeS3:
         return {"VersionId": version}
 
     def get_object(self, **kwargs):
+        self.get_calls.append(kwargs)
         try:
             value = self.objects[(kwargs["Bucket"], kwargs["Key"], kwargs["VersionId"])]
         except KeyError as error:
             raise ArchiveNotFound("archive object not found") from error
-        return {
-            "Body": FakeBody(value["Body"]),
-            "ContentLength": value["ContentLength"],
+        payload = value["Body"]
+        response = {
+            "Body": FakeBody(payload),
+            "ContentLength": len(payload),
             "Metadata": value["Metadata"],
             "VersionId": kwargs["VersionId"],
         }
+        if "Range" in kwargs:
+            byte_range = kwargs["Range"].removeprefix("bytes=")
+            start_text, end_text = byte_range.split("-", 1)
+            start, end = int(start_text), int(end_text)
+            payload = payload[start:end + 1]
+            response.update({
+                "Body": FakeBody(payload),
+                "ContentLength": len(payload),
+                "ContentRange": (
+                    f"bytes {start}-{end}/{value['ContentLength']}"
+                ),
+            })
+        return response
 
     def head_object(self, **kwargs):
+        self.head_calls.append(kwargs)
         matches = [
             (version, value)
             for (bucket, key, version), value in self.objects.items()
@@ -92,6 +112,7 @@ class FakeS3:
         }
 
     def delete_object(self, **kwargs):
+        self.delete_calls.append(kwargs)
         self.objects.pop(
             (kwargs["Bucket"], kwargs["Key"], kwargs["VersionId"]),
             None,
@@ -104,6 +125,7 @@ class FakeR2:
         self.objects: dict[tuple[str, str], dict] = {}
         self.put_calls: list[dict] = []
         self.get_calls: list[dict] = []
+        self.head_calls: list[dict] = []
         self.delete_calls: list[dict] = []
 
     def put_object(self, **kwargs):
@@ -128,6 +150,7 @@ class FakeR2:
         }
 
     def head_object(self, **kwargs):
+        self.head_calls.append(kwargs)
         try:
             value = self.objects[(kwargs["Bucket"], kwargs["Key"])]
         except KeyError as error:
@@ -246,6 +269,34 @@ class ArchiveStoreParityTest(unittest.TestCase):
             self.assertTrue(store.delete_raw(reference))
             self.assertFalse(store.delete_raw(reference))
 
+    def test_internal_delete_verifies_metadata_without_downloading_payload(self):
+        reference = self.s3.put_raw(
+            tenant_id=TENANT,
+            source_id=SOURCE,
+            native_id="native:internal-delete",
+            payload=PAYLOAD,
+            media_type="application/json",
+            created_at="2026-07-19T00:00:00Z",
+        )
+        get_count = len(self.s3_client.get_calls)
+
+        self.assertTrue(self.s3.delete_internal_raw(reference))
+        self.assertEqual(len(self.s3_client.get_calls), get_count)
+        self.assertTrue(self.s3_client.head_calls)
+        self.assertTrue(self.s3_client.delete_calls)
+
+        protected = self.s3.put_raw(
+            tenant_id=TENANT,
+            source_id=SOURCE,
+            native_id="native:internal-delete-protected",
+            payload=PAYLOAD,
+            media_type="application/json",
+            created_at="2026-07-19T00:00:00Z",
+        )
+        forged = {**protected, "tenant_id": "tenant:other"}
+        self.assertFalse(self.s3.delete_internal_raw(forged))
+        self.assertEqual(self.s3.read_raw(protected), PAYLOAD)
+
     def test_filesystem_rejects_a_symlinked_parent(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -295,6 +346,38 @@ class ArchiveStoreParityTest(unittest.TestCase):
             )
         self.assertEqual(len(self.s3_client.put_calls), 1)
 
+    def test_large_s3_read_uses_verified_parallel_ranges(self):
+        payload = b"0123456789abcdef" * 16
+        reference = self.s3.put(request(payload=payload))
+
+        with (
+            patch(
+                "server.recall_server.archive."
+                "S3_PARALLEL_READ_THRESHOLD_BYTES",
+                1,
+            ),
+            patch(
+                "server.recall_server.archive."
+                "S3_PARALLEL_READ_CHUNK_BYTES",
+                64,
+            ),
+        ):
+            result = self.s3.read(
+                reference,
+                tenant_id=TENANT,
+                source_id=SOURCE,
+            )
+
+        range_calls = [
+            call for call in self.s3_client.get_calls if "Range" in call
+        ]
+        self.assertEqual(result, payload)
+        self.assertEqual(len(range_calls), 4)
+        self.assertTrue(all(
+            call["VersionId"] == reference.version_id
+            for call in range_calls
+        ))
+
     def test_r2_uses_immutable_keys_without_unsupported_s3_features(self):
         client = FakeR2()
         store = S3ArchiveStore(
@@ -309,8 +392,10 @@ class ArchiveStoreParityTest(unittest.TestCase):
         )
 
         first = store.put(request())
+        self.assertEqual(client.head_calls, [])
         replay = store.put(request())
         self.assertEqual(first, replay)
+        self.assertEqual(len(client.head_calls), 1)
         self.assertEqual(
             first.version_id,
             "r2-sha256-" + hashlib.sha256(PAYLOAD).hexdigest(),
@@ -348,8 +433,10 @@ class ArchiveStoreParityTest(unittest.TestCase):
         )
 
         first = store.put(request())
+        self.assertEqual(client.head_calls, [])
         replay = store.put(request())
         self.assertEqual(first, replay)
+        self.assertEqual(len(client.head_calls), 1)
         self.assertEqual(
             first.version_id,
             "s3-sha256-" + hashlib.sha256(PAYLOAD).hexdigest(),

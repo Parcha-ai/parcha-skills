@@ -20,6 +20,7 @@ from recall_server.archive import FilesystemArchiveStore
 from recall_server.control import SecretBox
 from recall_server.db import BrainStore
 from recall_server.managed_worker import ManagedConnectorWorker
+from connectors.workspace_rail import WorkspaceRailError
 
 
 OWNER = "principal:owner:managed-worker-e2e"
@@ -121,6 +122,14 @@ class GmailRail:
         if operation == "gmail.history.list":
             return {"history": [], "historyId": "700"}
         raise AssertionError("unexpected synthetic Google operation")
+
+    def export_document(self, *, file_id, mime_type="text/plain"):
+        raise AssertionError("Gmail fixture does not export documents")
+
+
+class ExpiredGmailRail:
+    def run(self, _operation, _params):
+        raise WorkspaceRailError("authority_revoked")
 
     def export_document(self, *, file_id, mime_type="text/plain"):
         raise AssertionError("Gmail fixture does not export documents")
@@ -394,6 +403,36 @@ def main():
         paused = worker.run_once()
         assert paused["status"] == "idle"
 
+        with store.connect() as database:
+            database.execute(
+                """UPDATE connector_installations
+                   SET state='enabled',run_after=now()-interval '1 second'
+                   WHERE id=%s""",
+                (company_installation,),
+            )
+        worker.remote_rails["google.gmail"] = ExpiredGmailRail()
+        expired = worker.run_once()
+        assert expired["status"] == "failed"
+        assert expired["error_code"] == "connector_authority_revoked"
+        with store.connect() as database:
+            authority = database.execute(
+                """SELECT connection.status,installation.state,
+                          installation.last_error_code,
+                          installation.lease_owner,
+                          installation.lease_expires_at
+                   FROM provider_connections connection
+                   JOIN connector_installations installation
+                     ON installation.connection_id=connection.id
+                   WHERE installation.id=%s""",
+                (company_installation,),
+            ).fetchone()
+        assert authority["status"] == "degraded"
+        assert authority["state"] == "configured"
+        assert authority["last_error_code"] == "connector_authority_revoked"
+        assert authority["lease_owner"] is None
+        assert authority["lease_expires_at"] is None
+        assert worker.run_once()["status"] == "idle"
+
     print(
         json.dumps(
             {
@@ -404,6 +443,7 @@ def main():
                 "canonical_company_embeddings": 2,
                 "duplicate_events_after_replay": 0,
                 "paused_jobs_executed": 0,
+                "expired_authority_retries_after_detection": 0,
                 "plaintext_provider_credentials_at_rest": 0,
                 "rendered_secret_canaries": 0,
             },

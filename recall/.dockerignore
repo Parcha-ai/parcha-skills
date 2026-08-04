@@ -12,6 +12,8 @@ spikes/
 *.env
 **/*.env
 **/__pycache__/
+**/node_modules/
+**/dist/
 **/*.pyc
 **/*.pyo
 **/.DS_Store

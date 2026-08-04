@@ -1028,6 +1028,10 @@ def main() -> None:
             brain_writer=canonical[0] if canonical else None,
             archive=canonical[1] if canonical else None,
             tenant_id=canonical[2] if canonical else None,
+            # Canonical collectors already address individual records through
+            # manifest members. Bundle their private archive writes so a
+            # history backfill does not perform one object request per record.
+            bulk_manifest_archive=canonical is not None,
             max_scan_records=args.max_scan_records,
             max_scan_seconds=args.max_scan_seconds,
         )

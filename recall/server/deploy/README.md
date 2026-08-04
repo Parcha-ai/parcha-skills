@@ -64,7 +64,7 @@ infrastructure. The example is synthetic; a live manifest belongs in a private m
 location and contains references, never credential values.
 
 The production database gate requires a standard PostgreSQL URL with
-`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 38,
+`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 43,
 pgvector 0.8.0 or newer, and a runtime role without superuser, database/role creation,
 replication, or RLS-bypass privilege:
 
@@ -216,6 +216,82 @@ python -m recall_server.cli canonical-evidence-worker \
   --tenant tenant:company:example
 ```
 
+The source-native evidence projection stores one logical session, thread, or
+document revision rather than one object per retrieval chunk. Each JSONL record
+contains the complete privacy-processed source content, structural role and
+time metadata, and every canonical receipt for that source record. Documents
+larger than one object are represented by ordered immutable parts behind one
+opaque manifest. Oversized collector records are restored from the separately
+credentialed raw archive and verified against their declared size and digest
+before projection.
+
+Migration 39 adds the logical-document catalog, dirty-session queue, and
+durable object-cleanup queue. Migration 40 materializes source-record order so
+large-session projection does not repeatedly parse archived JSON in PostgreSQL.
+Populate it without removing the prior projection:
+
+```bash
+python -m recall_server.cli backfill-logical-evidence \
+  --tenant tenant:company:example --source source:google.gmail:example \
+  --batch-size 100 --max-batches 100 \
+  --upload-concurrency 2
+python -m recall_server.cli logical-evidence-worker \
+  --tenant tenant:company:example --upload-concurrency 2
+```
+
+After a retention-policy or projection-format change, intentionally replace
+every current logical document through the same tenant-scoped path:
+
+```bash
+python -m recall_server.cli backfill-logical-evidence \
+  --tenant tenant:company:example --rebuild-existing \
+  --batch-size 2000 --max-batches 100 --upload-concurrency 16
+```
+
+Ingest and forget transactions enqueue only affected logical documents.
+Revision replacement queues superseded S3 references in the same database
+transaction; transient delete failures remain durable and are retried by the
+worker. The operational default of 25 documents over two upload streams keeps
+memory and database load boring. One-time backfills may use up to 2,000
+documents per batch and raise `--upload-concurrency` as high as 32 only when
+`RECALL_DATABASE_POOL_MAX_SIZE` is at least the same value and a live
+throughput/memory measurement justifies it. The worker pre-warms that bounded
+pool before starting the measured projection. Keep the prior
+`canonical-evidence-worker` running until the
+logical-document integrity, rollback, and consumer cutover gates pass.
+
+Migration 41 adds the disposable, document-linked lossless passage index. It
+packs exact visible user and assistant message bytes into overlapping passages
+without crossing logical documents. Tool text remains available through the
+canonical sparse index; no completion model summarizes, classifies, or segments
+ingestion.
+
+```bash
+python -m recall_server.cli backfill-lossless-passages \
+  --tenant tenant:company:example --target-tokens 1024 \
+  --overlap-tokens 128 --batch-size 100 --max-batches 100 \
+  --concurrency 8
+python -m recall_server.cli lossless-passage-worker \
+  --tenant tenant:company:example --target-tokens 1024 \
+  --overlap-tokens 128
+```
+
+The passage policy is versioned by fingerprint. Evaluate alternative target and
+overlap values on a shadow database; production keeps one policy and deletes
+losing variants after cutover.
+
+Migration 42 adds fingerprinted shadow passage representations for retrieval
+experiments. Each arm remains tenant- and source-scoped, points back to the
+same lossless canonical passage, and can be removed by fingerprint. Contextual
+text and provider vectors are derived projections; they do not replace or
+truncate canonical evidence. Provider inputs use a fingerprinted 7,000-byte
+head/tail excerpt so one unusual code token cannot exceed a managed model's
+context window; a retrieval hit still resolves to the complete canonical
+passage and S3 document. Do not route production retrieval to a shadow arm
+until its private optimize and validation gates pass.
+Large resumable backfills may be split into deterministic, non-overlapping
+passage-ID shards without changing representation fingerprints.
+
 `recall_deep_search` first uses canonical retrieval to select authorized
 candidates, passes only opaque evidence keys and exact allowed receipts to a
 fixed server-owned inspection program, mounts the Archil disk read-only, and
@@ -267,12 +343,9 @@ credentials without gaining an implicit cross-brain view. Omit the optional
 `forget` scope for read-only agents; canonical forget also requires an owner
 grant on the exact source.
 
-The outcome-oriented answer façade is disabled by default. For a deterministic
-transport and grounding smoke test, set `RECALL_AGENT_RUNNER=scripted`. This
-exposes `use_recall` through MCP and
-`POST /v1/agent/brains/{tenant_id}/use-recall`. The scripted runner returns a
-deliberately partial receipt-backed summary; it does not call a model. Both
-transports share one domain operation, and the request cannot carry tenant,
+The outcome-oriented answer façade is disabled by default. Enabling the direct
+Pi runner exposes `use_recall` through MCP and
+`POST /v1/agent/brains/{tenant_id}/use-recall`. The request cannot carry tenant,
 principal, role, source grants, credentials, budgets, or trace policy.
 
 Schema 38 adds durable agent runs. `POST /v1/agent/brains/{tenant}/runs` starts
@@ -284,49 +357,43 @@ also advertises `io.modelcontextprotocol/tasks` and returns a native task only
 when the individual `tools/call` opts into that extension. Older or
 non-negotiating clients keep the synchronous `use_recall` result.
 
-For semantic synthesis, set `RECALL_AGENT_RUNNER=pi-ati` and run a pinned
-`brain-turn` artifact. The artifact is not part of this repository or its
-published images; the deployment mounts it into the container and the runtime
-verifies its digest before every agent turn:
+For semantic synthesis, enable the direct open-source Pi worker included in the
+image and configure one explicit OpenAI-compatible endpoint:
 
 ```text
-RECALL_ATI_COMMAND_JSON=["node","<mounted-artifact-path>"]
-RECALL_ATI_ARTIFACT_PATH=<mounted-artifact-path>
-RECALL_ATI_ARTIFACT_SHA256=<lowercase-sha256>
+RECALL_AGENT_RUNNER=pi
+RECALL_AGENT_MODEL_BASE_URL=https://api.cerebras.ai/v1
 RECALL_AGENT_MODEL_ALIAS=gpt-oss-120b
-RECALL_AGENT_MODEL_ROUTE=direct-provider:cerebras
 RECALL_AGENT_MODEL_KEY_FILE=/etc/secrets/cerebras-api-key
 ```
 
-The command is a JSON argument array and never passes through a shell. The
-Render secret file contains only the Cerebras API key. It must be a
+The Render secret file contains only the Cerebras API key. It must be a
 nonsymlinked regular file owned by the service user or root, with no write or
 execute permission for its group and no permissions for other users. Recall
 reloads it immediately before each child process. The child receives only that
-key, the fixed `https://api.cerebras.ai/v1` endpoint, explicit Cerebras route
-metadata, and a minimal process environment. The image includes the reviewed
-ATI artifact and Node runtime; the configured digest pins the artifact bytes.
+key, the explicit endpoint, and a minimal process environment. The worker and
+Pi dependencies are built from the checked-in lockfile; no opaque runtime
+artifact is vendored.
 
 On a Greppy host, use the dedicated credential-owning local broker instead.
-Recall passes the literal `not-a-secret` placeholder to ATI; no model bearer
+Recall passes the literal `not-a-secret` placeholder to Pi; no model bearer
 credential enters Recall or the child:
 
 ```text
-RECALL_AGENT_MODEL_ROUTE=private-broker
 RECALL_AGENT_MODEL_BASE_URL=http://<private-greppy-llm-proxy-host>:<port>
 RECALL_AGENT_MODEL_ALIAS=gemma-4-31b
 ```
 
 This mode fails closed unless the exact approved URL is loopback, link-local,
 RFC1918, carrier-grade NAT, or the private Docker host gateway. Do not expose
-the broker publicly. A Render deployment outside that private network uses the
-explicit direct Cerebras route.
+the broker publicly. A deployment outside that private network supplies an
+HTTPS endpoint and a private model-key file.
 
 Recall and Archil credentials remain in the host.
 
 The child can call only authorized read-only evidence tools. Semantic search is
 a hint; only receipts returned by deep inspection, exact show, or session
-context are citable. The model must finish through `evidence_finish`, and Recall
+context are citable. The model must finish through `finish`, and Recall
 rejects citations that were not opened in the same turn. Raw reasoning,
 questions, answers, tool arguments, source bodies, and credentials are excluded
 from durable traces.
@@ -456,6 +523,13 @@ one installation disables only that routed source, while disconnecting Google
 revokes provider authority for every dependent route. Uninstall removes the
 route from the active map.
 
+If the provider reports an expired or forbidden connected account, the managed
+worker marks the provider `degraded`, returns each enabled dependent route to
+`configured`, and stops retrying. `/admin` then reports that Google must be
+authorized again. A successful authorization binds the replacement connection,
+re-enables the selected route, and resumes its retained ACK checkpoint. Generic
+transport failures remain bounded retries and never masquerade as a reconnect.
+
 Native clients use the same versioned `/admin/api/v1` session, state, OAuth, and
 lifecycle contract. They must store the bootstrap or browser-session authority
 in the operating-system credential store and must not copy provider tokens out
@@ -479,6 +553,23 @@ surface. Mount `/var/lib/recall` on persistent encrypted storage so ACK-gated
 spools survive image restarts. Every worker replica must receive the same
 database, R2, embedding, and control-encryption settings as the API service; it
 does not listen on a network port.
+
+The same process can own the existing full-document and lossless-passage queues
+without adding another service. Set `RECALL_MANAGED_PROJECTIONS_ENABLED=1` and
+give the worker the evidence-archive settings already used by deep inspection.
+Each cycle drains at most 20 logical documents and 20 passage documents across
+four streams, then embeds at most 100 passages. Keep the worker database pool at
+eight or higher so those fixed bounds retain headroom. Leave the flag unset when
+an operator runs dedicated logical-evidence and passage workers instead; never
+run both owners for steady-state scheduling.
+
+Treat a one-time high-concurrency backfill as maintenance, not free background
+capacity. Do not run it beside managed projections unless the database session
+budget leaves both services headroom and health/readiness stay green for a
+complete canary batch. Stop on the first readiness failure; the durable queues
+make resumption safe. On a 50-session database with an eight-connection API pool
+and eight-connection managed-worker pool, prefer the managed worker itself over
+a sustained external drain.
 
 Run canonical embeddings as a separate worker from that same immutable image:
 

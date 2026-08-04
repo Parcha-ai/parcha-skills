@@ -25,7 +25,15 @@ from .evidence_projection import (
     CanonicalEvidenceProjector,
     EvidenceProjectionStore,
 )
-from .evidence_worker import run_canonical_evidence_worker
+from .evidence_worker import (
+    run_canonical_evidence_worker,
+    run_logical_evidence_worker,
+)
+from .logical_evidence import LogicalEvidenceProjectionStore
+from .logical_evidence_projection import CanonicalLogicalEvidenceProjector
+from .passage_index import CanonicalPassageProjector
+from .passage_projection import PassagePolicy
+from .passage_worker import run_passage_worker
 from .federation import QUALITY_SCORES, SOURCE_FAMILIES
 from .live_providers import (
     LiveProviderError,
@@ -126,6 +134,76 @@ def main() -> None:
         "--interval-seconds", type=float, default=5
     )
     canonical_evidence_worker.add_argument("--once", action="store_true")
+    logical_evidence = sub.add_parser("backfill-logical-evidence")
+    logical_evidence.add_argument("--tenant", required=True)
+    logical_evidence.add_argument(
+        "--source",
+        help="queue only this exact source within the tenant",
+    )
+    logical_evidence.add_argument("--batch-size", type=int, default=25)
+    logical_evidence.add_argument("--max-batches", type=int, default=10)
+    logical_evidence.add_argument("--upload-concurrency", type=int, default=2)
+    logical_evidence.add_argument(
+        "--cursor-fetch-rows",
+        type=int,
+        default=10_000,
+    )
+    logical_evidence.add_argument(
+        "--rebuild-existing",
+        action="store_true",
+        help="queue current logical documents even when a projection already exists",
+    )
+    logical_evidence_worker = sub.add_parser("logical-evidence-worker")
+    logical_evidence_worker.add_argument("--tenant", required=True)
+    logical_evidence_worker.add_argument("--batch-size", type=int, default=25)
+    logical_evidence_worker.add_argument(
+        "--max-batches-per-cycle", type=int, default=10
+    )
+    logical_evidence_worker.add_argument(
+        "--upload-concurrency", type=int, default=2
+    )
+    logical_evidence_worker.add_argument(
+        "--cursor-fetch-rows",
+        type=int,
+        default=10_000,
+    )
+    logical_evidence_worker.add_argument(
+        "--interval-seconds", type=float, default=5
+    )
+    logical_evidence_worker.add_argument("--once", action="store_true")
+    passage_backfill = sub.add_parser("backfill-lossless-passages")
+    passage_backfill.add_argument("--tenant", required=True)
+    passage_backfill.add_argument("--target-tokens", type=int, default=1024)
+    passage_backfill.add_argument("--overlap-tokens", type=int, default=128)
+    passage_backfill.add_argument("--batch-size", type=int, default=100)
+    passage_backfill.add_argument("--max-batches", type=int, default=10)
+    passage_backfill.add_argument("--concurrency", type=int, default=4)
+    passage_worker = sub.add_parser("lossless-passage-worker")
+    passage_worker.add_argument("--tenant", required=True)
+    passage_worker.add_argument("--target-tokens", type=int, default=1024)
+    passage_worker.add_argument("--overlap-tokens", type=int, default=128)
+    passage_worker.add_argument(
+        "--projection-batch-size",
+        type=int,
+        default=100,
+    )
+    passage_worker.add_argument(
+        "--embedding-batch-size",
+        type=int,
+        default=128,
+    )
+    passage_worker.add_argument(
+        "--max-batches-per-cycle",
+        type=int,
+        default=10,
+    )
+    passage_worker.add_argument("--concurrency", type=int, default=4)
+    passage_worker.add_argument(
+        "--interval-seconds",
+        type=float,
+        default=5,
+    )
+    passage_worker.add_argument("--once", action="store_true")
     sub.add_parser("export")
     conformance = sub.add_parser("mcp-conformance")
     conformance.add_argument("--config", type=Path, required=True)
@@ -350,7 +428,17 @@ def main() -> None:
                 json.dumps({"status": "rejected", "code": error.code}), file=sys.stderr
             )
             raise SystemExit(2) from None
-    store = BrainStore(args.dsn, semantic_runtime=SemanticRuntime.from_env())
+    pool_max_size = (
+        max(8, args.concurrency)
+        if args.command
+        in {"backfill-lossless-passages", "lossless-passage-worker"}
+        else None
+    )
+    store = BrainStore(
+        args.dsn,
+        semantic_runtime=SemanticRuntime.from_env(),
+        pool_max_size=pool_max_size,
+    )
     if args.command == "migrate":
         store.migrate()
         print(json.dumps({"status": "ok", "schema_version": SCHEMA_VERSION}))
@@ -466,6 +554,80 @@ def main() -> None:
                 tenant_id=args.tenant,
                 batch_size=args.batch_size,
                 max_batches_per_cycle=args.max_batches_per_cycle,
+                interval_seconds=args.interval_seconds,
+                once=args.once,
+            )
+        print(json.dumps(result, sort_keys=True))
+    elif args.command in {
+        "backfill-logical-evidence",
+        "logical-evidence-worker",
+    }:
+        projector = CanonicalLogicalEvidenceProjector(
+            store,
+            LogicalEvidenceProjectionStore(
+                build_evidence_archive_store(),
+                part_upload_concurrency=min(4, args.upload_concurrency),
+            ),
+            bound_tenant_id=args.tenant,
+            raw_archive=build_archive_store(),
+            cursor_fetch_rows=args.cursor_fetch_rows,
+        )
+        if args.command == "backfill-logical-evidence":
+            seeded = projector.seed_backfill(
+                tenant_id=args.tenant,
+                source_id=args.source,
+                include_existing=args.rebuild_existing,
+            )
+            result = projector.project_pending(
+                tenant_id=args.tenant,
+                batch_size=args.batch_size,
+                max_batches=args.max_batches,
+                upload_concurrency=args.upload_concurrency,
+            )
+            result = {"seeded": seeded, **result}
+        else:
+            result = run_logical_evidence_worker(
+                projector,
+                tenant_id=args.tenant,
+                batch_size=args.batch_size,
+                max_batches_per_cycle=args.max_batches_per_cycle,
+                upload_concurrency=args.upload_concurrency,
+                interval_seconds=args.interval_seconds,
+                once=args.once,
+            )
+        print(json.dumps(result, sort_keys=True))
+    elif args.command in {
+        "backfill-lossless-passages",
+        "lossless-passage-worker",
+    }:
+        projector = CanonicalPassageProjector(
+            store,
+            LogicalEvidenceProjectionStore(
+                build_evidence_archive_store(),
+            ),
+            policy=PassagePolicy(
+                target_tokens=args.target_tokens,
+                overlap_tokens=args.overlap_tokens,
+            ),
+            bound_tenant_id=args.tenant,
+        )
+        if args.command == "backfill-lossless-passages":
+            seeded = projector.seed_backfill(tenant_id=args.tenant)
+            result = projector.project_pending(
+                tenant_id=args.tenant,
+                batch_size=args.batch_size,
+                max_batches=args.max_batches,
+                concurrency=args.concurrency,
+            )
+            result = {"seeded": seeded, **result}
+        else:
+            result = run_passage_worker(
+                projector,
+                tenant_id=args.tenant,
+                projection_batch_size=args.projection_batch_size,
+                embedding_batch_size=args.embedding_batch_size,
+                max_batches_per_cycle=args.max_batches_per_cycle,
+                concurrency=args.concurrency,
                 interval_seconds=args.interval_seconds,
                 once=args.once,
             )

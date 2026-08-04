@@ -187,6 +187,27 @@ def _upstream_code(status: int) -> str:
     }.get(status, "upstream_error")
 
 
+def _sdk_error_code(error: Exception) -> str:
+    """Translate Composio's structured SDK failures without exposing payloads."""
+
+    status = getattr(error, "status_code", None)
+    body = getattr(error, "body", None)
+    detail = body.get("error") if isinstance(body, Mapping) else None
+    provider_code = detail.get("code") if isinstance(detail, Mapping) else None
+    # Composio 4302 means the session has no active connection for the pinned
+    # toolkit. In practice this is the stable failure returned for an expired
+    # or otherwise inactive connected account.
+    if provider_code == 4302 or status == 401:
+        return "authority_revoked"
+    if status == 403:
+        return "authority_forbidden"
+    if status == 429:
+        return "rate_limited"
+    if status == 400:
+        return "upstream_invalid_request"
+    return "transport_unavailable"
+
+
 def _payload(response: Any, operation: str, maximum: int) -> dict[str, Any]:
     status = _status_code(response)
     if status < 200 or status >= 300:
@@ -324,8 +345,8 @@ class ComposioWorkspaceRail:
                 raise
             except TimeoutError:
                 raise WorkspaceRailError("upstream_timeout") from None
-            except Exception:
-                raise WorkspaceRailError("transport_unavailable") from None
+            except Exception as error:
+                raise WorkspaceRailError(_sdk_error_code(error)) from None
         return self._session_value
 
     def _execute(self, operation: str, params: Mapping[str, Any]):
@@ -341,8 +362,8 @@ class ComposioWorkspaceRail:
             raise
         except TimeoutError:
             raise WorkspaceRailError("upstream_timeout") from None
-        except Exception:
-            raise WorkspaceRailError("transport_unavailable") from None
+        except Exception as error:
+            raise WorkspaceRailError(_sdk_error_code(error)) from None
 
     def run(self, operation: str, params: Mapping[str, Any]) -> Any:
         return _payload(

@@ -179,6 +179,22 @@ class BrainStore:
                     )
         return self._pool.connection()
 
+    def prepare_pool(self, minimum_size: int, *, timeout: float = 60.0) -> None:
+        """Pre-warm bounded parallel workers before their measured work starts."""
+
+        if (
+            isinstance(minimum_size, bool)
+            or not isinstance(minimum_size, int)
+            or not 1 <= minimum_size <= self.pool_max_size
+            or not 1 <= timeout <= 300
+        ):
+            raise ValueError("database pool warmup budget is invalid")
+        with self.connect():
+            pass
+        assert self._pool is not None
+        self._pool.resize(minimum_size, self.pool_max_size)
+        self._pool.wait(timeout=timeout)
+
     def close(self) -> None:
         if self._pool is not None:
             self._pool.close()

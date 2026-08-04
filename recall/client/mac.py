@@ -386,7 +386,8 @@ class BrainClient:
         self.privacy = privacy or PrivacyPolicy(mode="off")
 
     def _request(self, path: str, *, body: dict | None = None,
-                 idempotency_key: str | None = None, method: str | None = None) -> dict:
+                 idempotency_key: str | None = None, method: str | None = None,
+                 timeout: float = 60) -> dict:
         data = canonical_json(body) if body is not None else None
         headers = {"Authorization": "Bearer " + self.token}
         if data is not None:
@@ -399,7 +400,7 @@ class BrainClient:
             method=method or ("POST" if data is not None else "GET"),
             headers=headers,
         )
-        with open_no_redirect(request, timeout=60) as response:
+        with open_no_redirect(request, timeout=timeout) as response:
             return json.loads(response.read())
 
     def ingest(self, events: list[dict]) -> dict:
@@ -540,6 +541,18 @@ class CanonicalBrainWriter(_CanonicalClient):
         available_base64_bytes = MAX_INGEST_BYTES - len(empty_body)
         return 3 * (available_base64_bytes // 4)
 
+    def status(self) -> dict[str, Any]:
+        """Read content-free source and projection parity under write scope."""
+        return self._request(
+            "/v2/ingest/status",
+            body={
+                "tenant_id": self.tenant_id,
+                "principal_id": self.principal_id,
+                "source_id": self.source_id,
+            },
+            timeout=300,
+        )
+
     def ingest(self, events: list[dict[str, Any]]) -> dict[str, Any]:
         if not events or len(events) > MAX_CANONICAL_INGEST_EVENTS:
             raise ValueError("canonical ingest batch is invalid")
@@ -566,6 +579,7 @@ class CanonicalBrainWriter(_CanonicalClient):
             "/v2/ingest/canonical",
             body=body,
             idempotency_key=key,
+            timeout=300,
         )
 
 

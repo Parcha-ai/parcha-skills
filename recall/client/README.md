@@ -52,6 +52,15 @@ printf '%s' "$SCOPED_COWORK_TOKEN" | recall-brain keychain-store \
   --privacy-mode scrub
 ```
 
+For a hosted Brain, the operator enables only the authenticated canonical
+archive and ingest routes described in `server/deploy/README.md`. Create the
+device route in the web or Mac switchboard, store its one-time source token in
+Keychain, and use the same HTTPS endpoint in the installer. The token is bound
+to exactly one tenant, principal, and source; it cannot read the Brain or call
+MCP. After installation, `recall-brain mac-status` must reach `ready` or report
+one closed remediation code. Pause/disable retains the checkpoint, and resume
+continues from the last Brain ACK without replaying committed documents.
+
 `--sources`, `--visibility`, `--claude-root`, `--codex-root`, and
 `--cowork-root` are explicit consent controls. Cowork reads only the nested
 local project JSONL surface; it does not inspect app databases, audit logs,
@@ -137,8 +146,8 @@ an explicit choice:
 
 The Recall skill can use the same central Brain without shell-specific exports.
 Create a private read-only credential file, then a mode-0600
-`~/.config/recall-brain/client.json` containing only schema version, the `:9443`
-HTTPS endpoint, and the absolute token-file reference. Environment values still
+`~/.config/recall-brain/client.json` containing only schema version, the selected
+HTTPS Brain endpoint, and the absolute token-file reference. Environment values still
 override this profile, and `RECALL_MODE=local` remains a no-network rollback.
 
 To continuously ingest only files deliberately copied into a flat export inbox,

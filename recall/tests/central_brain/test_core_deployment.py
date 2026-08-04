@@ -199,6 +199,10 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
             "forget_tombstones",
             "canonical_audit_events",
             "canonical_evidence_objects",
+            "canonical_evidence_documents",
+            "canonical_evidence_document_parts",
+            "canonical_evidence_document_queue",
+            "canonical_evidence_cleanup_queue",
         ):
             self.assertIn(f"('{table}')", lowered)
         for provider in ("planetscale", "render", "supabase", "neon"):
@@ -394,6 +398,10 @@ class ContainerContractTest(unittest.TestCase):
             r"FROM node:22\.23\.1-bookworm-slim@sha256:[0-9a-f]{64} "
             r"AS node-runtime",
         )
+        self.assertIn("FROM node-runtime AS pi-agent-build", dockerfile)
+        self.assertIn("server/pi-agent/package-lock.json", dockerfile)
+        self.assertIn("npm ci --ignore-scripts", dockerfile)
+        self.assertIn("/opt/recall-pi", dockerfile)
         self.assertNotIn("vendor/ati", dockerfile)
         self.assertNotIn("/opt/ati", dockerfile)
         self.assertIn("USER 10001", dockerfile)
@@ -414,6 +422,18 @@ class ContainerContractTest(unittest.TestCase):
         self.assertIn('"--capability-profile", "production"', dockerfile)
         self.assertNotIn("ENV RECALL_AUTH_REQUIRED", dockerfile)
         self.assertNotRegex(dockerfile, re.compile(r"COPY\s+\.\s+\.", re.IGNORECASE))
+
+    def test_direct_pi_dependencies_are_lockfile_pinned(self) -> None:
+        package = json.loads((SERVER / "pi-agent" / "package.json").read_text())
+        lock = json.loads((SERVER / "pi-agent" / "package-lock.json").read_text())
+        self.assertEqual(package["dependencies"], {
+            "@earendil-works/pi-agent-core": "0.83.0",
+            "@earendil-works/pi-ai": "0.83.0",
+            "typebox": "1.3.7",
+        })
+        self.assertEqual(lock["lockfileVersion"], 3)
+        self.assertFalse((SERVER / "vendor" / "ati" / "README.md").exists())
+        self.assertFalse((SERVER / "vendor" / "ati" / "grep_ati_brain_turn.mjs").exists())
 
     def test_proprietary_ati_bundle_is_not_committed(self) -> None:
         tracked = subprocess.run(

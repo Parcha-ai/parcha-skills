@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import base64
 import json
 import hashlib
 import math
 import os
 import re
 import stat
+import struct
 import threading
 import time
 import urllib.error
@@ -23,6 +25,7 @@ QUERY_INSTRUCTION = (
     "Query: "
 )
 DOCUMENT_EMBEDDING_CONTRACT = "recall.document-embedding.v5:head-tail-4096"
+PASSAGE_EMBEDDING_CONTRACT = "recall.passage-embedding.v1:full-text"
 DEFAULT_EMBEDDING_REVISION = "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3"
 MAX_SEMANTIC_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_DOCUMENT_CHARS = 4096
@@ -106,8 +109,8 @@ class SemanticRuntime:
                 raise ValueError(
                     "embedding endpoint does not match the approved embedding endpoint"
                 )
-        if not 64 <= dimensions <= 2000:
-            raise ValueError("embedding dimensions must be between 64 and 2000")
+        if not 64 <= dimensions <= 4096:
+            raise ValueError("embedding dimensions must be between 64 and 4096")
         if embedding_protocol == "tei" and not re.fullmatch(r"[0-9a-f]{40}", revision):
             raise ValueError("embedding revision must be a pinned 40-character commit")
         if embedding_protocol != "tei" and (
@@ -304,6 +307,21 @@ class SemanticRuntime:
         )
         return hashlib.sha256(value.encode()).hexdigest()
 
+    @property
+    def passage_fingerprint(self) -> str:
+        value = "\0".join(
+            (
+                PASSAGE_EMBEDDING_CONTRACT,
+                self.embedding_protocol,
+                self.model,
+                self.revision,
+                str(self.dimensions),
+                self.document_prefix,
+                self.query_prefix,
+            )
+        )
+        return hashlib.sha256(value.encode()).hexdigest()
+
     @staticmethod
     def _cache_key(value: str) -> str:
         return hashlib.sha256(value.encode()).hexdigest()
@@ -432,7 +450,25 @@ class SemanticRuntime:
             ordered[index] = item.get("embedding")
         if any(value is None for value in ordered):
             raise ValueError("embedding endpoint returned the wrong batch size")
-        return self._validate_vectors(ordered, expected)
+        decoded = []
+        for value in ordered:
+            if not isinstance(value, str):
+                decoded.append(value)
+                continue
+            try:
+                raw = base64.b64decode(value, validate=True)
+            except ValueError as error:
+                raise ValueError(
+                    "embedding endpoint returned invalid base64"
+                ) from error
+            if len(raw) != self.dimensions * 4:
+                raise ValueError(
+                    "embedding endpoint returned the wrong dimensions"
+                )
+            decoded.append(
+                list(struct.unpack(f"<{self.dimensions}f", raw))
+            )
+        return self._validate_vectors(decoded, expected)
 
     @property
     def _managed_embedding_endpoint(self) -> str:
@@ -440,22 +476,31 @@ class SemanticRuntime:
             return self.embedding_url + "/embeddings"
         return self.embedding_url + "/v1/embeddings"
 
-    def _embed(self, texts: list[str], *, input_type: str) -> list[list[float]]:
+    def _embed(
+        self,
+        texts: list[str],
+        *,
+        input_type: str,
+        clip_documents: bool = True,
+    ) -> list[list[float]]:
         if not texts:
             return []
         lock = self._embedding_lock or nullcontext()
         with lock:
             self._ensure_embedding_identity()
+            prefix = (
+                self.document_prefix
+                if input_type == "document"
+                else self.query_prefix
+            )
+            prepare = (
+                self._document_text
+                if input_type == "document" and clip_documents
+                else str
+            )
             batches = [
                 [
-                    self._document_text(
-                        (
-                            self.document_prefix
-                            if input_type == "document"
-                            else self.query_prefix
-                        )
-                        + value
-                    )
+                    prepare(prefix + value)
                     for value in texts[start : start + self.embedding_batch_size]
                 ]
                 for start in range(0, len(texts), self.embedding_batch_size)
@@ -507,6 +552,7 @@ class SemanticRuntime:
         *,
         input_type: str,
         headers: dict[str, str],
+        retry: int = 0,
     ) -> list[list[float]]:
         payload: dict[str, object] = {
             "model": self.model,
@@ -524,7 +570,7 @@ class SemanticRuntime:
         else:
             payload.update(
                 {
-                    "encoding_format": "float",
+                    "encoding_format": "base64",
                     "dimensions": self.dimensions,
                 }
             )
@@ -540,11 +586,29 @@ class SemanticRuntime:
                     self._managed_embedding_endpoint, payload, headers
                 )
         except urllib.error.HTTPError as error:
+            if (
+                error.code == 429
+                and input_type == "document"
+                and retry < 4
+            ):
+                raw_delay = error.headers.get("Retry-After", "")
+                try:
+                    delay = float(raw_delay)
+                except (TypeError, ValueError):
+                    delay = 10.0
+                error.close()
+                time.sleep(min(30.0, max(1.0, delay)))
+                return self._embed_managed_batch(
+                    batch,
+                    input_type=input_type,
+                    headers=headers,
+                    retry=retry + 1,
+                )
             splittable = (
                 error.code == 413
                 or 500 <= error.code <= 504
                 or (
-                    self.embedding_protocol == "voyage"
+                    self.embedding_protocol in {"openai", "voyage"}
                     and input_type == "document"
                     and error.code == 400
                 )
@@ -557,15 +621,26 @@ class SemanticRuntime:
                 batch[:midpoint],
                 input_type=input_type,
                 headers=headers,
+                retry=retry,
             ) + self._embed_managed_batch(
                 batch[midpoint:],
                 input_type=input_type,
                 headers=headers,
+                retry=retry,
             )
         return self._openai_vectors(response, len(batch))
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         return self._embed(texts, input_type="document")
+
+    def embed_passages(self, texts: list[str]) -> list[list[float]]:
+        """Embed bounded passages without applying the legacy 4,096-char clip."""
+
+        return self._embed(
+            texts,
+            input_type="document",
+            clip_documents=False,
+        )
 
     @staticmethod
     def _document_text(value: str) -> str:
