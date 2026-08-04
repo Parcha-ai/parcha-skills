@@ -146,6 +146,51 @@ class OidcVerifierTest(unittest.TestCase):
         self.assertEqual(verifier.provider, "descope")
         self.assertFalse(hasattr(verifier, "management_key"))
 
+    def test_explicit_additional_issuer_maps_to_canonical_identity(self) -> None:
+        agentic_issuer = "https://identity.synthetic.invalid/v1/apps/agentic/server"
+        verifier = OidcJwtVerifier(
+            issuer=ISSUER,
+            additional_issuers=(agentic_issuer,),
+            audience=AUDIENCE,
+            jwks_uri=JWKS_URI,
+            jwks_loader=StaticJwks(self.jwks),
+        )
+
+        identity = verifier.verify(self.token(iss=agentic_issuer))
+
+        self.assertIsNotNone(identity)
+        self.assertEqual(identity.issuer, ISSUER)
+        self.assertEqual(identity.subject, "subject-synthetic-owner")
+        self.assertIsNone(self.verifier().verify(self.token(iss=agentic_issuer)))
+
+    def test_additional_issuer_configuration_is_bounded_and_exact(self) -> None:
+        arguments = {
+            "issuer": ISSUER,
+            "audience": AUDIENCE,
+            "jwks_uri": JWKS_URI,
+        }
+        with self.assertRaises(ValueError):
+            OidcJwtVerifier(
+                **arguments,
+                additional_issuers=("http://identity.synthetic.invalid",),
+            )
+        with self.assertRaises(ValueError):
+            OidcJwtVerifier(
+                **arguments,
+                additional_issuers=tuple(
+                    f"https://identity-{index}.synthetic.invalid"
+                    for index in range(9)
+                ),
+            )
+        with self.assertRaises(ValueError):
+            OidcJwtVerifier(
+                **arguments,
+                additional_issuers=(
+                    "https://identity-2.synthetic.invalid",
+                    "https://identity-2.synthetic.invalid/",
+                ),
+            )
+
     def test_configuration_requires_exact_https_and_declared_issuer(self) -> None:
         with self.assertRaises(ValueError):
             OidcJwtVerifier(
