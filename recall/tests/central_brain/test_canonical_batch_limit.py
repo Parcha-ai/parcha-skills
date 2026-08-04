@@ -33,7 +33,7 @@ class CanonicalBatchLimitTest(unittest.TestCase):
         expected = {"status": "committed", "receipts": []}
         with mock.patch.object(
             plane,
-            "_ingest_live_batch",
+            "_ingest_set_batch",
             return_value=expected,
         ) as ingest:
             result = plane.ingest_batch(
