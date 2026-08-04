@@ -204,16 +204,16 @@ def onboarding_page(invitation: InvitationEmail) -> bytes:
 </div>"""
     elif invitation.identity_login_enabled:
         activation = f"""<div class="activation">
-  <strong>First, verify your identity.</strong>
-  <span>This accepts the invitation. No password or Recall token is created.</span>
-  <a href="/join/{escape(invitation.invitation_id, quote=True)}/login">Continue with Descope →</a>
+  <strong>Add Recall in one paste.</strong>
+  <span>Choose a client below. Its Descope login accepts this exact invitation—no Recall key or separate account.</span>
+  <a href="/join/{escape(invitation.invitation_id, quote=True)}/login">Or activate in this browser →</a>
 </div>"""
     else:
         activation = """<div class="activation">
   <strong>Verify through your MCP client.</strong>
   <span>OAuth activates the invitation when you use the same email address.</span>
 </div>"""
-    cards_markup = "".join(cards) if invitation.accepted or not invitation.identity_login_enabled else ""
+    cards_markup = "".join(cards)
     return f"""<!doctype html>
 <html lang="en">
 <head>

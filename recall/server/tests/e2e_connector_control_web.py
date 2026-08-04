@@ -572,8 +572,8 @@ def main():
             server, "GET", f"/join/{oauth_invitation['id']}"
         )
         assert status == 200
-        assert b"Continue with Descope" in pending_page
-        assert b"npm install -g @openai/codex" not in pending_page
+        assert b"Or activate in this browser" in pending_page
+        assert b"npm install -g @openai/codex" in pending_page
         status, headers, _ = request(
             server, "GET", f"/join/{oauth_invitation['id']}/login"
         )

@@ -464,10 +464,10 @@ RECALL_INVITATION_EMAIL_API_KEY=<server-side API key>
 Configuration is explicit and all-or-none. Recall never renders or logs either
 secret. A delivery failure leaves the email-bound authorization pending and is
 shown in the admin UI; re-inviting the same address safely replaces the pending
-invitation and retries delivery. With browser identity enabled, the setup page
-first accepts the exact invitation through Descope and only then reveals the
-current Codex and Claude Code setup blocks. Without it, the MCP client discovers
-OAuth through RFC 9728 and activates the pending invitation on its first request. See
+invitation and retries delivery. The setup page presents the current Codex and
+Claude Code setup blocks immediately. The client's Descope login activates the
+exact email-bound invitation on its first MCP request, so the primary path has
+only one login. Browser identity also offers an optional pre-activation path. See
 [`docs/authorization-v1.md`](../../docs/authorization-v1.md) for the policy,
 generic OIDC contract, and revocation semantics.
 

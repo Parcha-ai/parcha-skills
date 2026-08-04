@@ -176,6 +176,15 @@ class InvitationTemplateTest(unittest.TestCase):
         self.assertIn("&lt;script&gt;", page)
         self.assertNotIn("invitee@example.invalid", page)
 
+    def test_pending_oauth_invitation_keeps_the_one_login_client_path(self) -> None:
+        page = onboarding_page(
+            invitation(identity_login_enabled=True, accepted=False)
+        ).decode()
+
+        self.assertIn("Add Recall in one paste", page)
+        self.assertIn("npm install -g @openai/codex", page)
+        self.assertIn("Or activate in this browser", page)
+
 
 class InvitationSenderTest(unittest.TestCase):
     def test_descope_sends_only_the_email_and_opaque_onboarding_url(self) -> None:
