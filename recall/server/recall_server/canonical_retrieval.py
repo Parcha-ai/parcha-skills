@@ -24,7 +24,7 @@ from .deep_inspection import (
 )
 from .federation import SOURCE_FAMILIES
 from .projectors import legacy_engine
-from .passage_projection import PassagePolicy
+from .passage_projection import DEFAULT_PASSAGE_POLICY, PassagePolicy
 from .passage_retrieval import PassageHintRetrieval
 
 AUTHORITY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._/@+-]{1,255}\Z")
@@ -142,10 +142,7 @@ class CanonicalRetrieval:
         self.archive = archive
         self.evidence_projector = evidence_projector
         self.deep_inspector = deep_inspector
-        self.passage_policy = passage_policy or PassagePolicy(
-            target_tokens=512,
-            overlap_tokens=64,
-        )
+        self.passage_policy = passage_policy or DEFAULT_PASSAGE_POLICY
 
     def bind(self, principal: dict[str, Any]) -> BoundCanonicalRetrieval:
         tenant_id = principal.get("tenant_id")
@@ -468,10 +465,7 @@ class BoundCanonicalRetrieval:
         self.archive = archive
         self.evidence_projector = evidence_projector
         self.deep_inspector = deep_inspector
-        self.passage_policy = passage_policy or PassagePolicy(
-            target_tokens=512,
-            overlap_tokens=64,
-        )
+        self.passage_policy = passage_policy or DEFAULT_PASSAGE_POLICY
 
     @staticmethod
     def _filters(

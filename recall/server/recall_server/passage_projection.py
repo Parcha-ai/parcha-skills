@@ -101,6 +101,15 @@ class PassagePolicy:
         return hashlib.sha256(value.encode()).hexdigest()
 
 
+# One authoritative pointer policy for both projection and retrieval. Shadow
+# policies remain explicit at their call sites and never become production by
+# accident.
+DEFAULT_PASSAGE_POLICY = PassagePolicy(
+    target_tokens=1024,
+    overlap_tokens=128,
+)
+
+
 @dataclass(frozen=True)
 class PassageMessage:
     record_ordinal: int

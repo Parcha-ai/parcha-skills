@@ -9,6 +9,11 @@ from unittest import mock
 import orjson
 
 from recall_server import SCHEMA_VERSION
+from recall_server.canonical_retrieval import (
+    BoundCanonicalRetrieval,
+    CanonicalRetrieval,
+)
+from recall_server.managed_worker import run_managed_worker
 from recall_server.logical_evidence import LogicalEvidenceRecord
 from recall_server.logical_evidence_projection import (
     CanonicalLogicalEvidenceProjector,
@@ -19,6 +24,7 @@ from recall_server.passage_index import (
     PassageCandidate,
 )
 from recall_server.passage_projection import (
+    DEFAULT_PASSAGE_POLICY,
     MAX_PASSAGE_TOKEN_BYTES,
     PASSAGE_CONTRACT,
     PassageMessage,
@@ -37,6 +43,24 @@ from recall_server.passage_worker import run_passage_worker
 
 
 class PassageProjectionTests(unittest.TestCase):
+    def test_projection_and_retrieval_share_one_authoritative_policy(self) -> None:
+        canonical = CanonicalRetrieval(object())  # type: ignore[arg-type]
+        bound = BoundCanonicalRetrieval(
+            object(),  # type: ignore[arg-type]
+            tenant_id="tenant:company:test",
+            principal_id="principal:owner",
+            authorized_sources=("codex:test",),
+        )
+
+        self.assertIs(canonical.passage_policy, DEFAULT_PASSAGE_POLICY)
+        self.assertIs(bound.passage_policy, DEFAULT_PASSAGE_POLICY)
+        self.assertEqual(DEFAULT_PASSAGE_POLICY.target_tokens, 1024)
+        self.assertEqual(DEFAULT_PASSAGE_POLICY.overlap_tokens, 128)
+        self.assertIn(
+            "policy=DEFAULT_PASSAGE_POLICY",
+            inspect.getsource(run_managed_worker),
+        )
+
     def test_codex_message_types_normalize_to_visible_roles(self) -> None:
         self.assertEqual(_explicit_roles(["agent_message"]), ("assistant",))
         self.assertEqual(_explicit_roles(["user_message"]), ("user",))

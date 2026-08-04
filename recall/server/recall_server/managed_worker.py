@@ -38,7 +38,7 @@ from .db import BrainStore
 from .logical_evidence import LogicalEvidenceProjectionStore
 from .logical_evidence_projection import CanonicalLogicalEvidenceProjector
 from .passage_index import CanonicalPassageProjector
-from .passage_projection import PassagePolicy
+from .passage_projection import DEFAULT_PASSAGE_POLICY
 
 
 SAFE_WORKER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{2,127}\Z")
@@ -620,7 +620,7 @@ def run_managed_worker(
         passage_projector = CanonicalPassageProjector(
             store,
             evidence_projection,
-            policy=PassagePolicy(target_tokens=1024, overlap_tokens=128),
+            policy=DEFAULT_PASSAGE_POLICY,
         )
     cycles = committed = failed = projection_failures = 0
     while True:
