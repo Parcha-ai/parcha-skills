@@ -823,18 +823,39 @@ class BoundCanonicalRetrieval:
 
     def passage_hints(
         self,
-        query: str,
+        needs: str | list[dict[str, Any]],
         filters: dict[str, Any] | None = None,
         limit: int = 10,
     ) -> dict[str, Any]:
         """Return document/range hints without answering the natural question."""
 
-        if not isinstance(query, str) or not query.strip() or len(query) > 8192:
-            raise ValueError("invalid passage hint query")
+        if isinstance(needs, str):
+            needs = [{"need": "verbatim question", "queries": [needs]}]
+        if (
+            not isinstance(needs, list)
+            or not 1 <= len(needs) <= 5
+            or any(
+                not isinstance(need, dict)
+                or set(need) != {"need", "queries"}
+                or not isinstance(need["need"], str)
+                or not need["need"].strip()
+                or len(need["need"]) > 512
+                or not isinstance(need["queries"], list)
+                or not 1 <= len(need["queries"]) <= 2
+                or any(
+                    not isinstance(query, str)
+                    or not query.strip()
+                    or len(query) > 2048
+                    for query in need["queries"]
+                )
+                for need in needs
+            )
+        ):
+            raise ValueError("invalid passage hint needs")
         if (
             isinstance(limit, bool)
             or not isinstance(limit, int)
-            or not 1 <= limit <= 20
+            or not len(needs) <= limit <= 50
         ):
             raise ValueError("invalid passage hint limit")
         (
@@ -859,16 +880,27 @@ class BoundCanonicalRetrieval:
                     "reason": "no-authorized-sources",
                 },
             }
-        informative = _informative_query_terms(query)
-        lexical_query = " ".join(informative) if informative else query
+        query_groups = tuple(
+            tuple(query.strip() for query in need["queries"])
+            for need in needs
+        )
+        lexical_groups = tuple(
+            tuple(
+                " ".join(informative)
+                if (informative := _informative_query_terms(query))
+                else query
+                for query in queries
+            )
+            for queries in query_groups
+        )
         return PassageHintRetrieval(
             self.store,
             tenant_id=self.tenant_id,
             sources=sources,
             policy_fingerprint=self.passage_policy.fingerprint,
-        ).search(
-            query,
-            lexical_query=lexical_query,
+        ).search_needs(
+            query_groups,
+            lexical_groups=lexical_groups,
             since=since,
             until=until,
             limit=limit,

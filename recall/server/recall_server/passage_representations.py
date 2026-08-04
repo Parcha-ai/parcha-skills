@@ -549,13 +549,29 @@ class CanonicalPassageRepresentationIndex:
         context_fingerprint = self.representation.context_fingerprint
         dimensions = self.representation.runtime.dimensions
         vector_column = VECTOR_COLUMNS[dimensions]
+        parent_table = (
+            "canonical_passage_contexts"
+            if context_fingerprint is not None
+            else "canonical_passages"
+        )
+        parent_context = (
+            " AND current.context_fingerprint=%s"
+            if context_fingerprint is not None
+            else ""
+        )
         insert = sql.SQL(
             """INSERT INTO
                    canonical_passage_embedding_representations(
                        tenant_id,source_id,passage_id,
                        representation_fingerprint,model,dimensions,
                        content_sha256,context_fingerprint,{vector_column}
-                   ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::halfvec)
+                   )
+                 SELECT %s,%s,%s,%s,%s,%s,%s,%s,%s::halfvec
+                   FROM {parent_table} current
+                  WHERE current.tenant_id=%s
+                    AND current.source_id=%s
+                    AND current.passage_id=%s
+                    {parent_context}
                ON CONFLICT(
                    tenant_id,source_id,passage_id,
                    representation_fingerprint
@@ -566,7 +582,11 @@ class CanonicalPassageRepresentationIndex:
                    context_fingerprint=excluded.context_fingerprint,
                    {vector_column}=excluded.{vector_column},
                    embedded_at=now()"""
-        ).format(vector_column=sql.Identifier(vector_column))
+        ).format(
+            vector_column=sql.Identifier(vector_column),
+            parent_table=sql.Identifier(parent_table),
+            parent_context=sql.SQL(parent_context),
+        )
         with self.store.connect() as connection:
             with connection.transaction():
                 with connection.cursor() as cursor:
@@ -576,7 +596,12 @@ class CanonicalPassageRepresentationIndex:
                                tenant_id,source_id,passage_id,
                                context_fingerprint,context_text_redacted,
                                context_sha256
-                           ) VALUES (%s,%s,%s,%s,%s,%s)
+                           )
+                         SELECT %s,%s,%s,%s,%s,%s
+                           FROM canonical_passages current
+                          WHERE current.tenant_id=%s
+                            AND current.source_id=%s
+                            AND current.passage_id=%s
                            ON CONFLICT(
                                tenant_id,source_id,passage_id,
                                context_fingerprint
@@ -596,6 +621,12 @@ class CanonicalPassageRepresentationIndex:
                                     context_fingerprint,
                                     text,
                                     digest,
+                                    row["tenant_id"],
+                                    row["source_id"],
+                                    (
+                                        row.get("target_passage_id")
+                                        or row["passage_id"]
+                                    ),
                                 )
                                 for row, text, digest in zip(
                                     rows, texts, hashes, strict=True
@@ -618,6 +649,17 @@ class CanonicalPassageRepresentationIndex:
                                 digest,
                                 context_fingerprint,
                                 vector,
+                                row["tenant_id"],
+                                row["source_id"],
+                                (
+                                    row.get("target_passage_id")
+                                    or row["passage_id"]
+                                ),
+                                *(
+                                    (context_fingerprint,)
+                                    if context_fingerprint is not None
+                                    else ()
+                                ),
                             )
                             for row, digest, vector in zip(
                                 rows, hashes, vectors, strict=True

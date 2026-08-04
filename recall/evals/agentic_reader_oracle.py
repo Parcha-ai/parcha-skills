@@ -132,21 +132,37 @@ class OracleDocumentRetrieval:
 
     def passage_hints(
         self,
-        query: str,
+        needs: str | list[dict[str, Any]],
         *,
         filters: dict[str, Any],
         limit: int,
     ) -> dict[str, Any]:
         """Return fixed document identities without evidence or passage hints."""
 
+        if isinstance(needs, str):
+            needs = [{"need": "verbatim question", "queries": [needs]}]
         if (
-            not isinstance(query, str)
-            or not query.strip()
-            or len(query) > 8192
+            not isinstance(needs, list)
+            or not 1 <= len(needs) <= 5
+            or any(
+                not isinstance(need, dict)
+                or set(need) != {"need", "queries"}
+                or not isinstance(need["need"], str)
+                or not need["need"].strip()
+                or not isinstance(need["queries"], list)
+                or not 1 <= len(need["queries"]) <= 2
+                or any(
+                    not isinstance(query, str)
+                    or not query.strip()
+                    or len(query) > 2048
+                    for query in need["queries"]
+                )
+                for need in needs
+            )
             or not isinstance(filters, dict)
             or isinstance(limit, bool)
             or not isinstance(limit, int)
-            or not 1 <= limit <= 20
+            or not len(needs) <= limit <= 20
         ):
             raise EvaluationInputError(
                 "reader-oracle hint request is invalid"
@@ -159,7 +175,7 @@ class OracleDocumentRetrieval:
                 raise EvaluationInputError(
                     "reader-oracle pointer boundary is invalid"
                 )
-            live = pointer_hints(query, filters=filters, limit=20)
+            live = pointer_hints(needs, filters=filters, limit=20)
             if not isinstance(live, dict):
                 raise EvaluationInputError(
                     "reader-oracle pointer result is invalid"

@@ -60,14 +60,25 @@ def principal(**extra) -> dict:
     }
 
 
+def hint_arguments(*, limit: int = 1) -> dict:
+    return {
+        "needs": [{
+            "need": "Answer the complete question",
+            "queries": [REQUEST["question"]],
+        }],
+        "filters": {},
+        "limit": limit,
+    }
+
+
 class FakeBoundRetrieval:
     calls: list[tuple]
 
     def __init__(self) -> None:
         self.calls = []
 
-    def passage_hints(self, query, *, filters, limit):
-        self.calls.append(("hints", query, filters, limit))
+    def passage_hints(self, needs, *, filters, limit):
+        self.calls.append(("hints", needs, filters, limit))
         return {
             "results": [{
                 "source_id": SOURCE,
@@ -334,26 +345,14 @@ class AgentFacadeUnitTest(unittest.TestCase):
         )
         tools = ConstrainedAgentTools(FakeBoundRetrieval(), context)
         for _ in range(context.budget.max_tool_calls):
-            tools.call("recall.hints", {
-                "query": REQUEST["question"],
-                "filters": {},
-                "limit": 1,
-            })
+            tools.call("recall.hints", hint_arguments())
         with self.assertRaisesRegex(AgentExecutionError, "budget is exhausted"):
-            tools.call("recall.hints", {
-                "query": REQUEST["question"],
-                "filters": {},
-                "limit": 1,
-            })
+            tools.call("recall.hints", hint_arguments())
 
     def test_expensive_tool_budgets_are_enforced_per_tool(self) -> None:
         context = DelegationContext.from_principal(principal())
         tools = ConstrainedAgentTools(FakeBoundRetrieval(), context)
-        arguments = {
-            "query": REQUEST["question"],
-            "filters": {},
-            "limit": 1,
-        }
+        arguments = hint_arguments()
         for _ in range(6):
             tools.call("recall.hints", arguments)
         with self.assertRaises(AgentExecutionError) as caught:
@@ -383,11 +382,7 @@ class AgentFacadeUnitTest(unittest.TestCase):
             DelegationContext.from_principal(principal()),
         )
         document_id = "ldoc_0123456789abcdef0123456789abcdef"
-        tools.call("recall.hints", {
-            "query": REQUEST["question"],
-            "filters": {},
-            "limit": 1,
-        })
+        tools.call("recall.hints", hint_arguments())
         result = tools.call("recall.find", {
             "aliases": ["d1"],
             "patterns": ["synthetic evidence"],
@@ -417,11 +412,7 @@ class AgentFacadeUnitTest(unittest.TestCase):
             retrieval,
             DelegationContext.from_principal(principal()),
         )
-        tools.call("recall.hints", {
-            "query": REQUEST["question"],
-            "filters": {},
-            "limit": 1,
-        })
+        tools.call("recall.hints", hint_arguments())
         result = tools.call("recall.open", {
             "alias": "d1",
             "cursor": None,
@@ -440,11 +431,7 @@ class AgentFacadeUnitTest(unittest.TestCase):
             FakeBoundRetrieval(),
             DelegationContext.from_principal(principal()),
         )
-        tools.call("recall.hints", {
-            "query": REQUEST["question"],
-            "filters": {},
-            "limit": 1,
-        })
+        tools.call("recall.hints", hint_arguments())
         with self.assertRaises(AgentExecutionError) as caught:
             tools.call("recall.open", {
                 "alias": "d1",
@@ -461,11 +448,7 @@ class AgentFacadeUnitTest(unittest.TestCase):
                     FakeBoundRetrieval(),
                     DelegationContext.from_principal(principal()),
                 )
-                tools.call("recall.hints", {
-                    "query": REQUEST["question"],
-                    "filters": {},
-                    "limit": 1,
-                })
+                tools.call("recall.hints", hint_arguments())
                 invented = f"d{index + 2}"
                 with self.assertRaises(AgentExecutionError) as caught:
                     tools.call("recall.find", {
@@ -502,11 +485,7 @@ class AgentFacadeUnitTest(unittest.TestCase):
                     CrossSourceFind(index),
                     DelegationContext.from_principal(principal()),
                 )
-                tools.call("recall.hints", {
-                    "query": REQUEST["question"],
-                    "filters": {},
-                    "limit": 1,
-                })
+                tools.call("recall.hints", hint_arguments())
                 with self.assertRaises(AgentExecutionError) as caught:
                     tools.call("recall.find", {
                         "aliases": ["d1"],
@@ -531,11 +510,7 @@ class AgentFacadeUnitTest(unittest.TestCase):
             context,
             monotonic=lambda: next(ticks),
         )
-        tools.call("recall.hints", {
-            "query": REQUEST["question"],
-            "filters": {},
-            "limit": 1,
-        })
+        tools.call("recall.hints", hint_arguments())
         tools.call("recall.exec", {
             "program": "rg synthetic /docs/d1",
             "timeout_seconds": 30,
@@ -571,11 +546,7 @@ class AgentFacadeUnitTest(unittest.TestCase):
             context,
             monotonic=lambda: next(ticks),
         )
-        tools.call("recall.hints", {
-            "query": REQUEST["question"],
-            "filters": {},
-            "limit": 1,
-        })
+        tools.call("recall.hints", hint_arguments())
         with self.assertRaises(AgentExecutionError) as caught:
             tools.call("recall.exec", {
                 "program": "rg synthetic /docs/d1",
@@ -601,11 +572,7 @@ class AgentFacadeUnitTest(unittest.TestCase):
             budget=AgentBudget(max_receipts=1),
         )
         tools = ConstrainedAgentTools(ManyReceipts(), context)
-        tools.call("recall.hints", {
-            "query": REQUEST["question"],
-            "filters": {},
-            "limit": 1,
-        })
+        tools.call("recall.hints", hint_arguments())
         with self.assertRaises(AgentExecutionError) as caught:
             tools.call("recall.exec", {
                 "program": "rg synthetic /docs/d1",
@@ -629,11 +596,7 @@ class AgentFacadeUnitTest(unittest.TestCase):
             budget=AgentBudget(max_tool_output_bytes=700),
         )
         tools = ConstrainedAgentTools(LargeResult(), context)
-        tools.call("recall.hints", {
-            "query": REQUEST["question"],
-            "filters": {},
-            "limit": 1,
-        })
+        tools.call("recall.hints", hint_arguments())
         arguments = {
             "program": "rg synthetic /docs/d1",
             "timeout_seconds": 10,

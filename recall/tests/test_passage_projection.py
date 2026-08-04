@@ -37,9 +37,12 @@ from recall_server.passage_projection import (
     visible_messages,
 )
 from recall_server.passage_retrieval import (
+    EXACT_DENSE_SETTINGS,
     PassageHintRetrieval,
+    _configure_exact_dense_search,
     collapse_document_candidates,
     fuse_document_rankings,
+    fuse_need_rankings,
 )
 from recall_server.passage_worker import run_passage_worker
 
@@ -713,6 +716,50 @@ class PassageProjectionTests(unittest.TestCase):
         self.assertIn("SELECT DISTINCT ON (", source)
         self.assertIn("passage.logical_document_id", source)
 
+    def test_dense_search_uses_exact_oracle_and_reports_honest_depth(
+        self,
+    ) -> None:
+        source = inspect.getsource(PassageHintRetrieval.search)
+        nearest = source.split("WITH nearest AS MATERIALIZED", 1)[1]
+        nearest = nearest.split("), ranked_documents", 1)[0]
+
+        self.assertIn("_configure_exact_dense_search(connection)", source)
+        self.assertIn("embedding.source_id", nearest)
+        self.assertIn("embedding.passage_id", nearest)
+        self.assertIn("dense_requested_passages", source)
+        self.assertIn("dense_returned_passages", source)
+        self.assertIn("dense_unique_documents", source)
+        self.assertIn("dense_depth_complete", source)
+        self.assertIn("dense_latency_ms", source)
+
+    def test_exact_dense_settings_fail_closed_when_not_applied(self) -> None:
+        class Cursor:
+            def __init__(self, values: dict[str, str]) -> None:
+                self.values = values
+
+            def fetchone(self) -> dict[str, str]:
+                return self.values
+
+        class Connection:
+            def __init__(self, values: dict[str, str]) -> None:
+                self.values = values
+                self.statements: list[str] = []
+
+            def execute(self, statement: str) -> Cursor:
+                self.statements.append(statement)
+                return Cursor(self.values)
+
+        connection = Connection(dict(EXACT_DENSE_SETTINGS))
+        self.assertEqual(
+            _configure_exact_dense_search(connection),
+            EXACT_DENSE_SETTINGS,
+        )
+        self.assertEqual(len(connection.statements), 1)
+
+        rejected = Connection({**EXACT_DENSE_SETTINGS, "enable_seqscan": "off"})
+        with self.assertRaisesRegex(RuntimeError, "not applied"):
+            _configure_exact_dense_search(rejected)
+
     def test_backfill_is_idempotent_fast_first_and_starvation_bounded(
         self,
     ) -> None:
@@ -1025,6 +1072,91 @@ class PassageProjectionTests(unittest.TestCase):
         self.assertEqual(maximum, 4)
         sequential_seconds = 4 * 0.15
         self.assertLess(elapsed, sequential_seconds * 0.55)
+
+    def test_need_fusion_preserves_a_candidate_from_every_material_need(
+        self,
+    ) -> None:
+        def candidate(document: int) -> dict:
+            return {
+                "source_id": "source:test",
+                "logical_document_id": f"ldoc_{document:032x}",
+                "revision": 1,
+                "native_parent_id": f"session:{document}",
+                "first_occurred_at": "2026-07-27T00:00:00Z",
+                "last_occurred_at": "2026-07-27T00:10:00Z",
+                "manifest_object_key": "objects/01/" + "a" * 64,
+                "manifest_content_sha256": "b" * 64,
+                "rank": 0.9,
+                "reasons": ["dense"],
+                "matching_ranges": [],
+            }
+
+        dominant = [candidate(index) for index in range(1, 7)]
+        complement = candidate(99)
+        global_only = fuse_document_rankings(
+            (dominant, dominant, [complement]),
+            limit=4,
+        )
+        self.assertNotIn(
+            complement["logical_document_id"],
+            {item["logical_document_id"] for item in global_only},
+        )
+
+        retained = fuse_need_rankings(
+            (dominant, [complement]),
+            limit=4,
+        )
+        self.assertIn(
+            complement["logical_document_id"],
+            {item["logical_document_id"] for item in retained},
+        )
+        self.assertEqual(len(retained), 4)
+
+    def test_need_search_preserves_a_sparse_only_pointer(self) -> None:
+        def candidate(document: int, kind: str) -> dict:
+            return {
+                "source_id": "source:test",
+                "logical_document_id": f"ldoc_{document:032x}",
+                "revision": 1,
+                "native_parent_id": f"session:{document}",
+                "first_occurred_at": "2026-07-27T00:00:00Z",
+                "last_occurred_at": "2026-07-27T00:10:00Z",
+                "manifest_object_key": "objects/01/" + "a" * 64,
+                "manifest_content_sha256": "b" * 64,
+                "rank": 0.9,
+                "reasons": [kind],
+                "matching_ranges": [],
+            }
+
+        dominant = [candidate(index, "dense") for index in range(1, 9)]
+        complement = candidate(99, "sparse-exact")
+        response = {
+            "results": dominant,
+            "arms": {
+                "dense": dominant,
+                "passage-lexical": dominant,
+                "sparse-exact": [complement],
+            },
+            "diagnostics": {
+                "dense_status": "ok",
+                "passage_lexical_status": "ok",
+                "sparse_status": "ok",
+            },
+        }
+        retrieval = object.__new__(PassageHintRetrieval)
+        with mock.patch.object(retrieval, "search", return_value=response):
+            result = retrieval.search_needs(
+                (("project outcome",),),
+                lexical_groups=(("project outcome",),),
+                since=None,
+                until=None,
+                limit=8,
+            )
+
+        self.assertIn(
+            complement["logical_document_id"],
+            {item["logical_document_id"] for item in result["results"]},
+        )
 
     def test_rejects_hidden_roles_and_invalid_policy(self) -> None:
         hidden = PassageMessage(

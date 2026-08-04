@@ -24,7 +24,10 @@ class ScriptedAgentRunner:
             if family is not None:
                 routed["source_family"] = family
             packets.append(tools.call("recall.hints", {
-                "query": request["question"],
+                "needs": [{
+                    "need": "Answer the complete question",
+                    "queries": [request["question"]],
+                }],
                 "filters": routed,
                 "limit": 10,
             }))

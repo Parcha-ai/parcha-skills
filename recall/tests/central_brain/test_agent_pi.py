@@ -69,8 +69,9 @@ class SyntheticRetrieval:
         self.limits: list[int] = []
         self.fail_deep = fail_deep
 
-    def passage_hints(self, query, *, filters, limit):
+    def passage_hints(self, needs, *, filters, limit):
         self.calls.append("recall_hints")
+        self.needs = getattr(self, "needs", []) + [needs]
         self.filters.append(dict(filters))
         self.limits.append(limit)
         return {
@@ -234,17 +235,20 @@ def success_script():
         (
             "search",
             {
-                "query": "Project Aurora bridge decision",
+                "needs": [
+                    {
+                        "need": "The bridge decision",
+                        "queries": ["Project Aurora bridge decision"],
+                    },
+                    {
+                        "need": "The grounding outcome",
+                        "queries": [
+                            "Project Aurora grounding verification",
+                        ],
+                    },
+                ],
                 "filters": filters,
-                "limit": 8,
-            },
-        ),
-        (
-            "search",
-            {
-                "query": "Project Aurora grounding verification",
-                "filters": filters,
-                "limit": 8,
+                "limit": 20,
             },
         ),
         (
@@ -334,7 +338,10 @@ class SimpleAgentKernelTest(unittest.TestCase):
         self.assertEqual(
             PiRunner._authorize_hint_arguments(
                 {
-                    "query": "project context",
+                    "needs": [{
+                        "need": "Project context",
+                        "queries": ["project context"],
+                    }],
                     "filters": {
                         "since": "",
                         "until": " ",
@@ -346,7 +353,10 @@ class SimpleAgentKernelTest(unittest.TestCase):
                 REQUEST,
             ),
             {
-                "query": "project context",
+                "needs": [{
+                    "need": "Project context",
+                    "queries": ["project context"],
+                }],
                 "filters": {
                     "since": REQUEST["since"],
                     "until": REQUEST["until"],
@@ -355,7 +365,78 @@ class SimpleAgentKernelTest(unittest.TestCase):
             },
         )
 
-    def test_two_agent_chosen_queries_exec_and_grounded_finish(self):
+    def test_hint_ledger_is_bounded_structurally_deduplicated_and_closed(self):
+        filters = {
+            "since": REQUEST["since"],
+            "until": REQUEST["until"],
+            "source_family": None,
+            "source_connector": None,
+        }
+        authorized = PiRunner._authorize_hint_arguments(
+            {
+                "needs": [
+                    {
+                        "need": " Decision evidence ",
+                        "queries": [" Alpha decision ", "alpha decision"],
+                    },
+                    {
+                        "need": "Decision evidence",
+                        "queries": ["Alpha decision"],
+                    },
+                    {
+                        "need": "Outcome evidence",
+                        "queries": ["Alpha outcome", "Alpha rollout"],
+                    },
+                ],
+                "filters": filters,
+                "limit": 50,
+            },
+            REQUEST,
+        )
+        self.assertEqual(
+            authorized["needs"],
+            [
+                {
+                    "need": "Decision evidence",
+                    "queries": ["Alpha decision"],
+                },
+                {
+                    "need": "Outcome evidence",
+                    "queries": ["Alpha outcome", "Alpha rollout"],
+                },
+            ],
+        )
+        for invalid in (
+            {**authorized, "unexpected": True},
+            {**authorized, "needs": []},
+            {
+                **authorized,
+                "needs": [
+                    {"need": str(index), "queries": [str(index)]}
+                    for index in range(6)
+                ],
+            },
+            {
+                **authorized,
+                "needs": [{
+                    "need": "too many queries",
+                    "queries": ["one", "two", "three"],
+                }],
+            },
+            {
+                **authorized,
+                "needs": [{
+                    "need": "unknown field",
+                    "queries": ["one"],
+                    "source": "gmail",
+                }],
+            },
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(AgentExecutionError):
+                    PiRunner._authorize_hint_arguments(invalid, REQUEST)
+
+    def test_agent_owned_need_ledger_exec_and_grounded_finish(self):
         transport = ScriptedTransport(success_script())
         retrieval = SyntheticRetrieval()
         bundle = service(transport).use_recall(
@@ -368,12 +449,13 @@ class SimpleAgentKernelTest(unittest.TestCase):
             [
                 "recall_hints",
                 "recall_hints",
-                "recall_hints",
                 "recall_exec",
             ],
         )
         self.assertEqual(bundle["result"]["status"], "complete")
         self.assertEqual(retrieval.limits[0], 8)
+        self.assertEqual(len(retrieval.needs[0]), 1)
+        self.assertEqual(len(retrieval.needs[1]), 2)
         self.assertEqual(
             bundle["result"]["citations"],
             [DECISION, IMPLEMENTATION],
@@ -401,6 +483,8 @@ class SimpleAgentKernelTest(unittest.TestCase):
             "literal",
             find_tool["description"],
         )
+        self.assertIn("needs", hint_tool["input_schema"]["properties"])
+        self.assertNotIn("query", hint_tool["input_schema"]["properties"])
         self.assertIn("actual match", find_tool["description"])
         self.assertIn("record_ordinal", open_tool["description"])
         self.assertIn(
@@ -424,7 +508,7 @@ class SimpleAgentKernelTest(unittest.TestCase):
         self.assertIn("pattern", connector_schema)
         self.assertEqual(
             [event["stage"] for event in bundle["trace"]][2:6],
-            ["retrieve", "retrieve", "retrieve", "inspect"],
+            ["retrieve", "retrieve", "inspect", "synthesize"],
         )
         system = transport.start["data"]["prompt_sections"][0]["content"]
         self.assertIn("/docs/dN", system)
@@ -493,7 +577,7 @@ class SimpleAgentKernelTest(unittest.TestCase):
         )
 
     def test_exec_can_use_host_seed_hints(self):
-        script = success_script()[2:]
+        script = success_script()[1:]
         retrieval = SyntheticRetrieval()
         service(ScriptedTransport(script)).use_recall(
             principal(),
@@ -540,7 +624,7 @@ class SimpleAgentKernelTest(unittest.TestCase):
 
     def test_hints_are_not_citable(self):
         script = success_script()
-        script.pop(2)
+        script.pop(1)
         script[-1] = (
             "finish",
             {

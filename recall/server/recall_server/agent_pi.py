@@ -32,6 +32,7 @@ from .agent import (
     AgentExecutionError,
     ConstrainedAgentTools,
     DelegationContext,
+    _normalize_hint_needs,
     _stable_id,
     _timestamp,
 )
@@ -71,9 +72,9 @@ AGENT_HINT_GUIDANCE = (
     "artifact identifier. Think in independent evidence needs: a named source, "
     "a time window, or a genuinely multi-part comparison may need separate "
     "queries. Optional filters must come from the question, not guesses. Use "
-    "source_connector for an explicitly named integration such as codex, "
-    "claude, slack, or gmail; use one hint call per named connector when the "
-    "question crosses connectors. If a map is empty or visibly off-target, "
+    "source_connector for one explicitly named integration such as codex, "
+    "claude, slack, or gmail; leave it null when one ledger crosses connectors. "
+    "If a map is empty or visibly off-target, "
     "try a shorter query built from distinctive identifiers and the requested "
     "decision, status, cause, change, owner, or next step. Once every material "
     "evidence need has plausible candidates, inspect them rather than exhausting "
@@ -111,7 +112,8 @@ AGENT_INVESTIGATOR_GUIDANCE = (
     "documents; do not over-filter. The host's initial packet covers only the "
     "verbatim question. Inspect its snippets and decide whether it plausibly "
     "covers each material evidence need. Before exec, issue only the missing "
-    "connector-specific or atomic queries; do not repeat the same search. Then "
+    "single ledger of missing connector-specific or atomic needs; do not repeat "
+    "the same search. Then "
     "transition to find, open, or exec over admitted full documents for "
     "precise evidence. Treat each matching range as an exact record pointer: "
     "open the strongest suggested record from each plausible candidate before "
@@ -876,7 +878,27 @@ def _tool_definitions(
     request: dict[str, Any],
     allowed_tools: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
-    query = {"type": "string", "minLength": 1, "maxLength": 8192}
+    query = {"type": "string", "minLength": 1, "maxLength": 2048}
+    need = _object_schema(
+        {
+            "need": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+                "description": "One material evidence need in your investigation.",
+            },
+            "queries": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 2,
+                "items": query,
+                "description": (
+                    "One or two materially different retrieval queries for this need."
+                ),
+            },
+        },
+        ["need", "queries"],
+    )
     filter_properties: dict[str, Any] = {
         "since": {
             "description": (
@@ -923,8 +945,7 @@ def _tool_definitions(
         "description": (
             "Optional exact integration route derived from the question, such "
             "as codex, claude, slack, gmail, github, or notion. Use null when "
-            "the integration is not explicit. For a cross-connector question, "
-            "make one hint call per named connector."
+            "the integration is not explicit or a ledger crosses connectors."
         ),
         "anyOf": [
             {
@@ -959,26 +980,31 @@ def _tool_definitions(
                 "Get fallible semantic and lexical pointers to authorized full "
                 "documents as stable short aliases such as d1 and d2. The host "
                 "supplied one verbatim-question packet. "
-                "Call this for a missing atomic need, an explicitly named "
-                "connector, or an off-target packet before inspection. Hints are "
+                "Submit every missing material evidence need together; the host "
+                "keeps a bounded candidate share for each. Hints are "
                 "routing candidates, never evidence. "
                 f"{AGENT_HINT_GUIDANCE}"
             ),
             "input_schema": _object_schema(
                 {
-                    "query": query,
+                    "needs": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 5,
+                        "items": need,
+                    },
                     "filters": filters,
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": 20,
+                        "maximum": 50,
                         "description": (
-                            "Candidate document count. Prefer 8 for an initial "
-                            "search and broaden only when evidence requires it."
+                            "Total candidate document count. Use at least one "
+                            "slot per need; prefer 20 and broaden only when needed."
                         ),
                     },
                 },
-                ["query", "filters", "limit"],
+                ["needs", "filters", "limit"],
             ),
             **common,
         },
@@ -1278,7 +1304,10 @@ class PiRunner:
             initial_hints = _agent_hint_packet(tools.call(
                 "recall.hints",
                 {
-                    "query": request["question"],
+                    "needs": [{
+                        "need": "Answer the user's complete question",
+                        "queries": [request["question"]],
+                    }],
                     "filters": request_filters,
                     "limit": 8,
                 },
@@ -1467,10 +1496,7 @@ class PiRunner:
     ) -> dict[str, Any]:
         if (
             not isinstance(value, dict)
-            or set(value) != {"query", "filters", "limit"}
-            or not isinstance(value["query"], str)
-            or not value["query"].strip()
-            or len(value["query"]) > 8192
+            or set(value) != {"needs", "filters", "limit"}
             or not isinstance(value["filters"], dict)
             or set(value["filters"]) - {
                 "since",
@@ -1480,8 +1506,20 @@ class PiRunner:
             }
             or isinstance(value["limit"], bool)
             or not isinstance(value["limit"], int)
-            or not 1 <= value["limit"] <= 20
+            or not 1 <= value["limit"] <= 50
         ):
+            raise AgentExecutionError(
+                "agent hint arguments are invalid",
+                code="agent_query_scope_violation",
+            )
+        try:
+            needs = _normalize_hint_needs(value["needs"])
+        except AgentExecutionError as error:
+            raise AgentExecutionError(
+                "agent hint arguments are invalid",
+                code="agent_query_scope_violation",
+            ) from error
+        if value["limit"] < len(needs):
             raise AgentExecutionError(
                 "agent hint arguments are invalid",
                 code="agent_query_scope_violation",
@@ -1545,7 +1583,7 @@ class PiRunner:
             if item is not None
         }
         return {
-            "query": value["query"],
+            "needs": needs,
             "filters": filters,
             "limit": value["limit"],
         }

@@ -193,6 +193,15 @@ class PassageRepresentationTests(unittest.TestCase):
         self.assertIn("not 1 <= shard_count <= 64", source)
         self.assertIn("not 0 <= shard_index < shard_count", source)
 
+    def test_backfill_skips_passages_replaced_during_embedding(self) -> None:
+        source = inspect.getsource(
+            CanonicalPassageRepresentationIndex._store_vectors
+        )
+
+        self.assertIn("FROM canonical_passages current", source)
+        self.assertIn("FROM {parent_table} current", source)
+        self.assertIn("current.passage_id=%s", source)
+
     def test_shadow_search_filters_authority_before_vector_ranking(self) -> None:
         source = inspect.getsource(PassageHintRetrieval.search_representation)
         nearest = source.split("WITH nearest AS MATERIALIZED", 1)[1]

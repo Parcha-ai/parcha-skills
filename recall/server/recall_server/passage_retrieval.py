@@ -15,6 +15,32 @@ from .passage_representations import FINGERPRINT_RE, VECTOR_COLUMNS
 
 
 MAX_BUNDLE_SEARCH_WORKERS = 4
+EXACT_DENSE_EXECUTION = "exact-sequential-v1"
+EXACT_DENSE_SETTINGS = {
+    "enable_indexscan": "off",
+    "enable_bitmapscan": "off",
+    "enable_seqscan": "on",
+}
+
+
+def _configure_exact_dense_search(connection: Any) -> dict[str, str]:
+    """Make one dense-query transaction use the measured exact oracle."""
+
+    observed = connection.execute(
+        """SELECT set_config('enable_indexscan','off',true)
+                          AS enable_indexscan,
+                  set_config('enable_bitmapscan','off',true)
+                          AS enable_bitmapscan,
+                  set_config('enable_seqscan','on',true)
+                          AS enable_seqscan"""
+    ).fetchone()
+    settings = {
+        name: str(observed[name])
+        for name in EXACT_DENSE_SETTINGS
+    }
+    if settings != EXACT_DENSE_SETTINGS:
+        raise RuntimeError("exact dense search settings were not applied")
+    return settings
 
 
 def collapse_document_candidates(
@@ -183,6 +209,46 @@ def fuse_document_rankings(
     return results
 
 
+def fuse_need_rankings(
+    rankings: tuple[list[dict[str, Any]], ...],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Reserve an equal candidate share per agent-authored evidence need."""
+
+    if not rankings or limit < len(rankings):
+        raise ValueError("invalid evidence need rankings")
+    if len(rankings) == 1:
+        return rankings[0][:limit]
+    quota = max(1, limit // len(rankings))
+    retained: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for ranking in rankings:
+        admitted = 0
+        for candidate in ranking:
+            document_id = candidate["logical_document_id"]
+            if document_id in seen:
+                continue
+            retained.append(candidate)
+            seen.add(document_id)
+            admitted += 1
+            if admitted == quota:
+                break
+    if len(retained) < limit:
+        for candidate in fuse_document_rankings(
+            rankings,
+            limit=limit,
+        ):
+            document_id = candidate["logical_document_id"]
+            if document_id in seen:
+                continue
+            retained.append(candidate)
+            seen.add(document_id)
+            if len(retained) == limit:
+                break
+    return fuse_document_rankings((retained,), limit=limit)
+
+
 class PassageHintRetrieval:
     """Read-only retrieval over one selected lossless passage policy."""
 
@@ -336,7 +402,9 @@ class PassageHintRetrieval:
         dense: list[dict[str, Any]] = []
         runtime = self.store.semantic_runtime
         dense_status = "disabled" if runtime is None else "ok"
+        dense_latency_ms = 0.0
         if runtime is not None:
+            dense_started = time.monotonic()
             try:
                 bounded = getattr(runtime, "embed_query_bounded", None)
                 vector = (
@@ -346,7 +414,9 @@ class PassageHintRetrieval:
                 )
                 temporal_scope = since is not None or until is not None
                 dense_oversample = 50 if temporal_scope else 5
+                dense_requested_passages = candidate_limit * dense_oversample
                 with self.store.connect() as connection:
+                    _configure_exact_dense_search(connection)
                     dense = self.store._execute_bounded(
                         connection,
                         """WITH nearest AS MATERIALIZED (
@@ -360,7 +430,9 @@ class PassageHintRetrieval:
                                   AND embedding.source_id=ANY(%s)
                                   AND embedding.runtime_fingerprint=%s
                                 ORDER BY embedding.embedding
-                                         <=> %s::halfvec
+                                         <=> %s::halfvec,
+                                         embedding.source_id,
+                                         embedding.passage_id
                                 LIMIT %s
                            ), ranked_documents AS MATERIALIZED (
                                SELECT DISTINCT ON (
@@ -403,7 +475,11 @@ class PassageHintRetrieval:
                                          passage.last_occurred_at DESC,
                                          passage.passage_id
                            )
-                           SELECT *,1-distance AS score
+                           SELECT *,1-distance AS score,
+                                  (SELECT count(*) FROM nearest)
+                                      AS dense_passage_count,
+                                  (SELECT count(*) FROM ranked_documents)
+                                      AS dense_document_count
                              FROM ranked_documents
                             ORDER BY distance,last_occurred_at DESC,passage_id
                             LIMIT %s""",
@@ -413,7 +489,7 @@ class PassageHintRetrieval:
                             self.sources,
                             runtime.passage_fingerprint,
                             vector,
-                            candidate_limit * dense_oversample,
+                            dense_requested_passages,
                             self.policy_fingerprint,
                             since,
                             since,
@@ -438,18 +514,50 @@ class PassageHintRetrieval:
                     if isinstance(error, SearchDeadlineExceeded)
                     else "unavailable"
                 )
+            finally:
+                dense_latency_ms = round(
+                    (time.monotonic() - dense_started) * 1000,
+                    3,
+                )
         legs = (
             ("dense", 0.55, dense),
             ("passage-lexical", 0.30, lexical),
             ("sparse-exact", 0.15, sparse),
         )
         results = collapse_document_candidates(legs, limit=limit)
+        dense_returned_passages = (
+            int(dense[0]["dense_passage_count"])
+            if dense
+            else 0
+        )
+        dense_unique_documents = (
+            int(dense[0]["dense_document_count"])
+            if dense
+            else 0
+        )
         response = {
             "results": results,
             "diagnostics": {
                 "engine": "lossless-passages-v1",
                 "policy_fingerprint": self.policy_fingerprint,
                 "dense_candidates": len(dense),
+                "dense_latency_ms": dense_latency_ms,
+                "dense_execution": (
+                    EXACT_DENSE_EXECUTION
+                    if runtime is not None
+                    else "disabled"
+                ),
+                "dense_requested_passages": (
+                    dense_requested_passages
+                    if runtime is not None
+                    else 0
+                ),
+                "dense_returned_passages": dense_returned_passages,
+                "dense_unique_documents": dense_unique_documents,
+                "dense_depth_complete": (
+                    runtime is not None
+                    and dense_returned_passages == dense_requested_passages
+                ),
                 "passage_lexical_candidates": len(lexical),
                 "sparse_candidates": len(sparse),
                 "dense_status": dense_status,
@@ -496,6 +604,77 @@ class PassageHintRetrieval:
             or not 1 <= limit <= 100
         ):
             raise ValueError("invalid candidate query bundle")
+        response = self._search_groups(
+            (queries,),
+            lexical_groups=(lexical_queries,),
+            since=since,
+            until=until,
+            limit=limit,
+            engine="lossless-passages-v1-bundle",
+            preserve_arms=False,
+        )
+        response["diagnostics"].pop("need_count")
+        return response
+
+    def search_needs(
+        self,
+        query_groups: tuple[tuple[str, ...], ...],
+        *,
+        lexical_groups: tuple[tuple[str, ...], ...],
+        since: str | None,
+        until: str | None,
+        limit: int,
+    ) -> dict[str, Any]:
+        """Retrieve one fair candidate pool for agent-authored evidence needs."""
+
+        if (
+            not 1 <= len(query_groups) <= 5
+            or len(query_groups) != len(lexical_groups)
+            or any(
+                not 1 <= len(group) <= 2
+                for group in (*query_groups, *lexical_groups)
+            )
+            or any(
+                len(queries) != len(lexical_queries)
+                for queries, lexical_queries in zip(
+                    query_groups,
+                    lexical_groups,
+                    strict=True,
+                )
+            )
+            or any(
+                not isinstance(query, str)
+                or not query.strip()
+                or len(query) > 2048
+                for groups in (query_groups, lexical_groups)
+                for group in groups
+                for query in group
+            )
+            or isinstance(limit, bool)
+            or not len(query_groups) <= limit <= 100
+        ):
+            raise ValueError("invalid evidence need ledger")
+        return self._search_groups(
+            query_groups,
+            lexical_groups=lexical_groups,
+            since=since,
+            until=until,
+            limit=limit,
+            engine="lossless-passages-v1-need-ledger",
+            preserve_arms=True,
+        )
+
+    def _search_groups(
+        self,
+        query_groups: tuple[tuple[str, ...], ...],
+        *,
+        lexical_groups: tuple[tuple[str, ...], ...],
+        since: str | None,
+        until: str | None,
+        limit: int,
+        engine: str,
+        preserve_arms: bool,
+    ) -> dict[str, Any]:
         def search(pair: tuple[str, str]) -> dict[str, Any]:
             query, lexical_query = pair
             return self.search(
@@ -507,13 +686,27 @@ class PassageHintRetrieval:
                 include_arms=True,
             )
 
-        pairs = tuple(zip(queries, lexical_queries, strict=True))
+        pairs = tuple(
+            pair
+            for queries, lexical_queries in zip(
+                query_groups,
+                lexical_groups,
+                strict=True,
+            )
+            for pair in zip(queries, lexical_queries, strict=True)
+        )
         with ThreadPoolExecutor(
             max_workers=min(MAX_BUNDLE_SEARCH_WORKERS, len(pairs)),
             thread_name_prefix="recall-passage-query",
         ) as executor:
             responses = list(executor.map(search, pairs))
         arm_names = ("dense", "passage-lexical", "sparse-exact")
+
+        grouped_responses = []
+        offset = 0
+        for queries in query_groups:
+            grouped_responses.append(responses[offset:offset + len(queries)])
+            offset += len(queries)
 
         def status(name: str) -> str:
             values = [
@@ -528,24 +721,50 @@ class PassageHintRetrieval:
                 return "disabled"
             return "ok"
 
+        def query_ranking(response: dict[str, Any]) -> list[dict[str, Any]]:
+            if not preserve_arms or limit < len(arm_names) + 1:
+                return response["results"]
+            return fuse_need_rankings(
+                (
+                    response["results"],
+                    *(response["arms"][arm] for arm in arm_names),
+                ),
+                limit=limit,
+            )
+
+        def group_ranking(group: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            rankings = tuple(query_ranking(response) for response in group)
+            return (
+                fuse_need_rankings(rankings, limit=limit)
+                if preserve_arms
+                else fuse_document_rankings(rankings, limit=limit)
+            )
+
         return {
-            "results": fuse_document_rankings(
-                tuple(response["results"] for response in responses),
+            "results": fuse_need_rankings(
+                tuple(
+                    group_ranking(group)
+                    for group in grouped_responses
+                ),
                 limit=limit,
             ),
             "arms": {
-                arm: fuse_document_rankings(
+                arm: fuse_need_rankings(
                     tuple(
-                        response["arms"][arm]
-                        for response in responses
+                        fuse_document_rankings(
+                            tuple(response["arms"][arm] for response in group),
+                            limit=limit,
+                        )
+                        for group in grouped_responses
                     ),
                     limit=limit,
                 )
                 for arm in arm_names
             },
             "diagnostics": {
-                "engine": "lossless-passages-v1-bundle",
-                "query_count": len(queries),
+                "engine": engine,
+                "need_count": len(query_groups),
+                "query_count": len(pairs),
                 "dense_status": status("dense_status"),
                 "passage_lexical_status": status(
                     "passage_lexical_status"

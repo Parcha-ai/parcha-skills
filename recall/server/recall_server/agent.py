@@ -205,18 +205,18 @@ class ConstrainedAgentTools:
             self._calls_by_tool[name] = tool_calls + 1
             if name == "recall.hints":
                 if (
-                    not {"query", "filters", "limit"} == set(arguments)
-                    or not isinstance(arguments["query"], str)
-                    or not arguments["query"].strip()
-                    or len(arguments["query"]) > 8192
+                    not {"needs", "filters", "limit"} == set(arguments)
                     or not isinstance(arguments["filters"], dict)
                     or isinstance(arguments["limit"], bool)
                     or not isinstance(arguments["limit"], int)
-                    or not 1 <= arguments["limit"] <= 20
+                    or not 1 <= arguments["limit"] <= 50
                 ):
                     raise AgentExecutionError("agent tool arguments are invalid")
+                needs = _normalize_hint_needs(arguments["needs"])
+                if arguments["limit"] < len(needs):
+                    raise AgentExecutionError("agent tool arguments are invalid")
                 result = self._retrieval.passage_hints(
-                    arguments["query"],
+                    needs,
                     filters=arguments["filters"],
                     limit=arguments["limit"],
                 )
@@ -633,6 +633,49 @@ class ConstrainedAgentTools:
             "source_count": 0,
             "session_count": 0,
         })
+
+
+def _normalize_hint_needs(value: Any) -> list[dict[str, Any]]:
+    """Validate and structurally deduplicate an agent-authored need ledger."""
+
+    if not isinstance(value, list) or not 1 <= len(value) <= 5:
+        raise AgentExecutionError("agent hint needs are invalid")
+    normalized: list[dict[str, Any]] = []
+    seen_needs: set[tuple[str, tuple[str, ...]]] = set()
+    for item in value:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"need", "queries"}
+            or not isinstance(item["need"], str)
+            or not item["need"].strip()
+            or len(item["need"]) > 512
+            or not isinstance(item["queries"], list)
+            or not 1 <= len(item["queries"]) <= 2
+        ):
+            raise AgentExecutionError("agent hint needs are invalid")
+        need = item["need"].strip()
+        queries: list[str] = []
+        seen_queries: set[str] = set()
+        for raw_query in item["queries"]:
+            if (
+                not isinstance(raw_query, str)
+                or not raw_query.strip()
+                or len(raw_query) > 2048
+            ):
+                raise AgentExecutionError("agent hint needs are invalid")
+            query = raw_query.strip()
+            key = " ".join(query.casefold().split())
+            if key not in seen_queries:
+                seen_queries.add(key)
+                queries.append(query)
+        key = (
+            " ".join(need.casefold().split()),
+            tuple(" ".join(query.casefold().split()) for query in queries),
+        )
+        if key not in seen_needs:
+            seen_needs.add(key)
+            normalized.append({"need": need, "queries": queries})
+    return normalized
 
 
 def _stable_id(prefix: str, value: str) -> str:
