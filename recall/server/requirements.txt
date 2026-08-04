@@ -1,6 +1,6 @@
 boto3==1.43.51
 composio==0.18.0
-cryptography==49.0.0
+cryptography==50.0.0
 defusedxml==0.7.1
 orjson==3.11.7
 psycopg[binary]==3.3.4
