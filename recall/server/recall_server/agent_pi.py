@@ -69,14 +69,19 @@ LOG = logging.getLogger(__name__)
 AGENT_HINT_GUIDANCE = (
     "Use the user's complete natural-language question verbatim as the first "
     "query, preserving every project name, path, UUID, branch, service, and "
-    "artifact identifier. Think in independent evidence needs: a named source, "
+    "artifact identifier. Queries are semantic natural language, not web-search "
+    "syntax: do not add quotation marks or invented field prefixes. Think in "
+    "independent evidence needs: a named source, "
     "a time window, or a genuinely multi-part comparison may need separate "
     "queries. Optional filters must come from the question, not guesses. Use "
     "source_connector for one explicitly named integration such as codex, "
     "claude, slack, or gmail; leave it null when one ledger crosses connectors. "
     "If a map is empty or visibly off-target, "
     "try a shorter query built from distinctive identifiers and the requested "
-    "decision, status, cause, change, owner, or next step. Once every material "
+    "decision, status, cause, change, owner, or next step. When snippets show "
+    "an interim sample, progress report, draft, or planned work, request the "
+    "next page for that unresolved need until you find the completed outcome "
+    "or establish a precise gap. Once every material "
     "evidence need has plausible candidates, inspect them rather than exhausting "
     "the hint budget."
 )
@@ -90,7 +95,7 @@ AGENT_EXEC_GUIDANCE = (
     "and routing receipts. Inspect those first, then broaden when needed. Use "
     "any bounded rg, jq, awk, sed, sort, or Python program that "
     "best expresses the investigation. Never run an unbounded recursive grep: "
-    "bound matches and stdout. Emit each "
+    "use `rg` rather than `grep -r`, and bound matches and stdout. Emit each "
     "supporting top-level receipt on its own exact line as "
     "`RECALL_EVIDENCE <recall://receipt>` alongside the actual matched JSONL "
     "record. A marker printed without its source record is not evidence. "
@@ -109,13 +114,16 @@ AGENT_FINISH_GUIDANCE = (
 AGENT_INVESTIGATOR_GUIDANCE = (
     "Use null for source or time filters unless explicitly provided in the "
     "question. Treat Voyage hints as high-recall pointers to admit plausible "
-    "documents; do not over-filter. The host's initial packet covers only the "
-    "verbatim question. Inspect its snippets and decide whether it plausibly "
-    "covers each material evidence need. Before exec, issue only the missing "
-    "single ledger of missing connector-specific or atomic needs; do not repeat "
-    "the same search. Then "
+    "documents; do not over-filter. Start with one search ledger containing "
+    "every material evidence need in the question. Use short natural-language "
+    "queries that preserve the named project and requested outcome; avoid "
+    "invented paths, dates, branches, metrics, or status labels. Then "
     "transition to find, open, or exec over admitted full documents for "
-    "precise evidence. Treat each matching range as an exact record pointer: "
+    "precise evidence. When a candidate has no useful matching range, use find "
+    "across its alias with the named project and outcome terms before opening; "
+    "opening record 0 only reads the first record and is not a document search. "
+    "Do not repeat search when it returns the same aliases—inspect them. Treat "
+    "each matching range as an exact record pointer: "
     "open the strongest suggested record from each plausible candidate before "
     "searching whole documents, and do not substitute a nearby record merely "
     "because it is topically related. If two distinct searches plus three "
@@ -797,82 +805,6 @@ def _object_schema(
     }
 
 
-def _agent_hint_packet(value: dict[str, Any]) -> dict[str, Any]:
-    """Project raw-question routing hints into a lean, non-evidentiary packet."""
-
-    results = value.get("results", []) if isinstance(value, dict) else []
-    projected = []
-    for candidate in results[:20] if isinstance(results, list) else []:
-        if not isinstance(candidate, dict):
-            continue
-        ranges = []
-        for match in candidate.get("matching_ranges", [])[:2]:
-            if not isinstance(match, dict):
-                continue
-            spans = [
-                {
-                    key: span[key]
-                    for key in ("record_ordinal", "record_count")
-                    if isinstance(span.get(key), int)
-                    and not isinstance(span.get(key), bool)
-                }
-                for span in match.get("spans", [])[:4]
-                if isinstance(span, dict)
-            ]
-            ranges.append({
-                key: item
-                for key, item in {
-                    "kind": match.get("kind"),
-                    "score": match.get("score"),
-                    "passage_ordinal": match.get("passage_ordinal"),
-                    "spans": spans,
-                    "routing_receipts": [
-                        receipt
-                        for receipt in match.get("receipts", [])[:8]
-                        if isinstance(receipt, str)
-                        and receipt.startswith("recall://")
-                    ],
-                    "text": (
-                        match.get("text", "")[:800]
-                        if isinstance(match.get("text"), str)
-                        else ""
-                    ),
-                }.items()
-                if item not in (None, "")
-            })
-        projected.append({
-            key: item
-            for key, item in {
-                "source_id": candidate.get("source_id"),
-                "alias": candidate.get("alias"),
-                "revision": candidate.get("revision"),
-                "first_occurred_at": candidate.get("first_occurred_at"),
-                "last_occurred_at": candidate.get("last_occurred_at"),
-                "rank": candidate.get("rank"),
-                "reasons": candidate.get("reasons"),
-                "matching_ranges": ranges,
-            }.items()
-            if item not in (None, "", [])
-        })
-    diagnostics = value.get("diagnostics", {}) if isinstance(value, dict) else {}
-    return {
-        "status": "ok",
-        "evidence": False,
-        "query_basis": "verbatim_user_question",
-        "results": projected,
-        "diagnostics": {
-            key: diagnostics[key]
-            for key in (
-                "engine",
-                "dense_status",
-                "passage_lexical_status",
-                "sparse_status",
-            )
-            if key in diagnostics
-        } if isinstance(diagnostics, dict) else {},
-    }
-
-
 def _tool_definitions(
     timeout_ms: int,
     request: dict[str, Any],
@@ -978,10 +910,10 @@ def _tool_definitions(
             "name": "search",
             "description": (
                 "Get fallible semantic and lexical pointers to authorized full "
-                "documents as stable short aliases such as d1 and d2. The host "
-                "supplied one verbatim-question packet. "
-                "Submit every missing material evidence need together; the host "
-                "keeps a bounded candidate share for each. Hints are "
+                "documents as stable short aliases such as d1 and d2. Submit "
+                "every material evidence need together on page 0; request a "
+                "later page with only the unresolved needs. The host preserves "
+                "each need independently. Hints are "
                 "routing candidates, never evidence. "
                 f"{AGENT_HINT_GUIDANCE}"
             ),
@@ -997,14 +929,23 @@ def _tool_definitions(
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": 50,
+                        "maximum": 40,
                         "description": (
-                            "Total candidate document count. Use at least one "
-                            "slot per need; prefer 20 and broaden only when needed."
+                            "Candidate documents per need and page. Prefer 40; "
+                            "the five-need maximum stays bounded at 200 aliases."
+                        ),
+                    },
+                    "page": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 19,
+                        "description": (
+                            "Zero-based page for every need in this call. Start "
+                            "at 0; submit only unresolved needs on later pages."
                         ),
                     },
                 },
-                ["needs", "filters", "limit"],
+                ["needs", "filters", "limit", "page"],
             ),
             **common,
         },
@@ -1026,7 +967,7 @@ def _tool_definitions(
                         "maxItems": 20,
                         "items": {
                             "type": "string",
-                            "pattern": "^d[1-9][0-9]?$",
+                            "pattern": "^d(?:[1-9]|[1-9][0-9]|1[0-9]{2}|200)$",
                         },
                     },
                     "patterns": {
@@ -1083,7 +1024,7 @@ def _tool_definitions(
                 {
                     "alias": {
                         "type": "string",
-                        "pattern": "^d[1-9][0-9]?$",
+                        "pattern": "^d(?:[1-9]|[1-9][0-9]|1[0-9]{2}|200)$",
                     },
                     "cursor": {
                         "anyOf": [
@@ -1124,12 +1065,23 @@ def _tool_definitions(
             "name": "exec",
             "description": (
                 "Run an agent-authored shell program beside the full immutable "
-                "documents admitted by prior search. Their stable aliases are "
+                "documents selected from prior search pages. Their stable aliases are "
                 "mounted read-only at /docs/dN; the container has no network. "
                 f"{AGENT_EXEC_GUIDANCE}"
             ),
             "input_schema": _object_schema(
                 {
+                    "aliases": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 80,
+                        "items": {
+                            "type": "string",
+                            "pattern": (
+                                "^d(?:[1-9]|[1-9][0-9]|1[0-9]{2}|200)$"
+                            ),
+                        },
+                    },
                     "program": {
                         "type": "string",
                         "minLength": 1,
@@ -1141,7 +1093,7 @@ def _tool_definitions(
                         "maximum": 30,
                     },
                 },
-                ["program", "timeout_seconds"],
+                ["aliases", "program", "timeout_seconds"],
             ),
             **common,
         },
@@ -1270,14 +1222,27 @@ class PiRunner:
                     )
                 except AgentExecutionError as error:
                     if error.code == "agent_citation_not_opened":
+                        valid_cited = getattr(
+                            error,
+                            "valid_cited_receipts",
+                            (),
+                        )
+                        invalid = getattr(error, "invalid_receipts", ())
                         error.model_guidance = (
-                            "Use only this exact opened receipt allowlist in claims: "
+                            "Delete every claim backed only by an invalid receipt. "
+                            "Use only these exact already-valid cited receipts in "
+                            "the remaining claims: "
                             + json.dumps(
-                                list(tools.citable_receipts)[:32],
+                                list(valid_cited)[:32],
                                 separators=(",", ":"),
                             )
-                                + ". Remove every other claim receipt, "
-                                "then submit finish once."
+                            + ". These receipts were invalid and must not appear: "
+                            + json.dumps(
+                                list(invalid)[:32],
+                                separators=(",", ":"),
+                            )
+                            + ". Do not shorten, reconstruct, or invent receipts; "
+                            "then submit finish once."
                         )
                     raise
                 sealed = True
@@ -1300,26 +1265,6 @@ class PiRunner:
         }
         if len(request.get("source_families") or []) == 1:
             request_filters["source_family"] = request["source_families"][0]
-        try:
-            initial_hints = _agent_hint_packet(tools.call(
-                "recall.hints",
-                {
-                    "needs": [{
-                        "need": "Answer the user's complete question",
-                        "queries": [request["question"]],
-                    }],
-                    "filters": request_filters,
-                    "limit": 8,
-                },
-            ))
-        except AgentExecutionError as error:
-            initial_hints = {
-                "status": "unavailable",
-                "evidence": False,
-                "query_basis": "verbatim_user_question",
-                "error_code": error.code,
-                "results": [],
-            }
         request_constraints: dict[str, Any] = {
             "filters": request_filters,
         }
@@ -1340,11 +1285,9 @@ class PiRunner:
             "or boundaries. find performs literal match-centered search; open "
             "cursor-pages exact content; exec gives arbitrary read-only shell "
             "over stable /docs/dN paths. "
-            f"The current UTC time is {_timestamp(now)}. Choose and reformulate "
-            f"queries yourself. The host already ran the user's verbatim question "
-            "once; its initial hint packet is fallible and has admitted any listed "
-            "aliases for inspection. Use it first, reformulate with search when "
-            f"coverage is weak, and never cite it as evidence. "
+            f"The current UTC time is {_timestamp(now)}. Decompose the complete "
+            "question into material evidence needs and choose the search queries "
+            "yourself. "
             f"{AGENT_INVESTIGATOR_GUIDANCE} Hints are "
             "never evidence. Cite only exact recall:// receipts returned by "
             "find or open, or opened by exec alongside their JSONL records. "
@@ -1384,13 +1327,6 @@ class PiRunner:
                                     context.budget.max_tool_output_bytes
                                 ),
                             },
-                            separators=(",", ":"),
-                        ),
-                    },
-                    {
-                        "id": "initial raw-question hints",
-                        "content": json.dumps(
-                            initial_hints,
                             separators=(",", ":"),
                         ),
                     },
@@ -1496,7 +1432,7 @@ class PiRunner:
     ) -> dict[str, Any]:
         if (
             not isinstance(value, dict)
-            or set(value) != {"needs", "filters", "limit"}
+            or set(value) != {"needs", "filters", "limit", "page"}
             or not isinstance(value["filters"], dict)
             or set(value["filters"]) - {
                 "since",
@@ -1506,7 +1442,10 @@ class PiRunner:
             }
             or isinstance(value["limit"], bool)
             or not isinstance(value["limit"], int)
-            or not 1 <= value["limit"] <= 50
+            or not 1 <= value["limit"] <= 40
+            or isinstance(value["page"], bool)
+            or not isinstance(value["page"], int)
+            or not 0 <= value["page"] <= 19
         ):
             raise AgentExecutionError(
                 "agent hint arguments are invalid",
@@ -1586,6 +1525,7 @@ class PiRunner:
             "needs": needs,
             "filters": filters,
             "limit": value["limit"],
+            "page": value["page"],
         }
 
     @staticmethod
@@ -1676,10 +1616,23 @@ class PiRunner:
             not set(citations) <= opened
             or any(urlsplit(item).netloc not in granted for item in citations)
         ):
-            raise AgentExecutionError(
+            error = AgentExecutionError(
                 "agent cited evidence it did not open",
                 code="agent_citation_not_opened",
             )
+            error.valid_cited_receipts = tuple(
+                receipt
+                for receipt in citations
+                if receipt in opened
+                and urlsplit(receipt).netloc in granted
+            )
+            error.invalid_receipts = tuple(
+                receipt
+                for receipt in citations
+                if receipt not in opened
+                or urlsplit(receipt).netloc not in granted
+            )
+            raise error
         if status in {"complete", "partial"} and (
             not answer or not claims or not citations
         ):

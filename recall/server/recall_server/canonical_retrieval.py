@@ -826,6 +826,7 @@ class BoundCanonicalRetrieval:
         needs: str | list[dict[str, Any]],
         filters: dict[str, Any] | None = None,
         limit: int = 10,
+        page: int | None = None,
     ) -> dict[str, Any]:
         """Return document/range hints without answering the natural question."""
 
@@ -856,6 +857,15 @@ class BoundCanonicalRetrieval:
             isinstance(limit, bool)
             or not isinstance(limit, int)
             or not len(needs) <= limit <= 50
+            or (page is not None and limit > 40)
+            or (
+                page is not None
+                and (
+                    isinstance(page, bool)
+                    or not isinstance(page, int)
+                    or not 0 <= page <= 19
+                )
+            )
         ):
             raise ValueError("invalid passage hint limit")
         (
@@ -904,6 +914,7 @@ class BoundCanonicalRetrieval:
             since=since,
             until=until,
             limit=limit,
+            page=page,
         )
 
     def execute_agent_program(

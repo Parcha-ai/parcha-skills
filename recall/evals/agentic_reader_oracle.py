@@ -136,6 +136,7 @@ class OracleDocumentRetrieval:
         *,
         filters: dict[str, Any],
         limit: int,
+        page: int | None = None,
     ) -> dict[str, Any]:
         """Return fixed document identities without evidence or passage hints."""
 
@@ -162,7 +163,16 @@ class OracleDocumentRetrieval:
             or not isinstance(filters, dict)
             or isinstance(limit, bool)
             or not isinstance(limit, int)
-            or not len(needs) <= limit <= 20
+            or not len(needs) <= limit <= 50
+            or (page is not None and limit > 40)
+            or (
+                page is not None
+                and (
+                    isinstance(page, bool)
+                    or not isinstance(page, int)
+                    or not 0 <= page <= 19
+                )
+            )
         ):
             raise EvaluationInputError(
                 "reader-oracle hint request is invalid"
@@ -175,7 +185,12 @@ class OracleDocumentRetrieval:
                 raise EvaluationInputError(
                     "reader-oracle pointer boundary is invalid"
                 )
-            live = pointer_hints(needs, filters=filters, limit=20)
+            live = pointer_hints(
+                needs,
+                filters=filters,
+                limit=20,
+                page=page,
+            )
             if not isinstance(live, dict):
                 raise EvaluationInputError(
                     "reader-oracle pointer result is invalid"

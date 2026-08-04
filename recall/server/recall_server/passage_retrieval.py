@@ -612,6 +612,7 @@ class PassageHintRetrieval:
             limit=limit,
             engine="lossless-passages-v1-bundle",
             preserve_arms=False,
+            page=None,
         )
         response["diagnostics"].pop("need_count")
         return response
@@ -624,6 +625,7 @@ class PassageHintRetrieval:
         since: str | None,
         until: str | None,
         limit: int,
+        page: int | None = None,
     ) -> dict[str, Any]:
         """Retrieve one fair candidate pool for agent-authored evidence needs."""
 
@@ -652,6 +654,15 @@ class PassageHintRetrieval:
             )
             or isinstance(limit, bool)
             or not len(query_groups) <= limit <= 100
+            or (page is not None and limit > 40)
+            or (
+                page is not None
+                and (
+                    isinstance(page, bool)
+                    or not isinstance(page, int)
+                    or not 0 <= page <= 19
+                )
+            )
         ):
             raise ValueError("invalid evidence need ledger")
         return self._search_groups(
@@ -662,6 +673,7 @@ class PassageHintRetrieval:
             limit=limit,
             engine="lossless-passages-v1-need-ledger",
             preserve_arms=True,
+            page=page,
         )
 
     def _search_groups(
@@ -674,7 +686,15 @@ class PassageHintRetrieval:
         limit: int,
         engine: str,
         preserve_arms: bool,
+        page: int | None,
     ) -> dict[str, Any]:
+        page_size = limit
+        search_limit = (
+            min(400, (page + 1) * page_size)
+            if page is not None
+            else limit
+        )
+
         def search(pair: tuple[str, str]) -> dict[str, Any]:
             query, lexical_query = pair
             return self.search(
@@ -682,7 +702,7 @@ class PassageHintRetrieval:
                 lexical_query=lexical_query,
                 since=since,
                 until=until,
-                limit=limit,
+                limit=search_limit,
                 include_arms=True,
             )
 
@@ -722,6 +742,14 @@ class PassageHintRetrieval:
             return "ok"
 
         def query_ranking(response: dict[str, Any]) -> list[dict[str, Any]]:
+            if page is not None:
+                return fuse_document_rankings(
+                    (
+                        response["results"],
+                        *(response["arms"][arm] for arm in arm_names),
+                    ),
+                    limit=search_limit,
+                )
             if not preserve_arms or limit < len(arm_names) + 1:
                 return response["results"]
             return fuse_need_rankings(
@@ -734,11 +762,61 @@ class PassageHintRetrieval:
 
         def group_ranking(group: list[dict[str, Any]]) -> list[dict[str, Any]]:
             rankings = tuple(query_ranking(response) for response in group)
+            if page is not None:
+                return fuse_document_rankings(
+                    rankings,
+                    limit=search_limit,
+                )
             return (
                 fuse_need_rankings(rankings, limit=limit)
                 if preserve_arms
                 else fuse_document_rankings(rankings, limit=limit)
             )
+
+        if page is not None:
+            start = page * page_size
+            stop = start + page_size
+            need_pages = []
+            paged_results = []
+            for need_index, group in enumerate(grouped_responses):
+                ranking = group_ranking(group)
+                selected = ranking[start:stop]
+                paged_results.extend(
+                    {
+                        **candidate,
+                        "need_index": need_index,
+                        "need_page": page,
+                    }
+                    for candidate in selected
+                )
+                may_have_more = (
+                    len(ranking) == search_limit
+                    and search_limit < 400
+                )
+                need_pages.append({
+                    "need_index": need_index,
+                    "page": page,
+                    "page_size": page_size,
+                    "result_count": len(selected),
+                    "next_page": page + 1 if may_have_more else None,
+                })
+            return {
+                "results": paged_results,
+                "diagnostics": {
+                    "engine": f"{engine}-paged",
+                    "need_count": len(query_groups),
+                    "query_count": len(pairs),
+                    "page": page,
+                    "page_size": page_size,
+                    "searched_depth_per_need": search_limit,
+                    "need_pages": need_pages,
+                    "dense_status": status("dense_status"),
+                    "passage_lexical_status": status(
+                        "passage_lexical_status"
+                    ),
+                    "sparse_status": status("sparse_status"),
+                },
+            }
 
         return {
             "results": fuse_need_rankings(

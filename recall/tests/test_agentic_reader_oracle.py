@@ -32,12 +32,13 @@ class FakeExecution:
         self.calls.append({"operation": "inspect", **kwargs})
         return {"matches": [], "opened_receipts": []}
 
-    def passage_hints(self, query, *, filters, limit):
+    def passage_hints(self, query, *, filters, limit, page=None):
         self.calls.append({
             "operation": "pointers",
             "query": query,
             "filters": filters,
             "limit": limit,
+            "page": page,
         })
         return {
             "results": [

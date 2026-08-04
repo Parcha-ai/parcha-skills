@@ -115,6 +115,60 @@ class AgentRunner(Protocol):
     ) -> dict[str, Any]: ...
 
 
+def _project_hint_candidate(
+    item: dict[str, Any],
+    *,
+    alias: str,
+) -> dict[str, Any]:
+    """Expose useful routing hints without making them look citable."""
+
+    ranges = []
+    for matching_range in item.get("matching_ranges", [])[:2]:
+        if not isinstance(matching_range, dict):
+            continue
+        spans = [
+            {
+                key: span[key]
+                for key in ("record_ordinal", "record_count")
+                if isinstance(span.get(key), int)
+                and not isinstance(span.get(key), bool)
+            }
+            for span in matching_range.get("spans", [])[:4]
+            if isinstance(span, dict)
+        ]
+        ranges.append({
+            key: value
+            for key, value in {
+                "kind": matching_range.get("kind"),
+                "score": matching_range.get("score"),
+                "passage_ordinal": matching_range.get("passage_ordinal"),
+                "spans": spans,
+                "text": (
+                    matching_range.get("text", "")[:800]
+                    if isinstance(matching_range.get("text"), str)
+                    else ""
+                ),
+            }.items()
+            if value not in (None, "", [])
+        })
+    return {
+        key: value
+        for key, value in {
+            "source_id": item.get("source_id"),
+            "alias": alias,
+            "revision": item.get("revision"),
+            "first_occurred_at": item.get("first_occurred_at"),
+            "last_occurred_at": item.get("last_occurred_at"),
+            "rank": item.get("rank"),
+            "reasons": item.get("reasons"),
+            "need_index": item.get("need_index"),
+            "need_page": item.get("need_page"),
+            "matching_ranges": ranges,
+        }.items()
+        if value not in (None, "", [])
+    }
+
+
 class ConstrainedAgentTools:
     """Small host-owned tool boundary over one tenant-bound retrieval view.
 
@@ -205,11 +259,15 @@ class ConstrainedAgentTools:
             self._calls_by_tool[name] = tool_calls + 1
             if name == "recall.hints":
                 if (
-                    not {"needs", "filters", "limit"} == set(arguments)
+                    not {"needs", "filters", "limit", "page"}
+                    == set(arguments)
                     or not isinstance(arguments["filters"], dict)
                     or isinstance(arguments["limit"], bool)
                     or not isinstance(arguments["limit"], int)
-                    or not 1 <= arguments["limit"] <= 50
+                    or not 1 <= arguments["limit"] <= 40
+                    or isinstance(arguments["page"], bool)
+                    or not isinstance(arguments["page"], int)
+                    or not 0 <= arguments["page"] <= 19
                 ):
                     raise AgentExecutionError("agent tool arguments are invalid")
                 needs = _normalize_hint_needs(arguments["needs"])
@@ -219,10 +277,12 @@ class ConstrainedAgentTools:
                     needs,
                     filters=arguments["filters"],
                     limit=arguments["limit"],
+                    page=arguments["page"],
                 )
                 results = result.get("results", [])
                 if not isinstance(results, list):
                     raise AgentExecutionError("agent hint result is invalid")
+                prior_documents = set(self._hinted_documents)
                 for item in results:
                     document_id = (
                         item.get("logical_document_id")
@@ -280,8 +340,8 @@ class ConstrainedAgentTools:
                                     and len(spans) < 64
                                 ):
                                     spans.append(candidate)
-                if len(self._hinted_documents) > 80:
-                    self._hinted_documents = self._hinted_documents[:80]
+                if len(self._hinted_documents) > 200:
+                    self._hinted_documents = self._hinted_documents[:200]
                     admitted = set(self._hinted_documents)
                     self._hinted_record_spans = {
                         key: value
@@ -305,25 +365,58 @@ class ConstrainedAgentTools:
                         in self._aliases_by_document.items()
                         if document_id in admitted
                     }
+                projected_results = [
+                    _project_hint_candidate(
+                        item,
+                        alias=self._aliases_by_document[document_id],
+                    )
+                    for item in results
+                    if isinstance(item, dict)
+                    and isinstance(
+                        document_id := item.get("logical_document_id"),
+                        str,
+                    )
+                    and document_id in self._aliases_by_document
+                ]
+                aliases = list(dict.fromkeys(
+                    item["alias"]
+                    for item in projected_results
+                    if isinstance(item.get("alias"), str)
+                ))
+                has_ranges = any(
+                    item.get("matching_ranges")
+                    for item in projected_results
+                )
+                new_alias_count = len(
+                    set(self._hinted_documents) - prior_documents
+                )
+                if not has_ranges and aliases:
+                    next_action = (
+                        "These documents have no exact record pointers. Use find "
+                        f"on {aliases[:20]} with distinctive project and outcome "
+                        "terms before opening record 0 or searching again."
+                    )
+                elif new_alias_count == 0 and aliases:
+                    next_action = (
+                        "This search admitted no new documents. Inspect the listed "
+                        "aliases with find, open, or exec; change page before "
+                        "searching again."
+                    )
+                else:
+                    next_action = (
+                        "Inspect the strongest matching ranges. If they describe "
+                        "only an interim result, request the next page for that "
+                        "unresolved need."
+                    )
                 result = {
-                    **result,
-                    "results": [
-                        {
-                            **{
-                                key: value
-                                for key, value in item.items()
-                                if key != "logical_document_id"
-                            },
-                            "alias": self._aliases_by_document[document_id],
-                        }
-                        for item in results
-                        if isinstance(item, dict)
-                        and isinstance(
-                            document_id := item.get("logical_document_id"),
-                            str,
-                        )
-                        and document_id in self._aliases_by_document
-                    ],
+                    "evidence": False,
+                    "results": projected_results,
+                    "next_action": next_action,
+                    "diagnostics": (
+                        result.get("diagnostics", {})
+                        if isinstance(result.get("diagnostics", {}), dict)
+                        else {}
+                    ),
                 }
             elif name == "recall.find":
                 aliases = arguments.get("aliases")
@@ -478,8 +571,23 @@ class ConstrainedAgentTools:
                     timeout_seconds=min(20, executable_seconds),
                 )
             elif name == "recall.exec":
+                aliases = arguments.get("aliases")
+                if not self._hinted_documents:
+                    raise AgentExecutionError(
+                        "agent execution requires at least one prior hint",
+                        code="agent_exec_without_hints",
+                    )
                 if (
-                    set(arguments) != {"program", "timeout_seconds"}
+                    set(arguments)
+                    != {"aliases", "program", "timeout_seconds"}
+                    or not isinstance(aliases, list)
+                    or not 1 <= len(aliases) <= 80
+                    or len(aliases) != len(set(aliases))
+                    or any(
+                        not isinstance(alias, str)
+                        or alias not in self._document_ids_by_alias
+                        for alias in aliases
+                    )
                     or not isinstance(arguments["program"], str)
                     or not arguments["program"].strip()
                     or len(arguments["program"]) > 16_000
@@ -488,11 +596,6 @@ class ConstrainedAgentTools:
                     or not 1 <= arguments["timeout_seconds"] <= 30
                 ):
                     raise AgentExecutionError("agent tool arguments are invalid")
-                if not self._hinted_documents:
-                    raise AgentExecutionError(
-                        "agent execution requires at least one prior hint",
-                        code="agent_exec_without_hints",
-                    )
                 # Archil's HTTP boundary adds up to four seconds around the
                 # sandbox timeout. Reserve that transport allowance plus two
                 # seconds for the model's grounded finish, so one synchronous
@@ -505,18 +608,22 @@ class ConstrainedAgentTools:
                         "agent turn has no time remaining for evidence execution",
                         code="agent_tool_deadline_exhausted",
                     )
+                document_ids = tuple(
+                    self._document_ids_by_alias[alias]
+                    for alias in aliases
+                )
                 result = self._retrieval.execute_agent_program(
                     arguments["program"],
-                    logical_document_ids=tuple(self._hinted_documents),
+                    logical_document_ids=document_ids,
                     document_aliases={
                         document_id: self._aliases_by_document[document_id]
-                        for document_id in self._hinted_documents
+                        for document_id in document_ids
                     },
                     record_spans={
                         document_id: tuple(
                             self._hinted_record_spans.get(document_id, ())
                         )
-                        for document_id in self._hinted_documents
+                        for document_id in document_ids
                     },
                     routing_receipts={
                         document_id: tuple(
@@ -525,7 +632,7 @@ class ConstrainedAgentTools:
                                 (),
                             )
                         )
-                        for document_id in self._hinted_documents
+                        for document_id in document_ids
                     },
                     timeout_seconds=min(
                         arguments["timeout_seconds"],

@@ -68,6 +68,7 @@ def hint_arguments(*, limit: int = 1) -> dict:
         }],
         "filters": {},
         "limit": limit,
+        "page": 0,
     }
 
 
@@ -77,8 +78,8 @@ class FakeBoundRetrieval:
     def __init__(self) -> None:
         self.calls = []
 
-    def passage_hints(self, needs, *, filters, limit):
-        self.calls.append(("hints", needs, filters, limit))
+    def passage_hints(self, needs, *, filters, limit, page=None):
+        self.calls.append(("hints", needs, filters, limit, page))
         return {
             "results": [{
                 "source_id": SOURCE,
@@ -370,6 +371,7 @@ class AgentFacadeUnitTest(unittest.TestCase):
         )
         with self.assertRaises(AgentExecutionError) as caught:
             tools.call("recall.exec", {
+                "aliases": ["d1"],
                 "program": "rg synthetic /docs/d1",
                 "timeout_seconds": 10,
             })
@@ -405,6 +407,21 @@ class AgentFacadeUnitTest(unittest.TestCase):
             call[1]["document_aliases"],
             {document_id: "d1"},
         )
+
+    def test_hints_expose_pages_without_storage_or_receipt_authority(self) -> None:
+        retrieval = FakeBoundRetrieval()
+        tools = ConstrainedAgentTools(
+            retrieval,
+            DelegationContext.from_principal(principal()),
+        )
+        result = tools.call("recall.hints", hint_arguments())
+        rendered = json.dumps(result)
+        self.assertFalse(result["evidence"])
+        self.assertEqual(result["results"][0]["alias"], "d1")
+        self.assertNotIn("logical_document_id", rendered)
+        self.assertNotIn("manifest_object_key", rendered)
+        self.assertNotIn(RECEIPT, rendered)
+        self.assertEqual(retrieval.calls[-1][-1], 0)
 
     def test_open_can_address_any_hinted_record_ordinal(self) -> None:
         retrieval = FakeBoundRetrieval()
@@ -512,6 +529,7 @@ class AgentFacadeUnitTest(unittest.TestCase):
         )
         tools.call("recall.hints", hint_arguments())
         tools.call("recall.exec", {
+            "aliases": ["d1"],
             "program": "rg synthetic /docs/d1",
             "timeout_seconds": 30,
         })
@@ -549,6 +567,7 @@ class AgentFacadeUnitTest(unittest.TestCase):
         tools.call("recall.hints", hint_arguments())
         with self.assertRaises(AgentExecutionError) as caught:
             tools.call("recall.exec", {
+                "aliases": ["d1"],
                 "program": "rg synthetic /docs/d1",
                 "timeout_seconds": 30,
             })
@@ -575,6 +594,7 @@ class AgentFacadeUnitTest(unittest.TestCase):
         tools.call("recall.hints", hint_arguments())
         with self.assertRaises(AgentExecutionError) as caught:
             tools.call("recall.exec", {
+                "aliases": ["d1"],
                 "program": "rg synthetic /docs/d1",
                 "timeout_seconds": 10,
             })
@@ -598,6 +618,7 @@ class AgentFacadeUnitTest(unittest.TestCase):
         tools = ConstrainedAgentTools(LargeResult(), context)
         tools.call("recall.hints", hint_arguments())
         arguments = {
+            "aliases": ["d1"],
             "program": "rg synthetic /docs/d1",
             "timeout_seconds": 10,
         }

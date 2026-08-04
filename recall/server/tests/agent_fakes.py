@@ -30,11 +30,18 @@ class ScriptedAgentRunner:
                 }],
                 "filters": routed,
                 "limit": 10,
+                "page": 0,
             }))
+        aliases = [
+            candidate["alias"]
+            for packet in packets
+            for candidate in packet.get("results", [])
+        ][:80]
         opened = tools.call("recall.exec", {
+            "aliases": aliases,
             "program": "find /mnt/archil/evidence -type f -print0 | xargs -0 rg -n --fixed-strings ''",
             "timeout_seconds": min(30, context.budget.deadline_seconds),
-        }) if any(packet.get("results") for packet in packets) else {}
+        }) if aliases else {}
         receipts = list(dict.fromkeys(_receipts(opened)))[:context.budget.max_receipts]
         if any(urlsplit(receipt).netloc not in set(context.authorized_sources) for receipt in receipts):
             raise RuntimeError("test runner escaped its source grant")
