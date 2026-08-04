@@ -456,6 +456,7 @@ class TetherCliTest(unittest.TestCase):
             "    pathlib.Path(os.environ['CAPTURE_PATH']).write_text(json.dumps(request))\n"
             "    return {'thread_ts': '123.456'}\n"
             "def doctor(): return (True, ['ok'])\n"
+            "def herdr_agent_identity(*args): return {}\n"
             "def zellij_pane_identity(*args): return {}\n"
             "def working_directory_identity(cwd): return {'cwd': cwd}\n",
             encoding="utf-8",

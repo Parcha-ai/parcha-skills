@@ -18,18 +18,24 @@ Hermes must be loaded from the exact tested Git commit in a clean checkout.
 Tracked changes, non-ignored untracked files, and ignored Python overlays in
 Hermes source trees fail closed, even when they are outside the Slack adapter.
 
-The installer refuses non-Linux hosts. Native Zellij continuation also depends
-on Linux `/proc` identity and Unix-domain sockets. Headless runs can publish
+The installer refuses non-Linux hosts. Native Herdr and Zellij continuation
+depend on Linux `/proc` identity and Unix-domain sockets. Herdr protocol 19 is
+supported and tested with Herdr 0.8.0. Headless runs can publish
 with an explicit `--run-id`; stock pi sessions cannot be resumed natively.
 
 ## Binding and database upgrade
 
-This release uses BindingV2 and SQLite schema 15.
+This source tree uses BindingV3 and SQLite schema 15.
 
-A BindingV2 record contains a concrete source, one delivery endpoint, and a
+A BindingV3 record contains a concrete source, one delivery endpoint, and a
 monotonic generation. Rebind and close increment the generation. Legacy or
 incomplete native bindings become `rebind_required`; Tether never guesses a
 replacement process or session.
+
+BindingV3 adds a Herdr live endpoint. It pins the private session socket,
+protocol, terminal and pane IDs, occupant-bound agent name, official native
+session reference, and Linux process incarnation. BindingV1 and BindingV2
+records remain readable and are canonicalized to BindingV3.
 
 At startup, the Store:
 

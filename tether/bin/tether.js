@@ -73,6 +73,87 @@ function stringValue(value) {
   return typeof value === "string" ? value : "";
 }
 
+function discoverHerdrBinary() {
+  const candidates = [stringValue(process.env.HERDR_BIN_PATH)];
+  for (const directory of stringValue(process.env.PATH).split(path.delimiter)) {
+    if (directory) candidates.push(path.join(directory, "herdr"));
+  }
+  const localVersions = path.join(home, ".local", "opt", "herdr");
+  try {
+    for (const version of fs.readdirSync(localVersions).sort().reverse()) {
+      candidates.push(path.join(localVersions, version, "herdr"));
+    }
+  } catch {
+    // Herdr is optional for detached and Zellij bindings.
+  }
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      if (fs.statSync(candidate).isFile()) return fs.realpathSync.native(candidate);
+    } catch {
+      // Continue to the next explicit or conventional location.
+    }
+  }
+  return "";
+}
+
+function herdrDoctorChecks() {
+  const checks = [];
+  let healthy = true;
+  const executable = discoverHerdrBinary();
+  if (!executable) {
+    return { healthy, checks: ["WARN Herdr client unavailable; Herdr live bindings are disabled"] };
+  }
+  const schemaResult = spawnSync(executable, ["api", "schema", "--json"], {
+    encoding: "utf8",
+    env: process.env,
+    timeout: 10_000,
+  });
+  try {
+    if (schemaResult.error || schemaResult.status !== 0) throw new Error("schema unavailable");
+    const schema = JSON.parse(schemaResult.stdout);
+    if (schema.protocol !== 19) {
+      healthy = false;
+      checks.push(`FAIL Herdr protocol=${stringValue(schema.protocol) || "unknown"}; expected 19`);
+    } else {
+      checks.push("ok Herdr client protocol=19 available");
+    }
+  } catch {
+    healthy = false;
+    checks.push("FAIL Herdr client compatibility check");
+  }
+
+  const socketPath = stringValue(process.env.HERDR_SOCKET_PATH);
+  if (socketPath) {
+    try {
+      const info = fs.lstatSync(socketPath);
+      const mode = info.mode & 0o777;
+      if (
+        info.isSymbolicLink() ||
+        !info.isSocket() ||
+        mode !== 0o600 ||
+        (typeof process.getuid === "function" && info.uid !== process.getuid())
+      ) {
+        throw new Error("unsafe socket");
+      }
+      const snapshotResult = spawnSync(executable, ["api", "snapshot"], {
+        encoding: "utf8",
+        env: process.env,
+        timeout: 10_000,
+      });
+      if (snapshotResult.error || snapshotResult.status !== 0) throw new Error("snapshot unavailable");
+      const response = JSON.parse(snapshotResult.stdout);
+      if (response?.result?.snapshot?.protocol !== 19) throw new Error("protocol mismatch");
+      checks.push("ok current Herdr session socket is private and compatible");
+    } catch {
+      healthy = false;
+      checks.push("FAIL current Herdr session socket is unavailable or unsafe");
+    }
+  }
+  return { healthy, checks };
+}
+
 function packagePayloadAvailable() {
   return fs.existsSync(packageInstaller) &&
     fs.existsSync(path.join(packageRoot, "skills", "tether", "SKILL.md"));
@@ -865,7 +946,7 @@ function runNotifier(
   const socketPath = resolveSocketPath(options);
   if (path.basename(socketPath) !== "bridge.sock") {
     throw new CliError(
-      "Zellij source capture requires a broker socket named bridge.sock.",
+      "Live terminal source capture requires a broker socket named bridge.sock.",
       EXIT_USAGE,
       "unsupported_socket_override",
     );
@@ -926,6 +1007,12 @@ function workingDirectoryIdentity(cwd) {
 
 function detectSource(options) {
   const cwd = path.resolve(stringValue(options.cwd) || process.cwd());
+  const hasHerdrEnvironment = Boolean(
+    process.env.HERDR_ENV ||
+    process.env.HERDR_SESSION ||
+    process.env.HERDR_SOCKET_PATH ||
+    process.env.HERDR_PANE_ID
+  );
   const hasZellijOption = Boolean(options["zellij-session"] || options["zellij-pane-id"]);
   if (Boolean(options["zellij-session"]) !== Boolean(options["zellij-pane-id"])) {
     throw new CliError("--zellij-session and --zellij-pane-id must be provided together.");
@@ -950,15 +1037,17 @@ function detectSource(options) {
       stringValue(process.env.CLAUDE_CODE_SESSION_ID) ||
       stringValue(process.env.CODEX_THREAD_ID) ||
       stringValue(process.env.ZELLIJ_SESSION_NAME) ||
-      stringValue(process.env.ZELLIJ_PANE_ID)
+      stringValue(process.env.ZELLIJ_PANE_ID) ||
+      hasHerdrEnvironment
     )
   ) {
     throw new CliError(
-      "An explicit headless or Hermes source cannot replace an active Codex, Claude Code, or Zellij binding; repair or rebind the exact native session.",
+      "An explicit headless or Hermes source cannot replace an active Codex, Claude Code, Herdr, or Zellij binding; repair or rebind the exact native session.",
       EXIT_USAGE,
       "native_binding_required",
     );
   }
+  if (hasHerdrEnvironment) return null;
   if (hasZellijOption) return null;
   if (explicit.length === 1) {
     const [kind, identifier] = explicit[0];
@@ -1117,6 +1206,9 @@ async function runDoctor(options) {
   const installIntegrity = verifyManagedInstall();
   checks.push(installIntegrity.line);
   if (!installIntegrity.ok) healthy = false;
+  const herdr = herdrDoctorChecks();
+  checks.push(...herdr.checks);
+  if (!herdr.healthy) healthy = false;
 
   let status = null;
   try {

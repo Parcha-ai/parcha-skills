@@ -44,7 +44,9 @@ runtime = _load_runtime()
 Store = runtime.Store
 broker_call = runtime.broker_call
 continue_native = runtime.continue_native
+deliver_herdr = runtime.deliver_herdr
 deliver_zellij = runtime.deliver_zellij
+interrupt_herdr = runtime.interrupt_herdr
 interrupt_zellij = runtime.interrupt_zellij
 effective_allowed_users = runtime.effective_allowed_users
 load_config = runtime.load_config
@@ -2718,8 +2720,8 @@ def _finish_batch(items, error: str | None = None) -> None:
 
 def _run_recovered_event(bridge, items):
     prompt = _batch_prompt(items)
-    if _has_bound_zellij_pane(bridge):
-        _submit_zellij_attempt(bridge, items, prompt)
+    if _has_bound_live_endpoint(bridge):
+        _submit_live_attempt(bridge, items, prompt)
         return None
     attempt_id, response = _submit_detached_attempt(
         bridge,
@@ -2741,7 +2743,26 @@ def _has_bound_zellij_pane(bridge) -> bool:
     return runtime.source_binding(bridge).endpoint_kind == "zellij_pane"
 
 
-def _submit_zellij_attempt(bridge, items, prompt: str) -> str:
+def _has_bound_live_endpoint(bridge) -> bool:
+    return runtime.source_binding(bridge).endpoint_kind in {
+        "zellij_pane",
+        "herdr_agent",
+    }
+
+
+def _submit_live_attempt(bridge, items, prompt: str) -> str:
+    endpoint = runtime.source_binding(bridge).endpoint_kind
+    if endpoint == "zellij_pane":
+        delivery_kind = "zellij"
+        deliver = deliver_zellij
+    elif endpoint == "herdr_agent":
+        delivery_kind = "herdr"
+        deliver = deliver_herdr
+    else:
+        raise runtime.NativeContinuationError(
+            "binding is not attached to a live terminal endpoint",
+            code="endpoint_mismatch",
+        )
     event_ids = [str(item["event_id"]) for item in items]
     attempt_id = runtime.delivery_attempt_id(
         bridge.bridge_id,
@@ -2753,6 +2774,7 @@ def _submit_zellij_attempt(bridge, items, prompt: str) -> str:
         bridge.bridge_id,
         bridge.binding_generation,
         attempt_id,
+        delivery_kind=delivery_kind,
     ):
         raise runtime.NativeContinuationError(
             "binding changed before pane delivery; retry against the current binding",
@@ -2773,7 +2795,7 @@ def _submit_zellij_attempt(bridge, items, prompt: str) -> str:
             code="binding_generation_changed",
         )
     try:
-        deliver_zellij(bridge, prompt, attempt_id)
+        deliver(bridge, prompt, attempt_id)
     except Exception as exc:
         if store.attempt_state(attempt_id, bridge.bridge_id) in {
             "replying",
@@ -2815,6 +2837,10 @@ def _submit_zellij_attempt(bridge, items, prompt: str) -> str:
             code="binding_generation_changed",
         )
     return attempt_id
+
+
+def _submit_zellij_attempt(bridge, items, prompt: str) -> str:
+    return _submit_live_attempt(bridge, items, prompt)
 
 
 def _submit_detached_attempt(
@@ -2981,9 +3007,9 @@ async def _drain_bridge(bridge_id, gateway, platform):
             attempt_id: str | None = None
             try:
                 prompt = _batch_prompt(items)
-                if _has_bound_zellij_pane(bridge):
+                if _has_bound_live_endpoint(bridge):
                     attempt_id = await asyncio.to_thread(
-                        _submit_zellij_attempt, bridge, items, prompt
+                        _submit_live_attempt, bridge, items, prompt
                     )
                 else:
                     attempt_id, response = await asyncio.to_thread(
@@ -2993,7 +3019,7 @@ async def _drain_bridge(bridge_id, gateway, platform):
                         prompt,
                         cancellation,
                     )
-                if _has_bound_zellij_pane(bridge):
+                if _has_bound_live_endpoint(bridge):
                     continue
                 if response != "NO_REPLY":
                     await asyncio.to_thread(
@@ -3039,6 +3065,28 @@ def _interrupt_active_zellij_attempt(bridge) -> int:
         bridge.bridge_id,
         int(active["binding_generation"]),
     )
+
+
+def _interrupt_active_herdr_attempt(bridge) -> int:
+    active = store.active_live_attempt(bridge.bridge_id, "herdr")
+    if active is None:
+        return 0
+    interrupt_herdr(bridge)
+    return store.cancel_live_attempt(
+        str(active["attempt_id"]),
+        bridge.bridge_id,
+        int(active["binding_generation"]),
+        delivery_kind="herdr",
+    )
+
+
+def _interrupt_active_live_attempt(bridge) -> int:
+    endpoint = runtime.source_binding(bridge).endpoint_kind
+    if endpoint == "zellij_pane":
+        return _interrupt_active_zellij_attempt(bridge)
+    if endpoint == "herdr_agent":
+        return _interrupt_active_herdr_attempt(bridge)
+    return 0
 
 
 async def _post_control_notice(
@@ -3227,9 +3275,9 @@ def _dispatch_native_mutation(
         if cancellation is not None:
             cancellation.set()
         try:
-            _interrupt_active_zellij_attempt(dispatch.bridge)
+            _interrupt_active_live_attempt(dispatch.bridge)
         except Exception as exc:
-            active = store.active_zellij_attempt(
+            active = store.active_live_attempt(
                 dispatch.bridge.bridge_id
             )
             if active is not None:
@@ -3239,7 +3287,7 @@ def _dispatch_native_mutation(
                     int(active["binding_generation"]),
                 )
             log.error(
-                "Tether could not verify interruption of the edited Zellij "
+                "Tether could not verify interruption of the edited live terminal "
                 "turn for %s: %s",
                 dispatch.bridge.bridge_id,
                 _failure_reason(exc),
@@ -3306,7 +3354,7 @@ def _dispatch_native_cancel(
         if cancellation is not None:
             cancellation.set()
         try:
-            cancelled_zellij = _interrupt_active_zellij_attempt(
+            cancelled_zellij = _interrupt_active_live_attempt(
                 dispatch.bridge
             )
         except runtime.NativeContinuationError:

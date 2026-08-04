@@ -23,6 +23,6 @@ TETHER_MESSAGE
 ```
 
 Use `--run-id` only for a genuinely headless run. It is not a fallback for a
-failed Codex, Claude Code, or Zellij capture. Use the exact `reply` command
+failed Codex, Claude Code, Herdr, or Zellij capture. Use the exact `reply` command
 supplied to a resumed native session. Do not call Slack APIs directly, expose
 credentials, or invent a replacement session when the bound source is stale.

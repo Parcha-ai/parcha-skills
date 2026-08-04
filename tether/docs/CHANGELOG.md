@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Adds BindingV3 Herdr protocol-19 live endpoints with official native-session
+  references, occupant-bound agent names, private socket validation, and exact
+  process-incarnation checks.
+- Routes generation-fenced native delivery, acknowledgment, edit interruption,
+  cancellation, and ambiguous-outcome recovery through Herdr `agent.prompt`
+  and `agent.send_keys` primitives.
+- Captures Herdr bindings from its session environment without requiring a
+  duplicate Codex or Claude session environment variable.
+
 ## 0.2.0-beta.1
 
 - Introduces BindingV2 and database schema 15.

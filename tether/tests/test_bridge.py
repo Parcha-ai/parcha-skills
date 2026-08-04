@@ -327,9 +327,9 @@ class StoreTest(unittest.TestCase):
                 self.assertEqual(
                     {key: canonical[key] for key in source},
                     source,
-                    "canonical BindingV2 metadata may be added, but source identity must be preserved",
+                    "canonical BindingV3 metadata may be added, but source identity must be preserved",
                 )
-                self.assertEqual(canonical["binding_version"], "2")
+                self.assertEqual(canonical["binding_version"], "3")
                 self.assertEqual(canonical["binding_state"], "verified")
         _, legacy_headless = self.runtime._canonical_source(
             "headless_run",
@@ -2288,6 +2288,72 @@ class NotifierTest(unittest.TestCase):
         self.assertEqual(source["zellij_pane_id"], "7")
         self.assertEqual(source["pane_command_hash"], "abc123")
         self.assertEqual(source["process_identity"], process_identity(agent="claude"))
+
+    def test_herdr_official_session_is_sufficient_for_native_capture(self):
+        args = types.SimpleNamespace(run_id=None, hermes_session_id=None)
+        identity = {
+            "herdr_session": "pilot",
+            "herdr_socket_path": str(self.home / "herdr.sock"),
+            "herdr_terminal_id": "term_6583153c2a1b81",
+            "herdr_pane_id": "w1:p1",
+            "herdr_agent_name": "tether_0123456789abcdef",
+            "herdr_agent_session_source": "codex_notify",
+            "herdr_agent_session_kind": "thread_id",
+            "herdr_agent_session_value": "codex-session",
+            "herdr_protocol": "19",
+            "native_session_id": "codex-session",
+            "pane_agent": "codex",
+            "process_identity": "herdr-proc-v1:exact",
+        }
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HERDR_ENV": "1",
+                "HERDR_SESSION": "pilot",
+                "HERDR_SOCKET_PATH": str(self.home / "herdr.sock"),
+                "HERDR_PANE_ID": "w1:p1",
+            },
+            clear=True,
+        ), mock.patch.object(
+            self.notifier,
+            "herdr_agent_identity",
+            return_value=identity,
+        ) as capture:
+            kind, source = self.notifier.detected_source(args)
+        self.assertEqual(kind, "codex_session")
+        self.assertEqual(source["session_id"], "codex-session")
+        self.assertEqual(source["herdr_terminal_id"], "term_6583153c2a1b81")
+        self.assertNotIn("native_session_id", source)
+        capture.assert_called_once_with(
+            str(self.home / "herdr.sock"),
+            "w1:p1",
+            "pilot",
+            str(pathlib.Path.cwd()),
+        )
+
+    def test_herdr_session_mismatch_fails_closed(self):
+        args = types.SimpleNamespace(run_id=None, hermes_session_id=None)
+        identity = {
+            "herdr_terminal_id": "term_6583153c2a1b81",
+            "native_session_id": "official-session",
+            "pane_agent": "codex",
+        }
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HERDR_ENV": "1",
+                "HERDR_SESSION": "pilot",
+                "HERDR_SOCKET_PATH": str(self.home / "herdr.sock"),
+                "HERDR_PANE_ID": "w1:p1",
+                "CODEX_THREAD_ID": "different-session",
+            },
+            clear=True,
+        ), mock.patch.object(
+            self.notifier,
+            "herdr_agent_identity",
+            return_value=identity,
+        ), self.assertRaisesRegex(SystemExit, "does not match"):
+            self.notifier.detected_source(args)
 
     def test_zellij_only_source_captures_process_identity(self):
         args = types.SimpleNamespace(run_id=None, hermes_session_id=None)

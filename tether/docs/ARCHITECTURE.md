@@ -1,6 +1,6 @@
 # Tether Architecture
 
-This document describes Tether `0.2.0-beta.1`, binding protocol 2, database
+This document describes Tether `0.2.0-beta.1`, binding protocol 3, database
 schema 15, and broker protocol 5. The implementation is authoritative:
 [`runtime/bridge_runtime.py`](../runtime/bridge_runtime.py),
 [`runtime/plugin/__init__.py`](../runtime/plugin/__init__.py), and
@@ -11,6 +11,7 @@ schema 15, and broker protocol 5. The implementation is authoritative:
 Tether connects one Slack thread to one continuation endpoint:
 
 - a verified Zellij pane;
+- a verified Herdr agent;
 - a detached Codex or Claude Code session;
 - a Hermes session; or
 - an explicit headless run.
@@ -26,7 +27,7 @@ does not own agent reasoning, tool authorization, or host sandboxing.
 | Hermes plugin | Receives Slack Events API callbacks through Socket Mode, normalizes events, resolves Slack identity, persists ingress, and dispatches the selected writer. |
 | SQLite Store | Owns schema, bindings, generations, ingress leases, event queues, attempts, outboxes, reconciliation, polling cursors, and retention. |
 | Local broker | Accepts same-UID Unix-socket requests, performs Slack writes, advances reconciliation, and exposes diagnostics and operator recovery. |
-| Native runtime | Verifies working directories and processes, resumes Codex or Claude Code, and delivers to Zellij. |
+| Native runtime | Verifies working directories and processes, resumes Codex or Claude Code, and delivers to Herdr or Zellij. |
 | Installer | Stages and snapshots managed files, records plugin state, and performs crash-recoverable install, upgrade, rollback, and uninstall. |
 
 ## Runtime topology
@@ -39,7 +40,7 @@ Slack Events API through Hermes Socket Mode
        -> HERMES: original adapter -> gateway
        -> NATIVE: atomic transfer -> bridge_events
                                   -> generation-bound attempt
-                                  -> Zellij or detached CLI
+                                  -> Herdr, Zellij, or detached CLI
 
 Local CLI or continued agent
   -> owner-only Unix socket
@@ -173,7 +174,7 @@ binds the bridge, ordered event IDs, and generation.
 - A submission that may have started becomes `uncertain`.
 - The exact reply key acknowledges the attempt or stages one immutable reply.
 - `NO_REPLY` acknowledges without posting.
-- A verified Zellij cancel targets and closes the exact attempt.
+- A verified Herdr or Zellij cancel targets and closes the exact attempt.
 
 Unknown, wrong-bridge, or stale-generation reply keys cannot post or suppress a
 reply.
@@ -266,6 +267,25 @@ This narrows but cannot remove the terminal time-of-check/time-of-use window.
 The process can change between the final check and Enter, and screen state
 cannot prove semantic consumption. Any such ambiguous outcome becomes
 `uncertain`; Tether does not retry it blindly.
+
+### Herdr
+
+The captured endpoint includes a private mode-`0600` same-user Unix socket,
+protocol 19, terminal and pane IDs, an occupant-bound agent name, Herdr's
+official Codex or Claude session reference, and the foreground process
+incarnation. The native session reference must equal the Tether source session.
+
+Delivery revalidates those fields, submits one prompt through `agent.prompt`
+over NDJSON, checks the returned agent, and revalidates the endpoint afterward.
+The prompt is transported in the socket body rather than process arguments.
+The occupant-bound name disappears when the terminal's agent is replaced, so a
+replacement cannot inherit the old delivery capability.
+
+Herdr does not currently expose an expected-revision precondition or a durable
+per-prompt turn ID. Therefore a missing response, unknown server error, or
+failed post-submit verification is `uncertain` and is never retried
+automatically. An explicit `agent_not_found` response proves submission did not
+start and is safe to requeue.
 
 ### Detached native process
 
@@ -365,7 +385,7 @@ See [Operations](OPERATIONS.md).
 | Property | Tests |
 | --- | --- |
 | Binding ownership and generations | [`tests/test_bridge_lifecycle.py`](../tests/test_bridge_lifecycle.py) |
-| Attempts, ambiguity, and cancellation | [`tests/test_attempt_recovery.py`](../tests/test_attempt_recovery.py), [`tests/test_zellij_cancellation.py`](../tests/test_zellij_cancellation.py) |
+| Attempts, ambiguity, and cancellation | [`tests/test_attempt_recovery.py`](../tests/test_attempt_recovery.py), [`tests/test_herdr_endpoint.py`](../tests/test_herdr_endpoint.py), [`tests/test_zellij_cancellation.py`](../tests/test_zellij_cancellation.py) |
 | Routing and thread ownership | [`tests/test_routing.py`](../tests/test_routing.py), [`tests/test_routing_plugin.py`](../tests/test_routing_plugin.py) |
 | Outboxes and reconciliation | [`tests/test_outbox_recovery.py`](../tests/test_outbox_recovery.py), [`tests/test_outbox_process_safety.py`](../tests/test_outbox_process_safety.py), [`tests/test_generic_outbox.py`](../tests/test_generic_outbox.py), [`tests/test_slack_plugin_protocol.py`](../tests/test_slack_plugin_protocol.py) |
 | Poll cursor and rate coordination | [`tests/test_poll_state_recovery.py`](../tests/test_poll_state_recovery.py), [`tests/test_reconciliation_recovery.py`](../tests/test_reconciliation_recovery.py) |

@@ -3,13 +3,13 @@
 This contract describes the persisted routing boundary. Security, installation,
 retention, and operator recovery are documented in the README and Operations.
 
-## BindingV2
+## BindingV3
 
 Each active bridge records:
 
 - one source: Codex session, Claude Code session, verified Zellij pane, Hermes
   session, or explicit headless run;
-- one endpoint: detached native resume, verified Zellij process, or Hermes
+- one endpoint: detached native resume, verified Herdr agent, verified Zellij process, or Hermes
   continuation;
 - one Slack workspace, channel, and thread;
 - one operator policy and idempotency key; and
@@ -20,9 +20,14 @@ directory. A native session running in Zellij also records the session, pane,
 adapter, host boot ID, PID, kernel start time, TTY ancestry, and executable
 identity. A Zellij-only bridge requires equivalent process evidence.
 
+A native session running in Herdr records the private socket path, protocol,
+terminal and pane IDs, occupant-bound agent name, Herdr's official native
+session reference, and the same class of Linux process-incarnation evidence.
+The official reference must equal the Tether source session ID.
+
 A headless bridge exists only when the caller supplies `--run-id`. It continues
 as a durable Hermes conversation after the original process exits. Ambient
-agent or Zellij variables never create a headless source.
+agent, Herdr, or Zellij variables never create a headless source.
 
 Legacy or incomplete native records become `rebind_required`. Tether never
 infers missing process identity, converts a native binding to Hermes, or chooses
@@ -53,6 +58,13 @@ A rebind increments the generation and fences older work.
 For a Zellij endpoint, Tether verifies the same process immediately before and
 after submission. A pane ID, pane title, command string, or visible keypress is
 not proof that the intended agent received the turn.
+
+For a Herdr endpoint, Tether targets an occupant-bound agent name with
+`agent.prompt`, not terminal keystroke staging. It verifies the private socket,
+protocol, official native session, terminal, adapter, and process incarnation
+before submission and rechecks them afterward. Herdr does not expose a
+conditional expected-revision prompt, so a lost response or unknown server
+error remains `uncertain` and is never blindly replayed.
 
 Native work returns either one useful Slack reply or ends with a standalone
 `NO_REPLY` line. That terminal control line acknowledges the attempt without

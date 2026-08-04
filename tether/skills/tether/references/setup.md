@@ -92,6 +92,9 @@ ${XDG_CONFIG_HOME:-~/.config}/tether/config.toml
 
 Use it for `default_channel`, `default_owner`, `team_id`, `allowed_users`,
 reply style targets, retention, native resume arguments, and Zellij agent commands.
+Herdr needs no Tether configuration key; install Herdr's official Codex or
+Claude integration so its API exposes the native session reference, then run
+`tether doctor` from the Herdr session.
 Keep one Slack app/workspace identity per Tether instance and database.
 
 Resumed Codex and Claude Code processes receive a minimal environment. For

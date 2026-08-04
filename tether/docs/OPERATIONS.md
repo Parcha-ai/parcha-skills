@@ -227,7 +227,7 @@ may exceed it. The enforced transport limit is 35,000 characters.
 | Broker unavailable | Restart Hermes, then run `tether doctor`. |
 | Socket Mode disconnected | Restore Socket Mode. Polling is not a complete substitute. |
 | Native binding stale | Rebind from the intended live session. Never route to another agent as fallback. |
-| Zellij submission uncertain | Inspect that pane, then use `tether resolve`. |
+| Live terminal submission uncertain | Inspect that Herdr agent or Zellij pane, then use `tether resolve`. |
 | Slack write uncertain | Keep one broker running and allow reconciliation; do not post the same text manually. |
 | Install interrupted | Run the same lifecycle command; it recovers the transaction journal first. |
 | Upgrade causes gateway failure | Inspect automatic rollback, then use `tether rollback --restart` if needed. |

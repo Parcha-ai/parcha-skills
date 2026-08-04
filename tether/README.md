@@ -1,10 +1,10 @@
 # Tether
 
-Tether binds a Slack thread to the Codex, Claude Code, Zellij, Hermes, or
+Tether binds a Slack thread to the Codex, Claude Code, Herdr, Zellij, Hermes, or
 headless run that created it. Hermes owns the Slack credential. Local clients
 use an owner-only Unix socket and do not receive that credential.
 
-`0.2.0-beta.1` is a pre-release. It uses BindingV2 and database schema 15.
+`0.2.0-beta.1` is a pre-release. This source tree uses BindingV3 and database schema 15.
 Read [Compatibility](docs/COMPATIBILITY.md) before upgrading an existing host.
 
 ## Supported boundary
@@ -16,7 +16,7 @@ Read [Compatibility](docs/COMPATIBILITY.md) before upgrading an existing host.
 | Node.js | Maintained LTS 22 or 24 |
 | Hermes Agent | Exactly 0.19.0; tested commit `b9ba7c78e41b5d187e2c8fb446655c4b71c42aa5` |
 | Native continuation | Codex and Claude Code |
-| Terminal continuation | Zellij on Linux with `/proc` process identity |
+| Terminal continuation | Herdr protocol 19 (tested with 0.8.0), or Zellij on Linux; both require `/proc` process identity |
 | Slack ingress | Slack Events API through Hermes Socket Mode |
 | Headless publication | Explicit `--run-id`; no native-session resume |
 
@@ -236,7 +236,7 @@ tether maintenance
 | Broker unavailable | Restart Hermes, then run `tether doctor`. |
 | Socket Mode disconnected | Restore Socket Mode; do not rely on polling alone. |
 | Native binding stale | Rebind from the intended live session. |
-| Zellij delivery uncertain | Inspect that exact pane, then use `tether resolve`. |
+| Live terminal delivery uncertain | Inspect that exact Herdr agent or Zellij pane, then use `tether resolve`. |
 | Upgrade failed | Review automatic rollback; run `tether rollback --restart` if needed. |
 
 ## Development
