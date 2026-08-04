@@ -125,6 +125,9 @@ _HERMES_EGRESS_CONTEXT: contextvars.ContextVar[dict[str, Any] | None] = (
 )
 
 
+_CANCELLED_REASON = "the continuation was cancelled by the operator"
+
+
 @dataclass
 class PluginState:
     store: Any = None
@@ -145,6 +148,7 @@ class PluginState:
     last_inbound_at: float | None = None
     last_poll_at: float | None = None
     last_poll_error_at: float | None = None
+    empty_team_warned: bool = False
     thread_bot_participants: dict[
         tuple[str, str, str], tuple[float, frozenset[str]]
     ] = field(default_factory=dict)
@@ -2408,6 +2412,23 @@ async def _poll_recent_replies(adapter) -> int:
         (bridge, bridge.team_id, bridge.channel_id, str(bridge.thread_ts), None)
         for bridge in bridges
     ] + [(None, *item) for item in participating]
+    skipped_count = sum(1 for target in targets if not target[1])
+    targets = [target for target in targets if target[1]]
+    if skipped_count:
+        if not state.empty_team_warned:
+            log.warning(
+                "Tether skipped %d thread(s) without a workspace identity; "
+                "rebind or backfill team_id to restore polling",
+                skipped_count,
+            )
+            state.empty_team_warned = True
+        else:
+            log.debug(
+                "Tether skipped %d thread(s) without a workspace identity",
+                skipped_count,
+            )
+    else:
+        state.empty_team_warned = False
     target_keys = {
         (team_id, channel_id, thread_ts)
         for _bridge, team_id, channel_id, thread_ts, _since in targets
@@ -2560,7 +2581,17 @@ async def _poll_recent_replies(adapter) -> int:
         except Exception as exc:
             failures += 1
             target = bridge.bridge_id if bridge is not None else f"{channel_id}:{thread_ts}"
-            log.warning("Could not poll Tether thread %s: %s", target, type(exc).__name__)
+            detail = (
+                f": {exc}"
+                if isinstance(exc, hermes_compat.HermesCompatibilityError)
+                else ""
+            )
+            log.warning(
+                "Could not poll Tether thread %s: %s%s",
+                target,
+                type(exc).__name__,
+                detail,
+            )
             continue
         if not page.page.complete:
             store.save_reply_poll_page_state(
@@ -2678,12 +2709,17 @@ def _suppress_bridge_reaction(event, gateway):
 
 def _failure_reason(exc: Exception) -> str:
     text = str(exc).lower()
+    if "credential helper" in text:
+        return (
+            "the local credential helper is misconfigured or failed validation "
+            "(check credential_command path, ownership, mode, and symlinks)"
+        )
     if "credential" in text or "authentication" in text or "401" in text:
         return "the native session credential could not be obtained or authenticated"
     if "timed out" in text:
         return "the continuation timed out and was stopped cleanly"
     if "cancelled" in text:
-        return "the continuation was cancelled by the operator"
+        return _CANCELLED_REASON
     if "session" in text and ("no longer" in text or "not found" in text or "invalid" in text):
         return "the captured agent session is no longer resumable"
     return "the bound session could not be resumed"
@@ -2919,6 +2955,34 @@ def _recover_queued_events():
                             bridge_id,
                             reason,
                         )
+                        if reason != _CANCELLED_REASON:
+                            notice_seed = str(items[0]["event_id"])
+                            try:
+                                broker_call({
+                                    "op": "thread_reply",
+                                    "team_id": bridge.team_id,
+                                    "channel_id": bridge.channel_id,
+                                    "thread_ts": bridge.thread_ts,
+                                    "idempotency_key": (
+                                        "control:reply-failed:"
+                                        + hashlib.sha256(
+                                            notice_seed.encode()
+                                        ).hexdigest()[:24]
+                                    ),
+                                    "text": (
+                                        "_Tether could not continue the "
+                                        "bound session: "
+                                        + reason
+                                        + ". Send another reply to retry._"
+                                    ),
+                                })
+                            except Exception as notice_exc:
+                                log.error(
+                                    "Tether could not post a durable "
+                                    "control notice for %s: %s",
+                                    bridge_id,
+                                    _failure_reason(notice_exc),
+                                )
                         break
             with state.recovery_lock:
                 if state.recovery_wake_counter != observed_wake:
@@ -3010,6 +3074,25 @@ async def _drain_bridge(bridge_id, gateway, platform):
                         f"{type(exc).__name__}: {reason}",
                     )
                 log.error("Bridge reply failed for %s: %s", bridge.bridge_id, reason)
+                cancelled = (
+                    cancellation is not None and cancellation.is_set()
+                )
+                if not cancelled and reason != _CANCELLED_REASON:
+                    notice_seed = attempt_id or str(items[0]["event_id"])
+                    asyncio.get_running_loop().create_task(
+                        _post_control_notice(
+                            bridge,
+                            idempotency_key=(
+                                "control:reply-failed:"
+                                + hashlib.sha256(notice_seed.encode()).hexdigest()[:24]
+                            ),
+                            text=(
+                                "_Tether could not continue the bound session: "
+                                + reason
+                                + ". Send another reply to retry._"
+                            ),
+                        )
+                    )
                 return
             finally:
                 state.active_cancellations.pop(bridge_id, None)
