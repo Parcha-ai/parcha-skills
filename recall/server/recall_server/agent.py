@@ -115,6 +115,58 @@ class AgentRunner(Protocol):
     ) -> dict[str, Any]: ...
 
 
+def _project_hint_candidate(
+    item: dict[str, Any],
+    *,
+    alias: str,
+) -> dict[str, Any]:
+    """Expose bounded routing hints without making them look citable."""
+
+    ranges = []
+    for matching_range in item.get("matching_ranges", [])[:2]:
+        if not isinstance(matching_range, dict):
+            continue
+        spans = [
+            {
+                key: span[key]
+                for key in ("record_ordinal", "record_count")
+                if isinstance(span.get(key), int)
+                and not isinstance(span.get(key), bool)
+            }
+            for span in matching_range.get("spans", [])[:4]
+            if isinstance(span, dict)
+        ]
+        ranges.append({
+            key: value
+            for key, value in {
+                "kind": matching_range.get("kind"),
+                "score": matching_range.get("score"),
+                "passage_ordinal": matching_range.get("passage_ordinal"),
+                "spans": spans,
+                "text": (
+                    matching_range.get("text", "")[:800]
+                    if isinstance(matching_range.get("text"), str)
+                    else ""
+                ),
+            }.items()
+            if value not in (None, "", [])
+        })
+    return {
+        key: value
+        for key, value in {
+            "source_id": item.get("source_id"),
+            "alias": alias,
+            "revision": item.get("revision"),
+            "first_occurred_at": item.get("first_occurred_at"),
+            "last_occurred_at": item.get("last_occurred_at"),
+            "rank": item.get("rank"),
+            "reasons": item.get("reasons"),
+            "matching_ranges": ranges,
+        }.items()
+        if value not in (None, "", [])
+    }
+
+
 class ConstrainedAgentTools:
     """Small host-owned tool boundary over one tenant-bound retrieval view.
 
@@ -306,16 +358,12 @@ class ConstrainedAgentTools:
                         if document_id in admitted
                     }
                 result = {
-                    **result,
+                    "evidence": False,
                     "results": [
-                        {
-                            **{
-                                key: value
-                                for key, value in item.items()
-                                if key != "logical_document_id"
-                            },
-                            "alias": self._aliases_by_document[document_id],
-                        }
+                        _project_hint_candidate(
+                            item,
+                            alias=self._aliases_by_document[document_id],
+                        )
                         for item in results
                         if isinstance(item, dict)
                         and isinstance(
@@ -324,6 +372,11 @@ class ConstrainedAgentTools:
                         )
                         and document_id in self._aliases_by_document
                     ],
+                    "diagnostics": (
+                        result.get("diagnostics", {})
+                        if isinstance(result.get("diagnostics", {}), dict)
+                        else {}
+                    ),
                 }
             elif name == "recall.find":
                 aliases = arguments.get("aliases")

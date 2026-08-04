@@ -826,12 +826,6 @@ def _agent_hint_packet(value: dict[str, Any]) -> dict[str, Any]:
                     "score": match.get("score"),
                     "passage_ordinal": match.get("passage_ordinal"),
                     "spans": spans,
-                    "routing_receipts": [
-                        receipt
-                        for receipt in match.get("receipts", [])[:8]
-                        if isinstance(receipt, str)
-                        and receipt.startswith("recall://")
-                    ],
                     "text": (
                         match.get("text", "")[:800]
                         if isinstance(match.get("text"), str)
@@ -1270,14 +1264,27 @@ class PiRunner:
                     )
                 except AgentExecutionError as error:
                     if error.code == "agent_citation_not_opened":
+                        valid_cited = getattr(
+                            error,
+                            "valid_cited_receipts",
+                            (),
+                        )
+                        invalid = getattr(error, "invalid_receipts", ())
                         error.model_guidance = (
-                            "Use only this exact opened receipt allowlist in claims: "
+                            "Delete every claim backed only by an invalid receipt. "
+                            "Use only these exact already-valid cited receipts in "
+                            "the remaining claims: "
                             + json.dumps(
-                                list(tools.citable_receipts)[:32],
+                                list(valid_cited)[:32],
                                 separators=(",", ":"),
                             )
-                                + ". Remove every other claim receipt, "
-                                "then submit finish once."
+                            + ". These receipts were invalid and must not appear: "
+                            + json.dumps(
+                                list(invalid)[:32],
+                                separators=(",", ":"),
+                            )
+                            + ". Do not shorten, reconstruct, or invent receipts; "
+                            "then submit finish once."
                         )
                     raise
                 sealed = True
@@ -1676,10 +1683,23 @@ class PiRunner:
             not set(citations) <= opened
             or any(urlsplit(item).netloc not in granted for item in citations)
         ):
-            raise AgentExecutionError(
+            error = AgentExecutionError(
                 "agent cited evidence it did not open",
                 code="agent_citation_not_opened",
             )
+            error.valid_cited_receipts = tuple(
+                receipt
+                for receipt in citations
+                if receipt in opened
+                and urlsplit(receipt).netloc in granted
+            )
+            error.invalid_receipts = tuple(
+                receipt
+                for receipt in citations
+                if receipt not in opened
+                or urlsplit(receipt).netloc not in granted
+            )
+            raise error
         if status in {"complete", "partial"} and (
             not answer or not claims or not citations
         ):

@@ -406,6 +406,38 @@ class AgentFacadeUnitTest(unittest.TestCase):
             {document_id: "d1"},
         )
 
+    def test_hints_expose_only_bounded_non_citable_routing_fields(self) -> None:
+        class VerboseHints(FakeBoundRetrieval):
+            def passage_hints(self, needs, *, filters, limit):
+                result = super().passage_hints(
+                    needs,
+                    filters=filters,
+                    limit=limit,
+                )
+                result["arms"] = {"dense": result["results"] * 100}
+                result["results"][0]["manifest_object_key"] = "private/object"
+                result["results"][0]["matching_ranges"][0]["text"] = (
+                    "x" * 2_000
+                )
+                return result
+
+        tools = ConstrainedAgentTools(
+            VerboseHints(),
+            DelegationContext.from_principal(principal()),
+        )
+        result = tools.call("recall.hints", hint_arguments())
+        rendered = json.dumps(result)
+        self.assertFalse(result["evidence"])
+        self.assertEqual(result["results"][0]["alias"], "d1")
+        self.assertEqual(
+            len(result["results"][0]["matching_ranges"][0]["text"]),
+            800,
+        )
+        self.assertNotIn("arms", result)
+        self.assertNotIn("logical_document_id", rendered)
+        self.assertNotIn("manifest_object_key", rendered)
+        self.assertNotIn(RECEIPT, rendered)
+
     def test_open_can_address_any_hinted_record_ordinal(self) -> None:
         retrieval = FakeBoundRetrieval()
         tools = ConstrainedAgentTools(

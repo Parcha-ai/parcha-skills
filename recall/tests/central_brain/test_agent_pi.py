@@ -530,12 +530,11 @@ class SimpleAgentKernelTest(unittest.TestCase):
             seed_packet["results"][0]["matching_ranges"][0]["spans"],
             [{"record_ordinal": 80, "record_count": 4}],
         )
-        self.assertEqual(
-            seed_packet["results"][0]["matching_ranges"][0][
-                "routing_receipts"
-            ],
-            [HINT],
+        self.assertNotIn(
+            "routing_receipts",
+            seed_packet["results"][0]["matching_ranges"][0],
         )
+        self.assertNotIn(HINT, json.dumps(seed_packet))
         self.assertNotIn(
             "manifest_object_key",
             json.dumps(seed_packet),
@@ -641,6 +640,83 @@ class SimpleAgentKernelTest(unittest.TestCase):
                 SyntheticRetrieval(),
             )
         self.assertEqual(caught.exception.code, "agent_citation_not_opened")
+
+    def test_invalid_finish_recovery_names_only_cited_receipts(self):
+        opened = [
+            f"recall://{SOURCE}/opened-{index}?rev=1#item=0"
+            for index in range(40)
+        ]
+        valid = opened[-1]
+        invalid = f"recall://{SOURCE}/not-opened?rev=1#item=0"
+
+        class ManyReceiptRetrieval(SyntheticRetrieval):
+            def execute_agent_program(self, *args, **kwargs):
+                self.calls.append("recall_exec")
+                return {
+                    "provider": "synthetic-archil",
+                    "stdout": "synthetic evidence",
+                    "stderr": "",
+                    "exit_code": 0,
+                    "complete": True,
+                    "stopped_reason": "completed",
+                    "opened_receipts": opened,
+                    "timing": None,
+                }
+
+        class RecoveringTransport:
+            guidance = ""
+
+            def run(self, start, invoke, *, timeout_seconds):
+                invoke("exec", success_script()[1][1])
+                bad_finish = {
+                    "status": "complete",
+                    "answer": "One supported and one unsupported claim.",
+                    "claims": [
+                        {"statement": "Supported.", "receipts": [valid]},
+                        {"statement": "Unsupported.", "receipts": [invalid]},
+                    ],
+                    "gaps": [],
+                }
+                try:
+                    invoke("finish", bad_finish)
+                except AgentExecutionError as error:
+                    self.guidance = error.model_guidance
+                else:
+                    raise AssertionError("invalid finish unexpectedly passed")
+                invoke(
+                    "finish",
+                    {
+                        "status": "complete",
+                        "answer": "Supported.",
+                        "claims": [
+                            {"statement": "Supported.", "receipts": [valid]},
+                        ],
+                        "gaps": [],
+                    },
+                )
+                return {
+                    "terminal": {
+                        "status": "complete",
+                        "model_attestation": {
+                            "model_alias": "gemma-4-31b",
+                            "route_kind": "private_broker",
+                            "provider": "broker",
+                            "route_identity": "10.23.45.67",
+                        },
+                    },
+                    "usage": {},
+                }
+
+        transport = RecoveringTransport()
+        result = service(transport).use_recall(
+            principal(),
+            REQUEST,
+            ManyReceiptRetrieval(),
+        )
+        self.assertEqual(result["result"]["citations"], [valid])
+        self.assertIn(valid, transport.guidance)
+        self.assertIn(invalid, transport.guidance)
+        self.assertNotIn(opened[0], transport.guidance)
 
     def test_provider_failure_is_content_free(self):
         with self.assertRaises(AgentExecutionError) as caught:
