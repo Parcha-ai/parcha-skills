@@ -426,6 +426,23 @@ roles, source grants, and revocation. The access token must have the exact
 `RECALL_MCP_RESOURCE_URI` audience, a `read` scope, and a provider-verified email
 for first-time invitation acceptance.
 
+To turn Descope's standard MCP consent flow into the branded Recall experience,
+name the flow `recall-mcp-user-consent` and run the setup-only operator script:
+
+```bash
+RECALL_DESCOPE_PROJECT_ID=P_replace_me \
+RECALL_DESCOPE_MGMT_KEY='<setup-only management key>' \
+node server/scripts/configure_descope_brand.js
+```
+
+The script discovers the welcome, OTP, verified-consent, and unverified-consent
+screens by their component contracts rather than project-specific screen IDs. It
+preserves every flow interaction, applies the Recall palette and copy, and updates
+inbound apps already assigned to that flow to use the managed dark host. It uses
+only Node's built-in APIs and is safe to rerun. The management key is not an
+application runtime dependency; remove it from the operator environment after
+setup unless invitation email delivery below also uses Descope.
+
 For the OAuth-first browser experience, create one confidential Descope Inbound
 App with the callback below and the `openid email recall.identity` scopes. The
 app-local `recall.identity` permission has no role mapping and authorizes only
