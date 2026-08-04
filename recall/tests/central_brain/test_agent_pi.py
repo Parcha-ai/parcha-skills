@@ -203,6 +203,25 @@ class ScriptedTransport:
         }
 
 
+class TerminalFailureTransport:
+    def __init__(self, reason_code, script=()):
+        self.reason_code = reason_code
+        self.script = list(script)
+
+    def run(self, start, invoke, *, timeout_seconds):
+        for name, arguments in self.script:
+            invoke(name, arguments)
+        error = AgentExecutionError(
+            "Pi turn did not complete",
+            code="agent_model_failed",
+        )
+        error.terminal_reason_code = self.reason_code
+        error.terminal_reason_message = (
+            "synthetic-secret-provider-message-must-not-escape"
+        )
+        raise error
+
+
 
 def success_script():
     filters = {
@@ -274,6 +293,43 @@ def service(transport) -> RecallAgentService:
 
 
 class SimpleAgentKernelTest(unittest.TestCase):
+    def test_terminal_failure_codes_and_partial_trace_are_content_free(self):
+        open_arguments = {
+            "alias": "d1",
+            "cursor": None,
+            "record_ordinal": 80,
+            "page_bytes": 32768,
+        }
+        expected = {
+            "pi_model_failed": "agent_model_provider_failed",
+            "pi_model_aborted": "agent_model_cancelled",
+            "pi_finish_missing": "agent_finish_missing",
+            "pi_agent_failed": "agent_model_failed",
+        }
+        for reason_code, error_code in expected.items():
+            with self.subTest(reason_code=reason_code):
+                with self.assertRaises(AgentExecutionError) as caught:
+                    RecallAgentService(
+                        PiRunner(TerminalFailureTransport(
+                            reason_code,
+                            [("open", open_arguments)],
+                        )),
+                    ).use_recall(principal(), REQUEST, SyntheticRetrieval())
+                error = caught.exception
+                self.assertEqual(error.code, error_code)
+                self.assertGreaterEqual(len(error.trace), 4)
+                self.assertEqual(error.trace[-1]["error_code"], error_code)
+                self.assertTrue(all(not event["receipts"] for event in error.trace))
+                rendered = json.dumps(error.trace)
+                self.assertNotIn("synthetic-secret-provider-message", rendered)
+                self.assertNotIn(DECISION, rendered)
+
+        with self.assertRaises(AgentExecutionError) as unknown:
+            RecallAgentService(
+                PiRunner(TerminalFailureTransport("private_provider_detail")),
+            ).use_recall(principal(), REQUEST, SyntheticRetrieval())
+        self.assertEqual(unknown.exception.code, "agent_model_failed")
+
     def test_blank_optional_hint_filters_are_normalized_to_absent(self):
         self.assertEqual(
             PiRunner._authorize_hint_arguments(

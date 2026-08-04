@@ -1384,11 +1384,37 @@ class PiRunner:
                 },
             },
         }
-        self.transport.run(
-            start,
-            invoke,
-            timeout_seconds=remaining_seconds,
-        )
+        try:
+            self.transport.run(
+                start,
+                invoke,
+                timeout_seconds=remaining_seconds,
+            )
+        except AgentExecutionError as error:
+            reason_code = getattr(error, "terminal_reason_code", None)
+            mapped_code = {
+                "pi_model_failed": "agent_model_provider_failed",
+                "pi_model_aborted": "agent_model_cancelled",
+                "pi_finish_missing": "agent_finish_missing",
+                "pi_agent_failed": "agent_model_failed",
+            }.get(reason_code, error.code)
+            error.code = mapped_code
+            completed = clock()
+            error.trace = self._trace(
+                trace_id,
+                run_id,
+                now=completed,
+                elapsed_ms=round(
+                    max(0.0, monotonic() - started) * 1000,
+                    3,
+                ),
+                observations=tools.observations,
+                citations=[],
+                status="failed",
+                include_receipts=False,
+                error_code=mapped_code,
+            )
+            raise
         if fatal_violation is not None:
             raise fatal_violation
         if finished is None:
@@ -1656,6 +1682,8 @@ class PiRunner:
         observations: tuple[dict[str, Any], ...],
         citations: list[str],
         status: str,
+        include_receipts: bool = True,
+        error_code: str | None = None,
     ) -> list[dict[str, Any]]:
         events: list[tuple[str, str, list[str], int, int, str, float]] = [
             ("authorize", "recall.authorization", [], 0, 0, "ok", 0.0),
@@ -1705,8 +1733,12 @@ class PiRunner:
             outcome,
             event_elapsed_ms,
         ) in enumerate(events):
-            bounded = list(dict.fromkeys(receipts))[:256]
-            trace.append({
+            bounded = (
+                list(dict.fromkeys(receipts))[:256]
+                if include_receipts
+                else []
+            )
+            event = {
                 "contract": "recall.agent-trace-event.v1",
                 "schema_version": 1,
                 "trace_id": trace_id,
@@ -1721,7 +1753,10 @@ class PiRunner:
                 "source_count": sources,
                 "session_count": sessions,
                 "tool": tool,
-            })
+            }
+            if error_code is not None and stage == "complete":
+                event["error_code"] = error_code
+            trace.append(event)
         return trace
 
 

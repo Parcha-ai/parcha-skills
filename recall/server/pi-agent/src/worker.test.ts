@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { createServer } from "node:http";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import type { Api, Model } from "@earendil-works/pi-ai";
@@ -80,6 +81,68 @@ test("normalizes an impossible model mismatch into a Pi error stream", async () 
     assert.equal(events[0].error.stopReason, "error");
     assert.match(events[0].error.errorMessage || "", /unsupported model API/);
   }
+});
+
+async function providerRetryCase(firstStatus: number): Promise<number> {
+  let calls = 0;
+  const server = createServer((_request, response) => {
+    calls += 1;
+    if (calls === 1) {
+      response.writeHead(firstStatus, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: { message: "synthetic provider failure" } }));
+      return;
+    }
+    const chunks = [
+      {
+        id: "chatcmpl-retry",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "gemma-4-31b",
+        choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: null }],
+      },
+      {
+        id: "chatcmpl-retry",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "gemma-4-31b",
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      },
+    ];
+    const body = chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("") + "data: [DONE]\n\n";
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(body);
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  try {
+    const model = openAiCompatibleModel(
+      "gemma-4-31b",
+      `http://127.0.0.1:${address.port}/v1`,
+      true,
+    );
+    const events = [];
+    const stream = await streamOpenAiCompletions(model, {
+      systemPrompt: "test",
+      messages: [{ role: "user", content: "test", timestamp: Date.now() }],
+      tools: [],
+    }, { apiKey: "synthetic-key" });
+    for await (const event of stream) events.push(event);
+    assert.ok(events.length > 0);
+  } finally {
+    server.close();
+    await once(server, "close");
+  }
+  return calls;
+}
+
+test("retries one fresh request for a retryable provider failure", async () => {
+  assert.equal(await providerRetryCase(503), 2);
+});
+
+test("does not retry a non-retryable provider failure", async () => {
+  assert.equal(await providerRetryCase(400), 1);
 });
 
 test("fails closed when the host closes stdin before a terminal", async () => {

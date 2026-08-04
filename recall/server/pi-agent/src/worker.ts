@@ -41,7 +41,14 @@ export const streamOpenAiCompletions: StreamFn = (model, context, options) => {
   if (model.api !== "openai-completions") {
     return failedModelStream(model, "Recall Pi received an unsupported model API");
   }
-  return streamSimple(model as Model<"openai-completions">, context, options);
+  return streamSimple(model as Model<"openai-completions">, context, {
+    ...options,
+    // One SDK-level retry is safe here: this wraps a single model request,
+    // before any new tool effect can occur. The host process deadline still
+    // bounds the complete turn, including backoff and the fresh request.
+    maxRetries: 1,
+    maxRetryDelayMs: Math.min(options?.maxRetryDelayMs ?? 2_000, 2_000),
+  });
 };
 
 export function executionModeForTool(name: string): "parallel" | "sequential" {
@@ -282,6 +289,12 @@ class Worker {
       ),
     });
     this.agent = agent;
+    let failureCode = "pi_agent_failed";
+    agent.subscribe((event) => {
+      if (event.type !== "message_end" || event.message.role !== "assistant") return;
+      if (event.message.stopReason === "error") failureCode = "pi_model_failed";
+      if (event.message.stopReason === "aborted") failureCode = "pi_model_aborted";
+    });
     agent.state.systemPrompt = systemPrompt(start);
     agent.state.model = openAiCompatibleModel(
       start.model.alias,
@@ -302,7 +315,10 @@ class Worker {
     try {
       await agent.prompt(promptText(start));
       await agent.waitForIdle();
-      if (!this.finished) throw new Error("agent ended without a grounded finish");
+      if (!this.finished) {
+        if (failureCode === "pi_agent_failed") failureCode = "pi_finish_missing";
+        throw new Error("agent ended without a grounded finish");
+      }
       if (this.pending.size !== 0) throw new Error("agent ended with unresolved tool calls");
       this.terminal = true;
       this.send("terminal.complete", {
@@ -323,7 +339,7 @@ class Worker {
         status: "failed",
         unresolved_call_ids: [],
         reason: {
-          code: "pi_agent_failed",
+          code: failureCode,
           message: error instanceof Error ? error.message.slice(0, 2_000) : "Pi agent failed",
         },
       });
