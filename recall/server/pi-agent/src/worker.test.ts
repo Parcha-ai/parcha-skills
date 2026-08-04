@@ -9,6 +9,7 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import { openAiCompatibleModel } from "./model.js";
 import {
   executionModeForTool,
+  failureCodeForStopReason,
   streamOpenAiCompletions,
   validateStart,
 } from "./worker.js";
@@ -54,6 +55,13 @@ test("serializes grounded finish while allowing retrieval concurrency", () => {
   assert.equal(executionModeForTool("search"), "parallel");
   assert.equal(executionModeForTool("open"), "parallel");
   assert.equal(executionModeForTool("finish"), "sequential");
+});
+
+test("classifies model termination from typed stop reasons only", () => {
+  assert.equal(failureCodeForStopReason("error"), "pi_model_failed");
+  assert.equal(failureCodeForStopReason("aborted"), "pi_model_aborted");
+  assert.equal(failureCodeForStopReason("stop"), undefined);
+  assert.equal(failureCodeForStopReason("provider said timeout in prose"), undefined);
 });
 
 test("normalizes an impossible model mismatch into a Pi error stream", async () => {

@@ -55,6 +55,12 @@ export function executionModeForTool(name: string): "parallel" | "sequential" {
   return name === "finish" ? "sequential" : "parallel";
 }
 
+export function failureCodeForStopReason(stopReason: string): string | undefined {
+  if (stopReason === "error") return "pi_model_failed";
+  if (stopReason === "aborted") return "pi_model_aborted";
+  return undefined;
+}
+
 type JsonObject = Record<string, unknown>;
 type InputFrame = {
   v: typeof PROTOCOL;
@@ -292,8 +298,7 @@ class Worker {
     let failureCode = "pi_agent_failed";
     agent.subscribe((event) => {
       if (event.type !== "message_end" || event.message.role !== "assistant") return;
-      if (event.message.stopReason === "error") failureCode = "pi_model_failed";
-      if (event.message.stopReason === "aborted") failureCode = "pi_model_aborted";
+      failureCode = failureCodeForStopReason(event.message.stopReason) ?? failureCode;
     });
     agent.state.systemPrompt = systemPrompt(start);
     agent.state.model = openAiCompatibleModel(

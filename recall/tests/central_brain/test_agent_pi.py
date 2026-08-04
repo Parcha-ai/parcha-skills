@@ -901,6 +901,26 @@ print(json.dumps({{"v":"{PROTOCOL}","turn_id":start["turn_id"],"seq":0,"type":"t
             )
         self.assertEqual(caught.exception.code, "agent_transport_frame_invalid")
 
+        timeout = SubprocessPiTransport(
+            (sys.executable, "-c", "import time; time.sleep(2)"),
+            model_base_url="https://api.cerebras.ai/v1",
+            route_kind="direct_provider",
+            provider="openai-compatible",
+            provider_key=ProviderKey(value="synthetic-provider-key-value"),
+            expected_route_identity="api.cerebras.ai",
+            environment={"PATH": os.environ["PATH"]},
+        )
+        with self.assertRaises(AgentExecutionError) as timed_out:
+            timeout.run(
+                {
+                    "turn_id": "turn_timeout",
+                    "data": {"model": {"alias": "gemma-4-31b"}},
+                },
+                lambda *_args: {},
+                timeout_seconds=0.05,
+            )
+        self.assertEqual(timed_out.exception.code, "agent_model_timeout")
+
     def test_configuration_has_one_pi_runner_and_private_secret_file(self):
         with tempfile.TemporaryDirectory() as directory:
             key_path = Path(directory) / "model.key"
