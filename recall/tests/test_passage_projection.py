@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import inspect
+import threading
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -928,6 +930,101 @@ class PassageProjectionTests(unittest.TestCase):
             results[0]["reasons"],
             ["dense", "passage-lexical"],
         )
+
+    def test_bundle_search_is_concurrent_and_order_equivalent(self) -> None:
+        def candidate(document: int, kind: str) -> dict:
+            return {
+                "source_id": "source:test",
+                "logical_document_id": f"ldoc_{document:032x}",
+                "revision": 1,
+                "native_parent_id": f"session:{document}",
+                "first_occurred_at": "2026-07-27T00:00:00Z",
+                "last_occurred_at": "2026-07-27T00:10:00Z",
+                "manifest_object_key": "objects/01/" + "a" * 64,
+                "manifest_content_sha256": "b" * 64,
+                "rank": 0.9,
+                "reasons": [kind],
+                "matching_ranges": [{
+                    "kind": kind,
+                    "score": 0.9,
+                    "text": f"candidate {document}",
+                    "text_clipped": False,
+                    "receipts": [],
+                }],
+            }
+
+        responses = {
+            f"query-{index}": {
+                "results": [
+                    candidate(99, "dense"),
+                    candidate(index, "dense"),
+                ],
+                "arms": {
+                    "dense": [candidate(index, "dense")],
+                    "passage-lexical": [
+                        candidate(index + 10, "passage-lexical")
+                    ],
+                    "sparse-exact": [
+                        candidate(index + 20, "sparse-exact")
+                    ],
+                },
+                "diagnostics": {
+                    "dense_status": "ok",
+                    "passage_lexical_status": "ok",
+                    "sparse_status": "ok",
+                },
+            }
+            for index in range(4)
+        }
+        active = maximum = 0
+        lock = threading.Lock()
+
+        def delayed_search(query, **_kwargs):
+            nonlocal active, maximum
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+            time.sleep(0.15)
+            with lock:
+                active -= 1
+            return responses[query]
+
+        retrieval = object.__new__(PassageHintRetrieval)
+        with mock.patch.object(retrieval, "search", side_effect=delayed_search):
+            started = time.monotonic()
+            actual = retrieval.search_bundle(
+                tuple(responses),
+                lexical_queries=tuple(f"lexical-{index}" for index in range(4)),
+                since=None,
+                until=None,
+                limit=20,
+            )
+            elapsed = time.monotonic() - started
+
+        expected = {
+            "results": fuse_document_rankings(
+                tuple(response["results"] for response in responses.values()),
+                limit=20,
+            ),
+            "arms": {
+                arm: fuse_document_rankings(
+                    tuple(response["arms"][arm] for response in responses.values()),
+                    limit=20,
+                )
+                for arm in ("dense", "passage-lexical", "sparse-exact")
+            },
+            "diagnostics": {
+                "engine": "lossless-passages-v1-bundle",
+                "query_count": 4,
+                "dense_status": "ok",
+                "passage_lexical_status": "ok",
+                "sparse_status": "ok",
+            },
+        }
+        self.assertEqual(actual, expected)
+        self.assertEqual(maximum, 4)
+        sequential_seconds = 4 * 0.15
+        self.assertLess(elapsed, sequential_seconds * 0.55)
 
     def test_rejects_hidden_roles_and_invalid_policy(self) -> None:
         hidden = PassageMessage(

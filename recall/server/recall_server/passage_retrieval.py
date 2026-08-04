@@ -5,12 +5,16 @@ from __future__ import annotations
 import json
 import time
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from psycopg import sql
 
 from .db import SearchDeadlineExceeded, bounded_search_text
 from .passage_representations import FINGERPRINT_RE, VECTOR_COLUMNS
+
+
+MAX_BUNDLE_SEARCH_WORKERS = 4
 
 
 def collapse_document_candidates(
@@ -492,8 +496,9 @@ class PassageHintRetrieval:
             or not 1 <= limit <= 100
         ):
             raise ValueError("invalid candidate query bundle")
-        responses = [
-            self.search(
+        def search(pair: tuple[str, str]) -> dict[str, Any]:
+            query, lexical_query = pair
+            return self.search(
                 query,
                 lexical_query=lexical_query,
                 since=since,
@@ -501,12 +506,13 @@ class PassageHintRetrieval:
                 limit=limit,
                 include_arms=True,
             )
-            for query, lexical_query in zip(
-                queries,
-                lexical_queries,
-                strict=True,
-            )
-        ]
+
+        pairs = tuple(zip(queries, lexical_queries, strict=True))
+        with ThreadPoolExecutor(
+            max_workers=min(MAX_BUNDLE_SEARCH_WORKERS, len(pairs)),
+            thread_name_prefix="recall-passage-query",
+        ) as executor:
+            responses = list(executor.map(search, pairs))
         arm_names = ("dense", "passage-lexical", "sparse-exact")
 
         def status(name: str) -> str:
