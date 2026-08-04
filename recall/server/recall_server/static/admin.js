@@ -301,6 +301,17 @@ $("#invitation-list").addEventListener("click", async (event) => {
   }
 });
 
+async function loadAuthMethods() {
+  try {
+    const methods = await api("/admin/api/v1/auth-methods");
+    $("#oauth-login").hidden = !methods.oauth;
+    $("#oauth-copy").hidden = !methods.oauth;
+    $("#legacy-login").open = !methods.oauth;
+  } catch (_error) {
+    $("#legacy-login").open = true;
+  }
+}
+
 async function load() {
   try {
     state.data = await api("/admin/api/v1/state");
@@ -313,6 +324,7 @@ async function load() {
 
 $("#auth-form").addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (!$("#admin-token").value) return;
   $("#auth-error").textContent = "";
   try {
     await api("/admin/api/v1/session", {
@@ -405,4 +417,4 @@ $("#google-auth-provider").addEventListener("change", () => {
 
 const oauth = new URLSearchParams(window.location.search).get("oauth");
 if (oauth === "connected") history.replaceState({}, "", "/admin");
-load();
+loadAuthMethods().then(load);

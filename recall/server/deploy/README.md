@@ -64,7 +64,7 @@ infrastructure. The example is synthetic; a live manifest belongs in a private m
 location and contains references, never credential values.
 
 The production database gate requires a standard PostgreSQL URL with
-`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 43,
+`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 44,
 pgvector 0.8.0 or newer, and a runtime role without superuser, database/role creation,
 replication, or RLS-bypass privilege:
 
@@ -426,6 +426,25 @@ roles, source grants, and revocation. The access token must have the exact
 `RECALL_MCP_RESOURCE_URI` audience, a `read` scope, and a provider-verified email
 for first-time invitation acceptance.
 
+For the OAuth-first browser experience, create one confidential Descope Inbound
+App with the callback below and the `openid email recall.identity` scopes. The
+app-local `recall.identity` permission has no role mapping and authorizes only
+identity confirmation; Recall remains the authorization system for brains:
+
+```text
+RECALL_IDENTITY_OAUTH_CLIENT_ID=<confidential Inbound App client ID>
+RECALL_IDENTITY_OAUTH_CLIENT_SECRET=<server-side Inbound App secret>
+RECALL_IDENTITY_OAUTH_REDIRECT_URI=https://<public-host>/admin/oauth/callback/identity
+RECALL_BOOTSTRAP_OWNER_EMAILS=owner@example.com
+```
+
+PKCE and one-use, ten-minute state are enforced even for the confidential app.
+Recall calls UserInfo, requires a verified email, discards the provider tokens,
+and creates only a 12-hour Recall browser session. On a fresh installation the
+allow-listed email may bind the single unclaimed owner principal once. Afterwards
+the durable Descope subject—not email—is authoritative. If multiple owner
+principals exist or another identity is already bound, claiming fails closed.
+
 In `/admin`, create a company invitation. By default Recall displays the
 brain-specific MCP URL for manual sharing. To send an onboarding email with a
 brain-specific setup page, enable one server-side delivery provider:
@@ -445,10 +464,10 @@ RECALL_INVITATION_EMAIL_API_KEY=<server-side API key>
 Configuration is explicit and all-or-none. Recall never renders or logs either
 secret. A delivery failure leaves the email-bound authorization pending and is
 shown in the admin UI; re-inviting the same address safely replaces the pending
-invitation and retries delivery. The setup page contains current Codex and
-Claude Code install, MCP registration, and OAuth login commands. Their MCP
-client discovers OAuth through RFC 9728, logs them in, and activates the
-pending invitation on the first request. See
+invitation and retries delivery. With browser identity enabled, the setup page
+first accepts the exact invitation through Descope and only then reveals the
+current Codex and Claude Code setup blocks. Without it, the MCP client discovers
+OAuth through RFC 9728 and activates the pending invitation on its first request. See
 [`docs/authorization-v1.md`](../../docs/authorization-v1.md) for the policy,
 generic OIDC contract, and revocation semantics.
 

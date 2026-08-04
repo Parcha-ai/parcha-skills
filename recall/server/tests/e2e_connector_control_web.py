@@ -26,6 +26,7 @@ from recall_server.control import (
     SecretBox,
 )
 from recall_server.db import BrainStore
+from recall_server.identity_oauth import BrowserIdentity
 
 
 OWNER = "principal:owner:e2e-control"
@@ -144,6 +145,28 @@ class FakeInvitationEmailSender:
         self.messages.append(invitation)
 
 
+class FakeIdentityOAuth:
+    provider_id = "descope"
+    canonical_issuer = "https://identity.synthetic.invalid/canonical"
+
+    def __init__(self):
+        self.starts = []
+        self.identity = BrowserIdentity(
+            "synthetic-owner-subject", "owner@example.com", True
+        )
+
+    def authorization_url(self, *, state, code_challenge):
+        self.starts.append((state, code_challenge))
+        return "https://identity.synthetic.invalid/authorize?" + urlencode(
+            {"state": state, "code_challenge": code_challenge}
+        )
+
+    def exchange(self, *, code, code_verifier):
+        assert code == "synthetic-authorization-code"
+        assert 43 <= len(code_verifier) <= 128
+        return self.identity
+
+
 def request(server, method, path, *, body=None, cookie=None, csrf=None):
     payload = None if body is None else json.dumps(body).encode()
     headers = {"Accept": "application/json"}
@@ -189,7 +212,7 @@ def main():
     store = BrainStore(os.environ["RECALL_DATABASE_URL"])
     store.migrate()
     tables = (
-        "authorization_audit_events,brain_invitations,external_identity_bindings,"
+        "identity_oauth_states,authorization_audit_events,brain_invitations,external_identity_bindings,"
         "control_audit_events,connector_installations,provider_connections,"
         "oauth_sessions,admin_sessions,admin_credentials,"
         "canonical_source_grants,brain_access_grants,brain_memberships,"
@@ -482,6 +505,159 @@ def main():
             csrf=admin_csrf,
         )
         assert status == 200 and revoked["status"] == "revoked"
+
+        identity = FakeIdentityOAuth()
+        control.identity_provider = identity
+        control.bootstrap_owner_emails = frozenset({"owner@example.com"})
+        status, _, methods = request(
+            server, "GET", "/admin/api/v1/auth-methods"
+        )
+        assert status == 200 and methods == {"legacy_key": True, "oauth": True}
+        status, headers, body = request(server, "GET", "/admin/login")
+        assert status == 303 and body == b""
+        assert dict(headers)["Location"].startswith(
+            "https://identity.synthetic.invalid/authorize?"
+        )
+        owner_state, owner_challenge = identity.starts[-1]
+        assert len(owner_challenge) == 43
+        status, headers, _ = request(
+            server,
+            "GET",
+            "/admin/oauth/callback/identity?"
+            + urlencode(
+                {
+                    "state": owner_state,
+                    "code": "synthetic-authorization-code",
+                }
+            ),
+        )
+        assert status == 303 and dict(headers)["Location"] == "/admin"
+        oauth_owner_session = cookie_value(headers, "recall_admin_session")
+        oauth_owner_csrf = cookie_value(headers, "recall_admin_csrf")
+        oauth_owner_cookie = oauth_owner_session + "; " + oauth_owner_csrf
+        status, _, oauth_owner_state = request(
+            server,
+            "GET",
+            "/admin/api/v1/state",
+            cookie=oauth_owner_cookie,
+        )
+        assert status == 200 and len(oauth_owner_state["brains"]) == 2
+        status, _, replay = request(
+            server,
+            "GET",
+            "/admin/oauth/callback/identity?"
+            + urlencode(
+                {
+                    "state": owner_state,
+                    "code": "synthetic-authorization-code",
+                }
+            ),
+        )
+        assert status == 400 and replay["error"] == "identity_oauth_callback_invalid"
+
+        status, _, oauth_invitation = request(
+            server,
+            "POST",
+            "/admin/api/v1/invitations",
+            body={
+                "tenant_id": COMPANY,
+                "email": "oauth-member@example.com",
+                "role": "member",
+            },
+            cookie=oauth_owner_cookie,
+            csrf=oauth_owner_csrf.split("=", 1)[1],
+        )
+        assert status == 201
+        status, _, pending_page = request(
+            server, "GET", f"/join/{oauth_invitation['id']}"
+        )
+        assert status == 200
+        assert b"Continue with Descope" in pending_page
+        assert b"npm install -g @openai/codex" not in pending_page
+        status, headers, _ = request(
+            server, "GET", f"/join/{oauth_invitation['id']}/login"
+        )
+        assert status == 303
+        wrong_member_state, _ = identity.starts[-1]
+        identity.identity = BrowserIdentity(
+            "synthetic-wrong-member", "someone-else@example.com", True
+        )
+        status, _, denied = request(
+            server,
+            "GET",
+            "/admin/oauth/callback/identity?"
+            + urlencode(
+                {
+                    "state": wrong_member_state,
+                    "code": "synthetic-authorization-code",
+                }
+            ),
+        )
+        assert status == 403 and denied["error"] == "brain_invitation_forbidden"
+        status, _, still_pending = request(
+            server, "GET", f"/join/{oauth_invitation['id']}"
+        )
+        assert status == 200 and b"Identity verified" not in still_pending
+        status, _, _ = request(
+            server, "GET", f"/join/{oauth_invitation['id']}/login"
+        )
+        assert status == 303
+        member_state, _ = identity.starts[-1]
+        identity.identity = BrowserIdentity(
+            "synthetic-member-subject", "oauth-member@example.com", True
+        )
+        status, headers, _ = request(
+            server,
+            "GET",
+            "/admin/oauth/callback/identity?"
+            + urlencode(
+                {
+                    "state": member_state,
+                    "code": "synthetic-authorization-code",
+                }
+            ),
+        )
+        assert status == 303
+        assert dict(headers)["Location"] == (
+            f"/join/{oauth_invitation['id']}?status=accepted"
+        )
+        status, _, accepted_page = request(
+            server, "GET", f"/join/{oauth_invitation['id']}"
+        )
+        assert status == 200
+        assert b"Identity verified" in accepted_page
+        assert b"npm install -g @openai/codex" in accepted_page
+        company_credential = store.resolve_external_identity(
+            issuer=identity.canonical_issuer,
+            subject="synthetic-member-subject",
+            scopes=["read"],
+            audience="https://recall.synthetic.invalid/mcp",
+            tenant_id=COMPANY,
+        )
+        assert company_credential and company_credential["role"] == "member"
+        assert store.resolve_external_identity(
+            issuer=identity.canonical_issuer,
+            subject="synthetic-member-subject",
+            scopes=["read"],
+            audience="https://recall.synthetic.invalid/mcp",
+            tenant_id=PERSONAL,
+        ) is None
+        status, _, revoked = request(
+            server,
+            "POST",
+            f"/admin/api/v1/invitations/{oauth_invitation['id']}/revoke",
+            body={},
+            cookie=oauth_owner_cookie,
+            csrf=oauth_owner_csrf.split("=", 1)[1],
+        )
+        assert status == 200 and revoked["status"] == "revoked"
+        assert store.resolve_external_identity(
+            issuer=identity.canonical_issuer,
+            subject="synthetic-member-subject",
+            scopes=["read"],
+            audience="https://recall.synthetic.invalid/mcp",
+            tenant_id=COMPANY,
+        ) is None
 
         device_body = {
             "connector_id": "local.codex",
@@ -849,6 +1025,11 @@ def main():
                 "csrf_denials": 1,
                 "oauth_state_replays": 0,
                 "hosted_account_binding_replays": 0,
+                "identity_owner_manual_db_edits": 0,
+                "identity_callback_replays": 0,
+                "wrong_email_acceptances": 0,
+                "cross_brain_identity_grants": 0,
+                "revoked_identity_grants": 0,
                 "plaintext_secret_renders": 0,
                 "encrypted_secret_wiped_on_revoke": True,
                 "browser_assets": 3,

@@ -52,6 +52,7 @@ class Opener:
 def invitation(**updates) -> InvitationEmail:
     values = {
         "invitation_id": "11111111-2222-4333-8444-555555555555",
+        "tenant_id": "tenant:company:synthetic",
         "recipient": "invitee@example.invalid",
         "organization_name": "Synthetic & Company",
         "brain_slug": "Engineering Brain",

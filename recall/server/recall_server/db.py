@@ -775,6 +775,7 @@ class BrainStore:
         scopes: list[str],
         audience: str,
         tenant_id: str | None = None,
+        invitation_id: str | None = None,
     ) -> dict[str, Any] | None:
         normalized_email = normalize_verified_email(email)
         if (
@@ -793,6 +794,10 @@ class BrainStore:
             or (
                 tenant_id is not None
                 and not V2_AUTHORITY_RE.fullmatch(tenant_id)
+            )
+            or (
+                invitation_id is not None
+                and not re.fullmatch(r"[0-9a-f-]{36}", invitation_id)
             )
         ):
             return None
@@ -815,9 +820,16 @@ class BrainStore:
                          AND invitation.expires_at>now()
                          AND space.brain_kind='company'
                          AND (%s::text IS NULL OR invitation.tenant_id=%s)
+                         AND (%s::uuid IS NULL OR invitation.id=%s::uuid)
                        ORDER BY invitation.created_at
                        FOR UPDATE OF invitation""",
-                    (email_sha256, tenant_id, tenant_id),
+                    (
+                        email_sha256,
+                        tenant_id,
+                        tenant_id,
+                        invitation_id,
+                        invitation_id,
+                    ),
                 ).fetchall()
                 if len(invitations) != 1:
                     return None

@@ -116,11 +116,16 @@
     <form id="auth-form" method="dialog">
       <span class="dialog-index">OWNER ACCESS / 01</span>
       <h2>Open the switchboard.</h2>
-      <p>Paste the one-time admin key created by Recall. It is exchanged for a short browser session and never placed in a URL.</p>
-      <label for="admin-token">Admin access key</label>
-      <input id="admin-token" name="token" type="password" autocomplete="off" spellcheck="false" required>
-      <p id="auth-error" class="error" role="alert"></p>
-      <button type="submit">Enter control plane <span aria-hidden="true">→</span></button>
+      <p id="oauth-copy">Use the same identity you use from Claude and Codex.</p>
+      <a id="oauth-login" class="oauth-login" href="/admin/login" hidden>Continue with Descope <span aria-hidden="true">→</span></a>
+      <details id="legacy-login">
+        <summary>Use a legacy admin key</summary>
+        <p>The key is exchanged for a short browser session and never placed in a URL.</p>
+        <label for="admin-token">Admin access key</label>
+        <input id="admin-token" name="token" type="password" autocomplete="off" spellcheck="false">
+        <p id="auth-error" class="error" role="alert"></p>
+        <button type="submit">Enter control plane <span aria-hidden="true">→</span></button>
+      </details>
     </form>
   </dialog>
 
