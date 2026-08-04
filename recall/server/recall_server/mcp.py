@@ -117,7 +117,7 @@ ALL_READ_TOOLS = (
                 "schema_version": {"const": 1},
                 "request_id": {
                     "type": "string",
-                    "pattern": "^[a-z][a-z0-9_]{2,31}_[A-Za-z0-9_-]{16,128}$",
+                    "pattern": "^req_[A-Za-z0-9_-]{16,128}$",
                 },
                 "idempotency_key": {
                     "type": "string",
@@ -173,7 +173,7 @@ ALL_READ_TOOLS = (
                 "schema_version": {"const": 1},
                 "request_id": {
                     "type": "string",
-                    "pattern": "^[a-z][a-z0-9_]{2,31}_[A-Za-z0-9_-]{16,128}$",
+                    "pattern": "^req_[A-Za-z0-9_-]{16,128}$",
                 },
                 "idempotency_key": {
                     "type": "string",
