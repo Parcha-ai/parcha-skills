@@ -69,12 +69,11 @@ class SyntheticRetrieval:
         self.limits: list[int] = []
         self.fail_deep = fail_deep
 
-    def passage_hints(self, needs, *, filters, limit, page=None):
+    def passage_hints(self, needs, *, filters, limit):
         self.calls.append("recall_hints")
         self.needs = getattr(self, "needs", []) + [needs]
         self.filters.append(dict(filters))
         self.limits.append(limit)
-        self.pages = getattr(self, "pages", []) + [page]
         return {
             "results": [
                 {
@@ -250,13 +249,11 @@ def success_script():
                 ],
                 "filters": filters,
                 "limit": 20,
-                "page": 0,
             },
         ),
         (
             "exec",
             {
-                "aliases": ["d1", "d2"],
                 "program": (
                     "rg -n 'bounded agent bridge|grounding check' "
                     "/docs/d1 /docs/d2"
@@ -319,7 +316,7 @@ class SimpleAgentKernelTest(unittest.TestCase):
                     RecallAgentService(
                         PiRunner(TerminalFailureTransport(
                             reason_code,
-                            [success_script()[0], ("open", open_arguments)],
+                            [("open", open_arguments)],
                         )),
                     ).use_recall(principal(), REQUEST, SyntheticRetrieval())
                 error = caught.exception
@@ -352,7 +349,6 @@ class SimpleAgentKernelTest(unittest.TestCase):
                         "source_connector": "",
                     },
                     "limit": 10,
-                    "page": 0,
                 },
                 REQUEST,
             ),
@@ -366,7 +362,6 @@ class SimpleAgentKernelTest(unittest.TestCase):
                     "until": REQUEST["until"],
                 },
                 "limit": 10,
-                "page": 0,
             },
         )
 
@@ -394,8 +389,7 @@ class SimpleAgentKernelTest(unittest.TestCase):
                     },
                 ],
                 "filters": filters,
-                "limit": 40,
-                "page": 0,
+                "limit": 50,
             },
             REQUEST,
         )
@@ -454,13 +448,14 @@ class SimpleAgentKernelTest(unittest.TestCase):
             retrieval.calls,
             [
                 "recall_hints",
+                "recall_hints",
                 "recall_exec",
             ],
         )
         self.assertEqual(bundle["result"]["status"], "complete")
-        self.assertEqual(retrieval.limits[0], 20)
-        self.assertEqual(retrieval.pages, [0])
-        self.assertEqual(len(retrieval.needs[0]), 2)
+        self.assertEqual(retrieval.limits[0], 8)
+        self.assertEqual(len(retrieval.needs[0]), 1)
+        self.assertEqual(len(retrieval.needs[1]), 2)
         self.assertEqual(
             bundle["result"]["citations"],
             [DECISION, IMPLEMENTATION],
@@ -511,25 +506,39 @@ class SimpleAgentKernelTest(unittest.TestCase):
             "properties"
         ]["source_connector"]["anyOf"][0]
         self.assertIn("pattern", connector_schema)
-        self.assertIn("page", hint_tool["input_schema"]["properties"])
-        exec_tool = next(
-            tool
-            for tool in transport.start["data"]["tools"]
-            if tool["name"] == "exec"
-        )
-        self.assertIn("aliases", exec_tool["input_schema"]["properties"])
         self.assertEqual(
-            [event["stage"] for event in bundle["trace"]][2:5],
-            ["retrieve", "inspect", "synthesize"],
+            [event["stage"] for event in bundle["trace"]][2:6],
+            ["retrieve", "retrieve", "inspect", "synthesize"],
         )
         system = transport.start["data"]["prompt_sections"][0]["content"]
         self.assertIn("/docs/dN", system)
         self.assertIn("literal match-centered search", system)
         self.assertNotIn("classify the question", system)
         self.assertNotIn("map_reduce", system)
+        seed_packet = json.loads(
+            transport.start["data"]["prompt_sections"][2]["content"]
+        )
+        self.assertEqual(seed_packet["query_basis"], "verbatim_user_question")
+        self.assertFalse(seed_packet["evidence"])
+        self.assertEqual(len(seed_packet["results"]), 2)
+        self.assertEqual(seed_packet["results"][0]["alias"], "d1")
+        self.assertNotIn(
+            "logical_document_id",
+            seed_packet["results"][0],
+        )
         self.assertEqual(
-            [section["id"] for section in transport.start["data"]["prompt_sections"]],
-            ["role", "request constraints"],
+            seed_packet["results"][0]["matching_ranges"][0]["spans"],
+            [{"record_ordinal": 80, "record_count": 4}],
+        )
+        self.assertEqual(
+            seed_packet["results"][0]["matching_ranges"][0][
+                "routing_receipts"
+            ],
+            [HINT],
+        )
+        self.assertNotIn(
+            "manifest_object_key",
+            json.dumps(seed_packet),
         )
         for tool in transport.start["data"]["tools"]:
             stack = [tool["input_schema"]]
@@ -567,20 +576,18 @@ class SimpleAgentKernelTest(unittest.TestCase):
             {"since": REQUEST["since"], "until": REQUEST["until"]},
         )
 
-    def test_exec_requires_agent_search_hints(self):
+    def test_exec_can_use_host_seed_hints(self):
         script = success_script()[1:]
         retrieval = SyntheticRetrieval()
-        with self.assertRaises(AgentExecutionError) as caught:
-            service(ScriptedTransport(script)).use_recall(
-                principal(),
-                REQUEST,
-                retrieval,
-            )
-        self.assertEqual(caught.exception.code, "agent_exec_without_hints")
+        service(ScriptedTransport(script)).use_recall(
+            principal(),
+            REQUEST,
+            retrieval,
+        )
+        self.assertEqual(retrieval.calls, ["recall_hints", "recall_exec"])
 
-    def test_find_can_use_agent_search_hints_and_ground_finish(self):
+    def test_find_can_use_host_seed_hints_and_ground_finish(self):
         script = [
-            success_script()[0],
             (
                 "find",
                 {
@@ -634,84 +641,6 @@ class SimpleAgentKernelTest(unittest.TestCase):
                 SyntheticRetrieval(),
             )
         self.assertEqual(caught.exception.code, "agent_citation_not_opened")
-
-    def test_invalid_finish_recovery_names_only_cited_receipts(self):
-        opened = [
-            f"recall://{SOURCE}/opened-{index}?rev=1#item=0"
-            for index in range(40)
-        ]
-        valid = opened[-1]
-        invalid = f"recall://{SOURCE}/not-opened?rev=1#item=0"
-
-        class ManyReceiptRetrieval(SyntheticRetrieval):
-            def execute_agent_program(self, *args, **kwargs):
-                self.calls.append("recall_exec")
-                return {
-                    "provider": "synthetic-archil",
-                    "stdout": "synthetic evidence",
-                    "stderr": "",
-                    "exit_code": 0,
-                    "complete": True,
-                    "stopped_reason": "completed",
-                    "opened_receipts": opened,
-                    "timing": None,
-                }
-
-        class RecoveringTransport:
-            guidance = ""
-
-            def run(self, start, invoke, *, timeout_seconds):
-                for name, arguments in success_script()[:2]:
-                    invoke(name, arguments)
-                bad_finish = {
-                    "status": "complete",
-                    "answer": "One supported and one unsupported claim.",
-                    "claims": [
-                        {"statement": "Supported.", "receipts": [valid]},
-                        {"statement": "Unsupported.", "receipts": [invalid]},
-                    ],
-                    "gaps": [],
-                }
-                try:
-                    invoke("finish", bad_finish)
-                except AgentExecutionError as error:
-                    self.guidance = error.model_guidance
-                else:
-                    raise AssertionError("invalid finish unexpectedly passed")
-                invoke(
-                    "finish",
-                    {
-                        "status": "complete",
-                        "answer": "Supported.",
-                        "claims": [
-                            {"statement": "Supported.", "receipts": [valid]},
-                        ],
-                        "gaps": [],
-                    },
-                )
-                return {
-                    "terminal": {
-                        "status": "complete",
-                        "model_attestation": {
-                            "model_alias": "gemma-4-31b",
-                            "route_kind": "private_broker",
-                            "provider": "broker",
-                            "route_identity": "10.23.45.67",
-                        },
-                    },
-                    "usage": {},
-                }
-
-        transport = RecoveringTransport()
-        result = service(transport).use_recall(
-            principal(),
-            REQUEST,
-            ManyReceiptRetrieval(),
-        )
-        self.assertEqual(result["result"]["citations"], [valid])
-        self.assertIn(valid, transport.guidance)
-        self.assertIn(invalid, transport.guidance)
-        self.assertNotIn(opened[0], transport.guidance)
 
     def test_provider_failure_is_content_free(self):
         with self.assertRaises(AgentExecutionError) as caught:
@@ -773,11 +702,7 @@ class SimpleAgentKernelTest(unittest.TestCase):
                     success_script()
                     + [(
                         "exec",
-                        {
-                            "aliases": ["d1"],
-                            "program": "true",
-                            "timeout_seconds": 1,
-                        },
+                        {"program": "true", "timeout_seconds": 1},
                     )]
                 )
             ).use_recall(principal(), REQUEST, SyntheticRetrieval())
@@ -802,9 +727,6 @@ class PiSubprocessBoundaryTest(unittest.TestCase):
                 index = len(calls)
                 calls.append(self.path)
                 if index == 0:
-                    name = "search"
-                    arguments = success_script()[0][1]
-                elif index == 1:
                     name = "open"
                     arguments = {
                         "alias": "d1",
@@ -812,7 +734,7 @@ class PiSubprocessBoundaryTest(unittest.TestCase):
                         "record_ordinal": 80,
                         "page_bytes": 32768,
                     }
-                elif index == 2:
+                elif index == 1:
                     chunks = [
                         {
                             "id": f"chatcmpl-{index}",
@@ -851,7 +773,7 @@ class PiSubprocessBoundaryTest(unittest.TestCase):
                         }],
                         "gaps": [],
                     }
-                if index != 2:
+                if index != 1:
                     chunks = [
                         {
                             "id": f"chatcmpl-{index}",
@@ -922,7 +844,6 @@ class PiSubprocessBoundaryTest(unittest.TestCase):
         self.assertEqual(result["result"]["status"], "complete")
         self.assertEqual(result["result"]["citations"], [DECISION])
         self.assertEqual(calls, [
-            "/v1/chat/completions",
             "/v1/chat/completions",
             "/v1/chat/completions",
             "/v1/chat/completions",
