@@ -452,6 +452,18 @@ pending invitation on the first request. See
 [`docs/authorization-v1.md`](../../docs/authorization-v1.md) for the policy,
 generic OIDC contract, and revocation semantics.
 
+If the authorization server does not support dynamic client registration,
+pre-register a public PKCE client for Codex and configure both values below.
+The callback URL must match Codex's localhost callback for the brain-specific
+MCP URL. Recall then renders a single `codex mcp add` command with the public
+client ID, resource indicator, and fixed callback port; no client secret or
+bearer token is distributed.
+
+```text
+RECALL_CODEX_OAUTH_CLIENT_ID=<public OAuth client ID>
+RECALL_CODEX_OAUTH_CALLBACK_PORT=8765
+```
+
 ## Unified connector administration
 
 Schemas 029–031 add one tenant-aware connector control plane for the web

@@ -17,6 +17,7 @@ import urllib.request
 DESCOPE_INVITE_URL = "https://api.descope.com/v1/mgmt/user/create"
 RESEND_EMAIL_URL = "https://api.resend.com/emails"
 PROJECT_ID_RE = re.compile(r"P[A-Za-z0-9]{10,63}\Z")
+OAUTH_CLIENT_ID_RE = re.compile(r"[A-Za-z0-9._~+/=-]{8,512}\Z")
 SAFE_NAME_RE = re.compile(r"[^a-z0-9]+")
 
 
@@ -39,6 +40,8 @@ class InvitationEmail:
     expires_at: datetime
     brain_url: str
     onboarding_url: str
+    codex_oauth_client_id: str = ""
+    codex_oauth_callback_port: int | None = None
 
     @property
     def server_name(self) -> str:
@@ -88,13 +91,41 @@ def invitation_urls(
     return brain_url, onboarding_url
 
 
+def codex_oauth_onboarding_from_env() -> tuple[str, int | None]:
+    client_id = os.environ.get("RECALL_CODEX_OAUTH_CLIENT_ID", "").strip()
+    raw_port = os.environ.get("RECALL_CODEX_OAUTH_CALLBACK_PORT", "").strip()
+    if not client_id and not raw_port:
+        return "", None
+    try:
+        port = int(raw_port)
+    except ValueError:
+        raise InvitationEmailError("invitation_email_configuration_invalid") from None
+    if not OAUTH_CLIENT_ID_RE.fullmatch(client_id) or not 1 <= port <= 65535:
+        raise InvitationEmailError("invitation_email_configuration_invalid")
+    return client_id, port
+
+
 def installation_commands(invitation: InvitationEmail) -> dict[str, tuple[str, ...]]:
-    return {
-        "codex": (
+    codex_add = f"codex mcp add {invitation.server_name} --url {invitation.brain_url}"
+    codex_commands = (
+        "npm install -g @openai/codex",
+        codex_add,
+        f"codex mcp login {invitation.server_name}",
+    )
+    if invitation.codex_oauth_client_id and invitation.codex_oauth_callback_port:
+        resource_uri = invitation.brain_url.split("/brains/", 1)[0]
+        codex_commands = (
             "npm install -g @openai/codex",
-            f"codex mcp add {invitation.server_name} --url {invitation.brain_url}",
-            f"codex mcp login {invitation.server_name}",
-        ),
+            (
+                "codex -c "
+                f"mcp_oauth_callback_port={invitation.codex_oauth_callback_port} "
+                f"mcp add {invitation.server_name} --url {invitation.brain_url} "
+                f"--oauth-client-id {invitation.codex_oauth_client_id} "
+                f"--oauth-resource {resource_uri}"
+            ),
+        )
+    return {
+        "codex": codex_commands,
         "claude": (
             "npm install -g @anthropic-ai/claude-code",
             (
@@ -335,6 +366,7 @@ __all__ = [
     "InvitationEmailError",
     "InvitationEmailSender",
     "ResendInvitationEmailSender",
+    "codex_oauth_onboarding_from_env",
     "installation_commands",
     "invitation_message",
     "invitation_urls",

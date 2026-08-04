@@ -27,6 +27,7 @@ from .invitation_email import (
     InvitationEmail,
     InvitationEmailError,
     InvitationEmailSender,
+    codex_oauth_onboarding_from_env,
     invitation_urls,
     sender_from_env,
 )
@@ -754,12 +755,16 @@ class ControlPlane:
         providers: dict[str, OAuthProvider],
         invitation_email_sender: InvitationEmailSender | None = None,
         mcp_resource_uri: str = "",
+        codex_oauth_client_id: str = "",
+        codex_oauth_callback_port: int | None = None,
     ):
         self.store = store
         self.secret_box = secret_box
         self.providers = dict(providers)
         self.invitation_email_sender = invitation_email_sender
         self.mcp_resource_uri = mcp_resource_uri
+        self.codex_oauth_client_id = codex_oauth_client_id
+        self.codex_oauth_callback_port = codex_oauth_callback_port
 
     @classmethod
     def from_env(cls, store: Any) -> "ControlPlane":
@@ -783,6 +788,9 @@ class ControlPlane:
             providers["composio"] = ComposioConnectionBroker.from_env()
         try:
             invitation_email_sender = sender_from_env()
+            codex_oauth_client_id, codex_oauth_callback_port = (
+                codex_oauth_onboarding_from_env()
+            )
         except InvitationEmailError:
             raise ControlError("invitation_email_configuration_invalid", 500) from None
         return cls(
@@ -791,6 +799,8 @@ class ControlPlane:
             providers,
             invitation_email_sender=invitation_email_sender,
             mcp_resource_uri=os.environ.get("RECALL_MCP_RESOURCE_URI", ""),
+            codex_oauth_client_id=codex_oauth_client_id,
+            codex_oauth_callback_port=codex_oauth_callback_port,
         )
 
     def create_admin_token(
@@ -1058,6 +1068,8 @@ class ControlPlane:
                         expires_at=expires_at,
                         brain_url=brain_url,
                         onboarding_url=onboarding_url,
+                        codex_oauth_client_id=self.codex_oauth_client_id,
+                        codex_oauth_callback_port=self.codex_oauth_callback_port,
                     )
                 )
                 delivery = {
@@ -1124,6 +1136,8 @@ class ControlPlane:
             expires_at=row["expires_at"],
             brain_url=brain_url,
             onboarding_url=onboarding_url,
+            codex_oauth_client_id=self.codex_oauth_client_id,
+            codex_oauth_callback_port=self.codex_oauth_callback_port,
         )
 
     def invitation_email_index(self, email: str) -> str:
