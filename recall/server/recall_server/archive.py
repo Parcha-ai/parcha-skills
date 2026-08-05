@@ -8,6 +8,7 @@ import re
 import stat
 import tempfile
 from base64 import b64encode
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Protocol
@@ -16,6 +17,9 @@ from urllib.parse import urlsplit
 from contracts.v2 import ContractError, validate_contract
 
 DEFAULT_MAXIMUM_BYTES = 64 * 1024 * 1024
+S3_PARALLEL_READ_THRESHOLD_BYTES = 128 * 1024 * 1024
+S3_PARALLEL_READ_CHUNK_BYTES = 64 * 1024 * 1024
+S3_PARALLEL_READ_WORKERS = 8
 IDENTITY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._/@+-]{1,255}")
 MEDIA_TYPE_RE = re.compile(r"[a-z0-9][a-z0-9.+-]{0,63}/[a-z0-9][a-z0-9.+-]{0,127}")
 BUCKET_RE = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
@@ -265,6 +269,24 @@ class _ArchiveStore:
             source_id=value["source_id"],
         )
 
+    def delete_internal_raw(self, value: dict[str, Any]) -> bool:
+        """Delete a trusted persisted reference without downloading its payload.
+
+        This path is intentionally limited to server-owned references recovered
+        from the database. Connector-facing references must continue through
+        ``delete_raw`` and its full integrity check.
+        """
+
+        reference = self._from_contract(value)
+        try:
+            return self.delete(
+                reference,
+                tenant_id=value["tenant_id"],
+                source_id=value["source_id"],
+            )
+        except ArchiveNotFound:
+            return False
+
     def read_raw(self, value: dict[str, Any]) -> bytes:
         """Resolve one closed reference without exposing namespace-key material."""
         reference = self._from_contract(value)
@@ -338,6 +360,22 @@ def _read_bounded(
     if not hmac.compare_digest(hashlib.sha256(payload).hexdigest(), content_sha256):
         raise ArchiveCorruption("archive content digest mismatch")
     return payload
+
+
+def _read_exact(stream: BinaryIO, *, size_bytes: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size_bytes
+    while remaining:
+        chunk = stream.read(min(1_048_576, remaining))
+        if not isinstance(chunk, bytes):
+            raise ValueError("archive stream must return bytes")
+        if not chunk:
+            raise ArchiveCorruption("archive stream ended before declared size")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if stream.read(1):
+        raise ArchiveCorruption("archive range exceeds declared size")
+    return b"".join(chunks)
 
 
 class FilesystemArchiveStore(_ArchiveStore):
@@ -592,19 +630,23 @@ class S3ArchiveStore(_ArchiveStore):
             size_bytes=size_bytes,
             version_id="pending",
         )
-        try:
-            existing = self.client.head_object(Bucket=self.bucket, Key=pending.object_key)
-        except ArchiveNotFound:
-            pass
-        except Exception as error:
-            raise ArchiveError("archive provider request failed") from error
-        else:
-            return self._existing_reference(
-                request,
-                content_sha256=content_sha256,
-                size_bytes=size_bytes,
-                response=existing,
-            )
+        if self.compatibility_profile == "aws":
+            try:
+                existing = self.client.head_object(
+                    Bucket=self.bucket,
+                    Key=pending.object_key,
+                )
+            except ArchiveNotFound:
+                pass
+            except Exception as error:
+                raise ArchiveError("archive provider request failed") from error
+            else:
+                return self._existing_reference(
+                    request,
+                    content_sha256=content_sha256,
+                    size_bytes=size_bytes,
+                    response=existing,
+                )
         kwargs: dict[str, Any] = {
             "Bucket": self.bucket,
             "Key": pending.object_key,
@@ -652,17 +694,11 @@ class S3ArchiveStore(_ArchiveStore):
                 size_bytes=size_bytes,
                 version_id=self._version_id(content_sha256, response),
             )
-        try:
-            stored = self.client.head_object(
-                Bucket=self.bucket, Key=pending.object_key,
-            )
-        except Exception as error:
-            raise ArchiveError("archive provider request failed") from error
-        return self._existing_reference(
+        return self._reference(
             request,
             content_sha256=content_sha256,
             size_bytes=size_bytes,
-            response=stored,
+            version_id=self._version_id(content_sha256, response),
         )
 
     def read(
@@ -675,6 +711,8 @@ class S3ArchiveStore(_ArchiveStore):
         self._validate_reference(reference)
         self._authorize(reference, tenant_id=tenant_id, source_id=source_id)
         version_kwargs = self._version_kwargs(reference)
+        if reference.size_bytes >= S3_PARALLEL_READ_THRESHOLD_BYTES:
+            return self._read_parallel(reference, version_kwargs)
         try:
             response = self.client.get_object(
                 Bucket=self.bucket,
@@ -696,6 +734,78 @@ class S3ArchiveStore(_ArchiveStore):
             maximum_bytes=self.maximum_bytes,
         )
         return payload
+
+    def _read_parallel(
+        self,
+        reference: ArtifactReference,
+        version_kwargs: dict[str, str],
+    ) -> bytes:
+        try:
+            head = self.client.head_object(
+                Bucket=self.bucket,
+                Key=reference.object_key,
+                **version_kwargs,
+            )
+            _verify_metadata(reference, head.get("Metadata"))
+            if head.get("ContentLength") != reference.size_bytes:
+                raise ArchiveCorruption("archive metadata mismatch")
+            payload = bytearray(reference.size_bytes)
+
+            def fetch(start: int, end: int) -> tuple[int, bytes]:
+                response = self.client.get_object(
+                    Bucket=self.bucket,
+                    Key=reference.object_key,
+                    Range=f"bytes={start}-{end}",
+                    **version_kwargs,
+                )
+                expected_size = end - start + 1
+                if (
+                    response.get("ContentLength") != expected_size
+                    or response.get("ContentRange")
+                    != f"bytes {start}-{end}/{reference.size_bytes}"
+                    or response.get("Body") is None
+                ):
+                    raise ArchiveCorruption("archive range metadata mismatch")
+                return start, _read_exact(
+                    response["Body"],
+                    size_bytes=expected_size,
+                )
+
+            ranges = [
+                (
+                    start,
+                    min(
+                        reference.size_bytes - 1,
+                        start + S3_PARALLEL_READ_CHUNK_BYTES - 1,
+                    ),
+                )
+                for start in range(
+                    0,
+                    reference.size_bytes,
+                    S3_PARALLEL_READ_CHUNK_BYTES,
+                )
+            ]
+            with ThreadPoolExecutor(
+                max_workers=min(S3_PARALLEL_READ_WORKERS, len(ranges)),
+                thread_name_prefix="recall-s3-range",
+            ) as executor:
+                futures = [
+                    executor.submit(fetch, start, end)
+                    for start, end in ranges
+                ]
+                for future in as_completed(futures):
+                    start, chunk = future.result()
+                    payload[start:start + len(chunk)] = chunk
+        except (ArchiveNotFound, ArchiveCorruption):
+            raise
+        except Exception as error:
+            raise ArchiveError("archive provider request failed") from error
+        if not hmac.compare_digest(
+            hashlib.sha256(payload).hexdigest(),
+            reference.content_sha256,
+        ):
+            raise ArchiveCorruption("archive content digest mismatch")
+        return bytes(payload)
 
     def delete(
         self,

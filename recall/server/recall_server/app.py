@@ -53,6 +53,7 @@ from .canonical import (
 from .canonical_retrieval import CanonicalRetrieval
 from .control import ControlError, ControlPlane
 from .db import BrainStore, IdempotencyConflict
+from .deep_inspection import DeepInspectionError
 from .deep_inspection_runtime import build_deep_inspector
 from .evidence_projection import (
     CanonicalEvidenceProjector,
@@ -90,6 +91,7 @@ ADMIN_INVITATION_REVOKE = re.compile(
     r"/admin/api/v1/invitations/([0-9a-f-]{36})/revoke\Z"
 )
 INVITATION_ONBOARDING = re.compile(r"/join/([0-9a-f-]{36})\Z")
+INVITATION_LOGIN = re.compile(r"/join/([0-9a-f-]{36})/login\Z")
 MCP_BRAIN_PATH = re.compile(
     r"/mcp/brains/([A-Za-z0-9][A-Za-z0-9:._@+-]{1,255})\Z"
 )
@@ -201,11 +203,17 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def send_redirect(self, location: str) -> None:
+    def send_redirect(
+        self,
+        location: str,
+        headers: list[tuple[str, str]] | None = None,
+    ) -> None:
         self.send_response(303)
         self.send_header("Location", location)
         self.send_header("Cache-Control", "no-store")
         self.send_header("Referrer-Policy", "no-referrer")
+        for name, value in headers or []:
+            self.send_header(name, value)
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -649,11 +657,16 @@ class Handler(BaseHTTPRequestHandler):
                 or path == "/admin"
                 or path.startswith("/admin/")
                 or bool(INVITATION_ONBOARDING.fullmatch(path))
+                or bool(INVITATION_LOGIN.fullmatch(path))
             )
         if os.environ.get("RECALL_CANONICAL_INGEST_PUBLIC") == "1":
             allowed = allowed or (
                 method == "POST"
-                and path in {"/v2/archive/objects", "/v2/ingest/canonical"}
+                and path in {
+                    "/v2/archive/objects",
+                    "/v2/ingest/canonical",
+                    "/v2/ingest/status",
+                }
             )
         if allowed:
             return False
@@ -702,6 +715,73 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, self.protected_resource_metadata())
             return
         if self.admin_web_enabled():
+            if parsed.path == "/admin/api/v1/auth-methods":
+                self.send_json(
+                    200,
+                    {
+                        "oauth": bool(
+                            self.control_plane
+                            and self.control_plane.identity_oauth_enabled
+                        ),
+                        "legacy_key": True,
+                    },
+                )
+                return
+            if parsed.path == "/admin/login":
+                if self.control_plane is None:
+                    self.send_json(404, {"error": "not found"})
+                    return
+                try:
+                    started = self.control_plane.start_identity_login(
+                        purpose="admin"
+                    )
+                    self.send_redirect(started["authorization_url"])
+                except ControlError as error:
+                    self.send_json(error.status, {"error": error.code})
+                return
+            invitation_login = INVITATION_LOGIN.fullmatch(parsed.path)
+            if invitation_login:
+                if self.control_plane is None:
+                    self.send_json(404, {"error": "not found"})
+                    return
+                try:
+                    started = self.control_plane.start_identity_login(
+                        purpose="join",
+                        invitation_id=invitation_login.group(1),
+                    )
+                    self.send_redirect(started["authorization_url"])
+                except ControlError as error:
+                    self.send_json(error.status, {"error": "not found"})
+                return
+            if parsed.path == "/admin/oauth/callback/identity":
+                if self.control_plane is None:
+                    self.send_json(404, {"error": "not found"})
+                    return
+                query = parse_qs(parsed.query, keep_blank_values=True)
+                if (
+                    query.get("error")
+                    or set(query) != {"state", "code"}
+                    or any(len(query.get(key, [])) != 1 for key in query)
+                ):
+                    self.send_json(400, {"error": "identity_oauth_callback_invalid"})
+                    return
+                try:
+                    completed = self.control_plane.complete_identity_login(
+                        state=query["state"][0], code=query["code"][0]
+                    )
+                    headers = []
+                    browser = completed.get("browser")
+                    if browser:
+                        headers = [
+                            ("Set-Cookie", value)
+                            for value in admin_session_headers(
+                                browser["session"], browser["csrf"]
+                            )
+                        ]
+                    self.send_redirect(completed["redirect"], headers)
+                except ControlError as error:
+                    self.send_json(error.status, {"error": error.code})
+                return
             invitation_onboarding = INVITATION_ONBOARDING.fullmatch(parsed.path)
             if invitation_onboarding:
                 if self.control_plane is None:
@@ -1158,6 +1238,43 @@ class Handler(BaseHTTPRequestHandler):
                 LOG.error("canonical ingest failed type=%s", type(exc).__name__)
                 self.send_json(500, {"error": "canonical ingest failed"})
             return
+        if path == "/v2/ingest/status":
+            principal = self.require("write")
+            if not principal:
+                return
+            length = self.body_length(MAX_BODY_BYTES)
+            if length is None:
+                return
+            try:
+                body = json.loads(self.rfile.read(length))
+                authority = self.canonical_authority(principal, body)
+                if authority is None:
+                    return
+                tenant_id, principal_id, source_id = authority
+                if self.canonical_plane is None:
+                    self.send_json(503, {"error": "canonical plane unavailable"})
+                    return
+                self.send_json(
+                    200,
+                    self.canonical_plane.source_status(
+                        tenant_id=tenant_id,
+                        principal_id=principal_id,
+                        source_id=source_id,
+                    ),
+                )
+            except (json.JSONDecodeError, TypeError, ValueError):
+                self.send_json(400, {"error": "canonical status request invalid"})
+            except CanonicalLifecycleError as exc:
+                status = (
+                    403
+                    if exc.error_code == "canonical_authority_forbidden"
+                    else 400
+                )
+                self.send_json(status, {"error": exc.error_code})
+            except Exception as exc:
+                LOG.error("canonical status failed type=%s", type(exc).__name__)
+                self.send_json(503, {"error": "canonical status unavailable"})
+            return
         if path == WEBHOOK_PATH:
             principal = self.require("webhook")
             if not principal:
@@ -1444,6 +1561,16 @@ class Handler(BaseHTTPRequestHandler):
                     200,
                     mcp_error_response(
                         McpProtocolError(-32602, "tool arguments rejected"),
+                        request_id,
+                    ),
+                )
+                return
+            except DeepInspectionError as exc:
+                LOG.error("mcp deep inspection failed code=%s", exc.code)
+                self.send_json(
+                    200,
+                    mcp_error_response(
+                        McpProtocolError(-32603, "tool execution failed"),
                         request_id,
                     ),
                 )

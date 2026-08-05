@@ -14,6 +14,7 @@ from pathlib import Path
 
 from collector.collector import (
     MAX_CANONICAL_BATCH_EVENTS,
+    MAX_CANONICAL_TOMBSTONE_BATCH_EVENTS,
     Collector,
     CollectorRuntimeError,
 )
@@ -113,6 +114,88 @@ class CollectorTest(unittest.TestCase):
         )
         self.assertEqual(collector.batch_size, MAX_CANONICAL_BATCH_EVENTS)
         self.assertEqual(MAX_CANONICAL_BATCH_EVENTS, 1_000)
+        collector.close()
+
+    def test_canonical_flush_bounds_tombstones_and_keeps_live_batches_separate(self) -> None:
+        batch_kinds: list[list[str]] = []
+        batch_sizes: list[int] = []
+
+        class Archive:
+            def put_raw(self, **kwargs):
+                digest = hashlib.sha256(kwargs["payload"]).hexdigest()
+                return {
+                    "contract": "recall.artifact-ref.v1",
+                    "schema_version": 1,
+                    "tenant_id": kwargs["tenant_id"],
+                    "source_id": kwargs["source_id"],
+                    "artifact_id": "art_" + digest[:32],
+                    "storage_backend": "s3",
+                    "object_key": "objects/aa/" + digest,
+                    "content_sha256": digest,
+                    "size_bytes": len(kwargs["payload"]),
+                    "media_type": kwargs["media_type"],
+                    "encryption": "sse-s3",
+                    "version_id": "synthetic-version",
+                    "created_at": kwargs["created_at"],
+                }
+
+        class Writer:
+            def ingest(self, events):
+                batch_kinds.append([event["kind"] for event in events])
+                batch_sizes.append(len(events))
+                return {
+                    "status": "committed",
+                    "inserted": len(events),
+                    "duplicate_events": 0,
+                    "receipts": [
+                        f"recall://{event['source_id']}/{event['native_id']}?rev=1"
+                        for event in events
+                    ],
+                    "replay": False,
+                }
+
+        collector = Collector(
+            root=self.root,
+            harness="claude",
+            source_id="claude:linux:test",
+            spool_path=self.spool,
+            endpoint=self.endpoint,
+            token="test-token-not-a-secret",
+            brain_writer=Writer(),
+            archive=Archive(),
+            tenant_id="tenant:personal",
+            batch_size=500,
+        )
+        transcript = self.root / "session.jsonl"
+        transcript.write_text(
+            "".join(
+                claude_line(f"record-{index}")
+                for index in range(MAX_CANONICAL_TOMBSTONE_BATCH_EVENTS + 6)
+            )
+        )
+        collector.scan()
+        collector.flush()
+        batch_kinds.clear()
+        batch_sizes.clear()
+
+        transcript.write_text(claude_line("replacement"))
+        collector.scan()
+        result = collector.flush()
+
+        self.assertEqual(result["acked"], MAX_CANONICAL_TOMBSTONE_BATCH_EVENTS + 6)
+        self.assertEqual(
+            batch_sizes,
+            [
+                1,
+                MAX_CANONICAL_TOMBSTONE_BATCH_EVENTS,
+                5,
+            ],
+        )
+        self.assertTrue(all(
+            len(set(kinds)) == 1
+            for kinds in batch_kinds
+        ))
+        self.assertEqual(batch_kinds[0], ["transcript_record"])
         collector.close()
 
     def test_discovery_prioritizes_newest_sessions_for_backfill_freshness(self) -> None:

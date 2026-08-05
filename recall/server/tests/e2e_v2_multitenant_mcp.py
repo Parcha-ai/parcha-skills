@@ -17,14 +17,18 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
-sys.path[:0] = [str(ROOT / "recall"), str(ROOT / "recall/server")]
+sys.path[:0] = [
+    str(ROOT / "recall"),
+    str(ROOT / "recall/server"),
+    str(ROOT / "recall/server/tests"),
+]
 
 from client.mac import canonical_envelope
 from recall_server.agent import (
     DelegationContext,
     RecallAgentService,
-    ScriptedAgentRunner,
 )
+from agent_fakes import ScriptedAgentRunner, ScriptedExecInspector
 from recall_server.agent_runs import (
     AgentRunCoordinator,
     AgentRunNotFound,
@@ -43,6 +47,12 @@ from recall_server.evidence_projection import (
     CanonicalEvidenceProjector,
     EvidenceProjectionStore,
 )
+from recall_server.logical_evidence import LogicalEvidenceProjectionStore
+from recall_server.logical_evidence_projection import (
+    CanonicalLogicalEvidenceProjector,
+)
+from recall_server.passage_index import CanonicalPassageProjector
+from recall_server.passage_projection import PassagePolicy
 
 
 OWNER = "principal:owner:e2e"
@@ -91,6 +101,7 @@ class FakeSemanticRuntime:
     dimensions = 512
     model = "synthetic-embedding-v1"
     fingerprint = "synthetic-canonical-runtime-v1"
+    passage_fingerprint = "synthetic-canonical-runtime-v1"
 
     @staticmethod
     def _vector(text: str) -> list[float]:
@@ -103,6 +114,9 @@ class FakeSemanticRuntime:
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         return [self._vector(text) for text in texts]
+
+    def embed_passages(self, texts: list[str]) -> list[list[float]]:
+        return self.embed_documents(texts)
 
     def embed_query(self, query: str) -> list[float]:
         if "semantic unavailable" in query:
@@ -301,7 +315,7 @@ def ingest(
     tombstone: bool = False,
 ) -> str:
     raw = json.dumps(
-        {"text": text, "deleted": tombstone},
+        {"role": "assistant", "text": text, "deleted": tombstone},
         sort_keys=True,
         separators=(",", ":"),
     ).encode()
@@ -318,7 +332,11 @@ def ingest(
         media_type="application/json",
         created_at=occurred_at,
     )
-    content = {"target_native_id": native_id} if tombstone else {"text": text}
+    content = (
+        {"target_native_id": native_id}
+        if tombstone
+        else {"role": "assistant", "text": text}
+    )
     event = canonical_envelope(
         source_id=source_id,
         native_id=native_id,
@@ -396,6 +414,7 @@ def main() -> None:
             store,
             evidence_projection,
         )
+        logical_projection = LogicalEvidenceProjectionStore(evidence_archive)
         personal_receipt = ingest(
             store,
             archive,
@@ -584,11 +603,41 @@ def main() -> None:
         )
         projected = evidence_projector.project_pending()
         assert projected["processed"] == 10
+        logical_projector = CanonicalLogicalEvidenceProjector(
+            store,
+            logical_projection,
+            raw_archive=archive,
+        )
+        logical = logical_projector.project_pending(
+            batch_size=100,
+            max_batches=1,
+            upload_concurrency=2,
+        )
+        assert logical["documents"] > 0
+        passage_policy = PassagePolicy(target_tokens=512, overlap_tokens=64)
+        passage_projector = CanonicalPassageProjector(
+            store,
+            logical_projection,
+            policy=passage_policy,
+        )
+        passages = passage_projector.project_pending(
+            batch_size=100,
+            max_batches=1,
+            concurrency=2,
+        )
+        assert passages["documents"] == logical["documents"]
+        assert passages["passages"] > 0
+        passage_embeddings = passage_projector.embed_pending(
+            batch_size=100,
+            max_batches=1,
+        )
+        assert passage_embeddings["processed"] == passages["passages"]
         retrieval = CanonicalRetrieval(
             store,
             archive,
             evidence_projector=evidence_projector,
             deep_inspector=LocalDeepInspector(evidence_projection),
+            passage_policy=passage_policy,
         )
         embedding = retrieval.embed_pending()
         assert embedding["processed"] == 10
@@ -647,7 +696,8 @@ def main() -> None:
         Handler.archive_store = archive
         Handler.evidence_archive_store = evidence_archive
         Handler.evidence_projector = evidence_projector
-        Handler.deep_inspector = retrieval.deep_inspector
+        Handler.deep_inspector = ScriptedExecInspector(retrieval.deep_inspector)
+        retrieval.deep_inspector = Handler.deep_inspector
         Handler.canonical_plane = CanonicalPlane(
             store,
             archive,
@@ -796,7 +846,10 @@ def main() -> None:
             assert agent_http_result["result"]["status"] == "partial"
             agent_receipts = set(agent_http_result["result"]["citations"])
             assert agent_receipts
-            assert agent_receipts <= returned_receipts
+            assert agent_receipts <= returned_receipts, (
+                agent_receipts,
+                returned_receipts,
+            )
             rendered_agent_trace = json.dumps(agent_http_result["trace"])
             assert agent_request["question"] not in rendered_agent_trace
             assert PERSONAL_SOURCE not in rendered_agent_trace
@@ -1239,7 +1292,7 @@ def main() -> None:
             assert {row["source_id"] for row in conversational["results"]} == {
                 PERSONAL_SOURCE
             }
-            assert conversational["diagnostics"]["lexical_mode"] == "relaxed"
+            assert conversational["diagnostics"]["lexical_mode"] == "strict-empty"
 
             unrelated = rpc(
                 server,
@@ -1248,7 +1301,7 @@ def main() -> None:
                 {"query": "Where did we discuss underwater zebras?"},
             )["result"]["structuredContent"]
             assert unrelated["diagnostics"]["lexical_candidates"] == 0
-            assert unrelated["diagnostics"]["lexical_mode"] == "relaxed-empty"
+            assert unrelated["diagnostics"]["lexical_mode"] == "strict-empty"
 
             degraded = rpc(
                 server,
@@ -1256,10 +1309,8 @@ def main() -> None:
                 "recall_search",
                 {"query": "shared launch marker semantic unavailable"},
             )["result"]["structuredContent"]
-            assert degraded["results"]
-            assert {row["source_id"] for row in degraded["results"]} == {
-                PERSONAL_SOURCE
-            }
+            assert degraded["results"] == []
+            assert degraded["diagnostics"]["lexical_mode"] == "strict-empty"
             assert degraded["diagnostics"]["semantic_status"] == "unavailable"
 
             family_routed = rpc(

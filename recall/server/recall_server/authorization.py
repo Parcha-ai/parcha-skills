@@ -212,6 +212,7 @@ class OidcJwtVerifier:
         issuer: str,
         audience: str,
         jwks_uri: str,
+        additional_issuers: tuple[str, ...] = (),
         provider: str = "oidc",
         jwks_loader: JwksLoader | None = None,
         clock: Any = time.time,
@@ -220,6 +221,15 @@ class OidcJwtVerifier:
             raise ValueError("OIDC provider invalid")
         self.provider = provider
         self.issuer = _https_uri(issuer, "OIDC issuer")
+        if not isinstance(additional_issuers, tuple) or len(additional_issuers) > 8:
+            raise ValueError("additional OIDC issuers invalid")
+        normalized_additional = tuple(
+            _https_uri(value, "additional OIDC issuer")
+            for value in additional_issuers
+        )
+        if len(set(normalized_additional)) != len(normalized_additional):
+            raise ValueError("additional OIDC issuers invalid")
+        self.accepted_issuers = frozenset((self.issuer, *normalized_additional))
         self.audience = _https_uri(audience, "OIDC audience")
         self.jwks_uri = _https_uri(jwks_uri, "JWKS URI")
         self.jwks_loader = jwks_loader or HttpsJwksCache(self.jwks_uri)
@@ -233,11 +243,19 @@ class OidcJwtVerifier:
         if provider not in {"oidc", "descope"}:
             raise RuntimeError("MCP auth provider is invalid")
         try:
+            additional_issuers = tuple(
+                value.strip()
+                for value in os.environ.get(
+                    "RECALL_OIDC_ADDITIONAL_ISSUERS", ""
+                ).split(",")
+                if value.strip()
+            )
             verifier = cls(
                 provider=provider,
                 issuer=os.environ.get("RECALL_OIDC_ISSUER", ""),
                 audience=os.environ.get("RECALL_MCP_RESOURCE_URI", ""),
                 jwks_uri=os.environ.get("RECALL_OIDC_JWKS_URI", ""),
+                additional_issuers=additional_issuers,
             )
         except ValueError as error:
             raise RuntimeError("OIDC resource configuration is invalid") from error
@@ -337,7 +355,7 @@ class OidcJwtVerifier:
         issued_at = payload.get("iat", 0)
         scopes = self._scopes(payload)
         if (
-            payload.get("iss") != self.issuer
+            payload.get("iss") not in self.accepted_issuers
             or not isinstance(subject, str)
             or not 1 <= len(subject) <= 512
             or self.audience not in audiences
@@ -355,6 +373,8 @@ class OidcJwtVerifier:
             return None
         email = normalize_verified_email(payload.get("email"))
         return VerifiedExternalIdentity(
+            # Provider-specific token issuers are deliberately collapsed onto the
+            # configured canonical issuer so one person has one durable binding.
             issuer=self.issuer,
             subject=subject,
             audience=self.audience,

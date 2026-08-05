@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -29,17 +30,27 @@ from connectors.sdk import (
 )
 from privacy.policy import PrivacyPolicy
 
-from .archive_runtime import build_archive_store
+from .archive_runtime import build_archive_store, build_evidence_archive_store
 from .canonical import CanonicalArchiveGateway, CanonicalPlane
 from .canonical_retrieval import CanonicalRetrieval
 from .control import ControlError, SecretBox
 from .db import BrainStore
+from .logical_evidence import LogicalEvidenceProjectionStore
+from .logical_evidence_projection import CanonicalLogicalEvidenceProjector
+from .passage_index import CanonicalPassageProjector
+from .passage_projection import DEFAULT_PASSAGE_POLICY
 
 
 SAFE_WORKER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{2,127}\Z")
 DEFAULT_INTERVAL_SECONDS = 60
 DEFAULT_LEASE_SECONDS = 300
 MAX_CREDENTIAL_BYTES = 64_000
+LOG = logging.getLogger(__name__)
+MANAGED_LOGICAL_BATCH_SIZE = 20
+MANAGED_PASSAGE_BATCH_SIZE = 20
+MANAGED_PASSAGE_EMBED_BATCH_SIZE = 100
+MANAGED_PROJECTION_MAX_BATCHES = 1
+MANAGED_PROJECTION_CONCURRENCY = 4
 
 
 def _worker_identity(value: str | None = None) -> str:
@@ -72,6 +83,37 @@ def _private_root(path: Path) -> Path:
     if stat.S_IMODE(metadata.st_mode) != 0o700:
         raise ValueError("managed worker state root is not private")
     return path
+
+
+def _run_projection_cycle(
+    logical: CanonicalLogicalEvidenceProjector,
+    passages: CanonicalPassageProjector,
+) -> dict[str, int | str]:
+    logical_result = logical.project_pending(
+        tenant_id=None,
+        batch_size=MANAGED_LOGICAL_BATCH_SIZE,
+        max_batches=MANAGED_PROJECTION_MAX_BATCHES,
+        upload_concurrency=MANAGED_PROJECTION_CONCURRENCY,
+    )
+    passage_result = passages.project_pending(
+        tenant_id=None,
+        batch_size=MANAGED_PASSAGE_BATCH_SIZE,
+        max_batches=MANAGED_PROJECTION_MAX_BATCHES,
+        concurrency=MANAGED_PROJECTION_CONCURRENCY,
+    )
+    embedding_result = passages.embed_pending(
+        tenant_id=None,
+        batch_size=MANAGED_PASSAGE_EMBED_BATCH_SIZE,
+        max_batches=MANAGED_PROJECTION_MAX_BATCHES,
+    )
+    return {
+        "status": "complete",
+        "logical_documents": int(logical_result["documents"]),
+        "logical_records": int(logical_result["records"]),
+        "passage_documents": int(passage_result["documents"]),
+        "passages": int(passage_result["passages"]),
+        "passage_embeddings": int(embedding_result["processed"]),
+    }
 
 
 def _selector_defaults(connector_id: str) -> dict[str, Any]:
@@ -394,6 +436,42 @@ class ManagedConnectorWorker:
                     (delay, error_code, installation_id, self.worker_id),
                 )
 
+    def _degrade_authority(
+        self,
+        row: dict[str, Any],
+        *,
+        error_code: str,
+    ) -> None:
+        """Stop retrying revoked authority until an operator reconnects it."""
+
+        connection_id = row.get("connection_id")
+        with self.store.connect() as connection:
+            with connection.transaction():
+                if connection_id is not None:
+                    connection.execute(
+                        """UPDATE provider_connections
+                           SET status='degraded',updated_at=now()
+                           WHERE id=%s AND status='connected'""",
+                        (connection_id,),
+                    )
+                    connection.execute(
+                        """UPDATE connector_installations
+                           SET state='configured',lease_owner=NULL,
+                               lease_expires_at=NULL,last_error_code=%s,
+                               failure_count=failure_count+1,updated_at=now()
+                           WHERE connection_id=%s AND state='enabled'""",
+                        (error_code, connection_id),
+                    )
+                else:
+                    connection.execute(
+                        """UPDATE connector_installations
+                           SET state='configured',lease_owner=NULL,
+                               lease_expires_at=NULL,last_error_code=%s,
+                               failure_count=failure_count+1,updated_at=now()
+                           WHERE id=%s AND lease_owner=%s""",
+                        (error_code, row["id"], self.worker_id),
+                    )
+
     def run_once(self) -> dict[str, Any]:
         row = self._claim()
         if row is None:
@@ -478,15 +556,21 @@ class ManagedConnectorWorker:
             }
         except Exception as error:
             code = self._safe_error(error)
-            self._finish(
-                row["id"],
-                success=False,
-                error_code=code,
-                retry_after_seconds=min(
-                    3600,
-                    self.interval_seconds * 2,
-                ),
-            )
+            if code in {
+                "connector_authority_revoked",
+                "connector_authority_forbidden",
+            }:
+                self._degrade_authority(row, error_code=code)
+            else:
+                self._finish(
+                    row["id"],
+                    success=False,
+                    error_code=code,
+                    retry_after_seconds=min(
+                        3600,
+                        self.interval_seconds * 2,
+                    ),
+                )
             return {
                 "schema_version": 1,
                 "status": "failed",
@@ -521,21 +605,81 @@ def run_managed_worker(
             os.environ.get("RECALL_CANONICAL_EMBED_MAX_BATCHES", "1")
         ),
     )
-    cycles = committed = failed = 0
+    projection_enabled = os.environ.get("RECALL_MANAGED_PROJECTIONS_ENABLED") == "1"
+    logical_projector = passage_projector = None
+    if projection_enabled:
+        evidence_projection = LogicalEvidenceProjectionStore(
+            build_evidence_archive_store(),
+            part_upload_concurrency=MANAGED_PROJECTION_CONCURRENCY,
+        )
+        logical_projector = CanonicalLogicalEvidenceProjector(
+            store,
+            evidence_projection,
+            raw_archive=worker.archive,
+        )
+        passage_projector = CanonicalPassageProjector(
+            store,
+            evidence_projection,
+            policy=DEFAULT_PASSAGE_POLICY,
+        )
+    cycles = committed = failed = projection_failures = 0
     while True:
         result = worker.run_once()
+        projection: dict[str, int | str] = {
+            "status": "disabled",
+            "logical_documents": 0,
+            "logical_records": 0,
+            "passage_documents": 0,
+            "passages": 0,
+            "passage_embeddings": 0,
+        }
+        if logical_projector is not None and passage_projector is not None:
+            try:
+                projection = _run_projection_cycle(
+                    logical_projector,
+                    passage_projector,
+                )
+            except Exception as error:
+                projection_failures += 1
+                projection["status"] = "failed"
+                LOG.error(
+                    "managed projection cycle failed type=%s",
+                    type(error).__name__,
+                )
         cycles += 1
         committed += int(result["committed"])
         failed += int(result["failed"])
         if once:
             return {
                 "schema_version": 1,
-                "status": result["status"],
+                "status": (
+                    "projection_failed"
+                    if projection["status"] == "failed"
+                    else result["status"]
+                ),
                 "cycles": cycles,
                 "committed": committed,
                 "failed": failed,
+                "projection_failures": projection_failures,
+                **{
+                    key: value
+                    for key, value in projection.items()
+                    if key != "status"
+                },
             }
-        time.sleep(1 if result["processed"] else min(interval_seconds, 30))
+        projection_activity = sum(
+            int(projection[key])
+            for key in (
+                "logical_documents",
+                "passage_documents",
+                "passage_embeddings",
+            )
+        )
+        time.sleep(
+            1
+            if result["processed"] or projection_activity
+            else min(interval_seconds, 30)
+        )
 
 
 __all__ = [

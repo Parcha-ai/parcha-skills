@@ -10,10 +10,14 @@ from urllib.parse import unquote, urlsplit
 from contracts.v2 import ContractError, IDENTITY_RE, validate_contract
 
 from .db import BrainStore
-from .projectors import validate_envelope
+from .canonical_text import (
+    MAX_CANONICAL_CHUNK_BYTES as MAX_CANONICAL_CHUNK_BYTES,
+    MAX_CANONICAL_TEXT_BYTES,
+    canonical_text_chunks,
+)
+from .logical_evidence_projection import mark_logical_evidence_dirty
+from .projectors import item_receipt, validate_envelope
 
-MAX_CANONICAL_TEXT_BYTES = 8_000_000
-MAX_CANONICAL_CHUNK_BYTES = 24_000
 MAX_LINKED_IDENTITIES = 10_000
 MAX_CANONICAL_BATCH_EVENTS = 1_000
 
@@ -88,34 +92,51 @@ def _linked_native_ids(
     ]
 
 
-def canonical_text_chunks(text: str) -> list[str]:
-    """Split retrieval text into lossless, embedding-safe UTF-8 chunks."""
-    if not isinstance(text, str):
-        raise TypeError("canonical text must be a string")
-    encoded = text.encode()
-    if not encoded:
-        return [""]
-    chunks: list[str] = []
-    offset = 0
-    while offset < len(encoded):
-        end = min(offset + MAX_CANONICAL_CHUNK_BYTES, len(encoded))
-        while end < len(encoded) and end > offset and encoded[end] & 0xC0 == 0x80:
-            end -= 1
-        if end == offset:
-            raise ValueError("canonical chunk boundary is invalid")
-        candidate = encoded[offset:end].decode()
-        if end < len(encoded):
-            window_start = max(0, len(candidate) - 2_048)
-            split = max(
-                candidate.rfind("\n", window_start),
-                candidate.rfind(" ", window_start),
-            )
-            if split >= window_start:
-                candidate = candidate[: split + 1]
-                end = offset + len(candidate.encode())
-        chunks.append(candidate)
-        offset = end
-    return chunks
+def _linked_native_ids_batch(
+    conn: Any,
+    *,
+    tenant_id: str,
+    source_id: str,
+    native_ids: list[str],
+) -> list[str]:
+    """Resolve tombstone descendants for many roots in one database round trip."""
+    rows = conn.execute(
+        """WITH RECURSIVE roots(root_native_id) AS (
+               SELECT DISTINCT value FROM unnest(%s::text[]) AS item(value)
+           ), linked(root_native_id,native_id) AS (
+               SELECT root.root_native_id,event.native_id
+               FROM roots root
+               JOIN canonical_events event
+                 ON event.tenant_id=%s AND event.source_id=%s
+                AND event.native_parent_id=root.root_native_id
+               UNION
+               SELECT parent.root_native_id,event.native_id
+               FROM canonical_events event
+               JOIN linked parent ON event.native_parent_id=parent.native_id
+               WHERE event.tenant_id=%s AND event.source_id=%s
+           ), bounded AS (
+               SELECT root_native_id,native_id,
+                      row_number() OVER (
+                          PARTITION BY root_native_id ORDER BY native_id
+                      ) AS ordinal
+               FROM linked
+           )
+           SELECT root_native_id,native_id,ordinal
+           FROM bounded
+           WHERE ordinal <= %s
+           ORDER BY root_native_id,ordinal""",
+        (
+            native_ids,
+            tenant_id,
+            source_id,
+            tenant_id,
+            source_id,
+            MAX_LINKED_IDENTITIES + 1,
+        ),
+    ).fetchall()
+    if any(int(row["ordinal"]) > MAX_LINKED_IDENTITIES for row in rows):
+        raise CanonicalLifecycleError("canonical_lineage_limit")
+    return sorted({*native_ids, *(row["native_id"] for row in rows)})
 
 
 def _timestamp(value: Any) -> str:
@@ -148,7 +169,9 @@ class CanonicalArchiveGateway:
         principal_id: str,
     ):
         CanonicalPlane._validate_host_identity(
-            tenant_id, principal_id, "source:placeholder",
+            tenant_id,
+            principal_id,
+            "source:placeholder",
         )
         self.store = store
         self.archive = archive
@@ -168,7 +191,9 @@ class CanonicalArchiveGateway:
         if tenant_id != self.tenant_id:
             raise CanonicalLifecycleError("archive_authority_forbidden")
         CanonicalPlane._validate_host_identity(
-            tenant_id, self.principal_id, source_id,
+            tenant_id,
+            self.principal_id,
+            source_id,
         )
         if not isinstance(native_id, str) or not IDENTITY_RE.fullmatch(native_id):
             raise CanonicalLifecycleError("archive_identity_invalid")
@@ -312,7 +337,8 @@ class CanonicalPlane:
             raise CanonicalLifecycleError("canonical_text_invalid")
         try:
             artifact = validate_contract(
-                artifact_ref, expected="recall.artifact-ref.v1",
+                artifact_ref,
+                expected="recall.artifact-ref.v1",
             )
             event = validate_envelope(envelope)
         except (ContractError, ValueError):
@@ -334,22 +360,14 @@ class CanonicalPlane:
         job_id = _opaque("job", tenant_id, source_id, connector_id, event_id)
         document_id = _opaque("doc", tenant_id, source_id, event_id)
         text_sha256 = hashlib.sha256(text_redacted.encode()).hexdigest()
-        chunk_texts = (
-            []
-            if is_tombstone
-            else canonical_text_chunks(text_redacted)
-        )
+        chunk_texts = [] if is_tombstone else canonical_text_chunks(text_redacted)
 
         connection_context = (
-            self.store.connect()
-            if _connection is None
-            else nullcontext(_connection)
+            self.store.connect() if _connection is None else nullcontext(_connection)
         )
         with connection_context as conn:
             transaction_context = (
-                conn.transaction()
-                if _connection is None
-                else nullcontext()
+                conn.transaction() if _connection is None else nullcontext()
             )
             with transaction_context:
                 self._register_source(
@@ -377,10 +395,16 @@ class CanonicalPlane:
                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                        ON CONFLICT(tenant_id,source_id,artifact_id) DO NOTHING""",
                     (
-                        tenant_id, source_id, artifact["artifact_id"],
-                        artifact["storage_backend"], artifact["object_key"],
-                        raw_sha256, artifact["size_bytes"], artifact["media_type"],
-                        artifact["encryption"], artifact["version_id"],
+                        tenant_id,
+                        source_id,
+                        artifact["artifact_id"],
+                        artifact["storage_backend"],
+                        artifact["object_key"],
+                        raw_sha256,
+                        artifact["size_bytes"],
+                        artifact["media_type"],
+                        artifact["encryption"],
+                        artifact["version_id"],
                         artifact["created_at"],
                     ),
                 )
@@ -394,8 +418,13 @@ class CanonicalPlane:
                 expected_artifact = {
                     key: artifact[key]
                     for key in (
-                        "storage_backend", "object_key", "content_sha256", "size_bytes",
-                        "media_type", "encryption", "version_id",
+                        "storage_backend",
+                        "object_key",
+                        "content_sha256",
+                        "size_bytes",
+                        "media_type",
+                        "encryption",
+                        "version_id",
                     )
                 }
                 if (
@@ -448,10 +477,20 @@ class CanonicalPlane:
                            occurred_at,observed_at,is_tombstone,canonical_redacted
                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                     (
-                        tenant_id, source_id, event_id, native_id,
-                        event.get("native_parent_id"), artifact["artifact_id"], job_id,
-                        event["kind"], event_sha256, revision, event["occurred_at"],
-                        event["observed_at"], is_tombstone, json.dumps(event),
+                        tenant_id,
+                        source_id,
+                        event_id,
+                        native_id,
+                        event.get("native_parent_id"),
+                        artifact["artifact_id"],
+                        job_id,
+                        event["kind"],
+                        event_sha256,
+                        revision,
+                        event["occurred_at"],
+                        event["observed_at"],
+                        is_tombstone,
+                        json.dumps(event),
                     ),
                 )
                 affected_native_ids = (
@@ -492,9 +531,16 @@ class CanonicalPlane:
                                content_sha256,revision,is_current,text_redacted,text_sha256
                            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,true,%s,%s)""",
                         (
-                            tenant_id, source_id, document_id, event_id,
-                            artifact["artifact_id"], native_id, event_sha256, revision,
-                            text_redacted, text_sha256,
+                            tenant_id,
+                            source_id,
+                            document_id,
+                            event_id,
+                            artifact["artifact_id"],
+                            native_id,
+                            event_sha256,
+                            revision,
+                            text_redacted,
+                            text_sha256,
                         ),
                     )
                     with conn.cursor() as cursor:
@@ -516,9 +562,11 @@ class CanonicalPlane:
                                     ),
                                     document_id,
                                     ordinal,
-                                    (
-                                        f"recall://{source_id}/{native_id}"
-                                        f"?rev={revision}#item={ordinal}"
+                                    item_receipt(
+                                        source_id,
+                                        native_id,
+                                        revision,
+                                        ordinal,
                                     ),
                                     chunk_text,
                                     hashlib.sha256(chunk_text.encode()).hexdigest(),
@@ -526,15 +574,24 @@ class CanonicalPlane:
                                 for ordinal, chunk_text in enumerate(chunk_texts)
                             ],
                         )
+                mark_logical_evidence_dirty(
+                    conn,
+                    tenant_id=tenant_id,
+                    source_id=source_id,
+                    native_ids=affected_native_ids,
+                    reason="ingest",
+                )
                 conn.execute(
                     """INSERT INTO canonical_audit_events(
                            tenant_id,source_id,audit_id,operation,status,
                            subject_sha256,item_count,byte_count
                        ) VALUES (%s,%s,%s,'ingest.commit','success',%s,1,%s)""",
                     (
-                        tenant_id, source_id,
+                        tenant_id,
+                        source_id,
                         _opaque("audit", tenant_id, source_id, event_id, "ingest"),
-                        identity_sha256, artifact["size_bytes"],
+                        identity_sha256,
+                        artifact["size_bytes"],
                     ),
                 )
         return {
@@ -559,11 +616,11 @@ class CanonicalPlane:
         ):
             raise CanonicalLifecycleError("canonical_batch_invalid")
         if (
-            all(event.get("kind") != "tombstone" for event in events)
+            len({event.get("kind") == "tombstone" for event in events}) == 1
             and len({event.get("native_id") for event in events}) == len(events)
             and len({event.get("source_id") for event in events}) == 1
         ):
-            return self._ingest_live_batch(
+            return self._ingest_set_batch(
                 tenant_id=tenant_id,
                 principal_id=principal_id,
                 events=events,
@@ -582,46 +639,213 @@ class CanonicalPlane:
                         ensure_ascii=False,
                         allow_nan=False,
                     )
-                    results.append(self.ingest_document(
-                        tenant_id=tenant_id,
-                        principal_id=principal_id,
-                        connector_id=connector_id,
-                        artifact_ref=artifact_ref,
-                        envelope=envelope,
-                        text_redacted=(
-                            ""
-                            if envelope.get("kind") == "tombstone"
-                            else text_redacted
-                        ),
-                        _connection=connection,
-                    ))
+                    results.append(
+                        self.ingest_document(
+                            tenant_id=tenant_id,
+                            principal_id=principal_id,
+                            connector_id=connector_id,
+                            artifact_ref=artifact_ref,
+                            envelope=envelope,
+                            text_redacted=(
+                                ""
+                                if envelope.get("kind") == "tombstone"
+                                else text_redacted
+                            ),
+                            _connection=connection,
+                        )
+                    )
         return {
             "status": "committed",
             "inserted": sum(result["inserted"] for result in results),
-            "duplicate_events": sum(
-                result["duplicate_events"] for result in results
-            ),
+            "duplicate_events": sum(result["duplicate_events"] for result in results),
             "receipts": [result["receipt"] for result in results],
             "replay": all(result["replay"] for result in results),
         }
 
-    def _ingest_live_batch(
+    def source_status(
+        self,
+        *,
+        tenant_id: str,
+        principal_id: str,
+        source_id: str,
+    ) -> dict[str, Any]:
+        """Return content-free corpus and projection parity for one source."""
+        self._validate_host_identity(tenant_id, principal_id, source_id)
+        with self.store.connect() as connection:
+            owner = connection.execute(
+                """SELECT owner_principal_id
+                   FROM canonical_sources
+                   WHERE tenant_id=%s AND source_id=%s""",
+                (tenant_id, source_id),
+            ).fetchone()
+            if owner is None or owner["owner_principal_id"] != principal_id:
+                raise CanonicalLifecycleError("canonical_authority_forbidden")
+            row = connection.execute(
+                """WITH latest AS (
+                       SELECT DISTINCT ON (native_id)
+                              native_id,native_parent_id,revision,is_tombstone
+                       FROM canonical_events
+                       WHERE tenant_id=%s AND source_id=%s
+                       ORDER BY native_id,revision DESC
+                   ), expected AS (
+                       SELECT native_id,native_parent_id,revision
+                       FROM latest WHERE NOT is_tombstone
+                   ), current_documents AS (
+                       SELECT document.native_id,document.revision,
+                              document.document_id,event.native_parent_id,
+                              document.text_redacted
+                       FROM canonical_documents document
+                       JOIN canonical_events event
+                         ON event.tenant_id=document.tenant_id
+                        AND event.source_id=document.source_id
+                        AND event.event_id=document.event_id
+                       WHERE document.tenant_id=%s
+                         AND document.source_id=%s
+                         AND document.is_current
+                         AND document.deleted_at IS NULL
+                   ), expected_parents AS (
+                       SELECT DISTINCT native_parent_id
+                       FROM current_documents
+                       WHERE native_parent_id IS NOT NULL
+                   )
+                   SELECT
+                     (SELECT count(*) FROM latest) AS latest_events,
+                     (SELECT count(*) FROM expected) AS live_events,
+                     (SELECT count(*) FROM latest WHERE is_tombstone)
+                       AS tombstoned_identities,
+                     (SELECT count(*) FROM current_documents)
+                       AS current_documents,
+                     (SELECT count(*)
+                        FROM expected item
+                        LEFT JOIN current_documents document
+                          ON document.native_id=item.native_id
+                         AND document.revision=item.revision
+                       WHERE document.native_id IS NULL)
+                       AS missing_current_documents,
+                     (SELECT count(*)
+                        FROM current_documents document
+                        LEFT JOIN expected item
+                          ON item.native_id=document.native_id
+                         AND item.revision=document.revision
+                       WHERE item.native_id IS NULL)
+                       AS stale_current_documents,
+                     (SELECT count(*) FROM current_documents
+                       WHERE text_redacted='') AS empty_current_documents,
+                     (SELECT count(*) FROM expected_parents)
+                       AS logical_documents_expected,
+                     (SELECT count(*) FROM canonical_evidence_documents
+                       WHERE tenant_id=%s AND source_id=%s)
+                       AS logical_documents,
+                     (SELECT count(*)
+                        FROM expected_parents parent
+                        LEFT JOIN canonical_evidence_documents document
+                          ON document.tenant_id=%s
+                         AND document.source_id=%s
+                         AND document.native_parent_id=parent.native_parent_id
+                       WHERE document.logical_document_id IS NULL)
+                       AS missing_logical_documents,
+                     (SELECT count(*)
+                        FROM canonical_evidence_documents document
+                        LEFT JOIN expected_parents parent
+                          ON parent.native_parent_id=document.native_parent_id
+                       WHERE document.tenant_id=%s AND document.source_id=%s
+                         AND parent.native_parent_id IS NULL)
+                       AS stale_logical_documents,
+                     (SELECT count(*) FROM canonical_evidence_document_parts
+                       WHERE tenant_id=%s AND source_id=%s)
+                       AS logical_document_parts,
+                     (SELECT count(*) FROM canonical_evidence_document_queue
+                       WHERE tenant_id=%s AND source_id=%s)
+                       AS logical_queue,
+                     (SELECT count(*) FROM canonical_evidence_cleanup_queue
+                       WHERE tenant_id=%s AND source_id=%s)
+                       AS cleanup_queue,
+                     (SELECT count(*) FROM canonical_passage_documents
+                       WHERE tenant_id=%s AND source_id=%s)
+                       AS passage_documents,
+                     (SELECT count(*)
+                        FROM canonical_evidence_documents document
+                        LEFT JOIN canonical_passage_documents passage_document
+                          ON passage_document.tenant_id=document.tenant_id
+                         AND passage_document.source_id=document.source_id
+                         AND passage_document.logical_document_id=
+                             document.logical_document_id
+                       WHERE document.tenant_id=%s AND document.source_id=%s
+                         AND passage_document.logical_document_id IS NULL)
+                       AS missing_passage_documents,
+                     (SELECT count(*) FROM canonical_passage_projection_queue
+                       WHERE tenant_id=%s AND source_id=%s)
+                       AS passage_queue,
+                     (SELECT count(*) FROM canonical_passages
+                       WHERE tenant_id=%s AND source_id=%s) AS passages,
+                     (SELECT count(*) FROM canonical_passage_embeddings
+                       WHERE tenant_id=%s AND source_id=%s) AS passage_embeddings,
+                     (SELECT count(*)
+                        FROM canonical_passages passage
+                        LEFT JOIN canonical_passage_embeddings embedding
+                          ON embedding.tenant_id=passage.tenant_id
+                         AND embedding.source_id=passage.source_id
+                         AND embedding.passage_id=passage.passage_id
+                         AND embedding.content_sha256=passage.text_sha256
+                       WHERE passage.tenant_id=%s AND passage.source_id=%s
+                         AND embedding.passage_id IS NULL)
+                       AS missing_passage_embeddings""",
+                (
+                    tenant_id,
+                    source_id,
+                    tenant_id,
+                    source_id,
+                    tenant_id,
+                    source_id,
+                    tenant_id,
+                    source_id,
+                    tenant_id,
+                    source_id,
+                    tenant_id,
+                    source_id,
+                    tenant_id,
+                    source_id,
+                    tenant_id,
+                    source_id,
+                    tenant_id,
+                    source_id,
+                    tenant_id,
+                    source_id,
+                    tenant_id,
+                    source_id,
+                    tenant_id,
+                    source_id,
+                    tenant_id,
+                    source_id,
+                    tenant_id,
+                    source_id,
+                ),
+            ).fetchone()
+        return {
+            "status": "ok",
+            "tenant_id": tenant_id,
+            "source_id": source_id,
+            **{key: int(value) for key, value in row.items()},
+        }
+
+    def _ingest_set_batch(
         self,
         *,
         tenant_id: str,
         principal_id: str,
         events: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        """Commit independent live documents with set-based remote SQL.
+        """Commit one homogeneous event batch with set-based remote SQL.
 
-        Tombstones and duplicate native identities intentionally stay on the
-        lineage-aware sequential path. This path removes per-event database
-        round trips while preserving the same contracts, locks, revisions,
-        artifact checks, receipts, and audit records.
+        Duplicate native identities intentionally stay on the lineage-aware
+        sequential path. Homogeneous tombstone batches resolve descendants in
+        one recursive query. The path preserves the same contracts, locks,
+        revisions, artifact checks, receipts, and audit records.
         """
         prepared: list[dict[str, Any]] = []
         artifacts: dict[str, dict[str, Any]] = {}
         source_ids: set[str] = set()
+        tombstone_modes: set[bool] = set()
         for envelope in events:
             provenance = envelope.get("provenance", {})
             connector_id = provenance.get("connector_id")
@@ -645,6 +869,8 @@ class CanonicalPlane:
             )
             source_id = event["source_id"]
             source_ids.add(source_id)
+            is_tombstone = event["kind"] == "tombstone"
+            tombstone_modes.add(is_tombstone)
             if (
                 artifact["tenant_id"] != tenant_id
                 or artifact["source_id"] != source_id
@@ -652,12 +878,16 @@ class CanonicalPlane:
                 or event.get("provenance", {}).get("artifact_ref") != artifact
             ):
                 raise CanonicalLifecycleError("canonical_lineage_invalid")
-            text_redacted = json.dumps(
-                event.get("content"),
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=False,
-                allow_nan=False,
+            text_redacted = (
+                ""
+                if is_tombstone
+                else json.dumps(
+                    event.get("content"),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
             )
             if len(text_redacted.encode()) > MAX_CANONICAL_TEXT_BYTES:
                 raise CanonicalLifecycleError("canonical_text_invalid")
@@ -704,15 +934,17 @@ class CanonicalPlane:
                         event_id,
                     ),
                     "text_redacted": text_redacted,
-                    "text_sha256": hashlib.sha256(
-                        text_redacted.encode()
-                    ).hexdigest(),
-                    "chunks": canonical_text_chunks(text_redacted),
+                    "text_sha256": hashlib.sha256(text_redacted.encode()).hexdigest(),
+                    "chunks": (
+                        [] if is_tombstone else canonical_text_chunks(text_redacted)
+                    ),
+                    "is_tombstone": is_tombstone,
                 }
             )
-        if len(source_ids) != 1:
+        if len(source_ids) != 1 or len(tombstone_modes) != 1:
             raise CanonicalLifecycleError("canonical_batch_invalid")
         source_id = next(iter(source_ids))
+        is_tombstone_batch = next(iter(tombstone_modes))
         native_ids = [item["native_id"] for item in prepared]
         lock_keys = sorted(
             f"v2\x1f{tenant_id}\x1f{source_id}\x1f{native_id}"
@@ -797,9 +1029,7 @@ class CanonicalPlane:
                         list(artifacts),
                     ),
                 ).fetchall()
-                stored_by_id = {
-                    row["artifact_id"]: row for row in stored_artifacts
-                }
+                stored_by_id = {row["artifact_id"]: row for row in stored_artifacts}
                 for artifact_id, artifact in artifacts.items():
                     stored = stored_by_id.get(artifact_id)
                     if (
@@ -837,7 +1067,7 @@ class CanonicalPlane:
                         max_revision.get(row["native_id"], 0),
                         int(row["revision"]),
                     )
-                live_rows: list[dict[str, Any]] = []
+                new_rows: list[dict[str, Any]] = []
                 results: list[dict[str, Any]] = []
                 for item in prepared:
                     prior_revision = exact_prior.get(
@@ -851,8 +1081,7 @@ class CanonicalPlane:
                                 "duplicate_events": 1,
                                 "revision": revision,
                                 "receipt": (
-                                    f"recall://{source_id}/{item['native_id']}"
-                                    f"?rev={revision}#item=0"
+                                    f"recall://{source_id}/{item['native_id']}?rev={revision}#item=0"
                                 ),
                                 "replay": True,
                             }
@@ -861,10 +1090,9 @@ class CanonicalPlane:
                     revision = max_revision.get(item["native_id"], 0) + 1
                     item["revision"] = revision
                     item["receipt"] = (
-                        f"recall://{source_id}/{item['native_id']}"
-                        f"?rev={revision}#item=0"
+                        f"recall://{source_id}/{item['native_id']}?rev={revision}#item=0"
                     )
-                    live_rows.append(item)
+                    new_rows.append(item)
                     results.append(
                         {
                             "inserted": 1,
@@ -875,24 +1103,52 @@ class CanonicalPlane:
                         }
                     )
 
-                if live_rows:
+                if new_rows:
+                    affected_native_ids = [
+                        item["native_id"] for item in new_rows
+                    ]
+                    if is_tombstone_batch:
+                        affected_native_ids = _linked_native_ids_batch(
+                            connection,
+                            tenant_id=tenant_id,
+                            source_id=source_id,
+                            native_ids=affected_native_ids,
+                        )
                     connection.execute(
                         """UPDATE canonical_documents
-                           SET is_current=false
+                           SET is_current=false,
+                               deleted_at=CASE
+                                   WHEN %s THEN now() ELSE deleted_at
+                               END
                            WHERE tenant_id=%s AND source_id=%s
                              AND native_id=ANY(%s) AND is_current""",
                         (
+                            is_tombstone_batch,
                             tenant_id,
                             source_id,
-                            [item["native_id"] for item in live_rows],
+                            affected_native_ids,
                         ),
                     )
+                    if is_tombstone_batch:
+                        connection.execute(
+                            """UPDATE canonical_chunks chunk
+                               SET deleted_at=now()
+                               FROM canonical_documents document
+                               WHERE chunk.tenant_id=document.tenant_id
+                                 AND chunk.source_id=document.source_id
+                                 AND chunk.document_id=document.document_id
+                                 AND document.tenant_id=%s
+                                 AND document.source_id=%s
+                                 AND document.native_id=ANY(%s)
+                                 AND chunk.deleted_at IS NULL""",
+                            (tenant_id, source_id, affected_native_ids),
+                        )
                     job_rows = [
                         {
                             "job_id": item["job_id"],
                             "connector_id": item["connector_id"],
                         }
-                        for item in live_rows
+                        for item in new_rows
                     ]
                     connection.execute(
                         """INSERT INTO canonical_ingest_jobs(
@@ -923,9 +1179,10 @@ class CanonicalPlane:
                             "revision": item["revision"],
                             "occurred_at": item["event"]["occurred_at"],
                             "observed_at": item["event"]["observed_at"],
+                            "is_tombstone": item["is_tombstone"],
                             "canonical_redacted": item["event"],
                         }
-                        for item in live_rows
+                        for item in new_rows
                     ]
                     connection.execute(
                         """INSERT INTO canonical_events(
@@ -936,13 +1193,14 @@ class CanonicalPlane:
                            SELECT %s,%s,row.event_id,row.native_id,
                                   row.native_parent_id,row.artifact_id,row.job_id,
                                   row.kind,row.content_sha256,row.revision,
-                                  row.occurred_at,row.observed_at,false,
+                                  row.occurred_at,row.observed_at,row.is_tombstone,
                                   row.canonical_redacted
                            FROM jsonb_to_recordset(%s::jsonb) AS row(
                                event_id text,native_id text,native_parent_id text,
                                artifact_id text,job_id text,kind text,
                                content_sha256 char(64),revision integer,
                                occurred_at timestamptz,observed_at timestamptz,
+                               is_tombstone boolean,
                                canonical_redacted jsonb
                            )""",
                         (
@@ -962,10 +1220,12 @@ class CanonicalPlane:
                             "text_redacted": item["text_redacted"],
                             "text_sha256": item["text_sha256"],
                         }
-                        for item in live_rows
+                        for item in new_rows
+                        if not item["is_tombstone"]
                     ]
-                    connection.execute(
-                        """INSERT INTO canonical_documents(
+                    if document_rows:
+                        connection.execute(
+                            """INSERT INTO canonical_documents(
                                tenant_id,source_id,document_id,event_id,artifact_id,
                                native_id,content_sha256,revision,is_current,
                                text_redacted,text_sha256
@@ -979,12 +1239,12 @@ class CanonicalPlane:
                                revision integer,text_redacted text,
                                text_sha256 char(64)
                            )""",
-                        (
-                            tenant_id,
-                            source_id,
-                            json.dumps(document_rows),
-                        ),
-                    )
+                            (
+                                tenant_id,
+                                source_id,
+                                json.dumps(document_rows),
+                            ),
+                        )
                     chunk_rows = [
                         {
                             "chunk_id": _opaque(
@@ -996,20 +1256,24 @@ class CanonicalPlane:
                             ),
                             "document_id": item["document_id"],
                             "ordinal": ordinal,
-                            "receipt": (
-                                f"recall://{source_id}/{item['native_id']}"
-                                f"?rev={item['revision']}#item={ordinal}"
+                            "receipt": item_receipt(
+                                source_id,
+                                item["native_id"],
+                                item["revision"],
+                                ordinal,
                             ),
                             "text_redacted": chunk_text,
                             "text_sha256": hashlib.sha256(
                                 chunk_text.encode()
                             ).hexdigest(),
                         }
-                        for item in live_rows
+                        for item in new_rows
+                        if not item["is_tombstone"]
                         for ordinal, chunk_text in enumerate(item["chunks"])
                     ]
-                    connection.execute(
-                        """INSERT INTO canonical_chunks(
+                    if chunk_rows:
+                        connection.execute(
+                            """INSERT INTO canonical_chunks(
                                tenant_id,source_id,chunk_id,document_id,ordinal,
                                receipt,text_redacted,text_sha256
                            )
@@ -1019,11 +1283,18 @@ class CanonicalPlane:
                                chunk_id text,document_id text,ordinal integer,
                                receipt text,text_redacted text,text_sha256 char(64)
                            )""",
-                        (
-                            tenant_id,
-                            source_id,
-                            json.dumps(chunk_rows),
-                        ),
+                            (
+                                tenant_id,
+                                source_id,
+                                json.dumps(chunk_rows),
+                            ),
+                        )
+                    mark_logical_evidence_dirty(
+                        connection,
+                        tenant_id=tenant_id,
+                        source_id=source_id,
+                        native_ids=affected_native_ids,
+                        reason="ingest",
                     )
                     audit_rows = [
                         {
@@ -1037,7 +1308,7 @@ class CanonicalPlane:
                             "subject_sha256": item["identity_sha256"],
                             "byte_count": item["artifact"]["size_bytes"],
                         }
-                        for item in live_rows
+                        for item in new_rows
                     ]
                     connection.execute(
                         """INSERT INTO canonical_audit_events(
@@ -1059,9 +1330,7 @@ class CanonicalPlane:
         return {
             "status": "committed",
             "inserted": sum(result["inserted"] for result in results),
-            "duplicate_events": sum(
-                result["duplicate_events"] for result in results
-            ),
+            "duplicate_events": sum(result["duplicate_events"] for result in results),
             "receipts": [result["receipt"] for result in results],
             "replay": all(result["replay"] for result in results),
         }
@@ -1101,9 +1370,16 @@ class CanonicalPlane:
                 **{
                     key: row[key]
                     for key in (
-                        "tenant_id", "source_id", "artifact_id", "storage_backend",
-                        "object_key", "content_sha256", "size_bytes", "media_type",
-                        "encryption", "version_id",
+                        "tenant_id",
+                        "source_id",
+                        "artifact_id",
+                        "storage_backend",
+                        "object_key",
+                        "content_sha256",
+                        "size_bytes",
+                        "media_type",
+                        "encryption",
+                        "version_id",
                     )
                 },
                 "created_at": _timestamp(row["created_at"]),
@@ -1192,8 +1468,13 @@ class CanonicalPlane:
                                deleted_at,status,idempotency_key
                            ) VALUES (%s,%s,%s,%s,%s,%s,'deleting',%s)""",
                         (
-                            tenant_id, source_id, target_sha256, value["mode"], reason,
-                            value["requested_at"], value["idempotency_key"],
+                            tenant_id,
+                            source_id,
+                            target_sha256,
+                            value["mode"],
+                            reason,
+                            value["requested_at"],
+                            value["idempotency_key"],
                         ),
                     )
                 for child_hash in identity_hashes[1:]:
@@ -1205,7 +1486,11 @@ class CanonicalPlane:
                            ON CONFLICT(tenant_id,source_id,target_identity_sha256)
                            DO NOTHING""",
                         (
-                            tenant_id, source_id, child_hash, value["mode"], reason,
+                            tenant_id,
+                            source_id,
+                            child_hash,
+                            value["mode"],
+                            reason,
                             value["requested_at"],
                         ),
                     )
@@ -1260,6 +1545,13 @@ class CanonicalPlane:
                          )""",
                     (tenant_id, source_id, native_ids, native_ids),
                 )
+                mark_logical_evidence_dirty(
+                    conn,
+                    tenant_id=tenant_id,
+                    source_id=source_id,
+                    native_ids=native_ids,
+                    reason="forget",
+                )
 
         evidence_deleted = 0
         try:
@@ -1280,12 +1572,18 @@ class CanonicalPlane:
                        ) VALUES (%s,%s,%s,'forget.archive','failed',%s,%s)
                        ON CONFLICT DO NOTHING""",
                     (
-                        tenant_id, source_id,
+                        tenant_id,
+                        source_id,
                         _opaque(
-                            "audit", tenant_id, source_id, target_sha256,
-                            value["idempotency_key"], "failed",
+                            "audit",
+                            tenant_id,
+                            source_id,
+                            target_sha256,
+                            value["idempotency_key"],
+                            "failed",
                         ),
-                        target_sha256, len(references),
+                        target_sha256,
+                        len(references),
                     ),
                 )
             raise CanonicalLifecycleError("archive_delete_failed") from None
@@ -1333,12 +1631,18 @@ class CanonicalPlane:
                            subject_sha256,item_count,byte_count
                        ) VALUES (%s,%s,%s,'forget.commit','success',%s,%s,%s)""",
                     (
-                        tenant_id, source_id,
+                        tenant_id,
+                        source_id,
                         _opaque(
-                            "audit", tenant_id, source_id, target_sha256,
-                            value["idempotency_key"], "success",
+                            "audit",
+                            tenant_id,
+                            source_id,
+                            target_sha256,
+                            value["idempotency_key"],
+                            "success",
                         ),
-                        target_sha256, projection_count,
+                        target_sha256,
+                        projection_count,
                         sum(reference["size_bytes"] for reference in references),
                     ),
                 )

@@ -159,6 +159,77 @@ def main() -> None:
             ).fetchone()
         if tuple(row.values()) != (1, 2):
             raise RuntimeError("event identity incorrectly inherited bundle identity")
+        live_status = plane.source_status(
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            source_id=source_id,
+        )
+        if (
+            live_status["live_events"] != 2
+            or live_status["current_documents"] != 2
+            or live_status["missing_current_documents"] != 0
+            or live_status["empty_current_documents"] != 0
+            or live_status["logical_documents_expected"] != 2
+        ):
+            raise RuntimeError("source status did not report live document parity")
+
+        tombstones = []
+        for index in range(2):
+            native_id = f"native:bulk:{index}"
+            tombstone = event(
+                source_id=source_id,
+                principal_id=principal_id,
+                native_id=native_id,
+                content={"target_native_id": native_id},
+                artifact=artifact,
+                created_at="2026-07-24T07:10:00Z",
+            )
+            tombstone["kind"] = "tombstone"
+            tombstones.append(tombstone)
+        tombstone_first = plane.ingest_batch(
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            events=tombstones,
+        )
+        tombstone_replay = plane.ingest_batch(
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            events=tombstones,
+        )
+        if tombstone_first["inserted"] != 2 or not tombstone_replay["replay"]:
+            raise RuntimeError("bulk tombstone replay was not idempotent")
+        with store.connect() as connection:
+            lifecycle = connection.execute(
+                """SELECT
+                     (SELECT count(*) FROM canonical_events
+                       WHERE tenant_id=%s AND source_id=%s
+                         AND is_tombstone) AS tombstones,
+                     (SELECT count(*) FROM canonical_documents
+                       WHERE tenant_id=%s AND source_id=%s
+                         AND is_current) AS current_documents,
+                     (SELECT count(*) FROM canonical_chunks
+                       WHERE tenant_id=%s AND source_id=%s
+                         AND deleted_at IS NULL) AS current_chunks""",
+                (
+                    tenant_id, source_id,
+                    tenant_id, source_id,
+                    tenant_id, source_id,
+                ),
+            ).fetchone()
+        if tuple(lifecycle.values()) != (2, 0, 0):
+            raise RuntimeError("bulk tombstones left authoritative content current")
+        deleted_status = plane.source_status(
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            source_id=source_id,
+        )
+        if (
+            deleted_status["live_events"] != 0
+            or deleted_status["current_documents"] != 0
+            or deleted_status["missing_current_documents"] != 0
+            or deleted_status["stale_current_documents"] != 0
+        ):
+            raise RuntimeError("source status did not report tombstone parity")
 
         first_forget = forget(
             plane=plane,
@@ -205,6 +276,7 @@ def main() -> None:
     print(json.dumps({
         "status": "pass",
         "events": 2,
+        "tombstones": 2,
         "archive_objects": 1,
         "duplicate_events_on_replay": 2,
         "shared_delete_raw_count": 0,

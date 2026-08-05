@@ -17,6 +17,7 @@ from recall_server.invitation_email import (  # noqa: E402
     InvitationEmail,
     InvitationEmailError,
     ResendInvitationEmailSender,
+    codex_oauth_onboarding_from_env,
     installation_commands,
     invitation_message,
     invitation_urls,
@@ -51,6 +52,7 @@ class Opener:
 def invitation(**updates) -> InvitationEmail:
     values = {
         "invitation_id": "11111111-2222-4333-8444-555555555555",
+        "tenant_id": "tenant:company:synthetic",
         "recipient": "invitee@example.invalid",
         "organization_name": "Synthetic & Company",
         "brain_slug": "Engineering Brain",
@@ -106,6 +108,58 @@ class InvitationTemplateTest(unittest.TestCase):
             "11111111-2222-4333-8444-555555555555",
         )
 
+    def test_codex_static_oauth_client_uses_pkce_callback_override(self) -> None:
+        item = invitation(
+            codex_oauth_client_id="synthetic-public-client-id",
+            codex_oauth_callback_port=8765,
+        )
+
+        commands = installation_commands(item)["codex"]
+
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(commands[0], "npm install -g @openai/codex")
+        self.assertEqual(
+            commands[1],
+            "codex -c mcp_oauth_callback_port=8765 mcp add "
+            "recall-engineering-brain --url "
+            "https://recall.synthetic.invalid/mcp/brains/tenant:company:synthetic "
+            "--oauth-client-id synthetic-public-client-id "
+            "--oauth-resource https://recall.synthetic.invalid/mcp",
+        )
+
+    def test_codex_static_oauth_config_is_all_or_none_and_shell_safe(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "RECALL_CODEX_OAUTH_CLIENT_ID": "synthetic-public-client-id",
+                "RECALL_CODEX_OAUTH_CALLBACK_PORT": "8765",
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                codex_oauth_onboarding_from_env(),
+                ("synthetic-public-client-id", 8765),
+            )
+        for values in (
+            {"RECALL_CODEX_OAUTH_CLIENT_ID": "synthetic-public-client-id"},
+            {"RECALL_CODEX_OAUTH_CALLBACK_PORT": "8765"},
+            {
+                "RECALL_CODEX_OAUTH_CLIENT_ID": "unsafe client;id",
+                "RECALL_CODEX_OAUTH_CALLBACK_PORT": "8765",
+            },
+            {
+                "RECALL_CODEX_OAUTH_CLIENT_ID": "synthetic-public-client-id",
+                "RECALL_CODEX_OAUTH_CALLBACK_PORT": "0",
+            },
+        ):
+            with self.subTest(values=values), mock.patch.dict(
+                os.environ, values, clear=True
+            ):
+                with self.assertRaisesRegex(
+                    InvitationEmailError, "configuration_invalid"
+                ):
+                    codex_oauth_onboarding_from_env()
+
     def test_message_and_page_escape_dynamic_values_and_never_render_recipient(
         self,
     ) -> None:
@@ -121,6 +175,15 @@ class InvitationTemplateTest(unittest.TestCase):
         self.assertNotIn('<script>alert("x")</script>', page)
         self.assertIn("&lt;script&gt;", page)
         self.assertNotIn("invitee@example.invalid", page)
+
+    def test_pending_oauth_invitation_keeps_the_one_login_client_path(self) -> None:
+        page = onboarding_page(
+            invitation(identity_login_enabled=True, accepted=False)
+        ).decode()
+
+        self.assertIn("Add Recall in one paste", page)
+        self.assertIn("npm install -g @openai/codex", page)
+        self.assertIn("Or activate in this browser", page)
 
 
 class InvitationSenderTest(unittest.TestCase):

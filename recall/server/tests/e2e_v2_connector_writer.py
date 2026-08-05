@@ -219,6 +219,15 @@ def main() -> None:
                 "events", "documents", "chunks", "current_documents", "leaks",
             )) != (3, 2, 2, 0, 0):
                 raise RuntimeError("canonical revision or tombstone state failed")
+            status = CanonicalBrainWriter(**common).status()
+            if (
+                status["status"] != "ok"
+                or status["live_events"] != 0
+                or status["current_documents"] != 0
+                or status["missing_current_documents"] != 0
+                or status["tombstoned_identities"] != 1
+            ):
+                raise RuntimeError("canonical status endpoint lost lifecycle parity")
             private_spool = b"".join(
                 path.read_bytes()
                 for path in spool.parent.glob(spool.name + "*")

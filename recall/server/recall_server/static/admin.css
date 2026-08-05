@@ -241,7 +241,7 @@ select {
 .switch span::after { content: ""; position: absolute; width: 13px; height: 13px; left: 3px; top: 3px; background: var(--ink); border-radius: 50%; transition: .2s; }
 .switch input:checked + span { background: var(--acid); }
 .switch input:checked + span::after { transform: translateX(17px); }
-.connect-button, .auth-dialog button {
+.connect-button, .auth-dialog button, .oauth-login {
   margin-top: auto;
   border: 0;
   background: var(--ink);
@@ -257,7 +257,7 @@ select {
   cursor: pointer;
   transition: background .2s, color .2s;
 }
-.connect-button:hover, .auth-dialog button:hover { background: var(--blue); }
+.connect-button:hover, .auth-dialog button:hover, .oauth-login:hover { background: var(--blue); }
 .integration-grid { display: grid; grid-template-columns: repeat(3, 1fr); margin-top: 28px; gap: 18px; }
 .catalog-card { border: 1px solid var(--line); padding: 26px; min-height: 190px; }
 .catalog-card .provider-kicker { color: var(--muted); }
@@ -288,6 +288,9 @@ select {
 .auth-dialog label { display: block; margin: 28px 0 8px; font: 800 10px monospace; text-transform: uppercase; }
 .auth-dialog input { width: 100%; border: 1px solid; background: var(--paper-bright); padding: 15px; font: 13px monospace; }
 .auth-dialog button { width: 100%; margin-top: 18px; }
+.oauth-login { margin-top: 22px; text-decoration: none; }
+.auth-dialog details { margin-top: 22px; border-top: 1px solid rgba(18,26,20,.35); padding-top: 18px; }
+.auth-dialog summary { cursor: pointer; font: 800 10px monospace; text-transform: uppercase; }
 .error { min-height: 20px; color: #a42b13; font-weight: 700; }
 .toast { position: fixed; right: 24px; bottom: 24px; background: var(--ink); color: white; padding: 15px 20px; font: 700 11px monospace; transform: translateY(130px); transition: transform .25s; z-index: 30; }
 .toast.show { transform: translateY(0); }

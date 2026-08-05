@@ -27,8 +27,14 @@ from .invitation_email import (
     InvitationEmail,
     InvitationEmailError,
     InvitationEmailSender,
+    codex_oauth_onboarding_from_env,
     invitation_urls,
     sender_from_env,
+)
+from .identity_oauth import (
+    BrowserIdentity,
+    DescopeIdentityOAuth,
+    IdentityOAuthError,
 )
 from connectors.composio_workspace_rail import (
     ComposioWorkspaceRail,
@@ -754,12 +760,20 @@ class ControlPlane:
         providers: dict[str, OAuthProvider],
         invitation_email_sender: InvitationEmailSender | None = None,
         mcp_resource_uri: str = "",
+        codex_oauth_client_id: str = "",
+        codex_oauth_callback_port: int | None = None,
+        identity_provider: DescopeIdentityOAuth | None = None,
+        bootstrap_owner_emails: tuple[str, ...] = (),
     ):
         self.store = store
         self.secret_box = secret_box
         self.providers = dict(providers)
         self.invitation_email_sender = invitation_email_sender
         self.mcp_resource_uri = mcp_resource_uri
+        self.codex_oauth_client_id = codex_oauth_client_id
+        self.codex_oauth_callback_port = codex_oauth_callback_port
+        self.identity_provider = identity_provider
+        self.bootstrap_owner_emails = frozenset(bootstrap_owner_emails)
 
     @classmethod
     def from_env(cls, store: Any) -> "ControlPlane":
@@ -783,14 +797,41 @@ class ControlPlane:
             providers["composio"] = ComposioConnectionBroker.from_env()
         try:
             invitation_email_sender = sender_from_env()
+            codex_oauth_client_id, codex_oauth_callback_port = (
+                codex_oauth_onboarding_from_env()
+            )
+            identity_provider = DescopeIdentityOAuth.from_env()
         except InvitationEmailError:
             raise ControlError("invitation_email_configuration_invalid", 500) from None
+        except IdentityOAuthError:
+            raise ControlError("identity_oauth_configuration_invalid", 500) from None
+        raw_owner_emails = tuple(
+            value.strip()
+            for value in os.environ.get(
+                "RECALL_BOOTSTRAP_OWNER_EMAILS", ""
+            ).split(",")
+            if value.strip()
+        )
+        bootstrap_owner_emails = tuple(
+            email for email in (normalize_verified_email(value) for value in raw_owner_emails)
+            if email is not None
+        )
+        if (
+            len(raw_owner_emails) > 8
+            or len(bootstrap_owner_emails) != len(raw_owner_emails)
+            or len(set(bootstrap_owner_emails)) != len(bootstrap_owner_emails)
+        ):
+            raise ControlError("identity_oauth_configuration_invalid", 500)
         return cls(
             store,
             SecretBox.from_env(),
             providers,
             invitation_email_sender=invitation_email_sender,
             mcp_resource_uri=os.environ.get("RECALL_MCP_RESOURCE_URI", ""),
+            codex_oauth_client_id=codex_oauth_client_id,
+            codex_oauth_callback_port=codex_oauth_callback_port,
+            identity_provider=identity_provider,
+            bootstrap_owner_emails=bootstrap_owner_emails,
         )
 
     def create_admin_token(
@@ -860,9 +901,6 @@ class ControlPlane:
     def exchange_admin_token(self, token: str) -> dict[str, str]:
         if not isinstance(token, str) or not ADMIN_TOKEN_RE.fullmatch(token):
             raise ControlError("admin_auth_invalid", 401)
-        session = "rcs_" + secrets.token_urlsafe(32)
-        csrf = secrets.token_urlsafe(32)
-        expires_at = _now() + timedelta(hours=12)
         with self.store.connect() as connection:
             credential = connection.execute(
                 """SELECT id,principal_id FROM admin_credentials
@@ -872,13 +910,37 @@ class ControlPlane:
             ).fetchone()
             if not credential:
                 raise ControlError("admin_auth_invalid", 401)
+        return self._create_admin_session(
+            credential["principal_id"], credential_id=credential["id"]
+        )
+
+    def _create_admin_session(
+        self,
+        principal_id: str,
+        *,
+        credential_id: uuid.UUID | None = None,
+    ) -> dict[str, str]:
+        session = "rcs_" + secrets.token_urlsafe(32)
+        csrf = secrets.token_urlsafe(32)
+        expires_at = _now() + timedelta(hours=12)
+        with self.store.connect() as connection:
+            access = connection.execute(
+                """SELECT 1 FROM brain_access_grants
+                   WHERE principal_id=%s
+                     AND permission IN ('owner','admin') LIMIT 1""",
+                (principal_id,),
+            ).fetchone()
+            if access is None:
+                raise ControlError("admin_access_missing", 403)
             connection.execute(
                 """INSERT INTO admin_sessions(
-                       id,credential_id,session_sha256,csrf_sha256,expires_at
-                   ) VALUES (%s,%s,%s,%s,%s)""",
+                       id,credential_id,principal_id,session_sha256,csrf_sha256,
+                       expires_at
+                   ) VALUES (%s,%s,%s,%s,%s,%s)""",
                 (
                     uuid.uuid4(),
-                    credential["id"],
+                    credential_id,
+                    principal_id,
                     _digest(session),
                     _digest(csrf),
                     expires_at,
@@ -900,15 +962,18 @@ class ControlPlane:
             raise ControlError("admin_session_invalid", 401)
         with self.store.connect() as connection:
             row = connection.execute(
-                """SELECT session.id,credential.principal_id,session.csrf_sha256
+                """SELECT session.id,session.principal_id,session.csrf_sha256
                    FROM admin_sessions session
-                   JOIN admin_credentials credential
+                   LEFT JOIN admin_credentials credential
                      ON credential.id=session.credential_id
                    WHERE session.session_sha256=%s
                      AND session.revoked_at IS NULL
                      AND session.expires_at>now()
-                     AND credential.revoked_at IS NULL
-                     AND credential.expires_at>now()""",
+                     AND (
+                         session.credential_id IS NULL
+                         OR (credential.revoked_at IS NULL
+                             AND credential.expires_at>now())
+                     )""",
                 (_digest(token),),
             ).fetchone()
         if not row:
@@ -922,6 +987,225 @@ class ControlPlane:
             "session_id": str(row["id"]),
             "principal_id": row["principal_id"],
         }
+
+    @property
+    def identity_oauth_enabled(self) -> bool:
+        return self.identity_provider is not None
+
+    def start_identity_login(
+        self,
+        *,
+        purpose: str,
+        invitation_id: str | None = None,
+    ) -> dict[str, str]:
+        provider = self.identity_provider
+        if provider is None:
+            raise ControlError("identity_oauth_unavailable", 404)
+        if purpose not in {"admin", "join"}:
+            raise ControlError("identity_oauth_request_invalid")
+        if purpose == "join":
+            if invitation_id is None:
+                raise ControlError("identity_oauth_request_invalid")
+            self.invitation_onboarding(invitation_id)
+        elif invitation_id is not None:
+            raise ControlError("identity_oauth_request_invalid")
+        state = secrets.token_urlsafe(32)
+        verifier = secrets.token_urlsafe(64)
+        challenge = base64.urlsafe_b64encode(
+            hashlib.sha256(verifier.encode()).digest()
+        ).rstrip(b"=").decode()
+        context = self.secret_box.seal(
+            {
+                "purpose": purpose,
+                "invitation_id": invitation_id,
+                "code_verifier": verifier,
+            },
+            purpose=f"identity-oauth:{_digest(state)}",
+        )
+        with self.store.connect() as connection:
+            connection.execute(
+                """INSERT INTO identity_oauth_states(
+                       state_sha256,encrypted_context,encryption_key_id,expires_at
+                   ) VALUES (%s,%s,%s,%s)""",
+                (
+                    _digest(state),
+                    context,
+                    self.secret_box.key_id,
+                    _now() + timedelta(minutes=10),
+                ),
+            )
+        return {
+            "authorization_url": provider.authorization_url(
+                state=state, code_challenge=challenge
+            )
+        }
+
+    def _resolve_admin_identity(self, identity: BrowserIdentity) -> str | None:
+        assert self.identity_provider is not None
+        subject_sha256 = _digest(identity.subject)
+        with self.store.connect() as connection:
+            rows = connection.execute(
+                """SELECT DISTINCT binding.principal_id
+                   FROM external_identity_bindings binding
+                   JOIN brain_access_grants access
+                     ON access.tenant_id=binding.tenant_id
+                    AND access.principal_id=binding.principal_id
+                   JOIN brain_spaces space
+                     ON space.tenant_id=binding.tenant_id
+                   JOIN brain_memberships membership
+                     ON membership.organization_id=space.organization_id
+                    AND membership.principal_id=binding.principal_id
+                   WHERE binding.issuer=%s AND binding.subject_sha256=%s
+                     AND binding.revoked_at IS NULL
+                     AND access.permission IN ('owner','admin')
+                     AND membership.role IN ('owner','admin')""",
+                (self.identity_provider.canonical_issuer, subject_sha256),
+            ).fetchall()
+        principals = {row["principal_id"] for row in rows}
+        return principals.pop() if len(principals) == 1 else None
+
+    def _claim_bootstrap_owner(self, identity: BrowserIdentity) -> str:
+        assert self.identity_provider is not None
+        email = normalize_verified_email(identity.email)
+        if email is None or email not in self.bootstrap_owner_emails:
+            raise ControlError("identity_owner_claim_forbidden", 403)
+        subject_sha256 = _digest(identity.subject)
+        issuer = self.identity_provider.canonical_issuer
+        with self.store.connect() as connection:
+            with connection.transaction():
+                owners = connection.execute(
+                    """SELECT DISTINCT access.principal_id
+                       FROM brain_access_grants access
+                       JOIN brain_spaces space USING(tenant_id)
+                       JOIN brain_memberships membership
+                         ON membership.organization_id=space.organization_id
+                        AND membership.principal_id=access.principal_id
+                       WHERE access.permission='owner'
+                         AND membership.role='owner'"""
+                ).fetchall()
+                principals = {row["principal_id"] for row in owners}
+                if len(principals) != 1:
+                    raise ControlError("identity_owner_claim_unavailable", 409)
+                principal_id = principals.pop()
+                existing = connection.execute(
+                    """SELECT binding.issuer,binding.subject_sha256
+                       FROM external_identity_bindings binding
+                       JOIN brain_access_grants access
+                         ON access.tenant_id=binding.tenant_id
+                        AND access.principal_id=binding.principal_id
+                       WHERE binding.principal_id=%s
+                         AND access.permission='owner'
+                         AND binding.revoked_at IS NULL
+                       FOR UPDATE OF binding""",
+                    (principal_id,),
+                ).fetchall()
+                if any(
+                    row["issuer"] != issuer
+                    or row["subject_sha256"] != subject_sha256
+                    for row in existing
+                ):
+                    raise ControlError("identity_owner_claim_forbidden", 403)
+                connection.execute(
+                    """INSERT INTO external_identity_bindings(
+                           issuer,subject_sha256,tenant_id,principal_id,
+                           principal_kind,revoked_at
+                       ) SELECT %s,%s,access.tenant_id,access.principal_id,
+                                'human',NULL
+                           FROM brain_access_grants access
+                          WHERE access.principal_id=%s
+                            AND access.permission='owner'
+                       ON CONFLICT(issuer,subject_sha256,tenant_id)
+                       DO UPDATE SET principal_id=excluded.principal_id,
+                                     principal_kind='human',revoked_at=NULL""",
+                    (issuer, subject_sha256, principal_id),
+                )
+                connection.execute(
+                    """INSERT INTO control_audit_events(
+                           id,principal_id,operation,status,target_sha256
+                       ) VALUES (%s,%s,'identity.owner.claim','success',%s)""",
+                    (uuid.uuid4(), principal_id, _digest(email)),
+                )
+        return principal_id
+
+    def complete_identity_login(self, *, state: str, code: str) -> dict[str, Any]:
+        provider = self.identity_provider
+        if (
+            provider is None
+            or not isinstance(state, str)
+            or not STATE_RE.fullmatch(state)
+            or not isinstance(code, str)
+            or not 1 <= len(code) <= 4096
+        ):
+            raise ControlError("identity_oauth_callback_invalid", 400)
+        state_sha256 = _digest(state)
+        with self.store.connect() as connection:
+            row = connection.execute(
+                """UPDATE identity_oauth_states SET consumed_at=now()
+                   WHERE state_sha256=%s AND consumed_at IS NULL
+                     AND expires_at>now()
+                   RETURNING encrypted_context,encryption_key_id""",
+                (state_sha256,),
+            ).fetchone()
+        if row is None or row["encryption_key_id"] != self.secret_box.key_id:
+            raise ControlError("identity_oauth_callback_invalid", 400)
+        context = self.secret_box.open(
+            bytes(row["encrypted_context"]),
+            purpose=f"identity-oauth:{state_sha256}",
+        )
+        if set(context) != {"purpose", "invitation_id", "code_verifier"}:
+            raise ControlError("identity_oauth_callback_invalid", 400)
+        try:
+            identity = provider.exchange(
+                code=code, code_verifier=context["code_verifier"]
+            )
+        except IdentityOAuthError as error:
+            raise ControlError(str(error), 502) from None
+        email = normalize_verified_email(identity.email)
+        if email is None or not identity.email_verified:
+            raise ControlError("identity_oauth_identity_invalid", 403)
+        purpose = context["purpose"]
+        if purpose == "admin" and context["invitation_id"] is None:
+            principal_id = self._resolve_admin_identity(identity)
+            if principal_id is None:
+                principal_id = self._claim_bootstrap_owner(identity)
+            return {
+                "status": "authenticated",
+                "redirect": "/admin",
+                "browser": self._create_admin_session(principal_id),
+            }
+        invitation_id = context["invitation_id"]
+        if purpose != "join" or not isinstance(invitation_id, str):
+            raise ControlError("identity_oauth_callback_invalid", 400)
+        invitation = self.invitation_onboarding(invitation_id)
+        credential = self.store.resolve_external_identity(
+            issuer=provider.canonical_issuer,
+            subject=identity.subject,
+            scopes=["read"],
+            audience=self.mcp_resource_uri,
+            tenant_id=invitation.tenant_id,
+        )
+        if credential is None:
+            credential = self.store.accept_external_invitation(
+                issuer=provider.canonical_issuer,
+                subject=identity.subject,
+                email=email,
+                email_index=self.invitation_email_index(email),
+                scopes=["read"],
+                audience=self.mcp_resource_uri,
+                tenant_id=invitation.tenant_id,
+                invitation_id=invitation_id,
+            )
+        if credential is None:
+            raise ControlError("brain_invitation_forbidden", 403)
+        result: dict[str, Any] = {
+            "status": "accepted",
+            "redirect": f"/join/{invitation_id}?status=accepted",
+        }
+        if credential["role"] in {"owner", "admin"}:
+            result["browser"] = self._create_admin_session(
+                credential["principal_id"]
+            )
+        return result
 
     def _brain_rows(self, principal_id: str) -> list[dict[str, Any]]:
         with self.store.connect() as connection:
@@ -1051,6 +1335,7 @@ class ControlPlane:
                 self.invitation_email_sender.send(
                     InvitationEmail(
                         invitation_id=str(invitation_id),
+                        tenant_id=tenant_id,
                         recipient=normalized_email,
                         organization_name=admin["display_name"],
                         brain_slug=admin["slug"],
@@ -1058,6 +1343,8 @@ class ControlPlane:
                         expires_at=expires_at,
                         brain_url=brain_url,
                         onboarding_url=onboarding_url,
+                        codex_oauth_client_id=self.codex_oauth_client_id,
+                        codex_oauth_callback_port=self.codex_oauth_callback_port,
                     )
                 )
                 delivery = {
@@ -1117,6 +1404,7 @@ class ControlPlane:
             raise ControlError("invitation_email_configuration_invalid", 500) from None
         return InvitationEmail(
             invitation_id=str(parsed_id),
+            tenant_id=row["tenant_id"],
             recipient="",
             organization_name=row["display_name"],
             brain_slug=row["slug"],
@@ -1124,6 +1412,10 @@ class ControlPlane:
             expires_at=row["expires_at"],
             brain_url=brain_url,
             onboarding_url=onboarding_url,
+            accepted=row["accepted_at"] is not None,
+            identity_login_enabled=self.identity_oauth_enabled,
+            codex_oauth_client_id=self.codex_oauth_client_id,
+            codex_oauth_callback_port=self.codex_oauth_callback_port,
         )
 
     def invitation_email_index(self, email: str) -> str:

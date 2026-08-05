@@ -14,6 +14,7 @@ from unittest import mock
 
 SERVER = Path(__file__).resolve().parents[2] / "server"
 sys.path.insert(0, str(SERVER))
+sys.path.insert(0, str(SERVER / "tests"))
 
 from recall_server.agent import (  # noqa: E402
     AgentBudget,
@@ -21,10 +22,10 @@ from recall_server.agent import (  # noqa: E402
     ConstrainedAgentTools,
     DelegationContext,
     RecallAgentService,
-    ScriptedAgentRunner,
     service_from_env,
 )
 from recall_server.app import Handler  # noqa: E402
+from agent_fakes import ScriptedAgentRunner  # noqa: E402
 
 
 TENANT = "tenant:synthetic:company"
@@ -64,6 +65,90 @@ class FakeBoundRetrieval:
 
     def __init__(self) -> None:
         self.calls = []
+
+    def passage_hints(self, query, *, filters, limit):
+        self.calls.append(("hints", query, filters, limit))
+        return {
+            "results": [{
+                "source_id": SOURCE,
+                "logical_document_id": (
+                    "ldoc_0123456789abcdef0123456789abcdef"
+                ),
+                "matching_ranges": [{
+                    "receipts": [RECEIPT],
+                    "spans": [{
+                        "record_ordinal": 11,
+                        "record_count": 3,
+                    }],
+                }],
+            }],
+            "diagnostics": {"engine": "synthetic"},
+        }
+
+    def execute_agent_program(
+        self,
+        program,
+        *,
+        logical_document_ids,
+        record_spans,
+        routing_receipts,
+        timeout_seconds,
+        document_aliases=None,
+    ):
+        self.calls.append((
+            "exec",
+            program,
+            logical_document_ids,
+            record_spans,
+            routing_receipts,
+            timeout_seconds,
+        ))
+        return {
+            "stdout": RECEIPT,
+            "opened_receipts": [RECEIPT],
+            "complete": True,
+        }
+
+    def find_documents(self, **arguments):
+        self.calls.append(("find", arguments))
+        return {
+            "provider": "synthetic",
+            "matches": [{
+                "document_alias": next(iter(
+                    arguments["document_aliases"].values()
+                )),
+                "record_ordinal": 11,
+                "occurred_at": "2026-07-23T00:00:00Z",
+                "content": '{"message":"synthetic evidence"}',
+                "receipts": [RECEIPT],
+            }],
+            "opened_receipts": [RECEIPT],
+            "complete": True,
+        }
+
+    def open_document(self, **arguments):
+        self.calls.append(("open", arguments))
+        return {
+            "provider": "synthetic",
+            "document_alias": arguments["document_alias"],
+            "records": [{
+                "document_alias": arguments["document_alias"],
+                "record_ordinal": 11,
+                "occurred_at": "2026-07-23T00:00:00Z",
+                "content": '{"message":"synthetic evidence"}',
+                "content_start": 0,
+                "content_end": 32,
+                "content_length": 32,
+                "content_byte_start": 0,
+                "content_byte_end": 32,
+                "content_length_bytes": 32,
+                "content_complete": True,
+                "receipts": [RECEIPT],
+            }],
+            "opened_receipts": [RECEIPT],
+            "next_cursor": None,
+            "complete": True,
+        }
 
     def investigate(self, question, *, filters, depth):
         self.calls.append(("investigate", question, filters, depth))
@@ -188,10 +273,8 @@ class AgentFacadeUnitTest(unittest.TestCase):
 
     def test_runner_configuration_is_explicit_and_fail_closed(self) -> None:
         self.assertIsNone(service_from_env({}))
-        self.assertIsInstance(
-            service_from_env({"RECALL_AGENT_RUNNER": "scripted"}),
-            RecallAgentService,
-        )
+        with self.assertRaisesRegex(RuntimeError, "unsupported"):
+            service_from_env({"RECALL_AGENT_RUNNER": "scripted"})
         with self.assertRaisesRegex(RuntimeError, "unsupported"):
             service_from_env({"RECALL_AGENT_RUNNER": "unknown"})
 
@@ -245,24 +328,271 @@ class AgentFacadeUnitTest(unittest.TestCase):
             )
 
     def test_host_owned_tool_budget_is_enforced(self) -> None:
-        context = DelegationContext.from_principal(principal())
+        context = dataclasses.replace(
+            DelegationContext.from_principal(principal()),
+            budget=AgentBudget(max_tool_calls=2),
+        )
         tools = ConstrainedAgentTools(FakeBoundRetrieval(), context)
         for _ in range(context.budget.max_tool_calls):
-            tools.call("recall.show", {"target": RECEIPT})
+            tools.call("recall.hints", {
+                "query": REQUEST["question"],
+                "filters": {},
+                "limit": 1,
+            })
         with self.assertRaisesRegex(AgentExecutionError, "budget is exhausted"):
-            tools.call("recall.show", {"target": RECEIPT})
+            tools.call("recall.hints", {
+                "query": REQUEST["question"],
+                "filters": {},
+                "limit": 1,
+            })
+
+    def test_expensive_tool_budgets_are_enforced_per_tool(self) -> None:
+        context = DelegationContext.from_principal(principal())
+        tools = ConstrainedAgentTools(FakeBoundRetrieval(), context)
+        arguments = {
+            "query": REQUEST["question"],
+            "filters": {},
+            "limit": 1,
+        }
+        for _ in range(6):
+            tools.call("recall.hints", arguments)
+        with self.assertRaises(AgentExecutionError) as caught:
+            tools.call("recall.hints", arguments)
+        self.assertEqual(
+            caught.exception.code,
+            "agent_tool_budget_exhausted",
+        )
+        self.assertEqual(tools.observations[-1]["outcome"], "failed")
+
+    def test_exec_requires_an_admitted_hint_document(self) -> None:
+        tools = ConstrainedAgentTools(
+            FakeBoundRetrieval(),
+            DelegationContext.from_principal(principal()),
+        )
+        with self.assertRaises(AgentExecutionError) as caught:
+            tools.call("recall.exec", {
+                "program": "rg synthetic /docs/d1",
+                "timeout_seconds": 10,
+            })
+        self.assertEqual(caught.exception.code, "agent_exec_without_hints")
+
+    def test_find_uses_stable_alias_and_full_document_scope(self) -> None:
+        retrieval = FakeBoundRetrieval()
+        tools = ConstrainedAgentTools(
+            retrieval,
+            DelegationContext.from_principal(principal()),
+        )
+        document_id = "ldoc_0123456789abcdef0123456789abcdef"
+        tools.call("recall.hints", {
+            "query": REQUEST["question"],
+            "filters": {},
+            "limit": 1,
+        })
+        result = tools.call("recall.find", {
+            "aliases": ["d1"],
+            "patterns": ["synthetic evidence"],
+            "context_chars": 800,
+            "limit": 6,
+        })
+        self.assertEqual(result["opened_receipts"], [RECEIPT])
+        self.assertEqual(tools.citable_receipts, (RECEIPT,))
+        call = retrieval.calls[-1]
+        self.assertEqual(call[0], "find")
+        self.assertEqual(
+            call[1]["record_spans"],
+            {document_id: ((11, 3),)},
+        )
+        self.assertEqual(
+            call[1]["routing_receipts"],
+            {document_id: (RECEIPT,)},
+        )
+        self.assertEqual(
+            call[1]["document_aliases"],
+            {document_id: "d1"},
+        )
+
+    def test_open_can_address_any_hinted_record_ordinal(self) -> None:
+        retrieval = FakeBoundRetrieval()
+        tools = ConstrainedAgentTools(
+            retrieval,
+            DelegationContext.from_principal(principal()),
+        )
+        tools.call("recall.hints", {
+            "query": REQUEST["question"],
+            "filters": {},
+            "limit": 1,
+        })
+        result = tools.call("recall.open", {
+            "alias": "d1",
+            "cursor": None,
+            "record_ordinal": 13,
+            "page_bytes": 32_768,
+        })
+        self.assertEqual(result["opened_receipts"], [RECEIPT])
+        call = retrieval.calls[-1]
+        self.assertEqual(call[0], "open")
+        self.assertEqual(call[1]["record_ordinal"], 13)
+        self.assertEqual(call[1]["page_bytes"], 32_768)
+        self.assertIsNone(call[1]["cursor"])
+
+    def test_open_rejects_cursor_with_record_ordinal(self) -> None:
+        tools = ConstrainedAgentTools(
+            FakeBoundRetrieval(),
+            DelegationContext.from_principal(principal()),
+        )
+        tools.call("recall.hints", {
+            "query": REQUEST["question"],
+            "filters": {},
+            "limit": 1,
+        })
+        with self.assertRaises(AgentExecutionError) as caught:
+            tools.call("recall.open", {
+                "alias": "d1",
+                "cursor": "0:0:0",
+                "record_ordinal": 13,
+                "page_bytes": 4_000,
+            })
+        self.assertEqual(caught.exception.code, "agent_open_invalid")
+
+    def test_find_rejects_two_hundred_unadmitted_aliases(self) -> None:
+        for index in range(200):
+            with self.subTest(index=index):
+                tools = ConstrainedAgentTools(
+                    FakeBoundRetrieval(),
+                    DelegationContext.from_principal(principal()),
+                )
+                tools.call("recall.hints", {
+                    "query": REQUEST["question"],
+                    "filters": {},
+                    "limit": 1,
+                })
+                invented = f"d{index + 2}"
+                with self.assertRaises(AgentExecutionError) as caught:
+                    tools.call("recall.find", {
+                        "aliases": [invented],
+                        "patterns": ["synthetic"],
+                        "context_chars": 800,
+                        "limit": 1,
+                    })
+                self.assertEqual(
+                    caught.exception.code,
+                    "agent_find_invalid",
+                )
+
+    def test_find_rejects_two_hundred_cross_source_receipts(self) -> None:
+        class CrossSourceFind(FakeBoundRetrieval):
+            def __init__(self, index):
+                super().__init__()
+                self.index = index
+
+            def find_documents(self, **arguments):
+                receipt = (
+                    "recall://source:foreign:"
+                    f"{self.index}/private?rev=1#item=0"
+                )
+                return {
+                    "matches": [],
+                    "opened_receipts": [receipt],
+                    "complete": True,
+                }
+
+        for index in range(200):
+            with self.subTest(index=index):
+                tools = ConstrainedAgentTools(
+                    CrossSourceFind(index),
+                    DelegationContext.from_principal(principal()),
+                )
+                tools.call("recall.hints", {
+                    "query": REQUEST["question"],
+                    "filters": {},
+                    "limit": 1,
+                })
+                with self.assertRaises(AgentExecutionError) as caught:
+                    tools.call("recall.find", {
+                        "aliases": ["d1"],
+                        "patterns": ["synthetic"],
+                        "context_chars": 800,
+                        "limit": 1,
+                    })
+                self.assertEqual(
+                    caught.exception.code,
+                    "agent_evidence_scope_violation",
+                )
+
+    def test_exec_timeout_is_clamped_to_the_remaining_turn_budget(self) -> None:
+        context = dataclasses.replace(
+            DelegationContext.from_principal(principal()),
+            budget=AgentBudget(deadline_seconds=25),
+        )
+        ticks = iter([100.0, 101.0, 101.0, 102.0, 108.5, 108.5, 109.0])
+        retrieval = FakeBoundRetrieval()
+        tools = ConstrainedAgentTools(
+            retrieval,
+            context,
+            monotonic=lambda: next(ticks),
+        )
+        tools.call("recall.hints", {
+            "query": REQUEST["question"],
+            "filters": {},
+            "limit": 1,
+        })
+        tools.call("recall.exec", {
+            "program": "rg synthetic /docs/d1",
+            "timeout_seconds": 30,
+        })
+        exec_call = retrieval.calls[-1]
+        self.assertEqual(exec_call[0], "exec")
+        self.assertEqual(
+            exec_call[-3],
+            {
+                "ldoc_0123456789abcdef0123456789abcdef": (
+                    (11, 3),
+                ),
+            },
+        )
+        self.assertEqual(
+            exec_call[-2],
+            {
+                "ldoc_0123456789abcdef0123456789abcdef": (
+                    RECEIPT,
+                ),
+            },
+        )
+        self.assertEqual(exec_call[-1], 10)
+
+    def test_exec_fails_closed_when_only_finish_reserve_remains(self) -> None:
+        context = dataclasses.replace(
+            DelegationContext.from_principal(principal()),
+            budget=AgentBudget(deadline_seconds=10),
+        )
+        ticks = iter([100.0, 101.0, 101.0, 102.0, 105.0, 105.0])
+        tools = ConstrainedAgentTools(
+            FakeBoundRetrieval(),
+            context,
+            monotonic=lambda: next(ticks),
+        )
+        tools.call("recall.hints", {
+            "query": REQUEST["question"],
+            "filters": {},
+            "limit": 1,
+        })
+        with self.assertRaises(AgentExecutionError) as caught:
+            tools.call("recall.exec", {
+                "program": "rg synthetic /docs/d1",
+                "timeout_seconds": 30,
+            })
+        self.assertEqual(
+            caught.exception.code,
+            "agent_tool_deadline_exhausted",
+        )
 
     def test_host_owned_receipt_budget_is_enforced(self) -> None:
         class ManyReceipts(FakeBoundRetrieval):
-            def investigate(self, question, *, filters, depth):
+            def execute_agent_program(self, *args, **kwargs):
                 return {
-                    "items": [
-                        {"receipt": RECEIPT},
-                        {
-                            "receipt": (
-                                f"recall://{SOURCE}/item-2?rev=1#item=0"
-                            )
-                        },
+                    "opened_receipts": [
+                        RECEIPT,
+                        f"recall://{SOURCE}/item-2?rev=1#item=0",
                     ]
                 }
 
@@ -271,11 +601,15 @@ class AgentFacadeUnitTest(unittest.TestCase):
             budget=AgentBudget(max_receipts=1),
         )
         tools = ConstrainedAgentTools(ManyReceipts(), context)
+        tools.call("recall.hints", {
+            "query": REQUEST["question"],
+            "filters": {},
+            "limit": 1,
+        })
         with self.assertRaises(AgentExecutionError) as caught:
-            tools.call("recall.investigate", {
-                "question": REQUEST["question"],
-                "filters": {},
-                "depth": "normal",
+            tools.call("recall.exec", {
+                "program": "rg synthetic /docs/d1",
+                "timeout_seconds": 10,
             })
         self.assertEqual(
             caught.exception.code,
@@ -284,20 +618,29 @@ class AgentFacadeUnitTest(unittest.TestCase):
 
     def test_cumulative_tool_output_budget_is_enforced(self) -> None:
         class LargeResult(FakeBoundRetrieval):
-            def show(self, target):
+            def execute_agent_program(self, *args, **kwargs):
                 return {
-                    "resolved_receipt": target,
+                    "opened_receipts": [RECEIPT],
                     "text": "x" * 200,
                 }
 
         context = dataclasses.replace(
             DelegationContext.from_principal(principal()),
-            budget=AgentBudget(max_tool_output_bytes=400),
+            budget=AgentBudget(max_tool_output_bytes=700),
         )
         tools = ConstrainedAgentTools(LargeResult(), context)
-        tools.call("recall.show", {"target": RECEIPT})
+        tools.call("recall.hints", {
+            "query": REQUEST["question"],
+            "filters": {},
+            "limit": 1,
+        })
+        arguments = {
+            "program": "rg synthetic /docs/d1",
+            "timeout_seconds": 10,
+        }
+        tools.call("recall.exec", arguments)
         with self.assertRaises(AgentExecutionError) as caught:
-            tools.call("recall.show", {"target": RECEIPT})
+            tools.call("recall.exec", arguments)
         self.assertEqual(
             caught.exception.code,
             "agent_tool_output_budget_exhausted",

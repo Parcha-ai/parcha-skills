@@ -44,7 +44,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/miguelrios/unc-skills.git",
+    "url": "git+https://github.com/Parcha-ai/parcha-skills.git",
     "directory": "recall"
   },
   "keywords": [

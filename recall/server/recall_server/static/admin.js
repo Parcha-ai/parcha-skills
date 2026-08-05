@@ -146,19 +146,25 @@ function renderGoogle() {
   const connected = state.data.connections.filter((item) =>
     item.provider === "google" || item.provider === "composio"
   );
+  const active = connected.filter((item) => item.status === "connected");
+  const degraded = connected.filter((item) => item.status === "degraded");
   const connection = $("#google-connection");
   connection.replaceChildren();
-  connection.append(connected.length
-    ? `${connected.length} connection${connected.length === 1 ? "" : "s"} · authority bound server-side`
+  connection.append(active.length
+    ? `${active.length} connection${active.length === 1 ? "" : "s"} · authority bound server-side`
+    : degraded.length
+      ? "Connection expired · authorize the source again"
     : available ? "Not connected" : "No connection provider configured");
   connected.forEach((item) => {
     const disconnect = document.createElement("button");
     disconnect.type = "button";
     disconnect.dataset.connectionId = item.id;
-    disconnect.textContent = `Disconnect ${item.provider}`;
+    disconnect.textContent = item.status === "degraded"
+      ? `Remove expired ${item.provider}`
+      : `Disconnect ${item.provider}`;
     connection.append(disconnect);
   });
-  connection.classList.toggle("connected", connected.length > 0);
+  connection.classList.toggle("connected", active.length > 0);
   $("#google-form button[type=submit]").disabled = !available;
 }
 
@@ -190,7 +196,13 @@ function renderInstallations() {
   state.data.installations.forEach((item) => {
     const row = document.createElement("article");
     row.className = "installation";
-    const action = item.state === "enabled"
+    const reconnectRequired = [
+      "connector_authority_revoked",
+      "connector_authority_forbidden",
+    ].includes(item.last_error_code);
+    const action = reconnectRequired
+      ? null
+      : item.state === "enabled"
       ? "pause"
       : item.state === "paused"
         ? "resume"
@@ -200,8 +212,13 @@ function renderInstallations() {
     const revoke = item.state === "revoked"
       ? ""
       : `<button data-action="revoke" data-id="${item.id}">revoke</button>`;
-    const runtime = item.last_error_code
-      ? `attention · ${item.last_error_code}`
+    const transition = action
+      ? `<button data-action="${action}" data-id="${item.id}">${action}</button>`
+      : "";
+    const runtime = reconnectRequired
+      ? "reconnect Google to resume"
+      : item.last_error_code
+        ? `attention · ${item.last_error_code}`
       : item.last_success_at
         ? "synced"
         : item.execution === "remote_worker" && item.state === "enabled"
@@ -212,7 +229,7 @@ function renderInstallations() {
       <span>${escapeText(brains.get(item.tenant_id) || item.tenant_id)}</span>
       <span class="state">${escapeText(runtime)}</span>
       <div class="installation-actions">
-        <button data-action="${action}" data-id="${item.id}">${action}</button>
+        ${transition}
         ${revoke}
       </div>`;
     target.append(row);
@@ -284,6 +301,17 @@ $("#invitation-list").addEventListener("click", async (event) => {
   }
 });
 
+async function loadAuthMethods() {
+  try {
+    const methods = await api("/admin/api/v1/auth-methods");
+    $("#oauth-login").hidden = !methods.oauth;
+    $("#oauth-copy").hidden = !methods.oauth;
+    $("#legacy-login").open = !methods.oauth;
+  } catch (_error) {
+    $("#legacy-login").open = true;
+  }
+}
+
 async function load() {
   try {
     state.data = await api("/admin/api/v1/state");
@@ -296,6 +324,7 @@ async function load() {
 
 $("#auth-form").addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (!$("#admin-token").value) return;
   $("#auth-error").textContent = "";
   try {
     await api("/admin/api/v1/session", {
@@ -388,4 +417,4 @@ $("#google-auth-provider").addEventListener("change", () => {
 
 const oauth = new URLSearchParams(window.location.search).get("oauth");
 if (oauth === "connected") history.replaceState({}, "", "/admin");
-load();
+loadAuthMethods().then(load);

@@ -20,6 +20,7 @@ from privacy.transport import open_no_redirect
 COLLECTOR_VERSION = 1
 MAX_BATCH_BYTES = 8_000_000
 MAX_CANONICAL_BATCH_EVENTS = 1_000
+MAX_CANONICAL_TOMBSTONE_BATCH_EVENTS = 10
 DEFAULT_MAX_SCAN_RECORDS = 1_000
 DEFAULT_MAX_SCAN_SECONDS = 20.0
 OVERSIZED_PROJECTION_TEXT_CHARS = 250_000
@@ -1060,8 +1061,34 @@ class Collector:
                     candidates.append(candidate)
             self.db.commit()
             rows: list[dict] = []
+            batch_kind: str | None = None
+            live_native_ids: set[str] = set()
             body_size = len(b'{"events":[]}')
             for candidate in candidates:
+                envelope = json.loads(candidate["envelope_json"])
+                kind = envelope.get("kind")
+                candidate_batch_kind = (
+                    "tombstone" if kind == "tombstone" else "live"
+                )
+                # The canonical server commits ordinary live records through a
+                # set-based transaction. Tombstones intentionally use the
+                # lineage-aware path on older compatible servers, so keep
+                # those requests small enough that a retry cannot overlap a
+                # still-running transaction. Never mix the two paths in one
+                # request.
+                if batch_kind is not None and candidate_batch_kind != batch_kind:
+                    break
+                if (
+                    candidate_batch_kind == "tombstone"
+                    and len(rows) >= MAX_CANONICAL_TOMBSTONE_BATCH_EVENTS
+                ):
+                    break
+                native_id = envelope.get("native_id")
+                if candidate_batch_kind == "live" and native_id in live_native_ids:
+                    # Multiple revisions for one native identity require the
+                    # sequential lineage path. Commit the earlier revision
+                    # first so each request remains eligible for set-based SQL.
+                    break
                 event_size = len(candidate["envelope_json"].encode()) + 1
                 if not rows and event_size > max_batch_bytes:
                     with self.db:
@@ -1074,6 +1101,9 @@ class Collector:
                     continue
                 if rows and body_size + event_size > max_batch_bytes:
                     break
+                batch_kind = candidate_batch_kind
+                if candidate_batch_kind == "live" and isinstance(native_id, str):
+                    live_native_ids.add(native_id)
                 rows.append(candidate)
                 body_size += event_size
             if not rows:

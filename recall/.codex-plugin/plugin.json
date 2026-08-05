@@ -6,8 +6,8 @@
     "name": "Miguel Rios",
     "url": "https://github.com/miguelrios"
   },
-  "homepage": "https://github.com/miguelrios/unc-skills/tree/main/recall",
-  "repository": "https://github.com/miguelrios/unc-skills/tree/main/recall",
+  "homepage": "https://github.com/Parcha-ai/parcha-skills/tree/main/recall",
+  "repository": "https://github.com/Parcha-ai/parcha-skills/tree/main/recall",
   "license": "MIT",
   "keywords": [
     "session-history",
@@ -25,7 +25,7 @@
     "capabilities": [
       "Read"
     ],
-    "websiteURL": "https://github.com/miguelrios/unc-skills/tree/main/recall",
+    "websiteURL": "https://github.com/Parcha-ai/parcha-skills/tree/main/recall",
     "defaultPrompt": [
       "Find the prior session where we worked on this.",
       "Show me related work from this branch."

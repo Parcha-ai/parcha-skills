@@ -17,6 +17,7 @@ import urllib.request
 DESCOPE_INVITE_URL = "https://api.descope.com/v1/mgmt/user/create"
 RESEND_EMAIL_URL = "https://api.resend.com/emails"
 PROJECT_ID_RE = re.compile(r"P[A-Za-z0-9]{10,63}\Z")
+OAUTH_CLIENT_ID_RE = re.compile(r"[A-Za-z0-9._~+/=-]{8,512}\Z")
 SAFE_NAME_RE = re.compile(r"[^a-z0-9]+")
 
 
@@ -32,6 +33,7 @@ class _RejectRedirect(urllib.request.HTTPRedirectHandler):
 @dataclass(frozen=True)
 class InvitationEmail:
     invitation_id: str
+    tenant_id: str
     recipient: str
     organization_name: str
     brain_slug: str
@@ -39,6 +41,10 @@ class InvitationEmail:
     expires_at: datetime
     brain_url: str
     onboarding_url: str
+    accepted: bool = False
+    identity_login_enabled: bool = False
+    codex_oauth_client_id: str = ""
+    codex_oauth_callback_port: int | None = None
 
     @property
     def server_name(self) -> str:
@@ -88,13 +94,41 @@ def invitation_urls(
     return brain_url, onboarding_url
 
 
+def codex_oauth_onboarding_from_env() -> tuple[str, int | None]:
+    client_id = os.environ.get("RECALL_CODEX_OAUTH_CLIENT_ID", "").strip()
+    raw_port = os.environ.get("RECALL_CODEX_OAUTH_CALLBACK_PORT", "").strip()
+    if not client_id and not raw_port:
+        return "", None
+    try:
+        port = int(raw_port)
+    except ValueError:
+        raise InvitationEmailError("invitation_email_configuration_invalid") from None
+    if not OAUTH_CLIENT_ID_RE.fullmatch(client_id) or not 1 <= port <= 65535:
+        raise InvitationEmailError("invitation_email_configuration_invalid")
+    return client_id, port
+
+
 def installation_commands(invitation: InvitationEmail) -> dict[str, tuple[str, ...]]:
-    return {
-        "codex": (
+    codex_add = f"codex mcp add {invitation.server_name} --url {invitation.brain_url}"
+    codex_commands = (
+        "npm install -g @openai/codex",
+        codex_add,
+        f"codex mcp login {invitation.server_name}",
+    )
+    if invitation.codex_oauth_client_id and invitation.codex_oauth_callback_port:
+        resource_uri = invitation.brain_url.split("/brains/", 1)[0]
+        codex_commands = (
             "npm install -g @openai/codex",
-            f"codex mcp add {invitation.server_name} --url {invitation.brain_url}",
-            f"codex mcp login {invitation.server_name}",
-        ),
+            (
+                "codex -c "
+                f"mcp_oauth_callback_port={invitation.codex_oauth_callback_port} "
+                f"mcp add {invitation.server_name} --url {invitation.brain_url} "
+                f"--oauth-client-id {invitation.codex_oauth_client_id} "
+                f"--oauth-resource {resource_uri}"
+            ),
+        )
+    return {
+        "codex": codex_commands,
         "claude": (
             "npm install -g @anthropic-ai/claude-code",
             (
@@ -163,6 +197,23 @@ def onboarding_page(invitation: InvitationEmail) -> bytes:
   <pre>{rendered}</pre>
 </section>"""
         )
+    if invitation.accepted:
+        activation = """<div class="activation activation-ready">
+  <strong>Identity verified.</strong>
+  <span>Your company-brain membership is active. Add one client below.</span>
+</div>"""
+    elif invitation.identity_login_enabled:
+        activation = f"""<div class="activation">
+  <strong>Add Recall in one paste.</strong>
+  <span>Choose a client below. Its Descope login accepts this exact invitation—no Recall key or separate account.</span>
+  <a href="/join/{escape(invitation.invitation_id, quote=True)}/login">Or activate in this browser →</a>
+</div>"""
+    else:
+        activation = """<div class="activation">
+  <strong>Verify through your MCP client.</strong>
+  <span>OAuth activates the invitation when you use the same email address.</span>
+</div>"""
+    cards_markup = "".join(cards)
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -179,6 +230,11 @@ def onboarding_page(invitation: InvitationEmail) -> bytes:
     h1 {{ margin:24px 0 18px;font:500 clamp(48px,8vw,100px)/.88 Georgia,serif;letter-spacing:-.05em; }}
     h1 em {{ color:var(--blue);font-weight:400; }}
     .lede {{ max-width:620px;font-size:20px;line-height:1.5;margin-bottom:54px; }}
+    .activation {{ display:grid;gap:10px;max-width:680px;margin:0 0 34px;padding:24px;border:1px solid var(--ink);background:#faf7eb; }}
+    .activation strong {{ font:500 28px Georgia,serif; }}
+    .activation span {{ color:#657064;line-height:1.5; }}
+    .activation a {{ margin-top:8px;padding:16px 18px;background:var(--ink);color:var(--acid);font:800 12px monospace;text-decoration:none;text-transform:uppercase; }}
+    .activation-ready {{ border-color:#1c55ff; }}
     .grid {{ display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:1px;background:var(--ink);border:1px solid var(--ink); }}
     section {{ min-width:0;background:#faf7eb;padding:32px; }}
     section>span {{ color:var(--blue); }}
@@ -191,8 +247,9 @@ def onboarding_page(invitation: InvitationEmail) -> bytes:
   <main>
     <p class="eyebrow">RECALL / VERIFIED COMPANY ACCESS</p>
     <h1>Join {escape(invitation.organization_name)}.<br><em>Remember together.</em></h1>
-    <p class="lede">Run one setup block, then sign in with the same email address that received the invitation. OAuth activates access automatically.</p>
-    <div class="grid">{"".join(cards)}</div>
+    <p class="lede">One identity, one company brain, no bearer tokens to copy.</p>
+    {activation}
+    <div class="grid">{cards_markup}</div>
     <footer>Access is limited to this company brain. No bearer token is copied into either client.</footer>
   </main>
 </body>
@@ -335,6 +392,7 @@ __all__ = [
     "InvitationEmailError",
     "InvitationEmailSender",
     "ResendInvitationEmailSender",
+    "codex_oauth_onboarding_from_env",
     "installation_commands",
     "invitation_message",
     "invitation_urls",

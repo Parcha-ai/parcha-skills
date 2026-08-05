@@ -1,6 +1,6 @@
 # recall
 
-[![skills.sh](https://skills.sh/b/miguelrios/unc-skills)](https://skills.sh/miguelrios/unc-skills/recall)
+[![GitHub](https://img.shields.io/badge/source-Parcha--ai%2Fparcha--skills-181717?logo=github)](https://github.com/Parcha-ai/parcha-skills/tree/main/recall)
 
 Claude Code and Codex keep detailed local transcripts of each session,
 including prompts, responses, commands, tool results, branches, and working
@@ -53,27 +53,27 @@ therefore return a session containing similar words. Each result includes a
 skills.sh:
 
 ```bash
-npx skills add miguelrios/unc-skills --skill recall
+npx skills add Parcha-ai/parcha-skills --skill recall
 ```
 
 Claude Code:
 
 ```bash
-claude plugin marketplace add miguelrios/unc-skills
+claude plugin marketplace add Parcha-ai/parcha-skills
 claude plugin install recall@unc-skills
 ```
 
 Codex:
 
 ```bash
-codex plugin marketplace add miguelrios/unc-skills
+codex plugin marketplace add Parcha-ai/parcha-skills
 codex plugin add recall@unc-skills
 ```
 
 pi (installs the complete unc-skills collection):
 
 ```bash
-pi install git:github.com/miguelrios/unc-skills
+pi install git:github.com/Parcha-ai/parcha-skills
 ```
 
 Start a new session, invoke Recall using the harness's normal skill syntax, and
@@ -83,8 +83,8 @@ installed directory, so you do not need to find a plugin-cache path.
 For a direct/manual Claude install:
 
 ```bash
-git clone https://github.com/miguelrios/unc-skills.git
-cd unc-skills/recall
+git clone https://github.com/Parcha-ai/parcha-skills.git
+cd parcha-skills/recall
 ./install.sh
 ```
 

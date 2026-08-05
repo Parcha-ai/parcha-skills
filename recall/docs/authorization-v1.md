@@ -62,13 +62,18 @@ RECALL_MCP_RESOURCE_URI=https://recall.example.com/mcp
 RECALL_AUTHORIZATION_SERVERS=https://identity.example.com
 RECALL_MCP_AUTH_PROVIDER=oidc
 RECALL_OIDC_ISSUER=https://identity.example.com
+# Optional, comma-separated, exact token issuers in the same identity domain:
+# RECALL_OIDC_ADDITIONAL_ISSUERS=https://identity.example.com/agentic/mcp
 RECALL_OIDC_JWKS_URI=https://identity.example.com/.well-known/jwks.json
 ```
 
 Use `RECALL_MCP_AUTH_PROVIDER=descope` for the Descope preset and copy the exact
 issuer and JWKS URL from the Descope MCP resource. The issuer must also appear
 in `RECALL_AUTHORIZATION_SERVERS`. Startup fails closed for non-HTTPS,
-credential-bearing, ambiguous, or mismatched URLs.
+credential-bearing, ambiguous, or mismatched URLs, and for more than eight
+additional token issuers. An explicitly accepted additional issuer is
+cryptographically verified and mapped to the canonical `RECALL_OIDC_ISSUER`,
+keeping one durable identity binding across OAuth clients.
 
 The public server exposes RFC 9728 protected-resource metadata at:
 
