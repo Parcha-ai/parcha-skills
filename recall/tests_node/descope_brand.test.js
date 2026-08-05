@@ -177,6 +177,9 @@ test("brandScreens changes presentation while preserving flow interactions", () 
   assert.deepEqual(screens[0].interactions, interactions);
 
   const consent = screens[2].htmlTemplate;
+  assert.equal(consent.ojc6ht, undefined);
+  assert.equal(consent.qIfDVKm2T2, undefined);
+  assert.equal(consent.ROOT.nodes.includes("qIfDVKm2T2"), false);
   assert.equal(consent._Z6xPaS9jy.props.id, "_Z6xPaS9jy");
   assert.match(consent.NpV0qhppf_.props.children, /read-only access/);
   assert.equal(consent["EQIG9X08-e"].props["border-radius"], undefined);

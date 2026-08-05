@@ -282,11 +282,12 @@ function styleWelcome(screen) {
 
 function styleConsent(screen, { verified }) {
   const t = parseTemplate(screen);
-  const [, appLogo] = findEntry(
-    t,
-    (node) => ["InboundAppLogo", "ThirdPartyAppLogo"].includes(node.type?.resolvedName),
-    "inbound app logo",
-  );
+  const appLogoEntry = Object.entries(t).find(([, node]) => [
+    "InboundAppLogo",
+    "ThirdPartyAppLogo",
+  ].includes(node.type?.resolvedName));
+  const appLogoId = appLogoEntry?.[0];
+  const appLogo = appLogoEntry?.[1];
   const [headlineId, headline] = findEntry(t, textContaining("{{mcpClient.name}}"), "consent headline");
   const [, requested] = findEntry(t, textContainingAny("will be able", "Requested access"), "scope heading");
   const [scopesId, scopes] = findEntry(
@@ -296,12 +297,11 @@ function styleConsent(screen, { verified }) {
   );
   const [, authorize] = findEntry(t, buttonLabeledAny("Authorize", "Connect company brain  →"), "authorize button");
   const [, cancel] = findEntry(t, buttonLabeledAny("Cancel", "Not now"), "cancel button");
-  const logoContainerId = appLogo.parent;
+  const logoContainerId = appLogo?.parent;
   const headlineContainerId = headline.parent;
   const requestedContainerId = requested.parent;
   const scopesContainerId = scopes.parent;
   const actionsContainerId = authorize.parent;
-  const logoContainer = t[logoContainerId];
   const headlineContainer = t[headlineContainerId];
   const requestedContainer = t[requestedContainerId];
   const scopesContainer = t[scopesContainerId];
@@ -321,7 +321,6 @@ function styleConsent(screen, { verified }) {
   t.ROOT.nodes = [
     "recallConsentBrand",
     "recallConsentEyebrow",
-    logoContainerId,
     headlineContainerId,
     "recallConsentBody",
     requestedContainerId,
@@ -336,7 +335,8 @@ function styleConsent(screen, { verified }) {
     "ACCESS REVIEW // COMPANY BRAIN",
     "subtitle2",
   );
-  styleContainer(logoContainer, { align: "center", justify: "center" });
+  if (appLogoId) delete t[appLogoId];
+  if (logoContainerId) delete t[logoContainerId];
   styleContainer(headlineContainer, { align: "center", justify: "center" });
   styleText(headline, "Connect {{mcpClient.name}}", "h3", "center");
   t.recallConsentBody = textNode(
