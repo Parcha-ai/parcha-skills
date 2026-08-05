@@ -12,7 +12,15 @@
 
 "use strict";
 
+const { isDeepStrictEqual } = require("node:util");
+
 const FLOW_ID = "recall-mcp-user-consent";
+const STYLE_ID = "recall";
+const JETBRAINS_MONO = {
+  family: ["JetBrains Mono", "monospace"],
+  label: "JetBrains Mono",
+  url: "https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&display=swap",
+};
 
 function descopeBaseUrl(projectId) {
   if (process.env.DESCOPE_BASE_URL) return process.env.DESCOPE_BASE_URL.replace(/\/$/, "");
@@ -34,7 +42,8 @@ function descopeClient(projectId, managementKey) {
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
     });
-    const payload = await response.json();
+    const text = await response.text();
+    const payload = text ? JSON.parse(text) : {};
     if (!response.ok) {
       const detail = payload?.errorDescription || payload?.errorMessage || `HTTP ${response.status}`;
       throw new Error(`Descope request failed: ${detail}`);
@@ -85,12 +94,43 @@ function brandTheme(theme) {
     result.cssTemplate[mode].globals.colors.primary = palette;
     result.cssTemplate[mode].globals.colors.secondary = secondary;
     result.cssTemplate[mode].globals.radius = squareRadii;
+    result.cssTemplate[mode].fonts = {
+      font1: JETBRAINS_MONO,
+      font2: JETBRAINS_MONO,
+    };
     result.cssTemplate[mode].components = {
       ...(result.cssTemplate[mode].components || {}),
       ...squareComponents,
     };
   }
   return result;
+}
+
+function brandSnapshot(files, theme) {
+  const stylesIndex = files["styles/styles.json"];
+  if (!stylesIndex?.styles) throw new Error("Descope snapshot is missing its styles index");
+
+  let changed = false;
+  for (const mode of ["light", "dark"]) {
+    const source = structuredClone(theme.cssTemplate[mode]);
+    const fonts = source.fonts;
+    delete source.fonts;
+    source.globals ||= {};
+    source.globals.fonts = fonts;
+    const style = { ...source, name: "Recall", type: "flows" };
+    const path = `styles/${STYLE_ID}-${mode}.json`;
+    if (!isDeepStrictEqual(files[path], style)) {
+      files[path] = style;
+      changed = true;
+    }
+
+    const name = `${STYLE_ID}-${mode}`;
+    if (!stylesIndex.styles.includes(name)) {
+      stylesIndex.styles.push(name);
+      changed = true;
+    }
+  }
+  return changed;
 }
 
 function parseTemplate(screen) {
@@ -202,7 +242,12 @@ function styleWelcome(screen) {
     (node) => byType("Logo")(node) || textContaining("RECALL //")(node),
     "logo",
   );
-  const [headlineId, headline] = findEntry(t, textContainingAny("Welcome", "Find the work"), "welcome headline");
+  const [headlineId, headline] = findEntry(
+    t,
+    (node) => byType("Text")(node)
+      && (["h1", "h2", "h3"].includes(node.props?.variant) || textContaining("Welcome")(node)),
+    "welcome headline",
+  );
   const [bodyId, body] = findEntry(t, textContainingAny("Privacy Statement", "shared engineering memory"), "welcome body");
   const [emailId, email] = findEntry(t, byType("EmailInput"), "email input");
   const [, continueButton] = findEntry(t, buttonLabeledAny("Continue", "Continue securely  →"), "continue button");
@@ -221,16 +266,11 @@ function styleWelcome(screen) {
 
   replaceLogoWithWordmark(logo);
   styleContainer(header, { align: "start", spaceBetween: "2" });
-  header.nodes = ["recallEyebrow", headlineId, bodyId, "recallTrust"];
+  header.nodes = ["recallEyebrow", headlineId, bodyId];
   t.recallEyebrow = textNode("recallEyebrow", headerId, "PARCHA // COMPANY BRAIN", "subtitle2");
-  styleText(headline, "Find the work. Keep the context.", "h2");
+  styleText(headline, "Connect to Parcha Recall.", "h2");
   styleText(body, "Connect your coding agent to Parcha's shared engineering memory.", "body1");
-  t.recallTrust = textNode(
-    "recallTrust",
-    headerId,
-    "READ ONLY  ·  COMPANY SCOPE  ·  REVOCABLE",
-    "body2",
-  );
+  delete t.recallTrust;
 
   styleContainer(form, { align: "stretch", direction: "column", spaceBetween: "3" });
   email.props.placeholder = "Work email";
@@ -287,7 +327,6 @@ function styleConsent(screen, { verified }) {
     logoContainerId,
     headlineContainerId,
     "recallConsentBody",
-    "recallConsentTrust",
     requestedContainerId,
     scopesContainerId,
     ...(verified ? [] : [warningContainerId]),
@@ -310,13 +349,7 @@ function styleConsent(screen, { verified }) {
     "body1",
     "center",
   );
-  t.recallConsentTrust = textNode(
-    "recallConsentTrust",
-    "ROOT",
-    "READ ONLY  ·  COMPANY BRAIN  ·  REVOKE ANYTIME",
-    "body2",
-    "center",
-  );
+  delete t.recallConsentTrust;
   styleContainer(requestedContainer, { align: "start" });
   styleText(requested, "Requested access", "subtitle2");
   styleContainer(scopesContainer, {
@@ -403,9 +436,10 @@ function brandScreens(screens) {
   styleOtp(classified.otp[0]);
 }
 
-function hostedLoginUrl(value) {
+function hostedLoginUrl(value, styleId) {
   const url = new URL(value);
   url.searchParams.set("flow", FLOW_ID);
+  if (styleId) url.searchParams.set("style", styleId);
   url.searchParams.set("theme", "dark");
   url.searchParams.set("bg", "#070A08");
   url.searchParams.set("width", "580px");
@@ -420,9 +454,21 @@ async function main() {
 
   const request = descopeClient(projectId, managementKey);
   const exportedTheme = await request("/v1/mgmt/theme/export", { body: {} });
-  const importedTheme = await request("/v1/mgmt/theme/import", {
-    body: { theme: brandTheme(exportedTheme.theme) },
-  });
+  const brandedTheme = brandTheme(exportedTheme.theme);
+  const snapshot = await request("/v1/mgmt/project/snapshot/export", { body: {} });
+  const snapshotChanged = brandSnapshot(snapshot.files, brandedTheme);
+  if (snapshotChanged) {
+    const validation = await request("/v1/mgmt/project/snapshot/validate", {
+      body: { files: snapshot.files },
+    });
+    const missingSecrets = Object.values(validation.missingSecrets || {}).some(
+      (secrets) => secrets?.length,
+    );
+    if (!validation.ok || validation.failures?.length || missingSecrets) {
+      throw new Error("Descope rejected the branded style snapshot");
+    }
+    await request("/v1/mgmt/project/snapshot/import", { body: { files: snapshot.files } });
+  }
   const exported = await request("/v1/mgmt/flow/export", { body: { flowId: FLOW_ID } });
   const screens = structuredClone(exported.screens);
   brandScreens(screens);
@@ -435,7 +481,7 @@ async function main() {
   let patchedApps = 0;
   for (const app of apps) {
     if (!app.loginPageUrl?.includes(`flow=${FLOW_ID}`)) continue;
-    const loginPageUrl = hostedLoginUrl(app.loginPageUrl);
+    const loginPageUrl = hostedLoginUrl(app.loginPageUrl, STYLE_ID);
     if (loginPageUrl === app.loginPageUrl) continue;
     await request("/v1/mgmt/thirdparty/app/patch", { body: { id: app.id, loginPageUrl } });
     patchedApps += 1;
@@ -446,7 +492,7 @@ async function main() {
     flowVersion: imported.flow?.version,
     screens: imported.screens?.length,
     patchedApps,
-    themeId: importedTheme.theme?.id,
+    snapshotChanged,
   }));
 }
 
@@ -459,6 +505,8 @@ if (require.main === module) {
 
 module.exports = {
   FLOW_ID,
+  STYLE_ID,
+  brandSnapshot,
   brandScreens,
   brandTheme,
   hostedLoginUrl,

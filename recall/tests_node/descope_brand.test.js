@@ -4,6 +4,8 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 
 const {
+  STYLE_ID,
+  brandSnapshot,
   brandScreens,
   brandTheme,
   hostedLoginUrl,
@@ -109,6 +111,9 @@ test("brandTheme applies the Recall palette without discarding theme identity", 
   assert.equal(branded.cssTemplate.dark.globals.radius.sm, "0px");
   assert.equal(branded.cssTemplate.dark.globals.radius["3xl"], "0px");
   assert.equal(branded.cssTemplate.dark.components.button["--descope-button-border-radius"], "0px");
+  assert.deepEqual(branded.cssTemplate.dark.fonts.font1.family, ["JetBrains Mono", "monospace"]);
+  assert.equal(branded.cssTemplate.dark.fonts.font2.label, "JetBrains Mono");
+  assert.match(branded.cssTemplate.light.fonts.font1.url, /family=JetBrains\+Mono/);
   assert.equal(
     branded.cssTemplate.light.components.emailField["--descope-email-field-input-border-radius"],
     "0px",
@@ -123,11 +128,28 @@ test("brandTheme applies the Recall palette without discarding theme identity", 
   }
 });
 
+test("brandSnapshot installs one hosted style and is idempotent", () => {
+  const theme = brandTheme({ id: "theme-1", cssTemplate: { light: {}, dark: {} } });
+  const files = { "styles/styles.json": { componentsVersion: "3.18.3", styles: ["dark", "light"] } };
+
+  assert.equal(brandSnapshot(files, theme), true);
+  assert.deepEqual(files["styles/styles.json"].styles, ["dark", "light", "recall-light", "recall-dark"]);
+  assert.deepEqual(files["styles/recall-dark.json"].globals.fonts.font1.family, [
+    "JetBrains Mono",
+    "monospace",
+  ]);
+  assert.equal(files["styles/recall-dark.json"].fonts, undefined);
+  assert.equal(files["styles/recall-dark.json"].name, "Recall");
+  assert.equal(files["styles/recall-dark.json"].type, "flows");
+  assert.equal(brandSnapshot(files, theme), false);
+});
+
 test("hostedLoginUrl keeps the app URL and selects Recall's managed presentation", () => {
-  const url = new URL(hostedLoginUrl("https://api.descope.com/login/P123?flow=old&tenant=parcha"));
+  const url = new URL(hostedLoginUrl("https://api.descope.com/login/P123?flow=old&tenant=parcha", STYLE_ID));
   assert.equal(url.origin, "https://api.descope.com");
   assert.equal(url.searchParams.get("flow"), "recall-mcp-user-consent");
   assert.equal(url.searchParams.get("tenant"), "parcha");
+  assert.equal(url.searchParams.get("style"), "recall");
   assert.equal(url.searchParams.get("theme"), "dark");
   assert.equal(url.searchParams.get("bg"), "#070A08");
   assert.equal(url.searchParams.get("width"), "580px");
@@ -146,7 +168,9 @@ test("brandScreens changes presentation while preserving flow interactions", () 
   brandScreens(screens);
 
   const welcome = JSON.parse(screens[0].htmlTemplate);
-  assert.equal(welcome.UTdxgyTBPh.props.children, "Find the work. Keep the context.");
+  assert.equal(welcome.UTdxgyTBPh.props.children, "Connect to Parcha Recall.");
+  assert.equal(welcome.recallTrust, undefined);
+  assert.equal(welcome.FTAR1uG31j.nodes.includes("recallTrust"), false);
   assert.equal(welcome["3TVRPM-NqM"].props.children, "Continue securely  →");
   assert.equal(welcome.U9D2pHfkJp.type.resolvedName, "Text");
   assert.deepEqual(screens[0].interactions, interactions);
@@ -156,9 +180,13 @@ test("brandScreens changes presentation while preserving flow interactions", () 
   assert.match(consent.NpV0qhppf_.props.children, /read-only access/);
   assert.equal(consent["EQIG9X08-e"].props["border-radius"], undefined);
   assert.equal(consent.VqlMUvC3Yz.props["border-radius"], undefined);
+  assert.equal(consent.recallConsentTrust, undefined);
+  assert.equal(consent.ROOT.nodes.includes("recallConsentTrust"), false);
   assert.deepEqual(screens[2].interactions, interactions);
 
   const otp = screens[3].htmlTemplate;
   assert.equal(otp.eBGiu9cYSb.props.children, "Check your inbox.");
   assert.equal(otp.resend.props.children, "Send a new code");
+
+  assert.doesNotThrow(() => brandScreens(screens));
 });
