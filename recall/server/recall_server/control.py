@@ -927,7 +927,7 @@ class ControlPlane:
             access = connection.execute(
                 """SELECT 1 FROM brain_access_grants
                    WHERE principal_id=%s
-                     AND permission IN ('owner','admin') LIMIT 1""",
+                     AND permission IN ('owner','admin','read') LIMIT 1""",
                 (principal_id,),
             ).fetchone()
             if access is None:
@@ -1194,6 +1194,12 @@ class ControlPlane:
                 audience=self.mcp_resource_uri,
                 tenant_id=invitation.tenant_id,
                 invitation_id=invitation_id,
+                actor_email_index=self.actor_identity_index(
+                    email,
+                    tenant_id=invitation.tenant_id,
+                    connector_id="identity",
+                    namespace="email",
+                ),
             )
         if credential is None:
             raise ControlError("brain_invitation_forbidden", 403)
@@ -1201,10 +1207,12 @@ class ControlPlane:
             "status": "accepted",
             "redirect": f"/join/{invitation_id}?status=accepted",
         }
-        if credential["role"] in {"owner", "admin"}:
-            result["browser"] = self._create_admin_session(
-                credential["principal_id"]
-            )
+        # Members need the same short browser session to enroll and control
+        # only their own source-local collectors. Authorization stays in each
+        # control-plane operation; this cookie is identity, not admin power.
+        result["browser"] = self._create_admin_session(
+            credential["principal_id"]
+        )
         return result
 
     def _brain_rows(self, principal_id: str) -> list[dict[str, Any]]:
@@ -1257,16 +1265,22 @@ class ControlPlane:
         principal_id: str,
         tenant_id: str,
         email: str,
+        display_name: str | None = None,
         role: str,
         expires_in_days: int = 7,
     ) -> dict[str, Any]:
         normalized_email = normalize_verified_email(email)
+        normalized_name = display_name.strip() if isinstance(display_name, str) else None
         if (
             not isinstance(principal_id, str)
             or not AUTHORITY_RE.fullmatch(principal_id)
             or not isinstance(tenant_id, str)
             or not AUTHORITY_RE.fullmatch(tenant_id)
             or normalized_email is None
+            or (
+                normalized_name is not None
+                and not 1 <= len(normalized_name) <= 200
+            )
             or role not in {"admin", "member"}
             or type(expires_in_days) is not int
             or not 1 <= expires_in_days <= 30
@@ -1305,8 +1319,9 @@ class ControlPlane:
                 connection.execute(
                     """INSERT INTO brain_invitations(
                            id,tenant_id,email_sha256,encrypted_email,
-                           encryption_key_id,role,invited_by_principal_id,expires_at
-                       ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+                           encryption_key_id,role,invited_by_principal_id,expires_at,
+                           actor_display_name
+                       ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                     (
                         invitation_id,
                         tenant_id,
@@ -1316,6 +1331,7 @@ class ControlPlane:
                         role,
                         principal_id,
                         expires_at,
+                        normalized_name,
                     ),
                 )
                 connection.execute(
@@ -1365,6 +1381,7 @@ class ControlPlane:
             "id": str(invitation_id),
             "tenant_id": tenant_id,
             "email": normalized_email,
+            "display_name": normalized_name,
             "role": role,
             "status": "pending",
             "expires_at": expires_at.isoformat(),
@@ -1427,15 +1444,120 @@ class ControlPlane:
             purpose="brain-invitation-email-v1",
         )
 
+    def actor_identity_index(
+        self,
+        subject: str,
+        *,
+        tenant_id: str,
+        connector_id: str,
+        namespace: str,
+    ) -> str:
+        try:
+            from .actor_attribution import ActorIdentityIndex
+
+            _connector, _namespace, digest = ActorIdentityIndex(
+                self.secret_box.blind_index
+            ).lookup(tenant_id, connector_id, namespace, subject)
+        except ValueError:
+            raise ControlError("actor_identity_invalid") from None
+        return digest
+
+    def register_actor_identity(
+        self,
+        *,
+        principal_id: str,
+        tenant_id: str,
+        actor_id: str,
+        connector_id: str,
+        namespace: str,
+        subject: str,
+    ) -> dict[str, Any]:
+        from .actor_attribution import ACTOR_ID_RE, ActorIdentityIndex
+
+        if (
+            not isinstance(tenant_id, str)
+            or not AUTHORITY_RE.fullmatch(tenant_id)
+            or not isinstance(actor_id, str)
+            or not ACTOR_ID_RE.fullmatch(actor_id)
+            or not isinstance(connector_id, str)
+            or not 1 <= len(connector_id) <= 128
+            or not isinstance(namespace, str)
+            or not 1 <= len(namespace) <= 128
+        ):
+            raise ControlError("actor_identity_invalid")
+        try:
+            lookup_connector, lookup_namespace, digest = ActorIdentityIndex(
+                self.secret_box.blind_index
+            ).lookup(tenant_id, connector_id, namespace, subject)
+        except ValueError:
+            raise ControlError("actor_identity_invalid") from None
+        with self.store.connect() as connection:
+            with connection.transaction():
+                self._brain_admin(
+                    connection,
+                    principal_id=principal_id,
+                    tenant_id=tenant_id,
+                )
+                actor = connection.execute(
+                    """SELECT 1 FROM brain_actors
+                       WHERE tenant_id=%s AND actor_id=%s AND active""",
+                    (tenant_id, actor_id),
+                ).fetchone()
+                if actor is None:
+                    raise ControlError("actor_not_found", 404)
+                prior = connection.execute(
+                    """SELECT actor_id FROM brain_actor_external_identities
+                       WHERE tenant_id=%s AND connector_id=%s
+                         AND namespace=%s AND subject_hmac_sha256=%s
+                       FOR UPDATE""",
+                    (tenant_id, lookup_connector, lookup_namespace, digest),
+                ).fetchone()
+                if prior is not None and prior["actor_id"] != actor_id:
+                    raise ControlError("actor_identity_conflict", 409)
+                connection.execute(
+                    """INSERT INTO brain_actor_external_identities(
+                           tenant_id,actor_id,connector_id,namespace,
+                           subject_hmac_sha256
+                       ) VALUES (%s,%s,%s,%s,%s)
+                       ON CONFLICT DO NOTHING""",
+                    (
+                        tenant_id,
+                        actor_id,
+                        lookup_connector,
+                        lookup_namespace,
+                        digest,
+                    ),
+                )
+                connection.execute(
+                    """INSERT INTO control_audit_events(
+                           id,principal_id,operation,status,target_sha256
+                       ) VALUES (%s,%s,'actor.identity.register','success',%s)""",
+                    (uuid.uuid4(), principal_id, _digest(actor_id)),
+                )
+        return {
+            "schema_version": 1,
+            "status": "registered",
+            "tenant_id": tenant_id,
+            "actor_id": actor_id,
+            "connector_id": lookup_connector,
+            "namespace": lookup_namespace,
+        }
+
     def _brain_invitations(self, principal_id: str) -> list[dict[str, Any]]:
         with self.store.connect() as connection:
             rows = connection.execute(
                 """SELECT invitation.id,invitation.tenant_id,
                           invitation.encrypted_email,invitation.encryption_key_id,
-                          invitation.role,invitation.expires_at,
-                          invitation.accepted_at,invitation.revoked_at
+                          invitation.role,invitation.actor_display_name,
+                          invitation.expires_at,
+                          invitation.accepted_at,invitation.revoked_at,
+                          actor_principal.actor_id
                    FROM brain_invitations invitation
                    JOIN brain_spaces space USING(tenant_id)
+                   LEFT JOIN brain_actor_principals actor_principal
+                     ON actor_principal.tenant_id=invitation.tenant_id
+                    AND actor_principal.principal_id=
+                        invitation.accepted_principal_id
                    JOIN brain_access_grants access
                      ON access.tenant_id=invitation.tenant_id
                     AND access.principal_id=%s
@@ -1471,6 +1593,8 @@ class ControlPlane:
                 "id": str(row["id"]),
                 "tenant_id": row["tenant_id"],
                 "email": email,
+                "display_name": row["actor_display_name"],
+                "actor_id": row["actor_id"],
                 "role": row["role"],
                 "status": status,
                 "expires_at": row["expires_at"].isoformat(),
@@ -1514,6 +1638,41 @@ class ControlPlane:
                 )
                 member = invitation["accepted_principal_id"]
                 if member is not None:
+                    revoked_installations = connection.execute(
+                        """UPDATE connector_installations
+                              SET state='revoked',revision=revision+1,
+                                  updated_at=now()
+                            WHERE tenant_id=%s AND principal_id=%s
+                              AND state NOT IN ('revoked','uninstalled')
+                        RETURNING id""",
+                        (invitation["tenant_id"], member),
+                    ).fetchall()
+                    installation_ids = [
+                        row["id"] for row in revoked_installations
+                    ]
+                    if installation_ids:
+                        connection.execute(
+                            """UPDATE collector_credentials SET revoked_at=now()
+                               WHERE installation_id=ANY(%s)
+                                 AND revoked_at IS NULL""",
+                            (installation_ids,),
+                        )
+                        connection.execute(
+                            """DELETE FROM collector_credentials
+                               WHERE installation_id=ANY(%s)""",
+                            (installation_ids,),
+                        )
+                        connection.execute(
+                            """DELETE FROM connector_installations
+                               WHERE id=ANY(%s)""",
+                            (installation_ids,),
+                        )
+                    connection.execute(
+                        """UPDATE mcp_credentials SET revoked_at=now()
+                           WHERE tenant_id=%s AND principal_id=%s
+                             AND revoked_at IS NULL""",
+                        (invitation["tenant_id"], member),
+                    )
                     connection.execute(
                         """UPDATE external_identity_bindings SET revoked_at=now()
                            WHERE tenant_id=%s AND principal_id=%s
@@ -1663,14 +1822,91 @@ class ControlPlane:
         with self.store.connect() as connection:
             with connection.transaction():
                 brain = connection.execute(
-                    """SELECT 1 FROM brain_access_grants
-                       WHERE tenant_id=%s AND principal_id=%s
-                         AND permission IN ('owner','admin')
-                       FOR UPDATE""",
+                    """SELECT space.brain_kind,access.permission,
+                              membership.role
+                         FROM brain_spaces space
+                         JOIN brain_access_grants access
+                           ON access.tenant_id=space.tenant_id
+                          AND access.principal_id=%s
+                         LEFT JOIN brain_memberships membership
+                           ON membership.organization_id=space.organization_id
+                          AND membership.principal_id=%s
+                        WHERE space.tenant_id=%s
+                          AND access.permission IN ('owner','admin','read')
+                        FOR UPDATE OF access""",
+                    (principal_id, principal_id, tenant_id),
+                ).fetchone()
+                if (
+                    not brain
+                    or (
+                        brain["brain_kind"] == "company"
+                        and brain["role"] not in {"owner", "admin", "member"}
+                    )
+                    or (
+                        brain["brain_kind"] == "personal"
+                        and brain["permission"] not in {"owner", "admin"}
+                    )
+                ):
+                    raise ControlError("device_brain_forbidden", 403)
+                actor = connection.execute(
+                    """SELECT actor_id FROM brain_actor_principals
+                       WHERE tenant_id=%s AND principal_id=%s""",
                     (tenant_id, principal_id),
                 ).fetchone()
-                if not brain:
-                    raise ControlError("device_brain_forbidden", 403)
+                if actor is None and brain["brain_kind"] == "company":
+                    raise ControlError("device_actor_missing", 409)
+                from .canonical import CanonicalLifecycleError, CanonicalPlane
+
+                try:
+                    CanonicalPlane.register_source(
+                        connection,
+                        tenant_id=tenant_id,
+                        principal_id=principal_id,
+                        source_id=source_id,
+                    )
+                except CanonicalLifecycleError:
+                    raise ControlError("device_source_conflict", 409) from None
+                if actor is not None:
+                    binding = connection.execute(
+                        """INSERT INTO canonical_source_actor_bindings(
+                               tenant_id,source_id,actor_id,relation
+                           ) VALUES (%s,%s,%s,'contributor')
+                           ON CONFLICT DO NOTHING
+                           RETURNING actor_id""",
+                        (tenant_id, source_id, actor["actor_id"]),
+                    ).fetchone()
+                    if binding is not None:
+                        connection.execute(
+                            """INSERT INTO canonical_evidence_document_queue(
+                                   tenant_id,source_id,native_parent_id,
+                                   generation,reason,changed_at
+                               )
+                               SELECT event.tenant_id,event.source_id,
+                                      coalesce(
+                                          event.native_parent_id,event.native_id
+                                      ),1,'backfill',clock_timestamp()
+                                 FROM canonical_events event
+                                 JOIN canonical_documents document
+                                   ON document.tenant_id=event.tenant_id
+                                  AND document.source_id=event.source_id
+                                  AND document.event_id=event.event_id
+                                  AND document.is_current
+                                  AND document.deleted_at IS NULL
+                                WHERE event.tenant_id=%s
+                                  AND event.source_id=%s
+                                GROUP BY event.tenant_id,event.source_id,
+                                         coalesce(
+                                             event.native_parent_id,event.native_id
+                                         )
+                               ON CONFLICT(
+                                   tenant_id,source_id,native_parent_id
+                               ) DO UPDATE SET
+                                   generation=
+                                     canonical_evidence_document_queue.generation+1,
+                                   reason='backfill',
+                                   changed_at=clock_timestamp()""",
+                            (tenant_id, source_id),
+                        )
                 replaced = connection.execute(
                     """UPDATE connector_installations
                        SET state='revoked',revision=revision+1,updated_at=now()

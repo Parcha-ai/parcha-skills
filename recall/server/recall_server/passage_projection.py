@@ -547,10 +547,18 @@ def visible_messages(
                 )
             group.append(continuation)
         expected_ordinal += len(group)
+        dense_roles = first.roles
+        if not dense_roles and any(
+            link.relation == "author" for link in first.actor_links
+        ):
+            # Provider records such as Slack messages carry exact authorship
+            # but no chat-harness role. They are human-visible messages, not
+            # sparse tool output, so include them in actor-aware embeddings.
+            dense_roles = ("user",)
         if (
             not first.receipts
-            or not first.roles
-            or not set(first.roles) <= VISIBLE_DENSE_ROLES
+            or not dense_roles
+            or not set(dense_roles) <= VISIBLE_DENSE_ROLES
         ):
             continue
         text = visible_message_text(
@@ -562,7 +570,7 @@ def visible_messages(
             record_ordinal=first.ordinal,
             record_count=len(group),
             occurred_at=first.occurred_at,
-            roles=first.roles,
+            roles=dense_roles,
             receipts=first.receipts,
             text=text,
             actor_links=first.actor_links,

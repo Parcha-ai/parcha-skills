@@ -64,7 +64,7 @@ infrastructure. The example is synthetic; a live manifest belongs in a private m
 location and contains references, never credential values.
 
 The production database gate requires a standard PostgreSQL URL with
-`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 45,
+`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 46,
 pgvector 0.8.0 or newer, and a runtime role without superuser, database/role creation,
 replication, or RLS-bypass privilege:
 
@@ -300,6 +300,11 @@ projection, and actor-aware contextual-representation backfill. Person filters
 remain inside the tenant and authorized-source boundary. See
 [`../../docs/actor-attribution.md`](../../docs/actor-attribution.md) for relation
 semantics, the retrofit sequence, and the cutover gate.
+
+Migration 46 adds the employee display name to invitations. Acceptance now
+creates and links the employee actor, and source-local route enrollment binds
+that actor as the source contributor. Apply it before inviting employees; mixed
+schema/application deployment is intentionally unsupported.
 
 `recall_deep_search` first uses canonical retrieval to select authorized
 candidates, passes only opaque evidence keys and exact allowed receipts to a

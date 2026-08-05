@@ -74,7 +74,7 @@ function renderAccess() {
     row.className = `access-row state-${item.status}`;
     const canRevoke = ["pending", "active"].includes(item.status);
     row.innerHTML = `
-      <strong>${escapeText(item.email)}</strong>
+      <strong>${escapeText(item.display_name || item.email)}</strong>
       <span>${escapeText(item.role)}</span>
       <span class="access-state"><i></i>${escapeText(item.status)}</span>
       <button type="button" data-invitation-id="${escapeText(item.id)}" ${canRevoke ? "" : "disabled"}>
@@ -253,11 +253,13 @@ $("#invite-form").addEventListener("submit", async (event) => {
       method: "POST",
       body: JSON.stringify({
         tenant_id: $("#invite-brain").value,
+        display_name: $("#invite-name").value,
         email: $("#invite-email").value,
         role: $("#invite-role").value,
       }),
     });
     $("#invite-email").value = "";
+    $("#invite-name").value = "";
     if (invitation.delivery?.status === "sent") {
       toast("Invitation emailed. OAuth activates access automatically.");
     } else if (invitation.delivery?.status === "failed") {
