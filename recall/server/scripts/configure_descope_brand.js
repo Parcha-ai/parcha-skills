@@ -286,25 +286,19 @@ function styleConsent(screen, { verified }) {
     "InboundAppLogo",
     "ThirdPartyAppLogo",
   ].includes(node.type?.resolvedName));
-  const appLogoId = appLogoEntry?.[0];
-  const appLogo = appLogoEntry?.[1];
-  const [headlineId, headline] = findEntry(t, textContaining("{{mcpClient.name}}"), "consent headline");
-  const [, requested] = findEntry(t, textContainingAny("will be able", "Requested access"), "scope heading");
-  const [scopesId, scopes] = findEntry(
-    t,
-    (node) => ["Scopes", "InboundAppScopes", "ScopesList"].includes(node.type?.resolvedName),
-    "scopes",
-  );
+  const headlineEntry = Object.entries(t).find(([, node]) => textContaining("{{mcpClient.name}}")(node));
+  const requestedEntry = Object.entries(t).find(([, node]) => textContainingAny(
+    "will be able",
+    "Requested access",
+  )(node));
+  const scopesEntry = Object.entries(t).find(([, node]) => [
+    "Scopes",
+    "InboundAppScopes",
+    "ScopesList",
+  ].includes(node.type?.resolvedName));
   const [, authorize] = findEntry(t, buttonLabeledAny("Authorize", "Connect company brain  →"), "authorize button");
   const [, cancel] = findEntry(t, buttonLabeledAny("Cancel", "Not now"), "cancel button");
-  const logoContainerId = appLogo?.parent;
-  const headlineContainerId = headline.parent;
-  const requestedContainerId = requested.parent;
-  const scopesContainerId = scopes.parent;
   const actionsContainerId = authorize.parent;
-  const headlineContainer = t[headlineContainerId];
-  const requestedContainer = t[requestedContainerId];
-  const scopesContainer = t[scopesContainerId];
   const actionsContainer = t[actionsContainerId];
   let warningContainerId;
   let warningContainer;
@@ -312,7 +306,11 @@ function styleConsent(screen, { verified }) {
   let warningBody;
   if (!verified) {
     [, warningHeadline] = findEntry(t, textContainingAny("Unverified Application", "NEW CLIENT CONNECTION"), "unverified warning");
-    [, warningBody] = findEntry(t, textContainingAny("put your data at risk", "read-only access"), "unverified detail");
+    [, warningBody] = findEntry(
+      t,
+      textContainingAny("put your data at risk", "read-only access", "not been verified by Descope"),
+      "unverified detail",
+    );
     warningContainerId = warningHeadline.parent;
     warningContainer = t[warningContainerId];
   }
@@ -321,10 +319,7 @@ function styleConsent(screen, { verified }) {
   t.ROOT.nodes = [
     "recallConsentBrand",
     "recallConsentEyebrow",
-    headlineContainerId,
     "recallConsentBody",
-    requestedContainerId,
-    scopesContainerId,
     ...(verified ? [] : [warningContainerId]),
     actionsContainerId,
   ];
@@ -335,26 +330,21 @@ function styleConsent(screen, { verified }) {
     "ACCESS REVIEW // COMPANY BRAIN",
     "subtitle2",
   );
-  if (appLogoId) delete t[appLogoId];
-  if (logoContainerId) delete t[logoContainerId];
-  styleContainer(headlineContainer, { align: "center", justify: "center" });
-  styleText(headline, "Connect {{mcpClient.name}}", "h3", "center");
+  for (const entry of [appLogoEntry, headlineEntry, requestedEntry, scopesEntry]) {
+    if (!entry) continue;
+    const [nodeId, node] = entry;
+    const parentId = node.parent;
+    delete t[nodeId];
+    if (parentId && parentId !== "ROOT") delete t[parentId];
+  }
   t.recallConsentBody = textNode(
     "recallConsentBody",
     "ROOT",
-    "Search Parcha's shared engineering history from your coding agent.",
+    "Connect your coding agent to Parcha's shared engineering history.",
     "body1",
     "center",
   );
   delete t.recallConsentTrust;
-  styleContainer(requestedContainer, { align: "start" });
-  styleText(requested, "Requested access", "subtitle2");
-  styleContainer(scopesContainer, {
-    align: "stretch",
-    background: "#151C17FF",
-    paddingX: "3",
-    paddingY: "3",
-  });
   styleContainer(actionsContainer, { align: "stretch", background: "#ffffff00", spaceBetween: "2" });
   authorize.props.children = "Connect company brain  →";
   cancel.props.children = "Not now";
@@ -370,7 +360,7 @@ function styleConsent(screen, { verified }) {
     styleText(warningHeadline, "NEW CLIENT CONNECTION", "subtitle2");
     styleText(
       warningBody,
-      "Descope has not verified this client. Recall still enforces read-only access to the Parcha company brain.",
+      "This client has not been verified by Descope.",
       "body2",
     );
   }
@@ -417,7 +407,10 @@ function brandScreens(screens) {
     const template = parseTemplate(screen);
     if (hasType(template, "EmailInput")) classified.welcome.push(screen);
     else if (hasType(template, "OneTimeCode") || hasType(template, "Code")) classified.otp.push(screen);
-    else if (["InboundAppScopes", "Scopes", "ScopesList"].some((name) => hasType(template, name))) {
+    else if (
+      ["InboundAppScopes", "Scopes", "ScopesList"].some((name) => hasType(template, name))
+      || Object.values(template).some(buttonLabeledAny("Authorize", "Connect company brain  →"))
+    ) {
       const isUnverified = Object.values(template).some(
         textContainingAny("Unverified Application", "NEW CLIENT CONNECTION"),
       );

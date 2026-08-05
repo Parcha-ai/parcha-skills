@@ -180,9 +180,18 @@ test("brandScreens changes presentation while preserving flow interactions", () 
   assert.equal(consent.ojc6ht, undefined);
   assert.equal(consent.qIfDVKm2T2, undefined);
   assert.equal(consent.ROOT.nodes.includes("qIfDVKm2T2"), false);
+  assert.equal(consent.LmrSIGOWZb, undefined);
+  assert.equal(consent.OHS3uAG0xM, undefined);
+  assert.equal(consent._FBvzhJtOx, undefined);
+  assert.equal(consent.Zgp3CGaHAw, undefined);
+  assert.equal(consent.scopeList, undefined);
+  assert.equal(consent["EQIG9X08-e"], undefined);
+  assert.equal(
+    consent.recallConsentBody.props.children,
+    "Connect your coding agent to Parcha's shared engineering history.",
+  );
   assert.equal(consent._Z6xPaS9jy.props.id, "_Z6xPaS9jy");
-  assert.match(consent.NpV0qhppf_.props.children, /read-only access/);
-  assert.equal(consent["EQIG9X08-e"].props["border-radius"], undefined);
+  assert.equal(consent.NpV0qhppf_.props.children, "This client has not been verified by Descope.");
   assert.equal(consent.VqlMUvC3Yz.props["border-radius"], undefined);
   assert.equal(consent.recallConsentTrust, undefined);
   assert.equal(consent.ROOT.nodes.includes("recallConsentTrust"), false);
