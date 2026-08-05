@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase
@@ -85,6 +86,47 @@ class InterruptingProjector(CanonicalLogicalEvidenceProjector):
 
 
 class LogicalEvidenceInterruptTests(TestCase):
+    def test_pending_reuses_document_weight_without_rescanning_events(self) -> None:
+        captured: dict[str, object] = {}
+
+        class Connection:
+            def execute(self, query, values):
+                captured["query"] = query
+                captured["values"] = values
+                return SimpleNamespace(
+                    fetchall=lambda: [
+                        {
+                            "tenant_id": "tenant:company:synthetic",
+                            "source_id": "source:synthetic",
+                            "native_parent_id": "session-1",
+                            "source_updated_at": "2026-08-05T00:00:00Z",
+                            "generation": 2,
+                            "revision": 3,
+                            "estimated_records": 42,
+                            "estimated_bytes": 84,
+                        }
+                    ]
+                )
+
+        class Store:
+            def connect(self):
+                return nullcontext(Connection())
+
+        projector = CanonicalLogicalEvidenceProjector(
+            Store(),
+            None,
+            bound_tenant_id="tenant:company:synthetic",
+        )
+
+        pending = projector._pending(
+            tenant_id="tenant:company:synthetic",
+            limit=10,
+        )
+
+        self.assertEqual(pending[0].estimated_records, 42)
+        self.assertEqual(pending[0].estimated_bytes, 84)
+        self.assertNotIn("canonical_events", captured["query"])
+
     def test_structural_values_reads_only_bounded_remembering_fields(self) -> None:
         parsed, types, roles = _structural_values(
             """{

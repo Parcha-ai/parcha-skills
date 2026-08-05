@@ -407,27 +407,18 @@ class CanonicalLogicalEvidenceProjector:
                           queue.changed_at AS source_updated_at,
                           queue.generation,
                           COALESCE(evidence.revision,0)+1 AS revision,
-                          estimate.estimated_records,
+                          COALESCE(evidence.record_count,1)
+                              AS estimated_records,
                           COALESCE(
                               evidence_size.estimated_bytes,
-                              estimate.estimated_records
+                              evidence.record_count,
+                              1
                           ) AS estimated_bytes
                      FROM canonical_evidence_document_queue queue
                      LEFT JOIN canonical_evidence_documents evidence
                        ON evidence.tenant_id=queue.tenant_id
                       AND evidence.source_id=queue.source_id
                       AND evidence.native_parent_id=queue.native_parent_id
-                     CROSS JOIN LATERAL (
-                              SELECT count(*)
-                                         AS estimated_records
-                                FROM canonical_events session_event
-                               WHERE session_event.tenant_id=queue.tenant_id
-                                 AND session_event.source_id=queue.source_id
-                                 AND COALESCE(
-                                     session_event.native_parent_id,
-                                     session_event.native_id
-                                 )=queue.native_parent_id
-                     ) estimate
                      LEFT JOIN LATERAL (
                               SELECT sum(part.size_bytes)
                                          AS estimated_bytes
