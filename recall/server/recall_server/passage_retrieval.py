@@ -10,6 +10,7 @@ from typing import Any
 
 from psycopg import sql
 
+from .actor_attribution import ACTOR_ID_RE, ACTOR_RELATIONS
 from .db import SearchDeadlineExceeded, bounded_search_text
 from .passage_representations import FINGERPRINT_RE, VECTOR_COLUMNS
 
@@ -193,11 +194,29 @@ class PassageHintRetrieval:
         tenant_id: str,
         sources: list[str],
         policy_fingerprint: str,
+        actor_ids: tuple[str, ...] | None = None,
+        actor_relations: tuple[str, ...] | None = None,
     ) -> None:
+        if actor_ids is not None and (
+            not isinstance(actor_ids, tuple)
+            or len(actor_ids) > 64
+            or tuple(sorted(set(actor_ids))) != actor_ids
+            or any(not ACTOR_ID_RE.fullmatch(value) for value in actor_ids)
+        ):
+            raise ValueError("invalid actor hint scope")
+        if actor_relations is not None and (
+            not isinstance(actor_relations, tuple)
+            or tuple(sorted(set(actor_relations))) != actor_relations
+            or not set(actor_relations) <= ACTOR_RELATIONS
+            or actor_ids is None
+        ):
+            raise ValueError("invalid actor relation scope")
         self.store = store
         self.tenant_id = tenant_id
         self.sources = sources
         self.policy_fingerprint = policy_fingerprint
+        self.actor_ids = actor_ids
+        self.actor_relations = actor_relations
 
     def search(
         self,
@@ -210,6 +229,12 @@ class PassageHintRetrieval:
         include_arms: bool = False,
     ) -> dict[str, Any]:
         candidate_limit = min(400, max(80, limit * 20))
+        actor_ids = list(self.actor_ids) if self.actor_ids is not None else None
+        actor_relations = (
+            list(self.actor_relations)
+            if self.actor_relations is not None
+            else None
+        )
         with self.store.connect() as connection:
             try:
                 lexical = self.store._execute_bounded(
@@ -244,6 +269,21 @@ class PassageHintRetrieval:
                         WHERE passage.tenant_id=%s
                           AND passage.source_id=ANY(%s)
                           AND projected.policy_fingerprint=%s
+                          AND (
+                              %s::text[] IS NULL
+                              OR EXISTS (
+                                  SELECT 1
+                                    FROM canonical_passage_actors actor
+                                   WHERE actor.tenant_id=passage.tenant_id
+                                     AND actor.source_id=passage.source_id
+                                     AND actor.passage_id=passage.passage_id
+                                     AND actor.actor_id=ANY(%s)
+                                     AND (
+                                         %s::text[] IS NULL
+                                         OR actor.relation=ANY(%s)
+                                     )
+                              )
+                          )
                           AND passage.search_vector @@
                               plainto_tsquery('simple',%s)
                           AND (%s::timestamptz IS NULL
@@ -258,6 +298,10 @@ class PassageHintRetrieval:
                         self.tenant_id,
                         self.sources,
                         self.policy_fingerprint,
+                        actor_ids,
+                        actor_ids,
+                        actor_relations,
+                        actor_relations,
                         lexical_query,
                         since,
                         since,
@@ -305,6 +349,23 @@ class PassageHintRetrieval:
                           AND chunk.deleted_at IS NULL
                           AND document.is_current
                           AND document.deleted_at IS NULL
+                          AND (
+                              %s::text[] IS NULL
+                              OR EXISTS (
+                                  SELECT 1
+                                    FROM canonical_evidence_document_actors actor
+                                   WHERE actor.tenant_id=evidence.tenant_id
+                                     AND actor.source_id=evidence.source_id
+                                     AND actor.logical_document_id=
+                                         evidence.logical_document_id
+                                     AND actor.revision=evidence.revision
+                                     AND actor.actor_id=ANY(%s)
+                                     AND (
+                                         %s::text[] IS NULL
+                                         OR actor.relation=ANY(%s)
+                                     )
+                              )
+                          )
                           AND chunk.search_vector @@
                               plainto_tsquery('simple',%s)
                           AND (%s::timestamptz IS NULL
@@ -318,6 +379,10 @@ class PassageHintRetrieval:
                         lexical_query,
                         self.tenant_id,
                         self.sources,
+                        actor_ids,
+                        actor_ids,
+                        actor_relations,
+                        actor_relations,
                         lexical_query,
                         since,
                         since,
@@ -359,6 +424,24 @@ class PassageHintRetrieval:
                                 WHERE embedding.tenant_id=%s
                                   AND embedding.source_id=ANY(%s)
                                   AND embedding.runtime_fingerprint=%s
+                                  AND (
+                                      %s::text[] IS NULL
+                                      OR EXISTS (
+                                          SELECT 1
+                                            FROM canonical_passage_actors actor
+                                           WHERE actor.tenant_id=
+                                                 embedding.tenant_id
+                                             AND actor.source_id=
+                                                 embedding.source_id
+                                             AND actor.passage_id=
+                                                 embedding.passage_id
+                                             AND actor.actor_id=ANY(%s)
+                                             AND (
+                                                 %s::text[] IS NULL
+                                                 OR actor.relation=ANY(%s)
+                                             )
+                                      )
+                                  )
                                 ORDER BY embedding.embedding
                                          <=> %s::halfvec
                                 LIMIT %s
@@ -412,6 +495,10 @@ class PassageHintRetrieval:
                             self.tenant_id,
                             self.sources,
                             runtime.passage_fingerprint,
+                            actor_ids,
+                            actor_ids,
+                            actor_relations,
+                            actor_relations,
                             vector,
                             candidate_limit * dense_oversample,
                             self.policy_fingerprint,

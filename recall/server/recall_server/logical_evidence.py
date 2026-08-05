@@ -13,6 +13,8 @@ from urllib.parse import urlsplit
 
 import orjson
 
+from .actor_attribution import ActorLink, actor_links, canonical_actor_links
+
 LOGICAL_DOCUMENT_ID_RE = re.compile(r"ldoc_[0-9a-f]{32}\Z")
 EVIDENCE_ID_RE = re.compile(r"evd_[0-9a-f]{32}\Z")
 ARTIFACT_ID_RE = re.compile(r"art_[0-9a-f]{32}\Z")
@@ -110,6 +112,7 @@ class LogicalEvidenceRecord:
     segment_count: int
     text: str
     canonical_content_bytes: bytes | None = None
+    actor_links: tuple[ActorLink, ...] = ()
 
     def validate(self, *, source_id: str) -> None:
         if (
@@ -148,6 +151,7 @@ class LogicalEvidenceRecord:
                 self.canonical_content_bytes is not None
                 and self.segment_count != 1
             )
+            or actor_links(self.actor_links) != self.actor_links
         ):
             raise LogicalEvidenceError("logical_evidence_record_invalid")
         _parsed_timestamp(self.occurred_at)
@@ -166,6 +170,8 @@ class LogicalEvidenceRecord:
             "segment_count": self.segment_count,
             "segment_ordinal": self.segment_ordinal,
         }
+        if self.actor_links:
+            value["actor_links"] = canonical_actor_links(self.actor_links)
         if self.segment_count > 1:
             value["content_fragment"] = self.text
         else:

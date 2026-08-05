@@ -4,6 +4,7 @@ import inspect
 import unittest
 
 from recall_server.passage_representations import (
+    ActorContext,
     CanonicalPassageRepresentationIndex,
     ContextPassage,
     DocumentContext,
@@ -55,6 +56,14 @@ class PassageRepresentationTests(unittest.TestCase):
             branch="feature/context",
             first_occurred_at="2026-07-29T00:00:00+00:00",
             last_occurred_at="2026-07-29T01:00:00+00:00",
+            actors=(
+                ActorContext(
+                    actor_id="actor_0123456789abcdef0123456789abcdef",
+                    display_name="Alice Example",
+                    relations=("contributor", "author"),
+                    aliases=("alice",),
+                ),
+            ),
         )
 
         first = contextualize_passage(
@@ -74,6 +83,10 @@ class PassageRepresentationTests(unittest.TestCase):
         self.assertIn("workspace: ati-harness", first.context_text)
         self.assertNotIn("worktrees/", first.context_text)
         self.assertNotIn("/redacted/home/", first.context_text)
+        self.assertIn(
+            "people: Alice Example [author, contributor] (also: alice)",
+            first.context_text,
+        )
         self.assertEqual(first.context_text.count("exact passage 4"), 1)
         self.assertEqual(first.context_text.count("exact passage 0"), 1)
         self.assertEqual(first.context_text.count("exact passage 1"), 1)
@@ -101,6 +114,28 @@ class PassageRepresentationTests(unittest.TestCase):
         self.assertNotIn("exact passage 0", result.context_text)
         self.assertNotIn("exact passage 8", result.context_text)
         self.assertNotIn("exact passage 10", result.context_text)
+
+    def test_many_actor_labels_stay_inside_the_embedding_budget(self) -> None:
+        result = contextualize_passage(
+            self.passage(1),
+            (),
+            metadata=DocumentContext(
+                actors=tuple(
+                    ActorContext(
+                        actor_id=f"actor_{index:032x}",
+                        display_name=f"Person {index} " + "x" * 256,
+                        relations=("author", "participant"),
+                        aliases=("y" * 256, "z" * 256),
+                    )
+                    for index in range(64)
+                ),
+            ),
+            policy=PassageContextPolicy(),
+        )
+
+        self.assertLessEqual(len(result.context_text.encode()), 7_000)
+        self.assertIn("people: Person", result.context_text)
+        self.assertIn("exact passage 1", result.context_text)
 
     def test_embedding_excerpt_is_bounded_and_keeps_both_ends(self) -> None:
         value = "alpha-" + ("x" * 12_000) + "-omega"

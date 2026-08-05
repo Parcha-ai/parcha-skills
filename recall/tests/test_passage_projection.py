@@ -11,6 +11,7 @@ from unittest import mock
 import orjson
 
 from recall_server import SCHEMA_VERSION
+from recall_server.actor_attribution import ActorLink
 from recall_server.canonical_retrieval import (
     BoundCanonicalRetrieval,
     CanonicalRetrieval,
@@ -80,7 +81,7 @@ class PassageProjectionTests(unittest.TestCase):
         )
         rendered = " ".join(migration.read_text().split()).casefold()
 
-        self.assertEqual(SCHEMA_VERSION, 44)
+        self.assertEqual(SCHEMA_VERSION, 45)
         self.assertIn(
             "create table if not exists canonical_passage_documents",
             rendered,
@@ -159,6 +160,36 @@ class PassageProjectionTests(unittest.TestCase):
             "drop constraint if exists "
             "canonical_passage_repr_vector_dimensions_check",
             native_sql,
+        )
+
+        attribution = (
+            Path(__file__).resolve().parents[1]
+            / "server"
+            / "schema"
+            / "045_actor_attribution.sql"
+        )
+        actor_sql = " ".join(attribution.read_text().split()).casefold()
+        for table in (
+            "brain_actors",
+            "brain_actor_external_identities",
+            "canonical_source_actor_bindings",
+            "canonical_event_actors",
+            "canonical_evidence_document_actors",
+            "canonical_passage_actors",
+        ):
+            self.assertIn(f"create table if not exists {table}", actor_sql)
+        self.assertIn(
+            "a principal answers \"who may access this brain?\"",
+            actor_sql,
+        )
+        self.assertIn("subject_hmac_sha256 char(64) not null", actor_sql)
+        passage_actor_table = actor_sql.split(
+            "create table if not exists canonical_passage_actors",
+            1,
+        )[1].split("create index", 1)[0]
+        self.assertNotIn(
+            "references brain_actors(tenant_id, actor_id) on delete cascade",
+            passage_actor_table,
         )
 
     def test_builds_lossless_overlapping_passages_without_crossing_documents(
@@ -310,7 +341,10 @@ class PassageProjectionTests(unittest.TestCase):
             policy=policy,
         )
 
-        self.assertEqual(PASSAGE_CONTRACT.rsplit(".", 1)[-1], "v3")
+        self.assertEqual(
+            PASSAGE_CONTRACT,
+            "recall.lossless-message-passage.v4:actor-aware",
+        )
         self.assertGreater(len(passages), 1)
         self.assertTrue(all(
             len(passage.text.encode())
@@ -330,6 +364,10 @@ class PassageProjectionTests(unittest.TestCase):
         self.assertEqual(CountingText.encode_calls, 2)
 
     def test_decodes_and_combines_segmented_visible_messages_only(self) -> None:
+        contributor = ActorLink(
+            "actor_0123456789abcdef0123456789abcdef",
+            "contributor",
+        )
         records = (
             LogicalEvidenceRecord(
                 ordinal=0,
@@ -341,6 +379,7 @@ class PassageProjectionTests(unittest.TestCase):
                 segment_ordinal=0,
                 segment_count=2,
                 text="first ",
+                actor_links=(contributor,),
             ),
             LogicalEvidenceRecord(
                 ordinal=1,
@@ -352,6 +391,7 @@ class PassageProjectionTests(unittest.TestCase):
                 segment_ordinal=1,
                 segment_count=2,
                 text="second",
+                actor_links=(contributor,),
             ),
             LogicalEvidenceRecord(
                 ordinal=2,
@@ -384,6 +424,7 @@ class PassageProjectionTests(unittest.TestCase):
                     roles=("assistant",),
                     receipts=("recall://source:test/long?rev=1#item=0",),
                     text="first second",
+                    actor_links=(contributor,),
                 ),
             ),
         )

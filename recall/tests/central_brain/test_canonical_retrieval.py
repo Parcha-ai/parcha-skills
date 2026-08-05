@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import sys
 import time
 import unittest
@@ -17,6 +18,7 @@ from recall_server.canonical_retrieval import (  # noqa: E402
 )
 from recall_server.db import SearchDeadlineExceeded  # noqa: E402
 from recall_server.deep_inspection import DeepInspectionError  # noqa: E402
+from recall_server.passage_retrieval import PassageHintRetrieval  # noqa: E402
 
 
 class DeadlineStore:
@@ -78,6 +80,22 @@ class RecordingStore:
         self.sql.append(" ".join(sql.split()))
         self.values.append(tuple(_values))
         return EmptyRows()
+
+
+class ActorRecordingStore(RecordingStore):
+    @contextmanager
+    def connect(self):
+        yield self
+
+    def execute(self, sql, values):
+        normalized = " ".join(sql.split())
+        self.sql.append(normalized)
+        self.values.append(tuple(values))
+        if "FROM brain_actors actor" in sql:
+            return Rows([{
+                "actor_id": "actor_0123456789abcdef0123456789abcdef",
+            }])
+        return Rows([])
 
 
 class AgentExecStore:
@@ -201,6 +219,43 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
                 source_connector="codex",
             ),
             ["codex:linux:test", "codex:mac:test"],
+        )
+
+    def test_person_hints_resolve_inside_tenant_and_filter_every_arm(self):
+        store = ActorRecordingStore()
+        retrieval = BoundCanonicalRetrieval(
+            store,
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=("codex:linux:test",),
+        )
+
+        result = retrieval.passage_hints(
+            "What did Alice write?",
+            filters={"person": "Alice", "person_relation": "author"},
+        )
+
+        self.assertEqual(result["results"], [])
+        resolver_sql = next(
+            value for value in store.sql if "FROM brain_actors actor" in value
+        )
+        self.assertIn("actor.tenant_id=%s", resolver_sql)
+        arm_sql = " ".join(
+            value
+            for value in store.sql
+            if "canonical_passage_actors" in value
+            or "canonical_evidence_document_actors" in value
+        )
+        self.assertEqual(arm_sql.count("actor.actor_id=ANY(%s)"), 2)
+        self.assertGreaterEqual(
+            inspect.getsource(PassageHintRetrieval.search).count(
+                "actor.actor_id=ANY(%s)"
+            ),
+            3,
+        )
+        self.assertIn(
+            "actor_0123456789abcdef0123456789abcdef",
+            repr(store.values),
         )
 
     def test_lexical_deadline_degrades_to_optional_semantic_path(self) -> None:

@@ -229,6 +229,8 @@ def success_script():
         "until": REQUEST["until"],
         "source_family": None,
         "source_connector": None,
+        "person": None,
+        "person_relation": None,
     }
     return [
         (
@@ -340,6 +342,8 @@ class SimpleAgentKernelTest(unittest.TestCase):
                         "until": " ",
                         "source_family": "",
                         "source_connector": "",
+                        "person": "",
+                        "person_relation": "",
                     },
                     "limit": 10,
                 },
@@ -422,6 +426,20 @@ class SimpleAgentKernelTest(unittest.TestCase):
             "properties"
         ]["source_connector"]["anyOf"][0]
         self.assertIn("pattern", connector_schema)
+        person_filters = hint_tool["input_schema"]["properties"]["filters"][
+            "properties"
+        ]
+        self.assertEqual(
+            set(person_filters["person_relation"]["anyOf"][0]["enum"]),
+            {
+                "author",
+                "contributor",
+                "owner",
+                "organizer",
+                "participant",
+                "attendee",
+            },
+        )
         self.assertEqual(
             [event["stage"] for event in bundle["trace"]][2:6],
             ["retrieve", "retrieve", "retrieve", "inspect"],

@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
+from .actor_attribution import ACTOR_RELATIONS
 from .authorization import decide
 from .canonical import CanonicalPlane
 from .db import BrainStore, SearchDeadlineExceeded, bounded_search_text
@@ -837,6 +838,19 @@ class BoundCanonicalRetrieval:
             or not 1 <= limit <= 20
         ):
             raise ValueError("invalid passage hint limit")
+        effective_filters = dict(filters or {})
+        person = effective_filters.pop("person", None)
+        relation = effective_filters.pop("person_relation", None)
+        if person is not None and (
+            not isinstance(person, str)
+            or not person.strip()
+            or len(person) > 256
+        ):
+            raise ValueError("invalid person filter")
+        if relation is not None and relation not in ACTOR_RELATIONS:
+            raise ValueError("invalid person relation filter")
+        if relation is not None and person is None:
+            raise ValueError("person relation requires a person filter")
         (
             source_id,
             source_family,
@@ -844,7 +858,7 @@ class BoundCanonicalRetrieval:
             source_connector,
             since,
             until,
-        ) = self._filters(filters or {})
+        ) = self._filters(effective_filters)
         sources = self._sources(
             source_id=source_id,
             source_family=source_family,
@@ -861,11 +875,33 @@ class BoundCanonicalRetrieval:
             }
         informative = _informative_query_terms(query)
         lexical_query = " ".join(informative) if informative else query
+        actor_ids: tuple[str, ...] | None = None
+        if person is not None:
+            with self.store.connect() as connection:
+                rows = connection.execute(
+                    """SELECT DISTINCT actor.actor_id
+                         FROM brain_actors actor
+                         LEFT JOIN brain_actor_aliases alias
+                           ON alias.tenant_id=actor.tenant_id
+                          AND alias.actor_id=actor.actor_id
+                          AND alias.searchable
+                        WHERE actor.tenant_id=%s
+                          AND actor.active
+                          AND (
+                              lower(actor.display_name)=lower(%s)
+                              OR lower(alias.alias)=lower(%s)
+                          )
+                        ORDER BY actor.actor_id""",
+                    (self.tenant_id, person.strip(), person.strip()),
+                ).fetchall()
+            actor_ids = tuple(row["actor_id"] for row in rows)
         return PassageHintRetrieval(
             self.store,
             tenant_id=self.tenant_id,
             sources=sources,
             policy_fingerprint=self.passage_policy.fingerprint,
+            actor_ids=actor_ids,
+            actor_relations=(relation,) if relation is not None else None,
         ).search(
             query,
             lexical_query=lexical_query,

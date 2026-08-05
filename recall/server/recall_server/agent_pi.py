@@ -934,9 +934,49 @@ def _tool_definitions(
             {"type": "null"},
         ],
     }
+    filter_properties["person"] = {
+        "description": (
+            "Optional exact employee display name or searchable alias. Use it "
+            "when the question explicitly asks what a named person did, wrote, "
+            "sent, or owned. This narrows authorized evidence; it never grants "
+            "access. Use null when no person is named."
+        ),
+        "anyOf": [
+            {"type": "string", "minLength": 1, "maxLength": 256},
+            {"type": "null"},
+        ],
+    }
+    filter_properties["person_relation"] = {
+        "description": (
+            "Optional exact relation for a named person. Use author for "
+            "wrote/sent, owner for owned, organizer for organized; use null "
+            "for broad questions such as what the person worked on or did."
+        ),
+        "anyOf": [
+            {
+                "type": "string",
+                "enum": [
+                    "author",
+                    "contributor",
+                    "owner",
+                    "organizer",
+                    "participant",
+                    "attendee",
+                ],
+            },
+            {"type": "null"},
+        ],
+    }
     filters = _object_schema(
         filter_properties,
-        ["since", "until", "source_family", "source_connector"],
+        [
+            "since",
+            "until",
+            "source_family",
+            "source_connector",
+            "person",
+            "person_relation",
+        ],
     )
     receipt = {
         "type": "string",
@@ -1477,6 +1517,8 @@ class PiRunner:
                 "until",
                 "source_family",
                 "source_connector",
+                "person",
+                "person_relation",
             }
             or isinstance(value["limit"], bool)
             or not isinstance(value["limit"], int)
@@ -1537,6 +1579,34 @@ class PiRunner:
         ):
             raise AgentExecutionError(
                 "agent hint scope is invalid",
+                code="agent_query_scope_violation",
+            )
+        person = filters.get("person")
+        if person is not None and (
+            not isinstance(person, str)
+            or not person.strip()
+            or len(person) > 256
+        ):
+            raise AgentExecutionError(
+                "agent person scope is invalid",
+                code="agent_query_scope_violation",
+            )
+        relation = filters.get("person_relation")
+        if relation is not None and relation not in {
+            "author",
+            "contributor",
+            "owner",
+            "organizer",
+            "participant",
+            "attendee",
+        }:
+            raise AgentExecutionError(
+                "agent person relation is invalid",
+                code="agent_query_scope_violation",
+            )
+        if relation is not None and person is None:
+            raise AgentExecutionError(
+                "agent person relation requires a person",
                 code="agent_query_scope_violation",
             )
         filters = {

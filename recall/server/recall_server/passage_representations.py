@@ -12,13 +12,14 @@ from typing import Any, Iterable
 from psycopg import sql
 
 
-CONTEXT_CONTRACT = "recall.passage-context.v2:project-basename-only"
+CONTEXT_CONTRACT = "recall.passage-context.v3:actor-aware"
 REPRESENTATION_CONTRACT = "recall.passage-representation.v1"
 REPRESENTATION_TEXT_CONTRACT = (
     "recall.passage-embedding-excerpt.v1:head-tail-7000-utf8-bytes"
 )
 FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}\Z")
 MAX_CONTEXT_FIELD_CHARS = 256
+MAX_PEOPLE_CONTEXT_CHARS = 2_048
 EMBEDDING_EXCERPT_MARKER = "\n[...embedding excerpt clipped...]\n"
 VECTOR_COLUMNS = {
     512: "embedding",
@@ -118,6 +119,14 @@ class ContextPassage:
 
 
 @dataclass(frozen=True)
+class ActorContext:
+    actor_id: str
+    display_name: str
+    relations: tuple[str, ...]
+    aliases: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class DocumentContext:
     source_family: str | None = None
     source_aliases: tuple[str, ...] = ()
@@ -126,6 +135,7 @@ class DocumentContext:
     branch: str | None = None
     first_occurred_at: str | None = None
     last_occurred_at: str | None = None
+    actors: tuple[ActorContext, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -169,16 +179,45 @@ class PassageRepresentation:
 
 
 def _metadata_lines(metadata: DocumentContext) -> list[str]:
-    aliases = tuple(
+    source_aliases = tuple(
         sorted({
             value
             for raw in metadata.source_aliases
             if (value := _bounded(raw)) is not None
         })[:4]
     )
+    people = []
+    for actor in sorted(
+        metadata.actors,
+        key=lambda value: (value.display_name.casefold(), value.actor_id),
+    )[:16]:
+        name = _bounded(actor.display_name)
+        relations = tuple(sorted({
+            bounded
+            for value in actor.relations
+            if (bounded := _bounded(value)) is not None
+        }))
+        actor_aliases = tuple(sorted({
+            value
+            for raw in actor.aliases
+            if (value := _bounded(raw)) is not None and value != name
+        }))[:4]
+        if name is None or not relations:
+            continue
+        label = f"{name} [{', '.join(relations)}]"
+        if actor_aliases:
+            label += f" (also: {', '.join(actor_aliases)})"
+        candidate = "; ".join((*people, label))
+        if len(candidate) > MAX_PEOPLE_CONTEXT_CHARS:
+            break
+        people.append(label)
     values = (
         ("source family", _bounded(metadata.source_family)),
-        ("source aliases", ", ".join(aliases) if aliases else None),
+        (
+            "source aliases",
+            ", ".join(source_aliases) if source_aliases else None,
+        ),
+        ("people", "; ".join(people) if people else None),
         ("harness", _bounded(metadata.harness)),
         ("workspace", workspace_label(metadata.workspace)),
         ("branch", _bounded(metadata.branch)),
@@ -428,7 +467,11 @@ class CanonicalPassageRepresentationIndex:
                           ) AS source_aliases,
                           session.harness,session.metadata,
                           evidence.first_occurred_at,
-                          evidence.last_occurred_at
+                          evidence.last_occurred_at,
+                          coalesce(
+                              attributed.actors,
+                              '[]'::jsonb
+                          ) AS actors
                      FROM targets target
                      JOIN canonical_passages support
                        ON support.tenant_id=target.tenant_id
@@ -462,6 +505,46 @@ class CanonicalPassageRepresentationIndex:
                            FROM source_aliases
                           WHERE source_id=evidence.source_id
                      ) aliases ON true
+                     LEFT JOIN LATERAL (
+                         SELECT jsonb_agg(
+                                    jsonb_build_object(
+                                        'actor_id',person.actor_id,
+                                        'display_name',person.display_name,
+                                        'relations',person.relations,
+                                        'aliases',person.aliases
+                                    )
+                                    ORDER BY lower(person.display_name),
+                                             person.actor_id
+                                ) AS actors
+                           FROM (
+                                 SELECT actor.actor_id,actor.display_name,
+                                        array_agg(
+                                            DISTINCT link.relation
+                                            ORDER BY link.relation
+                                        ) AS relations,
+                                        coalesce(
+                                            array_agg(
+                                                DISTINCT alias.alias
+                                                ORDER BY alias.alias
+                                            ) FILTER (
+                                                WHERE alias.searchable
+                                            ),
+                                            ARRAY[]::text[]
+                                        ) AS aliases
+                                   FROM canonical_passage_actors link
+                                   JOIN brain_actors actor
+                                     ON actor.tenant_id=link.tenant_id
+                                    AND actor.actor_id=link.actor_id
+                                    AND actor.active
+                                   LEFT JOIN brain_actor_aliases alias
+                                     ON alias.tenant_id=actor.tenant_id
+                                    AND alias.actor_id=actor.actor_id
+                                  WHERE link.tenant_id=target.tenant_id
+                                    AND link.source_id=target.source_id
+                                    AND link.passage_id=target.passage_id
+                                  GROUP BY actor.actor_id,actor.display_name
+                           ) person
+                     ) attributed ON true
                     ORDER BY target.tenant_id,target.source_id,
                              target.logical_document_id,target.revision,
                              target.ordinal,support.ordinal,
@@ -533,6 +616,15 @@ class CanonicalPassageRepresentationIndex:
                     branch=session_metadata.get("branch"),
                     first_occurred_at=str(first["first_occurred_at"]),
                     last_occurred_at=str(first["last_occurred_at"]),
+                    actors=tuple(
+                        ActorContext(
+                            actor_id=value["actor_id"],
+                            display_name=value["display_name"],
+                            relations=tuple(value.get("relations") or ()),
+                            aliases=tuple(value.get("aliases") or ()),
+                        )
+                        for value in first.get("actors") or ()
+                    ),
                 ),
                 policy=policy,
             )

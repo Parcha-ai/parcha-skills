@@ -12,6 +12,7 @@ from typing import Any
 
 import orjson
 
+from .actor_attribution import actor_links
 from .logical_evidence import (
     LogicalEvidenceError,
     LogicalEvidenceProjectionStore,
@@ -320,6 +321,7 @@ class CanonicalLogicalEvidenceProjector:
         text = self._restored_record_text(row, text)
         segments = self._text_segments(text)
         roles = _explicit_roles(row["explicit_role_values"])
+        attributed = actor_links(row.get("actor_links") or ())
         use_cached_content = (
             canonical_content_bytes is not None
             and len(segments) == 1
@@ -340,6 +342,7 @@ class CanonicalLogicalEvidenceProjector:
                     if use_cached_content
                     else None
                 ),
+                actor_links=attributed,
             )
 
     def _record_stream(self, cursor: Any):
@@ -639,6 +642,10 @@ class CanonicalLogicalEvidenceProjector:
                               document.revision AS document_revision,
                               source_record.chunk_count,
                               source_record.chunk_receipts,
+                              coalesce(
+                                  attributed.actor_links,
+                                  '[]'::jsonb
+                              ) AS actor_links,
                               artifact.artifact_id AS raw_artifact_id,
                               artifact.storage_backend AS raw_storage_backend,
                               artifact.object_key AS raw_object_key,
@@ -677,6 +684,28 @@ class CanonicalLogicalEvidenceProjector:
                                  AND chunk.deleted_at IS NULL
                          ) source_record
                            ON source_record.chunk_count>0
+                         LEFT JOIN LATERAL (
+                              SELECT jsonb_agg(
+                                         jsonb_build_object(
+                                             'actor_id',link.actor_id,
+                                             'relation',link.relation
+                                         )
+                                         ORDER BY link.actor_id,link.relation
+                                     ) AS actor_links
+                                FROM (
+                                      SELECT actor.actor_id,actor.relation
+                                        FROM canonical_event_actors actor
+                                       WHERE actor.tenant_id=event.tenant_id
+                                         AND actor.source_id=event.source_id
+                                         AND actor.event_id=event.event_id
+                                      UNION
+                                      SELECT binding.actor_id,binding.relation
+                                        FROM canonical_source_actor_bindings
+                                             binding
+                                       WHERE binding.tenant_id=event.tenant_id
+                                         AND binding.source_id=event.source_id
+                                ) link
+                         ) attributed ON true
                         ORDER BY
                           selected.candidate_ordinal,
                           event.source_ordinal IS NULL,
@@ -1146,6 +1175,43 @@ class CanonicalLogicalEvidenceProjector:
                             )
                         ],
                     )
+                connection.execute(
+                    """INSERT INTO canonical_evidence_document_actors(
+                           tenant_id,source_id,logical_document_id,revision,
+                           actor_id,relation
+                       )
+                       SELECT %s,%s,%s,%s,link.actor_id,link.relation
+                         FROM (
+                               SELECT actor.actor_id,actor.relation
+                                 FROM canonical_events event
+                                 JOIN canonical_event_actors actor
+                                   ON actor.tenant_id=event.tenant_id
+                                  AND actor.source_id=event.source_id
+                                  AND actor.event_id=event.event_id
+                                WHERE event.tenant_id=%s
+                                  AND event.source_id=%s
+                                  AND coalesce(
+                                      event.native_parent_id,event.native_id
+                                  )=%s
+                               UNION
+                               SELECT binding.actor_id,binding.relation
+                                 FROM canonical_source_actor_bindings binding
+                                WHERE binding.tenant_id=%s
+                                  AND binding.source_id=%s
+                         ) link
+                       ON CONFLICT DO NOTHING""",
+                    (
+                        prepared.tenant_id,
+                        prepared.source_id,
+                        prepared.logical_document_id,
+                        prepared.revision,
+                        prepared.tenant_id,
+                        prepared.source_id,
+                        prepared.native_parent_id,
+                        prepared.tenant_id,
+                        prepared.source_id,
+                    ),
+                )
                 connection.execute(
                     """INSERT INTO canonical_passage_projection_queue(
                            tenant_id,source_id,logical_document_id,revision,

@@ -11,10 +11,11 @@ from typing import Iterable, Iterator
 
 import orjson
 
+from .actor_attribution import ActorLink, actor_links
 from .logical_evidence import LogicalEvidenceError, LogicalEvidenceRecord
 
 
-PASSAGE_CONTRACT = "recall.lossless-message-passage.v3"
+PASSAGE_CONTRACT = "recall.lossless-message-passage.v4:actor-aware"
 PASSAGE_SEPARATOR = "\n"
 MAX_PASSAGE_TOKEN_BYTES = 64
 VISIBLE_DENSE_ROLES = frozenset({"user", "assistant"})
@@ -118,6 +119,7 @@ class PassageMessage:
     receipts: tuple[str, ...]
     text: str
     record_count: int = 1
+    actor_links: tuple[ActorLink, ...] = ()
 
     def validate(self) -> None:
         if (
@@ -142,6 +144,7 @@ class PassageMessage:
             or isinstance(self.record_count, bool)
             or not isinstance(self.record_count, int)
             or self.record_count < 1
+            or actor_links(self.actor_links) != self.actor_links
         ):
             raise ValueError(
                 "dense passage messages require visible user/assistant records"
@@ -184,6 +187,7 @@ class LosslessPassage:
     text: str
     text_sha256: str
     spans: tuple[PassageSpan, ...]
+    actor_links: tuple[ActorLink, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -418,6 +422,11 @@ def build_passages(
                     for span in spans
                     for receipt in messages[span.message_index].receipts
                 )),
+                actor_links=actor_links(
+                    link
+                    for span in spans
+                    for link in messages[span.message_index].actor_links
+                ),
                 text=text,
                 text_sha256=text_sha256,
                 spans=spans,
@@ -464,10 +473,11 @@ def decode_logical_record(
         "segment_count",
         "segment_ordinal",
     }
+    optional = {"actor_links"} if "actor_links" in value else set()
     payload_fields = set(value).intersection(
         {"content", "content_fragment", "text"}
     )
-    if set(value) != base | payload_fields or len(payload_fields) != 1:
+    if set(value) != base | optional | payload_fields or len(payload_fields) != 1:
         raise LogicalEvidenceError("passage_logical_record_invalid")
     if "content" in value:
         text = orjson.dumps(
@@ -489,6 +499,7 @@ def decode_logical_record(
             segment_ordinal=value["segment_ordinal"],
             segment_count=value["segment_count"],
             text=text,
+            actor_links=actor_links(value.get("actor_links", ())),
         )
         if verify_canonical:
             encoded = record.encode(source_id=source_id)
@@ -526,6 +537,7 @@ def visible_messages(
                 or continuation.event_kind != first.event_kind
                 or continuation.occurred_at != first.occurred_at
                 or continuation.roles != first.roles
+                or continuation.actor_links != first.actor_links
                 or continuation.receipts
                 or continuation.segment_ordinal != segment_ordinal
                 or continuation.segment_count != first.segment_count
@@ -553,6 +565,7 @@ def visible_messages(
             roles=first.roles,
             receipts=first.receipts,
             text=text,
+            actor_links=first.actor_links,
         )
         message.validate()
         messages.append(message)

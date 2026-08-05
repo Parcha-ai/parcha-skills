@@ -445,6 +445,21 @@ class CanonicalPassageProjector:
                                     passage.text,
                                     passage.text_sha256,
                                 ))
+                        with cursor.copy(
+                            """COPY canonical_passage_actors(
+                                   tenant_id,source_id,passage_id,
+                                   actor_id,relation
+                               ) FROM STDIN"""
+                        ) as copy:
+                            for passage in prepared.passages:
+                                for link in passage.actor_links:
+                                    copy.write_row((
+                                        passage.tenant_id,
+                                        passage.source_id,
+                                        passage.passage_id,
+                                        link.actor_id,
+                                        link.relation,
+                                    ))
                     connection.execute(
                         """INSERT INTO canonical_passage_embeddings(
                                tenant_id,source_id,passage_id,model,
