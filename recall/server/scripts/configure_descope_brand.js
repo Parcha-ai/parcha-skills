@@ -214,6 +214,11 @@ function hasType(template, resolvedName) {
   return Object.values(template).some((node) => node.type?.resolvedName === resolvedName);
 }
 
+function hasConsentScopes(template) {
+  return ["Scopes", "InboundAppScopes", "ScopesList"]
+    .some((name) => hasType(template, name));
+}
+
 function byType(resolvedName) {
   return (node) => node.type?.resolvedName === resolvedName;
 }
@@ -296,6 +301,10 @@ function styleConsent(screen, { verified }) {
     "InboundAppScopes",
     "ScopesList",
   ].includes(node.type?.resolvedName));
+  if (!scopesEntry) throw new Error("missing consent scopes component");
+  const scopeContainerId = scopesEntry[1].parent;
+  const scopeContainer = t[scopeContainerId];
+  if (!scopeContainer) throw new Error("missing consent scopes container");
   const [, authorize] = findEntry(t, buttonLabeledAny("Authorize", "Connect company brain  →"), "authorize button");
   const [, cancel] = findEntry(t, buttonLabeledAny("Cancel", "Not now"), "cancel button");
   const actionsContainerId = authorize.parent;
@@ -320,6 +329,8 @@ function styleConsent(screen, { verified }) {
     "recallConsentBrand",
     "recallConsentEyebrow",
     "recallConsentBody",
+    "recallRequestedAccess",
+    scopeContainerId,
     ...(verified ? [] : [warningContainerId]),
     actionsContainerId,
   ];
@@ -330,12 +341,12 @@ function styleConsent(screen, { verified }) {
     "ACCESS REVIEW // COMPANY BRAIN",
     "subtitle2",
   );
-  for (const entry of [appLogoEntry, headlineEntry, requestedEntry, scopesEntry]) {
+  for (const entry of [appLogoEntry, headlineEntry, requestedEntry]) {
     if (!entry) continue;
     const [nodeId, node] = entry;
     const parentId = node.parent;
     delete t[nodeId];
-    if (parentId && parentId !== "ROOT") delete t[parentId];
+    if (parentId && parentId !== "ROOT" && parentId !== scopeContainerId) delete t[parentId];
   }
   t.recallConsentBody = textNode(
     "recallConsentBody",
@@ -344,6 +355,19 @@ function styleConsent(screen, { verified }) {
     "body1",
     "center",
   );
+  t.recallRequestedAccess = textNode(
+    "recallRequestedAccess",
+    "ROOT",
+    "REQUESTED ACCESS",
+    "subtitle2",
+  );
+  styleContainer(scopeContainer, {
+    align: "stretch",
+    background: "#11150FFF",
+    paddingX: "3",
+    paddingY: "3",
+    spaceBetween: "1",
+  });
   delete t.recallConsentTrust;
   styleContainer(actionsContainer, { align: "stretch", background: "#ffffff00", spaceBetween: "2" });
   authorize.props.children = "Connect company brain  →";
@@ -426,6 +450,43 @@ function brandScreens(screens) {
   styleOtp(classified.otp[0]);
 }
 
+function restoreConsentScopes(screens, templates) {
+  const template = templates.find((item) => item.id === "inbound-apps-user-consent");
+  if (!template) throw new Error("missing Descope inbound-apps-user-consent template");
+  const source = template.screens
+    .map((screen) => parseTemplate(screen))
+    .find(hasConsentScopes);
+  if (!source) throw new Error("Descope consent template is missing its scopes component");
+  const [scopeId, scopeNode] = findEntry(
+    source,
+    (node) => ["Scopes", "InboundAppScopes", "ScopesList"].includes(node.type?.resolvedName),
+    "template consent scopes",
+  );
+  const containerId = scopeNode.parent;
+  const containerNode = source[containerId];
+  if (!containerNode) throw new Error("Descope consent template is missing its scopes container");
+
+  let restored = 0;
+  for (const screen of screens) {
+    const target = parseTemplate(screen);
+    const isConsent = Object.values(target).some(
+      buttonLabeledAny("Authorize", "Connect company brain  →"),
+    );
+    if (!isConsent || hasConsentScopes(target)) continue;
+    if (target[scopeId] || target[containerId]) {
+      throw new Error("cannot safely restore consent scopes due to component ID collision");
+    }
+    target[scopeId] = structuredClone(scopeNode);
+    target[containerId] = structuredClone(containerNode);
+    target[scopeId].parent = containerId;
+    target[containerId].parent = "ROOT";
+    target[containerId].nodes = [scopeId];
+    saveTemplate(screen, target);
+    restored += 1;
+  }
+  return restored;
+}
+
 function hostedLoginUrl(value, styleId) {
   const url = new URL(value);
   url.searchParams.set("flow", FLOW_ID);
@@ -461,6 +522,16 @@ async function main() {
   }
   const exported = await request("/v1/mgmt/flow/export", { body: { flowId: FLOW_ID } });
   const screens = structuredClone(exported.screens);
+  let restoredConsentScreens = 0;
+  if (screens.some((screen) => {
+    const template = parseTemplate(screen);
+    return Object.values(template).some(
+      buttonLabeledAny("Authorize", "Connect company brain  →"),
+    ) && !hasConsentScopes(template);
+  })) {
+    const available = await request("/v1/mgmt/flow/template/list", { body: {} });
+    restoredConsentScreens = restoreConsentScopes(screens, available.templates || []);
+  }
   brandScreens(screens);
   const imported = await request("/v1/mgmt/flow/import", {
     body: { flowId: FLOW_ID, flow: exported.flow, screens },
@@ -482,6 +553,7 @@ async function main() {
     flowVersion: imported.flow?.version,
     screens: imported.screens?.length,
     patchedApps,
+    restoredConsentScreens,
     snapshotChanged,
   }));
 }
@@ -500,4 +572,5 @@ module.exports = {
   brandScreens,
   brandTheme,
   hostedLoginUrl,
+  restoreConsentScopes,
 };

@@ -9,6 +9,7 @@ const {
   brandScreens,
   brandTheme,
   hostedLoginUrl,
+  restoreConsentScopes,
 } = require("../server/scripts/configure_descope_brand.js");
 
 function node(id, parent = "ROOT", props = {}) {
@@ -76,7 +77,10 @@ function consentTemplate({ verified }) {
     Zgp3CGaHAw: container("Zgp3CGaHAw"),
     _FBvzhJtOx: node("_FBvzhJtOx", "Zgp3CGaHAw", { children: "{{mcpClient.name}} will be able to:" }),
     "EQIG9X08-e": container("EQIG9X08-e"),
-    scopeList: setType(node("scopeList", "EQIG9X08-e"), verified ? "Scopes" : "InboundAppScopes"),
+    scopeList: setType(
+      node("scopeList", "EQIG9X08-e", { name: "thirdPartyAppApproveScopes" }),
+      verified ? "Scopes" : "InboundAppScopes",
+    ),
     woAD652rBY: container("woAD652rBY"),
     _Z6xPaS9jy: setType(node("_Z6xPaS9jy", "woAD652rBY", { children: "Authorize" }), "Button"),
     "6N3cb_5t3T": setType(node("6N3cb_5t3T", "woAD652rBY", { children: "Cancel" }), "Button"),
@@ -184,8 +188,10 @@ test("brandScreens changes presentation while preserving flow interactions", () 
   assert.equal(consent.OHS3uAG0xM, undefined);
   assert.equal(consent._FBvzhJtOx, undefined);
   assert.equal(consent.Zgp3CGaHAw, undefined);
-  assert.equal(consent.scopeList, undefined);
-  assert.equal(consent["EQIG9X08-e"], undefined);
+  assert.equal(consent.scopeList.type.resolvedName, "InboundAppScopes");
+  assert.equal(consent.scopeList.parent, "EQIG9X08-e");
+  assert.equal(consent.ROOT.nodes.includes("EQIG9X08-e"), true);
+  assert.equal(consent.recallRequestedAccess.props.children, "REQUESTED ACCESS");
   assert.equal(
     consent.recallConsentBody.props.children,
     "Connect your coding agent to Parcha's shared engineering history.",
@@ -202,4 +208,22 @@ test("brandScreens changes presentation while preserving flow interactions", () 
   assert.equal(otp.resend.props.children, "Send a new code");
 
   assert.doesNotThrow(() => brandScreens(screens));
+});
+
+test("restoreConsentScopes repairs a previously stripped consent input", () => {
+  const canonical = consentTemplate({ verified: true });
+  const broken = consentTemplate({ verified: false });
+  delete broken.scopeList;
+  delete broken["EQIG9X08-e"];
+  const screen = { id: "broken-consent", htmlTemplate: broken, interactions: [] };
+  const template = {
+    id: "inbound-apps-user-consent",
+    screens: [{ id: "canonical-consent", htmlTemplate: canonical }],
+  };
+
+  assert.equal(restoreConsentScopes([screen], [template]), 1);
+  assert.equal(screen.htmlTemplate.scopeList.props.name, "thirdPartyAppApproveScopes");
+  assert.equal(screen.htmlTemplate.scopeList.parent, "EQIG9X08-e");
+  assert.deepEqual(screen.htmlTemplate["EQIG9X08-e"].nodes, ["scopeList"]);
+  assert.equal(restoreConsentScopes([screen], [template]), 0);
 });
