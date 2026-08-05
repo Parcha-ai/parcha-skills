@@ -18,6 +18,7 @@ from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
 
 from . import PROJECTOR_VERSION
+from .actor_attribution import actor_id_for_principal
 from .authorization import normalize_verified_email
 from .capture import (
     CAPTURE_ORIGIN_RE,
@@ -366,6 +367,37 @@ class BrainStore:
                        DO UPDATE SET permission='owner'""",
                     (tenant_id, owner_principal_id),
                 )
+                existing_actor = conn.execute(
+                    """SELECT actor_id FROM brain_actor_principals
+                       WHERE tenant_id=%s AND principal_id=%s""",
+                    (tenant_id, owner_principal_id),
+                ).fetchone()
+                if existing_actor is None:
+                    actor_id = actor_id_for_principal(
+                        tenant_id,
+                        owner_principal_id,
+                    )
+                    conn.execute(
+                        """INSERT INTO brain_actors(
+                               tenant_id,actor_id,actor_kind,display_name
+                           ) VALUES (%s,%s,'human',%s)
+                           ON CONFLICT DO NOTHING""",
+                        (tenant_id, actor_id, owner_principal_id),
+                    )
+                    conn.execute(
+                        """INSERT INTO brain_actor_principals(
+                               tenant_id,actor_id,principal_id
+                           ) VALUES (%s,%s,%s)
+                           ON CONFLICT DO NOTHING""",
+                        (tenant_id, actor_id, owner_principal_id),
+                    )
+                    conn.execute(
+                        """INSERT INTO brain_actor_aliases(
+                               tenant_id,actor_id,alias
+                           ) VALUES (%s,%s,%s)
+                           ON CONFLICT DO NOTHING""",
+                        (tenant_id, actor_id, owner_principal_id),
+                    )
                 configured = conn.execute(
                     """SELECT organization.organization_kind,space.brain_kind,
                               space.organization_id,space.slug
@@ -776,6 +808,7 @@ class BrainStore:
         audience: str,
         tenant_id: str | None = None,
         invitation_id: str | None = None,
+        actor_email_index: str | None = None,
     ) -> dict[str, Any] | None:
         normalized_email = normalize_verified_email(email)
         if (
@@ -799,6 +832,10 @@ class BrainStore:
                 invitation_id is not None
                 and not re.fullmatch(r"[0-9a-f-]{36}", invitation_id)
             )
+            or (
+                actor_email_index is not None
+                and not re.fullmatch(r"[0-9a-f]{64}", actor_email_index)
+            )
         ):
             return None
         subject_sha256 = hashlib.sha256(subject.encode()).hexdigest()
@@ -806,12 +843,18 @@ class BrainStore:
         principal_id = "principal:human:" + hashlib.sha256(
             f"{issuer}\0{subject}".encode()
         ).hexdigest()[:32]
-        invitation_id: uuid.UUID | None = None
+        try:
+            parsed_invitation_id = (
+                uuid.UUID(invitation_id) if invitation_id is not None else None
+            )
+        except ValueError:
+            return None
         with self.connect() as conn:
             with conn.transaction():
                 invitations = conn.execute(
                     """SELECT invitation.id,invitation.tenant_id,
-                              invitation.role,space.organization_id
+                              invitation.role,invitation.actor_display_name,
+                              space.organization_id
                        FROM brain_invitations invitation
                        JOIN brain_spaces space USING(tenant_id)
                        WHERE invitation.email_sha256=%s
@@ -827,14 +870,14 @@ class BrainStore:
                         email_sha256,
                         tenant_id,
                         tenant_id,
-                        invitation_id,
-                        invitation_id,
+                        parsed_invitation_id,
+                        parsed_invitation_id,
                     ),
                 ).fetchall()
                 if len(invitations) != 1:
                     return None
                 invitation = invitations[0]
-                invitation_id = invitation["id"]
+                accepted_invitation_id = invitation["id"]
                 existing = conn.execute(
                     """SELECT principal_id FROM external_identity_bindings
                        WHERE issuer=%s AND subject_sha256=%s AND tenant_id=%s
@@ -901,12 +944,64 @@ class BrainStore:
                         principal_id,
                     ),
                 )
+                linked_actor = conn.execute(
+                    """SELECT actor_id FROM brain_actor_principals
+                       WHERE tenant_id=%s AND principal_id=%s""",
+                    (invitation["tenant_id"], principal_id),
+                ).fetchone()
+                actor_id = (
+                    linked_actor["actor_id"]
+                    if linked_actor is not None
+                    else actor_id_for_principal(invitation["tenant_id"], principal_id)
+                )
+                display_name = invitation["actor_display_name"] or normalized_email.split(
+                    "@", 1
+                )[0]
+                conn.execute(
+                    """INSERT INTO brain_actors(
+                           tenant_id,actor_id,actor_kind,display_name
+                       ) VALUES (%s,%s,'human',%s)
+                       ON CONFLICT(tenant_id,actor_id)
+                       DO UPDATE SET display_name=excluded.display_name,
+                                     active=true,updated_at=now()""",
+                    (invitation["tenant_id"], actor_id, display_name),
+                )
+                conn.execute(
+                    """INSERT INTO brain_actor_principals(
+                           tenant_id,actor_id,principal_id
+                       ) VALUES (%s,%s,%s)
+                       ON CONFLICT(tenant_id,principal_id)
+                       DO UPDATE SET actor_id=excluded.actor_id""",
+                    (invitation["tenant_id"], actor_id, principal_id),
+                )
+                conn.execute(
+                    """INSERT INTO brain_actor_aliases(
+                           tenant_id,actor_id,alias
+                       ) VALUES (%s,%s,%s),(%s,%s,%s)
+                       ON CONFLICT DO NOTHING""",
+                    (
+                        invitation["tenant_id"], actor_id, display_name,
+                        invitation["tenant_id"], actor_id, normalized_email,
+                    ),
+                )
+                if actor_email_index is not None:
+                    conn.execute(
+                        """INSERT INTO brain_actor_external_identities(
+                               tenant_id,actor_id,connector_id,namespace,
+                               subject_hmac_sha256
+                           ) VALUES (%s,%s,'identity','email',%s)
+                           ON CONFLICT(
+                               tenant_id,connector_id,namespace,
+                               subject_hmac_sha256
+                           ) DO UPDATE SET actor_id=excluded.actor_id""",
+                        (invitation["tenant_id"], actor_id, actor_email_index),
+                    )
                 accepted = conn.execute(
                     """UPDATE brain_invitations
                        SET accepted_principal_id=%s,accepted_at=now()
                        WHERE id=%s AND accepted_at IS NULL AND revoked_at IS NULL
                        RETURNING id""",
-                    (principal_id, invitation_id),
+                    (principal_id, accepted_invitation_id),
                 ).fetchone()
                 if not accepted:
                     return None
@@ -917,7 +1012,9 @@ class BrainStore:
                     (
                         uuid.uuid4(),
                         principal_id,
-                        hashlib.sha256(str(invitation_id).encode()).hexdigest(),
+                        hashlib.sha256(
+                            str(accepted_invitation_id).encode()
+                        ).hexdigest(),
                     ),
                 )
         return self.resolve_external_identity(

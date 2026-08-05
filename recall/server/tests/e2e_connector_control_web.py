@@ -352,6 +352,7 @@ def main():
 
         invitation_body = {
             "tenant_id": COMPANY,
+            "display_name": "Taylor Teammate",
             "email": "Teammate@Example.com",
             "role": "member",
         }
@@ -391,6 +392,7 @@ def main():
         )
         assert status == 201
         assert invitation["email"] == "teammate@example.com"
+        assert invitation["display_name"] == "Taylor Teammate"
         assert invitation["status"] == "pending"
         assert invitation["delivery"] == {
             "status": "sent",
@@ -448,6 +450,8 @@ def main():
                 "id": invitation["id"],
                 "tenant_id": COMPANY,
                 "email": "teammate@example.com",
+                "display_name": "Taylor Teammate",
+                "actor_id": None,
                 "role": "member",
                 "status": "pending",
                 "expires_at": invitation["expires_at"],
@@ -561,6 +565,7 @@ def main():
             "/admin/api/v1/invitations",
             body={
                 "tenant_id": COMPANY,
+                "display_name": "OAuth Member",
                 "email": "oauth-member@example.com",
                 "role": "member",
             },
@@ -577,7 +582,7 @@ def main():
         status, headers, _ = request(
             server, "GET", f"/join/{oauth_invitation['id']}/login"
         )
-        assert status == 303
+        assert status == 303, (status, _)
         wrong_member_state, _ = identity.starts[-1]
         identity.identity = BrowserIdentity(
             "synthetic-wrong-member", "someone-else@example.com", True
@@ -617,10 +622,14 @@ def main():
                 }
             ),
         )
-        assert status == 303
+        assert status == 303, (status, _)
         assert dict(headers)["Location"] == (
             f"/join/{oauth_invitation['id']}?status=accepted"
         )
+        member_session = cookie_value(headers, "recall_admin_session")
+        member_csrf_cookie = cookie_value(headers, "recall_admin_csrf")
+        member_cookie = member_session + "; " + member_csrf_cookie
+        member_csrf = member_csrf_cookie.split("=", 1)[1]
         status, _, accepted_page = request(
             server, "GET", f"/join/{oauth_invitation['id']}"
         )
@@ -642,6 +651,97 @@ def main():
             audience="https://recall.synthetic.invalid/mcp",
             tenant_id=PERSONAL,
         ) is None
+        status, _, member_state = request(
+            server,
+            "GET",
+            "/admin/api/v1/state",
+            cookie=member_cookie,
+        )
+        assert status == 200
+        assert member_state["brains"] == [
+            {
+                "tenant_id": COMPANY,
+                "slug": "company-control",
+                "brain_kind": "company",
+                "display_name": "Synthetic Company",
+                "permission": "read",
+            }
+        ]
+        with store.connect() as connection:
+            actor = connection.execute(
+                """SELECT actor.actor_id,actor.display_name
+                     FROM brain_actor_principals principal
+                     JOIN brain_actors actor USING(tenant_id,actor_id)
+                    WHERE principal.tenant_id=%s
+                      AND principal.principal_id=%s""",
+                (COMPANY, company_credential["principal_id"]),
+            ).fetchone()
+            assert actor["display_name"] == "OAuth Member"
+            aliases = {
+                row["alias"]
+                for row in connection.execute(
+                    """SELECT alias FROM brain_actor_aliases
+                       WHERE tenant_id=%s AND actor_id=%s""",
+                    (COMPANY, actor["actor_id"]),
+                ).fetchall()
+            }
+            assert aliases == {"OAuth Member", "oauth-member@example.com"}
+        member_device = {
+            "connector_id": "local.codex",
+            "tenant_id": COMPANY,
+            "device_id": "mac-member-e2e",
+            "source_id": "codex:mac:member-e2e",
+            "privacy_mode": "scrub",
+            "selectors": {},
+        }
+        status, _, member_route = request(
+            server,
+            "POST",
+            "/admin/api/v1/device/installations",
+            body=member_device,
+            cookie=member_cookie,
+            csrf=member_csrf,
+        )
+        assert status == 201
+        assert store.authenticate_bearer(member_route["token"], "write")
+        with store.connect() as connection:
+            binding = connection.execute(
+                """SELECT actor_id,relation
+                     FROM canonical_source_actor_bindings
+                    WHERE tenant_id=%s AND source_id=%s""",
+                (COMPANY, member_device["source_id"]),
+            ).fetchone()
+        assert binding == {
+            "actor_id": actor["actor_id"],
+            "relation": "contributor",
+        }
+        status, _, conflict = request(
+            server,
+            "POST",
+            "/admin/api/v1/device/installations",
+            body={
+                **member_device,
+                "device_id": "mac-owner-source-conflict",
+            },
+            cookie=oauth_owner_cookie,
+            csrf=oauth_owner_csrf.split("=", 1)[1],
+        )
+        assert status == 409 and conflict["error"] == "device_source_conflict"
+        status, _, registered = request(
+            server,
+            "POST",
+            f"/admin/api/v1/actors/{actor['actor_id']}/identities",
+            body={
+                "tenant_id": COMPANY,
+                "connector_id": "slack",
+                "namespace": "author_id",
+                "subject": "U0SYNTHETICMEMBER",
+            },
+            cookie=oauth_owner_cookie,
+            csrf=oauth_owner_csrf.split("=", 1)[1],
+        )
+        assert status == 201
+        assert registered["connector_id"] == "slack"
         status, _, revoked = request(
             server,
             "POST",
@@ -651,6 +751,14 @@ def main():
             csrf=oauth_owner_csrf.split("=", 1)[1],
         )
         assert status == 200 and revoked["status"] == "revoked"
+        assert store.authenticate_bearer(member_route["token"], "write") is None
+        status, _, former_member = request(
+            server,
+            "GET",
+            "/admin/api/v1/state",
+            cookie=member_cookie,
+        )
+        assert status == 200 and former_member["brains"] == []
         assert store.resolve_external_identity(
             issuer=identity.canonical_issuer,
             subject="synthetic-member-subject",

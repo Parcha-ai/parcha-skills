@@ -9,6 +9,7 @@ from urllib.parse import unquote, urlsplit
 
 from contracts.v2 import ContractError, IDENTITY_RE, validate_contract
 
+from .actor_attribution import ActorIdentityIndex, attribute_canonical_events
 from .db import BrainStore
 from .canonical_text import (
     MAX_CANONICAL_CHUNK_BYTES as MAX_CANONICAL_CHUNK_BYTES,
@@ -200,7 +201,7 @@ class CanonicalArchiveGateway:
         identity_sha256 = _identity_sha256(tenant_id, source_id, native_id)
         with self.store.connect() as conn:
             with conn.transaction():
-                CanonicalPlane._register_source(
+                CanonicalPlane.register_source(
                     conn,
                     tenant_id=tenant_id,
                     principal_id=self.principal_id,
@@ -236,10 +237,12 @@ class CanonicalPlane:
         store: BrainStore,
         archive: ArchiveLifecycle,
         evidence_projector: Any = None,
+        actor_identity_index: ActorIdentityIndex | None = None,
     ):
         self.store = store
         self.archive = archive
         self.evidence_projector = evidence_projector
+        self.actor_identity_index = actor_identity_index
 
     @staticmethod
     def _validate_host_identity(
@@ -254,7 +257,7 @@ class CanonicalPlane:
             raise CanonicalLifecycleError("canonical_authority_invalid")
 
     @staticmethod
-    def _register_source(
+    def register_source(
         conn: Any,
         *,
         tenant_id: str,
@@ -370,7 +373,7 @@ class CanonicalPlane:
                 conn.transaction() if _connection is None else nullcontext()
             )
             with transaction_context:
-                self._register_source(
+                self.register_source(
                     conn,
                     tenant_id=tenant_id,
                     principal_id=principal_id,
@@ -444,6 +447,21 @@ class CanonicalPlane:
                 ).fetchone()
                 if existing:
                     revision = existing["revision"]
+                    inserted_actor_links = attribute_canonical_events(
+                        conn,
+                        tenant_id=tenant_id,
+                        source_id=source_id,
+                        events=((event_id, connector_id, event),),
+                        identity_index=self.actor_identity_index,
+                    )
+                    if inserted_actor_links:
+                        mark_logical_evidence_dirty(
+                            conn,
+                            tenant_id=tenant_id,
+                            source_id=source_id,
+                            native_ids=[native_id],
+                            reason="ingest",
+                        )
                     return {
                         "status": "committed",
                         "inserted": 0,
@@ -492,6 +510,13 @@ class CanonicalPlane:
                         is_tombstone,
                         json.dumps(event),
                     ),
+                )
+                attribute_canonical_events(
+                    conn,
+                    tenant_id=tenant_id,
+                    source_id=source_id,
+                    events=((event_id, connector_id, event),),
+                    identity_index=self.actor_identity_index,
                 )
                 affected_native_ids = (
                     _linked_native_ids(
@@ -953,7 +978,7 @@ class CanonicalPlane:
 
         with self.store.connect() as connection:
             with connection.transaction():
-                self._register_source(
+                self.register_source(
                     connection,
                     tenant_id=tenant_id,
                     principal_id=principal_id,
@@ -1326,6 +1351,29 @@ class CanonicalPlane:
                             source_id,
                             json.dumps(audit_rows),
                         ),
+                    )
+                inserted_actor_links = attribute_canonical_events(
+                    connection,
+                    tenant_id=tenant_id,
+                    source_id=source_id,
+                    events=(
+                        (item["event_id"], item["connector_id"], item["event"])
+                        for item in prepared
+                    ),
+                    identity_index=self.actor_identity_index,
+                )
+                duplicate_native_ids = [
+                    item["native_id"]
+                    for item, result in zip(prepared, results, strict=True)
+                    if result["duplicate_events"]
+                ]
+                if inserted_actor_links and duplicate_native_ids:
+                    mark_logical_evidence_dirty(
+                        connection,
+                        tenant_id=tenant_id,
+                        source_id=source_id,
+                        native_ids=duplicate_native_ids,
+                        reason="ingest",
                     )
         return {
             "status": "committed",

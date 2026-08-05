@@ -31,6 +31,7 @@ from connectors.sdk import (
 from privacy.policy import PrivacyPolicy
 
 from .archive_runtime import build_archive_store, build_evidence_archive_store
+from .actor_attribution import ActorIdentityIndex
 from .canonical import CanonicalArchiveGateway, CanonicalPlane
 from .canonical_retrieval import CanonicalRetrieval
 from .control import ControlError, SecretBox
@@ -216,7 +217,11 @@ class ManagedConnectorWorker:
         self.interval_seconds = interval_seconds
         self.lease_seconds = lease_seconds
         self.embedding_max_batches = embedding_max_batches
-        self.plane = CanonicalPlane(store, archive)
+        self.plane = CanonicalPlane(
+            store,
+            archive,
+            actor_identity_index=ActorIdentityIndex(secret_box.blind_index),
+        )
         self.retrieval = CanonicalRetrieval(store, archive)
 
     def _claim(self) -> dict[str, Any] | None:

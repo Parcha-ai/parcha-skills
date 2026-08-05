@@ -74,6 +74,32 @@ citations.
 Actors with attributed content are retired with `active=false`; they are not
 hard-deleted while immutable logical documents still reference their IDs.
 
+## Employee enrollment lifecycle
+
+1. An owner invites an exact verified email and records the employee's display
+   name. OAuth acceptance creates one stable principal for access and one stable
+   actor for content; the two IDs remain separate and explicitly linked.
+2. Each source-local Codex or Claude route created by that employee is owned by
+   their principal and bound to their actor as `contributor`. Every accepted
+   company member receives read access to company sources, including sources
+   that existed before they joined and sources created after they joined.
+3. Canonical ingestion marks only structurally verified user messages as
+   `author`. Assistant responses, tool results, sidechains, and duplicate Codex
+   envelopes do not become employee-authored content.
+4. Provider directory identities are registered as tenant-scoped blind indexes.
+   Typed connector fields such as Slack `author_id` resolve to event actors in
+   the same transaction as canonical ingestion. Human-authored provider records
+   without a chat-harness role still enter actor-aware dense passages; records
+   with only a source `contributor` binding remain sparse unless they already
+   have an explicit visible role.
+5. Removing a member revokes their MCP grant and live collector credentials,
+   deletes their route configuration, and removes their source grants. It never
+   deletes previously attributed company history or rewrites its actor IDs.
+
+External identities are purpose-bound by tenant, connector, and namespace before
+storage. A provider ID registered in one company cannot correlate with or resolve
+inside another company even when both companies use the same Recall deployment.
+
 ## Connector contract
 
 New connectors should emit source-native identity references already present in
@@ -82,8 +108,8 @@ and participants). Ingestion resolves those references through
 `brain_actor_external_identities`, writes `canonical_event_actors`, and queues the
 affected logical document in the same transaction.
 
-The next employee-ingestion phase should add one reusable attribution resolver to
-the connector projector rather than connector-specific author columns. Its hard
-exit is an end-to-end eval proving that “what did person X do?” returns only
-authorized, correctly attributed documents across Codex and Claude before Slack
-or Docs are enabled.
+The reusable ingestion resolver is connector-independent. A fresh-PostgreSQL E2E
+enrolls four synthetic employees, gives each separate Codex and Claude sources,
+maps a shared Slack identity, projects logical documents and actor-context
+embeddings, and proves person-filter isolation, assistant exclusion, denied-user
+isolation, collector revocation, and preservation of company history.

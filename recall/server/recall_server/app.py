@@ -44,6 +44,7 @@ from .admin_web import (
     session_headers as admin_session_headers,
 )
 from .archive_runtime import build_archive_store, build_evidence_archive_store
+from .actor_attribution import ActorIdentityIndex
 from .authorization import ExternalIdentityVerifier, OidcJwtVerifier, decide
 from .canonical import (
     CanonicalArchiveGateway,
@@ -89,6 +90,9 @@ ADMIN_CONNECTION_REVOKE = re.compile(
 )
 ADMIN_INVITATION_REVOKE = re.compile(
     r"/admin/api/v1/invitations/([0-9a-f-]{36})/revoke\Z"
+)
+ADMIN_ACTOR_IDENTITY = re.compile(
+    r"/admin/api/v1/actors/(actor_[0-9a-f]{32})/identities\Z"
 )
 INVITATION_ONBOARDING = re.compile(r"/join/([0-9a-f-]{36})\Z")
 INVITATION_LOGIN = re.compile(r"/join/([0-9a-f-]{36})/login\Z")
@@ -335,6 +339,12 @@ class Handler(BaseHTTPRequestHandler):
                             scopes=list(claims.scopes),
                             audience=claims.audience,
                             tenant_id=requested_tenant,
+                            actor_email_index=self.control_plane.actor_identity_index(
+                                claims.email,
+                                tenant_id=requested_tenant,
+                                connector_id="identity",
+                                namespace="email",
+                            ),
                         )
             if not credential:
                 return None
@@ -1000,7 +1010,10 @@ class Handler(BaseHTTPRequestHandler):
             body = self.read_admin_json()
             if body is None:
                 return
-            if set(body) != {"tenant_id", "email", "role"}:
+            if set(body) not in (
+                {"tenant_id", "email", "role"},
+                {"tenant_id", "email", "display_name", "role"},
+            ):
                 self.send_json(400, {"error": "admin_request_invalid"})
                 return
             try:
@@ -1008,6 +1021,7 @@ class Handler(BaseHTTPRequestHandler):
                     principal_id=principal["principal_id"],
                     tenant_id=body["tenant_id"],
                     email=body["email"],
+                    display_name=body.get("display_name"),
                     role=body["role"],
                 )
                 self.send_json(201, result)
@@ -1035,6 +1049,36 @@ class Handler(BaseHTTPRequestHandler):
                     invitation_id=invitation_revoke.group(1),
                 )
                 self.send_json(200, result)
+            except ControlError as error:
+                self.send_json(error.status, {"error": error.code})
+            return
+        actor_identity = (
+            ADMIN_ACTOR_IDENTITY.fullmatch(path)
+            if self.admin_web_enabled()
+            else None
+        )
+        if actor_identity:
+            principal = self.admin_principal(csrf=True)
+            if principal is None:
+                return
+            body = self.read_admin_json()
+            if body is None:
+                return
+            if set(body) != {
+                "tenant_id", "connector_id", "namespace", "subject"
+            }:
+                self.send_json(400, {"error": "admin_request_invalid"})
+                return
+            try:
+                result = self.control_plane.register_actor_identity(
+                    principal_id=principal["principal_id"],
+                    tenant_id=body["tenant_id"],
+                    actor_id=actor_identity.group(1),
+                    connector_id=body["connector_id"],
+                    namespace=body["namespace"],
+                    subject=body["subject"],
+                )
+                self.send_json(201, result)
             except ControlError as error:
                 self.send_json(error.status, {"error": error.code})
             return
@@ -1791,6 +1835,16 @@ def validate_http_profile() -> None:
 def configure_runtime(dsn: str) -> None:
     Handler.store = BrainStore(dsn, semantic_runtime=SemanticRuntime.from_env())
     Handler.external_identity_verifier = OidcJwtVerifier.from_env()
+    Handler.control_plane = (
+        ControlPlane.from_env(Handler.store)
+        if os.environ.get("RECALL_ADMIN_WEB_ENABLED") == "1"
+        else None
+    )
+    actor_identity_index = (
+        ActorIdentityIndex(Handler.control_plane.secret_box.blind_index)
+        if Handler.control_plane is not None
+        else None
+    )
     if os.environ.get("RECALL_CANONICAL_V2_ENABLED") == "1":
         Handler.archive_store = build_archive_store()
         if os.environ.get("RECALL_EVIDENCE_ENABLED") == "1":
@@ -1815,6 +1869,7 @@ def configure_runtime(dsn: str) -> None:
             Handler.store,
             Handler.archive_store,
             Handler.evidence_projector,
+            actor_identity_index,
         )
         Handler.canonical_retrieval = (
             CanonicalRetrieval(
@@ -1864,11 +1919,6 @@ def configure_runtime(dsn: str) -> None:
         if Handler.agent_coordinator is not None:
             Handler.agent_coordinator.close()
         Handler.agent_coordinator = None
-    Handler.control_plane = (
-        ControlPlane.from_env(Handler.store)
-        if os.environ.get("RECALL_ADMIN_WEB_ENABLED") == "1"
-        else None
-    )
 
 
 def serve(dsn: str, host: str = "127.0.0.1", port: int = 8788) -> None:
