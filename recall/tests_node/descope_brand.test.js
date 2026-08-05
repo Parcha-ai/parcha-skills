@@ -168,7 +168,8 @@ test("brandScreens changes presentation while preserving flow interactions", () 
   brandScreens(screens);
 
   const welcome = JSON.parse(screens[0].htmlTemplate);
-  assert.equal(welcome.UTdxgyTBPh.props.children, "Connect to Parcha Recall.");
+  assert.equal(welcome.UTdxgyTBPh, undefined);
+  assert.deepEqual(welcome.FTAR1uG31j.nodes, ["recallEyebrow", "GyGw_AJiyl"]);
   assert.equal(welcome.recallTrust, undefined);
   assert.equal(welcome.FTAR1uG31j.nodes.includes("recallTrust"), false);
   assert.equal(welcome["3TVRPM-NqM"].props.children, "Continue securely  →");

@@ -242,19 +242,16 @@ function styleWelcome(screen) {
     (node) => byType("Logo")(node) || textContaining("RECALL //")(node),
     "logo",
   );
-  const [headlineId, headline] = findEntry(
-    t,
-    (node) => byType("Text")(node)
-      && (["h1", "h2", "h3"].includes(node.props?.variant) || textContaining("Welcome")(node)),
-    "welcome headline",
-  );
+  const headlineEntry = Object.entries(t).find(([, node]) => byType("Text")(node)
+    && (["h1", "h2", "h3"].includes(node.props?.variant) || textContaining("Welcome")(node)));
+  const headlineId = headlineEntry?.[0];
   const [bodyId, body] = findEntry(t, textContainingAny("Privacy Statement", "shared engineering memory"), "welcome body");
   const [emailId, email] = findEntry(t, byType("EmailInput"), "email input");
   const [, continueButton] = findEntry(t, buttonLabeledAny("Continue", "Continue securely  →"), "continue button");
   const [dividerId, divider] = findEntry(t, byType("Divider"), "divider");
   const [googleId, google] = findEntry(t, byType("GoogleButton"), "Google button");
   const [microsoftId, microsoft] = findEntry(t, byType("MicrosoftButton"), "Microsoft button");
-  const headerId = headline.parent;
+  const headerId = body.parent;
   const formId = email.parent;
   const socialId = google.parent;
   const header = t[headerId];
@@ -266,10 +263,10 @@ function styleWelcome(screen) {
 
   replaceLogoWithWordmark(logo);
   styleContainer(header, { align: "start", spaceBetween: "2" });
-  header.nodes = ["recallEyebrow", headlineId, bodyId];
+  header.nodes = ["recallEyebrow", bodyId];
   t.recallEyebrow = textNode("recallEyebrow", headerId, "PARCHA // COMPANY BRAIN", "subtitle2");
-  styleText(headline, "Connect to Parcha Recall.", "h2");
   styleText(body, "Connect your coding agent to Parcha's shared engineering memory.", "body1");
+  if (headlineId) delete t[headlineId];
   delete t.recallTrust;
 
   styleContainer(form, { align: "stretch", direction: "column", spaceBetween: "3" });
