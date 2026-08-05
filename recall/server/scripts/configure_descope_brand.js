@@ -59,6 +59,23 @@ function brandTheme(theme) {
     main: "#2A6DFFFF",
   };
   const result = structuredClone(theme);
+  const squareComponents = {
+    alert: { "--descope-alert-border-radius": "0px" },
+    button: { "--descope-button-border-radius": "0px" },
+    code: { "--descope-code-input-border-radius": "0px" },
+    emailField: { "--descope-email-field-input-border-radius": "0px" },
+    inputWrapper: { "--descope-input-wrapper-border-radius": "0px" },
+    tooltip: { "--descope-tooltip-border-radius": "0px" },
+  };
+  const squareRadii = {
+    "2xl": "0px",
+    "3xl": "0px",
+    lg: "0px",
+    md: "0px",
+    sm: "0px",
+    xl: "0px",
+    xs: "0px",
+  };
   result.codeMode = true;
   result.cssTemplate ||= {};
   for (const mode of ["light", "dark"]) {
@@ -67,6 +84,11 @@ function brandTheme(theme) {
     result.cssTemplate[mode].globals.colors ||= {};
     result.cssTemplate[mode].globals.colors.primary = palette;
     result.cssTemplate[mode].globals.colors.secondary = secondary;
+    result.cssTemplate[mode].globals.radius = squareRadii;
+    result.cssTemplate[mode].components = {
+      ...(result.cssTemplate[mode].components || {}),
+      ...squareComponents,
+    };
   }
   return result;
 }
@@ -300,7 +322,6 @@ function styleConsent(screen, { verified }) {
   styleContainer(scopesContainer, {
     align: "stretch",
     background: "#151C17FF",
-    "border-radius": "sm",
     paddingX: "3",
     paddingY: "3",
   });
@@ -312,7 +333,6 @@ function styleConsent(screen, { verified }) {
     styleContainer(warningContainer, {
       align: "start",
       background: "#312B10FF",
-      "border-radius": "sm",
       paddingX: "3",
       paddingY: "3",
       spaceBetween: "1",

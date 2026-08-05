@@ -443,6 +443,10 @@ only Node's built-in APIs and is safe to rerun. The management key is not an
 application runtime dependency; remove it from the operator environment after
 setup unless invitation email delivery below also uses Descope.
 
+Recall follows the company-wide Grep visual contract: square corners only. The
+operator script pins every global and component border-radius token to `0px`;
+do not reintroduce rounded cards, fields, buttons, alerts, or tooltips.
+
 For the OAuth-first browser experience, create one confidential Descope Inbound
 App with the callback below and the `openid email recall.identity` scopes. The
 app-local `recall.identity` permission has no role mapping and authorizes only

@@ -106,6 +106,21 @@ test("brandTheme applies the Recall palette without discarding theme identity", 
   assert.equal(branded.codeMode, true);
   assert.equal(branded.cssTemplate.dark.globals.colors.primary.main, "#C8FF3DFF");
   assert.equal(branded.cssTemplate.light.globals.colors.primary.contrast, "#071008FF");
+  assert.equal(branded.cssTemplate.dark.globals.radius.sm, "0px");
+  assert.equal(branded.cssTemplate.dark.globals.radius["3xl"], "0px");
+  assert.equal(branded.cssTemplate.dark.components.button["--descope-button-border-radius"], "0px");
+  assert.equal(
+    branded.cssTemplate.light.components.emailField["--descope-email-field-input-border-radius"],
+    "0px",
+  );
+  for (const mode of ["light", "dark"]) {
+    assert.deepEqual(new Set(Object.values(branded.cssTemplate[mode].globals.radius)), new Set(["0px"]));
+    for (const component of Object.values(branded.cssTemplate[mode].components)) {
+      for (const [property, value] of Object.entries(component)) {
+        if (property.includes("border-radius")) assert.equal(value, "0px");
+      }
+    }
+  }
 });
 
 test("hostedLoginUrl keeps the app URL and selects Recall's managed presentation", () => {
@@ -139,6 +154,8 @@ test("brandScreens changes presentation while preserving flow interactions", () 
   const consent = screens[2].htmlTemplate;
   assert.equal(consent._Z6xPaS9jy.props.id, "_Z6xPaS9jy");
   assert.match(consent.NpV0qhppf_.props.children, /read-only access/);
+  assert.equal(consent["EQIG9X08-e"].props["border-radius"], undefined);
+  assert.equal(consent.VqlMUvC3Yz.props["border-radius"], undefined);
   assert.deepEqual(screens[2].interactions, interactions);
 
   const otp = screens[3].htmlTemplate;
