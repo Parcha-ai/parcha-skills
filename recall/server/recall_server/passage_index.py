@@ -609,6 +609,8 @@ class CanonicalPassageProjector:
         tenant_id: str | None = None,
         batch_size: int = 100,
         max_batches: int = 10,
+        shard_count: int = 1,
+        shard_index: int = 0,
     ) -> dict[str, int | str]:
         """Embed only lossless passages missing the selected runtime fingerprint."""
 
@@ -625,11 +627,19 @@ class CanonicalPassageProjector:
             or isinstance(max_batches, bool)
             or not isinstance(max_batches, int)
             or not 1 <= max_batches <= 100
+            or isinstance(shard_count, bool)
+            or not isinstance(shard_count, int)
+            or not 1 <= shard_count <= 64
+            or isinstance(shard_index, bool)
+            or not isinstance(shard_index, int)
+            or not 0 <= shard_index < shard_count
         ):
             raise ValueError("passage embedding budget is invalid")
         processed = batches = 0
         tenant_scope = tenant_id or ""
         lock_name = f"recall:lossless-passage-embeddings:{tenant_scope}"
+        if shard_count > 1:
+            lock_name += f":shard:{shard_index}:{shard_count}"
         with self.store.connect() as connection:
             locked = connection.execute(
                 "SELECT pg_try_advisory_lock(hashtextextended(%s,0)) AS value",
@@ -658,6 +668,12 @@ class CanonicalPassageProjector:
                               AND embedding.content_sha256=passage.text_sha256
                             WHERE document.policy_fingerprint=%s
                               AND (%s::text='' OR passage.tenant_id=%s)
+                              AND (
+                                  (
+                                      hashtextextended(passage.passage_id,0)
+                                      & 9223372036854775807
+                                  ) %% %s
+                              )=%s
                               AND embedding.passage_id IS NULL
                             ORDER BY passage.tenant_id,passage.source_id,
                                      passage.passage_id
@@ -667,6 +683,8 @@ class CanonicalPassageProjector:
                             self.policy.fingerprint,
                             tenant_scope,
                             tenant_scope,
+                            shard_count,
+                            shard_index,
                             batch_size,
                         ),
                     ).fetchall()
@@ -731,6 +749,12 @@ class CanonicalPassageProjector:
                               AND embedding.content_sha256=passage.text_sha256
                             WHERE document.policy_fingerprint=%s
                               AND (%s::text='' OR passage.tenant_id=%s)
+                              AND (
+                                  (
+                                      hashtextextended(passage.passage_id,0)
+                                      & 9223372036854775807
+                                  ) %% %s
+                              )=%s
                               AND embedding.passage_id IS NULL
                        ) AS value""",
                     (
@@ -738,6 +762,8 @@ class CanonicalPassageProjector:
                         self.policy.fingerprint,
                         tenant_scope,
                         tenant_scope,
+                        shard_count,
+                        shard_index,
                     ),
                 ).fetchone()["value"]
                 connection.commit()

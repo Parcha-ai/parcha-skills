@@ -766,6 +766,14 @@ class PassageProjectionTests(unittest.TestCase):
         self.assertIn("sum(size_part.size_bytes)", pending)
         self.assertIn("interval '5 minutes'", pending)
 
+    def test_embedding_backfill_shards_by_stable_passage_identity(self) -> None:
+        source = inspect.getsource(CanonicalPassageProjector.embed_pending)
+
+        self.assertIn("1 <= shard_count <= 64", source)
+        self.assertIn("0 <= shard_index < shard_count", source)
+        self.assertIn("hashtextextended(passage.passage_id,0)", source)
+        self.assertIn("shard:{shard_index}:{shard_count}", source)
+
     def test_worker_projects_then_embeds_in_one_bounded_cycle(self) -> None:
         class Projector:
             def __init__(self) -> None:
