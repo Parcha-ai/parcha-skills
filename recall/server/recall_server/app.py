@@ -1891,6 +1891,12 @@ def configure_runtime(dsn: str) -> None:
         if Handler.agent_service is not None:
             try:
                 workers = int(environment.get("RECALL_AGENT_WORKERS", "4"))
+                sync_wait_seconds = float(
+                    environment.get(
+                        "RECALL_AGENT_SYNC_WAIT_SECONDS",
+                        "45",
+                    )
+                )
             except ValueError as error:
                 raise RuntimeError(
                     "Recall agent lifecycle configuration is invalid"
@@ -1901,6 +1907,7 @@ def configure_runtime(dsn: str) -> None:
                 backend,
                 workers=workers,
                 abandon_after_seconds=backend.lease_seconds,
+                sync_wait_seconds=sync_wait_seconds,
             )
             recovered = Handler.agent_coordinator.recover()
             pruned = backend.prune(

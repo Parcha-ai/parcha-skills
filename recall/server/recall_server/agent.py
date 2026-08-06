@@ -12,7 +12,7 @@ import hashlib
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Protocol
 from urllib.parse import urlsplit
@@ -51,6 +51,8 @@ class AgentExecutionError(RuntimeError):
 @dataclass(frozen=True)
 class AgentBudget:
     max_tool_calls: int = 12
+    max_hint_calls: int = 6
+    max_exec_seconds: int = 30
     max_receipts: int = 256
     max_tool_output_bytes: int = 2_000_000
     max_trace_events: int = 64
@@ -197,6 +199,11 @@ class ConstrainedAgentTools:
         try:
             tool_calls = self._calls_by_tool.get(name, 0)
             tool_limit = self.TOOL_CALL_LIMITS.get(name)
+            if name == "recall.hints":
+                tool_limit = min(
+                    tool_limit or self._context.budget.max_hint_calls,
+                    self._context.budget.max_hint_calls,
+                )
             if tool_limit is not None and tool_calls >= tool_limit:
                 raise AgentExecutionError(
                     f"{name} per-turn budget is exhausted",
@@ -529,6 +536,7 @@ class ConstrainedAgentTools:
                     },
                     timeout_seconds=min(
                         arguments["timeout_seconds"],
+                        self._context.budget.max_exec_seconds,
                         executable_seconds,
                     ),
                 )
@@ -604,24 +612,41 @@ class ConstrainedAgentTools:
                 ),
             })
             return result
-        except AgentExecutionError:
-            self._record_failed_observation(name, started_at)
+        except AgentExecutionError as error:
+            self._record_failed_observation(
+                name,
+                started_at,
+                error.code,
+            )
             raise
         except (TypeError, ValueError) as error:
-            self._record_failed_observation(name, started_at)
+            self._record_failed_observation(
+                name,
+                started_at,
+                "agent_evidence_tool_rejected",
+            )
             raise AgentExecutionError(
                 "agent evidence tool rejected the call",
                 code="agent_evidence_tool_rejected",
             ) from error
         except Exception as error:
-            self._record_failed_observation(name, started_at)
+            self._record_failed_observation(
+                name,
+                started_at,
+                "agent_evidence_tool_failed",
+            )
             raise AgentExecutionError(
                 "agent evidence tool failed",
                 code="agent_evidence_tool_failed",
             ) from error
         raise AgentExecutionError("agent tool is not authorized")
 
-    def _record_failed_observation(self, name: str, started_at: float) -> None:
+    def _record_failed_observation(
+        self,
+        name: str,
+        started_at: float,
+        error_code: str,
+    ) -> None:
         self._observations.append({
             "tool": name,
             "outcome": "failed",
@@ -632,6 +657,7 @@ class ConstrainedAgentTools:
             "receipts": [],
             "source_count": 0,
             "session_count": 0,
+            "error_code": error_code,
         })
 
 
@@ -706,6 +732,27 @@ class RecallAgentService:
         except ContractError as error:
             raise AgentRequestError("agent request is invalid") from error
         context = DelegationContext.from_principal(principal)
+        profiles = {
+            "quick": {
+                "deadline_seconds": 35,
+                "max_hint_calls": 3,
+                "max_exec_seconds": 10,
+            },
+            "normal": {
+                "deadline_seconds": 50,
+                "max_hint_calls": 3,
+                "max_exec_seconds": 15,
+            },
+            "deep": {
+                "deadline_seconds": 120,
+                "max_hint_calls": 6,
+                "max_exec_seconds": 30,
+            },
+        }
+        context = replace(
+            context,
+            budget=replace(context.budget, **profiles[query["depth"]]),
+        )
         return query, context
 
     def execute(

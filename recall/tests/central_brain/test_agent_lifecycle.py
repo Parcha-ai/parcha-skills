@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from concurrent.futures import Future
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from recall_server.agent import (  # noqa: E402
 )
 from recall_server.agent_runs import (  # noqa: E402
     AgentRunCoordinator,
+    CreatedRun,
     backend_from_env,
 )
 from recall_server.mcp import McpProtocolError, dispatch  # noqa: E402
@@ -261,6 +263,63 @@ class DurableConfigurationTest(unittest.TestCase):
             with self.subTest(environment=tuple(environment)):
                 with self.assertRaises((RuntimeError, ValueError)):
                     backend_from_env(environment, self.Store())
+
+    def test_sync_compatibility_timeout_returns_durable_identifiers(self) -> None:
+        pending = Future()
+
+        class Executor:
+            @staticmethod
+            def submit(*_args, **_kwargs):
+                return pending
+
+        class Service:
+            @staticmethod
+            def prepare(_principal, request):
+                return request, DelegationContext.from_principal(principal())
+
+        class Backend:
+            retention_seconds = 60
+
+            @staticmethod
+            def create(_context, _request, *, now):
+                del now
+                return CreatedRun(run("queued"), TASK_ID, True)
+
+            @staticmethod
+            def get(_context, _run_id, *, now):
+                del now
+                return run("running")
+
+            @staticmethod
+            def result(*_args, **_kwargs):
+                raise AssertionError("a running timeout has no final result")
+
+        coordinator = AgentRunCoordinator(
+            Service(),
+            Backend(),
+            sync_wait_seconds=0.01,
+            executor=Executor(),
+        )
+        value = coordinator.use_recall(
+            principal(),
+            REQUEST,
+            object(),
+        )
+        self.assertEqual(value["run"]["run_id"], RUN_ID)
+        self.assertEqual(
+            value["run"]["trace_id"],
+            "trc_0123456789abcdef0123456789abcdef",
+        )
+        self.assertEqual(value["run"]["status"], "running")
+        self.assertEqual(value["task_id"], TASK_ID)
+        self.assertEqual(
+            value["continuation"],
+            {
+                "tool": "recall_agent_result",
+                "arguments": {"run_id": RUN_ID},
+                "poll_after_ms": 1000,
+            },
+        )
 
     def test_schema_stores_hash_scope_state_and_bounded_outputs_not_question(self) -> None:
         schema = (

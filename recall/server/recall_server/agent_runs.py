@@ -7,6 +7,7 @@ import json
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Protocol
@@ -532,12 +533,15 @@ class AgentRunCoordinator:
         clock: Callable[[], datetime] | None = None,
         workers: int = 4,
         abandon_after_seconds: int = 120,
+        sync_wait_seconds: float = 45.0,
         executor: Any | None = None,
     ):
         if not 1 <= workers <= 16:
             raise ValueError("agent worker bound is invalid")
         if not 15 <= abandon_after_seconds <= 600:
             raise ValueError("agent abandonment bound is invalid")
+        if not 0.01 <= sync_wait_seconds <= 55:
+            raise ValueError("agent synchronous wait bound is invalid")
         self.service = service
         self.backend = backend
         self.clock = clock or (lambda: datetime.now(timezone.utc))
@@ -545,6 +549,7 @@ class AgentRunCoordinator:
             getattr(backend, "retention_seconds", 7 * 24 * 60 * 60)
         ) * 1000
         self.abandon_after_seconds = abandon_after_seconds
+        self.sync_wait_seconds = sync_wait_seconds
         self.lease_owner = f"agent-worker-{uuid.uuid4().hex}"
         self._executor = executor or ThreadPoolExecutor(
             max_workers=workers,
@@ -583,14 +588,7 @@ class AgentRunCoordinator:
         query, context = self.service.prepare(principal, request)
         created = self.backend.create(context, query, now=self.clock())
         if created.created:
-            future = self._executor.submit(
-                self._execute,
-                context,
-                query,
-                retrieval,
-                created.run["run_id"],
-            )
-            self._track(future)
+            self._submit(context, query, retrieval, created.run["run_id"])
         return {
             "run": created.run,
             "task_id": created.task_id,
@@ -607,8 +605,49 @@ class AgentRunCoordinator:
         created = self.backend.create(context, query, now=self.clock())
         run_id = created.run["run_id"]
         if created.created:
-            self._execute(context, query, retrieval, run_id)
+            future = self._submit(context, query, retrieval, run_id)
+            try:
+                future.result(timeout=self.sync_wait_seconds)
+            except FutureTimeoutError:
+                current = self.backend.get(
+                    context,
+                    run_id,
+                    now=self.clock(),
+                )
+                if current["status"] in SUCCESS_STATUSES:
+                    return self.backend.result(
+                        context,
+                        run_id,
+                        now=self.clock(),
+                    )
+                return {
+                    "run": current,
+                    "task_id": created.task_id,
+                    "ttl_ms": self.ttl_ms,
+                    "continuation": {
+                        "tool": "recall_agent_result",
+                        "arguments": {"run_id": run_id},
+                        "poll_after_ms": 1000,
+                    },
+                }
         return self.backend.result(context, run_id, now=self.clock())
+
+    def _submit(
+        self,
+        context: DelegationContext,
+        request: dict[str, Any],
+        retrieval: Any,
+        run_id: str,
+    ) -> Any:
+        future = self._executor.submit(
+            self._execute,
+            context,
+            request,
+            retrieval,
+            run_id,
+        )
+        self._track(future)
+        return future
 
     def _execute(
         self,
