@@ -19,6 +19,7 @@ Its design maps the source guidance into a compact response contract:
 | [US Plain Writing Act](https://uscode.house.gov/view.xhtml?req=granuleid:USC-prelim-title5-section301&num=0&edition=prelim) and [NARA's ten principles](https://www.archives.gov/open/plain-writing/10-principles.html) | Write for the reader, put the main point first, prefer active voice and everyday words, omit needless text, and use headings and lists. |
 | [JAN written-instruction guidance](https://askjan.org/solutions/Written-Instructions.cfm) and [organization guidance](https://askjan.org/limitations/Organizing-Planning-Prioritizing.cfm) | Externalize work with written steps, checklists, task separation, expected results, and visible state. |
 | [`i-have-adhd`](https://github.com/ayghri/i-have-adhd) | Lead with action, suppress tangents, restate state, show wins, handle errors matter-of-factly, stop after completion, and preserve explicit safety and depth exceptions. |
+| [`bro`](https://github.com/plannotator/dev-skills/tree/main/skills/general/bro) | Use plain human language, avoid jargon, and get straight to what matters. |
 
 The snippet does not claim certification or conformance, legal compliance,
 WCAG conformance, or medical accommodation. It deliberately avoids diagnosing
