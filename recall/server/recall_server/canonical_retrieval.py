@@ -913,6 +913,46 @@ class BoundCanonicalRetrieval:
             limit=limit,
         )
 
+    @staticmethod
+    def _investigation_probe(
+        passage_probe: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Adapt lossless document hints into receipt-backed session seeds."""
+
+        results: list[dict[str, Any]] = []
+        for document in passage_probe.get("results", ()):
+            selected_range = next(
+                (
+                    item
+                    for item in document.get("matching_ranges", ())
+                    if item.get("receipts")
+                ),
+                None,
+            )
+            if selected_range is None:
+                continue
+            receipts = selected_range["receipts"]
+            receipt = receipts[len(receipts) // 2]
+            native_id = urlsplit(receipt).path.lstrip("/")
+            results.append({
+                "source_id": document["source_id"],
+                "native_id": native_id,
+                "native_parent_id": document["native_parent_id"],
+                "revision": document["revision"],
+                "occurred_at": document["last_occurred_at"],
+                "time_basis": "occurred_at",
+                "text": selected_range.get("text", ""),
+                "text_clipped": bool(selected_range.get("text_clipped")),
+                "receipt": receipt,
+                "rank": document["rank"],
+                "logical_document_id": document["logical_document_id"],
+                "reasons": document.get("reasons", ()),
+            })
+        return {
+            "results": results,
+            "diagnostics": passage_probe.get("diagnostics", {}),
+        }
+
     def execute_agent_program(
         self,
         program: str,
@@ -1842,7 +1882,9 @@ class BoundCanonicalRetrieval:
         )
 
         probes: list[dict[str, Any]] = []
-        first = self.search(question, effective_filters, 20)
+        first = self._investigation_probe(
+            self.passage_hints(question, effective_filters, 20)
+        )
         probes.append(first)
         if not any(
             name in effective_filters
@@ -1875,7 +1917,9 @@ class BoundCanonicalRetrieval:
                     **effective_filters,
                     "source_family": row["family"],
                 }
-                probes.append(self.search(question, family_filters, 8))
+                probes.append(self._investigation_probe(
+                    self.passage_hints(question, family_filters, 8)
+                ))
 
         combined: dict[str, dict[str, Any]] = {}
         for probe_index, probe in enumerate(probes):
@@ -2051,6 +2095,11 @@ class BoundCanonicalRetrieval:
             "uncertainty": uncertainty,
             "diagnostics": {
                 "engine": "canonical-investigator-v1",
+                "candidate_engines": sorted({
+                    probe.get("diagnostics", {}).get("engine")
+                    for probe in probes
+                    if probe.get("diagnostics", {}).get("engine")
+                }),
                 "search_probes": len(probes),
                 "unique_candidates": len(combined),
                 "expanded_sessions": len(investigations),

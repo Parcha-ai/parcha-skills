@@ -737,20 +737,22 @@ class PassageProjectionTests(unittest.TestCase):
         self.assertIn("copy.write_row(", source)
         self.assertNotIn("cursor.executemany(", source)
 
-    def test_dense_temporal_candidates_are_oversampled_before_filtering(
+    def test_dense_temporal_scope_is_materialized_before_vector_ranking(
         self,
     ) -> None:
         source = inspect.getsource(PassageHintRetrieval.search)
-        nearest = source.split("WITH nearest AS MATERIALIZED", 1)[1]
-        nearest = nearest.split("LIMIT %s", 1)[0]
+        eligible = source.split(
+            "WITH eligible AS MATERIALIZED", 1
+        )[1].split("), nearest AS MATERIALIZED", 1)[0]
 
         self.assertIn(
             "dense_oversample = 50 if temporal_scope else 5",
             source,
         )
-        self.assertNotIn("canonical_passages", nearest)
-        self.assertIn("passage.last_occurred_at>=%s", source)
-        self.assertIn("passage.first_occurred_at<=%s", source)
+        self.assertIn("canonical_passages", eligible)
+        self.assertIn("embedding.source_id=ANY(%s)", eligible)
+        self.assertIn("passage.last_occurred_at>=%s", eligible)
+        self.assertIn("passage.first_occurred_at<=%s", eligible)
         self.assertIn("SELECT DISTINCT ON (", source)
         self.assertIn("passage.logical_document_id", source)
 
