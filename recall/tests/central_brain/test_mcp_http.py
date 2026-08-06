@@ -563,6 +563,22 @@ class RemoteMcpContractTest(unittest.TestCase):
             },
         )
         self.assertEqual(
+            tools["recall_search"]["properties"]["filters"]["properties"]["person"],
+            {"type": "string", "maxLength": 256},
+        )
+        self.assertEqual(
+            tools["recall_search"]["properties"]["filters"]["properties"]
+            ["person_relation"]["enum"],
+            [
+                "author",
+                "contributor",
+                "owner",
+                "organizer",
+                "participant",
+                "attendee",
+            ],
+        )
+        self.assertEqual(
             tools["recall_related"]["properties"]["limit"]["maximum"],
             20,
         )

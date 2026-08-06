@@ -305,6 +305,18 @@ ALL_READ_TOOLS = (
                         "source_id": {"type": "string"},
                         "source_family": {"type": "string"},
                         "source_alias": {"type": "string"},
+                        "person": {"type": "string", "maxLength": 256},
+                        "person_relation": {
+                            "type": "string",
+                            "enum": [
+                                "author",
+                                "contributor",
+                                "owner",
+                                "organizer",
+                                "participant",
+                                "attendee",
+                            ],
+                        },
                     },
                     "additionalProperties": False,
                 },
