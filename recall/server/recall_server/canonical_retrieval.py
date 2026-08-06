@@ -525,6 +525,64 @@ class BoundCanonicalRetrieval:
             values[1],
         )
 
+    @staticmethod
+    def _routing_filters(filters: dict[str, Any]) -> dict[str, Any]:
+        """Keep actor scope for passages, not source/time route parsing."""
+
+        return {
+            key: value
+            for key, value in filters.items()
+            if key not in {"person", "person_relation"}
+        }
+
+    def _actor_sources(
+        self,
+        person: str,
+        relation: str | None,
+        sources: list[str],
+        deadline_at: float,
+    ) -> list[str]:
+        """Find actor-linked sources so investigation can cover each tool."""
+
+        if not sources:
+            return []
+        try:
+            with self.store.connect() as connection:
+                rows = self.store._execute_bounded(
+                    connection,
+                    """SELECT DISTINCT linked.source_id
+                         FROM canonical_passage_actors linked
+                         JOIN brain_actors actor
+                           ON actor.tenant_id=linked.tenant_id
+                          AND actor.actor_id=linked.actor_id
+                         LEFT JOIN brain_actor_aliases alias
+                           ON alias.tenant_id=actor.tenant_id
+                          AND alias.actor_id=actor.actor_id
+                          AND alias.searchable
+                        WHERE linked.tenant_id=%s
+                          AND linked.source_id=ANY(%s)
+                          AND actor.active
+                          AND (
+                              lower(actor.display_name)=lower(%s)
+                              OR lower(alias.alias)=lower(%s)
+                          )
+                          AND (%s::text IS NULL OR linked.relation=%s)
+                        ORDER BY linked.source_id
+                        LIMIT 64""",
+                    (
+                        self.tenant_id,
+                        sources,
+                        person.strip(),
+                        person.strip(),
+                        relation,
+                        relation,
+                    ),
+                    deadline_at,
+                ).fetchall()
+        except SearchDeadlineExceeded:
+            return []
+        return [row["source_id"] for row in rows]
+
     def _sources(
         self,
         *,
@@ -912,6 +970,46 @@ class BoundCanonicalRetrieval:
             until=until,
             limit=limit,
         )
+
+    @staticmethod
+    def _investigation_probe(
+        passage_probe: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Adapt lossless document hints into receipt-backed session seeds."""
+
+        results: list[dict[str, Any]] = []
+        for document in passage_probe.get("results", ()):
+            selected_range = next(
+                (
+                    item
+                    for item in document.get("matching_ranges", ())
+                    if item.get("receipts")
+                ),
+                None,
+            )
+            if selected_range is None:
+                continue
+            receipts = selected_range["receipts"]
+            receipt = receipts[len(receipts) // 2]
+            native_id = urlsplit(receipt).path.lstrip("/")
+            results.append({
+                "source_id": document["source_id"],
+                "native_id": native_id,
+                "native_parent_id": document["native_parent_id"],
+                "revision": document["revision"],
+                "occurred_at": document["last_occurred_at"],
+                "time_basis": "occurred_at",
+                "text": selected_range.get("text", ""),
+                "text_clipped": bool(selected_range.get("text_clipped")),
+                "receipt": receipt,
+                "rank": document["rank"],
+                "logical_document_id": document["logical_document_id"],
+                "reasons": document.get("reasons", ()),
+            })
+        return {
+            "results": results,
+            "diagnostics": passage_probe.get("diagnostics", {}),
+        }
 
     def execute_agent_program(
         self,
@@ -1825,9 +1923,14 @@ class BoundCanonicalRetrieval:
         budget = budgets[depth]
         deadline_at = started_at + budget["deadline_seconds"]
         effective_filters = dict(filters or {})
-        source_id, source_family, source_alias, source_connector, _, _ = self._filters(
-            effective_filters
-        )
+        (
+            source_id,
+            source_family,
+            source_alias,
+            source_connector,
+            _,
+            _,
+        ) = self._filters(self._routing_filters(effective_filters))
         time_reason = "explicit"
         if "since" not in effective_filters and "until" not in effective_filters:
             since, until, time_reason = self._question_time_window(question)
@@ -1842,7 +1945,9 @@ class BoundCanonicalRetrieval:
         )
 
         probes: list[dict[str, Any]] = []
-        first = self.search(question, effective_filters, 20)
+        first = self._investigation_probe(
+            self.passage_hints(question, effective_filters, 20)
+        )
         probes.append(first)
         if not any(
             name in effective_filters
@@ -1875,7 +1980,47 @@ class BoundCanonicalRetrieval:
                     **effective_filters,
                     "source_family": row["family"],
                 }
-                probes.append(self.search(question, family_filters, 8))
+                probes.append(self._investigation_probe(
+                    self.passage_hints(question, family_filters, 8)
+                ))
+        person = effective_filters.get("person")
+        if (
+            isinstance(person, str)
+            and not any(
+                name in effective_filters
+                for name in (
+                    "source_id",
+                    "source_family",
+                    "source_alias",
+                    "source_connector",
+                )
+            )
+        ):
+            represented_sources = {
+                result["source_id"]
+                for probe in probes
+                for result in probe["results"]
+            }
+            actor_sources = self._actor_sources(
+                person,
+                effective_filters.get("person_relation"),
+                eligible_sources,
+                deadline_at,
+            )
+            missing_sources = [
+                source for source in actor_sources
+                if source not in represented_sources
+            ][:budget["families"]]
+            for actor_source in missing_sources:
+                if time.monotonic() >= deadline_at:
+                    break
+                source_filters = {
+                    **effective_filters,
+                    "source_id": actor_source,
+                }
+                probes.append(self._investigation_probe(
+                    self.passage_hints(question, source_filters, 8)
+                ))
 
         combined: dict[str, dict[str, Any]] = {}
         for probe_index, probe in enumerate(probes):
@@ -2051,6 +2196,11 @@ class BoundCanonicalRetrieval:
             "uncertainty": uncertainty,
             "diagnostics": {
                 "engine": "canonical-investigator-v1",
+                "candidate_engines": sorted({
+                    probe.get("diagnostics", {}).get("engine")
+                    for probe in probes
+                    if probe.get("diagnostics", {}).get("engine")
+                }),
                 "search_probes": len(probes),
                 "unique_candidates": len(combined),
                 "expanded_sessions": len(investigations),
@@ -2089,7 +2239,9 @@ class BoundCanonicalRetrieval:
         ):
             return ()
         search_query = " OR ".join(f'"{term}"' for term in terms)
-        _, _, _, _, since, until = self._filters(filters or {})
+        _, _, _, _, since, until = self._filters(
+            self._routing_filters(filters or {})
+        )
         deadline_at = time.monotonic() + self.store.search_deadline_ms / 1000
         try:
             with self.store.connect() as connection:
@@ -2269,7 +2421,7 @@ class BoundCanonicalRetrieval:
                 source_connector,
                 since,
                 until,
-            ) = self._filters(filters or {})
+            ) = self._filters(self._routing_filters(filters or {}))
             eligible_sources = set(self._sources(
                 source_id=(filters or {}).get("source_id"),
                 source_family=source_family,

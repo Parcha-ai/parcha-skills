@@ -29,7 +29,7 @@ class DeadlineStore:
 
 
 class DeadlineRetrieval(BoundCanonicalRetrieval):
-    def search(self, _query, _filters=None, _limit=10, _authorized_source=None):
+    def passage_hints(self, _query, _filters=None, _limit=10):
         return {"results": [], "diagnostics": {"engine": "synthetic"}}
 
 
@@ -60,6 +60,224 @@ class ParallelMapRetrieval(BoundCanonicalRetrieval):
 
 
 class CanonicalInvestigatorContractTest(unittest.TestCase):
+    def test_investigate_seeds_from_lossless_passages(self) -> None:
+        receipts = tuple(
+            f"recall://codex.jsonl:test/event-{index}?rev=1#item=0"
+            for index in range(3)
+        )
+
+        class Store:
+            @contextmanager
+            def connect(self):
+                yield object()
+
+            @staticmethod
+            def _execute_bounded(_connection, sql, _values, _deadline_at):
+                if "FROM canonical_sources" in sql:
+                    return type("Rows", (), {"fetchall": lambda self: [
+                        {"source_id": "codex.jsonl:test"}
+                    ]})()
+                return type(
+                    "Rows",
+                    (),
+                    {"fetchall": lambda self: []},
+                )()
+
+        class Retrieval(BoundCanonicalRetrieval):
+            def search(self, *_args, **_kwargs):
+                raise AssertionError("investigate used the legacy chunk index")
+
+            def passage_hints(self, query, filters=None, limit=10):
+                self.passage_call = (query, filters, limit)
+                return {
+                    "results": [{
+                        "source_id": "codex.jsonl:test",
+                        "logical_document_id": "ldoc_" + "1" * 32,
+                        "revision": 1,
+                        "native_parent_id": "session-1",
+                        "first_occurred_at": "2026-08-05T10:00:00+00:00",
+                        "last_occurred_at": "2026-08-05T12:00:00+00:00",
+                        "rank": 0.02,
+                        "reasons": ["dense"],
+                        "matching_ranges": [{
+                            "kind": "dense",
+                            "score": 0.8,
+                            "text": "implemented the snapshot rollout",
+                            "text_clipped": False,
+                            "receipts": list(receipts),
+                        }],
+                    }],
+                    "diagnostics": {"engine": "lossless-passages-v1"},
+                }
+
+            def session_context(self, target, **_kwargs):
+                self.context_target = target
+                return {
+                    "session": {
+                        "source_id": "codex.jsonl:test",
+                        "native_parent_id": "session-1",
+                        "time_basis": "occurred_at",
+                    },
+                    "events": [{
+                        "source_id": "codex.jsonl:test",
+                        "native_id": "event-1",
+                        "native_parent_id": "session-1",
+                        "revision": 1,
+                        "kind": "message",
+                        "occurred_at": "2026-08-05T11:00:00+00:00",
+                        "observed_at": "2026-08-05T11:00:01+00:00",
+                        "ingested_at": "2026-08-05T11:00:02+00:00",
+                        "time_basis": "occurred_at",
+                        "chunks": [],
+                    }],
+                    "anchor_receipt": target,
+                    "bounds": {"before": 2, "after": 2},
+                }
+
+        retrieval = Retrieval(
+            Store(),
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=("codex.jsonl:test",),
+        )
+        filters = {
+            "source_id": "codex.jsonl:test",
+            "since": "2026-08-05T00:00:00Z",
+            "until": "2026-08-06T00:00:00Z",
+            "person": "Christian",
+            "person_relation": "author",
+        }
+
+        result = retrieval.investigate(
+            "What did Chris implement?",
+            filters=filters,
+            depth="quick",
+        )
+
+        self.assertEqual(
+            retrieval.passage_call,
+            ("What did Chris implement?", filters, 20),
+        )
+        self.assertEqual(retrieval.context_target, receipts[1])
+        self.assertEqual(result["coverage"]["sessions"], 1)
+        self.assertEqual(result["diagnostics"]["unique_candidates"], 1)
+        self.assertEqual(
+            result["diagnostics"]["candidate_engines"],
+            ["lossless-passages-v1"],
+        )
+        self.assertEqual(
+            result["investigations"][0]["match"]["receipt"],
+            receipts[1],
+        )
+
+    def test_investigate_probes_missing_actor_linked_sources(self) -> None:
+        sources = ("claude.jsonl:test", "codex.jsonl:test")
+
+        class Rows:
+            def __init__(self, values):
+                self.values = values
+
+            def fetchall(self):
+                return self.values
+
+        class Store:
+            @contextmanager
+            def connect(self):
+                yield object()
+
+            @staticmethod
+            def _execute_bounded(_connection, sql, _values, _deadline_at):
+                if "FROM canonical_passage_actors linked" in sql:
+                    return Rows([{"source_id": source} for source in sources])
+                if "FROM canonical_sources" in sql:
+                    return Rows([{"source_id": source} for source in sources])
+                if "SELECT DISTINCT family" in sql:
+                    return Rows([{"family": "coding"}])
+                return Rows([])
+
+        class Retrieval(BoundCanonicalRetrieval):
+            def __init__(self):
+                super().__init__(
+                    Store(),
+                    tenant_id="tenant:test",
+                    principal_id="principal:test",
+                    authorized_sources=sources,
+                )
+                self.passage_calls = []
+
+            def passage_hints(self, query, filters=None, limit=10):
+                scoped = dict(filters or {})
+                self.passage_calls.append((query, scoped, limit))
+                source = scoped.get("source_id", "codex.jsonl:test")
+                receipt = f"recall://{source}/event?rev=1#item=0"
+                return {
+                    "results": [{
+                        "source_id": source,
+                        "logical_document_id": (
+                            "ldoc_" + ("1" if source.startswith("codex") else "2") * 32
+                        ),
+                        "revision": 1,
+                        "native_parent_id": source + ":session",
+                        "first_occurred_at": "2026-08-05T10:00:00+00:00",
+                        "last_occurred_at": "2026-08-05T12:00:00+00:00",
+                        "rank": 0.5,
+                        "reasons": ["dense"],
+                        "matching_ranges": [{
+                            "kind": "dense",
+                            "score": 0.8,
+                            "text": source,
+                            "text_clipped": False,
+                            "receipts": [receipt],
+                        }],
+                    }],
+                    "diagnostics": {"engine": "lossless-passages-v1"},
+                }
+
+            @staticmethod
+            def session_context(target, **_kwargs):
+                source = target.removeprefix("recall://").split("/", 1)[0]
+                return {
+                    "session": {
+                        "source_id": source,
+                        "native_parent_id": source + ":session",
+                        "time_basis": "occurred_at",
+                    },
+                    "events": [{
+                        "source_id": source,
+                        "native_id": "event",
+                        "native_parent_id": source + ":session",
+                        "revision": 1,
+                        "kind": "message",
+                        "occurred_at": "2026-08-05T11:00:00+00:00",
+                        "observed_at": "2026-08-05T11:00:01+00:00",
+                        "ingested_at": "2026-08-05T11:00:02+00:00",
+                        "time_basis": "occurred_at",
+                        "chunks": [],
+                    }],
+                    "anchor_receipt": target,
+                    "bounds": {"before": 2, "after": 2},
+                }
+
+        retrieval = Retrieval()
+        filters = {
+            "since": "2026-08-05T00:00:00Z",
+            "until": "2026-08-06T00:00:00Z",
+            "person": "Christian",
+            "person_relation": "author",
+        }
+        result = retrieval.investigate(
+            "What did Chris implement?",
+            filters=filters,
+            depth="quick",
+        )
+
+        self.assertIn(
+            ("What did Chris implement?", {**filters, "source_id": "claude.jsonl:test"}, 8),
+            retrieval.passage_calls,
+        )
+        self.assertEqual(result["coverage"]["sources"], list(sources))
+        self.assertEqual(result["coverage"]["sessions"], 2)
+
     def test_map_seed_expands_to_ranked_session_evidence(self) -> None:
         seed = "recall://codex.jsonl:test/seed?rev=1#item=0"
         expanded = (

@@ -60,6 +60,12 @@ class FakeStore:
             ],
         }
 
+    def investigate(self, question, *, filters, depth, authorized_source):
+        self.calls.append(
+            ("investigate", question, filters, depth, authorized_source)
+        )
+        return {"investigations": [], "coverage": {"sessions": 0}}
+
     def show(self, target, *, around, tail, prompts, authorized_source):
         self.calls.append(("show", target, around, tail, prompts, authorized_source))
         return {
@@ -562,6 +568,25 @@ class RemoteMcpContractTest(unittest.TestCase):
                 ]
             },
         )
+        with McpHttpServer(PolicyStore()) as server:
+            _, _, canonical_raw = server.request(
+                "POST",
+                request("tools/list"),
+                token="synthetic-human-read",
+                protocol="2025-11-25",
+            )
+        canonical_tools = {
+            tool["name"]: tool["inputSchema"]
+            for tool in json.loads(canonical_raw)["result"]["tools"]
+        }
+        investigate_filters = canonical_tools["recall_investigate"]["properties"][
+            "filters"
+        ]["properties"]
+        self.assertEqual(
+            investigate_filters["person"],
+            {"type": "string", "maxLength": 256},
+        )
+        self.assertIn("author", investigate_filters["person_relation"]["enum"])
         self.assertEqual(
             tools["recall_search"]["properties"]["filters"]["properties"]["person"],
             {"type": "string", "maxLength": 256},
@@ -648,6 +673,44 @@ class RemoteMcpContractTest(unittest.TestCase):
                 self.assertEqual(status, 200)
                 self.assertEqual(json.loads(raw)["error"]["code"], -32602)
                 self.assertNotIn("show", {call[0] for call in self.store.calls})
+
+    def test_investigate_passes_person_and_time_scope_to_store(self) -> None:
+        filters = {
+            "since": "2026-08-05T07:00:00Z",
+            "until": "2026-08-06T07:00:00Z",
+            "person": "Christian",
+            "person_relation": "author",
+        }
+        store = PolicyStore()
+        with McpHttpServer(store) as server:
+            status, _, raw = server.request(
+                "POST",
+                request(
+                    "tools/call",
+                    params={
+                        "name": "recall_investigate",
+                        "arguments": {
+                            "question": "What did Chris do yesterday?",
+                            "filters": filters,
+                            "depth": "deep",
+                        },
+                    },
+                ),
+                token="synthetic-human-read",
+                protocol="2025-11-25",
+            )
+        self.assertEqual(status, 200)
+        self.assertIn("result", json.loads(raw))
+        self.assertIn(
+            (
+                "investigate",
+                "What did Chris do yesterday?",
+                filters,
+                "deep",
+                ["source:synthetic:company"],
+            ),
+            store.calls,
+        )
 
     def test_search_and_related_bounds_reject_before_store(self) -> None:
         cases = (
