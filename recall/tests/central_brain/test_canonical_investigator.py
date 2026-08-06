@@ -60,6 +60,65 @@ class ParallelMapRetrieval(BoundCanonicalRetrieval):
 
 
 class CanonicalInvestigatorContractTest(unittest.TestCase):
+    def test_time_scoped_passage_hints_exclude_out_of_window_records(self) -> None:
+        recent = "recall://codex.jsonl:test/recent?rev=1#item=0"
+        old = "recall://codex.jsonl:test/old?rev=1#item=0"
+
+        class Rows:
+            @staticmethod
+            def fetchall():
+                return [{
+                    "receipt": recent,
+                    "text_redacted": "recent bounded evidence",
+                    "occurred_at": datetime(2026, 8, 5, tzinfo=timezone.utc),
+                }]
+
+        class Store:
+            search_deadline_ms = 1000
+
+            @contextmanager
+            def connect(self):
+                yield object()
+
+            @staticmethod
+            def _execute_bounded(_connection, _sql, values, _deadline_at):
+                self_values = values
+                assert set(self_values[2]) == {recent, old}
+                return Rows()
+
+        retrieval = BoundCanonicalRetrieval(
+            Store(),
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=("codex.jsonl:test",),
+        )
+        value = retrieval._clip_passage_hints_to_time_window(
+            {
+                "results": [{
+                    "source_id": "codex.jsonl:test",
+                    "matching_ranges": [{
+                        "kind": "dense",
+                        "score": 0.8,
+                        "text": "old imported history\n\nrecent bounded evidence",
+                        "text_clipped": False,
+                        "receipts": [old, recent],
+                        "spans": [{"record_ordinal": 0}],
+                    }],
+                }],
+                "diagnostics": {"engine": "lossless-passages-v1"},
+            },
+            sources=["codex.jsonl:test"],
+            since="2026-08-05T00:00:00Z",
+            until="2026-08-06T00:00:00Z",
+        )
+
+        matching_range = value["results"][0]["matching_ranges"][0]
+        self.assertEqual(matching_range["receipts"], [recent])
+        self.assertEqual(matching_range["text"], "recent bounded evidence")
+        self.assertTrue(matching_range["time_clipped"])
+        self.assertNotIn("spans", matching_range)
+        self.assertEqual(value["diagnostics"]["time_clip_status"], "ok")
+
     def test_investigate_seeds_from_lossless_passages(self) -> None:
         receipts = tuple(
             f"recall://codex.jsonl:test/event-{index}?rev=1#item=0"

@@ -956,7 +956,7 @@ class BoundCanonicalRetrieval:
                     (self.tenant_id, person.strip(), person.strip()),
                 ).fetchall()
             actor_ids = tuple(row["actor_id"] for row in rows)
-        return PassageHintRetrieval(
+        response = PassageHintRetrieval(
             self.store,
             tenant_id=self.tenant_id,
             sources=sources,
@@ -970,6 +970,103 @@ class BoundCanonicalRetrieval:
             until=until,
             limit=limit,
         )
+        if since is None and until is None:
+            return response
+        return self._clip_passage_hints_to_time_window(
+            response,
+            sources=sources,
+            since=since,
+            until=until,
+        )
+
+    def _clip_passage_hints_to_time_window(
+        self,
+        response: dict[str, Any],
+        *,
+        sources: list[str],
+        since: str | None,
+        until: str | None,
+    ) -> dict[str, Any]:
+        """Keep hint text and receipts inside the requested event window."""
+
+        receipts = list(dict.fromkeys(
+            receipt
+            for document in response.get("results", ())
+            for matching_range in document.get("matching_ranges", ())
+            for receipt in matching_range.get("receipts", ())
+        ))
+        diagnostics = dict(response.get("diagnostics", {}))
+        if not receipts:
+            diagnostics["time_clip_status"] = "ok"
+            return {**response, "diagnostics": diagnostics}
+        try:
+            with self.store.connect() as connection:
+                rows = self.store._execute_bounded(
+                    connection,
+                    """SELECT chunk.receipt,chunk.text_redacted,
+                              event.occurred_at
+                         FROM canonical_chunks chunk
+                         JOIN canonical_documents document
+                           USING(tenant_id,source_id,document_id)
+                         JOIN canonical_events event
+                           USING(tenant_id,source_id,event_id)
+                        WHERE chunk.tenant_id=%s
+                          AND chunk.source_id=ANY(%s)
+                          AND chunk.receipt=ANY(%s)
+                          AND chunk.deleted_at IS NULL
+                          AND document.is_current
+                          AND document.deleted_at IS NULL
+                          AND (%s::timestamptz IS NULL
+                               OR event.occurred_at>=%s)
+                          AND (%s::timestamptz IS NULL
+                               OR event.occurred_at<=%s)
+                        ORDER BY event.occurred_at,chunk.ordinal,
+                                 chunk.receipt""",
+                    (
+                        self.tenant_id,
+                        sources,
+                        receipts,
+                        since,
+                        since,
+                        until,
+                        until,
+                    ),
+                    time.monotonic()
+                    + self.store.search_deadline_ms / 1000,
+                ).fetchall()
+        except SearchDeadlineExceeded:
+            diagnostics["time_clip_status"] = "deadline-exceeded"
+            return {**response, "results": [], "diagnostics": diagnostics}
+        eligible = {row["receipt"]: row for row in rows}
+        results = []
+        for document in response.get("results", ()):
+            ranges = []
+            for matching_range in document.get("matching_ranges", ()):
+                range_rows = [
+                    eligible[receipt]
+                    for receipt in matching_range.get("receipts", ())
+                    if receipt in eligible
+                ]
+                if not range_rows:
+                    continue
+                text, clipped = bounded_search_text("\n\n".join(
+                    row["text_redacted"] for row in range_rows
+                ))
+                ranges.append({
+                    key: value
+                    for key, value in matching_range.items()
+                    if key != "spans"
+                } | {
+                    "text": text,
+                    "text_clipped": clipped,
+                    "receipts": [row["receipt"] for row in range_rows],
+                    "time_clipped": True,
+                })
+            if ranges:
+                results.append({**document, "matching_ranges": ranges})
+        diagnostics["time_clip_status"] = "ok"
+        diagnostics["time_clipped_receipts"] = len(eligible)
+        return {**response, "results": results, "diagnostics": diagnostics}
 
     @staticmethod
     def _investigation_probe(
