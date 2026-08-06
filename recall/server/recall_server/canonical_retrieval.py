@@ -592,6 +592,9 @@ class BoundCanonicalRetrieval:
             raise ValueError("invalid canonical search query")
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 20:
             raise ValueError("invalid canonical search limit")
+        effective_filters = dict(filters or {})
+        if "person" in effective_filters or "person_relation" in effective_filters:
+            return self.passage_hints(query, effective_filters, limit)
         (
             source_id,
             source_family,
@@ -599,7 +602,7 @@ class BoundCanonicalRetrieval:
             source_connector,
             since,
             until,
-        ) = self._filters(filters or {})
+        ) = self._filters(effective_filters)
         sources = self._sources(
             source_id=source_id,
             source_family=source_family,

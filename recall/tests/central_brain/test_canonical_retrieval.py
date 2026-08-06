@@ -221,7 +221,7 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
             ["codex:linux:test", "codex:mac:test"],
         )
 
-    def test_person_hints_resolve_inside_tenant_and_filter_every_arm(self):
+    def test_person_search_routes_to_hints_and_filters_every_arm(self):
         store = ActorRecordingStore()
         retrieval = BoundCanonicalRetrieval(
             store,
@@ -230,7 +230,7 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
             authorized_sources=("codex:linux:test",),
         )
 
-        result = retrieval.passage_hints(
+        result = retrieval.search(
             "What did Alice write?",
             filters={"person": "Alice", "person_relation": "author"},
         )
