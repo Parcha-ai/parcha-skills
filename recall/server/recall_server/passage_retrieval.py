@@ -411,10 +411,8 @@ class PassageHintRetrieval:
                 )
                 temporal_scope = since is not None or until is not None
                 dense_oversample = 50 if temporal_scope else 5
-                with self.store.connect() as connection:
-                    dense = self.store._execute_bounded(
-                        connection,
-                        """WITH nearest AS MATERIALIZED (
+                if actor_ids is None:
+                    nearest_sql = """WITH nearest AS MATERIALIZED (
                                SELECT embedding.tenant_id,
                                       embedding.source_id,
                                       embedding.passage_id,
@@ -424,28 +422,70 @@ class PassageHintRetrieval:
                                 WHERE embedding.tenant_id=%s
                                   AND embedding.source_id=ANY(%s)
                                   AND embedding.runtime_fingerprint=%s
-                                  AND (
-                                      %s::text[] IS NULL
-                                      OR EXISTS (
-                                          SELECT 1
-                                            FROM canonical_passage_actors actor
-                                           WHERE actor.tenant_id=
-                                                 embedding.tenant_id
-                                             AND actor.source_id=
-                                                 embedding.source_id
-                                             AND actor.passage_id=
-                                                 embedding.passage_id
-                                             AND actor.actor_id=ANY(%s)
-                                             AND (
-                                                 %s::text[] IS NULL
-                                                 OR actor.relation=ANY(%s)
-                                             )
-                                      )
-                                  )
                                 ORDER BY embedding.embedding
                                          <=> %s::halfvec
                                 LIMIT %s
-                           ), ranked_documents AS MATERIALIZED (
+                           )"""
+                    nearest_values = (
+                        vector,
+                        self.tenant_id,
+                        self.sources,
+                        runtime.passage_fingerprint,
+                        vector,
+                        candidate_limit * dense_oversample,
+                    )
+                else:
+                    # pgvector's approximate index applies SQL filters after
+                    # scanning its nearest graph. A selective person filter can
+                    # therefore produce zero rows even when thousands of
+                    # eligible passages exist. Freeze the authorized actor
+                    # subset first, then rank exactly inside that bounded set.
+                    nearest_sql = """WITH eligible AS MATERIALIZED (
+                               SELECT embedding.tenant_id,
+                                      embedding.source_id,
+                                      embedding.passage_id,
+                                      embedding.embedding
+                                 FROM canonical_passage_embeddings embedding
+                                WHERE embedding.tenant_id=%s
+                                  AND embedding.source_id=ANY(%s)
+                                  AND embedding.runtime_fingerprint=%s
+                                  AND EXISTS (
+                                      SELECT 1
+                                        FROM canonical_passage_actors actor
+                                       WHERE actor.tenant_id=
+                                             embedding.tenant_id
+                                         AND actor.source_id=
+                                             embedding.source_id
+                                         AND actor.passage_id=
+                                             embedding.passage_id
+                                         AND actor.actor_id=ANY(%s)
+                                         AND (
+                                             %s::text[] IS NULL
+                                             OR actor.relation=ANY(%s)
+                                         )
+                                  )
+                           ), nearest AS MATERIALIZED (
+                               SELECT eligible.tenant_id,
+                                      eligible.source_id,
+                                      eligible.passage_id,
+                                      eligible.embedding
+                                          <=> %s::halfvec AS distance
+                                 FROM eligible
+                                ORDER BY eligible.embedding <=> %s::halfvec
+                                LIMIT %s
+                           )"""
+                    nearest_values = (
+                        self.tenant_id,
+                        self.sources,
+                        runtime.passage_fingerprint,
+                        actor_ids,
+                        actor_relations,
+                        actor_relations,
+                        vector,
+                        vector,
+                        candidate_limit * dense_oversample,
+                    )
+                dense_sql = nearest_sql + """, ranked_documents AS MATERIALIZED (
                                SELECT DISTINCT ON (
                                           passage.logical_document_id
                                       )
@@ -489,18 +529,12 @@ class PassageHintRetrieval:
                            SELECT *,1-distance AS score
                              FROM ranked_documents
                             ORDER BY distance,last_occurred_at DESC,passage_id
-                            LIMIT %s""",
-                        (
-                            vector,
-                            self.tenant_id,
-                            self.sources,
-                            runtime.passage_fingerprint,
-                            actor_ids,
-                            actor_ids,
-                            actor_relations,
-                            actor_relations,
-                            vector,
-                            candidate_limit * dense_oversample,
+                            LIMIT %s"""
+                with self.store.connect() as connection:
+                    dense = self.store._execute_bounded(
+                        connection,
+                        dense_sql,
+                        nearest_values + (
                             self.policy_fingerprint,
                             since,
                             since,

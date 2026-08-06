@@ -754,6 +754,23 @@ class PassageProjectionTests(unittest.TestCase):
         self.assertIn("SELECT DISTINCT ON (", source)
         self.assertIn("passage.logical_document_id", source)
 
+    def test_dense_person_scope_is_materialized_before_vector_ranking(
+        self,
+    ) -> None:
+        source = inspect.getsource(PassageHintRetrieval.search)
+        eligible = source.split(
+            "WITH eligible AS MATERIALIZED", 1
+        )[1].split("), nearest AS MATERIALIZED", 1)[0]
+        actor_nearest = source.split(
+            "), nearest AS MATERIALIZED", 1
+        )[1].split("), ranked_documents AS MATERIALIZED", 1)[0]
+
+        self.assertIn("canonical_passage_actors", eligible)
+        self.assertIn("actor.actor_id=ANY(%s)", eligible)
+        self.assertIn("actor.relation=ANY(%s)", eligible)
+        self.assertIn("FROM eligible", actor_nearest)
+        self.assertIn("ORDER BY eligible.embedding <=> %s::halfvec", actor_nearest)
+
     def test_backfill_is_idempotent_fast_first_and_starvation_bounded(
         self,
     ) -> None:
