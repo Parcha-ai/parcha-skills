@@ -331,7 +331,10 @@ class ConstrainedAgentTools:
         return (
             isinstance(item, dict)
             and set(item)
-            == {"alias", "cursor", "record_ordinal", "page_bytes"}
+            == {"label", "alias", "cursor", "record_ordinal", "page_bytes"}
+            and isinstance(item["label"], str)
+            and bool(item["label"].strip())
+            and len(item["label"]) <= 80
             and isinstance(item["alias"], str)
             and item["alias"] in self._document_ids_by_alias
             and (
@@ -690,6 +693,7 @@ class ConstrainedAgentTools:
                             error.code,
                         )
                         documents.append({
+                            "label": item["label"],
                             "alias": item["alias"],
                             "status": "unavailable",
                             "error_code": error.code,
@@ -703,6 +707,7 @@ class ConstrainedAgentTools:
                             code,
                         )
                         documents.append({
+                            "label": item["label"],
                             "alias": item["alias"],
                             "status": "unavailable",
                             "error_code": code,
@@ -716,12 +721,14 @@ class ConstrainedAgentTools:
                             code,
                         )
                         documents.append({
+                            "label": item["label"],
                             "alias": item["alias"],
                             "status": "unavailable",
                             "error_code": code,
                         })
                     else:
                         documents.append({
+                            "label": item["label"],
                             "alias": item["alias"],
                             "status": "ok",
                             **opened,
