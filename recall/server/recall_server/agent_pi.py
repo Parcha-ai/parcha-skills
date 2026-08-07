@@ -156,10 +156,6 @@ def _model_tool_error_message(error: AgentExecutionError) -> str:
             "Copy the request's exact filters and depth; do not widen or "
             "change them."
         ),
-        "agent_tool_deadline_exhausted": (
-            "There is not enough turn time for another exec. Finish now using "
-            "evidence already returned, or report the precise evidence gap."
-        ),
     }
     return guidance.get(
         error.code,
@@ -173,7 +169,8 @@ class PiTransport(Protocol):
         start: dict[str, Any],
         invoke: Callable[[str, dict[str, Any]], dict[str, Any]],
         *,
-        timeout_seconds: float,
+        timeout_seconds: float | None,
+        cancelled: Callable[[], bool],
     ) -> dict[str, Any]: ...
 
 
@@ -399,7 +396,8 @@ class SubprocessPiTransport:
         process: subprocess.Popen[bytes],
         frame: dict[str, Any],
         *,
-        deadline: float,
+        deadline: float | None,
+        cancelled: Callable[[], bool],
     ) -> None:
         if process.stdin is None:
             raise AgentExecutionError(
@@ -420,18 +418,21 @@ class SubprocessPiTransport:
         descriptor = process.stdin.fileno()
         offset = 0
         while offset < len(payload):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            if cancelled():
+                raise AgentExecutionError(
+                    "Pi turn was cancelled",
+                    code="agent_cancelled_by_caller",
+                )
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
                 raise AgentExecutionError(
                     "Pi turn timed out",
                     code="agent_model_timeout",
                 )
-            _, ready, _ = select.select([], [descriptor], [], remaining)
+            wait = 0.25 if remaining is None else min(remaining, 0.25)
+            _, ready, _ = select.select([], [descriptor], [], wait)
             if not ready:
-                raise AgentExecutionError(
-                    "Pi turn timed out",
-                    code="agent_model_timeout",
-                )
+                continue
             try:
                 written = os.write(descriptor, payload[offset:offset + 65_536])
             except BlockingIOError:
@@ -453,7 +454,8 @@ class SubprocessPiTransport:
         process: subprocess.Popen[bytes],
         buffer: bytearray,
         *,
-        deadline: float,
+        deadline: float | None,
+        cancelled: Callable[[], bool],
     ) -> bytes:
         if process.stdout is None:
             raise AgentExecutionError(
@@ -477,18 +479,21 @@ class SubprocessPiTransport:
                     "Pi output frame is invalid",
                     code="agent_transport_frame_invalid",
                 )
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            if cancelled():
+                raise AgentExecutionError(
+                    "Pi turn was cancelled",
+                    code="agent_cancelled_by_caller",
+                )
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
                 raise AgentExecutionError(
                     "Pi turn timed out",
                     code="agent_model_timeout",
                 )
-            ready, _, _ = select.select([descriptor], [], [], remaining)
+            wait = 0.25 if remaining is None else min(remaining, 0.25)
+            ready, _, _ = select.select([descriptor], [], [], wait)
             if not ready:
-                raise AgentExecutionError(
-                    "Pi turn timed out",
-                    code="agent_model_timeout",
-                )
+                continue
             try:
                 chunk = os.read(
                     descriptor,
@@ -518,7 +523,8 @@ class SubprocessPiTransport:
         start: dict[str, Any],
         invoke: Callable[[str, dict[str, Any]], dict[str, Any]],
         *,
-        timeout_seconds: float,
+        timeout_seconds: float | None,
+        cancelled: Callable[[], bool] = lambda: False,
     ) -> dict[str, Any]:
         turn_id = start["turn_id"]
         api_key = (
@@ -553,7 +559,11 @@ class SubprocessPiTransport:
             ) from error
         input_sequence = 0
         output_sequence = 0
-        deadline = time.monotonic() + timeout_seconds
+        deadline = (
+            None
+            if timeout_seconds is None
+            else time.monotonic() + timeout_seconds
+        )
         turn_started = time.monotonic()
         terminal: dict[str, Any] | None = None
         usage: dict[str, Any] | None = None
@@ -575,10 +585,15 @@ class SubprocessPiTransport:
                 "type": "turn.start",
                 "at": datetime.now(timezone.utc).isoformat(),
                 "data": start["data"],
-            }, deadline=deadline)
+            }, deadline=deadline, cancelled=cancelled)
             input_sequence += 1
             while terminal is None:
-                line = self._read(process, output_buffer, deadline=deadline)
+                line = self._read(
+                    process,
+                    output_buffer,
+                    deadline=deadline,
+                    cancelled=cancelled,
+                )
                 try:
                     frame = json.loads(line)
                 except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -636,7 +651,7 @@ class SubprocessPiTransport:
                     tool_invocations += 1
                     try:
                         value = invoke(data["name"], data["arguments"])
-                        if time.monotonic() > deadline:
+                        if deadline is not None and time.monotonic() > deadline:
                             raise AgentExecutionError(
                                 "Pi turn timed out",
                                 code="agent_model_timeout",
@@ -686,7 +701,7 @@ class SubprocessPiTransport:
                         "type": "tool.result",
                         "at": datetime.now(timezone.utc).isoformat(),
                         "data": result,
-                    }, deadline=deadline)
+                    }, deadline=deadline, cancelled=cancelled)
                     input_sequence += 1
                     continue
                 if frame_type in TERMINAL_TYPES:
@@ -1262,6 +1277,7 @@ class PiRunner:
 
         def invoke(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             nonlocal finished, sealed, fatal_violation, finish_attempts
+            tools.check_cancelled()
             if sealed:
                 fatal_violation = AgentExecutionError(
                     "agent invoked a tool after finishing",
@@ -1269,6 +1285,7 @@ class PiRunner:
                 )
                 raise fatal_violation
             if name == "finish":
+                tools.report_progress("synthesizing")
                 finish_attempts += 1
                 if finish_attempts > 4:
                     fatal_violation = AgentExecutionError(
@@ -1338,12 +1355,10 @@ class PiRunner:
             request_constraints["allowed_source_families"] = request[
                 "source_families"
             ]
-        elapsed_before_model = max(0.0, monotonic() - started)
-        remaining_seconds = max(
-            1.0,
-            context.budget.deadline_seconds - elapsed_before_model,
-        )
-        timeout_ms = int(remaining_seconds * 1000)
+        tool_timeout_ms = max(
+            context.budget.max_find_seconds,
+            context.budget.max_exec_seconds,
+        ) * 1000
         system = (
             "You are Recall's evidence investigator. Use search as fallible "
             "pointer hints, then inspect complete admitted documents with find, "
@@ -1416,7 +1431,7 @@ class PiRunner:
                 ],
                 "capabilities": ["recall:evidence:read"],
                 "tools": _tool_definitions(
-                    timeout_ms,
+                    tool_timeout_ms,
                     request,
                     context.allowed_tools,
                 ),
@@ -1426,8 +1441,7 @@ class PiRunner:
                     "tool_choice": "required",
                 },
                 "limits": {
-                    "turn_timeout_ms": timeout_ms,
-                    "tool_timeout_ms": min(timeout_ms, 30_000),
+                    "tool_timeout_ms": tool_timeout_ms,
                     "max_frame_bytes": 1_000_000,
                 },
             },
@@ -1436,7 +1450,8 @@ class PiRunner:
             self.transport.run(
                 start,
                 invoke,
-                timeout_seconds=remaining_seconds,
+                timeout_seconds=None,
+                cancelled=tools.cancel_requested,
             )
         except AgentExecutionError as error:
             reason_code = getattr(error, "terminal_reason_code", None)

@@ -5,9 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Protocol
@@ -145,6 +145,31 @@ class AgentRunBackend(Protocol):
         now: datetime,
     ) -> dict[str, Any]: ...
 
+    def progress(
+        self,
+        context: DelegationContext,
+        run_id: str,
+        *,
+        lease_owner: str,
+        status_message: str,
+        now: datetime,
+    ) -> bool: ...
+
+    def heartbeat(
+        self,
+        context: DelegationContext,
+        run_id: str,
+        *,
+        lease_owner: str,
+        now: datetime,
+    ) -> bool: ...
+
+    def cancel_requested(
+        self,
+        context: DelegationContext,
+        run_id: str,
+    ) -> bool: ...
+
     def recover_abandoned(self, *, before: datetime, now: datetime) -> int: ...
 
     def prune(self, *, before: datetime) -> int: ...
@@ -192,6 +217,15 @@ class PostgresAgentRunBackend:
             "attempt": row["attempt"],
             "created_at": _timestamp(row["created_at"]),
             "updated_at": _timestamp(row["updated_at"]),
+            "status_message": row.get("status_message") or {
+                "queued": "queued",
+                "running": "planning",
+                "complete": "completed",
+                "partial": "completed",
+                "no_answer": "completed",
+                "failed": "failed",
+                "cancelled": "cancelled",
+            }[row["status"]],
         }
         if row.get("completed_at") is not None:
             value["completed_at"] = _timestamp(row["completed_at"])
@@ -218,7 +252,7 @@ class PostgresAgentRunBackend:
         query = (
             """SELECT tenant_id,run_id,task_id,request_id,principal_id,trace_id,
                       request_sha256,source_ids,status,attempt,cancel_requested,
-                      lease_owner,lease_expires_at,error_code,trace_events,result,
+                      lease_owner,lease_expires_at,error_code,status_message,trace_events,result,
                       created_at,updated_at,started_at,completed_at
                  FROM agent_runs
                 WHERE tenant_id=%s AND run_id=%s
@@ -227,7 +261,7 @@ class PostgresAgentRunBackend:
             else
             """SELECT tenant_id,run_id,task_id,request_id,principal_id,trace_id,
                       request_sha256,source_ids,status,attempt,cancel_requested,
-                      lease_owner,lease_expires_at,error_code,trace_events,result,
+                      lease_owner,lease_expires_at,error_code,status_message,trace_events,result,
                       created_at,updated_at,started_at,completed_at
                  FROM agent_runs
                 WHERE tenant_id=%s AND run_id=%s"""
@@ -258,7 +292,7 @@ class PostgresAgentRunBackend:
             existing = connection.execute(
                 """SELECT tenant_id,run_id,task_id,request_id,principal_id,trace_id,
                           request_sha256,source_ids,status,attempt,cancel_requested,
-                          lease_owner,lease_expires_at,error_code,trace_events,result,
+                          lease_owner,lease_expires_at,error_code,status_message,trace_events,result,
                           created_at,updated_at,started_at,completed_at
                      FROM agent_runs
                     WHERE tenant_id=%s AND run_id=%s
@@ -291,7 +325,7 @@ class PostgresAgentRunBackend:
                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'queued',%s,%s)
                    RETURNING tenant_id,run_id,task_id,request_id,principal_id,trace_id,
                              request_sha256,source_ids,status,attempt,cancel_requested,
-                             lease_owner,lease_expires_at,error_code,trace_events,result,
+                             lease_owner,lease_expires_at,error_code,status_message,trace_events,result,
                              created_at,updated_at,started_at,completed_at""",
                 (
                     context.tenant_id,
@@ -323,11 +357,12 @@ class PostgresAgentRunBackend:
             row = connection.execute(
                 """UPDATE agent_runs
                       SET status='running',lease_owner=%s,lease_expires_at=%s,
-                          started_at=COALESCE(started_at,%s),updated_at=%s
+                          started_at=COALESCE(started_at,%s),updated_at=%s,
+                          status_message='planning'
                     WHERE tenant_id=%s AND run_id=%s AND status='queued'
                 RETURNING tenant_id,run_id,task_id,request_id,principal_id,trace_id,
                           request_sha256,source_ids,status,attempt,cancel_requested,
-                          lease_owner,lease_expires_at,error_code,trace_events,result,
+                          lease_owner,lease_expires_at,error_code,status_message,trace_events,result,
                           created_at,updated_at,started_at,completed_at""",
                 (
                     lease_owner,
@@ -367,11 +402,12 @@ class PostgresAgentRunBackend:
                 """UPDATE agent_runs
                       SET status=%s,lease_owner=NULL,lease_expires_at=NULL,
                           trace_events=%s::jsonb,result=%s::jsonb,
+                          status_message='completed',
                           updated_at=%s,completed_at=%s
                     WHERE tenant_id=%s AND run_id=%s
                 RETURNING tenant_id,run_id,task_id,request_id,principal_id,trace_id,
                           request_sha256,source_ids,status,attempt,cancel_requested,
-                          lease_owner,lease_expires_at,error_code,trace_events,result,
+                          lease_owner,lease_expires_at,error_code,status_message,trace_events,result,
                           created_at,updated_at,started_at,completed_at""",
                 (
                     status,
@@ -407,11 +443,12 @@ class PostgresAgentRunBackend:
                 """UPDATE agent_runs
                       SET status='failed',lease_owner=NULL,lease_expires_at=NULL,
                           error_code=%s,trace_events=%s::jsonb,
+                          status_message='failed',
                           updated_at=%s,completed_at=%s
                     WHERE tenant_id=%s AND run_id=%s
                 RETURNING tenant_id,run_id,task_id,request_id,principal_id,trace_id,
                           request_sha256,source_ids,status,attempt,cancel_requested,
-                          lease_owner,lease_expires_at,error_code,trace_events,result,
+                          lease_owner,lease_expires_at,error_code,status_message,trace_events,result,
                           created_at,updated_at,started_at,completed_at""",
                 (
                     error_code,
@@ -470,16 +507,90 @@ class PostgresAgentRunBackend:
                 """UPDATE agent_runs
                       SET status='cancelled',cancel_requested=true,
                           lease_owner=NULL,lease_expires_at=NULL,
-                          error_code='cancelled_by_caller',
+                          error_code='cancelled_by_caller',status_message='cancelled',
                           updated_at=%s,completed_at=%s
                     WHERE tenant_id=%s AND run_id=%s
                 RETURNING tenant_id,run_id,task_id,request_id,principal_id,trace_id,
                           request_sha256,source_ids,status,attempt,cancel_requested,
-                          lease_owner,lease_expires_at,error_code,trace_events,result,
+                          lease_owner,lease_expires_at,error_code,status_message,trace_events,result,
                           created_at,updated_at,started_at,completed_at""",
                 (now, now, context.tenant_id, run_id),
             ).fetchone()
         return self._row_run(row)
+
+    def progress(
+        self,
+        context: DelegationContext,
+        run_id: str,
+        *,
+        lease_owner: str,
+        status_message: str,
+        now: datetime,
+    ) -> bool:
+        if status_message not in {
+            "planning", "searching", "inspecting", "synthesizing", "verifying"
+        }:
+            raise AgentRunStateError("agent progress state is invalid")
+        with self.connect() as connection:
+            result = connection.execute(
+                """UPDATE agent_runs
+                      SET status_message=%s,updated_at=%s,
+                          lease_expires_at=%s
+                    WHERE tenant_id=%s AND run_id=%s AND status='running'
+                      AND lease_owner=%s AND cancel_requested=false""",
+                (
+                    status_message,
+                    now,
+                    now + timedelta(seconds=self.lease_seconds),
+                    context.tenant_id,
+                    run_id,
+                    lease_owner,
+                ),
+            )
+            return result.rowcount == 1
+
+    def heartbeat(
+        self,
+        context: DelegationContext,
+        run_id: str,
+        *,
+        lease_owner: str,
+        now: datetime,
+    ) -> bool:
+        with self.connect() as connection:
+            result = connection.execute(
+                """UPDATE agent_runs
+                      SET updated_at=%s,lease_expires_at=%s
+                    WHERE tenant_id=%s AND run_id=%s AND status='running'
+                      AND lease_owner=%s AND cancel_requested=false""",
+                (
+                    now,
+                    now + timedelta(seconds=self.lease_seconds),
+                    context.tenant_id,
+                    run_id,
+                    lease_owner,
+                ),
+            )
+            return result.rowcount == 1
+
+    def cancel_requested(
+        self,
+        context: DelegationContext,
+        run_id: str,
+    ) -> bool:
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT principal_id,source_ids,status,cancel_requested
+                     FROM agent_runs
+                    WHERE tenant_id=%s AND run_id=%s""",
+                (context.tenant_id, run_id),
+            ).fetchone()
+        if row is None or not self._visible(
+            {"tenant_id": context.tenant_id, **row},
+            context,
+        ):
+            raise AgentRunNotFound("agent run not found")
+        return bool(row["cancel_requested"] or row["status"] == "cancelled")
 
     def recover_abandoned(self, *, before: datetime, now: datetime) -> int:
         with self.connect() as connection:
@@ -487,6 +598,7 @@ class PostgresAgentRunBackend:
                 """UPDATE agent_runs
                       SET status='failed',lease_owner=NULL,lease_expires_at=NULL,
                           error_code='worker_lost_retryable',
+                          status_message='failed',
                           updated_at=%s,completed_at=%s
                     WHERE (
                         status='queued' AND created_at < %s
@@ -536,15 +648,12 @@ class AgentRunCoordinator:
         clock: Callable[[], datetime] | None = None,
         workers: int = 4,
         abandon_after_seconds: int = 120,
-        sync_wait_seconds: float = 45.0,
         executor: Any | None = None,
     ):
         if not 1 <= workers <= 16:
             raise ValueError("agent worker bound is invalid")
         if not 15 <= abandon_after_seconds <= 600:
             raise ValueError("agent abandonment bound is invalid")
-        if not 0.01 <= sync_wait_seconds <= 55:
-            raise ValueError("agent synchronous wait bound is invalid")
         self.service = service
         self.backend = backend
         self.clock = clock or (lambda: datetime.now(timezone.utc))
@@ -552,7 +661,10 @@ class AgentRunCoordinator:
             getattr(backend, "retention_seconds", 7 * 24 * 60 * 60)
         ) * 1000
         self.abandon_after_seconds = abandon_after_seconds
-        self.sync_wait_seconds = sync_wait_seconds
+        self.heartbeat_seconds = min(
+            30.0,
+            max(5.0, float(getattr(backend, "lease_seconds", 600)) / 3),
+        )
         self.lease_owner = f"agent-worker-{uuid.uuid4().hex}"
         self._executor = executor or ThreadPoolExecutor(
             max_workers=workers,
@@ -561,6 +673,7 @@ class AgentRunCoordinator:
         self._owns_executor = executor is None
         self._lock = threading.Lock()
         self._futures: set[Any] = set()
+        self._cancel_events: dict[str, threading.Event] = {}
 
     def recover(self) -> int:
         now = self.clock()
@@ -570,6 +683,10 @@ class AgentRunCoordinator:
         )
 
     def close(self) -> None:
+        with self._lock:
+            events = tuple(self._cancel_events.values())
+        for event in events:
+            event.set()
         if self._owns_executor:
             self._executor.shutdown(wait=False, cancel_futures=True)
 
@@ -604,36 +721,19 @@ class AgentRunCoordinator:
         request: Any,
         retrieval: Any,
     ) -> dict[str, Any]:
-        query, context = self.service.prepare(principal, request)
-        created = self.backend.create(context, query, now=self.clock())
-        run_id = created.run["run_id"]
-        if created.created:
-            future = self._submit(context, query, retrieval, run_id)
-            try:
-                future.result(timeout=self.sync_wait_seconds)
-            except FutureTimeoutError:
-                current = self.backend.get(
-                    context,
-                    run_id,
-                    now=self.clock(),
-                )
-                if current["status"] in SUCCESS_STATUSES:
-                    return self.backend.result(
-                        context,
-                        run_id,
-                        now=self.clock(),
-                    )
-                return {
-                    "run": current,
-                    "task_id": created.task_id,
-                    "ttl_ms": self.ttl_ms,
-                    "continuation": {
-                        "tool": "recall_agent_result",
-                        "arguments": {"run_id": run_id},
-                        "poll_after_ms": 1000,
-                    },
-                }
-        return self.backend.result(context, run_id, now=self.clock())
+        started = self.start(principal, request, retrieval)
+        run_id = started["run"]["run_id"]
+        if started["run"]["status"] in SUCCESS_STATUSES:
+            context = DelegationContext.from_principal(principal)
+            return self.backend.result(context, run_id, now=self.clock())
+        return {
+            **started,
+            "continuation": {
+                "tool": "recall_agent_result",
+                "arguments": {"run_id": run_id},
+                "poll_after_ms": 1000,
+            },
+        }
 
     def _submit(
         self,
@@ -667,8 +767,85 @@ class AgentRunCoordinator:
         )
         if claimed is None:
             return
+        cancelled = threading.Event()
+        with self._lock:
+            self._cancel_events[run_id] = cancelled
+        heartbeat_stop = threading.Event()
+
+        def heartbeat() -> None:
+            consecutive_failures = 0
+            while not heartbeat_stop.wait(self.heartbeat_seconds):
+                try:
+                    if not self.backend.heartbeat(
+                        context,
+                        run_id,
+                        lease_owner=self.lease_owner,
+                        now=self.clock(),
+                    ):
+                        cancelled.set()
+                        return
+                    consecutive_failures = 0
+                except Exception:
+                    consecutive_failures += 1
+                    if consecutive_failures >= 3:
+                        # Stop work before an expired lease can be claimed by a
+                        # second worker. The durable backend remains authoritative.
+                        cancelled.set()
+                        return
+
+        heartbeat_thread = threading.Thread(
+            target=heartbeat,
+            name=f"recall-agent-heartbeat-{run_id[-8:]}",
+            daemon=True,
+        )
+        heartbeat_thread.start()
+        last_cancel_check = 0.0
+
+        def cancel_requested() -> bool:
+            nonlocal last_cancel_check
+            if cancelled.is_set():
+                return True
+            now = time.monotonic()
+            if now - last_cancel_check < 1.0:
+                return False
+            last_cancel_check = now
+            try:
+                checker = getattr(self.backend, "cancel_requested", None)
+                if checker is not None and checker(context, run_id):
+                    cancelled.set()
+            except AgentRunNotFound:
+                cancelled.set()
+            return cancelled.is_set()
+
+        def progress(status_message: str) -> None:
+            if cancel_requested():
+                raise AgentExecutionError(
+                    "agent run was cancelled",
+                    code="agent_cancelled_by_caller",
+                )
+            reporter = getattr(self.backend, "progress", None)
+            if reporter is None:
+                return
+            if not reporter(
+                context,
+                run_id,
+                lease_owner=self.lease_owner,
+                status_message=status_message,
+                now=self.clock(),
+            ):
+                cancelled.set()
+                raise AgentExecutionError(
+                    "agent run was cancelled",
+                    code="agent_cancelled_by_caller",
+                )
         try:
-            bundle = self.service.execute(request, context, retrieval)
+            bundle = self.service.execute(
+                request,
+                context,
+                retrieval,
+                cancel_requested=cancel_requested,
+                progress=progress,
+            )
             created_at = claimed["created_at"]
             now = self.clock()
             bundle["run"]["created_at"] = created_at
@@ -705,6 +882,11 @@ class AgentRunCoordinator:
                 )
             except AgentRunStateError:
                 pass
+        finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=1)
+            with self._lock:
+                self._cancel_events.pop(run_id, None)
 
     def status(self, principal: dict[str, Any], run_id: str) -> dict[str, Any]:
         context = DelegationContext.from_principal(principal)
@@ -716,9 +898,12 @@ class AgentRunCoordinator:
 
     def cancel(self, principal: dict[str, Any], run_id: str) -> dict[str, Any]:
         context = DelegationContext.from_principal(principal)
-        return {
-            "run": self.backend.cancel(context, run_id, now=self.clock()),
-        }
+        value = self.backend.cancel(context, run_id, now=self.clock())
+        with self._lock:
+            event = self._cancel_events.get(run_id)
+        if event is not None:
+            event.set()
+        return {"run": value}
 
     def task_status(self, principal: dict[str, Any], task_id: str) -> dict[str, Any]:
         context = DelegationContext.from_principal(principal)
@@ -734,8 +919,9 @@ class AgentRunCoordinator:
     def task_cancel(self, principal: dict[str, Any], task_id: str) -> dict[str, Any]:
         context = DelegationContext.from_principal(principal)
         run_id = self.backend.resolve_task(context, task_id)
+        value = self.cancel(principal, run_id)["run"]
         return {
-            "run": self.backend.cancel(context, run_id, now=self.clock()),
+            "run": value,
             "task_id": task_id,
             "ttl_ms": self.ttl_ms,
         }

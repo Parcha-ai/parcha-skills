@@ -203,7 +203,7 @@ def _run(value: dict[str, Any]) -> None:
             "created_at",
             "updated_at",
         },
-        optional={"completed_at", "error_code"},
+        optional={"completed_at", "error_code", "status_message"},
     )
     _opaque(value["run_id"], "run")
     _opaque(value["request_id"], "req")
@@ -225,6 +225,21 @@ def _run(value: dict[str, Any]) -> None:
     _integer(value["attempt"], minimum=1, maximum=100)
     _timestamp(value["created_at"])
     _timestamp(value["updated_at"])
+    if "status_message" in value:
+        _enum(
+            value["status_message"],
+            {
+                "queued",
+                "planning",
+                "searching",
+                "inspecting",
+                "synthesizing",
+                "verifying",
+                "completed",
+                "failed",
+                "cancelled",
+            },
+        )
     if "completed_at" in value:
         _timestamp(value["completed_at"])
         if status not in {"complete", "partial", "no_answer", "failed", "cancelled"}:

@@ -30,7 +30,7 @@ class ScriptedAgentRunner:
             }))
         opened = tools.call("recall.exec", {
             "program": "find /mnt/archil/evidence -type f -print0 | xargs -0 rg -n --fixed-strings ''",
-            "timeout_seconds": min(30, context.budget.deadline_seconds),
+            "timeout_seconds": context.budget.max_exec_seconds,
         }) if any(packet.get("results") for packet in packets) else {}
         receipts = list(dict.fromkeys(_receipts(opened)))[:context.budget.max_receipts]
         if any(urlsplit(receipt).netloc not in set(context.authorized_sources) for receipt in receipts):

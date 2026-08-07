@@ -1,24 +1,34 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
 from .authorization import allowed_tools, decide
 
-LATEST_PROTOCOL_VERSION = "2026-06-30"
+LATEST_PROTOCOL_VERSION = "2026-07-28"
+LATEST_LEGACY_PROTOCOL_VERSION = "2026-06-30"
 SUPPORTED_PROTOCOL_VERSIONS = frozenset(
-    {"2025-03-26", "2025-06-18", "2025-11-25", LATEST_PROTOCOL_VERSION}
+    {
+        "2025-03-26",
+        "2025-06-18",
+        "2025-11-25",
+        LATEST_LEGACY_PROTOCOL_VERSION,
+        LATEST_PROTOCOL_VERSION,
+    }
 )
 REQUEST_METHODS = (
     "initialize",
+    "server/discover",
     "ping",
     "tools/list",
     "tools/call",
     "tasks/get",
     "tasks/update",
     "tasks/cancel",
+    "subscriptions/listen",
 )
 NOTIFICATION_METHODS = ("notifications/initialized",)
 MAX_MCP_RESPONSE_BYTES = 1024 * 1024
@@ -34,6 +44,7 @@ TIME_BOUND_SCHEMA = {
 class McpProtocolError(Exception):
     code: int
     message: str
+    data: dict[str, Any] | None = None
 
 
 def _object(value: Any, name: str) -> dict:
@@ -100,8 +111,9 @@ ALL_READ_TOOLS = (
         "description": (
             "Ask the authenticated Recall brain one natural-language question. "
             "Recall owns investigation, grounding, citations, and the redacted trace. "
-            "Legacy synchronous clients receive a durable run handle with run_id "
-            "and trace_id when work continues beyond the bounded compatibility wait."
+            "Long investigations start asynchronously: MCP Tasks clients receive a "
+            "native task, and compatibility clients receive a durable run handle with "
+            "run_id and trace_id for status, result, or cancellation calls."
         ),
         "inputSchema": {
             "type": "object",
@@ -846,7 +858,10 @@ def bound_response(response: dict, request_id: Any) -> dict:
 
 
 def _tasks_extension_enabled(params: dict, protocol_version: str) -> bool:
-    if protocol_version != "2026-06-30":
+    if protocol_version not in {
+        LATEST_LEGACY_PROTOCOL_VERSION,
+        LATEST_PROTOCOL_VERSION,
+    }:
         return False
     metadata = params.get("_meta")
     if not isinstance(metadata, dict):
@@ -859,6 +874,69 @@ def _tasks_extension_enabled(params: dict, protocol_version: str) -> bool:
         isinstance(extensions, dict)
         and isinstance(extensions.get("io.modelcontextprotocol/tasks"), dict)
     )
+
+
+def _validate_modern_metadata(params: dict, protocol_version: str) -> None:
+    if protocol_version != LATEST_PROTOCOL_VERSION:
+        return
+    metadata = params.get("_meta")
+    if not isinstance(metadata, dict):
+        raise McpProtocolError(-32602, "modern MCP request metadata is required")
+    if metadata.get("io.modelcontextprotocol/protocolVersion") != protocol_version:
+        raise McpProtocolError(-32020, "MCP protocol metadata does not match header")
+    client = metadata.get("io.modelcontextprotocol/clientInfo")
+    capabilities = metadata.get("io.modelcontextprotocol/clientCapabilities")
+    if (
+        not isinstance(client, dict)
+        or not isinstance(client.get("name"), str)
+        or not client["name"]
+        or not isinstance(client.get("version"), str)
+        or not client["version"]
+        or not isinstance(capabilities, dict)
+    ):
+        raise McpProtocolError(-32602, "modern MCP client metadata is invalid")
+
+
+def task_subscription(
+    message: Any,
+    *,
+    protocol_version: str,
+) -> tuple[Any, tuple[str, ...]] | None:
+    request = _object(message, "request")
+    if request.get("method") != "subscriptions/listen":
+        return None
+    if protocol_version != LATEST_PROTOCOL_VERSION:
+        raise McpProtocolError(-32601, "method not found")
+    if request.get("jsonrpc") != "2.0" or "id" not in request:
+        raise McpProtocolError(-32600, "invalid subscription request")
+    params = _object(request.get("params", {}), "params")
+    _validate_modern_metadata(params, protocol_version)
+    if not _tasks_extension_enabled(params, protocol_version):
+        raise McpProtocolError(
+            -32003,
+            "missing Tasks client capability",
+            {
+                "requiredCapabilities": {
+                    "extensions": {"io.modelcontextprotocol/tasks": {}}
+                }
+            },
+        )
+    notifications = _object(params.get("notifications"), "notifications")
+    if set(notifications) != {"taskIds"}:
+        raise McpProtocolError(-32602, "only task subscriptions are supported")
+    raw_ids = notifications["taskIds"]
+    if (
+        not isinstance(raw_ids, list)
+        or not 1 <= len(raw_ids) <= 32
+        or any(
+            not isinstance(task_id, str)
+            or re.fullmatch(r"tsk_[0-9a-f]{32}", task_id) is None
+            for task_id in raw_ids
+        )
+        or len(raw_ids) != len(set(raw_ids))
+    ):
+        raise McpProtocolError(-32602, "task subscription identifiers are invalid")
+    return request["id"], tuple(raw_ids)
 
 
 def _task_result(
@@ -887,6 +965,17 @@ def _task_result(
         "ttlMs": ttl_ms,
         "pollIntervalMs": 1000,
     }
+    value["statusMessage"] = {
+        "queued": "Queued",
+        "planning": "Planning the investigation",
+        "searching": "Searching candidate evidence",
+        "inspecting": "Inspecting full evidence",
+        "synthesizing": "Synthesizing the answer",
+        "verifying": "Verifying citations",
+        "completed": "Completed",
+        "failed": "Failed",
+        "cancelled": "Cancelled",
+    }.get(run.get("status_message"), "Working")
     if status == "completed" and result is not None:
         value["result"] = _tool_result(result)
     elif status == "failed":
@@ -895,6 +984,32 @@ def _task_result(
             "message": run.get("error_code", "agent run failed"),
         }
     return value
+
+
+def task_notification(
+    state: dict,
+    task_id: str,
+    *,
+    subscription_id: Any,
+    result: dict | None = None,
+    ttl_ms: int = 604_800_000,
+) -> dict:
+    params = _task_result(
+        state,
+        task_id,
+        creation=False,
+        result=result,
+        ttl_ms=ttl_ms,
+    )
+    params.pop("resultType", None)
+    params["_meta"] = {
+        "io.modelcontextprotocol/subscriptionId": subscription_id,
+    }
+    return {
+        "jsonrpc": "2.0",
+        "method": "notifications/tasks",
+        "params": params,
+    }
 
 
 def dispatch(
@@ -914,6 +1029,8 @@ def dispatch(
         raise McpProtocolError(-32600, "invalid JSON-RPC version")
     method = _string(request.get("method"), "method")
     params = _object(request.get("params", {}), "params")
+    if method not in {"initialize", "notifications/initialized"}:
+        _validate_modern_metadata(params, protocol_version)
 
     def require_action(action: str, *, hide: bool = False) -> None:
         if principal.get("credential_kind") != "mcp":
@@ -934,13 +1051,41 @@ def dispatch(
             return None
         raise McpProtocolError(-32600, "unsupported notification")
 
-    if method == "initialize":
+    if method == "server/discover":
+        if protocol_version != LATEST_PROTOCOL_VERSION:
+            raise McpProtocolError(-32601, "method not found")
+        require_action("mcp.initialize")
+        result = {
+            "resultType": "complete",
+            "supportedVersions": [LATEST_PROTOCOL_VERSION],
+            "capabilities": {
+                "tools": {"listChanged": False},
+                **(
+                    {"extensions": {"io.modelcontextprotocol/tasks": {}}}
+                    if agent_lifecycle is not None
+                    else {}
+                ),
+            },
+            "_meta": {
+                "io.modelcontextprotocol/serverInfo": {
+                    "name": "recall",
+                    "version": "1",
+                },
+            },
+            "instructions": "Private, tenant- and source-scoped evidence retrieval.",
+            "ttlMs": 300_000,
+            "cacheScope": "private",
+        }
+    elif method == "initialize":
+        if protocol_version == LATEST_PROTOCOL_VERSION:
+            raise McpProtocolError(-32601, "method not found")
         require_action("mcp.initialize")
         requested = params.get("protocolVersion")
         selected = (
             requested
             if requested in SUPPORTED_PROTOCOL_VERSIONS
-            else LATEST_PROTOCOL_VERSION
+            and requested != LATEST_PROTOCOL_VERSION
+            else LATEST_LEGACY_PROTOCOL_VERSION
         )
         result = {
             "protocolVersion": selected,
@@ -951,16 +1096,24 @@ def dispatch(
                 "description": "Private, tenant- and source-scoped evidence retrieval.",
             },
         }
-        if selected == "2026-06-30" and agent_lifecycle is not None:
+        if selected == LATEST_LEGACY_PROTOCOL_VERSION and agent_lifecycle is not None:
             result["capabilities"]["extensions"] = {
                 "io.modelcontextprotocol/tasks": {},
             }
     elif method == "ping":
+        if protocol_version == LATEST_PROTOCOL_VERSION:
+            raise McpProtocolError(-32601, "method not found")
         require_action("mcp.ping")
         result = {}
     elif method == "tools/list":
         require_action("mcp.tools.list")
         result = {"tools": list(_tools_for(principal))}
+        if protocol_version == LATEST_PROTOCOL_VERSION:
+            result.update({
+                "resultType": "complete",
+                "ttlMs": 300_000,
+                "cacheScope": "private",
+            })
     elif method == "tools/call":
         name = _string(params.get("name"), "name")
         if name not in {tool["name"] for tool in _tools_for(principal)}:
@@ -996,11 +1149,20 @@ def dispatch(
                     agent_lifecycle=agent_lifecycle,
                 )
             )
+            if protocol_version == LATEST_PROTOCOL_VERSION:
+                result["resultType"] = "complete"
     elif method in {"tasks/get", "tasks/update", "tasks/cancel"}:
-        if protocol_version != "2026-06-30" or agent_lifecycle is None:
+        if protocol_version not in {
+            LATEST_LEGACY_PROTOCOL_VERSION,
+            LATEST_PROTOCOL_VERSION,
+        } or agent_lifecycle is None:
             raise McpProtocolError(-32601, "method not found")
         task_id = _string(params.get("taskId"), "taskId")
         expected_params = (
+            {"taskId", "inputResponses", "_meta"}
+            if method == "tasks/update"
+            else {"taskId", "_meta"}
+        ) if protocol_version == LATEST_PROTOCOL_VERSION else (
             {"taskId", "inputResponses"}
             if method == "tasks/update"
             else {"taskId"}
@@ -1039,8 +1201,11 @@ def dispatch(
 
 
 def error_response(error: McpProtocolError, request_id: Any = None) -> dict:
-    return {
+    value = {
         "jsonrpc": "2.0",
         "id": request_id,
         "error": {"code": error.code, "message": error.message},
     }
+    if error.data is not None:
+        value["error"]["data"] = error.data
+    return value

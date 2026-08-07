@@ -58,7 +58,6 @@ class AgentBudget:
     max_receipts: int = 256
     max_tool_output_bytes: int = 2_000_000
     max_trace_events: int = 64
-    deadline_seconds: int = 120
 
 
 @dataclass(frozen=True)
@@ -146,13 +145,14 @@ class ConstrainedAgentTools:
         context: DelegationContext,
         *,
         monotonic: Callable[[], float] | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+        progress: Callable[[str], None] | None = None,
     ):
         self._retrieval = retrieval
         self._context = context
         self._monotonic = monotonic or time.monotonic
-        self._deadline_at = (
-            self._monotonic() + context.budget.deadline_seconds
-        )
+        self._cancel_requested = cancel_requested or (lambda: False)
+        self._progress = progress or (lambda _phase: None)
         self._calls = 0
         self._calls_by_tool: dict[str, int] = {}
         self._opened_receipts: list[str] = []
@@ -189,7 +189,22 @@ class ConstrainedAgentTools:
             for name in self.TOOL_NAMES
         )
 
+    def check_cancelled(self) -> None:
+        if self.cancel_requested():
+            raise AgentExecutionError(
+                "agent run was cancelled",
+                code="agent_cancelled_by_caller",
+            )
+
+    def cancel_requested(self) -> bool:
+        return bool(self._cancel_requested())
+
+    def report_progress(self, phase: str) -> None:
+        self.check_cancelled()
+        self._progress(phase)
+
     def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.check_cancelled()
         if name not in self._context.allowed_tools:
             raise AgentExecutionError("agent tool is not authorized")
         if self._calls >= self._context.budget.max_tool_calls:
@@ -197,6 +212,12 @@ class ConstrainedAgentTools:
         if not isinstance(arguments, dict):
             raise AgentExecutionError("agent tool arguments are invalid")
         self._calls += 1
+        self.report_progress({
+            "recall.hints": "searching",
+            "recall.find": "inspecting",
+            "recall.open": "inspecting",
+            "recall.exec": "inspecting",
+        }.get(name, "working"))
         started_at = self._monotonic()
         try:
             tool_calls = self._calls_by_tool.get(name, 0)
@@ -378,13 +399,6 @@ class ConstrainedAgentTools:
                         "agent find arguments are invalid",
                         code="agent_find_invalid",
                     )
-                remaining = self._deadline_at - self._monotonic()
-                executable_seconds = int(remaining) - 6
-                if executable_seconds < 1:
-                    raise AgentExecutionError(
-                        "agent turn has no time remaining for evidence search",
-                        code="agent_tool_deadline_exhausted",
-                    )
                 document_ids = tuple(
                     self._document_ids_by_alias[alias]
                     for alias in aliases
@@ -413,10 +427,7 @@ class ConstrainedAgentTools:
                         )
                         for document_id in document_ids
                     },
-                    timeout_seconds=min(
-                        self._context.budget.max_find_seconds,
-                        executable_seconds,
-                    ),
+                    timeout_seconds=self._context.budget.max_find_seconds,
                 )
             elif name == "recall.open":
                 if (
@@ -464,13 +475,6 @@ class ConstrainedAgentTools:
                         "agent open arguments are invalid",
                         code="agent_open_invalid",
                     )
-                remaining = self._deadline_at - self._monotonic()
-                executable_seconds = int(remaining) - 6
-                if executable_seconds < 1:
-                    raise AgentExecutionError(
-                        "agent turn has no time remaining for evidence open",
-                        code="agent_tool_deadline_exhausted",
-                    )
                 alias = arguments["alias"]
                 document_id = self._document_ids_by_alias[alias]
                 result = self._retrieval.open_document(
@@ -492,7 +496,7 @@ class ConstrainedAgentTools:
                             )
                         )
                     },
-                    timeout_seconds=min(20, executable_seconds),
+                    timeout_seconds=20,
                 )
             elif name == "recall.exec":
                 if (
@@ -509,18 +513,6 @@ class ConstrainedAgentTools:
                     raise AgentExecutionError(
                         "agent execution requires at least one prior hint",
                         code="agent_exec_without_hints",
-                    )
-                # Archil's HTTP boundary adds up to four seconds around the
-                # sandbox timeout. Reserve that transport allowance plus two
-                # seconds for the model's grounded finish, so one synchronous
-                # exec can never consume more than the turn's remaining wall
-                # budget.
-                remaining = self._deadline_at - self._monotonic()
-                executable_seconds = int(remaining) - 6
-                if executable_seconds < 1:
-                    raise AgentExecutionError(
-                        "agent turn has no time remaining for evidence execution",
-                        code="agent_tool_deadline_exhausted",
                     )
                 result = self._retrieval.execute_agent_program(
                     arguments["program"],
@@ -547,7 +539,6 @@ class ConstrainedAgentTools:
                     timeout_seconds=min(
                         arguments["timeout_seconds"],
                         self._context.budget.max_exec_seconds,
-                        executable_seconds,
                     ),
                 )
             else:
@@ -602,6 +593,7 @@ class ConstrainedAgentTools:
                 if receipt not in self._citable_receipts:
                     self._citable_receipts.append(receipt)
             self._output_bytes += len(encoded)
+            self.check_cancelled()
             coverage = result.get("coverage", {}) if isinstance(result, dict) else {}
             self._observations.append({
                 "tool": name,
@@ -744,7 +736,6 @@ class RecallAgentService:
         context = DelegationContext.from_principal(principal)
         profiles = {
             "quick": {
-                "deadline_seconds": 35,
                 "max_tool_calls": 8,
                 "max_hint_calls": 3,
                 "max_exec_calls": 1,
@@ -752,7 +743,6 @@ class RecallAgentService:
                 "max_exec_seconds": 10,
             },
             "normal": {
-                "deadline_seconds": 50,
                 "max_tool_calls": 8,
                 "max_hint_calls": 2,
                 "max_exec_calls": 2,
@@ -760,7 +750,6 @@ class RecallAgentService:
                 "max_exec_seconds": 12,
             },
             "deep": {
-                "deadline_seconds": 120,
                 "max_tool_calls": 12,
                 "max_hint_calls": 6,
                 "max_exec_calls": 6,
@@ -779,9 +768,18 @@ class RecallAgentService:
         query: dict[str, Any],
         context: DelegationContext,
         retrieval: Any,
+        *,
+        cancel_requested: Callable[[], bool] | None = None,
+        progress: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
-        tools = ConstrainedAgentTools(retrieval, context)
+        tools = ConstrainedAgentTools(
+            retrieval,
+            context,
+            cancel_requested=cancel_requested,
+            progress=progress,
+        )
         try:
+            tools.report_progress("planning")
             bundle = self.runner.run(
                 query,
                 context,
@@ -789,6 +787,7 @@ class RecallAgentService:
                 clock=self.clock,
                 monotonic=self.monotonic,
             )
+            tools.report_progress("verifying")
             if not isinstance(bundle, dict) or set(bundle) != {"run", "trace", "result"}:
                 raise AgentExecutionError("agent runner result is invalid")
             now = self.clock()
