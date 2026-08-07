@@ -1484,9 +1484,20 @@ class CredentialBoundaryTest(unittest.TestCase):
         stale.chmod(0o600)
         os.utime(stale, (0, 0))
 
+        staged_instruction = ""
+        dump_snapshots = []
+
         def run(command, **_kwargs):
+            nonlocal staged_instruction
+            if "write-chars" in command:
+                staged_instruction += command[-1]
             if "dump-screen" in command:
-                return types.SimpleNamespace(stdout=f"prompt contains {marker}", stderr="", returncode=0)
+                dump_snapshots.append(staged_instruction)
+                return types.SimpleNamespace(
+                    stdout=staged_instruction,
+                    stderr="",
+                    returncode=0,
+                )
             return types.SimpleNamespace(stdout="", stderr="", returncode=0)
 
         with mock.patch.object(
@@ -1503,7 +1514,12 @@ class CredentialBoundaryTest(unittest.TestCase):
         commands = [call.args[0] for call in invoked.call_args_list]
         self.assertTrue(any("write-chars" in command for command in commands))
         self.assertTrue(any("send-keys" in command and "Enter" in command for command in commands))
-        self.assertEqual(sum("dump-screen" in command for command in commands), 2)
+        dump_commands = [
+            command for command in commands if "dump-screen" in command
+        ]
+        self.assertEqual(len(dump_commands), 2)
+        self.assertNotIn("--full", dump_commands[0])
+        self.assertIn("--full", dump_commands[1])
         self.assertGreaterEqual(identity.call_count, 2)
         written = "".join(
             command[-1] for command in commands
@@ -1512,6 +1528,13 @@ class CredentialBoundaryTest(unittest.TestCase):
         self.assertGreater(len([
             command for command in commands if "write-chars" in command
         ]), 1)
+        self.assertEqual(len(dump_snapshots), 2)
+        self.assertLessEqual(
+            len(dump_snapshots[0]),
+            self.runtime.ZELLIJ_WRITE_CHUNK_CHARS,
+        )
+        self.assertIn(marker, dump_snapshots[0])
+        self.assertEqual(dump_snapshots[1], written)
         self.assertIn("--reply-key " + marker, written)
         self.assertIn("at most one Slack message", written)
         self.assertIn("Default to 50 words", written)

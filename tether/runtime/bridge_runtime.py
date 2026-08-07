@@ -10975,24 +10975,27 @@ def deliver_zellij(
     try:
         # Absolute executable; session and pane are argv, never shell text.
         # Claude Code collapses one large synthetic terminal write into an
-        # opaque ``[Pasted text]`` placeholder. Stage bounded chunks so the
-        # attempt marker remains observable before Enter and after submission.
-        for offset in range(0, len(instruction), ZELLIJ_WRITE_CHUNK_CHARS):
-            subprocess.run(  # nosec B603
-                [
-                    zellij,
-                    "--session",
-                    session,
-                    "action",
-                    "write-chars",
-                    "--pane-id",
-                    target,
-                    instruction[offset : offset + ZELLIJ_WRITE_CHUNK_CHARS],
-                ],
-                check=True,
-                timeout=10,
-            )
-            write_accepted = True
+        # opaque ``[Pasted text]`` placeholder. Verify the marker in the first
+        # bounded chunk before the rest of a long input scrolls it off-screen.
+        chunks = [
+            instruction[offset : offset + ZELLIJ_WRITE_CHUNK_CHARS]
+            for offset in range(0, len(instruction), ZELLIJ_WRITE_CHUNK_CHARS)
+        ]
+        subprocess.run(  # nosec B603
+            [
+                zellij,
+                "--session",
+                session,
+                "action",
+                "write-chars",
+                "--pane-id",
+                target,
+                chunks[0],
+            ],
+            check=True,
+            timeout=10,
+        )
+        write_accepted = True
         time.sleep(0.15)
         staged = subprocess.run(  # nosec B603
             [zellij, "--session", session, "action", "dump-screen", "--pane-id", target],
@@ -11005,6 +11008,21 @@ def deliver_zellij(
         if marker not in staged.stdout:
             raise RuntimeError(
                 "Slack instruction was not visible in the captured Zellij pane"
+            )
+        for chunk in chunks[1:]:
+            subprocess.run(  # nosec B603
+                [
+                    zellij,
+                    "--session",
+                    session,
+                    "action",
+                    "write-chars",
+                    "--pane-id",
+                    target,
+                    chunk,
+                ],
+                check=True,
+                timeout=10,
             )
     except Exception as exc:
         if write_accepted:
@@ -11042,7 +11060,16 @@ def deliver_zellij(
     try:
         time.sleep(0.5)
         submitted = subprocess.run(  # nosec B603
-            [zellij, "--session", session, "action", "dump-screen", "--pane-id", target],
+            [
+                zellij,
+                "--session",
+                session,
+                "action",
+                "dump-screen",
+                "--pane-id",
+                target,
+                "--full",
+            ],
             check=True,
             text=True,
             stdout=subprocess.PIPE,
