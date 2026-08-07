@@ -111,6 +111,11 @@ ALL_READ_TOOLS = (
         "description": (
             "Ask the authenticated Recall brain one natural-language question. "
             "Recall owns investigation, grounding, citations, and the redacted trace. "
+            "For a broad matrix asking about several people across several dates, "
+            "the client agent should decompose it into parallel narrow calls, usually "
+            "one person/time slice, then synthesize their grounded results. Start "
+            "those cells at quick depth and deepen only ambiguous cells. Never use "
+            "one broad call as proof of absence for a requested cell. "
             "Long investigations start asynchronously: MCP Tasks clients receive a "
             "native task, and compatibility clients receive a durable run handle with "
             "run_id and trace_id for status, result, or cancellation calls."

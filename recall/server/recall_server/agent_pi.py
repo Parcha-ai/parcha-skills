@@ -98,8 +98,9 @@ AGENT_MAP_GUIDANCE = (
     "proof that they authored it. When the user explicitly asks what named "
     "people did in each requested time slice, build a coverage grid with one "
     "partition per named person per requested time slice. Give every cell the "
-    "exact `filters.person` value and time bounds; do not combine people or "
-    "time slices in those cells. Sample the strongest plausible candidate from "
+    "exact `filters.person` value, `person_relation` set to `contributor`, and "
+    "time bounds; do not combine people or time slices in those cells. Sample "
+    "the strongest plausible candidate from "
     "every nonempty cell before going deeper on any one cell. An empty cell may "
     "become a reported gap only after one sensible narrower retry; an inspected "
     "cell may become a gap only when its sample contains no relevant evidence. "
@@ -1042,8 +1043,9 @@ def _tool_definitions(
     filter_properties["person_relation"] = {
         "description": (
             "Optional exact relation for a named person. Use author for "
-            "wrote/sent, owner for owned, organizer for organized; use null "
-            "for broad questions such as what the person worked on or did."
+            "wrote/sent, contributor for what they worked on or did in their "
+            "own connected source, owner for owned, and organizer for organized. "
+            "Use null only when the question deliberately spans relations."
         ),
         "anyOf": [
             {

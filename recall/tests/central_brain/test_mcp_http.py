@@ -885,17 +885,27 @@ class RemoteMcpContractTest(unittest.TestCase):
                 ]
             },
         )
-        with McpHttpServer(PolicyStore()) as server:
+        with ModernTaskHttpServer() as server:
             _, _, canonical_raw = server.request(
-                "POST",
                 request("tools/list"),
-                token="synthetic-human-read",
                 protocol="2025-11-25",
             )
-        canonical_tools = {
-            tool["name"]: tool["inputSchema"]
+        canonical_catalog = {
+            tool["name"]: tool
             for tool in json.loads(canonical_raw)["result"]["tools"]
         }
+        canonical_tools = {
+            name: tool["inputSchema"]
+            for name, tool in canonical_catalog.items()
+        }
+        self.assertIn(
+            "one person/time slice",
+            canonical_catalog["use_recall"]["description"],
+        )
+        self.assertIn(
+            "Never use one broad call as proof of absence",
+            canonical_catalog["use_recall"]["description"],
+        )
         investigate_filters = canonical_tools["recall_investigate"]["properties"][
             "filters"
         ]["properties"]
