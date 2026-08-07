@@ -80,7 +80,9 @@ class DeepInspectionContractTests(unittest.TestCase):
             413: "deep_inspector_request_too_large",
             429: "deep_inspector_rate_limited",
             503: "deep_inspector_upstream_failed",
-            422: "deep_inspector_request_rejected",
+            400: "deep_inspector_bad_request",
+            404: "deep_inspector_endpoint_not_found",
+            422: "deep_inspector_validation_failed",
         }
         for status, code in expected.items():
             with (
