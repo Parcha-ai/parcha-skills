@@ -102,6 +102,22 @@ class UrllibTransport:
                 raw = response.read(MAX_TRANSPORT_BYTES + 1)
         except DeepInspectionError:
             raise
+        except urllib.error.HTTPError as error:
+            code = {
+                401: "deep_inspector_authentication_failed",
+                403: "deep_inspector_authentication_failed",
+                409: "deep_inspector_busy",
+                413: "deep_inspector_request_too_large",
+                429: "deep_inspector_rate_limited",
+            }.get(
+                error.code,
+                (
+                    "deep_inspector_upstream_failed"
+                    if 500 <= error.code <= 599
+                    else "deep_inspector_request_rejected"
+                ),
+            )
+            raise DeepInspectionError(code) from error
         except (OSError, urllib.error.URLError) as error:
             raise DeepInspectionError("deep_inspector_unavailable") from error
         if len(raw) > MAX_TRANSPORT_BYTES:
