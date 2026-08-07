@@ -784,6 +784,42 @@ class SimpleAgentKernelTest(unittest.TestCase):
         self.assertNotIn(HINT, transport.guidance)
         self.assertNotIn("bounded bridge", transport.guidance)
 
+    def test_grounded_finish_status_is_derived_from_evidence_gaps(self):
+        class RedundantStatusTransport:
+            def run(self, _start, invoke, *, timeout_seconds, cancelled):
+                del timeout_seconds
+                assert not cancelled()
+                invoke("open", {
+                    "items": [{
+                        "label": "bounded bridge decision",
+                        "alias": "d1",
+                        "cursor": None,
+                        "record_ordinal": 80,
+                        "page_bytes": 32768,
+                    }],
+                })
+                invoke("finish", {
+                    "status": "complete",
+                    "answer": "The bounded bridge was selected.",
+                    "claims": [{
+                        "statement": "The bounded bridge was selected.",
+                        "receipts": [DECISION],
+                    }],
+                    "gaps": ["No evidence was found for the second request."],
+                })
+                return {"terminal": {}, "usage": {}}
+
+        result = service(RedundantStatusTransport()).use_recall(
+            principal(),
+            REQUEST,
+            SyntheticRetrieval(),
+        )
+        self.assertEqual(result["result"]["status"], "partial")
+        self.assertEqual(
+            result["result"]["gaps"],
+            ["No evidence was found for the second request."],
+        )
+
     def test_provider_failure_is_content_free(self):
         with self.assertRaises(AgentExecutionError) as caught:
             service(ScriptedTransport(success_script())).use_recall(
