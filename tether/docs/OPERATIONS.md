@@ -73,6 +73,13 @@ A production deployment should report:
 - valid Hermes plugin wiring; and
 - connected Slack Events API ingress through Socket Mode.
 
+The gateway and interactive shells must resolve each configured native agent
+binary to the same executable. Long-lived gateway services often have a
+different `PATH`; in that case set `codex_binary` and `claude_binary` in
+`~/.config/tether/config.toml` to stable absolute launchers. After an agent
+upgrade, capture a fresh bridge or explicitly rebind it. Tether deliberately
+rejects a running executable that is not one of the configured trusted paths.
+
 The `conversations.replies` poller is only best-effort recovery. It may be
 rate-limited or unavailable to a bot token for channel threads. Do not accept a
 poll-only deployment as healthy.
