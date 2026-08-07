@@ -22,8 +22,8 @@ env:
   # Accounts whose current GitHub-registered GPG or SSH signing keys may sign
   # Tether release tags. Changes to this allowlist require normal code review.
   AUTHORIZED_RELEASE_SIGNERS: "miguelrios"
-  RELEASE_NODE_VERSION: "24.18.0"
-  RELEASE_NPM_VERSION: "12.0.1"
+  RELEASE_NODE_VERSION: "24.19.0"
+  RELEASE_NPM_VERSION: "12.0.2"
   RELEASE_PYTHON_VERSION: "3.14.0"
 
 jobs:

@@ -52,6 +52,8 @@ therefore return a session containing similar words. Each result includes a
 
 skills.sh:
 
+[View Recall on skills.sh](https://skills.sh/Parcha-ai/parcha-skills/recall).
+
 ```bash
 npx skills add Parcha-ai/parcha-skills --skill recall
 ```

@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.3.0-beta.1
+
+- Adds BindingV3 Herdr protocol-19 live endpoints with official native-session
+  references, occupant-bound agent names, private socket validation, and exact
+  process-incarnation checks.
+- Routes generation-fenced native delivery, acknowledgment, edit interruption,
+  cancellation, and ambiguous-outcome recovery through Herdr `agent.prompt`
+  and `agent.send_keys` primitives.
+- Captures Herdr bindings from its session environment without requiring a
+  duplicate Codex or Claude session environment variable.
+- Adds the `parcha.tether` Herdr plugin with contextual actions, Slack-link
+  handling, and a keyboard-driven popup cockpit.
+- Opens the cockpit through Herdr's active-pane popup contract while carrying
+  the independently verified target in a private single-use handoff record.
+- Adds broker protocol 6 contextual inspection without exposing credentials,
+  native session values, socket paths, process fingerprints, or message text.
+- Makes lifecycle `--restart` detect an active system-level Hermes gateway and
+  use Hermes's documented non-interactive system restart path.
+- Preserves the canonical default Herdr session, follows pane moves through the
+  occupant identity, and survives live handoff terminal-ID rotation only when
+  the native session and process incarnation remain unchanged.
+- Stages legacy Zellij follow-up instructions in bounded terminal writes so
+  Claude Code keeps the attempt marker visible instead of collapsing it into an
+  opaque pasted-text placeholder before Enter.
+
 ## Unreleased
 
 - Posts a Slack control notice when a bridge reply fails so threads are not

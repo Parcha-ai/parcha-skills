@@ -165,13 +165,15 @@ MAX_BROKER_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_SLACK_FILENAME = 180
 MAX_SOURCE_VALUE = 4_096
 MAX_IDEMPOTENCY_KEY = 256
+ZELLIJ_WRITE_CHUNK_CHARS = 96
 DEFAULT_BROKER_MAX_CONNECTIONS = 32
 DEFAULT_BROKER_READ_TIMEOUT_SECONDS = 5.0
 REPLY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 HERMES_SEND_GROUP_PATTERN = re.compile(r"^hsg_[0-9a-f]{32}$")
 SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
 CONFIG_VERSION = 1
-BINDING_VERSION = 2
+BINDING_VERSION = 3
+SUPPORTED_BINDING_VERSIONS = frozenset({1, 2, BINDING_VERSION})
 SCHEMA_VERSION = 15
 RECONCILIATION_PAGE_LIMIT = 15
 RECONCILIATION_INTERVAL_SECONDS = 60
@@ -181,10 +183,22 @@ PROCESS_IDENTITY_PREFIX = "linux-proc-v2:"
 PROCESS_IDENTITY_FIELDS = frozenset({
     "agent", "boot", "exe", "exe_path", "pane", "pid", "session", "start", "tty",
 })
+HERDR_PROCESS_IDENTITY_PREFIX = "herdr-proc-v1:"
+HERDR_PROCESS_IDENTITY_FIELDS = frozenset({
+    "agent", "boot", "exe", "exe_path", "pid", "start", "terminal", "tty",
+})
+HERDR_PROTOCOL_VERSION = 19
+HERDR_AGENT_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+HERDR_TERMINAL_ID_PATTERN = re.compile(r"^term_[A-Za-z0-9]+$")
 COMMON_SOURCE_FIELDS = frozenset({
     "binding_version", "binding_state", "endpoint_kind", "delivery_policy",
     "process_identity", "cwd_realpath", "cwd_device", "cwd_inode",
     "cwd_owner_uid",
+})
+HERDR_ENDPOINT_FIELDS = frozenset({
+    "herdr_session", "herdr_socket_path", "herdr_terminal_id",
+    "herdr_pane_id", "herdr_agent_name", "herdr_agent_session_source",
+    "herdr_agent_session_kind", "herdr_agent_session_value", "herdr_protocol",
 })
 BINDING_METADATA_FIELDS = frozenset({
     "binding_version", "binding_state", "endpoint_kind", "delivery_policy",
@@ -197,11 +211,11 @@ SOURCE_FIELDS = {
     "claude_session": frozenset({
         "session_id", "zellij_session", "zellij_pane_id", "cwd",
         "pane_command_hash", "pane_agent",
-    }) | COMMON_SOURCE_FIELDS,
+    }) | COMMON_SOURCE_FIELDS | HERDR_ENDPOINT_FIELDS,
     "codex_session": frozenset({
         "session_id", "zellij_session", "zellij_pane_id", "cwd",
         "pane_command_hash", "pane_agent",
-    }) | COMMON_SOURCE_FIELDS,
+    }) | COMMON_SOURCE_FIELDS | HERDR_ENDPOINT_FIELDS,
     "hermes_session": frozenset({"session_id", "run_id", "cwd"}) | COMMON_SOURCE_FIELDS,
     "headless_run": frozenset({"run_id", "queue_id", "cwd"}) | COMMON_SOURCE_FIELDS,
 }
@@ -246,6 +260,10 @@ class BridgeRequest(TypedDict, total=False):
     reply_key: str
     file_path: str | None
     limit: int
+    herdr_terminal_id: str
+    herdr_agent_name: str
+    herdr_agent_session_value: str
+    herdr_agent: str
     expected_generation: int
 
 
@@ -525,6 +543,15 @@ class SourceBinding:
     cwd_owner_uid: str = ""
     zellij_session: str = ""
     zellij_pane_id: str = ""
+    herdr_session: str = ""
+    herdr_socket_path: str = ""
+    herdr_terminal_id: str = ""
+    herdr_pane_id: str = ""
+    herdr_agent_name: str = ""
+    herdr_agent_session_source: str = ""
+    herdr_agent_session_kind: str = ""
+    herdr_agent_session_value: str = ""
+    herdr_protocol: str = ""
     pane_agent: str = ""
     process_identity: str = ""
 
@@ -535,6 +562,10 @@ class SourceBinding:
     @property
     def uses_zellij(self) -> bool:
         return self.endpoint_kind == "zellij_pane"
+
+    @property
+    def uses_herdr(self) -> bool:
+        return self.endpoint_kind == "herdr_agent"
 
 
 class NativeContinuationError(RuntimeError):
@@ -772,6 +803,37 @@ def _parse_process_identity(value: str) -> dict[str, str | int]:
     return payload
 
 
+def _parse_herdr_process_identity(value: str) -> dict[str, str | int]:
+    if not value.startswith(HERDR_PROCESS_IDENTITY_PREFIX):
+        raise ValueError("Herdr process identity has an unsupported format")
+    try:
+        payload = json.loads(value.removeprefix(HERDR_PROCESS_IDENTITY_PREFIX))
+    except json.JSONDecodeError as exc:
+        raise ValueError("Herdr process identity is malformed") from exc
+    if not isinstance(payload, dict) or set(payload) != HERDR_PROCESS_IDENTITY_FIELDS:
+        raise ValueError("Herdr process identity is incomplete")
+    string_fields = HERDR_PROCESS_IDENTITY_FIELDS - {"pid"}
+    if (
+        not all(isinstance(payload[field], str) for field in string_fields)
+        or not isinstance(payload["pid"], int)
+        or isinstance(payload["pid"], bool)
+    ):
+        raise ValueError("Herdr process identity has invalid field types")
+    if (
+        payload["pid"] <= 0
+        or not SESSION_ID_PATTERN.fullmatch(str(payload["agent"]))
+        or not HERDR_TERMINAL_ID_PATTERN.fullmatch(str(payload["terminal"]))
+        or not str(payload["start"]).isdigit()
+        or not str(payload["tty"]).lstrip("-").isdigit()
+        or int(str(payload["tty"])) <= 0
+        or not re.fullmatch(r"[0-9a-fA-F-]{16,64}", str(payload["boot"]))
+        or not re.fullmatch(r"[0-9a-f]+:[0-9a-f]+", str(payload["exe"]))
+        or not re.fullmatch(r"[0-9a-f]{16}", str(payload["exe_path"]))
+    ):
+        raise ValueError("Herdr process identity contains invalid values")
+    return payload
+
+
 def _native_adapter(kind: str) -> str:
     return {
         "claude_session": "claude",
@@ -800,8 +862,7 @@ def _validated_source_map(kind: str, raw_source: Any) -> dict[str, str]:
         raise ValueError("bridge source value is too large")
     supplied_version = source.get("binding_version", "")
     if supplied_version and supplied_version not in {
-        "1",
-        str(BINDING_VERSION),
+        str(version) for version in SUPPORTED_BINDING_VERSIONS
     }:
         raise ValueError("unsupported bridge binding version")
     return source
@@ -871,8 +932,6 @@ def _source_pane_fields(
         (
             zellij_session,
             zellij_pane,
-            pane_agent,
-            process_identity,
             source.get("pane_command_hash", ""),
         )
     )
@@ -883,6 +942,14 @@ def _source_pane_fields(
         process_identity,
         has_pane_data,
     )
+
+
+def _source_herdr_fields(source: dict[str, str]) -> tuple[dict[str, str], bool]:
+    fields = {
+        field: source.get(field, "")
+        for field in HERDR_ENDPOINT_FIELDS
+    }
+    return fields, any(fields.values())
 
 
 def _validate_bound_process_identity(
@@ -905,6 +972,21 @@ def _validate_bound_process_identity(
         raise ValueError("pane process identity contradicts the Zellij pane")
 
 
+def _validate_bound_herdr_process_identity(
+    process_identity: str,
+    *,
+    pane_agent: str,
+    terminal_id: str,
+) -> None:
+    if not process_identity:
+        return
+    identity = _parse_herdr_process_identity(process_identity)
+    if str(identity["agent"]) != pane_agent:
+        raise ValueError("Herdr process identity contradicts the bound adapter")
+    if str(identity["terminal"]) != terminal_id:
+        raise ValueError("Herdr process identity contradicts the bound terminal")
+
+
 def _binding_delivery_contract(
     kind: str,
     *,
@@ -916,6 +998,8 @@ def _binding_delivery_contract(
     pane_agent: str,
     process_identity: str,
     has_pane_data: bool,
+    herdr: dict[str, str],
+    has_herdr_data: bool,
     allow_legacy: bool,
 ) -> tuple[str, str, str, str]:
     adapter = _native_adapter(kind)
@@ -927,7 +1011,66 @@ def _binding_delivery_contract(
             raise ValueError(
                 f"{adapter} binding requires a working directory"
             )
-        endpoint = "zellij_pane" if has_pane_data else "detached_native"
+        if has_pane_data and has_herdr_data:
+            raise ValueError("native binding cannot target both Zellij and Herdr")
+        endpoint = (
+            "herdr_agent"
+            if has_herdr_data
+            else "zellij_pane"
+            if has_pane_data
+            else "detached_native"
+        )
+        if has_herdr_data:
+            required = (
+                "herdr_session",
+                "herdr_socket_path",
+                "herdr_terminal_id",
+                "herdr_pane_id",
+                "herdr_agent_name",
+                "herdr_agent_session_source",
+                "herdr_agent_session_kind",
+                "herdr_agent_session_value",
+                "herdr_protocol",
+            )
+            if not all(herdr.get(field) for field in required):
+                raise ValueError("native Herdr binding is incomplete")
+            if pane_agent != adapter:
+                raise ValueError(
+                    f"captured Herdr agent is "
+                    f"{pane_agent or 'unknown'}, not {adapter}"
+                )
+            if not Path(herdr["herdr_socket_path"]).is_absolute():
+                raise ValueError("Herdr socket path must be absolute")
+            if not SESSION_ID_PATTERN.fullmatch(herdr["herdr_session"]):
+                raise ValueError("Herdr session name is invalid")
+            if not SESSION_ID_PATTERN.fullmatch(herdr["herdr_pane_id"]):
+                raise ValueError("Herdr pane ID is invalid")
+            if not HERDR_TERMINAL_ID_PATTERN.fullmatch(
+                herdr["herdr_terminal_id"]
+            ):
+                raise ValueError("Herdr terminal ID is invalid")
+            if not HERDR_AGENT_NAME_PATTERN.fullmatch(
+                herdr["herdr_agent_name"]
+            ):
+                raise ValueError("Herdr agent name is invalid")
+            for field in (
+                "herdr_agent_session_source",
+                "herdr_agent_session_kind",
+                "herdr_agent_session_value",
+            ):
+                if not SESSION_ID_PATTERN.fullmatch(herdr[field]):
+                    raise ValueError("Herdr native session reference is invalid")
+            if herdr["herdr_agent_session_value"] != session_id:
+                raise ValueError(
+                    "Herdr native session reference contradicts the source session"
+                )
+            if herdr["herdr_protocol"] != str(HERDR_PROTOCOL_VERSION):
+                raise ValueError("unsupported Herdr protocol")
+            if not process_identity:
+                raise ValueError(
+                    "native Herdr binding requires an exact process identity"
+                )
+            return adapter, state, endpoint, "native_required"
         if has_pane_data:
             if not all((zellij_session, zellij_pane, pane_agent)):
                 raise ValueError("native pane binding is incomplete")
@@ -989,9 +1132,9 @@ def _validate_declared_binding_contract(
     for field, actual, label in claims:
         if source.get(field) and source[field] != actual:
             raise ValueError(f"{label} contradicts source identity")
-    if endpoint == "zellij_pane" and not process_identity:
+    if endpoint in {"zellij_pane", "herdr_agent"} and not process_identity:
         raise ValueError(
-            "BindingV2 Zellij endpoint requires a process identity"
+            "verified live endpoint requires a process identity"
         )
 
 
@@ -1013,16 +1156,32 @@ def _canonical_source(
         process_identity,
         has_pane_data,
     ) = _source_pane_fields(source)
+    herdr, has_herdr_data = _source_herdr_fields(source)
+    if (
+        not has_pane_data
+        and not has_herdr_data
+        and (pane_agent or process_identity)
+    ):
+        raise ValueError(
+            "live process metadata requires a Zellij or Herdr endpoint"
+        )
     if session_id and not SESSION_ID_PATTERN.fullmatch(session_id):
         raise ValueError("native session ID is invalid or option-like")
     if run_id and not SESSION_ID_PATTERN.fullmatch(run_id):
         raise ValueError("run ID is invalid or option-like")
-    _validate_bound_process_identity(
-        process_identity,
-        pane_agent=pane_agent,
-        zellij_session=zellij_session,
-        zellij_pane=zellij_pane,
-    )
+    if has_pane_data:
+        _validate_bound_process_identity(
+            process_identity,
+            pane_agent=pane_agent,
+            zellij_session=zellij_session,
+            zellij_pane=zellij_pane,
+        )
+    if has_herdr_data:
+        _validate_bound_herdr_process_identity(
+            process_identity,
+            pane_agent=pane_agent,
+            terminal_id=herdr["herdr_terminal_id"],
+        )
     adapter, state, endpoint, policy = _binding_delivery_contract(
         kind,
         session_id=session_id,
@@ -1033,6 +1192,8 @@ def _canonical_source(
         pane_agent=pane_agent,
         process_identity=process_identity,
         has_pane_data=has_pane_data,
+        herdr=herdr,
+        has_herdr_data=has_herdr_data,
         allow_legacy=allow_legacy,
     )
     _validate_declared_binding_contract(
@@ -1074,6 +1235,15 @@ def _canonical_source(
         cwd_owner_uid=cwd_identity["cwd_owner_uid"],
         zellij_session=zellij_session,
         zellij_pane_id=zellij_pane,
+        herdr_session=herdr["herdr_session"],
+        herdr_socket_path=herdr["herdr_socket_path"],
+        herdr_terminal_id=herdr["herdr_terminal_id"],
+        herdr_pane_id=herdr["herdr_pane_id"],
+        herdr_agent_name=herdr["herdr_agent_name"],
+        herdr_agent_session_source=herdr["herdr_agent_session_source"],
+        herdr_agent_session_kind=herdr["herdr_agent_session_kind"],
+        herdr_agent_session_value=herdr["herdr_agent_session_value"],
+        herdr_protocol=herdr["herdr_protocol"],
         pane_agent=pane_agent,
         process_identity=process_identity,
     )
@@ -1103,6 +1273,21 @@ def source_binding(bridge: Bridge) -> SourceBinding:
             zellij_pane_id=str(
                 source.get("zellij_pane_id") or source.get("pane_id") or ""
             ),
+            herdr_session=str(source.get("herdr_session") or ""),
+            herdr_socket_path=str(source.get("herdr_socket_path") or ""),
+            herdr_terminal_id=str(source.get("herdr_terminal_id") or ""),
+            herdr_pane_id=str(source.get("herdr_pane_id") or ""),
+            herdr_agent_name=str(source.get("herdr_agent_name") or ""),
+            herdr_agent_session_source=str(
+                source.get("herdr_agent_session_source") or ""
+            ),
+            herdr_agent_session_kind=str(
+                source.get("herdr_agent_session_kind") or ""
+            ),
+            herdr_agent_session_value=str(
+                source.get("herdr_agent_session_value") or ""
+            ),
+            herdr_protocol=str(source.get("herdr_protocol") or ""),
             pane_agent=str(source.get("pane_agent") or ""),
             process_identity=str(source.get("process_identity") or ""),
         )
@@ -1124,6 +1309,12 @@ def endpoint_identity_key(binding: SourceBinding) -> str:
             "zellij_pane",
             binding.zellij_session,
             binding.zellij_pane_id.removeprefix("terminal_"),
+        )
+    elif binding.endpoint_kind == "herdr_agent":
+        identity = (
+            "herdr_agent",
+            binding.herdr_socket_path,
+            binding.herdr_agent_name,
         )
     elif binding.endpoint_kind == "detached_native":
         identity = (
@@ -2546,6 +2737,74 @@ class Store:
                 (team_id, channel_id, thread_ts),
             ).fetchone()
             return self.decode(row)
+
+    def find_herdr_endpoint(
+        self,
+        terminal_id: str,
+        agent_name: str,
+        native_session_value: str,
+        agent: str,
+    ) -> Bridge | None:
+        """Resolve one active Herdr binding without trusting plugin context as authority."""
+        if not HERDR_TERMINAL_ID_PATTERN.fullmatch(terminal_id):
+            raise ValueError("invalid Herdr terminal ID")
+        if not HERDR_AGENT_NAME_PATTERN.fullmatch(agent_name):
+            raise ValueError("invalid Herdr agent name")
+        if not SESSION_ID_PATTERN.fullmatch(native_session_value):
+            raise ValueError("invalid Herdr native session reference")
+        if agent not in {"codex", "claude"}:
+            raise ValueError("unsupported Herdr agent")
+        matches: list[Bridge] = []
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM bridges WHERE status='active' ORDER BY updated_at DESC"
+            ).fetchall()
+        for row in rows:
+            bridge = self.decode(row)
+            if bridge is None or bridge.source_kind != f"{agent}_session":
+                continue
+            source = bridge.source
+            if (
+                source.get("endpoint_kind") == "herdr_agent"
+                and source.get("herdr_agent_name") == agent_name
+                and source.get("herdr_agent_session_value") == native_session_value
+            ):
+                matches.append(bridge)
+        if len(matches) > 1:
+            raise ValueError("multiple active bindings match this Herdr agent")
+        return matches[0] if matches else None
+
+    def bridge_work_counts(self, bridge_id: str) -> dict[str, int]:
+        with self.connect() as db:
+            queued = int(
+                db.execute(
+                    """
+                    SELECT count(*) FROM bridge_events
+                    WHERE bridge_id=? AND state IN (
+                      'pending','processing','prepared','submitting','awaiting_ack','replying'
+                    )
+                    """,
+                    (bridge_id,),
+                ).fetchone()[0]
+            )
+            uncertain = int(
+                db.execute(
+                    """
+                    SELECT count(*) FROM bridge_attempts
+                    WHERE bridge_id=? AND state='uncertain'
+                    """,
+                    (bridge_id,),
+                ).fetchone()[0]
+            ) + int(
+                db.execute(
+                    """
+                    SELECT count(*) FROM thread_ingress
+                    WHERE bridge_id=? AND state='uncertain'
+                    """,
+                    (bridge_id,),
+                ).fetchone()[0]
+            )
+        return {"queued": queued, "uncertain": uncertain}
 
     def rebind(
         self,
@@ -4911,7 +5170,7 @@ class Store:
             not event_ids
             or not REPLY_KEY_PATTERN.fullmatch(attempt_id)
             or binding_generation < 1
-            or delivery_kind not in {"zellij", "detached_native"}
+            or delivery_kind not in {"zellij", "herdr", "detached_native"}
         ):
             return False
         with self.connect() as db:
@@ -5039,7 +5298,7 @@ class Store:
                 """
                 SELECT state FROM bridge_attempts
                 WHERE attempt_id=? AND bridge_id=? AND binding_generation=?
-                  AND delivery_kind='zellij'
+                  AND delivery_kind IN ('zellij','herdr')
                 """,
                 (attempt_id, bridge_id, binding_generation),
             ).fetchone()
@@ -5054,7 +5313,7 @@ class Store:
                     error_code='terminal_interrupt_unverified',
                     updated_at=CURRENT_TIMESTAMP
                 WHERE attempt_id=? AND bridge_id=? AND binding_generation=?
-                  AND delivery_kind='zellij'
+                  AND delivery_kind IN ('zellij','herdr')
                   AND state IN ('submitting','awaiting_ack')
                 """,
                 (attempt_id, bridge_id, binding_generation),
@@ -5293,25 +5552,41 @@ class Store:
             ).fetchone()
             return str(row["state"]) if row is not None else None
 
-    def active_zellij_attempt(self, bridge_id: str) -> dict[str, Any] | None:
+    def active_live_attempt(
+        self,
+        bridge_id: str,
+        delivery_kind: str | None = None,
+    ) -> dict[str, Any] | None:
+        if delivery_kind not in {None, "zellij", "herdr"}:
+            raise ValueError("invalid live delivery kind")
+        kind_clause = "AND delivery_kind=?" if delivery_kind else "AND delivery_kind IN ('zellij','herdr')"
+        parameters: tuple[Any, ...] = (
+            (bridge_id, delivery_kind)
+            if delivery_kind
+            else (bridge_id,)
+        )
         with self.connect() as db:
             row = db.execute(
-                """
-                SELECT attempt_id,binding_generation,state
+                f"""
+                SELECT attempt_id,binding_generation,delivery_kind,state
                 FROM bridge_attempts
-                WHERE bridge_id=? AND delivery_kind='zellij'
+                WHERE bridge_id=? {kind_clause}
                   AND state IN ('submitting','uncertain','awaiting_ack')
                 ORDER BY updated_at DESC,created_at DESC LIMIT 1
-                """,
-                (bridge_id,),
+                """,  # nosec B608 - kind_clause is a fixed literal above
+                parameters,
             ).fetchone()
             if row is None:
                 return None
             return {
                 "attempt_id": str(row["attempt_id"]),
                 "binding_generation": int(row["binding_generation"]),
+                "delivery_kind": str(row["delivery_kind"]),
                 "state": str(row["state"]),
             }
+
+    def active_zellij_attempt(self, bridge_id: str) -> dict[str, Any] | None:
+        return self.active_live_attempt(bridge_id, "zellij")
 
     def cancel_zellij_attempt(
         self,
@@ -5321,6 +5596,25 @@ class Store:
         *,
         reason: str = "operator_cancelled",
     ) -> int:
+        return self.cancel_live_attempt(
+            attempt_id,
+            bridge_id,
+            binding_generation,
+            delivery_kind="zellij",
+            reason=reason,
+        )
+
+    def cancel_live_attempt(
+        self,
+        attempt_id: str,
+        bridge_id: str,
+        binding_generation: int,
+        *,
+        delivery_kind: str,
+        reason: str = "operator_cancelled",
+    ) -> int:
+        if delivery_kind not in {"zellij", "herdr"}:
+            raise ValueError("invalid live delivery kind")
         safe_reason = _safe_label(reason, 128) or "operator_cancelled"
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -5342,7 +5636,7 @@ class Store:
                 SET state='cancelled',error_code=?,
                     updated_at=CURRENT_TIMESTAMP
                 WHERE attempt_id=? AND bridge_id=?
-                  AND binding_generation=? AND delivery_kind='zellij'
+                  AND binding_generation=? AND delivery_kind=?
                   AND state IN ('submitting','uncertain','awaiting_ack')
                 """,
                 (
@@ -5350,6 +5644,7 @@ class Store:
                     attempt_id,
                     bridge_id,
                     binding_generation,
+                    delivery_kind,
                 ),
             )
             if cancelled.rowcount != 1:
@@ -5370,7 +5665,7 @@ class Store:
             )
             if events.rowcount <= 0:
                 raise RuntimeError(
-                    "cancelled Zellij attempt has no matching live events"
+                    "cancelled live attempt has no matching live events"
                 )
             return int(events.rowcount)
 
@@ -7571,7 +7866,7 @@ class Broker:
         status = {
             "ok": True,
             "implementation": "tether",
-            "protocol_version": 5,
+            "protocol_version": 6,
             "channel_configured": bool(effective_channel(config)),
             "owner_configured": bool(config.default_owner or allowed_users),
             "allowed_user_count": len(allowed_users),
@@ -7587,6 +7882,41 @@ class Broker:
             if isinstance(health, dict):
                 status.update(health)
         return status
+
+    def _herdr_context(self, request: BridgeRequest) -> dict[str, Any]:
+        terminal_id = str(request.get("herdr_terminal_id") or "")
+        agent_name = str(request.get("herdr_agent_name") or "")
+        native_session = str(request.get("herdr_agent_session_value") or "")
+        agent = str(request.get("herdr_agent") or "")
+        bridge = self.store.find_herdr_endpoint(
+            terminal_id,
+            agent_name,
+            native_session,
+            agent,
+        )
+        if bridge is None:
+            return {
+                "ok": True,
+                "bound": False,
+                "agent": agent,
+                "queued": 0,
+                "uncertain": 0,
+            }
+        counts = self.store.bridge_work_counts(bridge.bridge_id)
+        return {
+            "ok": True,
+            "bound": True,
+            "agent": agent,
+            "bridge": {
+                "bridge_id": bridge.bridge_id,
+                "status": bridge.status,
+                "binding_state": bridge.binding_state,
+                "binding_generation": bridge.binding_generation,
+                "channel_id": bridge.channel_id,
+                "thread_ts": bridge.thread_ts or "",
+            },
+            **counts,
+        }
 
     def _identity(self) -> dict[str, Any]:
         result = _slack_call(self.token, "auth.test", {})
@@ -8682,7 +9012,7 @@ class Broker:
         with self._notify_lock:
             for bridge_id in self.store.pending_root_ids():
                 bridge = self.store.get(bridge_id)
-                if bridge is None:
+                if bridge is None or bridge.status == "closed":
                     continue
                 try:
                     self._deliver_staged_root(bridge)
@@ -8973,6 +9303,8 @@ class Broker:
             return self._status(config, allowed_users)
         if operation == "identity":
             return self._identity()
+        if operation == "herdr_context":
+            return self._herdr_context(request)
         if operation == "maintenance":
             return {
                 "ok": True,
@@ -9330,9 +9662,15 @@ def origin_label(bridge: Bridge) -> str:
     zellij_pane = _safe_label(
         source.get("zellij_pane_id") or (source.get("pane_id") if bridge.source_kind == "zellij_pane" else "")
     )
+    herdr_session = _safe_label(source.get("herdr_session"))
+    herdr_terminal = _safe_label(source.get("herdr_terminal_id"))
     terminal = f" in Zellij `{zellij_session}`" if zellij_session else ""
     if terminal and zellij_pane:
         terminal += f" / pane `{zellij_pane}`"
+    if herdr_session:
+        terminal = f" in Herdr `{herdr_session}`"
+        if herdr_terminal:
+            terminal += f" / terminal `{herdr_terminal}`"
     if bridge.source_kind == "codex_session":
         label = f"Codex `{_short(source.get('session_id'))}`{terminal}"
     elif bridge.source_kind == "claude_session":
@@ -9743,6 +10081,562 @@ def continue_native(
     if persist_response is not None:
         persist_response(output)
     return output
+
+
+def _validate_herdr_socket(socket_path: str) -> Path:
+    candidate = Path(socket_path)
+    if not candidate.is_absolute() or "\x00" in socket_path:
+        raise _binding_error(
+            "process_identity_unavailable",
+            "Herdr socket path is invalid",
+        )
+    try:
+        metadata = candidate.lstat()
+    except (FileNotFoundError, PermissionError, OSError) as exc:
+        raise _binding_error(
+            "process_identity_unavailable",
+            "Herdr socket is unavailable",
+        ) from exc
+    if (
+        not stat.S_ISSOCK(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise _binding_error(
+            "process_identity_unavailable",
+            "Herdr socket is not a private socket owned by this user",
+        )
+    return candidate
+
+
+def _herdr_call(
+    socket_path: str,
+    method: str,
+    params: dict[str, Any],
+    *,
+    mutation: bool = False,
+    timeout: float = 10.0,
+) -> dict[str, Any]:
+    candidate = _validate_herdr_socket(socket_path)
+    request_id = "tether_" + uuid.uuid4().hex
+    payload = json.dumps(
+        {"id": request_id, "method": method, "params": params},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8") + b"\n"
+    if len(payload) > MAX_BROKER_REQUEST_BYTES:
+        raise ValueError("Herdr request is too large")
+    sent = False
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(timeout)
+    try:
+        client.connect(str(candidate))
+        if hasattr(socket, "SO_PEERCRED"):
+            raw_peer = client.getsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_PEERCRED,
+                struct.calcsize("3i"),
+            )
+            _peer_pid, peer_uid, _peer_gid = struct.unpack("3i", raw_peer)
+            if peer_uid != os.getuid():
+                raise PermissionError("Herdr peer owner does not match this user")
+        client.sendall(payload)
+        sent = True
+        response = bytearray()
+        while b"\n" not in response:
+            chunk = client.recv(min(65_536, MAX_BROKER_RESPONSE_BYTES + 1 - len(response)))
+            if not chunk:
+                raise ConnectionError("Herdr closed the socket before responding")
+            response.extend(chunk)
+            if len(response) > MAX_BROKER_RESPONSE_BYTES:
+                raise ValueError("Herdr response is too large")
+        frame, trailing = bytes(response).split(b"\n", 1)
+        if trailing.strip():
+            raise ValueError("Herdr returned unexpected response data")
+        decoded = json.loads(frame)
+    except NativeContinuationError:
+        raise
+    except Exception as exc:
+        code = (
+            "terminal_submit_uncertain"
+            if mutation and sent
+            else "terminal_submit_not_started"
+            if mutation
+            else "native_continuation_failed"
+        )
+        raise NativeContinuationError(
+            "Herdr request could not be completed safely",
+            code=code,
+        ) from exc
+    finally:
+        client.close()
+    if not isinstance(decoded, dict) or decoded.get("id") != request_id:
+        raise NativeContinuationError(
+            "Herdr returned an invalid response",
+            code=("terminal_submit_uncertain" if mutation else "native_continuation_failed"),
+        )
+    error = decoded.get("error")
+    if error is not None:
+        error_code = str(error.get("code") or "") if isinstance(error, dict) else ""
+        mutation_code = (
+            "terminal_submit_not_started"
+            if error_code == "agent_not_found"
+            else "terminal_submit_uncertain"
+        )
+        raise NativeContinuationError(
+            "Herdr rejected the exact agent operation",
+            code=(mutation_code if mutation else "native_continuation_failed"),
+        )
+    result = decoded.get("result")
+    if not isinstance(result, dict):
+        raise NativeContinuationError(
+            "Herdr response omitted its result",
+            code=("terminal_submit_uncertain" if mutation else "native_continuation_failed"),
+        )
+    return result
+
+
+def _herdr_result_record(
+    result: dict[str, Any],
+    *,
+    result_type: str,
+    field: str,
+) -> dict[str, Any]:
+    record = result.get(field)
+    if result.get("type") != result_type or not isinstance(record, dict):
+        raise NativeContinuationError("Herdr returned an unexpected response shape")
+    return record
+
+
+def _herdr_process_identity(
+    process_info: dict[str, Any],
+    *,
+    terminal_id: str,
+    expected_agent: str,
+    config: Config | None = None,
+    proc_root: Path = Path("/proc"),
+) -> str:
+    configured = config or load_config()
+    trusted_paths = _trusted_agent_paths(configured, {expected_agent})
+    if not trusted_paths.get(expected_agent):
+        raise _binding_error(
+            "process_identity_unavailable",
+            f"the configured {expected_agent} executable is not trusted",
+        )
+    processes = process_info.get("foreground_processes")
+    foreground_group = process_info.get("foreground_process_group_id")
+    if not isinstance(processes, list) or not processes:
+        raise _binding_error(
+            "process_identity_missing",
+            "Herdr terminal has no foreground agent process",
+        )
+    candidates: list[str] = []
+    boot_id = _boot_id(proc_root)
+    for record in processes:
+        if not isinstance(record, dict) or isinstance(record.get("pid"), bool):
+            continue
+        try:
+            pid = int(record["pid"])
+            process_dir = proc_root / str(pid)
+            stat_text = (process_dir / "stat").read_text(encoding="utf-8")
+            fields = stat_text[stat_text.rfind(")") + 2 :].split()
+            if len(fields) <= 19:
+                continue
+            process_group = int(fields[2])
+            tty_number = int(fields[4])
+            terminal_group = int(fields[5])
+            if (
+                tty_number <= 0
+                or process_group != terminal_group
+                or (
+                    isinstance(foreground_group, int)
+                    and foreground_group > 0
+                    and process_group != foreground_group
+                )
+            ):
+                continue
+            raw_command = (process_dir / "cmdline").read_bytes()
+            tokens = [
+                value.decode("utf-8", "replace")
+                for value in raw_command.split(b"\0")
+                if value
+            ]
+            executable_link = process_dir / "exe"
+            executable_path = str(executable_link.resolve(strict=True))
+            executable_stat = executable_link.stat()
+            agent, _quality = _process_agent(
+                executable_path,
+                tokens,
+                {expected_agent},
+                trusted_paths,
+            )
+            if agent != expected_agent:
+                continue
+            descriptor = {
+                "agent": agent,
+                "boot": boot_id,
+                "exe": f"{executable_stat.st_dev:x}:{executable_stat.st_ino:x}",
+                "exe_path": hashlib.sha256(
+                    executable_path.encode("utf-8", "replace")
+                ).hexdigest()[:16],
+                "pid": pid,
+                "start": fields[19],
+                "terminal": terminal_id,
+                "tty": str(tty_number),
+            }
+            candidates.append(
+                HERDR_PROCESS_IDENTITY_PREFIX
+                + json.dumps(descriptor, sort_keys=True, separators=(",", ":"))
+            )
+        except (
+            FileNotFoundError,
+            PermissionError,
+            ProcessLookupError,
+            ValueError,
+            IndexError,
+            KeyError,
+            OSError,
+        ):
+            continue
+    if not candidates:
+        raise _binding_error(
+            "process_identity_missing",
+            "Herdr terminal has no trusted foreground agent process",
+        )
+    if len(candidates) != 1:
+        raise _binding_error(
+            "process_identity_ambiguous",
+            "Herdr terminal has multiple trusted foreground agent processes",
+        )
+    return candidates[0]
+
+
+def _herdr_agent_name(socket_path: str, terminal_id: str) -> str:
+    digest = hashlib.sha256(
+        (socket_path + "\0" + terminal_id).encode("utf-8")
+    ).hexdigest()[:16]
+    return "tether_" + digest
+
+
+def herdr_agent_identity(
+    socket_path: str,
+    pane_id: str,
+    session: str,
+    cwd: str = "",
+    config: Config | None = None,
+    *,
+    assign_name: bool = True,
+) -> dict[str, str]:
+    ping = _herdr_call(socket_path, "ping", {})
+    if (
+        ping.get("type") != "pong"
+        or ping.get("protocol") != HERDR_PROTOCOL_VERSION
+    ):
+        raise _binding_error(
+            "process_identity_unavailable",
+            "Herdr protocol is unsupported by this Tether runtime",
+        )
+    pane = _herdr_result_record(
+        _herdr_call(socket_path, "pane.get", {"pane_id": pane_id}),
+        result_type="pane_info",
+        field="pane",
+    )
+    agent = _herdr_result_record(
+        _herdr_call(socket_path, "agent.get", {"target": pane_id}),
+        result_type="agent_info",
+        field="agent",
+    )
+    terminal_id = str(agent.get("terminal_id") or "")
+    current_pane = str(agent.get("pane_id") or "")
+    pane_agent = str(agent.get("agent") or "")
+    if (
+        terminal_id != str(pane.get("terminal_id") or "")
+        or current_pane != str(pane.get("pane_id") or "")
+        or pane_agent not in {"codex", "claude"}
+        or agent.get("launch_pending") is True
+    ):
+        raise _binding_error(
+            "adapter_pane_mismatch",
+            "Herdr pane does not contain one supported live native agent",
+        )
+    native_session = agent.get("agent_session")
+    if not isinstance(native_session, dict):
+        raise _binding_error(
+            "binding_rebind_required",
+            "Herdr has no official native session reference; install its agent integration",
+        )
+    native_source = str(native_session.get("source") or "")
+    native_agent = str(native_session.get("agent") or "")
+    native_kind = str(native_session.get("kind") or "")
+    native_value = str(native_session.get("value") or "")
+    if native_agent != pane_agent or not all(
+        (native_source, native_kind, native_value)
+    ):
+        raise _binding_error(
+            "adapter_pane_mismatch",
+            "Herdr native session reference does not match the live agent",
+        )
+    agent_name = str(agent.get("name") or "")
+    if not agent_name and assign_name:
+        agent_name = _herdr_agent_name(socket_path, terminal_id)
+        agent = _herdr_result_record(
+            _herdr_call(
+                socket_path,
+                "agent.rename",
+                {"target": current_pane, "name": agent_name},
+            ),
+            result_type="agent_info",
+            field="agent",
+        )
+    expected_session = {
+        "source": native_source,
+        "agent": pane_agent,
+        "kind": native_kind,
+        "value": native_value,
+    }
+    if (
+        str(agent.get("name") or "") != agent_name
+        or str(agent.get("terminal_id") or "") != terminal_id
+        or str(agent.get("pane_id") or "") != current_pane
+        or str(agent.get("agent") or "") != pane_agent
+        or agent.get("agent_session") != expected_session
+        or agent.get("launch_pending") is True
+        or (assign_name and not HERDR_AGENT_NAME_PATTERN.fullmatch(agent_name))
+    ):
+        raise _binding_error(
+            "process_identity_unavailable",
+            "Herdr could not preserve the exact occupant-bound agent identity",
+        )
+    process_info = _herdr_result_record(
+        _herdr_call(
+            socket_path,
+            "pane.process_info",
+            {"pane_id": current_pane},
+        ),
+        result_type="pane_process_info",
+        field="process_info",
+    )
+    process_identity = _herdr_process_identity(
+        process_info,
+        terminal_id=terminal_id,
+        expected_agent=pane_agent,
+        config=config,
+    )
+    verified_agent = _herdr_result_record(
+        _herdr_call(
+            socket_path,
+            "agent.get",
+            {"target": agent_name or current_pane},
+        ),
+        result_type="agent_info",
+        field="agent",
+    )
+    if (
+        str(verified_agent.get("name") or "") != agent_name
+        or str(verified_agent.get("terminal_id") or "") != terminal_id
+        or str(verified_agent.get("pane_id") or "") != current_pane
+        or str(verified_agent.get("agent") or "") != pane_agent
+        or verified_agent.get("agent_session") != expected_session
+        or verified_agent.get("launch_pending") is True
+    ):
+        raise _binding_error(
+            "process_identity_changed",
+            "Herdr agent changed while its exact binding was captured",
+        )
+    return {
+        "cwd": cwd,
+        "pane_agent": pane_agent,
+        "process_identity": process_identity,
+        "herdr_session": session,
+        "herdr_socket_path": str(_validate_herdr_socket(socket_path)),
+        "herdr_terminal_id": terminal_id,
+        "herdr_pane_id": current_pane,
+        "herdr_agent_name": agent_name,
+        "herdr_agent_session_source": native_source,
+        "herdr_agent_session_kind": native_kind,
+        "herdr_agent_session_value": native_value,
+        "herdr_protocol": str(HERDR_PROTOCOL_VERSION),
+        "native_session_id": native_value,
+    }
+
+
+def _same_herdr_process_identity(left: str, right: str) -> bool:
+    """Compare one process incarnation while allowing Herdr handoff ID rotation."""
+    try:
+        left_identity = _parse_herdr_process_identity(left)
+        right_identity = _parse_herdr_process_identity(right)
+    except ValueError:
+        return False
+    return all(
+        left_identity[field] == right_identity[field]
+        for field in HERDR_PROCESS_IDENTITY_FIELDS - {"terminal"}
+    )
+
+
+def _current_herdr_agent(binding: SourceBinding) -> tuple[dict[str, Any], str]:
+    ping = _herdr_call(binding.herdr_socket_path, "ping", {})
+    if (
+        ping.get("type") != "pong"
+        or ping.get("protocol") != HERDR_PROTOCOL_VERSION
+    ):
+        raise _binding_error(
+            "process_identity_changed",
+            "Herdr protocol changed after this binding was captured",
+        )
+    agent = _herdr_result_record(
+        _herdr_call(
+            binding.herdr_socket_path,
+            "agent.get",
+            {"target": binding.herdr_agent_name},
+        ),
+        result_type="agent_info",
+        field="agent",
+    )
+    native_session = agent.get("agent_session")
+    expected_session = {
+        "source": binding.herdr_agent_session_source,
+        "agent": binding.pane_agent,
+        "kind": binding.herdr_agent_session_kind,
+        "value": binding.herdr_agent_session_value,
+    }
+    current_terminal = str(agent.get("terminal_id") or "")
+    if (
+        str(agent.get("name") or "") != binding.herdr_agent_name
+        or not HERDR_TERMINAL_ID_PATTERN.fullmatch(current_terminal)
+        or str(agent.get("agent") or "") != binding.pane_agent
+        or native_session != expected_session
+        or agent.get("launch_pending") is True
+    ):
+        raise _binding_error(
+            "process_identity_changed",
+            "captured Herdr terminal now hosts a different agent session",
+        )
+    current_pane = str(agent.get("pane_id") or "")
+    process_info = _herdr_result_record(
+        _herdr_call(
+            binding.herdr_socket_path,
+            "pane.process_info",
+            {"pane_id": current_pane},
+        ),
+        result_type="pane_process_info",
+        field="process_info",
+    )
+    process_identity = _herdr_process_identity(
+        process_info,
+        terminal_id=current_terminal,
+        expected_agent=binding.pane_agent,
+    )
+    if not _same_herdr_process_identity(process_identity, binding.process_identity):
+        raise _binding_error(
+            "process_identity_changed",
+            "captured Herdr terminal now hosts a different process incarnation",
+        )
+    return agent, current_pane
+
+
+def _live_attempt_instruction(
+    bridge: Bridge,
+    text: str,
+    attempt_id: str | None,
+) -> tuple[str, str]:
+    notifier = RUNTIME_HOME / "tether_notify.py"
+    marker = attempt_id or ("att_" + uuid.uuid4().hex[:24])
+    if not REPLY_KEY_PATTERN.fullmatch(marker):
+        raise ValueError("invalid live delivery attempt ID")
+    inbox_dir = RUNTIME_HOME / "inbox"
+    RUNTIME_HOME.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    security.secure_state_directory(RUNTIME_HOME, create=True)
+    security.secure_state_directory(inbox_dir, create=True)
+    now = time.time()
+    for pattern in ("att_*.txt", "tether-*.txt"):
+        for stale in inbox_dir.glob(pattern):
+            with contextlib.suppress(OSError):
+                if not stale.is_symlink() and now - stale.stat().st_mtime > 86_400:
+                    stale.unlink()
+    inbox_path = inbox_dir / f"{marker}.txt"
+    payload = text + "\n"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(inbox_path, flags, 0o600)
+    except FileExistsError:
+        if security.read_private_text(inbox_path) != payload:
+            raise NativeContinuationError(
+                "live delivery inbox already contains different content",
+                code="terminal_submit_uncertain",
+            )
+    else:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as inbox:
+            inbox.write(payload)
+    reply_command = (
+        f"python3 {shlex.quote(str(notifier))} reply "
+        f"--bridge-id {bridge.bridge_id} --reply-key {marker} --text-stdin"
+    )
+    instruction = (
+        f"[Hermes Slack follow-up batch; {marker}] Read and handle the complete request in "
+        f"{shlex.quote(str(inbox_path))}, then delete that file. "
+        "Handle it as one turn. Check the current thread/task state before responding. "
+        "Post at most one Slack message for this entire batch, only when a useful response is needed; "
+        "do not post a second status summary or courtesy acknowledgment. Default to 50 words and "
+        "3 sentences; exceed that only when necessary for a complete or safe answer. Never suppress "
+        "a useful answer solely to meet the length target. If no new response is needed, submit "
+        f"NO_REPLY. Provide the response on standard input, never in argv, to: {reply_command}"
+    )
+    return marker, instruction
+
+
+def interrupt_herdr(bridge: Bridge) -> None:
+    binding = require_deliverable_binding(bridge, "herdr_agent")
+    _current_herdr_agent(binding)
+    _herdr_call(
+        binding.herdr_socket_path,
+        "agent.send_keys",
+        {"target": binding.herdr_agent_name, "keys": ["ctrl+c"]},
+        mutation=True,
+    )
+    _current_herdr_agent(binding)
+
+
+def deliver_herdr(
+    bridge: Bridge,
+    text: str,
+    attempt_id: str | None = None,
+) -> str:
+    binding = require_deliverable_binding(bridge, "herdr_agent")
+    current_agent, _current_pane = _current_herdr_agent(binding)
+    current_terminal = str(current_agent.get("terminal_id") or "")
+    marker, instruction = _live_attempt_instruction(bridge, text, attempt_id)
+    result = _herdr_call(
+        binding.herdr_socket_path,
+        "agent.prompt",
+        {"target": binding.herdr_agent_name, "text": instruction},
+        mutation=True,
+    )
+    agent = _herdr_result_record(
+        result,
+        result_type="agent_prompted",
+        field="agent",
+    )
+    if (
+        str(agent.get("name") or "") != binding.herdr_agent_name
+        or str(agent.get("terminal_id") or "") != current_terminal
+        or str(agent.get("agent") or "") != binding.pane_agent
+    ):
+        raise NativeContinuationError(
+            "Herdr accepted the prompt but returned a different agent",
+            code="terminal_submit_uncertain",
+            binding_id=bridge.bridge_id,
+        )
+    try:
+        _current_herdr_agent(binding)
+    except Exception as exc:
+        raise NativeContinuationError(
+            "Herdr accepted the prompt but the exact agent could not be reverified",
+            code="terminal_submit_uncertain",
+            binding_id=bridge.bridge_id,
+        ) from exc
+    return marker
 
 
 def _pane_number(pane: str) -> int:
@@ -10210,8 +11104,25 @@ def deliver_zellij(
     write_accepted = False
     try:
         # Absolute executable; session and pane are argv, never shell text.
+        # Claude Code collapses one large synthetic terminal write into an
+        # opaque ``[Pasted text]`` placeholder. Verify the marker in the first
+        # bounded chunk before the rest of a long input scrolls it off-screen.
+        chunks = [
+            instruction[offset : offset + ZELLIJ_WRITE_CHUNK_CHARS]
+            for offset in range(0, len(instruction), ZELLIJ_WRITE_CHUNK_CHARS)
+        ]
         subprocess.run(  # nosec B603
-            [zellij, "--session", session, "action", "write-chars", "--pane-id", target, instruction],
+            [
+                zellij,
+                "--session",
+                session,
+                "action",
+                "write-chars",
+                "--pane-id",
+                target,
+                "--",
+                chunks[0],
+            ],
             check=True,
             timeout=10,
         )
@@ -10228,6 +11139,22 @@ def deliver_zellij(
         if marker not in staged.stdout:
             raise RuntimeError(
                 "Slack instruction was not visible in the captured Zellij pane"
+            )
+        for chunk in chunks[1:]:
+            subprocess.run(  # nosec B603
+                [
+                    zellij,
+                    "--session",
+                    session,
+                    "action",
+                    "write-chars",
+                    "--pane-id",
+                    target,
+                    "--",
+                    chunk,
+                ],
+                check=True,
+                timeout=10,
             )
     except Exception as exc:
         if write_accepted:
@@ -10265,7 +11192,16 @@ def deliver_zellij(
     try:
         time.sleep(0.5)
         submitted = subprocess.run(  # nosec B603
-            [zellij, "--session", session, "action", "dump-screen", "--pane-id", target],
+            [
+                zellij,
+                "--session",
+                session,
+                "action",
+                "dump-screen",
+                "--pane-id",
+                target,
+                "--full",
+            ],
             check=True,
             text=True,
             stdout=subprocess.PIPE,
@@ -10292,6 +11228,30 @@ def deliver_zellij(
             binding_id=bridge.bridge_id,
         ) from exc
     return marker
+
+
+def _discover_herdr_binary() -> str:
+    candidates = [
+        os.getenv("HERDR_BIN_PATH", ""),
+        shutil.which("herdr", path=_base_child_env().get("PATH")) or "",
+    ]
+    candidates.extend(
+        str(path)
+        for path in sorted(
+            (Path.home() / ".local" / "opt" / "herdr").glob("*/herdr"),
+            reverse=True,
+        )
+    )
+    for value in candidates:
+        if not value:
+            continue
+        candidate = Path(value).expanduser()
+        try:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate.resolve(strict=True))
+        except (FileNotFoundError, PermissionError, OSError):
+            continue
+    return ""
 
 
 def doctor() -> tuple[bool, list[str]]:
@@ -10368,6 +11328,43 @@ def doctor() -> tuple[bool, list[str]]:
         else:
             ok = False
             checks.append(f"FAIL {label} missing")
+    herdr_binary = _discover_herdr_binary()
+    if not herdr_binary:
+        checks.append("WARN Herdr client unavailable; Herdr live bindings are disabled")
+    else:
+        try:
+            result = subprocess.run(  # nosec B603
+                [herdr_binary, "api", "schema", "--json"],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+            )
+            schema = json.loads(result.stdout)
+            if schema.get("protocol") != HERDR_PROTOCOL_VERSION:
+                ok = False
+                checks.append(
+                    f"FAIL Herdr protocol={schema.get('protocol', 'unknown')}; "
+                    f"expected {HERDR_PROTOCOL_VERSION}"
+                )
+            else:
+                checks.append(
+                    f"ok Herdr client protocol={HERDR_PROTOCOL_VERSION} available"
+                )
+        except Exception as exc:
+            ok = False
+            checks.append(f"FAIL Herdr client check: {safe_error(exc)}")
+    ambient_herdr_socket = os.getenv("HERDR_SOCKET_PATH", "")
+    if ambient_herdr_socket:
+        try:
+            ping = _herdr_call(ambient_herdr_socket, "ping", {})
+            if ping.get("protocol") != HERDR_PROTOCOL_VERSION:
+                raise ValueError("ambient Herdr protocol mismatch")
+            checks.append("ok current Herdr session socket is private and compatible")
+        except Exception as exc:
+            ok = False
+            checks.append(f"FAIL current Herdr session: {safe_error(exc)}")
     try:
         hermes_checkout = HERMES_HOME / "hermes-agent"
         if hermes_checkout.is_dir() and str(hermes_checkout) not in sys.path:

@@ -20,29 +20,43 @@ other than 0.19.0 and fails closed when the Slack adapter contract differs.
 Use an immutable published package:
 
 ```bash
-npx --yes --package=@parcha/tether@0.2.0-beta.1 \
-  tether setup --harness=both
+npx --yes --package=@parcha/tether@0.3.0-beta.1 \
+  tether setup --harness=both --herdr
 ```
 
-Use `--harness=codex` or `--harness=claude-code` for one harness. For a source
-install, replace `<verified-release-commit-sha>` with the full 40-character
+Use `--harness=codex` or `--harness=claude-code` for one harness. Omit
+`--herdr` on a host that uses only Zellij or detached native sessions. The
+coordinated path links the plugin from the exact managed package payload.
+For a source install, replace `<verified-release-commit-sha>` with the full 40-character
 commit from the matching GitHub release:
 
 ```bash
 TETHER_COMMIT="<verified-release-commit-sha>"
 npx --yes \
   --package="github:Parcha-ai/parcha-skills#$TETHER_COMMIT" \
-  tether setup --harness=both
+  tether setup --harness=both --herdr
 ```
 
 Do not install from `main`. The Agent Plugins marketplace manifest also uses a
 full source commit. Maintainers update that pin only after completing the
 procedure in the package's `docs/RELEASE.md`.
 
+When Tether core is already installed, install only the Herdr package from the
+same reviewed source commit:
+
+```bash
+herdr plugin install Parcha-ai/parcha-skills/tether/herdr-plugin \
+  --ref "$TETHER_COMMIT"
+```
+
 `setup` installs the runtime and skills, enables the Tether Hermes plugin,
 disables the legacy `session-bridge` plugin when present, configures Hermes bot
 ingress for mention-aware routing, disables busy acknowledgments, opens Hermes
 Slack setup, restarts the gateway, and runs readiness checks.
+
+The Herdr package has its own `herdr-plugin.toml`. It provides actions, a
+Slack-link handler, and a popup cockpit, but delegates credentials, routing,
+queues, and delivery to the same Tether broker.
 
 Slack setup remains manual: create or update the app from Hermes's generated
 manifest, install it to the workspace, create the Socket Mode app token, and
@@ -92,6 +106,9 @@ ${XDG_CONFIG_HOME:-~/.config}/tether/config.toml
 
 Use it for `default_channel`, `default_owner`, `team_id`, `allowed_users`,
 reply style targets, retention, native resume arguments, and Zellij agent commands.
+Herdr needs no Tether configuration key; install Herdr's official Codex or
+Claude integration so its API exposes the native session reference, then run
+`tether doctor` from the Herdr session.
 Keep one Slack app/workspace identity per Tether instance and database.
 
 Resumed Codex and Claude Code processes receive a minimal environment. For
@@ -117,8 +134,8 @@ remains the operator's responsibility.
 Generate the Slack manifest without opening the interactive flow:
 
 ```bash
-npx --yes --package=@parcha/tether@0.2.0-beta.1 \
-  tether setup --harness=both --non-interactive
+npx --yes --package=@parcha/tether@0.3.0-beta.1 \
+  tether setup --harness=both --herdr --non-interactive
 hermes gateway setup
 hermes gateway start
 tether doctor

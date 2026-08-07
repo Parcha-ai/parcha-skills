@@ -1,6 +1,8 @@
 import asyncio
 import concurrent.futures
+import hashlib
 import importlib.util
+import json
 import pathlib
 import sys
 import tempfile
@@ -652,6 +654,45 @@ class PluginAttemptRecoveryTest(unittest.TestCase):
             },
         )
 
+    def _herdr_bridge(self, key: str):
+        terminal_id = "term_6583153c2a1b81"
+        identity = "herdr-proc-v1:" + json.dumps(
+            {
+                "agent": "codex",
+                "boot": "00000000-0000-4000-8000-000000000001",
+                "exe": "1:2",
+                "exe_path": hashlib.sha256(
+                    b"/opt/codex/bin/codex"
+                ).hexdigest()[:16],
+                "pid": 200,
+                "start": "20000",
+                "terminal": terminal_id,
+                "tty": "34823",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        session_id = f"{key}-session"
+        return self._bridge(
+            key,
+            "codex_session",
+            {
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "pane_agent": "codex",
+                "process_identity": identity,
+                "herdr_session": "pilot",
+                "herdr_socket_path": "/tmp/herdr-pilot.sock",
+                "herdr_terminal_id": terminal_id,
+                "herdr_pane_id": "w1:p1",
+                "herdr_agent_name": "tether_0123456789abcdef",
+                "herdr_agent_session_source": "codex_notify",
+                "herdr_agent_session_kind": "thread_id",
+                "herdr_agent_session_value": session_id,
+                "herdr_protocol": "19",
+            },
+        )
+
     def _claimed_item(self, bridge, event_id: str):
         self.assertTrue(
             self.plugin.store.enqueue_event(
@@ -708,6 +749,78 @@ class PluginAttemptRecoveryTest(unittest.TestCase):
                 (event_id,),
             ).fetchone()[0]
         self.assertEqual(state, "failed")
+
+    def test_bound_herdr_submission_uses_herdr_attempt_ledger(self):
+        bridge = self._herdr_bridge("herdr-submit")
+        event_id = "1785000100.000199"
+        items = self._claimed_item(bridge, event_id)
+        with mock.patch.object(
+            self.plugin,
+            "deliver_herdr",
+            return_value="att_marker",
+        ) as deliver, mock.patch.object(
+            self.plugin,
+            "deliver_zellij",
+        ) as zellij:
+            attempt_id = self.plugin._submit_live_attempt(
+                bridge,
+                items,
+                "continue",
+            )
+        deliver.assert_called_once_with(bridge, "continue", attempt_id)
+        zellij.assert_not_called()
+        active = self.plugin.store.active_live_attempt(
+            bridge.bridge_id,
+            "herdr",
+        )
+        self.assertEqual(active["attempt_id"], attempt_id)
+        self.assertEqual(active["delivery_kind"], "herdr")
+        with self.plugin.store.connect() as database:
+            delivery_kind = database.execute(
+                "SELECT delivery_kind FROM bridge_attempts WHERE attempt_id=?",
+                (attempt_id,),
+            ).fetchone()[0]
+        self.assertEqual(delivery_kind, "herdr")
+
+    def test_bound_herdr_cancel_interrupts_and_closes_exact_attempt(self):
+        bridge = self._herdr_bridge("herdr-cancel")
+        event_id = "1785000100.000299"
+        items = self._claimed_item(bridge, event_id)
+        attempt_id = self.runtime.delivery_attempt_id(
+            bridge.bridge_id,
+            [item["event_id"] for item in items],
+            bridge.binding_generation,
+        )
+        self.assertTrue(
+            self.plugin.store.prepare_delivery_attempt(
+                [event_id],
+                bridge.bridge_id,
+                bridge.binding_generation,
+                attempt_id,
+                delivery_kind="herdr",
+            )
+        )
+        self.assertTrue(
+            self.plugin.store.mark_attempt_awaiting_ack(
+                attempt_id,
+                bridge.bridge_id,
+                bridge.binding_generation,
+            )
+        )
+        with mock.patch.object(
+            self.plugin,
+            "interrupt_herdr",
+        ) as interrupt:
+            cancelled = self.plugin._interrupt_active_live_attempt(bridge)
+        interrupt.assert_called_once_with(bridge)
+        self.assertEqual(cancelled, 1)
+        self.assertIsNone(
+            self.plugin.store.active_live_attempt(bridge.bridge_id, "herdr")
+        )
+        self.assertEqual(
+            self.plugin.store.attempt_state(attempt_id, bridge.bridge_id),
+            "cancelled",
+        )
 
     def test_crash_before_zellij_injection_is_recoverable(self):
         bridge = self._zellij_bridge("pre-injection")
