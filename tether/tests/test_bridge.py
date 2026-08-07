@@ -1528,6 +1528,10 @@ class CredentialBoundaryTest(unittest.TestCase):
         self.assertGreater(len([
             command for command in commands if "write-chars" in command
         ]), 1)
+        self.assertTrue(all(
+            command[-2] == "--"
+            for command in commands if "write-chars" in command
+        ))
         self.assertEqual(len(dump_snapshots), 2)
         self.assertLessEqual(
             len(dump_snapshots[0]),
