@@ -25,6 +25,7 @@ from recall_server.agent import (  # noqa: E402
     service_from_env,
 )
 from recall_server.app import Handler  # noqa: E402
+from recall_server.deep_inspection import DeepInspectionError  # noqa: E402
 from agent_fakes import ScriptedAgentRunner  # noqa: E402
 
 
@@ -840,6 +841,35 @@ class AgentFacadeUnitTest(unittest.TestCase):
             "timeout_seconds": 10,
         })
         self.assertEqual(retrieval.calls[-1][2], ("ldoc_" + "2" * 32,))
+
+    def test_deep_inspection_failure_keeps_its_safe_typed_code(self) -> None:
+        class UnavailableDeepInspection(FakeBoundRetrieval):
+            def execute_agent_program(self, *args, **kwargs):
+                del args, kwargs
+                raise DeepInspectionError("deep_inspector_object_unavailable")
+
+        tools = ConstrainedAgentTools(
+            UnavailableDeepInspection(),
+            DelegationContext.from_principal(principal()),
+        )
+        tools.call("recall.hints", {
+            "query": "synthetic work",
+            "filters": {},
+            "limit": 1,
+        })
+        with self.assertRaises(AgentExecutionError) as caught:
+            tools.call("recall.exec", {
+                "program": "true",
+                "timeout_seconds": 10,
+            })
+        self.assertEqual(
+            caught.exception.code,
+            "deep_inspector_object_unavailable",
+        )
+        self.assertEqual(
+            tools.observations[-1]["error_code"],
+            "deep_inspector_object_unavailable",
+        )
 
     def test_agent_map_rejects_duplicate_partition_labels(self) -> None:
         tools = ConstrainedAgentTools(
