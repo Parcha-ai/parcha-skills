@@ -429,6 +429,14 @@ class Worker {
     try {
       await agent.prompt(promptText(start));
       await agent.waitForIdle();
+      if (!this.finished && failureCode === "pi_agent_failed") {
+        await agent.prompt(
+          "You ended without calling finish. Call finish now with the grounded answer "
+          + "supported by already opened receipts, or with the precise evidence gap. "
+          + "Do not write another plain-text response and do not call any other tool.",
+        );
+        await agent.waitForIdle();
+      }
       if (!this.finished) {
         if (failureCode === "pi_agent_failed") failureCode = "pi_finish_missing";
         throw new Error("agent ended without a grounded finish");
