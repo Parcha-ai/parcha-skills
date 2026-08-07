@@ -808,8 +808,17 @@ class DeepInspectionContractTests(unittest.TestCase):
             },
         )
         command = call["body"]["command"]
+        self.assertEqual(call["timeout"], 55)
         self.assertNotIn(hostile, command)
         self.assertIn("unshare --user --map-root-user --net", command)
+        self.assertNotIn(
+            "timeout --signal=KILL 10s unshare",
+            command,
+        )
+        self.assertIn(
+            "timeout --signal=KILL 10s bash /tmp/recall-agent/program.sh",
+            command,
+        )
         self.assertIn(
             "mount --rbind /tmp/recall-authorized /mnt/archil/evidence",
             command,
