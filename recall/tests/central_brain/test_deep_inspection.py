@@ -8,7 +8,9 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 from pathlib import Path
+from unittest import mock
 
 from recall_server.archive import FilesystemArchiveStore
 from recall_server.agent_scan import AGENT_SCAN_SCRIPT
@@ -19,6 +21,7 @@ from recall_server.deep_inspection import (
     DeepInspectionError,
     EvidenceTarget,
     LocalDeepInspector,
+    UrllibTransport,
     agent_evidence_receipts,
 )
 from recall_server.evidence_projection import (
@@ -69,6 +72,40 @@ class RecordingTransport:
 
 
 class DeepInspectionContractTests(unittest.TestCase):
+    def test_archil_http_failures_keep_only_safe_status_classes(self):
+        expected = {
+            401: "deep_inspector_authentication_failed",
+            403: "deep_inspector_authentication_failed",
+            409: "deep_inspector_busy",
+            413: "deep_inspector_request_too_large",
+            429: "deep_inspector_rate_limited",
+            503: "deep_inspector_upstream_failed",
+            422: "deep_inspector_request_rejected",
+        }
+        for status, code in expected.items():
+            with (
+                self.subTest(status=status),
+                mock.patch(
+                    "urllib.request.urlopen",
+                    side_effect=urllib.error.HTTPError(
+                        "https://control.invalid/api/exec",
+                        status,
+                        "private provider detail",
+                        {},
+                        None,
+                    ),
+                ),
+                self.assertRaises(DeepInspectionError) as caught,
+            ):
+                UrllibTransport().post(
+                    url="https://control.invalid/api/exec",
+                    headers={"Authorization": "synthetic"},
+                    body={"command": "true"},
+                    timeout=1,
+                )
+            self.assertEqual(caught.exception.code, code)
+            self.assertNotIn("private provider detail", str(caught.exception))
+
     @staticmethod
     def _write_scan_fixture(
         root: Path,
