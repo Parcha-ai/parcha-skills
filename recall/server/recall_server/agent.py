@@ -940,8 +940,8 @@ class RecallAgentService:
             },
             "normal": {
                 "max_tool_calls": 12,
-                "max_hint_calls": 3,
-                "max_exec_calls": 4,
+                "max_hint_calls": 6,
+                "max_exec_calls": 6,
                 "max_find_seconds": 15,
                 "max_exec_seconds": 20,
             },
