@@ -25,6 +25,7 @@ REGION_ENDPOINTS = {
 MAX_TRANSPORT_BYTES = 256 * 1024
 MAX_AGENT_PROGRAM_BYTES = 16_000
 MAX_AGENT_EXEC_OUTPUT_BYTES = 40_000
+AGENT_EXEC_STAGE_GRACE_SECONDS = 45
 RECEIPT_TOKEN_PATTERN = (
     r"recall://[A-Za-z0-9:._@+-]+/[^\s\"'<>()[\]{},;]{1,1900}"
 )
@@ -377,6 +378,7 @@ for document_id,alias in aliases.items():
             "LC_ALL=C bash -c "
             + shlex.quote(
                 "set -o pipefail; "
+                f"timeout --signal=KILL {timeout_seconds}s "
                 "bash /tmp/recall-agent/program.sh | "
                 f"head -c {MAX_AGENT_EXEC_OUTPUT_BYTES}; "
                 "code=${PIPESTATUS[0]}; "
@@ -410,7 +412,6 @@ for document_id,alias in aliases.items():
         "chmod 0500 /tmp/recall-agent/recall-scan",
         "chmod 0400 /tmp/recall-agent/pointers.json",
         (
-            f"timeout --signal=KILL {timeout_seconds}s "
             "unshare --user --map-root-user --net --mount --pid --fork "
             "--mount-proc sh -c "
             + shlex.quote(inner_command)
@@ -660,7 +661,7 @@ class ArchilDeepInspector:
                     timeout_seconds=timeout_seconds,
                 ),
             },
-            timeout=timeout_seconds + 4,
+            timeout=timeout_seconds + AGENT_EXEC_STAGE_GRACE_SECONDS,
         )
         if (
             not isinstance(response, dict)
