@@ -275,7 +275,7 @@ class AgentFacadeUnitTest(unittest.TestCase):
     def test_request_depth_selects_host_owned_latency_bounds(self) -> None:
         expected = {
             "quick": (8, 3, 1, 8, 10),
-            "normal": (8, 2, 2, 8, 12),
+            "normal": (12, 3, 4, 15, 20),
             "deep": (12, 6, 6, 20, 30),
         }
         for depth, bounds in expected.items():
@@ -408,7 +408,7 @@ class AgentFacadeUnitTest(unittest.TestCase):
             "timeout_seconds": 30,
         })
         self.assertEqual(retrieval.calls[-1][0], "exec")
-        self.assertEqual(retrieval.calls[-1][-1], 12)
+        self.assertEqual(retrieval.calls[-1][-1], 20)
 
     def test_normal_depth_clamps_find_below_client_timeout(self) -> None:
         _, context = service().prepare(principal(), REQUEST)
@@ -426,7 +426,7 @@ class AgentFacadeUnitTest(unittest.TestCase):
             "limit": 6,
         })
         self.assertEqual(retrieval.calls[-1][0], "find")
-        self.assertEqual(retrieval.calls[-1][1]["timeout_seconds"], 8)
+        self.assertEqual(retrieval.calls[-1][1]["timeout_seconds"], 15)
 
     def test_exec_requires_an_admitted_hint_document(self) -> None:
         tools = ConstrainedAgentTools(
