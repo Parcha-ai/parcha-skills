@@ -137,7 +137,6 @@ class ConstrainedAgentTools:
     )
     TOOL_CALL_LIMITS = {
         "recall.hints": 6,
-        "recall.map": 2,
         "recall.find": 6,
         "recall.open": 10,
         "recall.exec": 6,

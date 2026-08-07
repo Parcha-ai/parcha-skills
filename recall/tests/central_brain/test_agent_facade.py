@@ -769,6 +769,32 @@ class AgentFacadeUnitTest(unittest.TestCase):
         self.assertEqual(retrieval.calls[-1][0], "exec")
         self.assertEqual(len(retrieval.calls[-1][2]), 18)
 
+    def test_agent_can_replan_maps_within_the_global_budget(self) -> None:
+        context = dataclasses.replace(
+            DelegationContext.from_principal(principal()),
+            budget=AgentBudget(max_tool_calls=4),
+        )
+        tools = ConstrainedAgentTools(FakeBoundRetrieval(), context)
+        arguments = {
+            "partitions": [
+                {
+                    "label": "first",
+                    "query": "first evidence need",
+                    "filters": {},
+                    "limit": 1,
+                },
+                {
+                    "label": "second",
+                    "query": "second evidence need",
+                    "filters": {},
+                    "limit": 1,
+                },
+            ],
+        }
+        for _ in range(3):
+            tools.call("recall.map", arguments)
+        self.assertEqual(len(tools.observations), 3)
+
     def test_agent_map_returns_compact_pointers_not_full_hint_bodies(self) -> None:
         class NoisyPartitionRetrieval(FakeBoundRetrieval):
             def passage_hints(self, query, *, filters, limit):
