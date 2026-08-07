@@ -648,6 +648,7 @@ class SimpleAgentKernelTest(unittest.TestCase):
             map_tool["description"],
         )
         self.assertIn("coverage grid", map_tool["description"])
+        self.assertIn("`person_relation` set to `contributor`", map_tool["description"])
         self.assertIn("batch-open", map_tool["description"])
         self.assertIn("partition label", map_tool["description"])
 
