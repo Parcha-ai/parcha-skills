@@ -709,7 +709,7 @@ class PiSubprocessBoundaryTest(unittest.TestCase):
         (SERVER / "pi-agent" / "dist" / "worker.js").is_file(),
         "build server/pi-agent before the direct worker integration test",
     )
-    def test_direct_pi_worker_runs_open_then_grounded_finish(self):
+    def test_direct_pi_worker_repairs_repeated_plain_text_then_finishes(self):
         calls = []
 
         class ModelHandler(BaseHTTPRequestHandler):
@@ -729,7 +729,7 @@ class PiSubprocessBoundaryTest(unittest.TestCase):
                         "record_ordinal": 80,
                         "page_bytes": 32768,
                     }
-                elif index == 1:
+                elif index in {1, 2}:
                     chunks = [
                         {
                             "id": f"chatcmpl-{index}",
@@ -768,7 +768,7 @@ class PiSubprocessBoundaryTest(unittest.TestCase):
                         }],
                         "gaps": [],
                     }
-                if index != 1:
+                if index not in {1, 2}:
                     chunks = [
                         {
                             "id": f"chatcmpl-{index}",
@@ -839,6 +839,7 @@ class PiSubprocessBoundaryTest(unittest.TestCase):
         self.assertEqual(result["result"]["status"], "complete")
         self.assertEqual(result["result"]["citations"], [DECISION])
         self.assertEqual(calls, [
+            "/v1/chat/completions",
             "/v1/chat/completions",
             "/v1/chat/completions",
             "/v1/chat/completions",
