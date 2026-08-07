@@ -492,6 +492,7 @@ class AgentFacadeUnitTest(unittest.TestCase):
         })
         result = tools.call("recall.open", {
             "items": [{
+                "label": "exact synthetic record",
                 "alias": "d1",
                 "cursor": None,
                 "record_ordinal": 13,
@@ -557,6 +558,7 @@ class AgentFacadeUnitTest(unittest.TestCase):
         result = tools.call("recall.open", {
             "items": [
                 {
+                    "label": f"partition for {alias}",
                     "alias": alias,
                     "cursor": None,
                     "record_ordinal": 11,
@@ -568,6 +570,10 @@ class AgentFacadeUnitTest(unittest.TestCase):
         self.assertEqual(
             [item["status"] for item in result["documents"]],
             ["ok", "ok"],
+        )
+        self.assertEqual(
+            [item["label"] for item in result["documents"]],
+            [f"partition for {alias}" for alias in aliases],
         )
         self.assertEqual(result["failed_documents"], 0)
         self.assertEqual(len(result["opened_receipts"]), 2)
@@ -590,6 +596,7 @@ class AgentFacadeUnitTest(unittest.TestCase):
         with self.assertRaises(AgentExecutionError) as caught:
             tools.call("recall.open", {
                 "items": [{
+                    "label": "invalid exact record",
                     "alias": "d1",
                     "cursor": "0:0:0",
                     "record_ordinal": 13,

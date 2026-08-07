@@ -103,7 +103,8 @@ AGENT_MAP_GUIDANCE = (
     "narrower filters. Use short labels and usually two candidates per "
     "partition. This is a map of where evidence may live, not an answer and "
     "not citable evidence. After mapping, batch-open the strongest suggested "
-    "record from one plausible candidate per requested partition. This gives "
+    "record from one plausible candidate per requested partition, copying the "
+    "partition label into each open item so actor/date attribution stays attached. This gives "
     "broad activity questions a bounded evidence sample without serial tool "
     "calls. Use find or exec only for partitions whose samples are unclear."
 )
@@ -1206,7 +1207,9 @@ def _tool_definitions(
             "description": (
                 "Open complete content from one or more admitted document aliases "
                 "in one batch. For broad questions, include one plausible alias "
-                "per requested partition rather than making serial calls. Start "
+                "per requested partition and copy that partition's map label into "
+                "the open item. The label is echoed beside the opened evidence so "
+                "actor and date attribution are not lost. Start "
                 "with cursor=null: when embedding hints supplied record spans, "
                 "record_ordinal=null begins at the strongest hinted record; "
                 "otherwise it begins at the document start. To open another exact "
@@ -1235,6 +1238,11 @@ def _tool_definitions(
                         ),
                         "items": _object_schema(
                             {
+                                "label": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 80,
+                                },
                                 "alias": {
                                     "type": "string",
                                     "pattern": "^d[1-9][0-9]?$",
@@ -1267,6 +1275,7 @@ def _tool_definitions(
                                 },
                             },
                             [
+                                "label",
                                 "alias",
                                 "cursor",
                                 "record_ordinal",

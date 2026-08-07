@@ -314,6 +314,7 @@ class SimpleAgentKernelTest(unittest.TestCase):
                     pass
                 invoke("open", {
                     "items": [{
+                        "label": "bounded bridge decision",
                         "alias": "d1",
                         "cursor": None,
                         "record_ordinal": 80,
@@ -355,6 +356,7 @@ class SimpleAgentKernelTest(unittest.TestCase):
     def test_terminal_failure_codes_and_partial_trace_are_content_free(self):
         open_arguments = {
             "items": [{
+                "label": "terminal failure evidence",
                 "alias": "d1",
                 "cursor": None,
                 "record_ordinal": 80,
@@ -642,6 +644,7 @@ class SimpleAgentKernelTest(unittest.TestCase):
         self.assertIn("host-verified actor attribution", map_tool["description"])
         self.assertIn("do not grep for the person's name", map_tool["description"])
         self.assertIn("batch-open", map_tool["description"])
+        self.assertIn("partition label", map_tool["description"])
 
     def test_explicit_scope_is_a_host_ceiling(self):
         script = success_script()
@@ -737,6 +740,7 @@ class SimpleAgentKernelTest(unittest.TestCase):
                 assert not cancelled()
                 invoke("open", {
                     "items": [{
+                        "label": "bounded bridge decision",
                         "alias": "d1",
                         "cursor": None,
                         "record_ordinal": 80,
@@ -863,6 +867,7 @@ class PiSubprocessBoundaryTest(unittest.TestCase):
                     name = "open"
                     arguments = {
                         "items": [{
+                            "label": "bounded bridge decision",
                             "alias": "d1",
                             "cursor": None,
                             "record_ordinal": 80,
