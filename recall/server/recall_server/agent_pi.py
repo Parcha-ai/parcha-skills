@@ -102,8 +102,10 @@ AGENT_MAP_GUIDANCE = (
     "Each partition is an ordinary high-recall pointer query with its own "
     "narrower filters. Use short labels and usually two candidates per "
     "partition. This is a map of where evidence may live, not an answer and "
-    "not citable evidence. After mapping, select a focused alias batch for "
-    "find or exec rather than issuing serial searches or mounting every hit."
+    "not citable evidence. After mapping, batch-open the strongest suggested "
+    "record from one plausible candidate per requested partition. This gives "
+    "broad activity questions a bounded evidence sample without serial tool "
+    "calls. Use find or exec only for partitions whose samples are unclear."
 )
 AGENT_EXEC_GUIDANCE = (
     "Each admitted document has a stable read-only directory such as "
@@ -148,8 +150,8 @@ AGENT_INVESTIGATOR_GUIDANCE = (
     "Do not substitute a coarser partition merely because it uses fewer calls. Then "
     "transition to find, open, or exec over admitted full documents for "
     "precise evidence. Treat each matching range as an exact record pointer: "
-    "open the strongest suggested record from each plausible candidate before "
-    "searching whole documents, and do not substitute a nearby record merely "
+    "batch-open the strongest suggested record from each plausible candidate "
+    "before searching whole documents, and do not substitute a nearby record merely "
     "because it is topically related. If two distinct searches plus three "
     "opened records still provide no direct support, stop and report the "
     "precise evidence gap instead of wandering. Continue until evidence is "
@@ -1202,13 +1204,15 @@ def _tool_definitions(
         {
             "name": "open",
             "description": (
-                "Open complete content from one admitted document alias. Start "
+                "Open complete content from one or more admitted document aliases "
+                "in one batch. For broad questions, include one plausible alias "
+                "per requested partition rather than making serial calls. Start "
                 "with cursor=null: when embedding hints supplied record spans, "
-                "this begins at the strongest hinted record; otherwise it begins "
-                "at the document start. To open any other exact record exposed "
-                "in a search matching range, pass its record_ordinal with "
-                "cursor=null. Prefer page_bytes=32768 for an exact suggested "
-                "record so short and medium records arrive complete. "
+                "record_ordinal=null begins at the strongest hinted record; "
+                "otherwise it begins at the document start. To open another exact "
+                "record exposed in a matching range, pass its record_ordinal with "
+                "cursor=null. Prefer page_bytes=8192 for a broad sample and 32768 "
+                "when one exact record needs its complete content. "
                 "A matching range's receipts describe its listed spans "
                 "collectively; when a plausible range lists multiple spans, "
                 "open each listed record before rejecting that range. "
@@ -1221,42 +1225,57 @@ def _tool_definitions(
             ),
             "input_schema": _object_schema(
                 {
-                    "alias": {
-                        "type": "string",
-                        "pattern": "^d[1-9][0-9]?$",
-                    },
-                    "cursor": {
-                        "anyOf": [
+                    "items": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "description": (
+                            "Records to open together. Keep total page_bytes "
+                            "at or below 262144."
+                        ),
+                        "items": _object_schema(
                             {
-                                "type": "string",
-                                "pattern": (
-                                    "^\\d{1,6}:\\d{1,12}:\\d{1,12}$"
-                                ),
+                                "alias": {
+                                    "type": "string",
+                                    "pattern": "^d[1-9][0-9]?$",
+                                },
+                                "cursor": {
+                                    "anyOf": [
+                                        {
+                                            "type": "string",
+                                            "pattern": (
+                                                "^\\d{1,6}:\\d{1,12}:"
+                                                "\\d{1,12}$"
+                                            ),
+                                        },
+                                        {"type": "null"},
+                                    ],
+                                },
+                                "record_ordinal": {
+                                    "anyOf": [
+                                        {
+                                            "type": "integer",
+                                            "minimum": 0,
+                                        },
+                                        {"type": "null"},
+                                    ],
+                                },
+                                "page_bytes": {
+                                    "type": "integer",
+                                    "minimum": 1024,
+                                    "maximum": 32768,
+                                },
                             },
-                            {"type": "null"},
-                        ],
-                    },
-                    "record_ordinal": {
-                        "anyOf": [
-                            {
-                                "type": "integer",
-                                "minimum": 0,
-                            },
-                            {"type": "null"},
-                        ],
-                    },
-                    "page_bytes": {
-                        "type": "integer",
-                        "minimum": 1024,
-                        "maximum": 32768,
+                            [
+                                "alias",
+                                "cursor",
+                                "record_ordinal",
+                                "page_bytes",
+                            ],
+                        ),
                     },
                 },
-                [
-                    "alias",
-                    "cursor",
-                    "record_ordinal",
-                    "page_bytes",
-                ],
+                ["items"],
             ),
             **common,
         },
