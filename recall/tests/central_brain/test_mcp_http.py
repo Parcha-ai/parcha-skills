@@ -640,7 +640,14 @@ class RemoteMcpContractTest(unittest.TestCase):
                         )
                         self.assertEqual(status, 200)
                         metadata = json.loads(raw)
-                        self.assertEqual(metadata["resource"], resource)
+                        expected_resource = (
+                            f"{resource}/brains/tenant:company:parcha"
+                            if metadata_path.endswith(
+                                "/mcp/brains/tenant:company:parcha"
+                            )
+                            else resource
+                        )
+                        self.assertEqual(metadata["resource"], expected_resource)
                         self.assertEqual(metadata["scopes_supported"], ["read"])
                         self.assertEqual(
                             metadata["authorization_servers"],
@@ -666,6 +673,21 @@ class RemoteMcpContractTest(unittest.TestCase):
                     "Bearer resource_metadata=\""
                     "https://recall.synthetic.invalid/"
                     ".well-known/oauth-protected-resource/mcp\", scope=\"read\"",
+                )
+
+                status, headers, _ = server.request(
+                    "POST",
+                    request("ping"),
+                    path="/mcp/brains/tenant:company:parcha",
+                    token=None,
+                )
+                self.assertEqual(status, 401)
+                self.assertEqual(
+                    headers["www-authenticate"],
+                    "Bearer resource_metadata=\""
+                    "https://recall.synthetic.invalid/"
+                    ".well-known/oauth-protected-resource/mcp/brains/"
+                    "tenant:company:parcha\", scope=\"read\"",
                 )
 
                 status, _, raw = server.request(

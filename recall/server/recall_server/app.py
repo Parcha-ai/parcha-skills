@@ -420,8 +420,10 @@ class Handler(BaseHTTPRequestHandler):
             )
             if not credential and self.external_identity_verifier is not None:
                 try:
+                    request_resource = self.mcp_resource_uri(requested_tenant)
                     claims = self.external_identity_verifier.verify(
-                        authorization.removeprefix("Bearer ").strip()
+                        authorization.removeprefix("Bearer ").strip(),
+                        audience=request_resource,
                     )
                 except Exception as error:
                     LOG.warning(
@@ -429,7 +431,7 @@ class Handler(BaseHTTPRequestHandler):
                         type(error).__name__,
                     )
                     return None
-                resource = os.environ.get("RECALL_MCP_RESOURCE_URI", "").rstrip("/")
+                resource = self.mcp_resource_uri()
                 if claims is not None and claims.valid_for(resource):
                     credential = self.store.resolve_external_identity(
                         issuer=claims.issuer,
@@ -571,7 +573,7 @@ class Handler(BaseHTTPRequestHandler):
             urlsplit(self.path).path == "/mcp"
             or MCP_BRAIN_PATH.fullmatch(urlsplit(self.path).path)
         ):
-            resource = os.environ.get("RECALL_MCP_RESOURCE_URI", "").rstrip("/")
+            resource = self.mcp_resource_uri(requested_tenant)
             if resource:
                 metadata = self.protected_resource_metadata_uri(resource)
                 headers = [
@@ -591,6 +593,13 @@ class Handler(BaseHTTPRequestHandler):
         return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
 
     @staticmethod
+    def mcp_resource_uri(requested_tenant: str | None = None) -> str:
+        resource = os.environ.get("RECALL_MCP_RESOURCE_URI", "").rstrip("/")
+        if not resource or requested_tenant is None:
+            return resource
+        return f"{resource}/brains/{requested_tenant}"
+
+    @staticmethod
     def is_protected_resource_metadata_path(path: str, resource: str) -> bool:
         if not resource:
             return False
@@ -606,8 +615,10 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     @staticmethod
-    def protected_resource_metadata() -> dict[str, object]:
-        resource = os.environ.get("RECALL_MCP_RESOURCE_URI", "").rstrip("/")
+    def protected_resource_metadata(
+        requested_tenant: str | None = None,
+    ) -> dict[str, object]:
+        resource = Handler.mcp_resource_uri(requested_tenant)
         servers = [
             value.strip().rstrip("/")
             for value in os.environ.get(
@@ -837,7 +848,16 @@ class Handler(BaseHTTPRequestHandler):
             return
         resource = os.environ.get("RECALL_MCP_RESOURCE_URI", "").rstrip("/")
         if self.is_protected_resource_metadata_path(parsed.path, resource):
-            self.send_json(200, self.protected_resource_metadata())
+            metadata_resource_path = parsed.path.removeprefix(
+                "/.well-known/oauth-protected-resource"
+            )
+            brain_match = MCP_BRAIN_PATH.fullmatch(metadata_resource_path)
+            self.send_json(
+                200,
+                self.protected_resource_metadata(
+                    brain_match.group(1) if brain_match else None
+                ),
+            )
             return
         if self.admin_web_enabled():
             if parsed.path == "/admin/api/v1/auth-methods":

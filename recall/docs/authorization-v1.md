@@ -83,10 +83,13 @@ https://recall.example.com/.well-known/oauth-protected-resource/mcp
 
 Unauthenticated MCP requests receive that URL in `WWW-Authenticate`. The client
 then discovers the authorization server, performs Authorization Code + PKCE,
-and requests an access token whose audience is the exact
-`RECALL_MCP_RESOURCE_URI`. Recall accepts bearer tokens only in the header; it
-does not accept query-string tokens, cookies, trusted proxy identities, token
-introspection fallbacks, or unsigned JWTs.
+and requests an access token whose audience is the exact MCP endpoint. For the
+unscoped route this is `RECALL_MCP_RESOURCE_URI`; for a brain-scoped route it is
+`RECALL_MCP_RESOURCE_URI/brains/<tenant_id>`. Recall validates the routed
+audience before mapping the subject back to its canonical identity binding.
+Recall accepts bearer tokens only in the header; it does not accept query-string
+tokens, cookies, trusted proxy identities, token introspection fallbacks, or
+unsigned JWTs.
 
 ## Security invariants
 
