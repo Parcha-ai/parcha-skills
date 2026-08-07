@@ -89,8 +89,12 @@ function safeFailureMessage(code: string): string {
   }[code] || "Pi agent failed";
 }
 
-async function retryPause(attempt: number, signal?: AbortSignal): Promise<void> {
-  const milliseconds = 250 * 2 ** attempt;
+async function retryPause(
+  attempt: number,
+  code: string | undefined,
+  signal?: AbortSignal,
+): Promise<void> {
+  const milliseconds = (code === "pi_model_rate_limited" ? 5_000 : 500) * 2 ** attempt;
   await new Promise<void>((resolve, reject) => {
     if (signal?.aborted) {
       reject(new Error("model retry cancelled"));
@@ -118,10 +122,11 @@ export const streamOpenAiCompletions: StreamFn = (model, context, options) => {
       const buffered: AssistantMessageEvent[] = [];
       const stream = streamSimple(model as Model<"openai-completions">, context, {
         ...options,
-        // Buffer the complete provider stream before exposing it to the agent.
-        // This makes a fresh retry safe even when the provider drops an SSE
-        // response after headers or partial text have arrived.
-        maxRetries: 0,
+        // Let pi-ai honor Retry-After and its standard provider backoff before
+        // our complete-stream retry handles failures that arrive after headers
+        // or partial SSE output.
+        maxRetries: 2,
+        maxRetryDelayMs: Math.min(options?.maxRetryDelayMs ?? 60_000, 60_000),
       });
       let failure: AssistantMessage | undefined;
       for await (const event of stream) {
@@ -135,7 +140,7 @@ export const streamOpenAiCompletions: StreamFn = (model, context, options) => {
         && attempt + 1 < MODEL_STREAM_ATTEMPTS
         && !options?.signal?.aborted
       ) {
-        await retryPause(attempt, options?.signal);
+        await retryPause(attempt, code, options?.signal);
         continue;
       }
       for (const event of buffered) output.push(event);
