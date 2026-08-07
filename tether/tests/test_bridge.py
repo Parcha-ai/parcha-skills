@@ -1505,10 +1505,13 @@ class CredentialBoundaryTest(unittest.TestCase):
         self.assertTrue(any("send-keys" in command and "Enter" in command for command in commands))
         self.assertEqual(sum("dump-screen" in command for command in commands), 2)
         self.assertGreaterEqual(identity.call_count, 2)
-        written = next(
+        written = "".join(
             command[-1] for command in commands
             if "write-chars" in command
         )
+        self.assertGreater(len([
+            command for command in commands if "write-chars" in command
+        ]), 1)
         self.assertIn("--reply-key " + marker, written)
         self.assertIn("at most one Slack message", written)
         self.assertIn("Default to 50 words", written)
@@ -1998,7 +2001,7 @@ class NativeBindingContractTest(unittest.TestCase):
         def run(command, **_kwargs):
             nonlocal staged_instruction
             if "write-chars" in command:
-                staged_instruction = command[-1]
+                staged_instruction += command[-1]
             if "dump-screen" in command:
                 return types.SimpleNamespace(
                     stdout=staged_instruction, stderr="", returncode=0

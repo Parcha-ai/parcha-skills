@@ -21,6 +21,9 @@
 - Preserves the canonical default Herdr session, follows pane moves through the
   occupant identity, and survives live handoff terminal-ID rotation only when
   the native session and process incarnation remain unchanged.
+- Stages legacy Zellij follow-up instructions in bounded terminal writes so
+  Claude Code keeps the attempt marker visible instead of collapsing it into an
+  opaque pasted-text placeholder before Enter.
 
 ## 0.2.0-beta.1
 

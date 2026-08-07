@@ -165,6 +165,7 @@ MAX_BROKER_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_SLACK_FILENAME = 180
 MAX_SOURCE_VALUE = 4_096
 MAX_IDEMPOTENCY_KEY = 256
+ZELLIJ_WRITE_CHUNK_CHARS = 96
 DEFAULT_BROKER_MAX_CONNECTIONS = 32
 DEFAULT_BROKER_READ_TIMEOUT_SECONDS = 5.0
 REPLY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
@@ -10973,12 +10974,25 @@ def deliver_zellij(
     write_accepted = False
     try:
         # Absolute executable; session and pane are argv, never shell text.
-        subprocess.run(  # nosec B603
-            [zellij, "--session", session, "action", "write-chars", "--pane-id", target, instruction],
-            check=True,
-            timeout=10,
-        )
-        write_accepted = True
+        # Claude Code collapses one large synthetic terminal write into an
+        # opaque ``[Pasted text]`` placeholder. Stage bounded chunks so the
+        # attempt marker remains observable before Enter and after submission.
+        for offset in range(0, len(instruction), ZELLIJ_WRITE_CHUNK_CHARS):
+            subprocess.run(  # nosec B603
+                [
+                    zellij,
+                    "--session",
+                    session,
+                    "action",
+                    "write-chars",
+                    "--pane-id",
+                    target,
+                    instruction[offset : offset + ZELLIJ_WRITE_CHUNK_CHARS],
+                ],
+                check=True,
+                timeout=10,
+            )
+            write_accepted = True
         time.sleep(0.15)
         staged = subprocess.run(  # nosec B603
             [zellij, "--session", session, "action", "dump-screen", "--pane-id", target],
