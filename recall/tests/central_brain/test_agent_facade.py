@@ -764,6 +764,79 @@ class AgentFacadeUnitTest(unittest.TestCase):
         self.assertEqual(retrieval.calls[-1][0], "exec")
         self.assertEqual(len(retrieval.calls[-1][2]), 18)
 
+    def test_agent_map_returns_compact_pointers_not_full_hint_bodies(self) -> None:
+        class NoisyPartitionRetrieval(FakeBoundRetrieval):
+            def passage_hints(self, query, *, filters, limit):
+                result = super().passage_hints(
+                    query,
+                    filters=filters,
+                    limit=limit,
+                )
+                result["results"][0].update({
+                    "native_parent_id": "session-synthetic",
+                    "first_occurred_at": "2026-07-01T00:00:00Z",
+                    "last_occurred_at": "2026-07-01T01:00:00Z",
+                    "rank": 1,
+                })
+                result["results"][0]["matching_ranges"][0].update({
+                    "text": "useful pointer " + "private body " * 4_000,
+                    "text_clipped": False,
+                })
+                return result
+
+        tools = ConstrainedAgentTools(
+            NoisyPartitionRetrieval(),
+            DelegationContext.from_principal(principal()),
+        )
+        result = tools.call("recall.map", {
+            "partitions": [
+                {
+                    "label": f"part-{index}",
+                    "query": f"synthetic work {index}",
+                    "filters": {},
+                    "limit": 1,
+                }
+                for index in range(2)
+            ],
+        })
+        rendered = json.dumps(result)
+        self.assertLess(len(rendered), 4_000)
+        self.assertNotIn(RECEIPT, rendered)
+        preview = result["partitions"][0]["results"][0]["previews"][0]
+        self.assertEqual(len(preview["text"]), 240)
+        self.assertTrue(preview["text_clipped"])
+
+    def test_agent_exec_mounts_only_agent_selected_map_aliases(self) -> None:
+        class PartitionRetrieval(FakeBoundRetrieval):
+            def passage_hints(self, query, *, filters, limit):
+                result = super().passage_hints(
+                    query,
+                    filters=filters,
+                    limit=limit,
+                )
+                result["results"][0]["logical_document_id"] = (
+                    "ldoc_" + ("1" if query == "first" else "2") * 32
+                )
+                return result
+
+        retrieval = PartitionRetrieval()
+        tools = ConstrainedAgentTools(
+            retrieval,
+            DelegationContext.from_principal(principal()),
+        )
+        tools.call("recall.map", {
+            "partitions": [
+                {"label": "first", "query": "first", "filters": {}, "limit": 1},
+                {"label": "second", "query": "second", "filters": {}, "limit": 1},
+            ],
+        })
+        tools.call("recall.exec", {
+            "aliases": ["d2"],
+            "program": "rg -n work /docs/d2",
+            "timeout_seconds": 10,
+        })
+        self.assertEqual(retrieval.calls[-1][2], ("ldoc_" + "2" * 32,))
+
     def test_agent_map_rejects_duplicate_partition_labels(self) -> None:
         tools = ConstrainedAgentTools(
             FakeBoundRetrieval(),

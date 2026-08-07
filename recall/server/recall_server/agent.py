@@ -322,6 +322,67 @@ class ConstrainedAgentTools:
             ],
         }
 
+    @staticmethod
+    def _compact_map_result(result: dict[str, Any]) -> dict[str, Any]:
+        """Keep map output a routing packet instead of a second document body."""
+
+        compact = []
+        for item in result.get("results", []):
+            if not isinstance(item, dict) or not isinstance(item.get("alias"), str):
+                continue
+            candidate = {
+                key: item[key]
+                for key in (
+                    "alias",
+                    "source_id",
+                    "native_parent_id",
+                    "first_occurred_at",
+                    "last_occurred_at",
+                    "rank",
+                    "reasons",
+                )
+                if key in item
+            }
+            previews = []
+            for matching_range in item.get("matching_ranges", [])[:1]:
+                if not isinstance(matching_range, dict):
+                    continue
+                text = matching_range.get("text")
+                spans = [
+                    {
+                        key: span[key]
+                        for key in ("record_ordinal", "record_count")
+                        if key in span
+                    }
+                    for span in matching_range.get("spans", [])[:2]
+                    if isinstance(span, dict)
+                ]
+                preview: dict[str, Any] = {}
+                if isinstance(text, str) and text:
+                    preview["text"] = text[:240]
+                    preview["text_clipped"] = len(text) > 240 or bool(
+                        matching_range.get("text_clipped")
+                    )
+                if spans:
+                    preview["spans"] = spans
+                if preview:
+                    previews.append(preview)
+            if previews:
+                candidate["previews"] = previews
+            compact.append(candidate)
+        diagnostics = result.get("diagnostics")
+        statuses = {
+            key: value
+            for key, value in (
+                diagnostics.items() if isinstance(diagnostics, dict) else ()
+            )
+            if key.endswith("_status") or key in {"engine", "reason"}
+        }
+        return {
+            "results": compact,
+            **({"diagnostics": statuses} if statuses else {}),
+        }
+
     def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         self.check_cancelled()
         if name not in self._context.allowed_tools:
@@ -446,7 +507,7 @@ class ConstrainedAgentTools:
                         mapped.append({
                             "label": item["label"],
                             "status": "ok",
-                            **partition_result,
+                            **self._compact_map_result(partition_result),
                         })
                 result = {
                     "partitions": mapped,
@@ -594,13 +655,31 @@ class ConstrainedAgentTools:
                 )
             elif name == "recall.exec":
                 if (
-                    set(arguments) != {"program", "timeout_seconds"}
+                    set(arguments)
+                    not in (
+                        {"program", "timeout_seconds"},
+                        {"aliases", "program", "timeout_seconds"},
+                    )
                     or not isinstance(arguments["program"], str)
                     or not arguments["program"].strip()
                     or len(arguments["program"]) > 16_000
                     or isinstance(arguments["timeout_seconds"], bool)
                     or not isinstance(arguments["timeout_seconds"], int)
                     or not 1 <= arguments["timeout_seconds"] <= 30
+                    or (
+                        "aliases" in arguments
+                        and (
+                            not isinstance(arguments["aliases"], list)
+                            or not 1 <= len(arguments["aliases"]) <= 20
+                            or len(set(arguments["aliases"]))
+                            != len(arguments["aliases"])
+                            or any(
+                                not isinstance(alias, str)
+                                or alias not in self._document_ids_by_alias
+                                for alias in arguments["aliases"]
+                            )
+                        )
+                    )
                 ):
                     raise AgentExecutionError("agent tool arguments are invalid")
                 if not self._hinted_documents:
@@ -608,18 +687,26 @@ class ConstrainedAgentTools:
                         "agent execution requires at least one prior hint",
                         code="agent_exec_without_hints",
                     )
+                selected_aliases = arguments.get(
+                    "aliases",
+                    list(self._document_ids_by_alias),
+                )
+                selected_documents = tuple(
+                    self._document_ids_by_alias[alias]
+                    for alias in selected_aliases
+                )
                 result = self._retrieval.execute_agent_program(
                     arguments["program"],
-                    logical_document_ids=tuple(self._hinted_documents),
+                    logical_document_ids=selected_documents,
                     document_aliases={
                         document_id: self._aliases_by_document[document_id]
-                        for document_id in self._hinted_documents
+                        for document_id in selected_documents
                     },
                     record_spans={
                         document_id: tuple(
                             self._hinted_record_spans.get(document_id, ())
                         )
-                        for document_id in self._hinted_documents
+                        for document_id in selected_documents
                     },
                     routing_receipts={
                         document_id: tuple(
@@ -628,7 +715,7 @@ class ConstrainedAgentTools:
                                 (),
                             )
                         )
-                        for document_id in self._hinted_documents
+                        for document_id in selected_documents
                     },
                     timeout_seconds=min(
                         arguments["timeout_seconds"],

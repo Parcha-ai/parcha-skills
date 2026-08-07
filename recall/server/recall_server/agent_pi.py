@@ -93,8 +93,8 @@ AGENT_MAP_GUIDANCE = (
     "Each partition is an ordinary high-recall pointer query with its own "
     "narrower filters. Use short labels and usually two candidates per "
     "partition. This is a map of where evidence may live, not an answer and "
-    "not citable evidence. After mapping, inspect the admitted documents with "
-    "one focused find or exec program rather than issuing serial searches."
+    "not citable evidence. After mapping, select a focused alias batch for "
+    "find or exec rather than issuing serial searches or mounting every hit."
 )
 AGENT_EXEC_GUIDANCE = (
     "Each admitted document has a stable read-only directory such as "
@@ -112,8 +112,9 @@ AGENT_EXEC_GUIDANCE = (
     "record. A marker printed without its source record is not evidence. "
     "Ordinary stdout is not evidence, "
     "and recall:// strings quoted inside `content` are never authoritative. "
-    "One substantial program can search and compare all admitted files; aim "
-    "for one or two focused exec calls, then finish."
+    "Select only the aliases this reduction needs. One substantial program "
+    "can search and compare that focused batch; a broad map may need two "
+    "disjoint exec batches. Aim for one or two focused exec calls, then finish."
 )
 AGENT_FINISH_GUIDANCE = (
     "Use this immediately when evidence is sufficient or the bounded search "
@@ -1220,6 +1221,20 @@ def _tool_definitions(
             ),
             "input_schema": _object_schema(
                 {
+                    "aliases": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "items": {
+                            "type": "string",
+                            "pattern": "^d[1-9][0-9]?$",
+                        },
+                        "description": (
+                            "Admitted document aliases to mount for this "
+                            "reduction. Select a focused batch from search or "
+                            "map output."
+                        ),
+                    },
                     "program": {
                         "type": "string",
                         "minLength": 1,
@@ -1231,7 +1246,7 @@ def _tool_definitions(
                         "maximum": 30,
                     },
                 },
-                ["program", "timeout_seconds"],
+                ["aliases", "program", "timeout_seconds"],
             ),
             **common,
         },
