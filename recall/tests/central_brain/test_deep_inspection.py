@@ -880,6 +880,91 @@ class DeepInspectionContractTests(unittest.TestCase):
         self.assertIn("mount -o remount,bind,ro /docs", command)
         self.assertNotIn("synthetic-key", json.dumps(call["body"]))
 
+    def test_agent_exec_compresses_broad_routing_manifests(self):
+        transport = RecordingTransport({
+            "success": True,
+            "data": {
+                "stdout": "",
+                "stderr": "",
+                "exitCode": 0,
+                "timing": {"totalMs": 1, "queueMs": 0, "executeMs": 1},
+            },
+        })
+        inspector = ArchilDeepInspector(
+            api_key="synthetic-key",
+            disk_id="dsk-0123456789abcdef",
+            region="aws-us-west-2",
+            transport=transport,
+        )
+        document_ids = tuple(
+            f"ldoc_{ordinal:032x}" for ordinal in range(1, 21)
+        )
+        routing_receipts = {
+            document_id: tuple(
+                "recall://source:company:synthetic/"
+                f"{document_ordinal:02x}{receipt_ordinal:062x}?rev=1#item=0"
+                for receipt_ordinal in range(32)
+            )
+            for document_ordinal, document_id in enumerate(document_ids, start=1)
+        }
+        inspector.execute(
+            tenant_id=TENANT,
+            program="recall-scan --all --pattern project",
+            objects=tuple(
+                AgentExecObject(
+                    object_key=f"objects/{ordinal:02x}/" + f"{ordinal:064x}",
+                    content_sha256=f"{ordinal:064x}",
+                )
+                for ordinal in range(1, 21)
+            ),
+            record_spans={document_id: ((0, 100),) for document_id in document_ids},
+            routing_receipts=routing_receipts,
+            document_aliases={
+                document_id: f"d{ordinal}"
+                for ordinal, document_id in enumerate(document_ids, start=1)
+            },
+            timeout_seconds=10,
+        )
+        command = transport.calls[0]["body"]["command"]
+        self.assertLess(len(command.encode()), 100_000)
+        self.assertIn("gzip.decompress", command)
+
+    def test_agent_exec_rejects_oversize_command_before_transport(self):
+        transport = RecordingTransport()
+        inspector = ArchilDeepInspector(
+            api_key="synthetic-key",
+            disk_id="dsk-0123456789abcdef",
+            region="aws-us-west-2",
+            transport=transport,
+        )
+        with (
+            mock.patch(
+                "recall_server.deep_inspection._agent_exec_command",
+                return_value="x" * 100_001,
+            ),
+            self.assertRaises(DeepInspectionError) as caught,
+        ):
+            inspector.execute(
+                tenant_id=TENANT,
+                program="true",
+                objects=(AgentExecObject(
+                    object_key="objects/aa/" + "a" * 64,
+                    content_sha256="c" * 64,
+                ),),
+                record_spans={
+                    "ldoc_0123456789abcdef0123456789abcdef": ((0, 1),),
+                },
+                routing_receipts={
+                    "ldoc_0123456789abcdef0123456789abcdef": (RECEIPT,),
+                },
+                timeout_seconds=10,
+            )
+        self.assertEqual(
+            caught.exception.code,
+            "deep_inspector_request_too_large",
+        )
+        self.assertEqual(transport.calls, [])
+
     def test_agent_evidence_accepts_records_but_not_receipts_inside_content(self):
         quoted = (
             "recall://source:company:synthetic/quoted?rev=1#item=0"
