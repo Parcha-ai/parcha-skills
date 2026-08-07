@@ -627,6 +627,8 @@ class SimpleAgentKernelTest(unittest.TestCase):
         self.assertIn("choose useful partitions yourself", map_tool["description"])
         self.assertIn("`filters.person`", map_tool["description"])
         self.assertIn("before inspecting extra candidates", map_tool["description"])
+        self.assertIn("host-verified actor attribution", map_tool["description"])
+        self.assertIn("do not grep for the person's name", map_tool["description"])
 
     def test_explicit_scope_is_a_host_ceiling(self):
         script = success_script()
