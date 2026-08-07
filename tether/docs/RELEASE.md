@@ -40,8 +40,8 @@ Do not release until all controls are active:
    repository administrators or security managers.
 6. Allow manual workflow dispatch only to release maintainers.
 
-GitHub Actions are pinned by commit. Release validation uses Node `24.18.0` and
-Python `3.14.0`; the publish job installs only the exact npm `12.0.1` client.
+GitHub Actions are pinned by commit. Release validation uses Node `24.19.0` and
+Python `3.14.0`; the publish job installs only the exact npm `12.0.2` client.
 The identity job compares both JavaScript toolchain pins with the official
 Node release index and npm registry, and fails when either pin is stale. The
 artifact-producing job has a fresh exact commit checkout and installs no lint
