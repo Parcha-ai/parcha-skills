@@ -487,10 +487,12 @@ class AgentFacadeUnitTest(unittest.TestCase):
             "limit": 1,
         })
         result = tools.call("recall.open", {
-            "alias": "d1",
-            "cursor": None,
-            "record_ordinal": 13,
-            "page_bytes": 32_768,
+            "items": [{
+                "alias": "d1",
+                "cursor": None,
+                "record_ordinal": 13,
+                "page_bytes": 32_768,
+            }],
         })
         self.assertEqual(result["opened_receipts"], [RECEIPT])
         call = retrieval.calls[-1]
@@ -498,6 +500,78 @@ class AgentFacadeUnitTest(unittest.TestCase):
         self.assertEqual(call[1]["record_ordinal"], 13)
         self.assertEqual(call[1]["page_bytes"], 32_768)
         self.assertIsNone(call[1]["cursor"])
+
+    def test_open_batches_agent_selected_records_in_one_tool_call(self) -> None:
+        class PartitionRetrieval(FakeBoundRetrieval):
+            def passage_hints(self, query, *, filters, limit):
+                result = super().passage_hints(
+                    query,
+                    filters=filters,
+                    limit=limit,
+                )
+                result["results"][0]["logical_document_id"] = (
+                    "ldoc_" + ("1" if query == "Miguel day one" else "2") * 32
+                )
+                return result
+
+            def open_document(self, **arguments):
+                result = super().open_document(**arguments)
+                alias = arguments["document_alias"]
+                receipt = (
+                    f"recall://{SOURCE}/session-{alias}"
+                    "?rev=1#item=0"
+                )
+                result["records"][0]["receipts"] = [receipt]
+                result["opened_receipts"] = [receipt]
+                return result
+
+        retrieval = PartitionRetrieval()
+        tools = ConstrainedAgentTools(
+            retrieval,
+            DelegationContext.from_principal(principal()),
+        )
+        mapped = tools.call("recall.map", {
+            "partitions": [
+                {
+                    "label": "Miguel / Aug 1",
+                    "query": "Miguel day one",
+                    "filters": {},
+                    "limit": 1,
+                },
+                {
+                    "label": "Chris / Aug 1",
+                    "query": "Chris day one",
+                    "filters": {},
+                    "limit": 1,
+                },
+            ],
+        })
+        aliases = [
+            partition["results"][0]["alias"]
+            for partition in mapped["partitions"]
+        ]
+        result = tools.call("recall.open", {
+            "items": [
+                {
+                    "alias": alias,
+                    "cursor": None,
+                    "record_ordinal": 11,
+                    "page_bytes": 8_192,
+                }
+                for alias in aliases
+            ],
+        })
+        self.assertEqual(
+            [item["status"] for item in result["documents"]],
+            ["ok", "ok"],
+        )
+        self.assertEqual(result["failed_documents"], 0)
+        self.assertEqual(len(result["opened_receipts"]), 2)
+        self.assertEqual(len(tools.citable_receipts), 2)
+        self.assertEqual(
+            [call[1]["document_alias"] for call in retrieval.calls[-2:]],
+            aliases,
+        )
 
     def test_open_rejects_cursor_with_record_ordinal(self) -> None:
         tools = ConstrainedAgentTools(
@@ -511,10 +585,12 @@ class AgentFacadeUnitTest(unittest.TestCase):
         })
         with self.assertRaises(AgentExecutionError) as caught:
             tools.call("recall.open", {
-                "alias": "d1",
-                "cursor": "0:0:0",
-                "record_ordinal": 13,
-                "page_bytes": 4_000,
+                "items": [{
+                    "alias": "d1",
+                    "cursor": "0:0:0",
+                    "record_ordinal": 13,
+                    "page_bytes": 4_000,
+                }],
             })
         self.assertEqual(caught.exception.code, "agent_open_invalid")
 

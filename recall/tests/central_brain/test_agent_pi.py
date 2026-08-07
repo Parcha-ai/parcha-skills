@@ -313,10 +313,12 @@ class SimpleAgentKernelTest(unittest.TestCase):
                 except AgentExecutionError:
                     pass
                 invoke("open", {
-                    "alias": "d1",
-                    "cursor": None,
-                    "record_ordinal": 80,
-                    "page_bytes": 32_768,
+                    "items": [{
+                        "alias": "d1",
+                        "cursor": None,
+                        "record_ordinal": 80,
+                        "page_bytes": 32_768,
+                    }],
                 })
                 invoke("finish", {
                     "status": "complete",
@@ -352,10 +354,12 @@ class SimpleAgentKernelTest(unittest.TestCase):
 
     def test_terminal_failure_codes_and_partial_trace_are_content_free(self):
         open_arguments = {
-            "alias": "d1",
-            "cursor": None,
-            "record_ordinal": 80,
-            "page_bytes": 32768,
+            "items": [{
+                "alias": "d1",
+                "cursor": None,
+                "record_ordinal": 80,
+                "page_bytes": 32768,
+            }],
         }
         expected = {
             "pi_model_failed": "agent_model_provider_failed",
@@ -480,10 +484,18 @@ class SimpleAgentKernelTest(unittest.TestCase):
         )
         self.assertIn(
             "record_ordinal",
-            open_tool["input_schema"]["properties"],
+            open_tool["input_schema"]["properties"]["items"]["items"][
+                "properties"
+            ],
         )
         self.assertEqual(
-            open_tool["input_schema"]["properties"]["page_bytes"]["maximum"],
+            open_tool["input_schema"]["properties"]["items"]["maxItems"],
+            20,
+        )
+        self.assertEqual(
+            open_tool["input_schema"]["properties"]["items"]["items"][
+                "properties"
+            ]["page_bytes"]["maximum"],
             32_768,
         )
         family_schema = hint_tool["input_schema"]["properties"]["filters"][
@@ -629,6 +641,7 @@ class SimpleAgentKernelTest(unittest.TestCase):
         self.assertIn("before inspecting extra candidates", map_tool["description"])
         self.assertIn("host-verified actor attribution", map_tool["description"])
         self.assertIn("do not grep for the person's name", map_tool["description"])
+        self.assertIn("batch-open", map_tool["description"])
 
     def test_explicit_scope_is_a_host_ceiling(self):
         script = success_script()
@@ -723,10 +736,12 @@ class SimpleAgentKernelTest(unittest.TestCase):
                 del timeout_seconds
                 assert not cancelled()
                 invoke("open", {
-                    "alias": "d1",
-                    "cursor": None,
-                    "record_ordinal": 80,
-                    "page_bytes": 32768,
+                    "items": [{
+                        "alias": "d1",
+                        "cursor": None,
+                        "record_ordinal": 80,
+                        "page_bytes": 32768,
+                    }],
                 })
                 try:
                     invoke("finish", {
@@ -847,10 +862,12 @@ class PiSubprocessBoundaryTest(unittest.TestCase):
                 if index == 0:
                     name = "open"
                     arguments = {
-                        "alias": "d1",
-                        "cursor": None,
-                        "record_ordinal": 80,
-                        "page_bytes": 32768,
+                        "items": [{
+                            "alias": "d1",
+                            "cursor": None,
+                            "record_ordinal": 80,
+                            "page_bytes": 32768,
+                        }],
                     }
                 elif index in {1, 2}:
                     chunks = [

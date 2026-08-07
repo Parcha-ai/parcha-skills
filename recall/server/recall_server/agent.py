@@ -323,6 +323,63 @@ class ConstrainedAgentTools:
             ],
         }
 
+    def _valid_open_item(self, item: Any) -> bool:
+        return (
+            isinstance(item, dict)
+            and set(item)
+            == {"alias", "cursor", "record_ordinal", "page_bytes"}
+            and isinstance(item["alias"], str)
+            and item["alias"] in self._document_ids_by_alias
+            and (
+                item["cursor"] is None
+                or (
+                    isinstance(item["cursor"], str)
+                    and re.fullmatch(
+                        r"\d{1,6}:\d{1,12}:\d{1,12}",
+                        item["cursor"],
+                    )
+                    is not None
+                )
+            )
+            and not isinstance(item["page_bytes"], bool)
+            and isinstance(item["page_bytes"], int)
+            and 1_024 <= item["page_bytes"] <= 32_768
+            and (
+                item["record_ordinal"] is None
+                or (
+                    not isinstance(item["record_ordinal"], bool)
+                    and isinstance(item["record_ordinal"], int)
+                    and item["record_ordinal"] >= 0
+                )
+            )
+            and not (
+                item["cursor"] is not None
+                and item["record_ordinal"] is not None
+            )
+        )
+
+    def _run_open_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        alias = item["alias"]
+        document_id = self._document_ids_by_alias[alias]
+        return self._retrieval.open_document(
+            logical_document_id=document_id,
+            document_alias=alias,
+            cursor=item["cursor"],
+            record_ordinal=item["record_ordinal"],
+            page_bytes=item["page_bytes"],
+            record_spans={
+                document_id: tuple(
+                    self._hinted_record_spans.get(document_id, ())
+                )
+            },
+            routing_receipts={
+                document_id: tuple(
+                    self._hinted_routing_receipts.get(document_id, ())
+                )
+            },
+            timeout_seconds=20,
+        )
+
     @staticmethod
     def _compact_map_result(result: dict[str, Any]) -> dict[str, Any]:
         """Keep map output a routing packet instead of a second document body."""
@@ -589,74 +646,93 @@ class ConstrainedAgentTools:
                     timeout_seconds=self._context.budget.max_find_seconds,
                 )
             elif name == "recall.open":
+                items = (
+                    arguments.get("items")
+                    if set(arguments) == {"items"}
+                    else None
+                )
                 if (
-                    set(arguments)
-                    != {
-                        "alias",
-                        "cursor",
-                        "record_ordinal",
-                        "page_bytes",
-                    }
-                    or not isinstance(arguments["alias"], str)
-                    or arguments["alias"]
-                    not in self._document_ids_by_alias
-                    or (
-                        arguments["cursor"] is not None
-                        and (
-                            not isinstance(arguments["cursor"], str)
-                            or re.fullmatch(
-                                r"\d{1,6}:\d{1,12}:\d{1,12}",
-                                arguments["cursor"],
-                            )
-                            is None
+                    not isinstance(items, list)
+                    or not 1 <= len(items) <= 20
+                    or any(not self._valid_open_item(item) for item in items)
+                    or len({
+                        (
+                            item["alias"],
+                            item["cursor"],
+                            item["record_ordinal"],
                         )
-                    )
-                    or isinstance(arguments["page_bytes"], bool)
-                    or not isinstance(arguments["page_bytes"], int)
-                    or not 1_024 <= arguments["page_bytes"] <= 32_768
-                    or (
-                        arguments["record_ordinal"] is not None
-                        and (
-                            isinstance(arguments["record_ordinal"], bool)
-                            or not isinstance(
-                                arguments["record_ordinal"],
-                                int,
-                            )
-                            or arguments["record_ordinal"] < 0
-                        )
-                    )
-                    or (
-                        arguments["cursor"] is not None
-                        and arguments["record_ordinal"] is not None
-                    )
+                        for item in items
+                    }) != len(items)
+                    or sum(item["page_bytes"] for item in items) > 262_144
                 ):
                     raise AgentExecutionError(
                         "agent open arguments are invalid",
                         code="agent_open_invalid",
                     )
-                alias = arguments["alias"]
-                document_id = self._document_ids_by_alias[alias]
-                result = self._retrieval.open_document(
-                    logical_document_id=document_id,
-                    document_alias=alias,
-                    cursor=arguments["cursor"],
-                    record_ordinal=arguments["record_ordinal"],
-                    page_bytes=arguments["page_bytes"],
-                    record_spans={
-                        document_id: tuple(
-                            self._hinted_record_spans.get(document_id, ())
+                documents = []
+                failures = 0
+                for item in items:
+                    self.check_cancelled()
+                    item_started = self._monotonic()
+                    try:
+                        opened = self._run_open_item(item)
+                    except AgentExecutionError as error:
+                        if error.code == "agent_cancelled_by_caller":
+                            raise
+                        failures += 1
+                        self._record_failed_observation(
+                            "recall.open",
+                            item_started,
+                            error.code,
                         )
-                    },
-                    routing_receipts={
-                        document_id: tuple(
-                            self._hinted_routing_receipts.get(
-                                document_id,
-                                (),
-                            )
+                        documents.append({
+                            "alias": item["alias"],
+                            "status": "unavailable",
+                            "error_code": error.code,
+                        })
+                    except (TypeError, ValueError):
+                        failures += 1
+                        code = "agent_evidence_tool_rejected"
+                        self._record_failed_observation(
+                            "recall.open",
+                            item_started,
+                            code,
                         )
-                    },
-                    timeout_seconds=20,
-                )
+                        documents.append({
+                            "alias": item["alias"],
+                            "status": "unavailable",
+                            "error_code": code,
+                        })
+                    except Exception:
+                        failures += 1
+                        code = "agent_evidence_tool_failed"
+                        self._record_failed_observation(
+                            "recall.open",
+                            item_started,
+                            code,
+                        )
+                        documents.append({
+                            "alias": item["alias"],
+                            "status": "unavailable",
+                            "error_code": code,
+                        })
+                    else:
+                        documents.append({
+                            "alias": item["alias"],
+                            "status": "ok",
+                            **opened,
+                        })
+                result = {
+                    "documents": documents,
+                    "opened_receipts": list(dict.fromkeys(
+                        receipt
+                        for document in documents
+                        if document.get("status") == "ok"
+                        for receipt in _receipts(document)
+                    )),
+                    "complete": failures == 0,
+                    "failed_documents": failures,
+                }
             elif name == "recall.exec":
                 if (
                     set(arguments)
