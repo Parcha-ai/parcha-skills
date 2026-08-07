@@ -104,10 +104,13 @@ class UrllibTransport:
             raise
         except urllib.error.HTTPError as error:
             code = {
+                400: "deep_inspector_bad_request",
                 401: "deep_inspector_authentication_failed",
                 403: "deep_inspector_authentication_failed",
+                404: "deep_inspector_endpoint_not_found",
                 409: "deep_inspector_busy",
                 413: "deep_inspector_request_too_large",
+                422: "deep_inspector_validation_failed",
                 429: "deep_inspector_rate_limited",
             }.get(
                 error.code,
