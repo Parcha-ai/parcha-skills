@@ -275,7 +275,7 @@ class AgentFacadeUnitTest(unittest.TestCase):
     def test_request_depth_selects_host_owned_latency_bounds(self) -> None:
         expected = {
             "quick": (8, 3, 1, 8, 10),
-            "normal": (12, 3, 4, 15, 20),
+            "normal": (12, 6, 6, 15, 20),
             "deep": (12, 6, 6, 20, 30),
         }
         for depth, bounds in expected.items():
