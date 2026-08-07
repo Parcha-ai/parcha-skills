@@ -23,6 +23,8 @@ from contracts.agent_v1 import (
 )
 from contracts.v2 import ContractError
 
+from .deep_inspection import DeepInspectionError
+
 
 class AgentRequestError(ValueError):
     """The public request is invalid."""
@@ -814,6 +816,16 @@ class ConstrainedAgentTools:
             raise AgentExecutionError(
                 "agent evidence tool rejected the call",
                 code="agent_evidence_tool_rejected",
+            ) from error
+        except DeepInspectionError as error:
+            self._record_failed_observation(
+                name,
+                started_at,
+                error.code,
+            )
+            raise AgentExecutionError(
+                "agent deep inspection failed",
+                code=error.code,
             ) from error
         except Exception as error:
             self._record_failed_observation(
