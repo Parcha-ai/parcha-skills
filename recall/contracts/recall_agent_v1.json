@@ -81,7 +81,7 @@
         "occurred_at": {"type": "string", "format": "date-time"},
         "stage": {"enum": ["authorize", "plan", "retrieve", "inspect", "synthesize", "verify", "complete"]},
         "outcome": {"enum": ["started", "ok", "degraded", "denied", "failed"]},
-        "elapsed_ms": {"type": "number", "minimum": 0, "maximum": 120000},
+        "elapsed_ms": {"type": "number", "minimum": 0, "maximum": 604800000},
         "receipts": {
           "type": "array",
           "maxItems": 256,

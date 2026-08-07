@@ -138,6 +138,25 @@ class AgentContractTest(unittest.TestCase):
         self.assertEqual(validated[1]["request_id"], REQUEST_ID)
         self.assertEqual(validated[4]["citations"], [RECEIPT])
 
+    def test_completed_agent_trace_can_exceed_two_minutes(self) -> None:
+        authority, request, run, trace, result = fixtures()
+        trace[-1]["elapsed_ms"] = 180_000
+        validated = validate_agent_exchange(
+            authority,
+            request,
+            run,
+            trace,
+            result,
+        )
+        self.assertEqual(validated[3][-1]["elapsed_ms"], 180_000)
+        catalog = json.loads(CATALOG.read_text())
+        self.assertGreaterEqual(
+            catalog["$defs"]["trace_event"]["properties"]["elapsed_ms"][
+                "maximum"
+            ],
+            180_000,
+        )
+
     def test_request_cannot_select_tenant_principal_or_brain(self) -> None:
         request = fixtures()[1]
         for field in ("tenant_id", "principal_id", "brain_id", "source_ids"):
