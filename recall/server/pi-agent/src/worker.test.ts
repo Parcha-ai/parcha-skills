@@ -128,12 +128,18 @@ test("normalizes an impossible model mismatch into a Pi error stream", async () 
   }
 });
 
-async function providerRetryCase(firstStatus: number): Promise<number> {
+async function providerRetryCase(
+  firstStatus: number,
+  retryAfterMs?: number,
+): Promise<{ calls: number; elapsedMs: number }> {
   let calls = 0;
   const server = createServer((_request, response) => {
     calls += 1;
     if (calls === 1) {
-      response.writeHead(firstStatus, { "content-type": "application/json" });
+      response.writeHead(firstStatus, {
+        "content-type": "application/json",
+        ...(retryAfterMs === undefined ? {} : { "retry-after-ms": String(retryAfterMs) }),
+      });
       response.end(JSON.stringify({ error: { message: "synthetic provider failure" } }));
       return;
     }
@@ -168,6 +174,7 @@ async function providerRetryCase(firstStatus: number): Promise<number> {
       true,
     );
     const events = [];
+    const started = Date.now();
     const stream = await streamOpenAiCompletions(model, {
       systemPrompt: "test",
       messages: [{ role: "user", content: "test", timestamp: Date.now() }],
@@ -175,19 +182,25 @@ async function providerRetryCase(firstStatus: number): Promise<number> {
     }, { apiKey: "synthetic-key" });
     for await (const event of stream) events.push(event);
     assert.ok(events.length > 0);
+    return { calls, elapsedMs: Date.now() - started };
   } finally {
     server.close();
     await once(server, "close");
   }
-  return calls;
 }
 
 test("retries one fresh request for a retryable provider failure", async () => {
-  assert.equal(await providerRetryCase(503), 2);
+  assert.equal((await providerRetryCase(503)).calls, 2);
+});
+
+test("honors provider retry timing before a rate-limit retry", async () => {
+  const result = await providerRetryCase(429, 700);
+  assert.equal(result.calls, 2);
+  assert.ok(result.elapsedMs >= 600, `retry returned after only ${result.elapsedMs}ms`);
 });
 
 test("does not retry a non-retryable provider failure", async () => {
-  assert.equal(await providerRetryCase(400), 1);
+  assert.equal((await providerRetryCase(400)).calls, 1);
 });
 
 test("discards a dropped partial SSE stream and retries the complete model request", async () => {
