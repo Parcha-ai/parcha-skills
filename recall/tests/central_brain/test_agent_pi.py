@@ -293,7 +293,7 @@ def service(transport) -> RecallAgentService:
     fixed = datetime(2026, 7, 25, 10, 0, tzinfo=timezone.utc)
     ticks = iter([10.0, 10.05, 10.25])
     return RecallAgentService(
-        PiRunner(transport),
+        PiRunner(transport, model_alias="gemma-4-31b"),
         clock=lambda: fixed,
         monotonic=lambda: next(ticks),
     )
@@ -333,7 +333,10 @@ class SimpleAgentKernelTest(unittest.TestCase):
                 return {"terminal": {}, "usage": {}}
 
         result = RecallAgentService(
-            PiRunner(RecoveringTransport()),
+            PiRunner(
+                RecoveringTransport(),
+                model_alias="gemma-4-31b",
+            ),
         ).use_recall(
             principal(),
             REQUEST,
@@ -379,10 +382,13 @@ class SimpleAgentKernelTest(unittest.TestCase):
             with self.subTest(reason_code=reason_code):
                 with self.assertRaises(AgentExecutionError) as caught:
                     RecallAgentService(
-                        PiRunner(TerminalFailureTransport(
-                            reason_code,
-                            [("open", open_arguments)],
-                        )),
+                        PiRunner(
+                            TerminalFailureTransport(
+                                reason_code,
+                                [("open", open_arguments)],
+                            ),
+                            model_alias="gemma-4-31b",
+                        ),
                     ).use_recall(principal(), REQUEST, SyntheticRetrieval())
                 error = caught.exception
                 self.assertEqual(error.code, error_code)
@@ -395,7 +401,10 @@ class SimpleAgentKernelTest(unittest.TestCase):
 
         with self.assertRaises(AgentExecutionError) as unknown:
             RecallAgentService(
-                PiRunner(TerminalFailureTransport("private_provider_detail")),
+                PiRunner(
+                    TerminalFailureTransport("private_provider_detail"),
+                    model_alias="gemma-4-31b",
+                ),
             ).use_recall(principal(), REQUEST, SyntheticRetrieval())
         self.assertEqual(unknown.exception.code, "agent_model_failed")
 
@@ -638,19 +647,12 @@ class SimpleAgentKernelTest(unittest.TestCase):
             for tool in transport.start["data"]["tools"]
             if tool["name"] == "map"
         )
-        self.assertIn("choose useful partitions yourself", map_tool["description"])
-        self.assertIn("`filters.person`", map_tool["description"])
-        self.assertIn("before inspecting extra candidates", map_tool["description"])
-        self.assertIn("host-verified actor attribution", map_tool["description"])
-        self.assertIn("do not grep for the person's name", map_tool["description"])
-        self.assertIn(
-            "one partition per named person per requested time slice",
-            map_tool["description"],
-        )
-        self.assertIn("coverage grid", map_tool["description"])
-        self.assertIn("`person_relation` set to `contributor`", map_tool["description"])
+        self.assertIn("genuinely needs coverage", map_tool["description"])
+        self.assertIn("each named person", map_tool["description"])
+        self.assertIn("verified attribution", map_tool["description"])
+        self.assertIn("not evidence", map_tool["description"])
         self.assertIn("batch-open", map_tool["description"])
-        self.assertIn("partition label", map_tool["description"])
+        self.assertIn("every nonempty partition", map_tool["description"])
 
     def test_explicit_scope_is_a_host_ceiling(self):
         script = success_script()
@@ -1014,7 +1016,10 @@ class PiSubprocessBoundaryTest(unittest.TestCase):
                 expected_route_identity="127.0.0.1",
                 environment={"PATH": os.environ["PATH"]},
             )
-            result = RecallAgentService(PiRunner(transport)).use_recall(
+            result = RecallAgentService(PiRunner(
+                transport,
+                model_alias="gemma-4-31b",
+            )).use_recall(
                 principal(),
                 REQUEST,
                 SyntheticRetrieval(),

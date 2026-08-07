@@ -399,13 +399,19 @@ credential enters Recall or the child:
 
 ```text
 RECALL_AGENT_MODEL_BASE_URL=http://<private-greppy-llm-proxy-host>:<port>
-RECALL_AGENT_MODEL_ALIAS=gemma-4-31b
+RECALL_AGENT_MODEL_ALIAS=<explicit-broker-model-id>
 ```
 
 This mode fails closed unless the exact approved URL is loopback, link-local,
 RFC1918, carrier-grade NAT, or the private Docker host gateway. Do not expose
 the broker publicly. A deployment outside that private network supplies an
 HTTPS endpoint and a private model-key file.
+
+The model alias is always explicit; Recall has no hidden default model. The
+authoritative model-visible behavioral text is in
+`recall_server/agent_prompt.py`. Model routing is isolated in
+`recall_server/agent_model.py`, so changing an OpenAI-compatible model does not
+change authorization, evidence tools, budgets, or grounding.
 
 Recall and Archil credentials remain in the host.
 
