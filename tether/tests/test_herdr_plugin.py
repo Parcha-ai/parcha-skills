@@ -76,7 +76,8 @@ class HerdrPluginTest(unittest.TestCase):
         self.assertEqual(result, 0)
         argv = run.call_args.args[0]
         self.assertFalse(any("slack.com" in argument for argument in argv))
-        self.assertEqual(argv[-2:], ["--target-pane", "w1:p1"])
+        self.assertNotIn("--target-pane", argv)
+        self.assertEqual(argv[-1], "--focus")
         token_argument = next(argument for argument in argv if argument.startswith("TETHER_INVOCATION_ID="))
         token = token_argument.split("=", 1)[1]
         target = self.state / f"invocation-{token}.json"

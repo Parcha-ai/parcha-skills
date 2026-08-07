@@ -167,9 +167,9 @@ def open_cockpit(mode: str) -> int:
         f"TETHER_INVOCATION_ID={token}",
         "--focus",
     ]
-    target_pane = context.get("focused_pane_id", "")
-    if target_pane:
-        command.extend(["--target-pane", target_pane])
+    # Herdr popup panes always target the active pane and reject an explicit
+    # --target-pane. The single-use invocation record preserves the exact
+    # pane context that Tether independently verifies inside the cockpit.
     result = subprocess.run(command, check=False)  # nosec B603
     if result.returncode != 0:
         (_secure_state_directory() / f"invocation-{token}.json").unlink(missing_ok=True)

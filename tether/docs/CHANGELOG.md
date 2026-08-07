@@ -12,6 +12,8 @@
   duplicate Codex or Claude session environment variable.
 - Adds the `parcha.tether` Herdr plugin with contextual actions, Slack-link
   handling, and a keyboard-driven popup cockpit.
+- Opens the cockpit through Herdr's active-pane popup contract while carrying
+  the independently verified target in a private single-use handoff record.
 - Adds broker protocol 6 contextual inspection without exposing credentials,
   native session values, socket paths, process fingerprints, or message text.
 - Makes lifecycle `--restart` detect an active system-level Hermes gateway and
