@@ -939,11 +939,11 @@ class RecallAgentService:
                 "max_exec_seconds": 10,
             },
             "normal": {
-                "max_tool_calls": 8,
-                "max_hint_calls": 2,
-                "max_exec_calls": 2,
-                "max_find_seconds": 8,
-                "max_exec_seconds": 12,
+                "max_tool_calls": 12,
+                "max_hint_calls": 3,
+                "max_exec_calls": 4,
+                "max_find_seconds": 15,
+                "max_exec_seconds": 20,
             },
             "deep": {
                 "max_tool_calls": 12,

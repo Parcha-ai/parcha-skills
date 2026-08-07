@@ -113,8 +113,11 @@ AGENT_EXEC_GUIDANCE = (
     "Ordinary stdout is not evidence, "
     "and recall:// strings quoted inside `content` are never authoritative. "
     "Select only the aliases this reduction needs. One substantial program "
-    "can search and compare that focused batch; a broad map may need two "
-    "disjoint exec batches. Aim for one or two focused exec calls, then finish."
+    "can search and compare that focused batch; broad coverage may need a few "
+    "disjoint exec batches. Do not repeat an equivalent program. When find, "
+    "open, or exec returns directly relevant opened records, preserve and cite "
+    "that evidence even if another requested partition remains a precise gap. "
+    "Finish as soon as the answer or honest partial answer is supported."
 )
 AGENT_FINISH_GUIDANCE = (
     "Use this immediately when evidence is sufficient or the bounded search "
