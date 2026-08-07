@@ -273,9 +273,9 @@ class AgentFacadeUnitTest(unittest.TestCase):
 
     def test_request_depth_selects_host_owned_latency_bounds(self) -> None:
         expected = {
-            "quick": (35, 8, 3, 1, 10),
-            "normal": (50, 8, 2, 2, 12),
-            "deep": (120, 12, 6, 6, 30),
+            "quick": (35, 8, 3, 1, 8, 10),
+            "normal": (50, 8, 2, 2, 8, 12),
+            "deep": (120, 12, 6, 6, 20, 30),
         }
         for depth, bounds in expected.items():
             with self.subTest(depth=depth):
@@ -287,6 +287,7 @@ class AgentFacadeUnitTest(unittest.TestCase):
                         context.budget.max_tool_calls,
                         context.budget.max_hint_calls,
                         context.budget.max_exec_calls,
+                        context.budget.max_find_seconds,
                         context.budget.max_exec_seconds,
                     ),
                     bounds,
@@ -404,6 +405,24 @@ class AgentFacadeUnitTest(unittest.TestCase):
         })
         self.assertEqual(retrieval.calls[-1][0], "exec")
         self.assertEqual(retrieval.calls[-1][-1], 12)
+
+    def test_normal_depth_clamps_find_below_client_timeout(self) -> None:
+        _, context = service().prepare(principal(), REQUEST)
+        retrieval = FakeBoundRetrieval()
+        tools = ConstrainedAgentTools(retrieval, context)
+        tools.call("recall.hints", {
+            "query": REQUEST["question"],
+            "filters": {},
+            "limit": 1,
+        })
+        tools.call("recall.find", {
+            "aliases": ["d1"],
+            "patterns": ["synthetic evidence"],
+            "context_chars": 800,
+            "limit": 6,
+        })
+        self.assertEqual(retrieval.calls[-1][0], "find")
+        self.assertEqual(retrieval.calls[-1][1]["timeout_seconds"], 8)
 
     def test_exec_requires_an_admitted_hint_document(self) -> None:
         tools = ConstrainedAgentTools(
