@@ -342,12 +342,16 @@ class AgentFacadeUnitTest(unittest.TestCase):
         with self.assertRaisesRegex(
             AgentExecutionError,
             "output failed validation",
-        ):
+        ) as caught:
             service(MutatingRunner()).use_recall(
                 principal(),
                 REQUEST,
                 FakeBoundRetrieval(),
             )
+        self.assertEqual(
+            caught.exception.code,
+            "agent_output_contract_failed",
+        )
 
     def test_host_owned_tool_budget_is_enforced(self) -> None:
         context = dataclasses.replace(

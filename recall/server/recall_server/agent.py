@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import time
 from dataclasses import dataclass, replace
@@ -24,6 +25,9 @@ from contracts.agent_v1 import (
 from contracts.v2 import ContractError
 
 from .deep_inspection import DeepInspectionError
+
+
+LOG = logging.getLogger(__name__)
 
 
 class AgentRequestError(ValueError):
@@ -1085,8 +1089,20 @@ class RecallAgentService:
             return bundle
         except AgentExecutionError:
             raise
-        except (ContractError, TypeError, ValueError) as error:
-            raise AgentExecutionError("agent output failed validation") from error
+        except ContractError as error:
+            LOG.error(
+                "agent output contract validation failed reason=%s",
+                error,
+            )
+            raise AgentExecutionError(
+                "agent output failed validation",
+                code="agent_output_contract_failed",
+            ) from error
+        except (TypeError, ValueError) as error:
+            raise AgentExecutionError(
+                "agent output failed validation",
+                code="agent_output_shape_failed",
+            ) from error
 
 
 def service_from_env(environment: dict[str, str]) -> RecallAgentService | None:
