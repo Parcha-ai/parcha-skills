@@ -1723,6 +1723,136 @@ class Store:
             WHERE endpoint_key!='' AND status IN ('pending','active')
             """
         )
+        teams = db.execute(
+            """
+            SELECT DISTINCT team_id FROM (
+                SELECT team_id FROM bridges WHERE team_id!=''
+                UNION
+                SELECT team_id FROM thread_participation WHERE team_id!=''
+                UNION
+                SELECT team_id FROM thread_ingress WHERE team_id!=''
+                UNION
+                SELECT team_id FROM slack_reply_poll_state WHERE team_id!=''
+            )
+            """
+        ).fetchall()
+        if len(teams) == 1:
+            team = teams[0][0]
+            db.execute(
+                """
+                UPDATE bridges
+                SET status='closed',binding_state='rebind_required',
+                    binding_error_code='team_backfill_conflict',
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE team_id=''
+                  AND status IN ('pending','active')
+                  AND thread_ts IS NOT NULL
+                  AND EXISTS (
+                    SELECT 1 FROM bridges AS b
+                    WHERE b.team_id=?
+                      AND b.channel_id=bridges.channel_id
+                      AND b.thread_ts=bridges.thread_ts
+                      AND b.status='active'
+                  )
+                """,
+                (team,),
+            )
+            db.execute(
+                """
+                UPDATE thread_participation
+                SET updated_at = (
+                    SELECT MAX(updated_at)
+                    FROM thread_participation AS tp
+                    WHERE tp.channel_id=thread_participation.channel_id
+                      AND tp.thread_ts=thread_participation.thread_ts
+                )
+                WHERE team_id=?
+                  AND EXISTS (
+                    SELECT 1 FROM thread_participation AS tp
+                    WHERE tp.team_id=''
+                      AND tp.channel_id=thread_participation.channel_id
+                      AND tp.thread_ts=thread_participation.thread_ts
+                  )
+                """,
+                (team,),
+            )
+            db.execute(
+                """
+                DELETE FROM thread_participation
+                WHERE team_id=''
+                  AND EXISTS (
+                    SELECT 1 FROM thread_participation AS tp
+                    WHERE tp.team_id=?
+                      AND tp.channel_id=thread_participation.channel_id
+                      AND tp.thread_ts=thread_participation.thread_ts
+                  )
+                """,
+                (team,),
+            )
+            db.execute(
+                """
+                UPDATE thread_participation
+                SET team_id=?
+                WHERE team_id=''
+                """,
+                (team,),
+            )
+            db.execute(
+                """
+                UPDATE bridges
+                SET team_id=?
+                WHERE team_id=''
+                """,
+                (team,),
+            )
+            db.execute(
+                """
+                UPDATE thread_ingress
+                SET team_id=?
+                WHERE team_id=''
+                """,
+                (team,),
+            )
+            db.execute(
+                """
+                UPDATE slack_reply_poll_state
+                SET updated_at = (
+                    SELECT MAX(updated_at)
+                    FROM slack_reply_poll_state AS tp
+                    WHERE tp.channel_id=slack_reply_poll_state.channel_id
+                      AND tp.thread_ts=slack_reply_poll_state.thread_ts
+                )
+                WHERE team_id=?
+                  AND EXISTS (
+                    SELECT 1 FROM slack_reply_poll_state AS tp
+                    WHERE tp.team_id=''
+                      AND tp.channel_id=slack_reply_poll_state.channel_id
+                      AND tp.thread_ts=slack_reply_poll_state.thread_ts
+                  )
+                """,
+                (team,),
+            )
+            db.execute(
+                """
+                DELETE FROM slack_reply_poll_state
+                WHERE team_id=''
+                  AND EXISTS (
+                    SELECT 1 FROM slack_reply_poll_state AS tp
+                    WHERE tp.team_id=?
+                      AND tp.channel_id=slack_reply_poll_state.channel_id
+                      AND tp.thread_ts=slack_reply_poll_state.thread_ts
+                  )
+                """,
+                (team,),
+            )
+            db.execute(
+                """
+                UPDATE slack_reply_poll_state
+                SET team_id=?
+                WHERE team_id=''
+                """,
+                (team,),
+            )
 
     @staticmethod
     def _add_missing_columns(
