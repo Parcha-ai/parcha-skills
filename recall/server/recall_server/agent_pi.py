@@ -1390,6 +1390,11 @@ class PiRunner:
                                 "depth": request["depth"],
                                 **request_constraints,
                                 "max_tool_calls": context.budget.max_tool_calls,
+                                "max_hint_calls": context.budget.max_hint_calls,
+                                "max_exec_calls": context.budget.max_exec_calls,
+                                "max_exec_seconds": (
+                                    context.budget.max_exec_seconds
+                                ),
                                 "max_receipts": context.budget.max_receipts,
                                 "max_tool_output_bytes": (
                                     context.budget.max_tool_output_bytes
