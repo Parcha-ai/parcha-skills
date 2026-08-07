@@ -52,6 +52,7 @@ class AgentExecutionError(RuntimeError):
 class AgentBudget:
     max_tool_calls: int = 12
     max_hint_calls: int = 6
+    max_exec_calls: int = 6
     max_exec_seconds: int = 30
     max_receipts: int = 256
     max_tool_output_bytes: int = 2_000_000
@@ -203,6 +204,11 @@ class ConstrainedAgentTools:
                 tool_limit = min(
                     tool_limit or self._context.budget.max_hint_calls,
                     self._context.budget.max_hint_calls,
+                )
+            if name == "recall.exec":
+                tool_limit = min(
+                    tool_limit or self._context.budget.max_exec_calls,
+                    self._context.budget.max_exec_calls,
                 )
             if tool_limit is not None and tool_calls >= tool_limit:
                 raise AgentExecutionError(
@@ -735,17 +741,23 @@ class RecallAgentService:
         profiles = {
             "quick": {
                 "deadline_seconds": 35,
+                "max_tool_calls": 8,
                 "max_hint_calls": 3,
+                "max_exec_calls": 1,
                 "max_exec_seconds": 10,
             },
             "normal": {
                 "deadline_seconds": 50,
-                "max_hint_calls": 3,
-                "max_exec_seconds": 15,
+                "max_tool_calls": 8,
+                "max_hint_calls": 2,
+                "max_exec_calls": 2,
+                "max_exec_seconds": 12,
             },
             "deep": {
                 "deadline_seconds": 120,
+                "max_tool_calls": 12,
                 "max_hint_calls": 6,
+                "max_exec_calls": 6,
                 "max_exec_seconds": 30,
             },
         }
