@@ -643,6 +643,11 @@ class SimpleAgentKernelTest(unittest.TestCase):
         self.assertIn("before inspecting extra candidates", map_tool["description"])
         self.assertIn("host-verified actor attribution", map_tool["description"])
         self.assertIn("do not grep for the person's name", map_tool["description"])
+        self.assertIn(
+            "one partition per named person per requested time slice",
+            map_tool["description"],
+        )
+        self.assertIn("coverage grid", map_tool["description"])
         self.assertIn("batch-open", map_tool["description"])
         self.assertIn("partition label", map_tool["description"])
 
