@@ -417,6 +417,7 @@ state, bounded redacted trace events, and terminal results. They never contain
 the original question, credentials, or source bodies. Expired worker leases become
 `worker_lost_retryable` terminal failures and are never silently rerun. Tune
 only within the validated bounds using `RECALL_AGENT_WORKERS`,
+`RECALL_AGENT_SYNC_WAIT_SECONDS`,
 `RECALL_AGENT_MAX_ACTIVE_PER_PRINCIPAL`, `RECALL_AGENT_LEASE_SECONDS`, and
 `RECALL_AGENT_RETENTION_SECONDS`.
 

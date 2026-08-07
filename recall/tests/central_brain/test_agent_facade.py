@@ -271,6 +271,25 @@ class AgentFacadeUnitTest(unittest.TestCase):
     def test_default_agent_deadline_allows_bounded_multi_step_retrieval(self) -> None:
         self.assertEqual(AgentBudget().deadline_seconds, 120)
 
+    def test_request_depth_selects_host_owned_latency_bounds(self) -> None:
+        expected = {
+            "quick": (35, 3, 10),
+            "normal": (50, 3, 15),
+            "deep": (120, 6, 30),
+        }
+        for depth, bounds in expected.items():
+            with self.subTest(depth=depth):
+                request = {**REQUEST, "depth": depth}
+                _, context = service().prepare(principal(), request)
+                self.assertEqual(
+                    (
+                        context.budget.deadline_seconds,
+                        context.budget.max_hint_calls,
+                        context.budget.max_exec_seconds,
+                    ),
+                    bounds,
+                )
+
     def test_runner_configuration_is_explicit_and_fail_closed(self) -> None:
         self.assertIsNone(service_from_env({}))
         with self.assertRaisesRegex(RuntimeError, "unsupported"):
@@ -363,6 +382,26 @@ class AgentFacadeUnitTest(unittest.TestCase):
             "agent_tool_budget_exhausted",
         )
         self.assertEqual(tools.observations[-1]["outcome"], "failed")
+        self.assertEqual(
+            tools.observations[-1]["error_code"],
+            "agent_tool_budget_exhausted",
+        )
+
+    def test_normal_depth_clamps_one_exec_below_client_timeout(self) -> None:
+        _, context = service().prepare(principal(), REQUEST)
+        retrieval = FakeBoundRetrieval()
+        tools = ConstrainedAgentTools(retrieval, context)
+        tools.call("recall.hints", {
+            "query": REQUEST["question"],
+            "filters": {},
+            "limit": 1,
+        })
+        tools.call("recall.exec", {
+            "program": "rg synthetic /docs/d1",
+            "timeout_seconds": 30,
+        })
+        self.assertEqual(retrieval.calls[-1][0], "exec")
+        self.assertEqual(retrieval.calls[-1][-1], 15)
 
     def test_exec_requires_an_admitted_hint_document(self) -> None:
         tools = ConstrainedAgentTools(

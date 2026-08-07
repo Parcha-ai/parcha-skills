@@ -1462,6 +1462,10 @@ class PiRunner:
                 "agent ended without a grounded finish",
                 code="agent_finish_missing",
             )
+        finished = self._surface_tool_failures(
+            finished,
+            tools.observations,
+        )
         completed = clock()
         elapsed_ms = round(max(0.0, monotonic() - started) * 1000, 3)
         trace = self._trace(
@@ -1743,6 +1747,54 @@ class PiRunner:
         }
 
     @staticmethod
+    def _surface_tool_failures(
+        finished: dict[str, Any],
+        observations: tuple[dict[str, Any], ...],
+    ) -> dict[str, Any]:
+        """Make degraded evidence coverage visible in result and answer."""
+
+        counts: dict[tuple[str, str], int] = {}
+        for observation in observations:
+            if observation.get("outcome") != "failed":
+                continue
+            key = (
+                str(observation.get("tool", "recall.unknown")),
+                str(
+                    observation.get(
+                        "error_code",
+                        "agent_evidence_tool_failed",
+                    )
+                ),
+            )
+            counts[key] = counts.get(key, 0) + 1
+        if not counts:
+            return finished
+        value = {
+            **finished,
+            "gaps": list(finished["gaps"]),
+        }
+        for (tool, code), count in sorted(counts.items()):
+            gap = (
+                f"{count} {tool} evidence stage"
+                f"{'s' if count != 1 else ''} failed ({code}); "
+                "coverage may be incomplete."
+            )
+            if gap not in value["gaps"] and len(value["gaps"]) < 64:
+                value["gaps"].append(gap)
+        if value["status"] == "complete":
+            value["status"] = "partial"
+        if value["answer"]:
+            note = (
+                "\n\nCoverage note: Recall encountered "
+                f"{sum(counts.values())} failed evidence stage"
+                f"{'s' if sum(counts.values()) != 1 else ''}; "
+                "the result is explicitly partial."
+            )
+            if len(value["answer"]) + len(note) <= 64_000:
+                value["answer"] += note
+        return value
+
+    @staticmethod
     def _trace(
         trace_id: str,
         run_id: str,
@@ -1755,9 +1807,11 @@ class PiRunner:
         include_receipts: bool = True,
         error_code: str | None = None,
     ) -> list[dict[str, Any]]:
-        events: list[tuple[str, str, list[str], int, int, str, float]] = [
-            ("authorize", "recall.authorization", [], 0, 0, "ok", 0.0),
-            ("plan", "pi", [], 0, 0, "ok", 0.0),
+        events: list[
+            tuple[str, str, list[str], int, int, str, float, str | None]
+        ] = [
+            ("authorize", "recall.authorization", [], 0, 0, "ok", 0.0, None),
+            ("plan", "pi", [], 0, 0, "ok", 0.0, None),
         ]
         for observation in observations:
             tool = observation["tool"]
@@ -1775,14 +1829,15 @@ class PiRunner:
                 int(observation["session_count"]),
                 str(observation["outcome"]),
                 float(observation["elapsed_ms"]),
+                observation.get("error_code"),
             ))
         events.extend([
             ("synthesize", "pi", citations, len({
                 urlsplit(item).netloc for item in citations
-            }), 0, "ok" if status == "complete" else "degraded", 0.0),
+            }), 0, "ok" if status == "complete" else "degraded", 0.0, None),
             ("verify", "recall.grounding", citations, len({
                 urlsplit(item).netloc for item in citations
-            }), 0, "ok" if status == "complete" else "degraded", 0.0),
+            }), 0, "ok" if status == "complete" else "degraded", 0.0, None),
             (
                 "complete",
                 "recall.agent",
@@ -1791,6 +1846,7 @@ class PiRunner:
                 0,
                 "ok" if status == "complete" else "degraded",
                 elapsed_ms,
+                error_code,
             ),
         ])
         trace = []
@@ -1802,6 +1858,7 @@ class PiRunner:
             sessions,
             outcome,
             event_elapsed_ms,
+            event_error_code,
         ) in enumerate(events):
             bounded = (
                 list(dict.fromkeys(receipts))[:256]
@@ -1824,8 +1881,8 @@ class PiRunner:
                 "session_count": sessions,
                 "tool": tool,
             }
-            if error_code is not None and stage == "complete":
-                event["error_code"] = error_code
+            if event_error_code is not None:
+                event["error_code"] = event_error_code
             trace.append(event)
         return trace
 

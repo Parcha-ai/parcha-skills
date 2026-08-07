@@ -295,6 +295,55 @@ def service(transport) -> RecallAgentService:
 
 
 class SimpleAgentKernelTest(unittest.TestCase):
+    def test_failed_inner_stage_forces_visible_partial_result(self):
+        class RecoveringTransport:
+            def run(self, _start, invoke, *, timeout_seconds):
+                del timeout_seconds
+                try:
+                    invoke("exec", {
+                        "program": "rg synthetic /docs/d1",
+                        "timeout_seconds": 10,
+                    })
+                except AgentExecutionError:
+                    pass
+                invoke("open", {
+                    "alias": "d1",
+                    "cursor": None,
+                    "record_ordinal": 80,
+                    "page_bytes": 32_768,
+                })
+                invoke("finish", {
+                    "status": "complete",
+                    "answer": "The bounded bridge was selected.",
+                    "claims": [{
+                        "statement": "The bounded bridge was selected.",
+                        "receipts": [DECISION],
+                    }],
+                    "gaps": [],
+                })
+                return {"terminal": {}, "usage": {}}
+
+        result = RecallAgentService(
+            PiRunner(RecoveringTransport()),
+        ).use_recall(
+            principal(),
+            REQUEST,
+            SyntheticRetrieval(fail_deep=True),
+        )
+        self.assertEqual(result["result"]["status"], "partial")
+        self.assertIn("explicitly partial", result["result"]["answer"])
+        self.assertEqual(len(result["result"]["gaps"]), 1)
+        self.assertIn("recall.exec", result["result"]["gaps"][0])
+        failed = [
+            event for event in result["trace"]
+            if event["outcome"] == "failed"
+        ]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(
+            failed[0]["error_code"],
+            "agent_evidence_tool_failed",
+        )
+
     def test_terminal_failure_codes_and_partial_trace_are_content_free(self):
         open_arguments = {
             "alias": "d1",

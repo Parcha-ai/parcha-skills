@@ -99,7 +99,9 @@ ALL_READ_TOOLS = (
         "name": "use_recall",
         "description": (
             "Ask the authenticated Recall brain one natural-language question. "
-            "Recall owns investigation, grounding, citations, and the redacted trace."
+            "Recall owns investigation, grounding, citations, and the redacted trace. "
+            "Legacy synchronous clients receive a durable run handle with run_id "
+            "and trace_id when work continues beyond the bounded compatibility wait."
         ),
         "inputSchema": {
             "type": "object",
