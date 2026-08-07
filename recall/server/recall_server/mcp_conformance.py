@@ -15,6 +15,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .mcp import (
+    LATEST_PROTOCOL_VERSION,
     NOTIFICATION_METHODS,
     READ_TOOLS,
     REQUEST_METHODS,
@@ -480,6 +481,23 @@ class _McpHttpClient:
             headers["Origin"] = self.config.origin
         payload = None
         if body is not None:
+            if protocol == LATEST_PROTOCOL_VERSION:
+                params = body.setdefault("params", {})
+                params.setdefault("_meta", {
+                    "io.modelcontextprotocol/protocolVersion": protocol,
+                    "io.modelcontextprotocol/clientInfo": {
+                        "name": "recall-conformance",
+                        "version": "1",
+                    },
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                })
+                headers["Mcp-Method"] = body["method"]
+                if body["method"] == "tools/call":
+                    headers["Mcp-Name"] = params["name"]
+                elif body["method"] in {
+                    "tasks/get", "tasks/update", "tasks/cancel"
+                }:
+                    headers["Mcp-Name"] = params["taskId"]
             payload = json.dumps(body, ensure_ascii=False).encode()
             headers.update(
                 {
@@ -655,9 +673,31 @@ def run_conformance(config: McpConformanceConfig) -> dict[str, Any]:
     expected = _expected_cells()
     executed: set[str] = set()
     tool_errors = 0
-    latest = max(SUPPORTED_PROTOCOL_VERSIONS)
+    latest = max(
+        version
+        for version in SUPPORTED_PROTOCOL_VERSIONS
+        if version != LATEST_PROTOCOL_VERSION
+    )
 
     for protocol in sorted(SUPPORTED_PROTOCOL_VERSIONS):
+        if protocol == LATEST_PROTOCOL_VERSION:
+            status, discovered = client.rpc(
+                config.owner_token,
+                protocol,
+                "server/discover",
+            )
+            if (
+                status != 200
+                or protocol not in discovered.get("result", {}).get(
+                    "supportedVersions", []
+                )
+            ):
+                raise ConformanceError("protocol discovery failed")
+            executed.update({
+                f"protocol:{protocol}",
+                "method:server/discover",
+            })
+            continue
         status, initialized = client.rpc(
             config.owner_token,
             protocol,
@@ -678,6 +718,21 @@ def run_conformance(config: McpConformanceConfig) -> dict[str, Any]:
             raise ConformanceError("protocol initialization failed")
         executed.add(f"protocol:{protocol}")
     executed.update({"method:initialize", "lifecycle:initialize"})
+
+    status, subscription = client.rpc(
+        config.owner_token,
+        LATEST_PROTOCOL_VERSION,
+        "subscriptions/listen",
+        {"notifications": {
+            "taskIds": ["tsk_0123456789abcdef0123456789abcdef"],
+        }},
+    )
+    if (
+        status != 400
+        or subscription.get("error", {}).get("code") != -32003
+    ):
+        raise ConformanceError("task subscription capability gate failed")
+    executed.add("method:subscriptions/listen")
 
     status, raw = client.notification(
         config.owner_token,

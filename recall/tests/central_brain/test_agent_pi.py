@@ -6,6 +6,7 @@ import stat
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -185,7 +186,9 @@ class ScriptedTransport:
         self.script = script
         self.start = None
 
-    def run(self, start, invoke, *, timeout_seconds):
+    def run(self, start, invoke, *, timeout_seconds, cancelled):
+        del timeout_seconds
+        assert not cancelled()
         self.start = start
         for name, arguments in self.script:
             invoke(name, arguments)
@@ -208,7 +211,9 @@ class TerminalFailureTransport:
         self.reason_code = reason_code
         self.script = list(script)
 
-    def run(self, start, invoke, *, timeout_seconds):
+    def run(self, start, invoke, *, timeout_seconds, cancelled):
+        del start, timeout_seconds
+        assert not cancelled()
         for name, arguments in self.script:
             invoke(name, arguments)
         error = AgentExecutionError(
@@ -297,8 +302,9 @@ def service(transport) -> RecallAgentService:
 class SimpleAgentKernelTest(unittest.TestCase):
     def test_failed_inner_stage_forces_visible_partial_result(self):
         class RecoveringTransport:
-            def run(self, _start, invoke, *, timeout_seconds):
+            def run(self, _start, invoke, *, timeout_seconds, cancelled):
                 del timeout_seconds
+                assert not cancelled()
                 try:
                     invoke("exec", {
                         "program": "rg synthetic /docs/d1",
@@ -987,6 +993,33 @@ print(json.dumps({{"v":"{PROTOCOL}","turn_id":start["turn_id"],"seq":0,"type":"t
                 timeout_seconds=0.05,
             )
         self.assertEqual(timed_out.exception.code, "agent_model_timeout")
+
+    def test_transport_cooperatively_cancels_an_unbounded_turn(self):
+        transport = SubprocessPiTransport(
+            (sys.executable, "-c", "import time; time.sleep(60)"),
+            model_base_url="https://api.cerebras.ai/v1",
+            route_kind="direct_provider",
+            provider="openai-compatible",
+            provider_key=ProviderKey(value="synthetic-provider-key-value"),
+            expected_route_identity="api.cerebras.ai",
+            environment={"PATH": os.environ["PATH"]},
+        )
+        started = time.monotonic()
+        with self.assertRaises(AgentExecutionError) as cancelled:
+            transport.run(
+                {
+                    "turn_id": "turn_cancelled",
+                    "data": {"model": {"alias": "gemma-4-31b"}},
+                },
+                lambda *_args: {},
+                timeout_seconds=None,
+                cancelled=lambda: time.monotonic() - started > 0.15,
+            )
+        self.assertEqual(
+            cancelled.exception.code,
+            "agent_cancelled_by_caller",
+        )
+        self.assertLess(time.monotonic() - started, 1.0)
 
     def test_configuration_has_one_pi_runner_and_private_secret_file(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -18,7 +18,13 @@ from recall_server.agent_runs import (  # noqa: E402
     CreatedRun,
     backend_from_env,
 )
-from recall_server.mcp import McpProtocolError, dispatch  # noqa: E402
+from recall_server.mcp import (  # noqa: E402
+    LATEST_PROTOCOL_VERSION,
+    McpProtocolError,
+    dispatch,
+    task_notification,
+    task_subscription,
+)
 
 
 RUN_ID = "run_0123456789abcdef0123456789abcdef"
@@ -120,6 +126,22 @@ def message(method: str, params: dict) -> dict:
         "id": 1,
         "method": method,
         "params": params,
+    }
+
+
+def modern_params(**values) -> dict:
+    return {
+        **values,
+        "_meta": {
+            "io.modelcontextprotocol/protocolVersion": LATEST_PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientInfo": {
+                "name": "synthetic",
+                "version": "1",
+            },
+            "io.modelcontextprotocol/clientCapabilities": {
+                "extensions": {"io.modelcontextprotocol/tasks": {}},
+            },
+        },
     }
 
 
@@ -243,6 +265,74 @@ class McpTaskNegotiationTest(unittest.TestCase):
                 task_name=TASK_ID,
             )
 
+    def test_modern_discovery_task_poll_and_notification_shapes(self) -> None:
+        discovered = self.call(
+            message("server/discover", modern_params()),
+            protocol=LATEST_PROTOCOL_VERSION,
+        )
+        self.assertEqual(
+            discovered["result"]["supportedVersions"],
+            [LATEST_PROTOCOL_VERSION],
+        )
+        self.assertIn(
+            "io.modelcontextprotocol/tasks",
+            discovered["result"]["capabilities"]["extensions"],
+        )
+        self.assertEqual(
+            (discovered["result"]["ttlMs"], discovered["result"]["cacheScope"]),
+            (300_000, "private"),
+        )
+        self.assertEqual(
+            discovered["result"]["_meta"][
+                "io.modelcontextprotocol/serverInfo"
+            ]["name"],
+            "recall",
+        )
+        created = self.call(
+            message("tools/call", modern_params(
+                name="use_recall",
+                arguments=REQUEST,
+            )),
+            protocol=LATEST_PROTOCOL_VERSION,
+        )
+        self.assertEqual(created["result"]["resultType"], "task")
+        self.assertEqual(created["result"]["statusMessage"], "Working")
+        polled = self.call(
+            message("tasks/get", modern_params(taskId=TASK_ID)),
+            protocol=LATEST_PROTOCOL_VERSION,
+            task_name=TASK_ID,
+        )
+        self.assertEqual(polled["result"]["status"], "working")
+        notification = task_notification(
+            run("running"),
+            TASK_ID,
+            subscription_id="subscription-1",
+            ttl_ms=60_000,
+        )
+        self.assertEqual(notification["method"], "notifications/tasks")
+        self.assertNotIn("resultType", notification["params"])
+
+    def test_modern_task_subscription_requires_capability_and_closed_ids(self) -> None:
+        payload = message(
+            "subscriptions/listen",
+            modern_params(notifications={"taskIds": [TASK_ID]}),
+        )
+        self.assertEqual(
+            task_subscription(
+                payload,
+                protocol_version=LATEST_PROTOCOL_VERSION,
+            ),
+            (1, (TASK_ID,)),
+        )
+        payload["params"]["_meta"][
+            "io.modelcontextprotocol/clientCapabilities"
+        ] = {}
+        with self.assertRaisesRegex(McpProtocolError, "Tasks"):
+            task_subscription(
+                payload,
+                protocol_version=LATEST_PROTOCOL_VERSION,
+            )
+
 
 class DurableConfigurationTest(unittest.TestCase):
     class Store:
@@ -264,7 +354,7 @@ class DurableConfigurationTest(unittest.TestCase):
                 with self.assertRaises((RuntimeError, ValueError)):
                     backend_from_env(environment, self.Store())
 
-    def test_sync_compatibility_timeout_returns_durable_identifiers(self) -> None:
+    def test_compatibility_call_returns_durable_identifiers_immediately(self) -> None:
         pending = Future()
 
         class Executor:
@@ -297,7 +387,6 @@ class DurableConfigurationTest(unittest.TestCase):
         coordinator = AgentRunCoordinator(
             Service(),
             Backend(),
-            sync_wait_seconds=0.01,
             executor=Executor(),
         )
         value = coordinator.use_recall(
@@ -310,7 +399,7 @@ class DurableConfigurationTest(unittest.TestCase):
             value["run"]["trace_id"],
             "trc_0123456789abcdef0123456789abcdef",
         )
-        self.assertEqual(value["run"]["status"], "running")
+        self.assertEqual(value["run"]["status"], "queued")
         self.assertEqual(value["task_id"], TASK_ID)
         self.assertEqual(
             value["continuation"],
@@ -334,7 +423,7 @@ class DurableConfigurationTest(unittest.TestCase):
 
     def test_coordinator_persists_safe_typed_failure_code(self) -> None:
         class Service:
-            def execute(self, *_args):
+            def execute(self, *_args, **_kwargs):
                 raise AgentExecutionError(
                     "provider body is not durable",
                     code="agent_model_timeout",

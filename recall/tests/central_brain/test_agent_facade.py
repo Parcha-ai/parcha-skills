@@ -268,14 +268,14 @@ def service(runner=None) -> RecallAgentService:
 
 
 class AgentFacadeUnitTest(unittest.TestCase):
-    def test_default_agent_deadline_allows_bounded_multi_step_retrieval(self) -> None:
-        self.assertEqual(AgentBudget().deadline_seconds, 120)
+    def test_agent_budget_has_no_whole_run_wall_deadline(self) -> None:
+        self.assertFalse(hasattr(AgentBudget(), "deadline_seconds"))
 
     def test_request_depth_selects_host_owned_latency_bounds(self) -> None:
         expected = {
-            "quick": (35, 8, 3, 1, 8, 10),
-            "normal": (50, 8, 2, 2, 8, 12),
-            "deep": (120, 12, 6, 6, 20, 30),
+            "quick": (8, 3, 1, 8, 10),
+            "normal": (8, 2, 2, 8, 12),
+            "deep": (12, 6, 6, 20, 30),
         }
         for depth, bounds in expected.items():
             with self.subTest(depth=depth):
@@ -283,7 +283,6 @@ class AgentFacadeUnitTest(unittest.TestCase):
                 _, context = service().prepare(principal(), request)
                 self.assertEqual(
                     (
-                        context.budget.deadline_seconds,
                         context.budget.max_tool_calls,
                         context.budget.max_hint_calls,
                         context.budget.max_exec_calls,
@@ -579,10 +578,10 @@ class AgentFacadeUnitTest(unittest.TestCase):
                     "agent_evidence_scope_violation",
                 )
 
-    def test_exec_timeout_is_clamped_to_the_remaining_turn_budget(self) -> None:
+    def test_exec_timeout_is_clamped_to_the_per_operation_budget(self) -> None:
         context = dataclasses.replace(
             DelegationContext.from_principal(principal()),
-            budget=AgentBudget(deadline_seconds=25),
+            budget=AgentBudget(max_exec_seconds=10),
         )
         ticks = iter([100.0, 101.0, 101.0, 102.0, 108.5, 108.5, 109.0])
         retrieval = FakeBoundRetrieval()
@@ -620,30 +619,22 @@ class AgentFacadeUnitTest(unittest.TestCase):
         )
         self.assertEqual(exec_call[-1], 10)
 
-    def test_exec_fails_closed_when_only_finish_reserve_remains(self) -> None:
-        context = dataclasses.replace(
-            DelegationContext.from_principal(principal()),
-            budget=AgentBudget(deadline_seconds=10),
-        )
-        ticks = iter([100.0, 101.0, 101.0, 102.0, 105.0, 105.0])
+    def test_cancelled_agent_stops_before_another_evidence_operation(self) -> None:
+        context = DelegationContext.from_principal(principal())
         tools = ConstrainedAgentTools(
             FakeBoundRetrieval(),
             context,
-            monotonic=lambda: next(ticks),
+            cancel_requested=lambda: True,
         )
-        tools.call("recall.hints", {
-            "query": REQUEST["question"],
-            "filters": {},
-            "limit": 1,
-        })
         with self.assertRaises(AgentExecutionError) as caught:
-            tools.call("recall.exec", {
-                "program": "rg synthetic /docs/d1",
-                "timeout_seconds": 30,
+            tools.call("recall.hints", {
+                "query": REQUEST["question"],
+                "filters": {},
+                "limit": 1,
             })
         self.assertEqual(
             caught.exception.code,
-            "agent_tool_deadline_exhausted",
+            "agent_cancelled_by_caller",
         )
 
     def test_host_owned_receipt_budget_is_enforced(self) -> None:

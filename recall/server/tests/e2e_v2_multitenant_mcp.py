@@ -828,21 +828,65 @@ def main() -> None:
                 "since": "2026-07-22T00:00:00Z",
                 "until": "2026-07-24T23:59:59Z",
             }
-            agent_http_status, agent_http_result = agent_http(
+            agent_started_at = time.monotonic()
+            agent_http_status, agent_http_started = agent_http(
                 server,
                 company_token["token"],
                 COMPANY,
                 agent_request,
             )
             assert agent_http_status == 200
-            agent_mcp_result = rpc(
+            assert time.monotonic() - agent_started_at < 0.5
+            assert agent_http_started["run"]["status"] in {"queued", "running"}
+            assert agent_http_started["continuation"]["tool"] == (
+                "recall_agent_result"
+            )
+            agent_http_run_id = agent_http_started["run"]["run_id"]
+
+            agent_mcp_request = {
+                **agent_request,
+                "request_id": "req_1111222233334444",
+                "idempotency_key": "synthetic-company-agent-mcp-compat",
+            }
+            agent_started_at = time.monotonic()
+            agent_mcp_started = rpc(
                 server,
                 company_token["token"],
                 "use_recall",
-                agent_request,
+                agent_mcp_request,
                 path=f"/mcp/brains/{COMPANY}",
             )["result"]["structuredContent"]
-            assert agent_http_result == agent_mcp_result
+            assert time.monotonic() - agent_started_at < 0.5
+            assert agent_mcp_started["run"]["status"] in {"queued", "running"}
+            agent_mcp_run_id = agent_mcp_started["run"]["run_id"]
+
+            agent_path = f"/v1/agent/brains/{COMPANY}/runs"
+            for _attempt in range(100):
+                result_code, agent_http_result = agent_lifecycle_http(
+                    server,
+                    company_token["token"],
+                    "GET",
+                    f"{agent_path}/{agent_http_run_id}/result",
+                )
+                assert result_code == 200
+                if "result" in agent_http_result:
+                    break
+                time.sleep(0.01)
+            for _attempt in range(100):
+                agent_mcp_result = rpc(
+                    server,
+                    company_token["token"],
+                    "recall_agent_result",
+                    {"run_id": agent_mcp_run_id},
+                    path=f"/mcp/brains/{COMPANY}",
+                )["result"]["structuredContent"]
+                if "result" in agent_mcp_result:
+                    break
+                time.sleep(0.01)
+            for field in ("status", "answer", "claims", "gaps", "citations"):
+                assert agent_http_result["result"][field] == (
+                    agent_mcp_result["result"][field]
+                )
             assert agent_http_result["result"]["status"] == "partial"
             agent_receipts = set(agent_http_result["result"]["citations"])
             assert agent_receipts
@@ -876,7 +920,7 @@ def main() -> None:
                 "request_id": "req_abcdef0123456789",
                 "idempotency_key": "synthetic-company-agent-detached",
             }
-            detached_path = f"/v1/agent/brains/{COMPANY}/runs"
+            detached_path = agent_path
             detached_status, detached = agent_lifecycle_http(
                 server,
                 company_token["token"],
@@ -1073,7 +1117,7 @@ def main() -> None:
                               AND table_name='agent_runs'"""
                     ).fetchall()
                 }
-            assert durable_runs == 6
+            assert durable_runs == 7
             assert "question" not in agent_columns
             assert "credential" not in agent_columns
             for row in stored_traces:

@@ -64,7 +64,7 @@ infrastructure. The example is synthetic; a live manifest belongs in a private m
 location and contains references, never credential values.
 
 The production database gate requires a standard PostgreSQL URL with
-`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 46,
+`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 47,
 pgvector 0.8.0 or newer, and a runtime role without superuser, database/role creation,
 replication, or RLS-bypass privilege:
 
@@ -366,10 +366,14 @@ Schema 38 adds durable agent runs. `POST /v1/agent/brains/{tenant}/runs` starts
 detached work; the corresponding run, result, and cancel routes remain bound to
 the authenticated tenant, principal, and current source grants. MCP exposes the
 same compatibility lifecycle as `recall_agent_start`, `recall_agent_status`,
-`recall_agent_result`, and `recall_agent_cancel`. Under MCP `2026-06-30`, Recall
-also advertises `io.modelcontextprotocol/tasks` and returns a native task only
-when the individual `tools/call` opts into that extension. Older or
-non-negotiating clients keep the synchronous `use_recall` result.
+`recall_agent_result`, and `recall_agent_cancel`. MCP `2026-07-28` clients can
+discover `io.modelcontextprotocol/tasks`, receive a durable native task from
+`use_recall`, poll it with `tasks/get`, cancel it with `tasks/cancel`, or listen
+for full task-state updates through `subscriptions/listen`. The pre-final
+`2026-06-30` task negotiation remains available during the ecosystem rollout.
+Older or non-negotiating clients receive the same durable run immediately and
+continue with the explicit lifecycle tools; `use_recall` never holds an HTTP
+request open for the investigation.
 
 For semantic synthesis, enable the direct open-source Pi worker included in the
 image and configure one explicit OpenAI-compatible endpoint:
@@ -413,11 +417,13 @@ questions, answers, tool arguments, source bodies, and credentials are excluded
 from durable traces.
 
 Lifecycle rows contain authority identifiers, a request hash, opaque handles,
-state, bounded redacted trace events, and terminal results. They never contain
-the original question, credentials, or source bodies. Expired worker leases become
-`worker_lost_retryable` terminal failures and are never silently rerun. Tune
-only within the validated bounds using `RECALL_AGENT_WORKERS`,
-`RECALL_AGENT_SYNC_WAIT_SECONDS`,
+state, a content-free progress phase, bounded redacted trace events, and terminal
+results. They never contain the original question, credentials, or source bodies.
+Expired worker leases become
+`worker_lost_retryable` terminal failures and are never silently rerun. Active
+runs renew their leases and poll durable cancellation while the Pi process is
+working. Search depth controls bounded tool effort, not a whole-run wall-clock
+deadline. Tune only within the validated bounds using `RECALL_AGENT_WORKERS`,
 `RECALL_AGENT_MAX_ACTIVE_PER_PRINCIPAL`, `RECALL_AGENT_LEASE_SECONDS`, and
 `RECALL_AGENT_RETENTION_SECONDS`.
 

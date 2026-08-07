@@ -75,6 +75,7 @@ from .mcp import (
 from .mcp import (
     error_response as mcp_error_response,
 )
+from .mcp import task_notification, task_subscription
 from .semantic import SemanticRuntime
 from .webhooks import WEBHOOK_PATH, WebhookError, build_webhook_event
 
@@ -231,6 +232,79 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def send_task_subscription(
+        self,
+        principal: dict,
+        subscription_id: object,
+        task_ids: tuple[str, ...],
+    ) -> None:
+        if self.agent_coordinator is None:
+            raise McpProtocolError(-32601, "method not found")
+        states = {
+            task_id: self.agent_coordinator.task_status(principal, task_id)
+            for task_id in task_ids
+        }
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store, no-transform")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        def send(message: dict) -> None:
+            payload = json.dumps(
+                message,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode()
+            self.wfile.write(b"event: message\ndata: " + payload + b"\n\n")
+            self.wfile.flush()
+
+        try:
+            send({
+                "jsonrpc": "2.0",
+                "method": "notifications/subscriptions/acknowledged",
+                "params": {
+                    "notifications": {"taskIds": list(task_ids)},
+                    "_meta": {
+                        "io.modelcontextprotocol/subscriptionId": subscription_id,
+                    },
+                },
+            })
+            observed: dict[str, str] = {}
+            last_keepalive = time.monotonic()
+            while True:
+                for task_id in task_ids:
+                    state = states[task_id]
+                    run = state["run"]
+                    version = f"{run['status']}:{run['updated_at']}"
+                    if observed.get(task_id) != version:
+                        final = None
+                        if run["status"] in {"complete", "partial", "no_answer"}:
+                            final = self.agent_coordinator.task_result(
+                                principal,
+                                task_id,
+                            )
+                        send(task_notification(
+                            run,
+                            task_id,
+                            subscription_id=subscription_id,
+                            result=final,
+                            ttl_ms=state["ttl_ms"],
+                        ))
+                        observed[task_id] = version
+                time.sleep(1)
+                states = {
+                    task_id: self.agent_coordinator.task_status(principal, task_id)
+                    for task_id in task_ids
+                }
+                if time.monotonic() - last_keepalive >= 15:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    last_keepalive = time.monotonic()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
     def valid_mcp_origin(self) -> bool:
         origin = self.headers.get("Origin")
         if origin is None:
@@ -276,6 +350,47 @@ class Handler(BaseHTTPRequestHandler):
             ),
         )
         return False
+
+    def valid_mcp_routing_headers(
+        self,
+        body: object,
+        protocol_version: str,
+    ) -> bool:
+        if protocol_version != LATEST_PROTOCOL_VERSION:
+            return True
+        if not isinstance(body, dict):
+            return True
+        method = body.get("method")
+        params = body.get("params") if isinstance(body.get("params"), dict) else {}
+        metadata = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
+        expected_name = None
+        if method == "tools/call":
+            expected_name = params.get("name")
+        elif method in {"tasks/get", "tasks/update", "tasks/cancel"}:
+            expected_name = params.get("taskId")
+        if (
+            not isinstance(method, str)
+            or self.headers.get("Mcp-Method") != method
+            or metadata.get("io.modelcontextprotocol/protocolVersion")
+            != protocol_version
+            or (
+                expected_name is not None
+                and self.headers.get("Mcp-Name") != expected_name
+            )
+            or (
+                expected_name is None
+                and self.headers.get("Mcp-Name") is not None
+            )
+        ):
+            self.send_json(
+                400,
+                mcp_error_response(
+                    McpProtocolError(-32020, "MCP routing headers do not match"),
+                    body.get("id"),
+                ),
+            )
+            return False
+        return True
 
     def body_length(self, maximum: int) -> int | None:
         try:
@@ -1521,6 +1636,11 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.loads(self.rfile.read(length))
                 if isinstance(body, dict):
                     request_id = body.get("id")
+                protocol_version = (
+                    self.headers.get("MCP-Protocol-Version") or "2025-03-26"
+                )
+                if not self.valid_mcp_routing_headers(body, protocol_version):
+                    return
                 mcp_store = self.store
                 if os.environ.get("RECALL_CANONICAL_MCP_ENABLED") == "1":
                     if self.canonical_retrieval is None:
@@ -1559,6 +1679,24 @@ class Handler(BaseHTTPRequestHandler):
                             task_id,
                         ),
                     }
+                subscription = task_subscription(
+                    body,
+                    protocol_version=protocol_version,
+                )
+                if subscription is not None:
+                    if lifecycle is None:
+                        raise McpProtocolError(-32601, "method not found")
+                    if not self.authorize_mcp(
+                        principal,
+                        "mcp.recall_agent_status",
+                    ):
+                        raise McpProtocolError(-32600, "operation not authorized")
+                    self.send_task_subscription(
+                        principal,
+                        subscription[0],
+                        subscription[1],
+                    )
+                    return
                 response = dispatch_mcp(
                     mcp_store,
                     principal,
@@ -1585,10 +1723,7 @@ class Handler(BaseHTTPRequestHandler):
                         else None
                     ),
                     agent_lifecycle=lifecycle,
-                    protocol_version=(
-                        self.headers.get("MCP-Protocol-Version")
-                        or LATEST_PROTOCOL_VERSION
-                    ),
+                    protocol_version=protocol_version,
                     task_name=self.headers.get("Mcp-Name"),
                 )
             except json.JSONDecodeError:
@@ -1598,7 +1733,25 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
             except McpProtocolError as exc:
-                self.send_json(200, mcp_error_response(exc, request_id))
+                status = (
+                    404
+                    if protocol_version == LATEST_PROTOCOL_VERSION
+                    and exc.code == -32601
+                    else 400
+                    if protocol_version == LATEST_PROTOCOL_VERSION
+                    and exc.code in {-32020, -32003}
+                    else 200
+                )
+                self.send_json(status, mcp_error_response(exc, request_id))
+                return
+            except (AgentRunNotFound, AgentRunStateError):
+                self.send_json(
+                    200,
+                    mcp_error_response(
+                        McpProtocolError(-32602, "agent task is unavailable"),
+                        request_id,
+                    ),
+                )
                 return
             except (ValueError, TypeError):
                 self.send_json(
@@ -1891,12 +2044,6 @@ def configure_runtime(dsn: str) -> None:
         if Handler.agent_service is not None:
             try:
                 workers = int(environment.get("RECALL_AGENT_WORKERS", "4"))
-                sync_wait_seconds = float(
-                    environment.get(
-                        "RECALL_AGENT_SYNC_WAIT_SECONDS",
-                        "45",
-                    )
-                )
             except ValueError as error:
                 raise RuntimeError(
                     "Recall agent lifecycle configuration is invalid"
@@ -1907,7 +2054,6 @@ def configure_runtime(dsn: str) -> None:
                 backend,
                 workers=workers,
                 abandon_after_seconds=backend.lease_seconds,
-                sync_wait_seconds=sync_wait_seconds,
             )
             recovered = Handler.agent_coordinator.recover()
             pruned = backend.prune(
@@ -1938,6 +2084,7 @@ def serve(dsn: str, host: str = "127.0.0.1", port: int = 8788) -> None:
         raise RuntimeError("authentication is required for a non-loopback TCP bind")
     configure_runtime(dsn)
     server = ThreadingHTTPServer((host, port), Handler)
+    server.daemon_threads = True
     LOG.info("brainstore listening host=%s port=%s", host, port)
     try:
         server.serve_forever()

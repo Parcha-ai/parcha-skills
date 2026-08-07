@@ -141,6 +141,7 @@ class McpConformanceCoverageTest(unittest.TestCase):
             set(manifest["methods"]),
             {
                 "initialize",
+                "server/discover",
                 "notifications/initialized",
                 "ping",
                 "tools/list",
@@ -148,6 +149,7 @@ class McpConformanceCoverageTest(unittest.TestCase):
                 "tasks/get",
                 "tasks/update",
                 "tasks/cancel",
+                "subscriptions/listen",
             },
         )
         self.assertEqual(

@@ -63,6 +63,7 @@
         "attempt": {"type": "integer", "minimum": 1, "maximum": 100},
         "created_at": {"type": "string", "format": "date-time"},
         "updated_at": {"type": "string", "format": "date-time"},
+        "status_message": {"enum": ["queued", "planning", "searching", "inspecting", "synthesizing", "verifying", "completed", "failed", "cancelled"]},
         "completed_at": {"type": "string", "format": "date-time"},
         "error_code": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]{1,63}$"}
       }
