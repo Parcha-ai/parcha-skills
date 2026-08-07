@@ -183,11 +183,9 @@ def _model_tool_error_message(error: AgentExecutionError) -> str:
         ),
         "agent_finish_invalid": (
             "Submit finish with exactly status, answer, claims, and gaps. "
-            "The host derives citations from claim receipts. The gaps field "
-            "means missing evidence only, "
-            "not project blockers: complete requires gaps=[], partial requires "
-            "at least one evidence gap, and no_answer requires empty answer, "
-            "claims, plus at least one evidence gap."
+            "The host derives citations from claim receipts and canonical status "
+            "from grounded content. The gaps field means missing evidence only, "
+            "not project blockers."
         ),
         "agent_citation_not_opened": (
             "Use only receipts opened by find, open, or exec in claims."
@@ -1340,9 +1338,10 @@ def _tool_definitions(
                 f"{AGENT_FINISH_GUIDANCE} Every claim "
                 "receipt must have appeared in prior find, open, or exec output. "
                 "The host derives citations from those claim receipts. "
-                "gaps means missing evidence, not unresolved project blockers: "
-                "complete requires []; partial requires a nonempty list; no_answer "
-                "requires empty answer and claims plus a nonempty gap."
+                "The host also derives canonical status from grounded content: "
+                "answer and claims without gaps is complete, with gaps is partial, "
+                "and empty answer and claims with a gap is no_answer. gaps means "
+                "missing evidence, not unresolved project blockers."
             ),
             "input_schema": _object_schema(
                 {
@@ -1981,27 +1980,22 @@ class PiRunner:
                 "agent cited evidence it did not open",
                 code="agent_citation_not_opened",
             )
-        if status in {"complete", "partial"} and (
-            not answer or not claims or not citations
-        ):
+        if answer or claims or citations:
+            if not answer or not claims or not citations:
+                raise AgentExecutionError(
+                    "agent answer is not grounded",
+                    code="agent_claim_not_grounded",
+                )
+            # Status is redundant model bookkeeping. Derive the canonical
+            # value from grounded content so a semantically valid answer is
+            # not discarded because the model mislabeled its evidence gaps.
+            status = "partial" if gaps else "complete"
+        elif gaps:
+            status = "no_answer"
+        else:
             raise AgentExecutionError(
                 "agent answer is not grounded",
                 code="agent_claim_not_grounded",
-            )
-        if (
-            (status == "complete" and gaps)
-            or (status == "partial" and not gaps)
-        ):
-            raise AgentExecutionError(
-                "agent answer status disagrees with its gaps",
-                code="agent_finish_invalid",
-            )
-        if status == "no_answer" and (
-            answer or claims or not gaps
-        ):
-            raise AgentExecutionError(
-                "agent no-answer payload is invalid",
-                code="agent_finish_invalid",
             )
         return {
             "status": status,
