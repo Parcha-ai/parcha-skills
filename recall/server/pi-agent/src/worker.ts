@@ -258,7 +258,7 @@ export function validateStart(value: unknown): StartData {
   if (!Array.isArray(prompt.parts) || prompt.parts.length === 0) {
     throw new Error("turn.start.data.prompt.parts is invalid");
   }
-  if (!Array.isArray(data.tools) || data.tools.length !== 5) {
+  if (!Array.isArray(data.tools) || data.tools.length !== 6) {
     throw new Error("turn.start.data.tools must contain the closed Recall catalog");
   }
   const names = data.tools.map((item, index) => {
@@ -272,7 +272,7 @@ export function validateStart(value: unknown): StartData {
   });
   if (
     new Set(names).size !== names.length
-    || names.join(",") !== "search,find,open,exec,finish"
+    || names.join(",") !== "search,map,find,open,exec,finish"
   ) {
     throw new Error("Recall Pi tool catalog is invalid");
   }

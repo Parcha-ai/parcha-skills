@@ -41,6 +41,7 @@ from .federation import SOURCE_FAMILIES
 PROTOCOL = "recall.pi-run.v1"
 MODEL_TOOL_NAMES = {
     "search": "recall.hints",
+    "map": "recall.map",
     "find": "recall.find",
     "open": "recall.open",
     "exec": "recall.exec",
@@ -79,6 +80,22 @@ AGENT_HINT_GUIDANCE = (
     "evidence need has plausible candidates, inspect them rather than exhausting "
     "the hint budget."
 )
+AGENT_MAP_GUIDANCE = (
+    "For a question spanning many dates, people, sources, or initiatives, "
+    "choose useful partitions yourself and submit them together. Time slices "
+    "are often useful for activity summaries, but they are not mandatory. "
+    "Align the partitions with the coverage the user actually requested: "
+    "'each day' requires time partitions that cover the requested days, while "
+    "'each person' requires person partitions. A partition may include several "
+    "entities when that avoids an unnecessary cross-product. Do not keep the "
+    "entire time window in every person partition when the requested coverage "
+    "is daily. "
+    "Each partition is an ordinary high-recall pointer query with its own "
+    "narrower filters. Use short labels and usually two candidates per "
+    "partition. This is a map of where evidence may live, not an answer and "
+    "not citable evidence. After mapping, inspect the admitted documents with "
+    "one focused find or exec program rather than issuing serial searches."
+)
 AGENT_EXEC_GUIDANCE = (
     "Each admitted document has a stable read-only directory such as "
     "`/docs/d1`. Its exact files are `/docs/d1/manifest.json` and ordered "
@@ -111,7 +128,11 @@ AGENT_INVESTIGATOR_GUIDANCE = (
     "documents; do not over-filter. The host's initial packet covers only the "
     "verbatim question. Inspect its snippets and decide whether it plausibly "
     "covers each material evidence need. Before exec, issue only the missing "
-    "connector-specific or atomic queries; do not repeat the same search. Then "
+    "connector-specific or atomic queries; do not repeat the same search. When "
+    "the user asks for exhaustive coverage such as every day, every person, or "
+    "every named source, use map to create a covering set along that explicit "
+    "dimension; its labels and narrower filters should make omissions visible. "
+    "Do not substitute a coarser partition merely because it uses fewer calls. Then "
     "transition to find, open, or exec over admitted full documents for "
     "precise evidence. Treat each matching range as an exact record pointer: "
     "open the strongest suggested record from each plausible candidate before "
@@ -1038,6 +1059,46 @@ def _tool_definitions(
             **common,
         },
         {
+            "name": "map",
+            "description": (
+                "Run an agent-designed set of retrieval partitions in one "
+                "tool call and admit the union of their candidate documents. "
+                f"{AGENT_MAP_GUIDANCE}"
+            ),
+            "input_schema": _object_schema(
+                {
+                    "partitions": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 32,
+                        "items": _object_schema(
+                            {
+                                "label": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 80,
+                                },
+                                "query": query,
+                                "filters": filters,
+                                "limit": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "maximum": 4,
+                                    "description": (
+                                        "Candidate documents for this "
+                                        "partition. Prefer 2."
+                                    ),
+                                },
+                            },
+                            ["label", "query", "filters", "limit"],
+                        ),
+                    },
+                },
+                ["partitions"],
+            ),
+            **common,
+        },
+        {
             "name": "find",
             "description": (
                 "Search complete admitted documents for one to five literal "
@@ -1324,6 +1385,11 @@ class PiRunner:
                     arguments,
                     request,
                 )
+            elif host_name == "recall.map":
+                arguments = self._authorize_map_arguments(
+                    arguments,
+                    request,
+                )
             return tools.call(host_name, arguments)
 
         request_filters = {
@@ -1360,8 +1426,8 @@ class PiRunner:
             context.budget.max_exec_seconds,
         ) * 1000
         system = (
-            "You are Recall's evidence investigator. Use search as fallible "
-            "pointer hints, then inspect complete admitted documents with find, "
+            "You are Recall's evidence investigator. Use search or map as "
+            "fallible pointer hints, then inspect complete admitted documents with find, "
             "open, or exec. Embedding snippets are suggestions, never evidence "
             "or boundaries. find performs literal match-centered search; open "
             "cursor-pages exact content; exec gives arbitrary read-only shell "
@@ -1370,7 +1436,8 @@ class PiRunner:
             f"queries yourself. The host already ran the user's verbatim question "
             "once; its initial hint packet is fallible and has admitted any listed "
             "aliases for inspection. Use it first, reformulate with search when "
-            f"coverage is weak, and never cite it as evidence. "
+            f"coverage is weak; use map when the question needs multiple "
+            f"agent-chosen partitions. Never cite either as evidence. "
             f"{AGENT_INVESTIGATOR_GUIDANCE} Hints are "
             "never evidence. Cite only exact recall:// receipts returned by "
             "find or open, or opened by exec alongside their JSONL records. "
@@ -1565,6 +1632,7 @@ class PiRunner:
             key: (None if isinstance(item, str) and not item.strip() else item)
             for key, item in value["filters"].items()
         }
+        parsed_bounds: dict[str, datetime] = {}
         for name in ("since", "until"):
             candidate = filters.get(name)
             if candidate is not None:
@@ -1587,8 +1655,31 @@ class PiRunner:
                         "agent hint scope is invalid",
                         code="agent_query_scope_violation",
                     )
-            if name in request:
-                filters[name] = request[name]
+                parsed_bounds[name] = parsed
+            request_value = request.get(name)
+            if request_value is not None:
+                request_bound = datetime.fromisoformat(
+                    request_value.replace("Z", "+00:00")
+                )
+                candidate_bound = parsed_bounds.get(name)
+                if candidate_bound is None:
+                    filters[name] = request_value
+                    parsed_bounds[name] = request_bound
+                elif name == "since" and candidate_bound < request_bound:
+                    filters[name] = request_value
+                    parsed_bounds[name] = request_bound
+                elif name == "until" and candidate_bound > request_bound:
+                    filters[name] = request_value
+                    parsed_bounds[name] = request_bound
+        if (
+            parsed_bounds.get("since") is not None
+            and parsed_bounds.get("until") is not None
+            and parsed_bounds["since"] >= parsed_bounds["until"]
+        ):
+            raise AgentExecutionError(
+                "agent hint scope is empty",
+                code="agent_query_scope_violation",
+            )
         family = filters.get("source_family")
         if family is not None and (
             not isinstance(family, str)
@@ -1651,6 +1742,54 @@ class PiRunner:
             "query": value["query"],
             "filters": filters,
             "limit": value["limit"],
+        }
+
+    @classmethod
+    def _authorize_map_arguments(
+        cls,
+        value: dict[str, Any],
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        partitions = value.get("partitions") if isinstance(value, dict) else None
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"partitions"}
+            or not isinstance(partitions, list)
+            or not 2 <= len(partitions) <= 32
+            or any(not isinstance(item, dict) for item in partitions)
+            or any(
+                set(item) != {"label", "query", "filters", "limit"}
+                or not isinstance(item["label"], str)
+                or not item["label"].strip()
+                or len(item["label"]) > 80
+                or isinstance(item["limit"], bool)
+                or not isinstance(item["limit"], int)
+                or not 1 <= item["limit"] <= 4
+                for item in partitions
+            )
+            or len({item["label"] for item in partitions}) != len(partitions)
+            or sum(len(item["query"]) for item in partitions) > 32_768
+            or sum(item["limit"] for item in partitions) > 80
+        ):
+            raise AgentExecutionError(
+                "agent map arguments are invalid",
+                code="agent_query_scope_violation",
+            )
+        return {
+            "partitions": [
+                {
+                    "label": item["label"],
+                    **cls._authorize_hint_arguments(
+                        {
+                            "query": item["query"],
+                            "filters": item["filters"],
+                            "limit": item["limit"],
+                        },
+                        request,
+                    ),
+                }
+                for item in partitions
+            ],
         }
 
     @staticmethod
