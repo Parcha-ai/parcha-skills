@@ -289,7 +289,20 @@ class OidcJwtVerifier:
             return ()
         return tuple(sorted(set(values)))
 
-    def verify(self, token: str) -> VerifiedExternalIdentity | None:
+    def verify(
+        self,
+        token: str,
+        *,
+        audience: str | None = None,
+    ) -> VerifiedExternalIdentity | None:
+        try:
+            expected_audience = (
+                self.audience
+                if audience is None
+                else _https_uri(audience, "OIDC request audience")
+            )
+        except ValueError:
+            return None
         if (
             not isinstance(token, str)
             or not 1 <= len(token.encode()) <= _MAX_TOKEN_BYTES
@@ -358,7 +371,7 @@ class OidcJwtVerifier:
             payload.get("iss") not in self.accepted_issuers
             or not isinstance(subject, str)
             or not 1 <= len(subject) <= 512
-            or self.audience not in audiences
+            or expected_audience not in audiences
             or isinstance(expires_at, bool)
             or not isinstance(expires_at, (int, float))
             or expires_at <= now
@@ -374,7 +387,9 @@ class OidcJwtVerifier:
         email = normalize_verified_email(payload.get("email"))
         return VerifiedExternalIdentity(
             # Provider-specific token issuers are deliberately collapsed onto the
-            # configured canonical issuer so one person has one durable binding.
+            # configured canonical issuer and resource so one person has one durable
+            # binding. The optional request audience only narrows a token to one
+            # routed brain; it never widens the canonical identity authority.
             issuer=self.issuer,
             subject=subject,
             audience=self.audience,

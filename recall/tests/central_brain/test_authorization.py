@@ -98,6 +98,26 @@ class OidcVerifierTest(unittest.TestCase):
         self.assertTrue(identity.email_verified)
         self.assertEqual(loader.calls, 1)
 
+    def test_routed_brain_audience_is_verified_but_identity_stays_canonical(self) -> None:
+        brain_audience = f"{AUDIENCE}/brains/tenant:company:parcha"
+        verifier = self.verifier()
+
+        identity = verifier.verify(
+            self.token(aud=brain_audience),
+            audience=brain_audience,
+        )
+
+        self.assertIsNotNone(identity)
+        self.assertEqual(identity.audience, AUDIENCE)
+        self.assertTrue(identity.valid_for(AUDIENCE))
+        self.assertIsNone(verifier.verify(self.token(aud=brain_audience)))
+        self.assertIsNone(
+            verifier.verify(self.token(), audience=brain_audience)
+        )
+        self.assertIsNone(
+            verifier.verify(self.token(), audience="http://recall.invalid/mcp")
+        )
+
     def test_wrong_issuer_audience_time_scope_key_and_signature_fail_closed(self) -> None:
         now = int(time.time())
         cases = (

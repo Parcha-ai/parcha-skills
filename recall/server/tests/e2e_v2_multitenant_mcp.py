@@ -253,7 +253,12 @@ def agent_lifecycle_http(
 
 
 class SyntheticExternalVerifier:
-    def verify(self, token: str) -> VerifiedExternalIdentity | None:
+    def verify(
+        self,
+        token: str,
+        *,
+        audience: str | None = None,
+    ) -> VerifiedExternalIdentity | None:
         now = datetime.now(timezone.utc)
         values = {
             "external-human-read": (
