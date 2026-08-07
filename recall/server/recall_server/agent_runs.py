@@ -450,7 +450,10 @@ class PostgresAgentRunBackend:
                 if not isinstance(bundle, dict):
                     raise AgentRunStateError("agent result is invalid")
                 return bundle
-            return {"run": self._row_run(row)}
+            value = {"run": self._row_run(row)}
+            if row["status"] in TERMINAL_STATUSES:
+                value["trace"] = row["trace_events"]
+            return value
 
     def cancel(
         self,

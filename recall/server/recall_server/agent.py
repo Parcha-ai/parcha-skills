@@ -53,6 +53,7 @@ class AgentBudget:
     max_tool_calls: int = 12
     max_hint_calls: int = 6
     max_exec_calls: int = 6
+    max_find_seconds: int = 20
     max_exec_seconds: int = 30
     max_receipts: int = 256
     max_tool_output_bytes: int = 2_000_000
@@ -412,7 +413,10 @@ class ConstrainedAgentTools:
                         )
                         for document_id in document_ids
                     },
-                    timeout_seconds=min(20, executable_seconds),
+                    timeout_seconds=min(
+                        self._context.budget.max_find_seconds,
+                        executable_seconds,
+                    ),
                 )
             elif name == "recall.open":
                 if (
@@ -744,6 +748,7 @@ class RecallAgentService:
                 "max_tool_calls": 8,
                 "max_hint_calls": 3,
                 "max_exec_calls": 1,
+                "max_find_seconds": 8,
                 "max_exec_seconds": 10,
             },
             "normal": {
@@ -751,6 +756,7 @@ class RecallAgentService:
                 "max_tool_calls": 8,
                 "max_hint_calls": 2,
                 "max_exec_calls": 2,
+                "max_find_seconds": 8,
                 "max_exec_seconds": 12,
             },
             "deep": {
@@ -758,6 +764,7 @@ class RecallAgentService:
                 "max_tool_calls": 12,
                 "max_hint_calls": 6,
                 "max_exec_calls": 6,
+                "max_find_seconds": 20,
                 "max_exec_seconds": 30,
             },
         }
