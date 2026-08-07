@@ -26,6 +26,9 @@ AGENT_CONTRACTS = frozenset({
     "recall.agent-trace-event.v1",
     "recall.agent-result.v1",
 })
+# Serialization guard only. Runtime cancellation belongs to the caller and the
+# durable task lifecycle, so this must not behave like a two-minute deadline.
+MAX_TRACE_ELAPSED_MS = 7 * 24 * 60 * 60 * 1000
 OPAQUE_RE = re.compile(r"[a-z][a-z0-9_]{2,31}_[A-Za-z0-9_-]{16,128}\Z")
 IDENTITY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:@/-]{1,159}\Z")
 SAFE_ERROR_RE = re.compile(r"[a-z][a-z0-9_.-]{1,63}\Z")
@@ -105,7 +108,12 @@ def _integer(value: Any, *, minimum: int = 0, maximum: int = 2**63 - 1) -> int:
     return value
 
 
-def _number(value: Any, *, minimum: float = 0, maximum: float = 120_000) -> float:
+def _number(
+    value: Any,
+    *,
+    minimum: float = 0,
+    maximum: float = MAX_TRACE_ELAPSED_MS,
+) -> float:
     if (
         isinstance(value, bool)
         or not isinstance(value, (int, float))
