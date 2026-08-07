@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import gzip
 import json
 import re
 import shlex
@@ -25,6 +26,7 @@ REGION_ENDPOINTS = {
 MAX_TRANSPORT_BYTES = 256 * 1024
 MAX_AGENT_PROGRAM_BYTES = 16_000
 MAX_AGENT_EXEC_OUTPUT_BYTES = 40_000
+MAX_ARCHIL_COMMAND_BYTES = 100_000
 AGENT_EXEC_STAGE_GRACE_SECONDS = 45
 RECEIPT_TOKEN_PATTERN = (
     r"recall://[A-Za-z0-9:._@+-]+/[^\s\"'<>()[\]{},;]{1,1900}"
@@ -278,7 +280,10 @@ def _agent_exec_command(
 ) -> str:
     """Build a content-addressed, no-network view for an agent-authored program."""
 
-    payload = base64.b64encode(
+    def encode(value: bytes) -> str:
+        return base64.b64encode(gzip.compress(value, mtime=0)).decode()
+
+    payload = encode(
         json.dumps(
             [
                 {
@@ -290,17 +295,17 @@ def _agent_exec_command(
             separators=(",", ":"),
             sort_keys=True,
         ).encode()
-    ).decode()
-    encoded_program = base64.b64encode(program.encode()).decode()
-    encoded_scan = base64.b64encode(AGENT_SCAN_SCRIPT.encode()).decode()
-    encoded_aliases = base64.b64encode(
+    )
+    encoded_program = encode(program.encode())
+    encoded_scan = encode(AGENT_SCAN_SCRIPT.encode())
+    encoded_aliases = encode(
         json.dumps(
             document_aliases,
             separators=(",", ":"),
             sort_keys=True,
         ).encode()
-    ).decode()
-    encoded_pointers = base64.b64encode(
+    )
+    encoded_pointers = encode(
         json.dumps(
             {
                 document_id: {
@@ -317,11 +322,11 @@ def _agent_exec_command(
             separators=(",", ":"),
             sort_keys=True,
         ).encode()
-    ).decode()
+    )
     stage_script = r"""
-import base64,json,pathlib,re,subprocess,sys
-items=json.loads(base64.b64decode(sys.argv[1]))
-aliases=json.loads(base64.b64decode(sys.argv[2]))
+import base64,gzip,json,pathlib,re,subprocess,sys
+items=json.loads(gzip.decompress(base64.b64decode(sys.argv[1])))
+aliases=json.loads(gzip.decompress(base64.b64decode(sys.argv[2])))
 source=pathlib.Path("/mnt/archil/evidence").resolve()
 target=pathlib.Path("/tmp/recall-authorized").resolve()
 docs=pathlib.Path("/tmp/recall-docs").resolve()
@@ -376,6 +381,21 @@ for document_id,alias in aliases.items():
             "/mnt/archil/evidence/"+object_key
         )
 """.strip()
+    inflate_script = (
+        "import base64,gzip,sys;sys.stdout.buffer.write("
+        "gzip.decompress(base64.b64decode(sys.argv[1])))"
+    )
+
+    def inflate(encoded: str, path: str) -> str:
+        return (
+            "python3 -c "
+            + shlex.quote(inflate_script)
+            + " "
+            + shlex.quote(encoded)
+            + " > "
+            + shlex.quote(path)
+        )
+
     inner_command = " && ".join([
         (
             "python3 -c "
@@ -412,21 +432,9 @@ for document_id,alias in aliases.items():
         # directory so a prior alias cannot make the next mkdir fail.
         "rm -rf /tmp/recall-authorized /tmp/recall-agent /tmp/recall-docs",
         "mkdir -p /tmp/recall-agent",
-        (
-            "printf '%s' "
-            + shlex.quote(encoded_program)
-            + " | base64 -d > /tmp/recall-agent/program.sh"
-        ),
-        (
-            "printf '%s' "
-            + shlex.quote(encoded_scan)
-            + " | base64 -d > /tmp/recall-agent/recall-scan"
-        ),
-        (
-            "printf '%s' "
-            + shlex.quote(encoded_pointers)
-            + " | base64 -d > /tmp/recall-agent/pointers.json"
-        ),
+        inflate(encoded_program, "/tmp/recall-agent/program.sh"),
+        inflate(encoded_scan, "/tmp/recall-agent/recall-scan"),
+        inflate(encoded_pointers, "/tmp/recall-agent/pointers.json"),
         "chmod 0500 /tmp/recall-agent/program.sh",
         "chmod 0500 /tmp/recall-agent/recall-scan",
         "chmod 0400 /tmp/recall-agent/pointers.json",
@@ -661,6 +669,16 @@ class ArchilDeepInspector:
             document_id: f"d{ordinal}"
             for ordinal, document_id in enumerate(record_spans, start=1)
         }
+        command = _agent_exec_command(
+            program=program,
+            objects=unique,
+            document_aliases=aliases,
+            record_spans=record_spans,
+            routing_receipts=routing_receipts,
+            timeout_seconds=timeout_seconds,
+        )
+        if len(command.encode()) > MAX_ARCHIL_COMMAND_BYTES:
+            raise DeepInspectionError("deep_inspector_request_too_large")
         response = self.transport.post(
             url=REGION_ENDPOINTS[self.region] + "/api/exec",
             headers={"Authorization": self.api_key},
@@ -671,14 +689,7 @@ class ArchilDeepInspector:
                         "readOnly": True,
                     }
                 },
-                "command": _agent_exec_command(
-                    program=program,
-                    objects=unique,
-                    document_aliases=aliases,
-                    record_spans=record_spans,
-                    routing_receipts=routing_receipts,
-                    timeout_seconds=timeout_seconds,
-                ),
+                "command": command,
             },
             timeout=timeout_seconds + AGENT_EXEC_STAGE_GRACE_SECONDS,
         )
