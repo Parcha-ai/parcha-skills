@@ -25,6 +25,17 @@
   Claude Code keeps the attempt marker visible instead of collapsing it into an
   opaque pasted-text placeholder before Enter.
 
+## Unreleased
+
+- Posts a Slack control notice when a bridge reply fails so threads are not
+  silently abandoned.
+- Adds idempotent `team_id` backfill migration for legacy bridges, and skips
+  polling threads with an empty workspace identity instead of retrying and
+  failing every cycle.
+- Distinguishes local credential-helper misconfiguration from model
+  authentication failure in continuation error messages, and surfaces
+  `HermesCompatibilityError` detail in poll logs.
+
 ## 0.2.0-beta.1
 
 - Introduces BindingV2 and database schema 15.
