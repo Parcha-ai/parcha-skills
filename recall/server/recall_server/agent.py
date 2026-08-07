@@ -388,7 +388,10 @@ class ConstrainedAgentTools:
         if name not in self._context.allowed_tools:
             raise AgentExecutionError("agent tool is not authorized")
         if self._calls >= self._context.budget.max_tool_calls:
-            raise AgentExecutionError("agent tool-call budget is exhausted")
+            raise AgentExecutionError(
+                "agent tool-call budget is exhausted",
+                code="agent_tool_budget_exhausted",
+            )
         if not isinstance(arguments, dict):
             raise AgentExecutionError("agent tool arguments are invalid")
         self._calls += 1

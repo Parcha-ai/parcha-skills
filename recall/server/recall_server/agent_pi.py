@@ -185,6 +185,43 @@ def _model_tool_error_message(error: AgentExecutionError) -> str:
     )
 
 
+def _finish_repair_guidance(
+    error: AgentExecutionError,
+    opened_receipts: tuple[str, ...],
+) -> str:
+    """Give the model one exact, content-free finish contract to repair."""
+
+    allowlist = list(opened_receipts)[:32]
+    if not allowlist:
+        return (
+            "No citable receipt has been opened. Inspect evidence with find, "
+            "open, or exec before answering, or submit exactly "
+            '{"status":"no_answer","answer":"","claims":[],"gaps":'
+            '["No opened evidence supports an answer."]}. '
+            "Search and map routing receipts are never citable."
+        )
+    example = json.dumps(
+        {
+            "status": "partial",
+            "answer": "State only what the opened evidence supports.",
+            "claims": [{
+                "statement": "One supported claim from the answer.",
+                "receipts": [allowlist[0]],
+            }],
+            "gaps": ["Name any requested part not supported by opened evidence."],
+        },
+        separators=(",", ":"),
+    )
+    return (
+        f"Repair the finish payload after {error.code}. Use exactly the keys "
+        "status, answer, claims, and gaps. For complete use gaps=[]; for "
+        "partial use at least one precise evidence gap. Every claim needs a "
+        "nonempty statement and one or more receipts copied exactly from this "
+        f"opened allowlist: {json.dumps(allowlist, separators=(',', ':'))}. "
+        f"A structurally valid partial example is: {example}"
+    )
+
+
 class PiTransport(Protocol):
     def run(
         self,
@@ -1376,15 +1413,14 @@ class PiRunner:
                         context,
                     )
                 except AgentExecutionError as error:
-                    if error.code == "agent_citation_not_opened":
-                        error.model_guidance = (
-                            "Use only this exact opened receipt allowlist in claims: "
-                            + json.dumps(
-                                list(tools.citable_receipts)[:32],
-                                separators=(",", ":"),
-                            )
-                                + ". Remove every other claim receipt, "
-                                "then submit finish once."
+                    if error.code in {
+                        "agent_citation_not_opened",
+                        "agent_claim_not_grounded",
+                        "agent_finish_invalid",
+                    }:
+                        error.model_guidance = _finish_repair_guidance(
+                            error,
+                            tools.citable_receipts,
                         )
                     raise
                 sealed = True
