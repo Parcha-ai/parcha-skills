@@ -96,6 +96,12 @@ npx --yes --package=@parcha/tether@0.3.0-beta.1 \
   tether upgrade --harness=both --restart --herdr
 ```
 
+On Linux, `--restart` detects an active system-level
+`hermes-gateway.service` and uses Hermes's documented `gateway restart
+--system` command through non-interactive `/usr/bin/sudo`. If that privilege is
+unavailable or the restart fails, the lifecycle command restores the snapshot
+and exits nonzero.
+
 The current schema is 15. Runtime startup rejects a database with a newer
 schema, upgrades supported older schemas in one immediate transaction, and
 marks legacy or incomplete native bindings `rebind_required`. Rebind those

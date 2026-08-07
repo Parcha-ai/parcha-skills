@@ -200,6 +200,10 @@ npx --yes --package=@parcha/tether@0.3.0-beta.1 \
   tether upgrade --harness=both --restart --herdr
 ```
 
+On Linux, `--restart` detects an active system-level Hermes gateway and uses
+Hermes's documented non-interactive system restart path. A restart failure
+restores the previous managed state and returns nonzero.
+
 Restore the immediately previous managed payload:
 
 ```bash

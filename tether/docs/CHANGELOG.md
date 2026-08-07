@@ -14,6 +14,8 @@
   handling, and a keyboard-driven popup cockpit.
 - Adds broker protocol 6 contextual inspection without exposing credentials,
   native session values, socket paths, process fingerprints, or message text.
+- Makes lifecycle `--restart` detect an active system-level Hermes gateway and
+  use Hermes's documented non-interactive system restart path.
 - Preserves the canonical default Herdr session and follows pane moves through
   the stable terminal and occupant identity.
 

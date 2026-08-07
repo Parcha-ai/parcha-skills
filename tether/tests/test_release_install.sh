@@ -157,6 +157,7 @@ esac
 EOF
 chmod 700 "$HERMES_BIN"
 export HERMES_TEST_LOG="$TEST_ROOT/hermes.log"
+export TETHER_TEST_SYSTEM_GATEWAY_ACTIVE=0
 
 HERDR_BIN="$FAKE_BIN/herdr"
 export HERDR_TEST_LOG="$TEST_ROOT/herdr.log"
@@ -514,7 +515,8 @@ assert_equals "$(<"$STATE/last-backup")" "$baseline_last_backup"
 "$REAL_INSTALL" -m 600 "$TEST_ROOT/config.saved" "$CONFIG"
 
 set +e
-HERMES_TEST_FAIL_ON="gateway restart" \
+TETHER_TEST_SYSTEM_GATEWAY_ACTIVE=1 \
+HERMES_TEST_FAIL_ON="gateway restart --system" \
   "$PACKAGE_ROOT/install.sh" upgrade --harness=both --restart \
   >"$TEST_ROOT/restart-failure.out" 2>&1
 restart_failure_rc=$?
@@ -522,6 +524,7 @@ set -e
 [[ "$restart_failure_rc" -eq 74 ]] ||
   fail "restart failure returned $restart_failure_rc instead of 74"
 assert_contains "$TEST_ROOT/restart-failure.out" "restoring the previous state"
+assert_contains "$HERMES_TEST_LOG" "gateway restart --system"
 ! grep -Fq "Installed Tether" "$TEST_ROOT/restart-failure.out" ||
   fail "restart failure reported installation success"
 assert_absent "$STATE/transaction.tsv"
