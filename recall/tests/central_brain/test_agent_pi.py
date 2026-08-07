@@ -711,6 +711,51 @@ class SimpleAgentKernelTest(unittest.TestCase):
             )
         self.assertEqual(caught.exception.code, "agent_citation_not_opened")
 
+    def test_invalid_grounded_finish_gets_exact_content_free_repair_contract(self):
+        class RepairingTransport:
+            guidance = None
+
+            def run(self, _start, invoke, *, timeout_seconds, cancelled):
+                del timeout_seconds
+                assert not cancelled()
+                invoke("open", {
+                    "alias": "d1",
+                    "cursor": None,
+                    "record_ordinal": 80,
+                    "page_bytes": 32768,
+                })
+                try:
+                    invoke("finish", {
+                        "status": "complete",
+                        "answer": "The bounded bridge was selected.",
+                        "claims": [],
+                        "gaps": [],
+                    })
+                except AgentExecutionError as error:
+                    self.guidance = getattr(error, "model_guidance", None)
+                invoke("finish", {
+                    "status": "complete",
+                    "answer": "The bounded bridge was selected.",
+                    "claims": [{
+                        "statement": "The bounded bridge was selected.",
+                        "receipts": [DECISION],
+                    }],
+                    "gaps": [],
+                })
+                return {"terminal": {}, "usage": {}}
+
+        transport = RepairingTransport()
+        result = service(transport).use_recall(
+            principal(),
+            REQUEST,
+            SyntheticRetrieval(),
+        )
+        self.assertEqual(result["result"]["status"], "complete")
+        self.assertIn("status, answer, claims, and gaps", transport.guidance)
+        self.assertIn(DECISION, transport.guidance)
+        self.assertNotIn(HINT, transport.guidance)
+        self.assertNotIn("bounded bridge", transport.guidance)
+
     def test_provider_failure_is_content_free(self):
         with self.assertRaises(AgentExecutionError) as caught:
             service(ScriptedTransport(success_script())).use_recall(

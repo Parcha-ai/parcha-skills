@@ -360,12 +360,16 @@ class AgentFacadeUnitTest(unittest.TestCase):
                 "filters": {},
                 "limit": 1,
             })
-        with self.assertRaisesRegex(AgentExecutionError, "budget is exhausted"):
+        with self.assertRaisesRegex(
+            AgentExecutionError,
+            "budget is exhausted",
+        ) as caught:
             tools.call("recall.hints", {
                 "query": REQUEST["question"],
                 "filters": {},
                 "limit": 1,
             })
+        self.assertEqual(caught.exception.code, "agent_tool_budget_exhausted")
 
     def test_expensive_tool_budgets_are_enforced_per_tool(self) -> None:
         context = DelegationContext.from_principal(principal())
