@@ -462,12 +462,22 @@ class SimpleAgentKernelTest(unittest.TestCase):
             for tool in transport.start["data"]["tools"]
             if tool["name"] == "open"
         )
+        exec_tool = next(
+            tool
+            for tool in transport.start["data"]["tools"]
+            if tool["name"] == "exec"
+        )
         self.assertIn(
             "literal",
             find_tool["description"],
         )
         self.assertIn("actual match", find_tool["description"])
         self.assertIn("record_ordinal", open_tool["description"])
+        self.assertIn("aliases", exec_tool["input_schema"]["required"])
+        self.assertEqual(
+            exec_tool["input_schema"]["properties"]["aliases"]["maxItems"],
+            20,
+        )
         self.assertIn(
             "record_ordinal",
             open_tool["input_schema"]["properties"],
