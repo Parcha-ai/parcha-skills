@@ -716,52 +716,6 @@ class AgentFacadeUnitTest(unittest.TestCase):
             self.assertNotIn(f'"{forbidden}"', rendered)
 
 
-class AgentHttpServer:
-    def __init__(self) -> None:
-        self.store = FakeStore()
-        self.retrieval = FakeCanonicalRetrieval()
-        Handler.store = self.store
-        Handler.canonical_retrieval = self.retrieval
-        Handler.agent_service = service()
-        Handler.agent_coordinator = None
-        Handler.external_identity_verifier = None
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-
-    def __enter__(self):
-        self.thread.start()
-        return self
-
-    def __exit__(self, *_exc):
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=2)
-        Handler.canonical_retrieval = None
-        Handler.agent_service = None
-        Handler.agent_coordinator = None
-
-    def request(self, path, body, *, protocol=None):
-        payload = json.dumps(body).encode()
-        headers = {
-            "Authorization": "Bearer synthetic-agent-token",
-            "Content-Type": "application/json",
-            "Content-Length": str(len(payload)),
-            "Accept": "application/json, text/event-stream",
-        }
-        if protocol is not None:
-            headers["MCP-Protocol-Version"] = protocol
-        connection = http.client.HTTPConnection(
-            "127.0.0.1",
-            self.server.server_port,
-            timeout=3,
-        )
-        connection.request("POST", path, body=payload, headers=headers)
-        response = connection.getresponse()
-        raw = response.read()
-        connection.close()
-        return response.status, json.loads(raw)
-
-
     def test_agent_chosen_map_admits_many_partitions_in_one_tool_call(self) -> None:
         class PartitionRetrieval(FakeBoundRetrieval):
             def passage_hints(self, query, *, filters, limit):
@@ -827,6 +781,141 @@ class AgentHttpServer:
             })
         self.assertEqual(caught.exception.code, "agent_map_invalid")
 
+    def test_agent_map_surfaces_one_partition_failure_and_keeps_mapping(self) -> None:
+        class PartialRetrieval(FakeBoundRetrieval):
+            def passage_hints(self, query, *, filters, limit):
+                if query == "unavailable partition":
+                    raise RuntimeError("private provider detail")
+                return super().passage_hints(
+                    query,
+                    filters=filters,
+                    limit=limit,
+                )
+
+        tools = ConstrainedAgentTools(
+            PartialRetrieval(),
+            DelegationContext.from_principal(principal()),
+        )
+        result = tools.call("recall.map", {
+            "partitions": [
+                {
+                    "label": "missing",
+                    "query": "unavailable partition",
+                    "filters": {},
+                    "limit": 1,
+                },
+                {
+                    "label": "available",
+                    "query": "available partition",
+                    "filters": {},
+                    "limit": 1,
+                },
+            ],
+        })
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["failed_partitions"], 1)
+        self.assertEqual(
+            [partition["status"] for partition in result["partitions"]],
+            ["unavailable", "ok"],
+        )
+        self.assertEqual(result["partitions"][1]["results"][0]["alias"], "d1")
+        failures = [
+            observation
+            for observation in tools.observations
+            if observation["outcome"] == "failed"
+        ]
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["tool"], "recall.map")
+        self.assertEqual(
+            failures[0]["error_code"],
+            "agent_evidence_tool_failed",
+        )
+
+    def test_agent_map_honors_cancellation_between_partitions(self) -> None:
+        cancelled = False
+
+        class CancellingRetrieval(FakeBoundRetrieval):
+            def passage_hints(self, query, *, filters, limit):
+                nonlocal cancelled
+                result = super().passage_hints(
+                    query,
+                    filters=filters,
+                    limit=limit,
+                )
+                cancelled = True
+                return result
+
+        retrieval = CancellingRetrieval()
+        tools = ConstrainedAgentTools(
+            retrieval,
+            DelegationContext.from_principal(principal()),
+            cancel_requested=lambda: cancelled,
+        )
+        with self.assertRaises(AgentExecutionError) as caught:
+            tools.call("recall.map", {
+                "partitions": [
+                    {
+                        "label": "first",
+                        "query": "first partition",
+                        "filters": {},
+                        "limit": 1,
+                    },
+                    {
+                        "label": "second",
+                        "query": "second partition",
+                        "filters": {},
+                        "limit": 1,
+                    },
+                ],
+            })
+        self.assertEqual(caught.exception.code, "agent_cancelled_by_caller")
+        self.assertEqual(len(retrieval.calls), 1)
+
+
+class AgentHttpServer:
+    def __init__(self) -> None:
+        self.store = FakeStore()
+        self.retrieval = FakeCanonicalRetrieval()
+        Handler.store = self.store
+        Handler.canonical_retrieval = self.retrieval
+        Handler.agent_service = service()
+        Handler.agent_coordinator = None
+        Handler.external_identity_verifier = None
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_exc):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        Handler.canonical_retrieval = None
+        Handler.agent_service = None
+        Handler.agent_coordinator = None
+
+    def request(self, path, body, *, protocol=None):
+        payload = json.dumps(body).encode()
+        headers = {
+            "Authorization": "Bearer synthetic-agent-token",
+            "Content-Type": "application/json",
+            "Content-Length": str(len(payload)),
+            "Accept": "application/json, text/event-stream",
+        }
+        if protocol is not None:
+            headers["MCP-Protocol-Version"] = protocol
+        connection = http.client.HTTPConnection(
+            "127.0.0.1",
+            self.server.server_port,
+            timeout=3,
+        )
+        connection.request("POST", path, body=payload, headers=headers)
+        response = connection.getresponse()
+        raw = response.read()
+        connection.close()
+        return response.status, json.loads(raw)
 
 class AgentTransportParityTest(unittest.TestCase):
     def setUp(self) -> None:

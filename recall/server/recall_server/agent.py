@@ -388,18 +388,70 @@ class ConstrainedAgentTools:
                         "agent map arguments are invalid",
                         code="agent_map_invalid",
                     )
-                result = {
-                    "partitions": [
-                        {
+                mapped = []
+                failures = 0
+                for item in partitions:
+                    self.check_cancelled()
+                    partition_started = self._monotonic()
+                    try:
+                        partition_result = self._run_hint({
+                            "query": item["query"],
+                            "filters": item["filters"],
+                            "limit": item["limit"],
+                        })
+                    except AgentExecutionError as error:
+                        if error.code == "agent_cancelled_by_caller":
+                            raise
+                        failures += 1
+                        self._record_failed_observation(
+                            "recall.map",
+                            partition_started,
+                            error.code,
+                        )
+                        mapped.append({
                             "label": item["label"],
-                            **self._run_hint({
-                                "query": item["query"],
-                                "filters": item["filters"],
-                                "limit": item["limit"],
-                            }),
-                        }
-                        for item in partitions
-                    ],
+                            "status": "unavailable",
+                            "error_code": error.code,
+                            "results": [],
+                        })
+                    except (TypeError, ValueError):
+                        failures += 1
+                        code = "agent_evidence_tool_rejected"
+                        self._record_failed_observation(
+                            "recall.map",
+                            partition_started,
+                            code,
+                        )
+                        mapped.append({
+                            "label": item["label"],
+                            "status": "unavailable",
+                            "error_code": code,
+                            "results": [],
+                        })
+                    except Exception:
+                        failures += 1
+                        code = "agent_evidence_tool_failed"
+                        self._record_failed_observation(
+                            "recall.map",
+                            partition_started,
+                            code,
+                        )
+                        mapped.append({
+                            "label": item["label"],
+                            "status": "unavailable",
+                            "error_code": code,
+                            "results": [],
+                        })
+                    else:
+                        mapped.append({
+                            "label": item["label"],
+                            "status": "ok",
+                            **partition_result,
+                        })
+                result = {
+                    "partitions": mapped,
+                    "complete": failures == 0,
+                    "failed_partitions": failures,
                     "evidence": False,
                 }
             elif name == "recall.find":
