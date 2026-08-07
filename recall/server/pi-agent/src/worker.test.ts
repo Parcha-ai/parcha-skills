@@ -4,12 +4,14 @@ import { once } from "node:events";
 import { createServer } from "node:http";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import type { Api, AssistantMessage, Model } from "@earendil-works/pi-ai";
 
 import { openAiCompatibleModel } from "./model.js";
 import {
   executionModeForTool,
+  failureCodeForModelMessage,
   failureCodeForStopReason,
+  retryableModelFailure,
   streamOpenAiCompletions,
   validateStart,
 } from "./worker.js";
@@ -62,6 +64,41 @@ test("classifies model termination from typed stop reasons only", () => {
   assert.equal(failureCodeForStopReason("aborted"), "pi_model_aborted");
   assert.equal(failureCodeForStopReason("stop"), undefined);
   assert.equal(failureCodeForStopReason("provider said timeout in prose"), undefined);
+});
+
+function failedMessage(errorMessage: string, stopReason: "error" | "aborted" = "error"): AssistantMessage {
+  return {
+    role: "assistant",
+    content: [],
+    api: "openai-completions",
+    provider: "cerebras",
+    model: "gemma-4-31b",
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason,
+    errorMessage,
+    timestamp: Date.now(),
+  };
+}
+
+test("classifies provider failures without forwarding raw diagnostics", () => {
+  assert.equal(failureCodeForModelMessage(failedMessage("Request timed out.")), "pi_model_timeout");
+  assert.equal(failureCodeForModelMessage(failedMessage("429 Too Many Requests")), "pi_model_rate_limited");
+  assert.equal(failureCodeForModelMessage(failedMessage("503 service unavailable")), "pi_model_unavailable");
+  assert.equal(failureCodeForModelMessage(failedMessage("maximum context length exceeded")), "pi_model_context_overflow");
+  assert.equal(failureCodeForModelMessage(failedMessage("401 invalid API key")), "pi_model_auth_failed");
+  assert.equal(failureCodeForModelMessage(failedMessage("400 bad request")), "pi_model_bad_request");
+  assert.equal(failureCodeForModelMessage(failedMessage("cancelled", "aborted")), "pi_model_aborted");
+  assert.equal(retryableModelFailure("pi_model_timeout"), true);
+  assert.equal(retryableModelFailure("pi_model_unavailable"), true);
+  assert.equal(retryableModelFailure("pi_model_auth_failed"), false);
+  assert.equal(retryableModelFailure("pi_model_context_overflow"), false);
 });
 
 test("normalizes an impossible model mismatch into a Pi error stream", async () => {
@@ -151,6 +188,66 @@ test("retries one fresh request for a retryable provider failure", async () => {
 
 test("does not retry a non-retryable provider failure", async () => {
   assert.equal(await providerRetryCase(400), 1);
+});
+
+test("discards a dropped partial SSE stream and retries the complete model request", async () => {
+  let calls = 0;
+  const server = createServer((_request, response) => {
+    calls += 1;
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    if (calls === 1) {
+      response.write(`data: ${JSON.stringify({
+        id: "chatcmpl-dropped",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "gemma-4-31b",
+        choices: [{ index: 0, delta: { role: "assistant", content: "discard-me" }, finish_reason: null }],
+      })}\n\n`);
+      response.destroy();
+      return;
+    }
+    const chunks = [
+      {
+        id: "chatcmpl-recovered",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "gemma-4-31b",
+        choices: [{ index: 0, delta: { role: "assistant", content: "recovered" }, finish_reason: null }],
+      },
+      {
+        id: "chatcmpl-recovered",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "gemma-4-31b",
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      },
+    ];
+    response.end(chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("") + "data: [DONE]\n\n");
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  try {
+    const model = openAiCompatibleModel(
+      "gemma-4-31b",
+      `http://127.0.0.1:${address.port}/v1`,
+      true,
+    );
+    const events = [];
+    const stream = await streamOpenAiCompletions(model, {
+      systemPrompt: "test",
+      messages: [{ role: "user", content: "test", timestamp: Date.now() }],
+      tools: [],
+    }, { apiKey: "synthetic-key" });
+    for await (const event of stream) events.push(event);
+    assert.equal(calls, 2);
+    assert.doesNotMatch(JSON.stringify(events), /discard-me/);
+    assert.match(JSON.stringify(events), /recovered/);
+  } finally {
+    server.close();
+    await once(server, "close");
+  }
 });
 
 test("fails closed when the host closes stdin before a terminal", async () => {

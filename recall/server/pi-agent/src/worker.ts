@@ -3,6 +3,7 @@ import {
   createAssistantMessageEventStream,
   type Api,
   type AssistantMessage,
+  type AssistantMessageEvent,
   type Model,
 } from "@earendil-works/pi-ai";
 import { streamSimple } from "@earendil-works/pi-ai/api/openai-completions";
@@ -12,8 +13,13 @@ import type { TSchema } from "typebox";
 import { modelEnvironment, openAiCompatibleModel, PROTOCOL } from "./model.js";
 
 const MAX_FRAME_BYTES = 1_000_000;
+const MODEL_STREAM_ATTEMPTS = 3;
 
-function failedModelStream(model: Model<Api>, message: string) {
+function failedModelStream(
+  model: Model<Api>,
+  message: string,
+  stopReason: "error" | "aborted" = "error",
+) {
   const stream = createAssistantMessageEventStream();
   const error: AssistantMessage = {
     role: "assistant",
@@ -29,26 +35,129 @@ function failedModelStream(model: Model<Api>, message: string) {
       totalTokens: 0,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
     },
-    stopReason: "error",
+    stopReason,
     errorMessage: message,
     timestamp: Date.now(),
   };
-  stream.push({ type: "error", reason: "error", error });
+  stream.push({ type: "error", reason: stopReason, error });
   return stream;
+}
+
+export function failureCodeForModelMessage(message: AssistantMessage): string | undefined {
+  if (message.stopReason === "aborted") return "pi_model_aborted";
+  if (message.stopReason !== "error") return undefined;
+  const detail = (message.errorMessage || "").toLowerCase();
+  if (/context.{0,40}(length|window|token)|maximum context|too many tokens/.test(detail)) {
+    return "pi_model_context_overflow";
+  }
+  if (/(^|\D)(401|403)(\D|$)|unauthorized|authentication|invalid api key/.test(detail)) {
+    return "pi_model_auth_failed";
+  }
+  if (/(^|\D)429(\D|$)|rate.?limit|too many requests/.test(detail)) {
+    return "pi_model_rate_limited";
+  }
+  if (/(^|\D)(408)(\D|$)|timed? out|timeout|etimedout|headers timeout/.test(detail)) {
+    return "pi_model_timeout";
+  }
+  if (
+    /(^|\D)(500|502|503|504)(\D|$)|unavailable|overloaded|connection|econnreset|fetch failed|terminated/.test(detail)
+  ) {
+    return "pi_model_unavailable";
+  }
+  if (/(^|\D)(400|404|422)(\D|$)|bad request|unprocessable/.test(detail)) {
+    return "pi_model_bad_request";
+  }
+  return "pi_model_failed";
+}
+
+export function retryableModelFailure(code: string | undefined): boolean {
+  return code === "pi_model_timeout"
+    || code === "pi_model_rate_limited"
+    || code === "pi_model_unavailable";
+}
+
+function safeFailureMessage(code: string): string {
+  return {
+    pi_model_timeout: "Model request timed out",
+    pi_model_rate_limited: "Model provider rate limited the request",
+    pi_model_unavailable: "Model provider was unavailable",
+    pi_model_context_overflow: "Model context limit was exceeded",
+    pi_model_auth_failed: "Model provider rejected authentication",
+    pi_model_bad_request: "Model provider rejected the request",
+    pi_model_aborted: "Model request was cancelled",
+    pi_model_failed: "Model provider request failed",
+  }[code] || "Pi agent failed";
+}
+
+async function retryPause(attempt: number, signal?: AbortSignal): Promise<void> {
+  const milliseconds = 250 * 2 ** attempt;
+  await new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error("model retry cancelled"));
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new Error("model retry cancelled"));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, milliseconds);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 export const streamOpenAiCompletions: StreamFn = (model, context, options) => {
   if (model.api !== "openai-completions") {
     return failedModelStream(model, "Recall Pi received an unsupported model API");
   }
-  return streamSimple(model as Model<"openai-completions">, context, {
-    ...options,
-    // One SDK-level retry is safe here: this wraps a single model request,
-    // before any new tool effect can occur. The host process deadline still
-    // bounds the complete turn, including backoff and the fresh request.
-    maxRetries: 1,
-    maxRetryDelayMs: Math.min(options?.maxRetryDelayMs ?? 2_000, 2_000),
+  const output = createAssistantMessageEventStream();
+  void (async () => {
+    for (let attempt = 0; attempt < MODEL_STREAM_ATTEMPTS; attempt += 1) {
+      const buffered: AssistantMessageEvent[] = [];
+      const stream = streamSimple(model as Model<"openai-completions">, context, {
+        ...options,
+        // Buffer the complete provider stream before exposing it to the agent.
+        // This makes a fresh retry safe even when the provider drops an SSE
+        // response after headers or partial text have arrived.
+        maxRetries: 0,
+      });
+      let failure: AssistantMessage | undefined;
+      for await (const event of stream) {
+        buffered.push(event);
+        if (event.type === "error") failure = event.error;
+      }
+      const code = failure ? failureCodeForModelMessage(failure) : undefined;
+      if (
+        failure
+        && retryableModelFailure(code)
+        && attempt + 1 < MODEL_STREAM_ATTEMPTS
+        && !options?.signal?.aborted
+      ) {
+        await retryPause(attempt, options?.signal);
+        continue;
+      }
+      for (const event of buffered) output.push(event);
+      output.end();
+      return;
+    }
+  })().catch((error) => {
+    const fallback = failedModelStream(
+      model,
+      error instanceof Error && error.message === "model retry cancelled"
+        ? "Model request was cancelled"
+        : "Recall Pi model retry failed",
+      error instanceof Error && error.message === "model retry cancelled"
+        ? "aborted"
+        : "error",
+    );
+    void (async () => {
+      for await (const event of fallback) output.push(event);
+      output.end();
+    })();
   });
+  return output;
 };
 
 export function executionModeForTool(name: string): "parallel" | "sequential" {
@@ -298,7 +407,7 @@ class Worker {
     let failureCode = "pi_agent_failed";
     agent.subscribe((event) => {
       if (event.type !== "message_end" || event.message.role !== "assistant") return;
-      failureCode = failureCodeForStopReason(event.message.stopReason) ?? failureCode;
+      failureCode = failureCodeForModelMessage(event.message) ?? failureCode;
     });
     agent.state.systemPrompt = systemPrompt(start);
     agent.state.model = openAiCompatibleModel(
@@ -345,7 +454,7 @@ class Worker {
         unresolved_call_ids: [],
         reason: {
           code: failureCode,
-          message: error instanceof Error ? error.message.slice(0, 2_000) : "Pi agent failed",
+          message: safeFailureMessage(failureCode),
         },
       });
     }

@@ -359,6 +359,12 @@ class SimpleAgentKernelTest(unittest.TestCase):
         }
         expected = {
             "pi_model_failed": "agent_model_provider_failed",
+            "pi_model_timeout": "agent_model_timeout",
+            "pi_model_rate_limited": "agent_model_rate_limited",
+            "pi_model_unavailable": "agent_model_unavailable",
+            "pi_model_context_overflow": "agent_model_context_overflow",
+            "pi_model_auth_failed": "agent_model_auth_failed",
+            "pi_model_bad_request": "agent_model_bad_request",
             "pi_model_aborted": "agent_model_cancelled",
             "pi_finish_missing": "agent_finish_missing",
             "pi_agent_failed": "agent_model_failed",
