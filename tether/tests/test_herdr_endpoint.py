@@ -304,6 +304,121 @@ class HerdrEndpointTest(unittest.TestCase):
             {"target": "w1:p1", "name": "tether_0123456789abcdef"},
         )
 
+    def test_read_only_capture_never_assigns_an_agent_name(self):
+        pane = {"pane_id": "w1:p1", "terminal_id": "term_6583153c2a1b81"}
+        unnamed = {
+            **pane,
+            "agent": "codex",
+            "name": None,
+            "launch_pending": False,
+            "agent_session": {
+                "source": "codex_notify",
+                "agent": "codex",
+                "kind": "thread_id",
+                "value": "codex-session-1",
+            },
+        }
+        responses = (
+            {"type": "pong", "protocol": 19},
+            {"type": "pane_info", "pane": pane},
+            {"type": "agent_info", "agent": unnamed},
+            {"type": "pane_process_info", "process_info": {"pane_id": "w1:p1"}},
+            {"type": "agent_info", "agent": unnamed},
+        )
+        with mock.patch.object(
+            self.runtime, "_herdr_call", side_effect=responses
+        ) as call, mock.patch.object(
+            self.runtime,
+            "_herdr_process_identity",
+            return_value=self.process_identity(),
+        ), mock.patch.object(
+            self.runtime,
+            "_validate_herdr_socket",
+            return_value=pathlib.Path("/tmp/herdr.sock"),
+        ):
+            identity = self.runtime.herdr_agent_identity(
+                "/tmp/herdr.sock",
+                "w1:p1",
+                "default",
+                str(self.home),
+                assign_name=False,
+            )
+
+        self.assertEqual(identity["herdr_session"], "default")
+        self.assertEqual(identity["herdr_agent_name"], "")
+        self.assertNotIn("agent.rename", [entry.args[1] for entry in call.call_args_list])
+
+    def test_moved_pane_keeps_binding_when_terminal_and_occupant_match(self):
+        canonical = self.runtime.Store.validate_source("codex_session", self.source())
+        binding = types.SimpleNamespace(**{
+            "herdr_socket_path": canonical["herdr_socket_path"],
+            "herdr_agent_name": canonical["herdr_agent_name"],
+            "herdr_terminal_id": canonical["herdr_terminal_id"],
+            "herdr_pane_id": canonical["herdr_pane_id"],
+            "herdr_agent_session_source": canonical["herdr_agent_session_source"],
+            "herdr_agent_session_kind": canonical["herdr_agent_session_kind"],
+            "herdr_agent_session_value": canonical["herdr_agent_session_value"],
+            "pane_agent": canonical["pane_agent"],
+            "process_identity": canonical["process_identity"],
+        })
+        moved = {
+            "name": canonical["herdr_agent_name"],
+            "terminal_id": canonical["herdr_terminal_id"],
+            "pane_id": "w2:p9",
+            "agent": "codex",
+            "launch_pending": False,
+            "agent_session": {
+                "source": canonical["herdr_agent_session_source"],
+                "agent": "codex",
+                "kind": canonical["herdr_agent_session_kind"],
+                "value": canonical["herdr_agent_session_value"],
+            },
+        }
+        responses = (
+            {"type": "pong", "protocol": 19},
+            {"type": "agent_info", "agent": moved},
+            {"type": "pane_process_info", "process_info": {"pane_id": "w2:p9"}},
+        )
+        with mock.patch.object(
+            self.runtime, "_herdr_call", side_effect=responses
+        ), mock.patch.object(
+            self.runtime,
+            "_herdr_process_identity",
+            return_value=canonical["process_identity"],
+        ):
+            agent, pane_id = self.runtime._current_herdr_agent(binding)
+
+        self.assertEqual(agent["terminal_id"], canonical["herdr_terminal_id"])
+        self.assertEqual(pane_id, "w2:p9")
+
+    def test_context_lookup_returns_sanitized_binding_and_counts(self):
+        store = self.runtime.Store(self.home / "bridges.db")
+        bridge = store.create({
+            "source_kind": "codex_session",
+            "source": self.source(),
+            "owner_user_id": "*",
+            "team_id": "T12345678",
+            "channel_id": "C12345678",
+            "idempotency_key": "herdr-context-test",
+        })
+        store.bind(bridge.bridge_id, "1234567890.123456")
+        broker = self.runtime.Broker(
+            "unused",
+            store=store,
+            verified_workspace_team_id="T12345678",
+        )
+        result = broker._herdr_context({
+            "herdr_terminal_id": "term_6583153c2a1b81",
+            "herdr_agent_session_value": "codex-session-1",
+            "herdr_agent": "codex",
+        })
+
+        self.assertTrue(result["bound"])
+        self.assertEqual(result["bridge"]["channel_id"], "C12345678")
+        serialized = json.dumps(result)
+        self.assertNotIn("codex-session-1", serialized)
+        self.assertNotIn("herdr.sock", serialized)
+
     def test_delivery_revalidates_before_and_after_atomic_prompt(self):
         canonical = self.runtime.Store.validate_source(
             "codex_session", self.source()

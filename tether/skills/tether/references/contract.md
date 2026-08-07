@@ -66,6 +66,11 @@ before submission and rechecks them afterward. Herdr does not expose a
 conditional expected-revision prompt, so a lost response or unknown server
 error remains `uncertain` and is never blindly replayed.
 
+Herdr plugin context is a targeting hint, not authority. Tether re-resolves the
+focused pane through Herdr before create, attach, rebind, delivery,
+cancellation, or recovery. The plugin owns no Slack credential and cannot
+bypass the broker's allowlist, generation fence, or durable attempt ledger.
+
 Native work returns either one useful Slack reply or ends with a standalone
 `NO_REPLY` line. That terminal control line acknowledges the attempt without
 posting the output or any preceding routing rationale. Cancellation terminates

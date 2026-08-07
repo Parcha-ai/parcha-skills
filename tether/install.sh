@@ -564,6 +564,9 @@ build_install_plan() {
   add_file "$SKILL_SOURCE/scripts/tether_notify.py" "$RUNTIME_HOME/tether_notify.py" 700
   add_file "$ROOT_DIR/install.sh" "$RUNTIME_HOME/install.sh" 700
   add_file "$ROOT_DIR/package.json" "$RUNTIME_HOME/package.json" 600
+  add_file "$ROOT_DIR/herdr-plugin/herdr-plugin.toml" "$RUNTIME_HOME/herdr-plugin/herdr-plugin.toml" 644
+  add_file "$ROOT_DIR/herdr-plugin/tether_plugin.py" "$RUNTIME_HOME/herdr-plugin/tether_plugin.py" 700
+  add_file "$ROOT_DIR/herdr-plugin/README.md" "$RUNTIME_HOME/herdr-plugin/README.md" 644
   add_file "$ROOT_DIR/runtime/plugin/__init__.py" "$PLUGIN_HOME/__init__.py" 600
   add_file "$ROOT_DIR/runtime/plugin/plugin.yaml" "$PLUGIN_HOME/plugin.yaml" 644
   add_file "$ROOT_DIR/bin/tether.js" "$LOCAL_BIN/tether" 700

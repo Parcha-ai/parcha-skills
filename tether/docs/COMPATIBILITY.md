@@ -2,7 +2,7 @@
 
 ## Supported release boundary
 
-Tether `0.2.0-beta.1` supports:
+Tether `0.3.0-beta.1` supports:
 
 - Linux on x86-64 or arm64;
 - Python 3.11, 3.12, 3.13, or 3.14;
@@ -77,9 +77,13 @@ current ownership evidence is unavailable.
 
 ## CLI compatibility
 
-The CLI and local broker must both use broker protocol 5. Tether rejects older
+The CLI and local broker must both use broker protocol 6. Tether rejects older
 and unknown newer protocols; upgrade the package and installed runtime
 together.
+
+The `parcha.tether` plugin requires Herdr 0.8.0 or newer within protocol 19.
+The beta supports Herdr-managed Codex and Claude Code agents on Linux. Other
+recognized agents remain visible in Herdr but cannot be bound by Tether.
 
 Use `--text-stdin` or `--text-fd FD` for notification and reply text.
 Deprecated `--text` remains accepted for compatibility but exposes text in

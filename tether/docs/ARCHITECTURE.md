@@ -1,7 +1,7 @@
 # Tether Architecture
 
-This document describes Tether `0.2.0-beta.1`, binding protocol 3, database
-schema 15, and broker protocol 5. The implementation is authoritative:
+This document describes Tether `0.3.0-beta.1`, binding protocol 3, database
+schema 15, and broker protocol 6. The implementation is authoritative:
 [`runtime/bridge_runtime.py`](../runtime/bridge_runtime.py),
 [`runtime/plugin/__init__.py`](../runtime/plugin/__init__.py), and
 [`runtime/routing.py`](../runtime/routing.py).
@@ -286,6 +286,12 @@ per-prompt turn ID. Therefore a missing response, unknown server error, or
 failed post-submit verification is `uncertain` and is never retried
 automatically. An explicit `agent_not_found` response proves submission did not
 start and is safe to requeue.
+
+The `parcha.tether` Herdr plugin is outside this authority boundary. It
+provides manifest actions, a link handler, and a terminal popup, then calls the
+local Tether CLI. Its invocation context is revalidated against Herdr and the
+broker. Slack credentials, routing decisions, durable queues, and delivery
+attempts remain in Hermes and Tether.
 
 ### Detached native process
 

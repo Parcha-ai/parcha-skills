@@ -96,6 +96,15 @@ captures `HERDR_SESSION`, `HERDR_SOCKET_PATH`, and `HERDR_PANE_ID`, then verifie
 Herdr's official native session reference. After attaching, use `tether reply --bridge-id
 ...` for the native session's result. Do not guess a pane or session identity.
 
+## Use inside Herdr
+
+When `parcha.tether` is installed, use `Tether: Open cockpit` for the focused
+Codex or Claude Code pane. The cockpit can create or attach a Slack thread,
+rebind the intended replacement agent, detach, run doctor, and inspect
+uncertain work. A selected or Ctrl-clicked Slack thread link opens a review
+step; it never attaches automatically. Treat plugin context only as a hint and
+let Tether revalidate the exact live endpoint.
+
 ## Operate safely
 
 - Keep secrets, raw credentials, private prompts, and sensitive findings out of notification text and source metadata.

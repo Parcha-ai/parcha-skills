@@ -1,7 +1,7 @@
 # Tether Operations
 
 This runbook covers installation, upgrade, rollback, recovery, and diagnosis
-for Tether `0.2.0-beta.1`.
+for Tether `0.3.0-beta.1`.
 
 ## Managed state
 
@@ -29,11 +29,11 @@ errors. Treat it and its backups as sensitive.
 Use an immutable published version:
 
 ```bash
-npx --yes --package=@parcha/tether@0.2.0-beta.1 \
+npx --yes --package=@parcha/tether@0.3.0-beta.1 \
   tether install --harness=both --dry-run
 
-npx --yes --package=@parcha/tether@0.2.0-beta.1 \
-  tether setup --harness=both
+npx --yes --package=@parcha/tether@0.3.0-beta.1 \
+  tether setup --harness=both --herdr
 ```
 
 Use `--harness=codex` or `--harness=claude-code` when only one harness is
@@ -92,8 +92,8 @@ Before crossing a database schema boundary:
 Upgrade the managed payload:
 
 ```bash
-npx --yes --package=@parcha/tether@0.2.0-beta.1 \
-  tether upgrade --harness=both --restart
+npx --yes --package=@parcha/tether@0.3.0-beta.1 \
+  tether upgrade --harness=both --restart --herdr
 ```
 
 The current schema is 15. Runtime startup rejects a database with a newer
@@ -109,8 +109,12 @@ transaction journal and completes recovery before starting new work.
 Restore the immediately previous managed payload and recorded plugin state:
 
 ```bash
-tether rollback --restart
+tether rollback --restart --herdr
 ```
+
+Pass `--herdr` when the companion plugin is installed. Tether reconciles the
+global Herdr link with the restored payload: it relinks a restored plugin or
+unlinks it when the restored version predates the plugin.
 
 Rollback does not:
 
@@ -126,8 +130,11 @@ database and keep retrying.
 ## Uninstall
 
 ```bash
-tether uninstall
+tether uninstall --herdr
 ```
+
+`--herdr` unlinks `parcha.tether` before removing its managed files. Omit it on
+a host where the companion plugin was never linked.
 
 Uninstall disables the plugin and removes only files whose checksums still
 match the installer manifest. It preserves locally modified managed files,
@@ -138,7 +145,7 @@ Because uninstall removes `~/.local/bin/tether`, restore through the same
 immutable package:
 
 ```bash
-npx --yes --package=@parcha/tether@0.2.0-beta.1 \
+npx --yes --package=@parcha/tether@0.3.0-beta.1 \
   tether rollback --restart
 ```
 

@@ -5,11 +5,13 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import shutil
 # Hermes is invoked with a fixed argv list, never a shell.
 import subprocess  # nosec B404
 import sys
 import time
+import urllib.parse
 from collections.abc import Sequence
 from pathlib import Path
 from types import ModuleType
@@ -20,6 +22,12 @@ RUNTIME_PATH = DATA_HOME / "tether" / "bridge_runtime.py"
 SETUP_TIMEOUT_SECONDS = 900
 SERVICE_TIMEOUT_SECONDS = 60
 MAX_MESSAGE_BYTES = 512 * 1024
+MAX_SLACK_URL_BYTES = 2048
+SLACK_THREAD_URL = re.compile(
+    r"^https://[a-z0-9-]+\.slack\.com/archives/"
+    r"(?P<channel>[CDG][A-Z0-9]{7,})/p(?P<seconds>[0-9]{10})(?P<fraction>[0-9]{6})/?$",
+    re.IGNORECASE,
+)
 
 
 def _load_runtime(path: Path = RUNTIME_PATH) -> ModuleType:
@@ -136,12 +144,20 @@ def _select_native_source(
 
 
 def _ambient_terminal_identity(cwd: str) -> dict[str, str] | None:
+    raw_session = os.getenv("HERDR_SESSION", "")
     herdr_values = {
-        "session": os.getenv("HERDR_SESSION", ""),
+        # Herdr intentionally omits HERDR_SESSION for its canonical default
+        # session. The socket and pane markers remain authoritative.
+        "session": raw_session or "default",
         "socket": os.getenv("HERDR_SOCKET_PATH", ""),
         "pane": os.getenv("HERDR_PANE_ID", ""),
     }
-    if os.getenv("HERDR_ENV") or any(herdr_values.values()):
+    if (
+        os.getenv("HERDR_ENV")
+        or raw_session
+        or herdr_values["socket"]
+        or herdr_values["pane"]
+    ):
         if not all(herdr_values.values()):
             raise SystemExit(
                 "Herdr environment is incomplete; reattach the intended Herdr session"
@@ -159,6 +175,164 @@ def _ambient_terminal_identity(cwd: str) -> dict[str, str] | None:
             cwd,
         )
     return None
+
+
+def _herdr_identity_for_pane(
+    pane_id: str,
+    cwd: str,
+    *,
+    assign_name: bool,
+) -> dict[str, str]:
+    socket_path = os.getenv("HERDR_SOCKET_PATH", "")
+    if not os.getenv("HERDR_ENV") or not socket_path or not pane_id:
+        raise SystemExit(
+            "Herdr context is incomplete; run this command from a Herdr plugin or pane"
+        )
+    return herdr_agent_identity(
+        socket_path,
+        pane_id,
+        os.getenv("HERDR_SESSION", "") or "default",
+        cwd,
+        assign_name=assign_name,
+    )
+
+
+def _herdr_source_for_pane(pane_id: str, cwd: str) -> tuple[str, dict[str, str]]:
+    identity = _herdr_identity_for_pane(pane_id, cwd, assign_name=True)
+    agent = identity.get("pane_agent", "")
+    if agent not in {"codex", "claude"}:
+        raise SystemExit("Tether's Herdr beta supports Codex and Claude Code only")
+    native_session = identity.get("native_session_id", "")
+    if not native_session:
+        raise SystemExit(
+            "Herdr has no official native session reference; install its agent integration"
+        )
+    return (
+        f"{agent}_session",
+        {
+            "session_id": native_session,
+            **working_directory_identity(cwd),
+            **_terminal_source(identity),
+        },
+    )
+
+
+def parse_slack_thread_url(value: str) -> tuple[str, str]:
+    parsed = urllib.parse.urlsplit(value.strip())
+    normalized = urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, "", "")
+    )
+    match = SLACK_THREAD_URL.fullmatch(normalized)
+    if match is None or parsed.query or parsed.fragment:
+        raise SystemExit(
+            "Slack URL must be an https://<workspace>.slack.com/archives/<channel>/p<timestamp> thread link"
+        )
+    return (
+        match.group("channel").upper(),
+        f"{match.group('seconds')}.{match.group('fraction')}",
+    )
+
+
+def slack_thread_url(args: argparse.Namespace) -> str:
+    if args.slack_url is not None:
+        print(
+            "DEPRECATED: --slack-url exposes the thread URL in process arguments; "
+            "use --slack-url-stdin.",
+            file=sys.stderr,
+        )
+        return str(args.slack_url)
+    payload = sys.stdin.buffer.read(MAX_SLACK_URL_BYTES + 1)
+    if len(payload) > MAX_SLACK_URL_BYTES:
+        raise SystemExit(f"Slack thread URL exceeds {MAX_SLACK_URL_BYTES} bytes")
+    try:
+        value = payload.decode("utf-8", errors="strict").strip()
+    except UnicodeDecodeError as exc:
+        raise SystemExit("Slack thread URL from stdin is not valid UTF-8") from exc
+    if not value:
+        raise SystemExit("Slack thread URL from stdin is empty")
+    return value
+
+
+def run_herdr_command(args: argparse.Namespace) -> int:
+    pane_id = str(args.pane or "")
+    cwd = str(Path(args.cwd or Path.cwd()).resolve())
+    if args.herdr_command == "status":
+        identity = _herdr_identity_for_pane(
+            pane_id,
+            cwd,
+            assign_name=False,
+        )
+        agent = identity.get("pane_agent", "")
+        supported = agent in {"codex", "claude"}
+        context: dict[str, object] = {
+            "ok": True,
+            "supported": supported,
+            "agent": agent,
+            "pane_id": identity.get("herdr_pane_id", ""),
+            "terminal_id": identity.get("herdr_terminal_id", ""),
+            "named": bool(identity.get("herdr_agent_name")),
+            "native_session": bool(identity.get("herdr_agent_session_value")),
+        }
+        if supported and identity.get("herdr_agent_session_value"):
+            context.update(
+                broker_call({
+                    "op": "herdr_context",
+                    "herdr_terminal_id": identity["herdr_terminal_id"],
+                    "herdr_agent_session_value": identity["herdr_agent_session_value"],
+                    "herdr_agent": agent,
+                })
+            )
+        else:
+            context.update({"bound": False, "queued": 0, "uncertain": 0})
+        print(json.dumps(context, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    if args.herdr_command == "detach":
+        result = broker_call({
+            "op": "close",
+            "bridge_id": args.bridge_id,
+            "expected_generation": args.expected_generation,
+            "team_id": args.team or "",
+        })
+    else:
+        kind, source = _herdr_source_for_pane(pane_id, cwd)
+        if args.herdr_command == "create":
+            result = broker_call({
+                "op": "notify",
+                "text": message_text(args),
+                "source_kind": kind,
+                "source": source,
+                "owner_user_id": args.owner or "",
+                "channel_id": args.channel or "",
+                "team_id": args.team or "",
+                "idempotency_key": args.idempotency_key,
+                "file_path": None,
+            })
+        elif args.herdr_command == "attach":
+            channel, thread_ts = parse_slack_thread_url(slack_thread_url(args))
+            result = broker_call({
+                "op": "attach",
+                "source_kind": kind,
+                "source": source,
+                "owner_user_id": args.owner or "",
+                "channel_id": channel,
+                "team_id": args.team or "",
+                "thread_ts": thread_ts,
+                "idempotency_key": args.idempotency_key,
+            })
+        elif args.herdr_command == "rebind":
+            result = broker_call({
+                "op": "rebind",
+                "source_kind": kind,
+                "source": source,
+                "channel_id": args.channel,
+                "team_id": args.team or "",
+                "thread_ts": args.thread_ts,
+            })
+        else:  # pragma: no cover - argparse owns the command set
+            raise SystemExit("unsupported Herdr command")
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
 
 
 def detected_source(args: argparse.Namespace) -> tuple[str, dict[str, str]]:
@@ -375,6 +549,43 @@ def build_parser() -> argparse.ArgumentParser:
     setup = sub.add_parser("setup")
     setup.add_argument("--non-interactive", action="store_true")
     setup.add_argument("--no-restart", action="store_true")
+    herdr = sub.add_parser("herdr")
+    herdr_sub = herdr.add_subparsers(dest="herdr_command", required=True)
+    herdr_status = herdr_sub.add_parser("status")
+    herdr_status.add_argument("--pane", required=True)
+    herdr_status.add_argument("--cwd")
+    herdr_status.add_argument("--json", action="store_true")
+    herdr_create = herdr_sub.add_parser("create")
+    herdr_create.add_argument("--pane", required=True)
+    herdr_create.add_argument("--cwd")
+    herdr_create.add_argument("--channel")
+    herdr_create.add_argument("--owner")
+    herdr_create.add_argument("--team")
+    herdr_create.add_argument("--idempotency-key", required=True)
+    herdr_create.add_argument("--json", action="store_true")
+    _add_message_input(herdr_create)
+    herdr_attach = herdr_sub.add_parser("attach")
+    herdr_attach.add_argument("--pane", required=True)
+    herdr_attach.add_argument("--cwd")
+    herdr_attach_url = herdr_attach.add_mutually_exclusive_group(required=True)
+    herdr_attach_url.add_argument("--slack-url")
+    herdr_attach_url.add_argument("--slack-url-stdin", action="store_true")
+    herdr_attach.add_argument("--owner")
+    herdr_attach.add_argument("--team")
+    herdr_attach.add_argument("--idempotency-key", required=True)
+    herdr_attach.add_argument("--json", action="store_true")
+    herdr_rebind = herdr_sub.add_parser("rebind")
+    herdr_rebind.add_argument("--pane", required=True)
+    herdr_rebind.add_argument("--cwd")
+    herdr_rebind.add_argument("--channel", required=True)
+    herdr_rebind.add_argument("--thread-ts", required=True)
+    herdr_rebind.add_argument("--team")
+    herdr_rebind.add_argument("--json", action="store_true")
+    herdr_detach = herdr_sub.add_parser("detach")
+    herdr_detach.add_argument("--bridge-id", required=True)
+    herdr_detach.add_argument("--expected-generation", type=int, required=True)
+    herdr_detach.add_argument("--team")
+    herdr_detach.add_argument("--json", action="store_true")
     return parser
 
 
@@ -672,6 +883,8 @@ def run_setup(args: argparse.Namespace) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "herdr":
+        return run_herdr_command(args)
     if args.command == "doctor":
         ok, checks = doctor()
         print("\n".join(checks))

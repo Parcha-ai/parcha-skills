@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0-beta.1
 
 - Adds BindingV3 Herdr protocol-19 live endpoints with official native-session
   references, occupant-bound agent names, private socket validation, and exact
@@ -10,6 +10,12 @@
   and `agent.send_keys` primitives.
 - Captures Herdr bindings from its session environment without requiring a
   duplicate Codex or Claude session environment variable.
+- Adds the `parcha.tether` Herdr plugin with contextual actions, Slack-link
+  handling, and a keyboard-driven popup cockpit.
+- Adds broker protocol 6 contextual inspection without exposing credentials,
+  native session values, socket paths, process fingerprints, or message text.
+- Preserves the canonical default Herdr session and follows pane moves through
+  the stable terminal and occupant identity.
 
 ## 0.2.0-beta.1
 

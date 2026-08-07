@@ -20,7 +20,7 @@ const MIN_TIMEOUT_MS = 50;
 const MAX_TIMEOUT_MS = 60_000;
 const CHILD_TIMEOUT_MS = 60_000;
 const LIFECYCLE_TIMEOUT_MS = 900_000;
-const BROKER_PROTOCOL_VERSION = 5;
+const BROKER_PROTOCOL_VERSION = 6;
 
 const packageRoot = path.resolve(__dirname, "..");
 const packageInstaller = path.join(packageRoot, "install.sh");
@@ -154,6 +154,22 @@ function herdrDoctorChecks() {
   return { healthy, checks };
 }
 
+function manageHerdrPlugin(action) {
+  const executable = discoverHerdrBinary();
+  if (!executable) {
+    throw new CliError(
+      "Herdr is unavailable; install Herdr before using --herdr.",
+      EXIT_USAGE,
+      "herdr_unavailable",
+    );
+  }
+  const pluginRoot = path.join(runtimeHome, "herdr-plugin");
+  const commandArgs = action === "unlink"
+    ? ["plugin", "unlink", "parcha.tether"]
+    : ["plugin", "link", pluginRoot];
+  return runChild(executable, commandArgs, CHILD_TIMEOUT_MS);
+}
+
 function packagePayloadAvailable() {
   return fs.existsSync(packageInstaller) &&
     fs.existsSync(path.join(packageRoot, "skills", "tether", "SKILL.md"));
@@ -263,6 +279,9 @@ function expectedManagedTargets(metadata) {
     path.join(runtimeRoot, "tether_notify.py"),
     path.join(runtimeRoot, "install.sh"),
     path.join(runtimeRoot, "package.json"),
+    path.join(runtimeRoot, "herdr-plugin", "herdr-plugin.toml"),
+    path.join(runtimeRoot, "herdr-plugin", "tether_plugin.py"),
+    path.join(runtimeRoot, "herdr-plugin", "README.md"),
     path.join(pluginRoot, "__init__.py"),
     path.join(pluginRoot, "plugin.yaml"),
     path.join(localBin, "tether"),
@@ -466,6 +485,7 @@ function printHelp(command = "") {
     resolve: "tether resolve --kind ingress|attempt|reconciliation --id ID --action retry|complete|abandon [--team ID]",
     history: "tether history [--channel ID] [--limit N] [--team ID]",
     thread: "tether thread --channel ID --thread-ts TS [--limit N] [--team ID]",
+    herdr: "tether herdr status|create|attach|rebind|detach [options]",
   };
   if (command && commandHelp[command]) {
     process.stdout.write(`${commandHelp[command]}\n`);
@@ -474,11 +494,12 @@ function printHelp(command = "") {
   process.stdout.write(`Tether ${readVersion()}
 
 Usage:
-  tether setup [--harness=codex|claude-code|both]
-  tether install|upgrade [installer options]
-  tether rollback|uninstall [--dry-run] [--restart]
+  tether setup [--harness=codex|claude-code|both] [--herdr]
+  tether install|upgrade [installer options] [--herdr]
+  tether rollback|uninstall [--dry-run] [--restart] [--herdr]
   tether doctor|status|identity|maintenance [--json]
   tether notify|reply|attach|rebind|close|unbind|post|history|thread [options]
+  tether herdr status|create|attach|rebind|detach [options]
   tether unresolved|resolve [options]
   tether version
 
@@ -851,7 +872,7 @@ function brokerCall(request, options) {
 function assertNonRoot(command) {
   const mutating = new Set([
     "setup", "install", "upgrade", "rollback", "uninstall", "maintenance",
-    "notify", "reply", "attach", "rebind", "close", "unbind", "post", "resolve",
+    "notify", "reply", "attach", "rebind", "close", "unbind", "post", "resolve", "herdr",
   ]);
   if (
     mutating.has(command) &&
@@ -1507,13 +1528,25 @@ async function main() {
 
   assertNonRoot(command);
 
+  if (command === "herdr") {
+    return runNotifier("herdr", argv, {}, CHILD_TIMEOUT_MS);
+  }
+
   if (command === "install" || command === "upgrade") {
     if (!packagePayloadAvailable()) {
       throw new CliError(
         "Install and upgrade require a complete tagged Tether package. Run the documented npx command.",
       );
     }
-    return runChild(packageInstaller, [command, ...argv], LIFECYCLE_TIMEOUT_MS);
+    const withHerdr = argv.includes("--herdr");
+    const installerArgs = argv.filter((argument) => argument !== "--herdr");
+    const installed = runChild(
+      packageInstaller,
+      [command, ...installerArgs],
+      LIFECYCLE_TIMEOUT_MS,
+    );
+    if (installed !== 0 || !withHerdr) return installed;
+    return manageHerdrPlugin("link");
   }
 
   if (command === "rollback" || command === "uninstall") {
@@ -1523,15 +1556,36 @@ async function main() {
     if (!fs.existsSync(installer)) {
       throw new CliError("The Tether lifecycle installer is unavailable.");
     }
-    return runChild(installer, [command, ...argv], LIFECYCLE_TIMEOUT_MS);
+    const withHerdr = argv.includes("--herdr");
+    const installerArgs = argv.filter((argument) => argument !== "--herdr");
+    if (command === "uninstall" && withHerdr) {
+      const unlinked = manageHerdrPlugin("unlink");
+      if (unlinked !== 0) return unlinked;
+    }
+    const completed = runChild(
+      installer,
+      [command, ...installerArgs],
+      LIFECYCLE_TIMEOUT_MS,
+    );
+    if (completed === 0 && command === "rollback" && withHerdr) {
+      const manifest = path.join(runtimeHome, "herdr-plugin", "herdr-plugin.toml");
+      return manageHerdrPlugin(fs.existsSync(manifest) ? "link" : "unlink");
+    }
+    if (completed !== 0 && command === "uninstall" && withHerdr) {
+      manageHerdrPlugin("link");
+    }
+    return completed;
   }
 
   if (command === "setup") {
+    const withHerdr = argv.includes("--herdr");
     const installArgs = argv.filter((argument) =>
       argument.startsWith("--harness=") ||
       ["--both", "--codex", "--claude-code"].includes(argument)
     );
-    const setupArgs = argv.filter((argument) => !installArgs.includes(argument));
+    const setupArgs = argv.filter((argument) =>
+      argument !== "--herdr" && !installArgs.includes(argument)
+    );
     if (packagePayloadAvailable()) {
       const installed = runChild(
         packageInstaller,
@@ -1540,7 +1594,9 @@ async function main() {
       );
       if (installed !== 0) return installed;
     }
-    return runNotifier("setup", setupArgs, {}, LIFECYCLE_TIMEOUT_MS);
+    const configured = runNotifier("setup", setupArgs, {}, LIFECYCLE_TIMEOUT_MS);
+    if (configured !== 0 || !withHerdr) return configured;
+    return manageHerdrPlugin("link");
   }
 
   return runBrokerCommand(command, argv);

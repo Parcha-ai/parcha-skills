@@ -1,6 +1,6 @@
 # Tether Security Model
 
-This document describes the security boundary of Tether `0.2.0-beta.1`,
+This document describes the security boundary of Tether `0.3.0-beta.1`,
 binding protocol 2, and database schema 15. The implementation and tests are
 authoritative.
 
@@ -189,6 +189,12 @@ Herdr has no conditional expected-revision prompt or durable Tether turn ID.
 The occupant-bound name prevents a replacement agent from inheriting the old
 target, while ambiguous acceptance remains durable `uncertain` state requiring
 operator resolution.
+
+Herdr plugin commands run unsandboxed as the current Unix user. Tether treats
+their pane, selection, and clicked-link context only as a hint and revalidates
+the exact endpoint. Selected Slack links cross into the popup through a
+single-use owner-only file; message bodies use stdin and neither appears in
+Herdr's plugin command argv or command log.
 
 ### Detached continuation
 

@@ -259,6 +259,9 @@ class BridgeRequest(TypedDict, total=False):
     reply_key: str
     file_path: str | None
     limit: int
+    herdr_terminal_id: str
+    herdr_agent_session_value: str
+    herdr_agent: str
     expected_generation: int
 
 
@@ -2602,6 +2605,71 @@ class Store:
                 (team_id, channel_id, thread_ts),
             ).fetchone()
             return self.decode(row)
+
+    def find_herdr_endpoint(
+        self,
+        terminal_id: str,
+        native_session_value: str,
+        agent: str,
+    ) -> Bridge | None:
+        """Resolve one active Herdr binding without trusting plugin context as authority."""
+        if not HERDR_TERMINAL_ID_PATTERN.fullmatch(terminal_id):
+            raise ValueError("invalid Herdr terminal ID")
+        if not SESSION_ID_PATTERN.fullmatch(native_session_value):
+            raise ValueError("invalid Herdr native session reference")
+        if agent not in {"codex", "claude"}:
+            raise ValueError("unsupported Herdr agent")
+        matches: list[Bridge] = []
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM bridges WHERE status='active' ORDER BY updated_at DESC"
+            ).fetchall()
+        for row in rows:
+            bridge = self.decode(row)
+            if bridge is None or bridge.source_kind != f"{agent}_session":
+                continue
+            source = bridge.source
+            if (
+                source.get("endpoint_kind") == "herdr_agent"
+                and source.get("herdr_terminal_id") == terminal_id
+                and source.get("herdr_agent_session_value") == native_session_value
+            ):
+                matches.append(bridge)
+        if len(matches) > 1:
+            raise ValueError("multiple active bindings match this Herdr agent")
+        return matches[0] if matches else None
+
+    def bridge_work_counts(self, bridge_id: str) -> dict[str, int]:
+        with self.connect() as db:
+            queued = int(
+                db.execute(
+                    """
+                    SELECT count(*) FROM bridge_events
+                    WHERE bridge_id=? AND state IN (
+                      'pending','processing','prepared','submitting','awaiting_ack','replying'
+                    )
+                    """,
+                    (bridge_id,),
+                ).fetchone()[0]
+            )
+            uncertain = int(
+                db.execute(
+                    """
+                    SELECT count(*) FROM bridge_attempts
+                    WHERE bridge_id=? AND state='uncertain'
+                    """,
+                    (bridge_id,),
+                ).fetchone()[0]
+            ) + int(
+                db.execute(
+                    """
+                    SELECT count(*) FROM thread_ingress
+                    WHERE bridge_id=? AND state='uncertain'
+                    """,
+                    (bridge_id,),
+                ).fetchone()[0]
+            )
+        return {"queued": queued, "uncertain": uncertain}
 
     def rebind(
         self,
@@ -7663,7 +7731,7 @@ class Broker:
         status = {
             "ok": True,
             "implementation": "tether",
-            "protocol_version": 5,
+            "protocol_version": 6,
             "channel_configured": bool(effective_channel(config)),
             "owner_configured": bool(config.default_owner or allowed_users),
             "allowed_user_count": len(allowed_users),
@@ -7679,6 +7747,35 @@ class Broker:
             if isinstance(health, dict):
                 status.update(health)
         return status
+
+    def _herdr_context(self, request: BridgeRequest) -> dict[str, Any]:
+        terminal_id = str(request.get("herdr_terminal_id") or "")
+        native_session = str(request.get("herdr_agent_session_value") or "")
+        agent = str(request.get("herdr_agent") or "")
+        bridge = self.store.find_herdr_endpoint(terminal_id, native_session, agent)
+        if bridge is None:
+            return {
+                "ok": True,
+                "bound": False,
+                "agent": agent,
+                "queued": 0,
+                "uncertain": 0,
+            }
+        counts = self.store.bridge_work_counts(bridge.bridge_id)
+        return {
+            "ok": True,
+            "bound": True,
+            "agent": agent,
+            "bridge": {
+                "bridge_id": bridge.bridge_id,
+                "status": bridge.status,
+                "binding_state": bridge.binding_state,
+                "binding_generation": bridge.binding_generation,
+                "channel_id": bridge.channel_id,
+                "thread_ts": bridge.thread_ts or "",
+            },
+            **counts,
+        }
 
     def _identity(self) -> dict[str, Any]:
         result = _slack_call(self.token, "auth.test", {})
@@ -9065,6 +9162,8 @@ class Broker:
             return self._status(config, allowed_users)
         if operation == "identity":
             return self._identity()
+        if operation == "herdr_context":
+            return self._herdr_context(request)
         if operation == "maintenance":
             return {
                 "ok": True,
@@ -10084,6 +10183,8 @@ def herdr_agent_identity(
     session: str,
     cwd: str = "",
     config: Config | None = None,
+    *,
+    assign_name: bool = True,
 ) -> dict[str, str]:
     ping = _herdr_call(socket_path, "ping", {})
     if (
@@ -10135,7 +10236,7 @@ def herdr_agent_identity(
             "Herdr native session reference does not match the live agent",
         )
     agent_name = str(agent.get("name") or "")
-    if not agent_name:
+    if not agent_name and assign_name:
         agent_name = _herdr_agent_name(socket_path, terminal_id)
         agent = _herdr_result_record(
             _herdr_call(
@@ -10159,7 +10260,7 @@ def herdr_agent_identity(
         or str(agent.get("agent") or "") != pane_agent
         or agent.get("agent_session") != expected_session
         or agent.get("launch_pending") is True
-        or not HERDR_AGENT_NAME_PATTERN.fullmatch(agent_name)
+        or (assign_name and not HERDR_AGENT_NAME_PATTERN.fullmatch(agent_name))
     ):
         raise _binding_error(
             "process_identity_unavailable",
@@ -10181,7 +10282,11 @@ def herdr_agent_identity(
         config=config,
     )
     verified_agent = _herdr_result_record(
-        _herdr_call(socket_path, "agent.get", {"target": agent_name}),
+        _herdr_call(
+            socket_path,
+            "agent.get",
+            {"target": agent_name or current_pane},
+        ),
         result_type="agent_info",
         field="agent",
     )
@@ -10243,7 +10348,6 @@ def _current_herdr_agent(binding: SourceBinding) -> tuple[dict[str, Any], str]:
     if (
         str(agent.get("name") or "") != binding.herdr_agent_name
         or str(agent.get("terminal_id") or "") != binding.herdr_terminal_id
-        or str(agent.get("pane_id") or "") != binding.herdr_pane_id
         or str(agent.get("agent") or "") != binding.pane_agent
         or native_session != expected_session
         or agent.get("launch_pending") is True

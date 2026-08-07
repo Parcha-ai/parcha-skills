@@ -62,6 +62,15 @@ or test tooling.
    npm run pack:check
    ```
 
+   Also validate the companion manifest with the release Herdr binary in an
+   isolated configuration root. Explicitly unset `HERDR_ENV`,
+   `HERDR_SOCKET_PATH`, `HERDR_SESSION`, and pane/workspace/tab variables so
+   the CLI cannot route the operation to a live server. Start a disposable
+   headless Herdr server in that isolated root, then link, list, disable,
+   enable, unlink, and stop `parcha.tether`. Do not use the maintainer's live
+   Herdr configuration for this release check. This proves Herdr accepts the
+   packaged manifest without starting or reconfiguring the Tether broker.
+
 3. Fetch protected `main`. Confirm the signing key is registered to an
    allowlisted GitHub account, then create and push a signed annotated tag on
    that exact commit:

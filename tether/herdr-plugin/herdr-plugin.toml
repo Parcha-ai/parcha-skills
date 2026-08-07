@@ -1,0 +1,42 @@
+id = "parcha.tether"
+name = "Tether"
+version = "0.3.0-beta.1"
+min_herdr_version = "0.8.0"
+description = "Keep Slack threads attached to the exact Herdr agent that created them"
+platforms = ["linux"]
+
+[[actions]]
+id = "open-cockpit"
+title = "Tether: Open cockpit"
+description = "Inspect and operate the Tether binding for the current agent"
+contexts = ["global", "workspace", "tab", "pane"]
+command = ["python3", "tether_plugin.py", "open"]
+
+[[actions]]
+id = "attach-slack-thread"
+title = "Tether: Attach Slack thread"
+description = "Review and attach a selected or clicked Slack thread to the current agent"
+contexts = ["pane", "selection"]
+command = ["python3", "tether_plugin.py", "open", "--prefill-thread"]
+
+[[actions]]
+id = "rebind-current"
+title = "Tether: Rebind current agent"
+description = "Review and repair a stale Tether binding from the intended agent"
+contexts = ["pane"]
+command = ["python3", "tether_plugin.py", "open", "--mode", "rebind"]
+
+[[panes]]
+id = "cockpit"
+title = "Tether"
+description = "Binding, queue, health, and recovery controls"
+placement = "popup"
+width = "84%"
+height = "84%"
+command = ["python3", "tether_plugin.py", "cockpit"]
+
+[[link_handlers]]
+id = "slack-thread"
+title = "Attach Slack thread with Tether"
+pattern = "^https://[A-Za-z0-9-]+\\.slack\\.com/archives/[CDG][A-Z0-9]{7,}/p[0-9]{16}/?$"
+action = "attach-slack-thread"

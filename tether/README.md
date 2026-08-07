@@ -4,7 +4,7 @@ Tether binds a Slack thread to the Codex, Claude Code, Herdr, Zellij, Hermes, or
 headless run that created it. Hermes owns the Slack credential. Local clients
 use an owner-only Unix socket and do not receive that credential.
 
-`0.2.0-beta.1` is a pre-release. This source tree uses BindingV3 and database schema 15.
+`0.3.0-beta.1` is a pre-release. This source tree uses BindingV3 and database schema 15.
 Read [Compatibility](docs/COMPATIBILITY.md) before upgrading an existing host.
 
 ## Supported boundary
@@ -59,13 +59,14 @@ See [Architecture](docs/ARCHITECTURE.md) and
 Install an immutable published version:
 
 ```bash
-npx --yes --package=@parcha/tether@0.2.0-beta.1 \
-  tether setup --harness=both
+npx --yes --package=@parcha/tether@0.3.0-beta.1 \
+  tether setup --harness=both --herdr
 ```
 
 Use `--harness=codex` or `--harness=claude-code` for one harness. Setup requires
 Hermes 0.19.0, an explicit Slack operator allowlist, and a Slack app configured
-for Socket Mode.
+for Socket Mode. Omit `--herdr` on a host that uses only Zellij or detached
+native sessions.
 
 For a source install, use the full 40-character commit from the matching
 release:
@@ -74,10 +75,18 @@ release:
 TETHER_COMMIT="<verified-release-commit-sha>"
 npx --yes \
   --package="github:Parcha-ai/parcha-skills#$TETHER_COMMIT" \
-  tether setup --harness=both
+  tether setup --harness=both --herdr
 ```
 
 Do not install from a moving branch.
+
+When Tether core is already installed, install the Herdr-native package from
+the same reviewed commit:
+
+```bash
+herdr plugin install Parcha-ai/parcha-skills/tether/herdr-plugin \
+  --ref "$TETHER_COMMIT"
+```
 
 To install only the portable instruction skill:
 
@@ -106,6 +115,12 @@ Hermes, an explicit operator allowlist, and connected Socket Mode ingress.
 From Codex or Claude Code:
 
 > Let me know in Slack when this is done.
+
+Inside Herdr, invoke `Tether: Open cockpit` from the plugin action menu. It can
+create a thread for the focused Codex or Claude agent, attach a selected or
+Ctrl-clicked Slack thread URL, rebind a stale agent, detach, run doctor, and
+inspect unresolved work. Create, attach, and rebind disclose and then assign a
+visible occupant-bound `tether_…` name when the agent is unnamed.
 
 For a process that may exit, provide a durable run identity and pass text over
 standard input:
@@ -181,14 +196,14 @@ whether the original operation ran.
 Upgrade:
 
 ```bash
-npx --yes --package=@parcha/tether@0.2.0-beta.1 \
-  tether upgrade --harness=both --restart
+npx --yes --package=@parcha/tether@0.3.0-beta.1 \
+  tether upgrade --harness=both --restart --herdr
 ```
 
 Restore the immediately previous managed payload:
 
 ```bash
-tether rollback --restart
+tether rollback --restart --herdr
 ```
 
 Install and upgrade take a lifecycle lock, stage a complete payload, snapshot
@@ -199,8 +214,12 @@ Rollback does not downgrade `bridges.db` or undo Slack settings. Uninstall
 retains config, bridge state, snapshots, and locally modified managed files:
 
 ```bash
-tether uninstall
+tether uninstall --herdr
 ```
+
+Use `--herdr` only when the companion plugin is linked. Rollback reconciles the
+link with the restored payload; uninstall removes the link before deleting
+unchanged managed plugin files.
 
 See [Operations](docs/OPERATIONS.md) for backup, rollback, diagnostics,
 retention, and irreversible state removal.

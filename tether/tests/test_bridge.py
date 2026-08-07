@@ -775,7 +775,7 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(bridge.owner_user_id, "*", "Hermes's explicit allowlist is shared by default")
         self.assertEqual(status["allowed_user_count"], 2)
         self.assertEqual(status["implementation"], "tether")
-        self.assertEqual(status["protocol_version"], 5)
+        self.assertEqual(status["protocol_version"], 6)
         self.assertNotIn("allowed_users", status, "status reports readiness, never identities")
 
     def test_shared_channel_rejects_accidental_owner_restriction(self):
@@ -2078,6 +2078,12 @@ class NotifierTest(unittest.TestCase):
             "HERMES_HOME": str(self.home / ".hermes"),
             "XDG_DATA_HOME": str(self.home / "data"),
             "XDG_CONFIG_HOME": str(self.home / "config"),
+            "HERDR_ENV": "",
+            "HERDR_SESSION": "",
+            "HERDR_SOCKET_PATH": "",
+            "HERDR_PANE_ID": "",
+            "HERDR_TAB_ID": "",
+            "HERDR_WORKSPACE_ID": "",
         }
         self.env_patch = mock.patch.dict(os.environ, env, clear=False)
         self.env_patch.start()
@@ -2330,6 +2336,77 @@ class NotifierTest(unittest.TestCase):
             "pilot",
             str(pathlib.Path.cwd()),
         )
+
+    def test_default_herdr_session_does_not_require_session_environment(self):
+        args = types.SimpleNamespace(run_id=None, hermes_session_id=None)
+        identity = {
+            "herdr_session": "default",
+            "herdr_socket_path": str(self.home / "herdr.sock"),
+            "herdr_terminal_id": "term_6583153c2a1b81",
+            "herdr_pane_id": "w1:p1",
+            "herdr_agent_name": "tether_0123456789abcdef",
+            "herdr_agent_session_source": "codex_notify",
+            "herdr_agent_session_kind": "thread_id",
+            "herdr_agent_session_value": "codex-session",
+            "herdr_protocol": "19",
+            "native_session_id": "codex-session",
+            "pane_agent": "codex",
+            "process_identity": "herdr-proc-v1:exact",
+        }
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HERDR_ENV": "1",
+                "HERDR_SOCKET_PATH": str(self.home / "herdr.sock"),
+                "HERDR_PANE_ID": "w1:p1",
+            },
+            clear=True,
+        ), mock.patch.object(
+            self.notifier,
+            "herdr_agent_identity",
+            return_value=identity,
+        ) as capture:
+            kind, source = self.notifier.detected_source(args)
+
+        self.assertEqual(kind, "codex_session")
+        self.assertEqual(source["herdr_session"], "default")
+        capture.assert_called_once_with(
+            str(self.home / "herdr.sock"),
+            "w1:p1",
+            "default",
+            str(pathlib.Path.cwd()),
+        )
+
+    def test_slack_thread_url_parser_is_strict_and_canonical(self):
+        channel, thread_ts = self.notifier.parse_slack_thread_url(
+            "https://workspace.slack.com/archives/C12345678/p1234567890123456"
+        )
+        self.assertEqual(channel, "C12345678")
+        self.assertEqual(thread_ts, "1234567890.123456")
+        for invalid in (
+            "http://workspace.slack.com/archives/C12345678/p1234567890123456",
+            "https://workspace.slack.com/archives/C12345678/p1234567890123456?token=x",
+            "https://evil.example/archives/C12345678/p1234567890123456",
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(SystemExit):
+                self.notifier.parse_slack_thread_url(invalid)
+
+    def test_herdr_attach_reads_slack_url_from_bounded_stdin(self):
+        expected = "https://workspace.slack.com/archives/C12345678/p1234567890123456"
+        stream = io.TextIOWrapper(io.BytesIO((expected + "\n").encode("utf-8")))
+        with mock.patch.object(self.notifier.sys, "stdin", stream):
+            actual = self.notifier.slack_thread_url(
+                types.SimpleNamespace(slack_url=None)
+            )
+        self.assertEqual(actual, expected)
+
+        oversized = io.TextIOWrapper(
+            io.BytesIO(b"x" * (self.notifier.MAX_SLACK_URL_BYTES + 1))
+        )
+        with mock.patch.object(
+            self.notifier.sys, "stdin", oversized
+        ), self.assertRaises(SystemExit):
+            self.notifier.slack_thread_url(types.SimpleNamespace(slack_url=None))
 
     def test_herdr_session_mismatch_fails_closed(self):
         args = types.SimpleNamespace(run_id=None, hermes_session_id=None)
