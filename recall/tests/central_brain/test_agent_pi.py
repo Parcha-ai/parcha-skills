@@ -445,7 +445,7 @@ class SimpleAgentKernelTest(unittest.TestCase):
         )
         self.assertEqual(
             [tool["name"] for tool in transport.start["data"]["tools"]],
-            ["search", "find", "open", "exec", "finish"],
+            ["search", "map", "find", "open", "exec", "finish"],
         )
         hint_tool = next(
             tool
@@ -551,6 +551,70 @@ class SimpleAgentKernelTest(unittest.TestCase):
                 if schema.get("type") == "array":
                     stack.append(schema["items"])
                 stack.extend(schema.get("anyOf", []))
+
+    def test_agent_can_map_narrower_time_partitions_then_exec(self):
+        filters = {
+            "source_family": None,
+            "source_connector": None,
+            "person": None,
+            "person_relation": None,
+        }
+        script = [
+            (
+                "map",
+                {
+                    "partitions": [
+                        {
+                            "label": "morning",
+                            "query": "Aurora work in the morning",
+                            "filters": {
+                                **filters,
+                                "since": "2026-07-23T00:00:00Z",
+                                "until": "2026-07-23T12:00:00Z",
+                            },
+                            "limit": 2,
+                        },
+                        {
+                            "label": "afternoon",
+                            "query": "Aurora work in the afternoon",
+                            "filters": {
+                                **filters,
+                                "since": "2026-07-23T12:00:00Z",
+                                "until": "2026-07-24T00:00:00Z",
+                            },
+                            "limit": 2,
+                        },
+                    ],
+                },
+            ),
+            *success_script()[2:],
+        ]
+        transport = ScriptedTransport(script)
+        retrieval = SyntheticRetrieval()
+        result = service(transport).use_recall(
+            principal(),
+            REQUEST,
+            retrieval,
+        )
+        self.assertEqual(result["result"]["status"], "complete")
+        self.assertEqual(
+            retrieval.calls,
+            ["recall_hints", "recall_hints", "recall_hints", "recall_exec"],
+        )
+        self.assertEqual(
+            retrieval.filters[1]["until"],
+            "2026-07-23T12:00:00Z",
+        )
+        self.assertEqual(
+            retrieval.filters[2]["since"],
+            "2026-07-23T12:00:00Z",
+        )
+        map_tool = next(
+            tool
+            for tool in transport.start["data"]["tools"]
+            if tool["name"] == "map"
+        )
+        self.assertIn("choose useful partitions yourself", map_tool["description"])
 
     def test_explicit_scope_is_a_host_ceiling(self):
         script = success_script()

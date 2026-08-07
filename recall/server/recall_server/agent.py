@@ -128,12 +128,14 @@ class ConstrainedAgentTools:
 
     TOOL_NAMES = (
         "recall.hints",
+        "recall.map",
         "recall.find",
         "recall.open",
         "recall.exec",
     )
     TOOL_CALL_LIMITS = {
         "recall.hints": 6,
+        "recall.map": 2,
         "recall.find": 6,
         "recall.open": 10,
         "recall.exec": 6,
@@ -203,6 +205,123 @@ class ConstrainedAgentTools:
         self.check_cancelled()
         self._progress(phase)
 
+    @staticmethod
+    def _valid_hint_arguments(arguments: dict[str, Any]) -> bool:
+        return (
+            {"query", "filters", "limit"} == set(arguments)
+            and isinstance(arguments["query"], str)
+            and bool(arguments["query"].strip())
+            and len(arguments["query"]) <= 8192
+            and isinstance(arguments["filters"], dict)
+            and not isinstance(arguments["limit"], bool)
+            and isinstance(arguments["limit"], int)
+            and 1 <= arguments["limit"] <= 20
+        )
+
+    def _run_hint(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        if not self._valid_hint_arguments(arguments):
+            raise AgentExecutionError("agent tool arguments are invalid")
+        result = self._retrieval.passage_hints(
+            arguments["query"],
+            filters=arguments["filters"],
+            limit=arguments["limit"],
+        )
+        results = result.get("results", [])
+        if not isinstance(results, list):
+            raise AgentExecutionError("agent hint result is invalid")
+        for item in results:
+            document_id = (
+                item.get("logical_document_id")
+                if isinstance(item, dict)
+                else None
+            )
+            if (
+                isinstance(document_id, str)
+                and document_id not in self._hinted_documents
+            ):
+                self._hinted_documents.append(document_id)
+                alias = f"d{len(self._hinted_documents)}"
+                self._document_ids_by_alias[alias] = document_id
+                self._aliases_by_document[document_id] = alias
+            if isinstance(document_id, str):
+                spans = self._hinted_record_spans.setdefault(document_id, [])
+                routing_receipts = self._hinted_routing_receipts.setdefault(
+                    document_id,
+                    [],
+                )
+                for matching_range in item.get("matching_ranges", [])[:2]:
+                    if not isinstance(matching_range, dict):
+                        continue
+                    for receipt in matching_range.get("receipts", []):
+                        if (
+                            isinstance(receipt, str)
+                            and receipt.startswith("recall://")
+                            and len(receipt) <= 2048
+                            and receipt not in routing_receipts
+                            and len(routing_receipts) < 256
+                        ):
+                            routing_receipts.append(receipt)
+                    for span in matching_range.get("spans", []):
+                        if not isinstance(span, dict):
+                            continue
+                        start = span.get("record_ordinal")
+                        count = span.get("record_count")
+                        candidate = (start, count)
+                        if (
+                            isinstance(start, int)
+                            and not isinstance(start, bool)
+                            and start >= 0
+                            and isinstance(count, int)
+                            and not isinstance(count, bool)
+                            and 1 <= count <= 10_000
+                            and candidate not in spans
+                            and len(spans) < 64
+                        ):
+                            spans.append(candidate)
+        if len(self._hinted_documents) > 80:
+            self._hinted_documents = self._hinted_documents[:80]
+            admitted = set(self._hinted_documents)
+            self._hinted_record_spans = {
+                key: value
+                for key, value in self._hinted_record_spans.items()
+                if key in admitted
+            }
+            self._hinted_routing_receipts = {
+                key: value
+                for key, value in self._hinted_routing_receipts.items()
+                if key in admitted
+            }
+            self._document_ids_by_alias = {
+                alias: document_id
+                for alias, document_id in self._document_ids_by_alias.items()
+                if document_id in admitted
+            }
+            self._aliases_by_document = {
+                document_id: alias
+                for document_id, alias in self._aliases_by_document.items()
+                if document_id in admitted
+            }
+        return {
+            **result,
+            "results": [
+                {
+                    **{
+                        key: value
+                        for key, value in item.items()
+                        if key != "logical_document_id"
+                    },
+                    "alias": self._aliases_by_document[document_id],
+                }
+                for item in results
+                if isinstance(item, dict)
+                and isinstance(
+                    document_id := item.get("logical_document_id"),
+                    str,
+                )
+                and document_id in self._aliases_by_document
+            ],
+        }
+
     def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         self.check_cancelled()
         if name not in self._context.allowed_tools:
@@ -214,6 +333,7 @@ class ConstrainedAgentTools:
         self._calls += 1
         self.report_progress({
             "recall.hints": "searching",
+            "recall.map": "searching",
             "recall.find": "inspecting",
             "recall.open": "inspecting",
             "recall.exec": "inspecting",
@@ -239,126 +359,48 @@ class ConstrainedAgentTools:
                 )
             self._calls_by_tool[name] = tool_calls + 1
             if name == "recall.hints":
+                result = self._run_hint(arguments)
+            elif name == "recall.map":
+                partitions = arguments.get("partitions")
                 if (
-                    not {"query", "filters", "limit"} == set(arguments)
-                    or not isinstance(arguments["query"], str)
-                    or not arguments["query"].strip()
-                    or len(arguments["query"]) > 8192
-                    or not isinstance(arguments["filters"], dict)
-                    or isinstance(arguments["limit"], bool)
-                    or not isinstance(arguments["limit"], int)
-                    or not 1 <= arguments["limit"] <= 20
-                ):
-                    raise AgentExecutionError("agent tool arguments are invalid")
-                result = self._retrieval.passage_hints(
-                    arguments["query"],
-                    filters=arguments["filters"],
-                    limit=arguments["limit"],
-                )
-                results = result.get("results", [])
-                if not isinstance(results, list):
-                    raise AgentExecutionError("agent hint result is invalid")
-                for item in results:
-                    document_id = (
-                        item.get("logical_document_id")
-                        if isinstance(item, dict)
-                        else None
+                    set(arguments) != {"partitions"}
+                    or not isinstance(partitions, list)
+                    or not 2 <= len(partitions) <= 32
+                    or any(not isinstance(item, dict) for item in partitions)
+                    or any(
+                        set(item) != {"label", "query", "filters", "limit"}
+                        or not isinstance(item["label"], str)
+                        or not item["label"].strip()
+                        or len(item["label"]) > 80
+                        or not self._valid_hint_arguments({
+                            "query": item["query"],
+                            "filters": item["filters"],
+                            "limit": item["limit"],
+                        })
+                        for item in partitions
                     )
-                    if (
-                        isinstance(document_id, str)
-                        and document_id not in self._hinted_documents
-                    ):
-                        self._hinted_documents.append(document_id)
-                        alias = f"d{len(self._hinted_documents)}"
-                        self._document_ids_by_alias[alias] = document_id
-                        self._aliases_by_document[document_id] = alias
-                    if isinstance(document_id, str):
-                        spans = self._hinted_record_spans.setdefault(
-                            document_id,
-                            [],
-                        )
-                        routing_receipts = (
-                            self._hinted_routing_receipts.setdefault(
-                                document_id,
-                                [],
-                            )
-                        )
-                        for matching_range in item.get(
-                            "matching_ranges",
-                            [],
-                        )[:2]:
-                            if not isinstance(matching_range, dict):
-                                continue
-                            for receipt in matching_range.get("receipts", []):
-                                if (
-                                    isinstance(receipt, str)
-                                    and receipt.startswith("recall://")
-                                    and len(receipt) <= 2048
-                                    and receipt not in routing_receipts
-                                    and len(routing_receipts) < 256
-                                ):
-                                    routing_receipts.append(receipt)
-                            for span in matching_range.get("spans", []):
-                                if not isinstance(span, dict):
-                                    continue
-                                start = span.get("record_ordinal")
-                                count = span.get("record_count")
-                                candidate = (start, count)
-                                if (
-                                    isinstance(start, int)
-                                    and not isinstance(start, bool)
-                                    and start >= 0
-                                    and isinstance(count, int)
-                                    and not isinstance(count, bool)
-                                    and 1 <= count <= 10_000
-                                    and candidate not in spans
-                                    and len(spans) < 64
-                                ):
-                                    spans.append(candidate)
-                if len(self._hinted_documents) > 80:
-                    self._hinted_documents = self._hinted_documents[:80]
-                    admitted = set(self._hinted_documents)
-                    self._hinted_record_spans = {
-                        key: value
-                        for key, value in self._hinted_record_spans.items()
-                        if key in admitted
-                    }
-                    self._hinted_routing_receipts = {
-                        key: value
-                        for key, value in self._hinted_routing_receipts.items()
-                        if key in admitted
-                    }
-                    self._document_ids_by_alias = {
-                        alias: document_id
-                        for alias, document_id
-                        in self._document_ids_by_alias.items()
-                        if document_id in admitted
-                    }
-                    self._aliases_by_document = {
-                        document_id: alias
-                        for document_id, alias
-                        in self._aliases_by_document.items()
-                        if document_id in admitted
-                    }
+                    or len({item["label"] for item in partitions})
+                    != len(partitions)
+                    or sum(len(item["query"]) for item in partitions) > 32_768
+                    or sum(item["limit"] for item in partitions) > 80
+                ):
+                    raise AgentExecutionError(
+                        "agent map arguments are invalid",
+                        code="agent_map_invalid",
+                    )
                 result = {
-                    **result,
-                    "results": [
+                    "partitions": [
                         {
-                            **{
-                                key: value
-                                for key, value in item.items()
-                                if key != "logical_document_id"
-                            },
-                            "alias": self._aliases_by_document[document_id],
+                            "label": item["label"],
+                            **self._run_hint({
+                                "query": item["query"],
+                                "filters": item["filters"],
+                                "limit": item["limit"],
+                            }),
                         }
-                        for item in results
-                        if isinstance(item, dict)
-                        and isinstance(
-                            document_id := item.get("logical_document_id"),
-                            str,
-                        )
-                        and document_id in self._aliases_by_document
+                        for item in partitions
                     ],
+                    "evidence": False,
                 }
             elif name == "recall.find":
                 aliases = arguments.get("aliases")

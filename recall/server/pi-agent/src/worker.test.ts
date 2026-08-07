@@ -17,7 +17,7 @@ import {
 } from "./worker.js";
 
 const schema = { type: "object", properties: {}, required: [], additionalProperties: false };
-const tools = ["search", "find", "open", "exec", "finish"].map((name) => ({
+const tools = ["search", "map", "find", "open", "exec", "finish"].map((name) => ({
   name,
   description: `${name} tool`,
   input_schema: schema,
@@ -33,7 +33,7 @@ test("accepts only the closed Recall tool catalog", () => {
     tools,
     model: { alias: "gemma-4-31b", thinking: "low" },
   });
-  assert.deepEqual(start.tools.map((tool) => tool.name), ["search", "find", "open", "exec", "finish"]);
+  assert.deepEqual(start.tools.map((tool) => tool.name), ["search", "map", "find", "open", "exec", "finish"]);
   assert.throws(() => validateStart({
     session_id: "run_123",
     prompt: { parts: [{ type: "text", text: "question" }] },
@@ -55,6 +55,7 @@ test("rejects mutable or approval-gated tools", () => {
 
 test("serializes grounded finish while allowing retrieval concurrency", () => {
   assert.equal(executionModeForTool("search"), "parallel");
+  assert.equal(executionModeForTool("map"), "parallel");
   assert.equal(executionModeForTool("open"), "parallel");
   assert.equal(executionModeForTool("finish"), "sequential");
 });

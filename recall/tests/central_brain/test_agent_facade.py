@@ -762,6 +762,72 @@ class AgentHttpServer:
         return response.status, json.loads(raw)
 
 
+    def test_agent_chosen_map_admits_many_partitions_in_one_tool_call(self) -> None:
+        class PartitionRetrieval(FakeBoundRetrieval):
+            def passage_hints(self, query, *, filters, limit):
+                self.calls.append(("hints", query, filters, limit))
+                ordinal = len([
+                    call for call in self.calls if call[0] == "hints"
+                ])
+                return {
+                    "results": [{
+                        "source_id": SOURCE,
+                        "logical_document_id": f"ldoc_partition_{ordinal:02d}",
+                        "matching_ranges": [],
+                    }],
+                    "diagnostics": {"engine": "synthetic"},
+                }
+
+        context = dataclasses.replace(
+            DelegationContext.from_principal(principal()),
+            budget=AgentBudget(max_tool_calls=2),
+        )
+        retrieval = PartitionRetrieval()
+        tools = ConstrainedAgentTools(retrieval, context)
+        result = tools.call("recall.map", {
+            "partitions": [
+                {
+                    "label": f"day-{day:02d}",
+                    "query": "what work happened",
+                    "filters": {
+                        "since": f"2026-07-{day:02d}T00:00:00Z",
+                        "until": f"2026-07-{day + 1:02d}T00:00:00Z",
+                    },
+                    "limit": 2,
+                }
+                for day in range(1, 19)
+            ],
+        })
+        self.assertEqual(len(result["partitions"]), 18)
+        self.assertEqual(
+            [partition["results"][0]["alias"] for partition in result["partitions"]],
+            [f"d{index}" for index in range(1, 19)],
+        )
+        tools.call("recall.exec", {
+            "program": "rg -n work /docs/d*",
+            "timeout_seconds": 30,
+        })
+        self.assertEqual(retrieval.calls[-1][0], "exec")
+        self.assertEqual(len(retrieval.calls[-1][2]), 18)
+
+    def test_agent_map_rejects_duplicate_partition_labels(self) -> None:
+        tools = ConstrainedAgentTools(
+            FakeBoundRetrieval(),
+            DelegationContext.from_principal(principal()),
+        )
+        partition = {
+            "label": "same",
+            "query": "synthetic work",
+            "filters": {},
+            "limit": 1,
+        }
+        with self.assertRaises(AgentExecutionError) as caught:
+            tools.call("recall.map", {
+                "partitions": [partition, dict(partition)],
+            })
+        self.assertEqual(caught.exception.code, "agent_map_invalid")
+
+
 class AgentTransportParityTest(unittest.TestCase):
     def setUp(self) -> None:
         self.environment = mock.patch.dict(
