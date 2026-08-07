@@ -182,7 +182,10 @@ becomes `uncertain` and is not retried automatically.
 
 Tether revalidates the named agent, official native session, terminal, adapter,
 and process before calling Herdr `agent.prompt`, then validates the returned
-agent and process again. Prompt text stays in the private socket request body.
+agent and process again. A live handoff may rotate only Herdr's internal
+terminal ID; Tether accepts that rotation only when the occupant name, native
+session, and remaining process-incarnation evidence are unchanged. Prompt text
+stays in the private socket request body.
 Cancellation uses `agent.send_keys` only after the same endpoint check.
 
 Herdr has no conditional expected-revision prompt or durable Tether turn ID.

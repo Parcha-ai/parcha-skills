@@ -277,6 +277,10 @@ incarnation. The native session reference must equal the Tether source session.
 
 Delivery revalidates those fields, submits one prompt through `agent.prompt`
 over NDJSON, checks the returned agent, and revalidates the endpoint afterward.
+Herdr live handoff may rotate its internal terminal ID while preserving the
+same process. Tether follows that rotation only when the occupant-bound name,
+official native session, and every process-incarnation field except the
+Herdr-issued terminal ID remain identical.
 The prompt is transported in the socket body rather than process arguments.
 The occupant-bound name disappears when the terminal's agent is replaced, so a
 replacement cannot inherit the old delivery capability.

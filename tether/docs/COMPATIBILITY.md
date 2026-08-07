@@ -37,6 +37,11 @@ protocol, terminal and pane IDs, occupant-bound agent name, official native
 session reference, and Linux process incarnation. BindingV1 and BindingV2
 records remain readable and are canonicalized to BindingV3.
 
+Herdr 0.8.0 live handoff can replace its internal terminal ID without replacing
+the terminal process. Tether keeps the binding only when the named occupant,
+native session, and process incarnation still match; process replacement still
+requires an explicit rebind.
+
 At startup, the Store:
 
 1. rejects a database whose `PRAGMA user_version` is newer than 15;

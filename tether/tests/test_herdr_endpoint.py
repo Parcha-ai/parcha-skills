@@ -222,6 +222,16 @@ class HerdrEndpointTest(unittest.TestCase):
             self.runtime.endpoint_identity_key(binding),
             self.runtime.endpoint_identity_key(binding),
         )
+        rotated = types.SimpleNamespace(
+            **{
+                **binding.__dict__,
+                "herdr_terminal_id": "term_7654321fedcba98",
+            }
+        )
+        self.assertEqual(
+            self.runtime.endpoint_identity_key(binding),
+            self.runtime.endpoint_identity_key(rotated),
+        )
 
     def test_binding_rejects_cross_endpoint_and_session_confusion(self):
         cases = (
@@ -391,6 +401,58 @@ class HerdrEndpointTest(unittest.TestCase):
         self.assertEqual(agent["terminal_id"], canonical["herdr_terminal_id"])
         self.assertEqual(pane_id, "w2:p9")
 
+    def test_live_handoff_keeps_binding_when_only_terminal_id_rotates(self):
+        canonical = self.runtime.Store.validate_source("codex_session", self.source())
+        binding = types.SimpleNamespace(**{
+            "herdr_socket_path": canonical["herdr_socket_path"],
+            "herdr_agent_name": canonical["herdr_agent_name"],
+            "herdr_terminal_id": canonical["herdr_terminal_id"],
+            "herdr_pane_id": canonical["herdr_pane_id"],
+            "herdr_agent_session_source": canonical["herdr_agent_session_source"],
+            "herdr_agent_session_kind": canonical["herdr_agent_session_kind"],
+            "herdr_agent_session_value": canonical["herdr_agent_session_value"],
+            "pane_agent": canonical["pane_agent"],
+            "process_identity": canonical["process_identity"],
+        })
+        rotated_terminal = "term_7654321fedcba98"
+        moved = {
+            "name": canonical["herdr_agent_name"],
+            "terminal_id": rotated_terminal,
+            "pane_id": "w1:p1",
+            "agent": "codex",
+            "launch_pending": False,
+            "agent_session": {
+                "source": canonical["herdr_agent_session_source"],
+                "agent": "codex",
+                "kind": canonical["herdr_agent_session_kind"],
+                "value": canonical["herdr_agent_session_value"],
+            },
+        }
+        responses = (
+            {"type": "pong", "protocol": 19},
+            {"type": "agent_info", "agent": moved},
+            {"type": "pane_process_info", "process_info": {"pane_id": "w1:p1"}},
+        )
+        with mock.patch.object(
+            self.runtime, "_herdr_call", side_effect=responses
+        ), mock.patch.object(
+            self.runtime,
+            "_herdr_process_identity",
+            return_value=self.process_identity(terminal=rotated_terminal),
+        ):
+            agent, pane_id = self.runtime._current_herdr_agent(binding)
+
+        self.assertEqual(agent["terminal_id"], rotated_terminal)
+        self.assertEqual(pane_id, "w1:p1")
+
+    def test_live_handoff_still_rejects_replaced_process(self):
+        self.assertFalse(
+            self.runtime._same_herdr_process_identity(
+                self.process_identity(terminal="term_rotated"),
+                self.process_identity(pid=201, start="20001"),
+            )
+        )
+
     def test_context_lookup_returns_sanitized_binding_and_counts(self):
         store = self.runtime.Store(self.home / "bridges.db")
         bridge = store.create({
@@ -408,7 +470,8 @@ class HerdrEndpointTest(unittest.TestCase):
             verified_workspace_team_id="T12345678",
         )
         result = broker._herdr_context({
-            "herdr_terminal_id": "term_6583153c2a1b81",
+            "herdr_terminal_id": "term_7654321fedcba98",
+            "herdr_agent_name": "tether_0123456789abcdef",
             "herdr_agent_session_value": "codex-session-1",
             "herdr_agent": "codex",
         })
@@ -437,14 +500,17 @@ class HerdrEndpointTest(unittest.TestCase):
             "type": "agent_prompted",
             "agent": {
                 "name": "tether_0123456789abcdef",
-                "terminal_id": "term_6583153c2a1b81",
+                "terminal_id": "term_7654321fedcba98",
                 "agent": "codex",
             },
         }
         with mock.patch.object(
             self.runtime,
             "_current_herdr_agent",
-            return_value=({}, "w1:p1"),
+            return_value=(
+                {"terminal_id": "term_7654321fedcba98"},
+                "w1:p1",
+            ),
         ) as current, mock.patch.object(
             self.runtime,
             "_live_attempt_instruction",

@@ -278,6 +278,7 @@ def run_herdr_command(args: argparse.Namespace) -> int:
                 broker_call({
                     "op": "herdr_context",
                     "herdr_terminal_id": identity["herdr_terminal_id"],
+                    "herdr_agent_name": identity["herdr_agent_name"],
                     "herdr_agent_session_value": identity["herdr_agent_session_value"],
                     "herdr_agent": agent,
                 })

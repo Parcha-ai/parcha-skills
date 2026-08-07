@@ -260,6 +260,7 @@ class BridgeRequest(TypedDict, total=False):
     file_path: str | None
     limit: int
     herdr_terminal_id: str
+    herdr_agent_name: str
     herdr_agent_session_value: str
     herdr_agent: str
     expected_generation: int
@@ -1312,7 +1313,7 @@ def endpoint_identity_key(binding: SourceBinding) -> str:
         identity = (
             "herdr_agent",
             binding.herdr_socket_path,
-            binding.herdr_terminal_id,
+            binding.herdr_agent_name,
         )
     elif binding.endpoint_kind == "detached_native":
         identity = (
@@ -2609,12 +2610,15 @@ class Store:
     def find_herdr_endpoint(
         self,
         terminal_id: str,
+        agent_name: str,
         native_session_value: str,
         agent: str,
     ) -> Bridge | None:
         """Resolve one active Herdr binding without trusting plugin context as authority."""
         if not HERDR_TERMINAL_ID_PATTERN.fullmatch(terminal_id):
             raise ValueError("invalid Herdr terminal ID")
+        if not HERDR_AGENT_NAME_PATTERN.fullmatch(agent_name):
+            raise ValueError("invalid Herdr agent name")
         if not SESSION_ID_PATTERN.fullmatch(native_session_value):
             raise ValueError("invalid Herdr native session reference")
         if agent not in {"codex", "claude"}:
@@ -2631,7 +2635,7 @@ class Store:
             source = bridge.source
             if (
                 source.get("endpoint_kind") == "herdr_agent"
-                and source.get("herdr_terminal_id") == terminal_id
+                and source.get("herdr_agent_name") == agent_name
                 and source.get("herdr_agent_session_value") == native_session_value
             ):
                 matches.append(bridge)
@@ -7750,9 +7754,15 @@ class Broker:
 
     def _herdr_context(self, request: BridgeRequest) -> dict[str, Any]:
         terminal_id = str(request.get("herdr_terminal_id") or "")
+        agent_name = str(request.get("herdr_agent_name") or "")
         native_session = str(request.get("herdr_agent_session_value") or "")
         agent = str(request.get("herdr_agent") or "")
-        bridge = self.store.find_herdr_endpoint(terminal_id, native_session, agent)
+        bridge = self.store.find_herdr_endpoint(
+            terminal_id,
+            agent_name,
+            native_session,
+            agent,
+        )
         if bridge is None:
             return {
                 "ok": True,
@@ -10319,6 +10329,19 @@ def herdr_agent_identity(
     }
 
 
+def _same_herdr_process_identity(left: str, right: str) -> bool:
+    """Compare one process incarnation while allowing Herdr handoff ID rotation."""
+    try:
+        left_identity = _parse_herdr_process_identity(left)
+        right_identity = _parse_herdr_process_identity(right)
+    except ValueError:
+        return False
+    return all(
+        left_identity[field] == right_identity[field]
+        for field in HERDR_PROCESS_IDENTITY_FIELDS - {"terminal"}
+    )
+
+
 def _current_herdr_agent(binding: SourceBinding) -> tuple[dict[str, Any], str]:
     ping = _herdr_call(binding.herdr_socket_path, "ping", {})
     if (
@@ -10345,9 +10368,10 @@ def _current_herdr_agent(binding: SourceBinding) -> tuple[dict[str, Any], str]:
         "kind": binding.herdr_agent_session_kind,
         "value": binding.herdr_agent_session_value,
     }
+    current_terminal = str(agent.get("terminal_id") or "")
     if (
         str(agent.get("name") or "") != binding.herdr_agent_name
-        or str(agent.get("terminal_id") or "") != binding.herdr_terminal_id
+        or not HERDR_TERMINAL_ID_PATTERN.fullmatch(current_terminal)
         or str(agent.get("agent") or "") != binding.pane_agent
         or native_session != expected_session
         or agent.get("launch_pending") is True
@@ -10368,10 +10392,10 @@ def _current_herdr_agent(binding: SourceBinding) -> tuple[dict[str, Any], str]:
     )
     process_identity = _herdr_process_identity(
         process_info,
-        terminal_id=binding.herdr_terminal_id,
+        terminal_id=current_terminal,
         expected_agent=binding.pane_agent,
     )
-    if process_identity != binding.process_identity:
+    if not _same_herdr_process_identity(process_identity, binding.process_identity):
         raise _binding_error(
             "process_identity_changed",
             "captured Herdr terminal now hosts a different process incarnation",
@@ -10449,7 +10473,8 @@ def deliver_herdr(
     attempt_id: str | None = None,
 ) -> str:
     binding = require_deliverable_binding(bridge, "herdr_agent")
-    _current_herdr_agent(binding)
+    current_agent, _current_pane = _current_herdr_agent(binding)
+    current_terminal = str(current_agent.get("terminal_id") or "")
     marker, instruction = _live_attempt_instruction(bridge, text, attempt_id)
     result = _herdr_call(
         binding.herdr_socket_path,
@@ -10464,7 +10489,7 @@ def deliver_herdr(
     )
     if (
         str(agent.get("name") or "") != binding.herdr_agent_name
-        or str(agent.get("terminal_id") or "") != binding.herdr_terminal_id
+        or str(agent.get("terminal_id") or "") != current_terminal
         or str(agent.get("agent") or "") != binding.pane_agent
     ):
         raise NativeContinuationError(

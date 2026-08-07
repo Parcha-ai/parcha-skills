@@ -18,8 +18,9 @@
   native session values, socket paths, process fingerprints, or message text.
 - Makes lifecycle `--restart` detect an active system-level Hermes gateway and
   use Hermes's documented non-interactive system restart path.
-- Preserves the canonical default Herdr session and follows pane moves through
-  the stable terminal and occupant identity.
+- Preserves the canonical default Herdr session, follows pane moves through the
+  occupant identity, and survives live handoff terminal-ID rotation only when
+  the native session and process incarnation remain unchanged.
 
 ## 0.2.0-beta.1
 
