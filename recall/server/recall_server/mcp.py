@@ -456,10 +456,11 @@ ALL_READ_TOOLS = (
             "Run bounded read-only shell over exact full Recall documents selected "
             "by recall_search. Pass only logical_document_id values returned by "
             "search; ordered aliases are mounted at /docs/d1 through /docs/d20. "
-            "Use rg, jq, awk, sed, sort, or Python to inspect the files. The sandbox "
-            "has no network and cannot mutate evidence. Search hits are hints, not "
-            "proof: only recall:// values in opened_receipts are citation authority. "
-            "To cite a match, print its JSONL record. An optional exact "
+            "For portable verified search, run `recall-scan --broad --fixed "
+            "--pattern TERM --limit N`; ordinary shell and Python are also available. "
+            "The sandbox has no network and cannot mutate evidence. Search hits are "
+            "hints, not proof: only recall:// values in opened_receipts are citation "
+            "authority. To cite a match, print its JSONL record. An optional exact "
             "`RECALL_EVIDENCE <receipt>` line may accompany, never replace, that record."
         ),
         "inputSchema": {

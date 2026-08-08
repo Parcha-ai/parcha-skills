@@ -960,6 +960,10 @@ class RemoteMcpContractTest(unittest.TestCase):
             canonical_catalog["recall_exec"]["description"],
         )
         self.assertIn(
+            "recall-scan --broad --fixed",
+            canonical_catalog["recall_exec"]["description"],
+        )
+        self.assertIn(
             "one person/time slice",
             canonical_catalog["use_recall"]["description"],
         )
