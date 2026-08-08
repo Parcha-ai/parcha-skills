@@ -759,6 +759,54 @@ def main() -> None:
             assert PERSONAL_SOURCE not in json.dumps(company)
             assert OUTSIDER_SOURCE not in json.dumps(company)
 
+            company_document_id = next(
+                row["logical_document_id"]
+                for row in company_results
+                if row["source_id"] == COMPANY_SOURCE
+            )
+            executed = rpc(
+                server,
+                company_token["token"],
+                "recall_exec",
+                {
+                    "targets": [{
+                        "logical_document_id": company_document_id,
+                        "alias": "d1",
+                    }],
+                    "program": "rg -n --fixed-strings synthetic /docs/d1",
+                    "timeout_seconds": 7,
+                },
+            )["result"]["structuredContent"]
+            assert executed["provider"] == "synthetic-exec"
+            assert executed["documents_available"] == 1
+            assert executed["objects_available"] >= 2
+            assert PERSONAL_SOURCE not in json.dumps(executed)
+            assert OUTSIDER_SOURCE not in json.dumps(executed)
+
+            personal_document_id = personal_results[0]["logical_document_id"]
+            for index in range(400):
+                denied_target = rpc(
+                    server,
+                    company_token["token"],
+                    "recall_exec",
+                    {
+                        "targets": [{
+                            "logical_document_id": (
+                                personal_document_id
+                                if index % 2 == 0
+                                else f"ldoc_{index + 1:032x}"
+                            ),
+                            "alias": "d1",
+                        }],
+                        "program": "true",
+                        "timeout_seconds": 1,
+                    },
+                )
+                assert denied_target["error"] == {
+                    "code": -32603,
+                    "message": "recall_exec_failed",
+                }
+
             investigated = rpc(
                 server,
                 company_token["token"],
@@ -1745,6 +1793,12 @@ def main() -> None:
                 "plaintext_credential_rows": 0,
                 "empty_grant_hits": 0,
                 "legacy_reads": 0,
+                "direct_exec_tool_calls": 1,
+                "direct_exec_documents": executed["documents_available"],
+                "direct_exec_cross_brain_accepts": 0,
+                "direct_exec_guessed_target_accepts": 0,
+                "direct_exec_cross_brain_attempts": 200,
+                "direct_exec_guessed_target_attempts": 200,
                 "investigate_tool_calls": 1,
                 "investigate_sessions": investigated["coverage"]["sessions"],
                 "investigate_sources": len(investigated["coverage"]["sources"]),

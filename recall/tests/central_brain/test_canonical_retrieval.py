@@ -595,6 +595,29 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
                 timeout_seconds=7,
             )
 
+    def test_agent_exec_guessed_and_cross_source_targets_fail_closed_200_of_200(self):
+        source = "codex.jsonl:test"
+        receipt = f"recall://{source}/event?rev=1#item=0"
+        inspector = RecordingExecInspector(receipt)
+        retrieval = BoundCanonicalRetrieval(
+            AgentExecStore(receipt),
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=(source,),
+            deep_inspector=inspector,
+        )
+        for index in range(200):
+            target = f"ldoc_{index + 1:032x}"
+            with self.subTest(index=index), self.assertRaises(DeepInspectionError):
+                retrieval.execute_agent_program(
+                    "true",
+                    logical_document_ids=(target,),
+                    record_spans={target: ()},
+                    routing_receipts={target: ()},
+                    timeout_seconds=1,
+                )
+        self.assertEqual(inspector.calls, [])
+
     def test_native_inspect_projects_verified_records_without_paths(self):
         source = "codex.jsonl:test"
         receipt = f"recall://{source}/event?rev=1#item=0"

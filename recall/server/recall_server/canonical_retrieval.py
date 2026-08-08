@@ -624,7 +624,7 @@ class BoundCanonicalRetrieval:
     @staticmethod
     def _row(row: dict[str, Any], score: float) -> dict[str, Any]:
         text, clipped = bounded_search_text(row["text_redacted"])
-        return {
+        result = {
             "source_id": row["source_id"],
             "native_id": row["native_id"],
             "native_parent_id": row.get("native_parent_id"),
@@ -638,6 +638,10 @@ class BoundCanonicalRetrieval:
             "receipt": row["receipt"],
             "rank": round(score, 8),
         }
+        logical_document_id = row.get("logical_document_id")
+        if isinstance(logical_document_id, str):
+            result["logical_document_id"] = logical_document_id
+        return result
 
     def search(
         self,
@@ -720,12 +724,18 @@ class BoundCanonicalRetrieval:
                    SELECT candidate.source_id,document.native_id,document.revision,
                           event.native_parent_id,event.occurred_at,event.observed_at,
                           event.created_at,candidate.text_redacted,candidate.receipt,
-                          candidate.score
+                          candidate.score,evidence.logical_document_id
                    FROM candidates candidate
                    JOIN canonical_documents document
                      USING(tenant_id,source_id,document_id)
                    JOIN canonical_events event
                      USING(tenant_id,source_id,event_id)
+                   LEFT JOIN canonical_evidence_documents evidence
+                     ON evidence.tenant_id=event.tenant_id
+                    AND evidence.source_id=event.source_id
+                    AND evidence.native_parent_id=COALESCE(
+                        event.native_parent_id,event.native_id
+                    )
                    WHERE document.is_current
                      AND document.deleted_at IS NULL
                      AND (%s::timestamptz IS NULL OR event.occurred_at>=%s)
@@ -795,7 +805,8 @@ class BoundCanonicalRetrieval:
                                   event.native_parent_id,event.occurred_at,
                                   event.observed_at,event.created_at,
                                   chunk.text_redacted,chunk.receipt,
-                                  1-candidate.distance AS score
+                                  1-candidate.distance AS score,
+                                  evidence.logical_document_id
                            FROM candidates candidate
                            JOIN canonical_chunks chunk
                              USING(tenant_id,source_id,chunk_id)
@@ -803,6 +814,12 @@ class BoundCanonicalRetrieval:
                              USING(tenant_id,source_id,document_id)
                            JOIN canonical_events event
                              USING(tenant_id,source_id,event_id)
+                           LEFT JOIN canonical_evidence_documents evidence
+                             ON evidence.tenant_id=event.tenant_id
+                            AND evidence.source_id=event.source_id
+                            AND evidence.native_parent_id=COALESCE(
+                                event.native_parent_id,event.native_id
+                            )
                            WHERE chunk.deleted_at IS NULL
                              AND document.is_current
                              AND document.deleted_at IS NULL
