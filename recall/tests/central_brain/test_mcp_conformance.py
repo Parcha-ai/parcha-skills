@@ -146,10 +146,6 @@ class McpConformanceCoverageTest(unittest.TestCase):
                 "ping",
                 "tools/list",
                 "tools/call",
-                "tasks/get",
-                "tasks/update",
-                "tasks/cancel",
-                "subscriptions/listen",
             },
         )
         self.assertEqual(

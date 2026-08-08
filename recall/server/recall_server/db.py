@@ -1193,28 +1193,6 @@ class BrainStore:
                     """SELECT count(*) AS n FROM items
                     WHERE deleted_at IS NULL AND btrim(text_redacted) <> ''"""
                 ).fetchone()["n"]
-            agent = conn.execute(
-                """SELECT
-                       count(*) FILTER (
-                           WHERE status IN ('queued','running')
-                       ) AS active,
-                       count(*) FILTER (
-                           WHERE status IN ('complete','partial','no_answer')
-                       ) AS completed,
-                       count(*) FILTER (WHERE status='failed') AS failed,
-                       count(*) FILTER (WHERE status='cancelled') AS cancelled,
-                       count(*) FILTER (
-                           WHERE error_code='worker_lost_retryable'
-                       ) AS recovered
-                   FROM agent_runs"""
-            ).fetchone()
-            metrics.update({
-                "agent_runs_active": agent["active"],
-                "agent_runs_completed": agent["completed"],
-                "agent_runs_failed": agent["failed"],
-                "agent_runs_cancelled": agent["cancelled"],
-                "agent_runs_recovered": agent["recovered"],
-            })
             return metrics
 
     def embed_pending(
