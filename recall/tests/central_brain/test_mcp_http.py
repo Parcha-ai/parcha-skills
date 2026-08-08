@@ -26,6 +26,7 @@ except ModuleNotFoundError:
     sys.modules["psycopg.rows"] = psycopg_rows
 
 from recall_server.app import Handler  # noqa: E402
+from recall_server.deep_inspection import DeepInspectionError  # noqa: E402
 
 
 class FakeStore:
@@ -66,6 +67,23 @@ class FakeStore:
             ("investigate", question, filters, depth, authorized_source)
         )
         return {"investigations": [], "coverage": {"sessions": 0}}
+
+    def execute_agent_program(self, program, **arguments):
+        self.calls.append(("exec", program, arguments))
+        return {
+            "provider": "synthetic-archil",
+            "stdout": "synthetic evidence",
+            "stderr": "",
+            "exit_code": 0,
+            "complete": True,
+            "stopped_reason": "completed",
+            "output_truncated": False,
+            "opened_receipts": [
+                "recall://source:synthetic:company/item-1?rev=1"
+            ],
+            "documents_available": len(arguments["logical_document_ids"]),
+            "objects_available": len(arguments["logical_document_ids"]),
+        }
 
     def show(self, target, *, around, tail, prompts, authorized_source):
         self.calls.append(("show", target, around, tail, prompts, authorized_source))
@@ -176,6 +194,12 @@ class OversizedShowStore(FakeStore):
             "receipt": target,
             "text": "private-oversized-canary-" + ("x" * (1024 * 1024)),
         }
+
+
+class FailingExecStore(PolicyStore):
+    def execute_agent_program(self, program, **arguments):
+        del program, arguments
+        raise DeepInspectionError("private-provider-payload-must-not-escape")
 
 
 class McpHttpServer:
@@ -703,6 +727,7 @@ class RemoteMcpContractTest(unittest.TestCase):
                 self.assertEqual(names, {
                     "recall_search",
                     "recall_deep_search",
+                    "recall_exec",
                     "recall_investigate",
                     "recall_session_context",
                     "recall_show",
@@ -920,6 +945,24 @@ class RemoteMcpContractTest(unittest.TestCase):
             name: tool["inputSchema"]
             for name, tool in canonical_catalog.items()
         }
+        self.assertEqual(
+            canonical_tools["recall_exec"]["properties"]["targets"]["maxItems"],
+            20,
+        )
+        self.assertEqual(
+            canonical_tools["recall_exec"]["properties"]["timeout_seconds"][
+                "maximum"
+            ],
+            30,
+        )
+        self.assertIn(
+            "/docs/d1",
+            canonical_catalog["recall_exec"]["description"],
+        )
+        self.assertIn(
+            "recall-scan --broad --fixed",
+            canonical_catalog["recall_exec"]["description"],
+        )
         self.assertIn(
             "one person/time slice",
             canonical_catalog["use_recall"]["description"],
@@ -1060,6 +1103,104 @@ class RemoteMcpContractTest(unittest.TestCase):
             ),
             store.calls,
         )
+
+    def test_exec_passes_only_bounded_exact_targets_to_canonical_store(self) -> None:
+        first = "ldoc_0123456789abcdef0123456789abcdef"
+        second = "ldoc_fedcba9876543210fedcba9876543210"
+        store = PolicyStore()
+        with McpHttpServer(store) as server:
+            status, _, raw = server.request(
+                "POST",
+                request(
+                    "tools/call",
+                    params={
+                        "name": "recall_exec",
+                        "arguments": {
+                            "targets": [
+                                {"logical_document_id": first, "alias": "d1"},
+                                {"logical_document_id": second, "alias": "d2"},
+                            ],
+                            "program": "rg -n --fixed-strings decision /docs",
+                            "timeout_seconds": 17,
+                        },
+                    },
+                ),
+                token="synthetic-human-read",
+                protocol="2025-11-25",
+            )
+        self.assertEqual(status, 200)
+        result = json.loads(raw)["result"]["structuredContent"]
+        self.assertEqual(result["documents_available"], 2)
+        self.assertEqual(result["opened_receipts"], [
+            "recall://source:synthetic:company/item-1?rev=1"
+        ])
+        self.assertIn(
+            (
+                "exec",
+                "rg -n --fixed-strings decision /docs",
+                {
+                    "logical_document_ids": (first, second),
+                    "document_aliases": {first: "d1", second: "d2"},
+                    "record_spans": {first: (), second: ()},
+                    "routing_receipts": {first: (), second: ()},
+                    "timeout_seconds": 17,
+                },
+            ),
+            store.calls,
+        )
+
+    def test_exec_rejects_duplicate_targets_before_store(self) -> None:
+        document_id = "ldoc_0123456789abcdef0123456789abcdef"
+        store = PolicyStore()
+        with McpHttpServer(store) as server:
+            status, _, raw = server.request(
+                "POST",
+                request(
+                    "tools/call",
+                    params={
+                        "name": "recall_exec",
+                        "arguments": {
+                            "targets": [
+                                {"logical_document_id": document_id, "alias": "d1"},
+                                {"logical_document_id": document_id, "alias": "d2"},
+                            ],
+                            "program": "true",
+                        },
+                    },
+                ),
+                token="synthetic-human-read",
+                protocol="2025-11-25",
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw)["error"]["code"], -32602)
+        self.assertNotIn("exec", {call[0] for call in store.calls})
+
+    def test_exec_provider_failure_is_content_free(self) -> None:
+        document_id = "ldoc_0123456789abcdef0123456789abcdef"
+        with McpHttpServer(FailingExecStore()) as server:
+            status, _, raw = server.request(
+                "POST",
+                request(
+                    "tools/call",
+                    params={
+                        "name": "recall_exec",
+                        "arguments": {
+                            "targets": [
+                                {"logical_document_id": document_id, "alias": "d1"}
+                            ],
+                            "program": "true",
+                        },
+                    },
+                ),
+                token="synthetic-human-read",
+                protocol="2025-11-25",
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(raw)["error"],
+            {"code": -32603, "message": "recall_exec_failed"},
+        )
+        self.assertNotIn(b"private-provider-payload", raw)
 
     def test_search_and_related_bounds_reject_before_store(self) -> None:
         cases = (

@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any
 
 from .authorization import allowed_tools, decide
+from .deep_inspection import DeepInspectionError
 
 LATEST_PROTOCOL_VERSION = "2026-07-28"
 LATEST_LEGACY_PROTOCOL_VERSION = "2026-06-30"
@@ -450,6 +451,60 @@ ALL_READ_TOOLS = (
         "annotations": {"readOnlyHint": True},
     },
     {
+        "name": "recall_exec",
+        "description": (
+            "Run bounded read-only shell over exact full Recall documents selected "
+            "by recall_search. Pass only logical_document_id values returned by "
+            "search; ordered aliases are mounted at /docs/d1 through /docs/d20. "
+            "For portable verified search, run `recall-scan --broad --fixed "
+            "--pattern TERM --limit N`; ordinary shell and Python are also available. "
+            "The sandbox has no network and cannot mutate evidence. Search hits are "
+            "hints, not proof: only recall:// values in opened_receipts are citation "
+            "authority. To cite a match, print its JSONL record. An optional exact "
+            "`RECALL_EVIDENCE <receipt>` line may accompany, never replace, that record."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "targets": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 20,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "logical_document_id": {
+                                "type": "string",
+                                "pattern": r"^ldoc_[0-9a-f]{32}$",
+                            },
+                            "alias": {
+                                "type": "string",
+                                "pattern": r"^d(?:[1-9]|1[0-9]|20)$",
+                            },
+                        },
+                        "required": ["logical_document_id", "alias"],
+                        "additionalProperties": False,
+                    },
+                },
+                "program": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 16000,
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 30,
+                    "default": 20,
+                },
+            },
+            "required": ["targets", "program"],
+            "additionalProperties": False,
+        },
+        "outputSchema": {"type": "object"},
+        "annotations": {"readOnlyHint": True},
+    },
+    {
         "name": "recall_session_context",
         "description": (
             "Expand one recall:// receipt inside its authorized source session "
@@ -513,6 +568,7 @@ CANONICAL_ONLY_READ_TOOLS = frozenset({
     "recall_agent_result",
     "recall_agent_cancel",
     "recall_deep_search",
+    "recall_exec",
     "recall_investigate",
     "recall_session_context",
 })
@@ -738,6 +794,53 @@ def _call_tool(
             depth=depth,
             authorized_source=authorized_source,
         )
+    if name == "recall_exec":
+        _reject_extra(arguments, frozenset({"targets", "program", "timeout_seconds"}))
+        targets = arguments.get("targets")
+        if not isinstance(targets, list) or not 1 <= len(targets) <= 20:
+            raise McpProtocolError(-32602, "targets must contain 1 to 20 documents")
+        logical_document_ids: list[str] = []
+        document_aliases: dict[str, str] = {}
+        for target in targets:
+            if not isinstance(target, dict):
+                raise McpProtocolError(-32602, "each target must be an object")
+            _reject_extra(target, frozenset({"logical_document_id", "alias"}))
+            document_id = _string(
+                target.get("logical_document_id"),
+                "logical_document_id",
+            )
+            alias = _string(target.get("alias"), "alias")
+            if re.fullmatch(r"ldoc_[0-9a-f]{32}", document_id) is None:
+                raise McpProtocolError(-32602, "logical_document_id is invalid")
+            if re.fullmatch(r"d(?:[1-9]|1[0-9]|20)", alias) is None:
+                raise McpProtocolError(-32602, "alias must be d1 through d20")
+            if document_id in document_aliases or alias in document_aliases.values():
+                raise McpProtocolError(-32602, "targets must be unique")
+            logical_document_ids.append(document_id)
+            document_aliases[document_id] = alias
+        program = _string(arguments.get("program"), "program")
+        if len(program.encode()) > 16_000:
+            raise McpProtocolError(-32602, "program must be at most 16000 bytes")
+        timeout_seconds = _integer(
+            arguments.get("timeout_seconds"),
+            "timeout_seconds",
+            default=20,
+            minimum=1,
+            maximum=30,
+        )
+        try:
+            return store.execute_agent_program(
+                program,
+                logical_document_ids=tuple(logical_document_ids),
+                document_aliases=document_aliases,
+                record_spans={document_id: () for document_id in logical_document_ids},
+                routing_receipts={
+                    document_id: () for document_id in logical_document_ids
+                },
+                timeout_seconds=timeout_seconds,
+            )
+        except DeepInspectionError:
+            raise McpProtocolError(-32603, "recall_exec_failed") from None
     if name == "recall_session_context":
         _reject_extra(arguments, frozenset({"target", "before", "after"}))
         target = _string(arguments.get("target"), "target")
