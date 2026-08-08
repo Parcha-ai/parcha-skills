@@ -136,8 +136,10 @@ class BrainStore:
             raise ValueError("database pool size must be between 4 and 32")
         self.pool_max_size = configured_pool_size
         configured = search_deadline_ms if search_deadline_ms is not None else int(os.environ.get("RECALL_SEARCH_DEADLINE_MS", str(DEFAULT_SEARCH_DEADLINE_MS)))
-        if not 10 <= configured <= 5000:
-            raise ValueError("search deadline must be between 10 and 5000 milliseconds")
+        if not 10 <= configured <= 30_000:
+            raise ValueError(
+                "search deadline must be between 10 and 30000 milliseconds"
+            )
         self.search_deadline_ms = configured
         try:
             similarity = (

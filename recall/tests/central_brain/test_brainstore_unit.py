@@ -1213,18 +1213,18 @@ class EnvelopeContractTest(unittest.TestCase):
         self.assertEqual(DEFAULT_SEARCH_DEADLINE_MS, 300)
         self.assertLess(DEFAULT_SEARCH_DEADLINE_MS, 500)
 
-    def test_large_remote_corpora_may_select_a_bounded_five_second_deadline(self) -> None:
+    def test_large_remote_corpora_may_select_a_bounded_thirty_second_deadline(self) -> None:
         self.assertEqual(
             BrainStore(
                 "postgresql://synthetic.invalid/recall",
-                search_deadline_ms=5000,
+                search_deadline_ms=30_000,
             ).search_deadline_ms,
-            5000,
+            30_000,
         )
-        with self.assertRaisesRegex(ValueError, "between 10 and 5000"):
+        with self.assertRaisesRegex(ValueError, "between 10 and 30000"):
             BrainStore(
                 "postgresql://synthetic.invalid/recall",
-                search_deadline_ms=5001,
+                search_deadline_ms=30_001,
             )
 
     def test_advisory_lock_key_is_postgres_text_safe_and_boundary_preserving(self) -> None:
