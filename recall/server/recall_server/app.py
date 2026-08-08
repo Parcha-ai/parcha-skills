@@ -12,27 +12,12 @@ import stat
 import struct
 import threading
 import time
-from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 from .admin_web import (
     CSRF_COOKIE,
     SESSION_COOKIE,
-)
-from .agent import (
-    AgentExecutionError,
-    AgentRequestError,
-    RecallAgentService,
-    service_from_env as agent_service_from_env,
-)
-from .agent_runs import (
-    AgentRunConflict,
-    AgentRunCoordinator,
-    AgentRunNotFound,
-    AgentRunStateError,
-    AgentRunUnavailable,
-    backend_from_env as agent_backend_from_env,
 )
 from .admin_web import (
     asset as admin_asset,
@@ -75,7 +60,6 @@ from .mcp import (
 from .mcp import (
     error_response as mcp_error_response,
 )
-from .mcp import task_notification, task_subscription
 from .semantic import SemanticRuntime
 from .webhooks import WEBHOOK_PATH, WebhookError, build_webhook_event
 
@@ -100,24 +84,6 @@ INVITATION_LOGIN = re.compile(r"/join/([0-9a-f-]{36})/login\Z")
 MCP_BRAIN_PATH = re.compile(
     r"/mcp/brains/([A-Za-z0-9][A-Za-z0-9:._@+-]{1,255})\Z"
 )
-AGENT_BRAIN_PATH = re.compile(
-    r"/v1/agent/brains/([A-Za-z0-9][A-Za-z0-9:._@+-]{1,255})/use-recall\Z"
-)
-AGENT_RUNS_PATH = re.compile(
-    r"/v1/agent/brains/([A-Za-z0-9][A-Za-z0-9:._@+-]{1,255})/runs\Z"
-)
-AGENT_RUN_PATH = re.compile(
-    r"/v1/agent/brains/([A-Za-z0-9][A-Za-z0-9:._@+-]{1,255})/"
-    r"runs/(run_[0-9a-f]{32})\Z"
-)
-AGENT_RUN_RESULT_PATH = re.compile(
-    r"/v1/agent/brains/([A-Za-z0-9][A-Za-z0-9:._@+-]{1,255})/"
-    r"runs/(run_[0-9a-f]{32})/result\Z"
-)
-AGENT_RUN_CANCEL_PATH = re.compile(
-    r"/v1/agent/brains/([A-Za-z0-9][A-Za-z0-9:._@+-]{1,255})/"
-    r"runs/(run_[0-9a-f]{32})/cancel\Z"
-)
 COUNTERS = {
     "http_requests": 0,
     "http_errors": 0,
@@ -138,8 +104,6 @@ class Handler(BaseHTTPRequestHandler):
     deep_inspector = None
     canonical_plane: CanonicalPlane | None = None
     canonical_retrieval: CanonicalRetrieval | None = None
-    agent_service: RecallAgentService | None = None
-    agent_coordinator: AgentRunCoordinator | None = None
     control_plane: ControlPlane | None = None
     external_identity_verifier: ExternalIdentityVerifier | None = None
 
@@ -231,79 +195,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header(name, value)
         self.send_header("Content-Length", "0")
         self.end_headers()
-
-    def send_task_subscription(
-        self,
-        principal: dict,
-        subscription_id: object,
-        task_ids: tuple[str, ...],
-    ) -> None:
-        if self.agent_coordinator is None:
-            raise McpProtocolError(-32601, "method not found")
-        states = {
-            task_id: self.agent_coordinator.task_status(principal, task_id)
-            for task_id in task_ids
-        }
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-store, no-transform")
-        self.send_header("X-Accel-Buffering", "no")
-        self.end_headers()
-
-        def send(message: dict) -> None:
-            payload = json.dumps(
-                message,
-                ensure_ascii=False,
-                allow_nan=False,
-                separators=(",", ":"),
-            ).encode()
-            self.wfile.write(b"event: message\ndata: " + payload + b"\n\n")
-            self.wfile.flush()
-
-        try:
-            send({
-                "jsonrpc": "2.0",
-                "method": "notifications/subscriptions/acknowledged",
-                "params": {
-                    "notifications": {"taskIds": list(task_ids)},
-                    "_meta": {
-                        "io.modelcontextprotocol/subscriptionId": subscription_id,
-                    },
-                },
-            })
-            observed: dict[str, str] = {}
-            last_keepalive = time.monotonic()
-            while True:
-                for task_id in task_ids:
-                    state = states[task_id]
-                    run = state["run"]
-                    version = f"{run['status']}:{run['updated_at']}"
-                    if observed.get(task_id) != version:
-                        final = None
-                        if run["status"] in {"complete", "partial", "no_answer"}:
-                            final = self.agent_coordinator.task_result(
-                                principal,
-                                task_id,
-                            )
-                        send(task_notification(
-                            run,
-                            task_id,
-                            subscription_id=subscription_id,
-                            result=final,
-                            ttl_ms=state["ttl_ms"],
-                        ))
-                        observed[task_id] = version
-                time.sleep(1)
-                states = {
-                    task_id: self.agent_coordinator.task_status(principal, task_id)
-                    for task_id in task_ids
-                }
-                if time.monotonic() - last_keepalive >= 15:
-                    self.wfile.write(b": keepalive\n\n")
-                    self.wfile.flush()
-                    last_keepalive = time.monotonic()
-        except (BrokenPipeError, ConnectionResetError):
-            return
 
     def valid_mcp_origin(self) -> bool:
         origin = self.headers.get("Origin")
@@ -726,11 +617,6 @@ class Handler(BaseHTTPRequestHandler):
             f"recall_source_freshness_seconds {db['source_freshness_seconds']}",
             f"recall_embedded_items {db['embedded_items']}",
             f"recall_embedding_lag {db['embedding_lag']}",
-            f"recall_agent_runs_active {db['agent_runs_active']}",
-            f"recall_agent_runs_completed_total {db['agent_runs_completed']}",
-            f"recall_agent_runs_failed_total {db['agent_runs_failed']}",
-            f"recall_agent_runs_cancelled_total {db['agent_runs_cancelled']}",
-            f"recall_agent_runs_recovered_total {db['agent_runs_recovered']}",
             "",
         ]
         return "\n".join(lines).encode()
@@ -762,25 +648,14 @@ class Handler(BaseHTTPRequestHandler):
         if not (self.public_mcp_profile() or self.public_edge_profile()):
             return False
         mcp_path = path == "/mcp" or MCP_BRAIN_PATH.fullmatch(path)
-        agent_post_path = (
-            AGENT_BRAIN_PATH.fullmatch(path)
-            or AGENT_RUNS_PATH.fullmatch(path)
-            or AGENT_RUN_CANCEL_PATH.fullmatch(path)
-        )
-        agent_get_path = (
-            AGENT_RUN_PATH.fullmatch(path)
-            or AGENT_RUN_RESULT_PATH.fullmatch(path)
-        )
         resource = os.environ.get("RECALL_MCP_RESOURCE_URI", "").rstrip("/")
         metadata_path = self.is_protected_resource_metadata_path(path, resource)
         allowed = (
-            method == "POST"
-            and (bool(mcp_path) or bool(agent_post_path))
+            method == "POST" and bool(mcp_path)
         ) or (
             method == "GET"
             and (
                 bool(mcp_path)
-                or bool(agent_get_path)
                 or path in {"/healthz", "/readyz"}
                 or metadata_path
             )
@@ -1003,37 +878,6 @@ class Handler(BaseHTTPRequestHandler):
                 except ControlError as error:
                     self.send_json(error.status, {"error": error.code})
                 return
-        agent_result_match = AGENT_RUN_RESULT_PATH.fullmatch(parsed.path)
-        agent_run_match = AGENT_RUN_PATH.fullmatch(parsed.path)
-        if agent_result_match or agent_run_match:
-            matched = agent_result_match or agent_run_match
-            if self.agent_coordinator is None:
-                self.send_json(404, {"error": "not found"})
-                return
-            principal = self.require("read", requested_tenant=matched.group(1))
-            if principal is None:
-                return
-            action = (
-                "mcp.recall_agent_result"
-                if agent_result_match
-                else "mcp.recall_agent_status"
-            )
-            if not self.authorize_mcp(principal, action):
-                self.send_json(403, {"error": "operation not authorized"})
-                return
-            try:
-                result = (
-                    self.agent_coordinator.result(principal, matched.group(2))
-                    if agent_result_match
-                    else self.agent_coordinator.status(principal, matched.group(2))
-                )
-                self.send_json(200, result)
-            except AgentRunNotFound:
-                self.send_json(404, {"error": "agent run not found"})
-            except Exception as error:
-                LOG.error("agent lifecycle read failed type=%s", type(error).__name__)
-                self.send_json(500, {"error": "agent lifecycle failed"})
-            return
         brain_match = MCP_BRAIN_PATH.fullmatch(parsed.path)
         if parsed.path == "/mcp" or brain_match:
             if not self.valid_mcp_origin():
@@ -1505,119 +1349,7 @@ class Handler(BaseHTTPRequestHandler):
                 LOG.error("webhook failed type=%s", type(exc).__name__)
                 self.send_json(500, {"error": "webhook failed"})
             return
-        agent_start_match = AGENT_RUNS_PATH.fullmatch(path)
-        agent_cancel_match = AGENT_RUN_CANCEL_PATH.fullmatch(path)
-        if agent_start_match or agent_cancel_match:
-            matched = agent_start_match or agent_cancel_match
-            if self.agent_coordinator is None or self.canonical_retrieval is None:
-                self.send_json(404, {"error": "not found"})
-                return
-            principal = self.require("read", requested_tenant=matched.group(1))
-            if principal is None:
-                return
-            action = (
-                "mcp.recall_agent_start"
-                if agent_start_match
-                else "mcp.recall_agent_cancel"
-            )
-            if not self.authorize_mcp(principal, action):
-                self.send_json(403, {"error": "operation not authorized"})
-                return
-            content_type = (
-                self.headers.get("Content-Type", "").split(";", 1)[0].strip().casefold()
-            )
-            if content_type != "application/json":
-                self.send_json(415, {"error": "unsupported content type"})
-                return
-            length = self.body_length(64 * 1024)
-            if length is None:
-                return
-            try:
-                body = json.loads(self.rfile.read(length))
-                if agent_start_match:
-                    retrieval = self.canonical_retrieval.bind(principal)
-                    result = self.agent_coordinator.start(
-                        principal,
-                        body,
-                        retrieval,
-                    )
-                    self.send_json(202, result)
-                else:
-                    if body != {}:
-                        raise AgentRequestError("cancel request is invalid")
-                    result = self.agent_coordinator.cancel(
-                        principal,
-                        matched.group(2),
-                    )
-                    self.send_json(200, result)
-            except (json.JSONDecodeError, AgentRequestError):
-                self.send_json(400, {"error": "agent request invalid"})
-            except AgentRunConflict:
-                self.send_json(409, {"error": "agent idempotency conflict"})
-            except AgentRunUnavailable:
-                self.send_json(429, {"error": "agent concurrency bound reached"})
-            except AgentRunNotFound:
-                self.send_json(404, {"error": "agent run not found"})
-            except AgentRunStateError:
-                self.send_json(409, {"error": "agent run state conflict"})
-            except Exception as error:
-                LOG.error("agent lifecycle write failed type=%s", type(error).__name__)
-                self.send_json(500, {"error": "agent lifecycle failed"})
-            return
         brain_match = MCP_BRAIN_PATH.fullmatch(path)
-        agent_match = AGENT_BRAIN_PATH.fullmatch(path)
-        if agent_match:
-            if self.agent_service is None or self.canonical_retrieval is None:
-                self.send_json(404, {"error": "not found"})
-                return
-            principal = self.require(
-                "read",
-                requested_tenant=agent_match.group(1),
-            )
-            if principal is None:
-                return
-            if not self.authorize_mcp(principal, "mcp.use_recall"):
-                self.send_json(403, {"error": "operation not authorized"})
-                return
-            content_type = (
-                self.headers.get("Content-Type", "").split(";", 1)[0].strip().casefold()
-            )
-            if content_type != "application/json":
-                self.send_json(415, {"error": "unsupported content type"})
-                return
-            length = self.body_length(64 * 1024)
-            if length is None:
-                return
-            try:
-                body = json.loads(self.rfile.read(length))
-                retrieval = self.canonical_retrieval.bind(principal)
-                result = (
-                    self.agent_coordinator.use_recall(
-                        principal,
-                        body,
-                        retrieval,
-                    )
-                    if self.agent_coordinator is not None
-                    else self.agent_service.use_recall(
-                        principal,
-                        body,
-                        retrieval,
-                    )
-                )
-                self.send_json(200, result)
-            except (json.JSONDecodeError, AgentRequestError):
-                self.send_json(400, {"error": "agent request invalid"})
-            except AgentRunConflict:
-                self.send_json(409, {"error": "agent idempotency conflict"})
-            except AgentRunUnavailable:
-                self.send_json(429, {"error": "agent concurrency bound reached"})
-            except AgentExecutionError as error:
-                LOG.error("agent execution failed type=%s", type(error).__name__)
-                self.send_json(500, {"error": "agent execution failed"})
-            except Exception as error:
-                LOG.error("agent route failed type=%s", type(error).__name__)
-                self.send_json(500, {"error": "agent execution failed"})
-            return
         if path == "/mcp" or brain_match:
             if not self.valid_mcp_origin():
                 return
@@ -1631,10 +1363,6 @@ class Handler(BaseHTTPRequestHandler):
             )
             if not principal:
                 return
-            principal["agent_enabled"] = (
-                self.agent_service is not None
-                or self.agent_coordinator is not None
-            )
             content_type = (
                 self.headers.get("Content-Type", "").split(";", 1)[0].strip().casefold()
             )
@@ -1666,85 +1394,12 @@ class Handler(BaseHTTPRequestHandler):
                     if self.canonical_retrieval is None:
                         raise RuntimeError("canonical retrieval unavailable")
                     mcp_store = self.canonical_retrieval.bind(principal)
-                lifecycle = None
-                if self.agent_coordinator is not None:
-                    lifecycle = {
-                        "start": lambda arguments: self.agent_coordinator.start(
-                            principal,
-                            arguments,
-                            mcp_store,
-                        ),
-                        "status": lambda run_id: self.agent_coordinator.status(
-                            principal,
-                            run_id,
-                        ),
-                        "result": lambda run_id: self.agent_coordinator.result(
-                            principal,
-                            run_id,
-                        ),
-                        "cancel": lambda run_id: self.agent_coordinator.cancel(
-                            principal,
-                            run_id,
-                        ),
-                        "task_status": lambda task_id: self.agent_coordinator.task_status(
-                            principal,
-                            task_id,
-                        ),
-                        "task_result": lambda task_id: self.agent_coordinator.task_result(
-                            principal,
-                            task_id,
-                        ),
-                        "task_cancel": lambda task_id: self.agent_coordinator.task_cancel(
-                            principal,
-                            task_id,
-                        ),
-                    }
-                subscription = task_subscription(
-                    body,
-                    protocol_version=protocol_version,
-                )
-                if subscription is not None:
-                    if lifecycle is None:
-                        raise McpProtocolError(-32601, "method not found")
-                    if not self.authorize_mcp(
-                        principal,
-                        "mcp.recall_agent_status",
-                    ):
-                        raise McpProtocolError(-32600, "operation not authorized")
-                    self.send_task_subscription(
-                        principal,
-                        subscription[0],
-                        subscription[1],
-                    )
-                    return
                 response = dispatch_mcp(
                     mcp_store,
                     principal,
                     body,
                     authorize=lambda action: self.authorize_mcp(principal, action),
-                    agent=(
-                        lambda arguments: (
-                            self.agent_coordinator.use_recall(
-                                principal,
-                                arguments,
-                                mcp_store,
-                            )
-                            if self.agent_coordinator is not None
-                            else self.agent_service.use_recall(
-                                principal,
-                                arguments,
-                                mcp_store,
-                            )
-                        )
-                        if (
-                            self.agent_service is not None
-                            or self.agent_coordinator is not None
-                        )
-                        else None
-                    ),
-                    agent_lifecycle=lifecycle,
                     protocol_version=protocol_version,
-                    task_name=self.headers.get("Mcp-Name"),
                 )
             except json.JSONDecodeError:
                 self.send_json(
@@ -1763,15 +1418,6 @@ class Handler(BaseHTTPRequestHandler):
                     else 200
                 )
                 self.send_json(status, mcp_error_response(exc, request_id))
-                return
-            except (AgentRunNotFound, AgentRunStateError):
-                self.send_json(
-                    200,
-                    mcp_error_response(
-                        McpProtocolError(-32602, "agent task is unavailable"),
-                        request_id,
-                    ),
-                )
                 return
             except (ValueError, TypeError):
                 self.send_json(
@@ -2054,33 +1700,6 @@ def configure_runtime(dsn: str) -> None:
             if os.environ.get("RECALL_CANONICAL_MCP_ENABLED") == "1"
             else None
         )
-        if Handler.agent_coordinator is not None:
-            Handler.agent_coordinator.close()
-        environment = dict(os.environ)
-        Handler.agent_service = agent_service_from_env(environment)
-        Handler.agent_coordinator = None
-        if Handler.agent_service is not None and Handler.canonical_retrieval is None:
-            raise RuntimeError("Recall agent requires canonical MCP retrieval")
-        if Handler.agent_service is not None:
-            try:
-                workers = int(environment.get("RECALL_AGENT_WORKERS", "4"))
-            except ValueError as error:
-                raise RuntimeError(
-                    "Recall agent lifecycle configuration is invalid"
-                ) from error
-            backend = agent_backend_from_env(environment, Handler.store)
-            Handler.agent_coordinator = AgentRunCoordinator(
-                Handler.agent_service,
-                backend,
-                workers=workers,
-                abandon_after_seconds=backend.lease_seconds,
-            )
-            recovered = Handler.agent_coordinator.recover()
-            pruned = backend.prune(
-                before=datetime.now(timezone.utc)
-                - timedelta(seconds=backend.retention_seconds)
-            )
-            LOG.info("agent lifecycle recovered=%s pruned=%s", recovered, pruned)
     else:
         Handler.archive_store = None
         Handler.evidence_archive_store = None
@@ -2088,10 +1707,6 @@ def configure_runtime(dsn: str) -> None:
         Handler.deep_inspector = None
         Handler.canonical_plane = None
         Handler.canonical_retrieval = None
-        Handler.agent_service = None
-        if Handler.agent_coordinator is not None:
-            Handler.agent_coordinator.close()
-        Handler.agent_coordinator = None
 
 
 def serve(dsn: str, host: str = "127.0.0.1", port: int = 8788) -> None:

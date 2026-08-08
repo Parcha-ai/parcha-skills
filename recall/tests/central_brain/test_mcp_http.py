@@ -5,7 +5,6 @@ import json
 import os
 import sys
 import threading
-import time
 import types
 import unittest
 from http.server import ThreadingHTTPServer
@@ -61,12 +60,6 @@ class FakeStore:
                 }
             ],
         }
-
-    def investigate(self, question, *, filters, depth, authorized_source):
-        self.calls.append(
-            ("investigate", question, filters, depth, authorized_source)
-        )
-        return {"investigations": [], "coverage": {"sessions": 0}}
 
     def execute_agent_program(self, program, **arguments):
         self.calls.append(("exec", program, arguments))
@@ -255,164 +248,6 @@ class McpHttpServer:
         return response.status, result_headers, raw
 
 
-class AsyncTaskCoordinator:
-    def __init__(self) -> None:
-        self.polls = 0
-        self.cancelled = False
-
-    @staticmethod
-    def _run(status: str) -> dict:
-        value = {
-            "contract": "recall.agent-run.v1",
-            "schema_version": 1,
-            "run_id": "run_0123456789abcdef0123456789abcdef",
-            "request_id": "req_0123456789abcdef",
-            "tenant_id": "tenant:synthetic:company",
-            "principal_id": "principal:synthetic:member",
-            "trace_id": "trc_0123456789abcdef0123456789abcdef",
-            "status": status,
-            "status_message": "completed" if status == "complete" else "searching",
-            "attempt": 1,
-            "created_at": "2026-08-07T00:00:00Z",
-            "updated_at": (
-                "2026-08-07T00:00:02Z"
-                if status == "complete"
-                else "2026-08-07T00:00:01Z"
-            ),
-        }
-        if status == "complete":
-            value["completed_at"] = "2026-08-07T00:00:02Z"
-        return value
-
-    def start(self, *_args):
-        return {
-            "run": self._run("running"),
-            "task_id": "tsk_0123456789abcdef0123456789abcdef",
-            "ttl_ms": 60_000,
-        }
-
-    def task_status(self, *_args):
-        self.polls += 1
-        return {
-            "run": self._run(
-                "cancelled"
-                if self.cancelled
-                else "complete" if self.polls >= 2 else "running"
-            ),
-            "task_id": "tsk_0123456789abcdef0123456789abcdef",
-            "ttl_ms": 60_000,
-        }
-
-    @staticmethod
-    def task_result(*_args):
-        return {"answer": "Synthetic durable answer"}
-
-    def task_cancel(self, *_args):
-        self.cancelled = True
-        return {}
-
-    @staticmethod
-    def status(*_args):
-        return {}
-
-    @staticmethod
-    def result(*_args):
-        return {}
-
-    @staticmethod
-    def cancel(*_args):
-        return {}
-
-    def use_recall(self, *_args):
-        started = self.start(None)
-        return {
-            **started,
-            "continuation": {
-                "tool": "recall_agent_result",
-                "arguments": {"run_id": started["run"]["run_id"]},
-                "poll_after_ms": 1000,
-            },
-        }
-
-
-class ModernTaskHttpServer:
-    def __init__(self) -> None:
-        Handler.store = PolicyStore()
-        Handler.agent_service = None
-        Handler.agent_coordinator = AsyncTaskCoordinator()
-        Handler.canonical_retrieval = None
-        Handler.external_identity_verifier = None
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.server.daemon_threads = True
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-
-    def __enter__(self):
-        self.thread.start()
-        return self
-
-    def __exit__(self, *_exc):
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=2)
-        Handler.agent_coordinator = None
-
-    def request(
-        self,
-        body: dict,
-        *,
-        name: str | None = None,
-        protocol: str = "2026-07-28",
-    ):
-        connection, response = self.open(body, name=name, protocol=protocol)
-        raw = response.read()
-        content_type = response.getheader("Content-Type")
-        status = response.status
-        connection.close()
-        return status, content_type, raw
-
-    def open(
-        self,
-        body: dict,
-        *,
-        name: str | None = None,
-        protocol: str = "2026-07-28",
-        route_method: str | None = None,
-    ):
-        payload = json.dumps(body).encode()
-        headers = {
-            "Authorization": "Bearer synthetic-human-read",
-            "Content-Type": "application/json",
-            "Content-Length": str(len(payload)),
-            "Accept": "application/json, text/event-stream",
-            "MCP-Protocol-Version": protocol,
-        }
-        if protocol == "2026-07-28":
-            headers["Mcp-Method"] = route_method or body["method"]
-        if name is not None:
-            headers["Mcp-Name"] = name
-        connection = http.client.HTTPConnection(
-            "127.0.0.1",
-            self.server.server_port,
-            timeout=4,
-        )
-        connection.request("POST", "/mcp", body=payload, headers=headers)
-        response = connection.getresponse()
-        return connection, response
-
-
-def modern_meta() -> dict:
-    return {
-        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-        "io.modelcontextprotocol/clientInfo": {
-            "name": "synthetic-modern-client",
-            "version": "1",
-        },
-        "io.modelcontextprotocol/clientCapabilities": {
-            "extensions": {"io.modelcontextprotocol/tasks": {}},
-        },
-    }
-
-
 def request(method: str, request_id: int = 1, params: dict | None = None) -> dict:
     return {
         "jsonrpc": "2.0",
@@ -477,164 +312,6 @@ class RemoteMcpContractTest(unittest.TestCase):
                     "recall_forget",
                 ],
             )
-
-    def test_modern_task_returns_immediately_and_streams_to_completion(self) -> None:
-        request_value = {
-            "contract": "recall.agent-request.v1",
-            "schema_version": 1,
-            "request_id": "req_0123456789abcdef",
-            "idempotency_key": "synthetic-modern-http",
-            "question": "What changed?",
-            "depth": "normal",
-        }
-        with ModernTaskHttpServer() as server:
-            started_at = time.monotonic()
-            status, content_type, raw = server.request(
-                request(
-                    "tools/call",
-                    params={
-                        "name": "use_recall",
-                        "arguments": request_value,
-                        "_meta": modern_meta(),
-                    },
-                ),
-                name="use_recall",
-            )
-            self.assertLess(time.monotonic() - started_at, 0.5)
-            self.assertEqual((status, content_type), (200, "application/json"))
-            task = json.loads(raw)["result"]
-            self.assertEqual((task["resultType"], task["status"]), ("task", "working"))
-
-            connection, response = server.open(request(
-                "subscriptions/listen",
-                request_id=2,
-                params={
-                    "notifications": {"taskIds": [task["taskId"]]},
-                    "_meta": modern_meta(),
-                },
-            ))
-            self.assertEqual(
-                (response.status, response.getheader("Content-Type")),
-                (200, "text/event-stream"),
-            )
-            messages = []
-            while len(messages) < 3:
-                line = response.readline().decode()
-                self.assertTrue(line, "subscription closed before terminal task state")
-                if line.startswith("data: "):
-                    messages.append(json.loads(line.removeprefix("data: ")))
-            response.close()
-            connection.close()
-            self.assertEqual(
-                messages[0]["method"],
-                "notifications/subscriptions/acknowledged",
-            )
-            self.assertEqual(
-                [item["params"]["status"] for item in messages[1:]],
-                ["working", "completed"],
-            )
-            self.assertEqual(
-                messages[-1]["params"]["result"]["structuredContent"]["answer"],
-                "Synthetic durable answer",
-            )
-
-            # A dropped listener never loses the durable result. Re-subscribing
-            # starts with an acknowledgement and the current complete state.
-            connection, response = server.open(request(
-                "subscriptions/listen",
-                request_id=3,
-                params={
-                    "notifications": {"taskIds": [task["taskId"]]},
-                    "_meta": modern_meta(),
-                },
-            ))
-            replayed = []
-            while len(replayed) < 2:
-                line = response.readline().decode()
-                self.assertTrue(line)
-                if line.startswith("data: "):
-                    replayed.append(json.loads(line.removeprefix("data: ")))
-            response.close()
-            connection.close()
-            self.assertEqual(replayed[1]["params"]["status"], "completed")
-
-    def test_legacy_client_gets_immediate_handle_and_can_cancel(self) -> None:
-        request_value = {
-            "contract": "recall.agent-request.v1",
-            "schema_version": 1,
-            "request_id": "req_0123456789abcdef",
-            "idempotency_key": "synthetic-legacy-http",
-            "question": "What changed?",
-            "depth": "normal",
-        }
-        with ModernTaskHttpServer() as server:
-            started_at = time.monotonic()
-            status, _, raw = server.request(
-                request(
-                    "tools/call",
-                    params={"name": "use_recall", "arguments": request_value},
-                ),
-                protocol="2025-11-25",
-            )
-            self.assertLess(time.monotonic() - started_at, 0.5)
-            self.assertEqual(status, 200)
-            handle = json.loads(raw)["result"]["structuredContent"]
-            self.assertEqual(handle["run"]["status"], "running")
-            self.assertEqual(handle["continuation"]["tool"], "recall_agent_result")
-
-            task_id = handle["task_id"]
-            status, _, raw = server.request(
-                request("tasks/cancel", params={"taskId": task_id}),
-                name=task_id,
-                protocol="2026-06-30",
-            )
-            self.assertEqual(status, 200)
-            self.assertEqual(json.loads(raw)["result"], {"resultType": "complete"})
-
-    def test_modern_header_mismatch_and_missing_capability_use_http_errors(self) -> None:
-        with ModernTaskHttpServer() as server:
-            body = request("tools/list", params={"_meta": modern_meta()})
-            connection, response = server.open(body)
-            self.assertEqual(response.status, 200)
-            listed = json.loads(response.read())["result"]
-            connection.close()
-            self.assertEqual(
-                (listed["ttlMs"], listed["cacheScope"]),
-                (300_000, "private"),
-            )
-
-            connection, response = server.open(
-                body,
-                route_method="ping",
-            )
-            self.assertEqual(response.status, 400)
-            self.assertEqual(json.loads(response.read())["error"]["code"], -32020)
-            connection.close()
-
-            body["method"] = "ping"
-            connection, response = server.open(body)
-            self.assertEqual(response.status, 404)
-            self.assertEqual(json.loads(response.read())["error"]["code"], -32601)
-            connection.close()
-
-            body = request(
-                "subscriptions/listen",
-                params={
-                    "notifications": {
-                        "taskIds": ["tsk_0123456789abcdef0123456789abcdef"]
-                    },
-                    "_meta": {
-                        **modern_meta(),
-                        "io.modelcontextprotocol/clientCapabilities": {},
-                    },
-                },
-            )
-            connection, response = server.open(body)
-            self.assertEqual(response.status, 400)
-            error = json.loads(response.read())["error"]
-            connection.close()
-            self.assertEqual(error["code"], -32003)
-            self.assertIn("requiredCapabilities", error["data"])
 
     def test_oauth_resource_challenge_and_default_deny_policy(self) -> None:
         resource = "https://recall.synthetic.invalid/mcp"
@@ -726,9 +403,7 @@ class RemoteMcpContractTest(unittest.TestCase):
                 }
                 self.assertEqual(names, {
                     "recall_search",
-                    "recall_deep_search",
                     "recall_exec",
-                    "recall_investigate",
                     "recall_session_context",
                     "recall_show",
                     "recall_related",
@@ -932,9 +607,11 @@ class RemoteMcpContractTest(unittest.TestCase):
                 ]
             },
         )
-        with ModernTaskHttpServer() as server:
+        with McpHttpServer(PolicyStore()) as server:
             _, _, canonical_raw = server.request(
+                "POST",
                 request("tools/list"),
+                token="synthetic-human-read",
                 protocol="2025-11-25",
             )
         canonical_catalog = {
@@ -963,22 +640,6 @@ class RemoteMcpContractTest(unittest.TestCase):
             "recall-scan --broad --fixed",
             canonical_catalog["recall_exec"]["description"],
         )
-        self.assertIn(
-            "one person/time slice",
-            canonical_catalog["use_recall"]["description"],
-        )
-        self.assertIn(
-            "Never use one broad call as proof of absence",
-            canonical_catalog["use_recall"]["description"],
-        )
-        investigate_filters = canonical_tools["recall_investigate"]["properties"][
-            "filters"
-        ]["properties"]
-        self.assertEqual(
-            investigate_filters["person"],
-            {"type": "string", "maxLength": 256},
-        )
-        self.assertIn("author", investigate_filters["person_relation"]["enum"])
         self.assertEqual(
             tools["recall_search"]["properties"]["filters"]["properties"]["person"],
             {"type": "string", "maxLength": 256},
@@ -1065,44 +726,6 @@ class RemoteMcpContractTest(unittest.TestCase):
                 self.assertEqual(status, 200)
                 self.assertEqual(json.loads(raw)["error"]["code"], -32602)
                 self.assertNotIn("show", {call[0] for call in self.store.calls})
-
-    def test_investigate_passes_person_and_time_scope_to_store(self) -> None:
-        filters = {
-            "since": "2026-08-05T07:00:00Z",
-            "until": "2026-08-06T07:00:00Z",
-            "person": "Christian",
-            "person_relation": "author",
-        }
-        store = PolicyStore()
-        with McpHttpServer(store) as server:
-            status, _, raw = server.request(
-                "POST",
-                request(
-                    "tools/call",
-                    params={
-                        "name": "recall_investigate",
-                        "arguments": {
-                            "question": "What did Chris do yesterday?",
-                            "filters": filters,
-                            "depth": "deep",
-                        },
-                    },
-                ),
-                token="synthetic-human-read",
-                protocol="2025-11-25",
-            )
-        self.assertEqual(status, 200)
-        self.assertIn("result", json.loads(raw))
-        self.assertIn(
-            (
-                "investigate",
-                "What did Chris do yesterday?",
-                filters,
-                "deep",
-                ["source:synthetic:company"],
-            ),
-            store.calls,
-        )
 
     def test_exec_passes_only_bounded_exact_targets_to_canonical_store(self) -> None:
         first = "ldoc_0123456789abcdef0123456789abcdef"

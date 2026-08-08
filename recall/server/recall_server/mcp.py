@@ -26,10 +26,6 @@ REQUEST_METHODS = (
     "ping",
     "tools/list",
     "tools/call",
-    "tasks/get",
-    "tasks/update",
-    "tasks/cancel",
-    "subscriptions/listen",
 )
 NOTIFICATION_METHODS = ("notifications/initialized",)
 MAX_MCP_RESPONSE_BYTES = 1024 * 1024
@@ -108,176 +104,6 @@ def _date_time(value: Any, name: str) -> str:
 
 ALL_READ_TOOLS = (
     {
-        "name": "use_recall",
-        "description": (
-            "Ask the authenticated Recall brain one natural-language question. "
-            "Recall owns investigation, grounding, citations, and the redacted trace. "
-            "For a broad matrix asking about several people across several dates, "
-            "the client agent should decompose it into parallel narrow calls, usually "
-            "one person/time slice, then synthesize their grounded results. Start "
-            "those cells at quick depth and deepen only ambiguous cells. Never use "
-            "one broad call as proof of absence for a requested cell. "
-            "Long investigations start asynchronously: MCP Tasks clients receive a "
-            "native task, and compatibility clients receive a durable run handle with "
-            "run_id and trace_id for status, result, or cancellation calls."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": [
-                "contract",
-                "schema_version",
-                "request_id",
-                "idempotency_key",
-                "question",
-                "depth",
-            ],
-            "properties": {
-                "contract": {"const": "recall.agent-request.v1"},
-                "schema_version": {"const": 1},
-                "request_id": {
-                    "type": "string",
-                    "pattern": "^req_[A-Za-z0-9_-]{16,128}$",
-                },
-                "idempotency_key": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 200,
-                },
-                "question": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 8192,
-                },
-                "depth": {
-                    "type": "string",
-                    "enum": ["quick", "normal", "deep"],
-                    "default": "normal",
-                },
-                "since": {"type": "string", "format": "date-time"},
-                "until": {"type": "string", "format": "date-time"},
-                "source_families": {
-                    "type": "array",
-                    "maxItems": 32,
-                    "uniqueItems": True,
-                    "items": {
-                        "type": "string",
-                        "minLength": 2,
-                        "maxLength": 160,
-                    },
-                },
-            },
-        },
-        "outputSchema": {"type": "object"},
-        "annotations": { "readOnlyHint": True },
-    },
-    {
-        "name": "recall_agent_start",
-        "description": (
-            "Durably start one Recall investigation and return immediately with "
-            "an authorization-bound run handle."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": [
-                "contract",
-                "schema_version",
-                "request_id",
-                "idempotency_key",
-                "question",
-                "depth",
-            ],
-            "properties": {
-                "contract": {"const": "recall.agent-request.v1"},
-                "schema_version": {"const": 1},
-                "request_id": {
-                    "type": "string",
-                    "pattern": "^req_[A-Za-z0-9_-]{16,128}$",
-                },
-                "idempotency_key": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 200,
-                },
-                "question": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 8192,
-                },
-                "depth": {
-                    "type": "string",
-                    "enum": ["quick", "normal", "deep"],
-                },
-                "since": {"type": "string", "format": "date-time"},
-                "until": {"type": "string", "format": "date-time"},
-                "source_families": {
-                    "type": "array",
-                    "maxItems": 32,
-                    "uniqueItems": True,
-                    "items": {
-                        "type": "string",
-                        "minLength": 2,
-                        "maxLength": 160,
-                    },
-                },
-            },
-        },
-        "outputSchema": {"type": "object"},
-        "annotations": {"readOnlyHint": True},
-    },
-    {
-        "name": "recall_agent_status",
-        "description": "Read one authenticated Recall agent run status.",
-        "inputSchema": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["run_id"],
-            "properties": {
-                "run_id": {
-                    "type": "string",
-                    "pattern": "^run_[0-9a-f]{32}$",
-                },
-            },
-        },
-        "outputSchema": {"type": "object"},
-        "annotations": {"readOnlyHint": True},
-    },
-    {
-        "name": "recall_agent_result",
-        "description": "Read one terminal Recall agent result and redacted trace.",
-        "inputSchema": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["run_id"],
-            "properties": {
-                "run_id": {
-                    "type": "string",
-                    "pattern": "^run_[0-9a-f]{32}$",
-                },
-            },
-        },
-        "outputSchema": {"type": "object"},
-        "annotations": {"readOnlyHint": True},
-    },
-    {
-        "name": "recall_agent_cancel",
-        "description": "Cancel one queued or running authenticated Recall agent run.",
-        "inputSchema": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["run_id"],
-            "properties": {
-                "run_id": {
-                    "type": "string",
-                    "pattern": "^run_[0-9a-f]{32}$",
-                },
-            },
-        },
-        "outputSchema": {"type": "object"},
-        "annotations": {"readOnlyHint": False, "destructiveHint": True},
-    },
-    {
         "name": "recall_related",
         "description": (
             "Find Recall evidence related to a working directory or branch. "
@@ -305,8 +131,11 @@ ALL_READ_TOOLS = (
     {
         "name": "recall_search",
         "description": (
-            "Search the authorized Recall brain using a natural-language "
-            "question. Results include stable recall:// receipts for follow-up."
+            "Search the authorized Recall brain for high-recall evidence pointers. "
+            "Use natural language, identifiers, people, source, and time filters as "
+            "the question warrants; reformulate or split the question when useful. "
+            "Results include logical_document_id values for recall_exec and stable "
+            "recall:// receipts for exact follow-up. Hits are hints, not proof."
         ),
         "inputSchema": {
             "type": "object",
@@ -348,103 +177,6 @@ ALL_READ_TOOLS = (
                 },
             },
             "required": ["query"],
-            "additionalProperties": False,
-        },
-        "outputSchema": {"type": "object"},
-        "annotations": {"readOnlyHint": True},
-    },
-    {
-        "name": "recall_investigate",
-        "description": (
-            "Investigate a natural-language question in one bounded call. "
-            "Uses source occurrence time, diversifies across sessions and sources, "
-            "and returns exact recall:// receipts with surrounding evidence."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "question": {
-                    "type": "string",
-                    "maxLength": 8192,
-                },
-                "filters": {
-                    "type": "object",
-                    "default": {},
-                    "properties": {
-                        "since": TIME_BOUND_SCHEMA,
-                        "until": TIME_BOUND_SCHEMA,
-                        "source_id": {"type": "string"},
-                        "source_family": {"type": "string"},
-                        "source_alias": {"type": "string"},
-                        "person": {"type": "string", "maxLength": 256},
-                        "person_relation": {
-                            "type": "string",
-                            "enum": [
-                                "author",
-                                "contributor",
-                                "owner",
-                                "organizer",
-                                "participant",
-                                "attendee",
-                            ],
-                        },
-                    },
-                    "additionalProperties": False,
-                },
-                "depth": {
-                    "type": "string",
-                    "enum": ["quick", "normal", "deep"],
-                    "default": "normal",
-                },
-            },
-            "required": ["question"],
-            "additionalProperties": False,
-        },
-        "outputSchema": {"type": "object"},
-        "annotations": {"readOnlyHint": True},
-    },
-    {
-        "name": "recall_deep_search",
-        "description": (
-            "Deep-search full privacy-processed evidence files in one bounded "
-            "call. Recall selects and authorizes files; optional serverless "
-            "compute returns exact recall:// receipts and completeness."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "question": {"type": "string", "maxLength": 8192},
-                "filters": {
-                    "type": "object",
-                    "default": {},
-                    "properties": {
-                        "since": TIME_BOUND_SCHEMA,
-                        "until": TIME_BOUND_SCHEMA,
-                        "source_id": {"type": "string"},
-                        "source_family": {"type": "string"},
-                        "source_alias": {"type": "string"},
-                        "person": {"type": "string", "maxLength": 256},
-                        "person_relation": {
-                            "type": "string",
-                            "enum": [
-                                "author",
-                                "contributor",
-                                "owner",
-                                "organizer",
-                                "participant",
-                                "attendee",
-                            ],
-                        },
-                    },
-                    "additionalProperties": False,
-                },
-                "depth": {
-                    "type": "string",
-                    "enum": ["quick", "normal", "deep"],
-                    "default": "normal",
-                },
-            },
-            "required": ["question"],
             "additionalProperties": False,
         },
         "outputSchema": {"type": "object"},
@@ -562,14 +294,7 @@ ALL_READ_TOOLS = (
     },
 )
 CANONICAL_ONLY_READ_TOOLS = frozenset({
-    "use_recall",
-    "recall_agent_start",
-    "recall_agent_status",
-    "recall_agent_result",
-    "recall_agent_cancel",
-    "recall_deep_search",
     "recall_exec",
-    "recall_investigate",
     "recall_session_context",
 })
 CANONICAL_READ_TOOLS = tuple(
@@ -686,23 +411,12 @@ def _tools_for(principal: dict) -> tuple[dict, ...]:
             CANONICAL_SHOW_TOOL if tool["name"] == "recall_show" else tool
             for tool in READ_TOOLS + CANONICAL_READ_TOOLS + WRITE_TOOLS
             if tool["name"] in permitted
-            and (
-                tool["name"] not in {
-                    "use_recall",
-                    "recall_agent_start",
-                    "recall_agent_status",
-                    "recall_agent_result",
-                    "recall_agent_cancel",
-                }
-                or principal.get("agent_enabled") is True
-            )
         )
     if _write_enabled(principal):
         return READ_TOOLS + WRITE_TOOLS
     if _canonical_forget_enabled(principal):
         return READ_TOOLS + (WRITE_TOOLS[1],)
     return READ_TOOLS
-
 
 def _reject_extra(arguments: dict, allowed: frozenset[str]) -> None:
     unknown = sorted(set(arguments) - allowed)
@@ -715,35 +429,11 @@ def _call_tool(
     principal: dict,
     name: str,
     arguments: dict,
-    *,
-    agent=None,
-    agent_lifecycle=None,
 ) -> dict:
     authorized_source = principal.get(
         "authorized_sources",
         principal.get("source_id"),
     )
-    if name == "use_recall":
-        if agent is None:
-            raise McpProtocolError(-32602, "unknown tool")
-        return agent(arguments)
-    if name in {
-        "recall_agent_start",
-        "recall_agent_status",
-        "recall_agent_result",
-        "recall_agent_cancel",
-    }:
-        if agent_lifecycle is None:
-            raise McpProtocolError(-32602, "unknown tool")
-        operation = name.removeprefix("recall_agent_")
-        callback = agent_lifecycle.get(operation)
-        if callback is None:
-            raise McpProtocolError(-32602, "unknown tool")
-        if operation == "start":
-            return callback(arguments)
-        _reject_extra(arguments, frozenset({"run_id"}))
-        run_id = _string(arguments.get("run_id"), "run_id")
-        return callback(run_id)
     if name == "recall_search":
         _reject_extra(arguments, frozenset({"query", "filters", "limit"}))
         query = _string(arguments.get("query"), "query")
@@ -758,42 +448,6 @@ def _call_tool(
             maximum=20,
         )
         return store.search(query, filters, limit, authorized_source)
-    if name == "recall_investigate":
-        _reject_extra(arguments, frozenset({"question", "filters", "depth"}))
-        question = _string(arguments.get("question"), "question")
-        if len(question) > 8192:
-            raise McpProtocolError(-32602, "question must be at most 8192 characters")
-        filters = _object(arguments.get("filters", {}), "filters")
-        depth = _string(arguments.get("depth", "normal"), "depth")
-        if depth not in {"quick", "normal", "deep"}:
-            raise McpProtocolError(
-                -32602,
-                "depth must be quick, normal, or deep",
-            )
-        return store.investigate(
-            question,
-            filters=filters,
-            depth=depth,
-            authorized_source=authorized_source,
-        )
-    if name == "recall_deep_search":
-        _reject_extra(arguments, frozenset({"question", "filters", "depth"}))
-        question = _string(arguments.get("question"), "question")
-        if len(question) > 8192:
-            raise McpProtocolError(-32602, "question must be at most 8192 characters")
-        filters = _object(arguments.get("filters", {}), "filters")
-        depth = _string(arguments.get("depth", "normal"), "depth")
-        if depth not in {"quick", "normal", "deep"}:
-            raise McpProtocolError(
-                -32602,
-                "depth must be quick, normal, or deep",
-            )
-        return store.deep_search(
-            question,
-            filters=filters,
-            depth=depth,
-            authorized_source=authorized_source,
-        )
     if name == "recall_exec":
         _reject_extra(arguments, frozenset({"targets", "program", "timeout_seconds"}))
         targets = arguments.get("targets")
@@ -965,25 +619,6 @@ def bound_response(response: dict, request_id: Any) -> dict:
     )
 
 
-def _tasks_extension_enabled(params: dict, protocol_version: str) -> bool:
-    if protocol_version not in {
-        LATEST_LEGACY_PROTOCOL_VERSION,
-        LATEST_PROTOCOL_VERSION,
-    }:
-        return False
-    metadata = params.get("_meta")
-    if not isinstance(metadata, dict):
-        return False
-    capabilities = metadata.get("io.modelcontextprotocol/clientCapabilities")
-    if not isinstance(capabilities, dict):
-        return False
-    extensions = capabilities.get("extensions")
-    return (
-        isinstance(extensions, dict)
-        and isinstance(extensions.get("io.modelcontextprotocol/tasks"), dict)
-    )
-
-
 def _validate_modern_metadata(params: dict, protocol_version: str) -> None:
     if protocol_version != LATEST_PROTOCOL_VERSION:
         return
@@ -1005,131 +640,13 @@ def _validate_modern_metadata(params: dict, protocol_version: str) -> None:
         raise McpProtocolError(-32602, "modern MCP client metadata is invalid")
 
 
-def task_subscription(
-    message: Any,
-    *,
-    protocol_version: str,
-) -> tuple[Any, tuple[str, ...]] | None:
-    request = _object(message, "request")
-    if request.get("method") != "subscriptions/listen":
-        return None
-    if protocol_version != LATEST_PROTOCOL_VERSION:
-        raise McpProtocolError(-32601, "method not found")
-    if request.get("jsonrpc") != "2.0" or "id" not in request:
-        raise McpProtocolError(-32600, "invalid subscription request")
-    params = _object(request.get("params", {}), "params")
-    _validate_modern_metadata(params, protocol_version)
-    if not _tasks_extension_enabled(params, protocol_version):
-        raise McpProtocolError(
-            -32003,
-            "missing Tasks client capability",
-            {
-                "requiredCapabilities": {
-                    "extensions": {"io.modelcontextprotocol/tasks": {}}
-                }
-            },
-        )
-    notifications = _object(params.get("notifications"), "notifications")
-    if set(notifications) != {"taskIds"}:
-        raise McpProtocolError(-32602, "only task subscriptions are supported")
-    raw_ids = notifications["taskIds"]
-    if (
-        not isinstance(raw_ids, list)
-        or not 1 <= len(raw_ids) <= 32
-        or any(
-            not isinstance(task_id, str)
-            or re.fullmatch(r"tsk_[0-9a-f]{32}", task_id) is None
-            for task_id in raw_ids
-        )
-        or len(raw_ids) != len(set(raw_ids))
-    ):
-        raise McpProtocolError(-32602, "task subscription identifiers are invalid")
-    return request["id"], tuple(raw_ids)
-
-
-def _task_result(
-    run: dict,
-    task_id: str,
-    *,
-    creation: bool,
-    result: dict | None = None,
-    ttl_ms: int = 604_800_000,
-) -> dict:
-    status = {
-        "queued": "working",
-        "running": "working",
-        "complete": "completed",
-        "partial": "completed",
-        "no_answer": "completed",
-        "failed": "failed",
-        "cancelled": "cancelled",
-    }[run["status"]]
-    value = {
-        "resultType": "task" if creation else "complete",
-        "taskId": task_id,
-        "status": status,
-        "createdAt": run["created_at"],
-        "lastUpdatedAt": run["updated_at"],
-        "ttlMs": ttl_ms,
-        "pollIntervalMs": 1000,
-    }
-    value["statusMessage"] = {
-        "queued": "Queued",
-        "planning": "Planning the investigation",
-        "searching": "Searching candidate evidence",
-        "inspecting": "Inspecting full evidence",
-        "synthesizing": "Synthesizing the answer",
-        "verifying": "Verifying citations",
-        "completed": "Completed",
-        "failed": "Failed",
-        "cancelled": "Cancelled",
-    }.get(run.get("status_message"), "Working")
-    if status == "completed" and result is not None:
-        value["result"] = _tool_result(result)
-    elif status == "failed":
-        value["error"] = {
-            "code": -32603,
-            "message": run.get("error_code", "agent run failed"),
-        }
-    return value
-
-
-def task_notification(
-    state: dict,
-    task_id: str,
-    *,
-    subscription_id: Any,
-    result: dict | None = None,
-    ttl_ms: int = 604_800_000,
-) -> dict:
-    params = _task_result(
-        state,
-        task_id,
-        creation=False,
-        result=result,
-        ttl_ms=ttl_ms,
-    )
-    params.pop("resultType", None)
-    params["_meta"] = {
-        "io.modelcontextprotocol/subscriptionId": subscription_id,
-    }
-    return {
-        "jsonrpc": "2.0",
-        "method": "notifications/tasks",
-        "params": params,
-    }
-
-
 def dispatch(
     store,
     principal: dict,
     message: Any,
     *,
     authorize=None,
-    agent=None,
-    agent_lifecycle=None,
     protocol_version: str = LATEST_PROTOCOL_VERSION,
-    task_name: str | None = None,
 ) -> dict | None:
     request = _object(message, "request")
     request_id = request.get("id")
@@ -1166,14 +683,7 @@ def dispatch(
         result = {
             "resultType": "complete",
             "supportedVersions": [LATEST_PROTOCOL_VERSION],
-            "capabilities": {
-                "tools": {"listChanged": False},
-                **(
-                    {"extensions": {"io.modelcontextprotocol/tasks": {}}}
-                    if agent_lifecycle is not None
-                    else {}
-                ),
-            },
+            "capabilities": {"tools": {"listChanged": False}},
             "_meta": {
                 "io.modelcontextprotocol/serverInfo": {
                     "name": "recall",
@@ -1204,10 +714,6 @@ def dispatch(
                 "description": "Private, tenant- and source-scoped evidence retrieval.",
             },
         }
-        if selected == LATEST_LEGACY_PROTOCOL_VERSION and agent_lifecycle is not None:
-            result["capabilities"]["extensions"] = {
-                "io.modelcontextprotocol/tasks": {},
-            }
     elif method == "ping":
         if protocol_version == LATEST_PROTOCOL_VERSION:
             raise McpProtocolError(-32601, "method not found")
@@ -1230,78 +736,16 @@ def dispatch(
             raise McpProtocolError(-32602, "unknown tool")
         require_action(f"mcp.{name}", hide=True)
         arguments = _object(params.get("arguments", {}), "arguments")
-        if (
-            name == "use_recall"
-            and agent_lifecycle is not None
-            and _tasks_extension_enabled(params, protocol_version)
-        ):
-            started = agent_lifecycle["start"](arguments)
-            final = None
-            if started["run"]["status"] in {"complete", "partial", "no_answer"}:
-                final = agent_lifecycle["task_result"](started["task_id"])
-            result = _task_result(
-                started["run"],
-                started["task_id"],
-                creation=True,
-                result=final,
-                ttl_ms=started["ttl_ms"],
+        result = _tool_result(
+            _call_tool(
+                store,
+                principal,
+                name,
+                arguments,
             )
-        else:
-            result = _tool_result(
-                _call_tool(
-                    store,
-                    principal,
-                    name,
-                    arguments,
-                    agent=agent,
-                    agent_lifecycle=agent_lifecycle,
-                )
-            )
-            if protocol_version == LATEST_PROTOCOL_VERSION:
-                result["resultType"] = "complete"
-    elif method in {"tasks/get", "tasks/update", "tasks/cancel"}:
-        if protocol_version not in {
-            LATEST_LEGACY_PROTOCOL_VERSION,
-            LATEST_PROTOCOL_VERSION,
-        } or agent_lifecycle is None:
-            raise McpProtocolError(-32601, "method not found")
-        task_id = _string(params.get("taskId"), "taskId")
-        expected_params = (
-            {"taskId", "inputResponses", "_meta"}
-            if method == "tasks/update"
-            else {"taskId", "_meta"}
-        ) if protocol_version == LATEST_PROTOCOL_VERSION else (
-            {"taskId", "inputResponses"}
-            if method == "tasks/update"
-            else {"taskId"}
         )
-        if set(params) != expected_params or task_name != task_id:
-            raise McpProtocolError(-32602, "task routing header is invalid")
-        action = (
-            "mcp.recall_agent_cancel"
-            if method == "tasks/cancel"
-            else "mcp.recall_agent_status"
-        )
-        require_action(action, hide=True)
-        if method == "tasks/update":
-            _object(params["inputResponses"], "inputResponses")
-            agent_lifecycle["task_status"](task_id)
-            raise McpProtocolError(-32602, "task input is not supported")
-        if method == "tasks/cancel":
-            agent_lifecycle["task_cancel"](task_id)
-            result = {"resultType": "complete"}
-        else:
-            state = agent_lifecycle["task_status"](task_id)
-            final = None
-            if state["run"]["status"] in {"complete", "partial", "no_answer"}:
-                final = agent_lifecycle["task_result"](task_id)
-            result = _task_result(
-                state["run"],
-                task_id,
-                creation=False,
-                result=final,
-                ttl_ms=state["ttl_ms"],
-            )
+        if protocol_version == LATEST_PROTOCOL_VERSION:
+            result["resultType"] = "complete"
     else:
         raise McpProtocolError(-32601, "method not found")
 

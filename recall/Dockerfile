@@ -1,13 +1,3 @@
-FROM node:22.23.1-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3 AS node-runtime
-
-FROM node-runtime AS pi-agent-build
-WORKDIR /opt/recall-pi
-COPY server/pi-agent/package.json server/pi-agent/package-lock.json ./
-RUN npm ci --ignore-scripts
-COPY server/pi-agent/tsconfig.json ./
-COPY server/pi-agent/src ./src
-RUN npm run build && npm prune --omit=dev --ignore-scripts
-
 FROM python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -35,15 +25,10 @@ COPY --chown=10001:10001 collector /opt/recall/collector
 COPY --chown=10001:10001 privacy /opt/recall/privacy
 COPY --chown=10001:10001 scripts/install_gws.py /opt/recall/scripts/install_gws.py
 COPY --chown=10001:10001 skills/recall/scripts/recall.py /opt/skills/recall/scripts/recall.py
-COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
-COPY --from=pi-agent-build --chown=10001:10001 /opt/recall-pi/package.json /opt/recall-pi/package.json
-COPY --from=pi-agent-build --chown=10001:10001 /opt/recall-pi/dist /opt/recall-pi
-COPY --from=pi-agent-build --chown=10001:10001 /opt/recall-pi/node_modules /opt/recall-pi/node_modules
 
 RUN python /opt/recall/scripts/install_gws.py \
       --target x86_64-unknown-linux-gnu \
-      --prefix /opt/recall/vendor/gws/0.22.5 \
-    && chmod -R a-w /opt/recall-pi
+      --prefix /opt/recall/vendor/gws/0.22.5
 
 USER 10001
 EXPOSE 8788

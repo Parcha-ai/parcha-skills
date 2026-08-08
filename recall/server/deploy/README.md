@@ -306,14 +306,6 @@ creates and links the employee actor, and source-local route enrollment binds
 that actor as the source contributor. Apply it before inviting employees; mixed
 schema/application deployment is intentionally unsupported.
 
-`recall_deep_search` first uses canonical retrieval to select authorized
-candidates, passes only opaque evidence keys and exact allowed receipts to a
-fixed server-owned inspection program, mounts the Archil disk read-only, and
-revalidates every returned receipt. The question is encoded as data and can
-never become a shell command or object path. Interactive executions are bounded
-by file, match, output-byte, and time limits. Use
-`RECALL_DEEP_INSPECTOR=local` for the same contract without third-party compute.
-
 Enable the canonical v2 write plane only after the archive probe and database
 migrations pass:
 
@@ -357,75 +349,14 @@ credentials without gaining an implicit cross-brain view. Omit the optional
 `forget` scope for read-only agents; canonical forget also requires an owner
 grant on the exact source.
 
-The outcome-oriented answer façade is disabled by default. Enabling the direct
-Pi runner exposes `use_recall` through MCP and
-`POST /v1/agent/brains/{tenant_id}/use-recall`. The request cannot carry tenant,
-principal, role, source grants, credentials, budgets, or trace policy.
-
-Schema 38 adds durable agent runs. `POST /v1/agent/brains/{tenant}/runs` starts
-detached work; the corresponding run, result, and cancel routes remain bound to
-the authenticated tenant, principal, and current source grants. MCP exposes the
-same compatibility lifecycle as `recall_agent_start`, `recall_agent_status`,
-`recall_agent_result`, and `recall_agent_cancel`. MCP `2026-07-28` clients can
-discover `io.modelcontextprotocol/tasks`, receive a durable native task from
-`use_recall`, poll it with `tasks/get`, cancel it with `tasks/cancel`, or listen
-for full task-state updates through `subscriptions/listen`. The pre-final
-`2026-06-30` task negotiation remains available during the ecosystem rollout.
-Older or non-negotiating clients receive the same durable run immediately and
-continue with the explicit lifecycle tools; `use_recall` never holds an HTTP
-request open for the investigation.
-
-For semantic synthesis, enable the direct open-source Pi worker included in the
-image and configure one explicit OpenAI-compatible endpoint:
-
-```text
-RECALL_AGENT_RUNNER=pi
-RECALL_AGENT_MODEL_BASE_URL=https://api.cerebras.ai/v1
-RECALL_AGENT_MODEL_ALIAS=gpt-oss-120b
-RECALL_AGENT_MODEL_KEY_FILE=/etc/secrets/cerebras-api-key
-```
-
-The Render secret file contains only the Cerebras API key. It must be a
-nonsymlinked regular file owned by the service user or root, with no write or
-execute permission for its group and no permissions for other users. Recall
-reloads it immediately before each child process. The child receives only that
-key, the explicit endpoint, and a minimal process environment. The worker and
-Pi dependencies are built from the checked-in lockfile; no opaque runtime
-artifact is vendored.
-
-On a Greppy host, use the dedicated credential-owning local broker instead.
-Recall passes the literal `not-a-secret` placeholder to Pi; no model bearer
-credential enters Recall or the child:
-
-```text
-RECALL_AGENT_MODEL_BASE_URL=http://<private-greppy-llm-proxy-host>:<port>
-RECALL_AGENT_MODEL_ALIAS=gemma-4-31b
-```
-
-This mode fails closed unless the exact approved URL is loopback, link-local,
-RFC1918, carrier-grade NAT, or the private Docker host gateway. Do not expose
-the broker publicly. A deployment outside that private network supplies an
-HTTPS endpoint and a private model-key file.
-
-Recall and Archil credentials remain in the host.
-
-The child can call only authorized read-only evidence tools. Semantic search is
-a hint; only receipts returned by deep inspection, exact show, or session
-context are citable. The model must finish through `finish`, and Recall
-rejects citations that were not opened in the same turn. Raw reasoning,
-questions, answers, tool arguments, source bodies, and credentials are excluded
-from durable traces.
-
-Lifecycle rows contain authority identifiers, a request hash, opaque handles,
-state, a content-free progress phase, bounded redacted trace events, and terminal
-results. They never contain the original question, credentials, or source bodies.
-Expired worker leases become
-`worker_lost_retryable` terminal failures and are never silently rerun. Active
-runs renew their leases and poll durable cancellation while the Pi process is
-working. Search depth controls bounded tool effort, not a whole-run wall-clock
-deadline. Tune only within the validated bounds using `RECALL_AGENT_WORKERS`,
-`RECALL_AGENT_MAX_ACTIVE_PER_PRINCIPAL`, `RECALL_AGENT_LEASE_SECONDS`, and
-`RECALL_AGENT_RETENTION_SECONDS`.
+The hosted MCP is model-free. The caller's own agent interprets the question,
+uses `recall_search` for high-recall pointers, optionally uses `recall_show`
+for exact context, and runs bounded read-only shell or Python over selected full
+documents with `recall_exec`. Search results are hints; only host-verified
+`opened_receipts` from show or exec authorize citations. Recall owns tenant and
+source grants, exact target resolution, read-only mounting, network isolation,
+resource bounds, and receipt verification. No model key or nested agent runtime
+belongs in the Recall service.
 
 ### Human OAuth and company-brain invitations
 
