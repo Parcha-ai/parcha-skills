@@ -723,6 +723,8 @@ class RemoteMcpContractTest(unittest.TestCase):
         self.assertIn("recall_search", instructions)
         self.assertIn("recall_exec", instructions)
         self.assertIn("opened_receipts", instructions)
+        self.assertIn("Never infer", instructions)
+        self.assertIn("each named part", instructions)
 
     def test_show_uses_timestamp_and_rejects_conflicting_tail_before_store(self) -> None:
         target = "recall://synthetic:codex/item-1?rev=1"

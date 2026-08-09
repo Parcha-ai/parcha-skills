@@ -416,8 +416,13 @@ ALL_READ_TOOLS = (
 RETRIEVAL_INSTRUCTIONS = (
     "Use recall_search to find likely full documents, then inspect exact records "
     "with recall_show or recall_exec before answering. Search hits are hints, not "
-    "proof. For one named topic, make no more than three focused searches and stop "
-    "once the evidence supports the answer. Use recall_scope with recall_exec_map "
+    "proof. Treat each named part of the question as an evidence gap and inspect "
+    "enough distinct candidates to support each part; the best evidence may rank "
+    "below the first result. Never infer that an unfamiliar project or person name "
+    "is an alias: material claims require opened evidence using that name or an "
+    "explicit alias, otherwise report insufficient evidence. For one named topic, "
+    "make no more than three focused searches and stop once the evidence supports "
+    "the answer. Use recall_scope with recall_exec_map "
     "only for explicitly broad person, source, or time coverage. Cite only receipts "
     "returned in opened_receipts."
 )
