@@ -658,35 +658,8 @@ class BoundCanonicalRetrieval:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 20:
             raise ValueError("invalid canonical search limit")
         effective_filters = dict(filters or {})
-        if any(
-            name in effective_filters
-            for name in ("person", "person_relation", "since", "until")
-        ):
-            scope = self.scope_documents(
-                filters=effective_filters,
-                limit=limit,
-                offset=0,
-            )
-            documents = scope["documents"]
-            return {
-                "results": [
-                    {
-                        **document,
-                        "rank": round(1.0 / (60 + rank), 8),
-                        "reasons": ["exact-metadata-scope"],
-                        "matching_ranges": [],
-                    }
-                    for rank, document in enumerate(documents, start=1)
-                ],
-                "diagnostics": {
-                    **scope["diagnostics"],
-                    "engine": "canonical-filter-scope-v1",
-                    "scope_total_documents": scope["total_documents"],
-                    "scope_complete": scope["complete"],
-                    "semantic_status": "not-needed",
-                    "lexical_mode": "not-needed",
-                },
-            }
+        if "person" in effective_filters or "person_relation" in effective_filters:
+            return self.passage_hints(query, effective_filters, limit)
         (
             source_id,
             source_family,

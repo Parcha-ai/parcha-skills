@@ -8,6 +8,7 @@ import time
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
+from unittest import mock
 
 
 SERVER = Path(__file__).resolve().parents[2] / "server"
@@ -396,10 +397,8 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
         self.assertIn("canonical_evidence_document_actors", scope_sql)
         self.assertIn("document.last_occurred_at>=%s", scope_sql)
 
-    def test_filtered_search_uses_exact_scope_without_embedding(self) -> None:
-        store = ScopeStore()
-        runtime = RecordingSemanticRuntime()
-        store.semantic_runtime = runtime
+    def test_filtered_search_preserves_query_semantics(self) -> None:
+        store = ActorRecordingStore()
         retrieval = BoundCanonicalRetrieval(
             store,
             tenant_id="tenant:test",
@@ -407,26 +406,28 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
             authorized_sources=("codex.jsonl:test",),
         )
 
-        result = retrieval.search(
-            "What did Alice work on?",
-            filters={
-                "person": "Alice",
-                "since": "2026-08-08T00:00:00Z",
-                "until": "2026-08-09T00:00:00Z",
-            },
-        )
+        response = {
+            "results": [],
+            "diagnostics": {"engine": "lossless-passages-v1"},
+        }
+        with mock.patch.object(
+            PassageHintRetrieval,
+            "search",
+            return_value=response,
+        ) as search:
+            result = retrieval.search(
+                "What did Alice work on?",
+                filters={
+                    "person": "Alice",
+                    "since": "2026-08-08T00:00:00Z",
+                    "until": "2026-08-09T00:00:00Z",
+                },
+            )
 
-        self.assertEqual(runtime.calls, [])
-        self.assertEqual(
-            result["diagnostics"]["engine"],
-            "canonical-filter-scope-v1",
-        )
-        self.assertEqual(
-            result["results"][0]["reasons"],
-            ["exact-metadata-scope"],
-        )
-        self.assertEqual(result["results"][0]["matching_ranges"], [])
-        self.assertNotIn("text", result["results"][0])
+        self.assertEqual(result["diagnostics"]["engine"], "lossless-passages-v1")
+        search.assert_called_once()
+        self.assertEqual(search.call_args.kwargs["since"], "2026-08-08T00:00:00Z")
+        self.assertEqual(search.call_args.kwargs["until"], "2026-08-09T00:00:00Z")
 
     def test_parallel_exec_fans_out_without_hidden_reduction(self) -> None:
         retrieval = ParallelExecRetrieval()
