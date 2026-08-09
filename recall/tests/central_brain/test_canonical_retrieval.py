@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import inspect
 import sys
+import threading
 import time
 import unittest
 from contextlib import contextmanager
@@ -169,6 +170,100 @@ class RecordingExecInspector:
         }
 
 
+class ScopeStore(RecordingStore):
+    @contextmanager
+    def connect(self):
+        yield self
+
+    def _execute_bounded(self, _connection, sql, values, deadline_at):
+        self.deadlines = getattr(self, "deadlines", [])
+        self.deadlines.append(deadline_at)
+        self.sql.append(" ".join(sql.split()))
+        self.values.append(tuple(values))
+        if "FROM brain_actors actor" in sql:
+            return Rows([{
+                "actor_id": "actor_0123456789abcdef0123456789abcdef",
+            }])
+        return Rows([{
+            "source_id": "codex.jsonl:test",
+            "logical_document_id": "ldoc_" + "1" * 32,
+            "revision": 1,
+            "first_occurred_at": "2026-08-08T00:00:00Z",
+            "last_occurred_at": "2026-08-08T01:00:00Z",
+            "record_count": 10,
+            "part_count": 1,
+            "total_documents": 1,
+        }])
+
+
+class ParallelExecStore:
+    semantic_runtime = None
+
+    def __init__(
+        self,
+        *,
+        omit: str | None = None,
+        sizes: dict[str, int] | None = None,
+    ) -> None:
+        self.omit = omit
+        self.sizes = sizes or {}
+
+    @contextmanager
+    def connect(self):
+        yield self
+
+    def execute(self, _sql, values):
+        return Rows([
+            {
+                "logical_document_id": document_id,
+                "size_bytes": self.sizes.get(document_id, 1),
+            }
+            for document_id in values[2]
+            if document_id != self.omit
+        ])
+
+
+class ParallelExecRetrieval(BoundCanonicalRetrieval):
+    def __init__(
+        self,
+        *,
+        stdout: str = "",
+        stderr: str = "",
+        omit: str | None = None,
+        sizes: dict[str, int] | None = None,
+    ) -> None:
+        super().__init__(
+            ParallelExecStore(omit=omit, sizes=sizes),
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=("codex.jsonl:test",),
+        )
+        self.active = 0
+        self.maximum = 0
+        self.lock = threading.Lock()
+        self.stdout = stdout
+        self.stderr = stderr
+
+    def execute_agent_program(self, _program, *, logical_document_ids, **_kwargs):
+        with self.lock:
+            self.active += 1
+            self.maximum = max(self.maximum, self.active)
+        time.sleep(0.1)
+        with self.lock:
+            self.active -= 1
+        return {
+            "provider": "synthetic-archil",
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "exit_code": 0,
+            "complete": True,
+            "stopped_reason": "completed",
+            "opened_receipts": [],
+            "documents_available": len(logical_document_ids),
+            "objects_available": len(logical_document_ids),
+        }
+
+
 class CanonicalRetrievalDeadlineTest(unittest.TestCase):
     def test_uuid_routes_exactly_even_when_the_question_has_other_terms(self) -> None:
         session_id = "8668a658-a6cf-4358-9d7e-c29e5782c1dd"
@@ -230,7 +325,7 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
             authorized_sources=("codex:linux:test",),
         )
 
-        result = retrieval.search(
+        result = retrieval.passage_hints(
             "What did Alice write?",
             filters={"person": "Alice", "person_relation": "author"},
         )
@@ -258,6 +353,186 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
             repr(store.values),
         )
 
+    def test_scope_is_content_free_complete_and_actor_time_bounded(self) -> None:
+        store = ScopeStore()
+        retrieval = BoundCanonicalRetrieval(
+            store,
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=("codex.jsonl:test",),
+        )
+
+        result = retrieval.scope_documents(
+            filters={
+                "person": "Alice",
+                "person_relation": "author",
+                "since": "2026-08-08T00:00:00Z",
+                "until": "2026-08-09T00:00:00Z",
+            },
+            limit=40,
+            offset=0,
+        )
+
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["total_documents"], 1)
+        self.assertEqual(
+            set(result["documents"][0]),
+            {
+                "source_id",
+                "logical_document_id",
+                "revision",
+                "first_occurred_at",
+                "last_occurred_at",
+                "record_count",
+                "part_count",
+            },
+        )
+        self.assertNotIn("text", repr(result))
+        self.assertEqual(len(set(store.deadlines)), 1)
+        scope_sql = next(
+            sql for sql in store.sql
+            if "FROM canonical_evidence_documents document" in sql
+        )
+        self.assertIn("canonical_evidence_document_actors", scope_sql)
+        self.assertIn("document.last_occurred_at>=%s", scope_sql)
+
+    def test_filtered_search_uses_exact_scope_without_embedding(self) -> None:
+        store = ScopeStore()
+        runtime = RecordingSemanticRuntime()
+        store.semantic_runtime = runtime
+        retrieval = BoundCanonicalRetrieval(
+            store,
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=("codex.jsonl:test",),
+        )
+
+        result = retrieval.search(
+            "What did Alice work on?",
+            filters={
+                "person": "Alice",
+                "since": "2026-08-08T00:00:00Z",
+                "until": "2026-08-09T00:00:00Z",
+            },
+        )
+
+        self.assertEqual(runtime.calls, [])
+        self.assertEqual(
+            result["diagnostics"]["engine"],
+            "canonical-filter-scope-v1",
+        )
+        self.assertEqual(
+            result["results"][0]["reasons"],
+            ["exact-metadata-scope"],
+        )
+        self.assertEqual(result["results"][0]["matching_ranges"], [])
+        self.assertNotIn("text", result["results"][0])
+
+    def test_parallel_exec_fans_out_without_hidden_reduction(self) -> None:
+        retrieval = ParallelExecRetrieval()
+        document_ids = tuple(f"ldoc_{index:032x}" for index in range(4))
+        started = time.monotonic()
+
+        result = retrieval.execute_agent_program_parallel(
+            "rg -n --fixed-strings decision /docs",
+            logical_document_ids=document_ids,
+            document_aliases={
+                document_id: f"d{index}"
+                for index, document_id in enumerate(document_ids, start=1)
+            },
+            timeout_seconds=10,
+            max_parallel=4,
+            shard_size=1,
+        )
+        elapsed = time.monotonic() - started
+
+        self.assertTrue(result["complete"])
+        self.assertEqual(len(result["shards"]), 4)
+        self.assertEqual(retrieval.maximum, 4)
+        self.assertLess(elapsed, 0.25)
+        self.assertNotIn("answer", result)
+
+    def test_parallel_exec_bounds_shards_and_aggregate_output(self) -> None:
+        retrieval = ParallelExecRetrieval(
+            stdout="x" * 25_000,
+            stderr="y" * 3_000,
+        )
+        document_ids = tuple(f"ldoc_{index:032x}" for index in range(80))
+
+        result = retrieval.execute_agent_program_parallel(
+            "printf lots",
+            logical_document_ids=document_ids,
+            document_aliases={
+                document_id: f"d{index}"
+                for index, document_id in enumerate(document_ids, start=1)
+            },
+            timeout_seconds=10,
+            max_parallel=8,
+            shard_size=1,
+        )
+
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["stopped_reason"], "partial_failure")
+        self.assertEqual(len(result["shards"]), 8)
+        self.assertEqual(result["timing"]["effective_shard_size"], 10)
+        self.assertTrue(all(
+            shard["stopped_reason"] == "output_limit"
+            and len(shard["stdout"].encode()) <= 20_000
+            and len(shard["stderr"].encode()) <= 2_000
+            and shard["opened_receipts"] == []
+            for shard in result["shards"]
+        ))
+
+    def test_parallel_exec_fails_closed_before_any_unauthorized_shard(self) -> None:
+        denied = "ldoc_" + "2" * 32
+        retrieval = ParallelExecRetrieval(omit=denied)
+        document_ids = ("ldoc_" + "1" * 32, denied)
+
+        with self.assertRaisesRegex(
+            DeepInspectionError,
+            "deep_inspector_target_invalid",
+        ):
+            retrieval.execute_agent_program_parallel(
+                "rg decision /docs",
+                logical_document_ids=document_ids,
+                document_aliases={
+                    document_ids[0]: "d1",
+                    document_ids[1]: "d2",
+                },
+                timeout_seconds=10,
+                max_parallel=2,
+                shard_size=1,
+            )
+
+        self.assertEqual(retrieval.maximum, 0)
+
+    def test_parallel_exec_byte_balances_uneven_documents(self) -> None:
+        document_ids = tuple(f"ldoc_{index:032x}" for index in range(4))
+        retrieval = ParallelExecRetrieval(sizes={
+            document_ids[0]: 100,
+            document_ids[1]: 90,
+            document_ids[2]: 10,
+            document_ids[3]: 10,
+        })
+
+        result = retrieval.execute_agent_program_parallel(
+            "rg decision /docs",
+            logical_document_ids=document_ids,
+            document_aliases={
+                document_id: f"d{index}"
+                for index, document_id in enumerate(document_ids, start=1)
+            },
+            timeout_seconds=10,
+            max_parallel=2,
+            shard_size=2,
+        )
+
+        self.assertEqual(
+            sorted(shard["input_bytes"] for shard in result["shards"]),
+            [100, 110],
+        )
+        self.assertEqual(result["timing"]["input_bytes"], 210)
+
     def test_lexical_deadline_degrades_to_optional_semantic_path(self) -> None:
         store = DeadlineStore()
         started = time.monotonic()
@@ -278,7 +553,7 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
         self.assertGreaterEqual(store.deadline_at, started)
         self.assertLessEqual(store.deadline_at, started + 0.1)
 
-    def test_semantic_database_query_gets_an_independent_hard_deadline(self) -> None:
+    def test_semantic_and_lexical_queries_share_one_hard_deadline(self) -> None:
         store = DeadlineStore()
         store.semantic_runtime = SemanticRuntime()
         retrieval = BoundCanonicalRetrieval(
@@ -297,7 +572,13 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
             "deadline-exceeded",
         )
         self.assertEqual(len(store.deadlines), 2)
-        self.assertGreaterEqual(store.deadlines[1], store.deadlines[0])
+        self.assertEqual(len(set(store.deadlines)), 1)
+        self.assertIn("elapsed_ms", result["diagnostics"])
+        self.assertEqual(result["diagnostics"]["deadline_ms"], 25)
+        self.assertEqual(
+            {leg["leg"] for leg in result["diagnostics"]["legs"]},
+            {"lexical", "semantic"},
+        )
 
     def test_semantic_search_adds_one_domain_noun_probe(self) -> None:
         store = RecordingStore()

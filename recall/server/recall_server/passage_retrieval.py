@@ -227,7 +227,11 @@ class PassageHintRetrieval:
         until: str | None,
         limit: int,
         include_arms: bool = False,
+        deadline_at: float | None = None,
     ) -> dict[str, Any]:
+        started_at = time.monotonic()
+        if deadline_at is None:
+            deadline_at = started_at + self.store.search_deadline_ms / 1000
         candidate_limit = min(400, max(80, limit * 20))
         actor_ids = list(self.actor_ids) if self.actor_ids is not None else None
         actor_relations = (
@@ -309,8 +313,7 @@ class PassageHintRetrieval:
                         until,
                         candidate_limit,
                     ),
-                    time.monotonic()
-                    + self.store.search_deadline_ms / 1000,
+                    deadline_at,
                 ).fetchall()
                 lexical_status = "ok"
             except SearchDeadlineExceeded:
@@ -390,8 +393,7 @@ class PassageHintRetrieval:
                         until,
                         candidate_limit,
                     ),
-                    time.monotonic()
-                    + self.store.search_deadline_ms / 1000,
+                    deadline_at,
                 ).fetchall()
                 sparse_status = "ok"
             except SearchDeadlineExceeded:
@@ -568,10 +570,7 @@ class PassageHintRetrieval:
                             until,
                             candidate_limit,
                         ),
-                        (
-                            time.monotonic()
-                            + self.store.search_deadline_ms / 1000
-                        ),
+                        deadline_at,
                     ).fetchall()
             except (
                 json.JSONDecodeError,
@@ -602,6 +601,16 @@ class PassageHintRetrieval:
                 "dense_status": dense_status,
                 "passage_lexical_status": lexical_status,
                 "sparse_status": sparse_status,
+                "elapsed_ms": round(
+                    (time.monotonic() - started_at) * 1000,
+                    3,
+                ),
+                "deadline_ms": self.store.search_deadline_ms,
+                "deadline_exceeded": "deadline-exceeded" in {
+                    dense_status,
+                    lexical_status,
+                    sparse_status,
+                },
             },
         }
         if include_arms:

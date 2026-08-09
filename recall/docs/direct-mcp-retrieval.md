@@ -9,17 +9,44 @@ The hosted Recall service owns authorization and access to private data.
 
 - `recall_search` returns authorized high-recall pointers, exact receipts, and
   logical document IDs. Embeddings help the caller find where an answer could be;
-  a hit is not proof.
+  a hit is not proof. Lexical and semantic search share one wall-clock budget and
+  run concurrently; a successful leg is preserved when the other leg times out.
+- `recall_scope` enumerates exact, content-free document boundaries for person,
+  source, and time constraints. It does not spend the search budget embedding a
+  question whose universe is already known. Page until `complete` is true.
 - `recall_show` and `recall_session_context` open exact receipt-backed context.
 - `recall_exec` mounts only explicitly selected full documents into a bounded,
   read-only, networkless sandbox. The caller can use `recall-scan`, shell, Python,
   `jq`, and ordinary text tools to inspect them.
+- `recall_exec_map` applies one caller-authored program concurrently to bounded
+  shards of as many as 80 authorized full documents. Each shard is independent;
+  the MCP client agent reads the outputs, changes its search program if needed,
+  and performs the semantic reduction itself.
 - `opened_receipts` is the citation boundary. Recall reauthorizes every requested
   document and verifies every receipt returned by execution.
 
 The caller can search narrowly, broaden, decompose a time range, sample, or inspect
 whole documents according to the question. Recall does not impose a deterministic
 retrieval plan and does not need a model-provider credential.
+
+## Broad-question workflow
+
+For a question such as “What did Alice work on yesterday?”, the client should:
+
+1. Call `recall_scope` with the exact person and UTC time bounds.
+2. Page until `complete` is true. A `null` total means more pages remain or the
+   deadline was reached; it never means the partial page is complete.
+3. Write a simple shell, Python, `jq`, or `recall-scan` program that extracts the
+   evidence relevant to the natural-language question.
+4. Call `recall_exec_map` on the scoped document IDs. Use small shards for large
+   documents or heterogeneous sessions, and more parallel workers when breadth is
+   the bottleneck.
+5. Inspect the shard outputs, run a second targeted program when evidence is thin,
+   and synthesize only from verified `opened_receipts`.
+
+This is agentic map/reduce without a nested model: exact metadata supplies recall,
+embeddings prioritize ambiguous concepts, Archil supplies parallel full-document
+inspection, and the already-present MCP client agent owns judgment.
 
 ## Trust boundary
 

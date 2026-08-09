@@ -78,6 +78,36 @@ class FakeStore:
             "objects_available": len(arguments["logical_document_ids"]),
         }
 
+    def scope_documents(self, *, filters, limit, offset):
+        self.calls.append(("scope", filters, limit, offset))
+        return {
+            "documents": [{
+                "source_id": "source:synthetic:company",
+                "logical_document_id": (
+                    "ldoc_0123456789abcdef0123456789abcdef"
+                ),
+                "revision": 1,
+                "first_occurred_at": "2026-08-08T00:00:00Z",
+                "last_occurred_at": "2026-08-08T01:00:00Z",
+                "record_count": 2,
+                "part_count": 1,
+            }],
+            "total_documents": 1,
+            "offset": offset,
+            "complete": True,
+            "diagnostics": {"engine": "canonical-scope-v1"},
+        }
+
+    def execute_agent_program_parallel(self, program, **arguments):
+        self.calls.append(("exec_map", program, arguments))
+        return {
+            "provider": "synthetic-archil",
+            "complete": True,
+            "opened_receipts": [],
+            "shards": [{"shard": 0, "complete": True, "stdout": ""}],
+            "timing": {"elapsed_ms": 100.0},
+        }
+
     def show(self, target, *, around, tail, prompts, authorized_source):
         self.calls.append(("show", target, around, tail, prompts, authorized_source))
         return {
@@ -403,7 +433,9 @@ class RemoteMcpContractTest(unittest.TestCase):
                 }
                 self.assertEqual(names, {
                     "recall_search",
+                    "recall_scope",
                     "recall_exec",
+                    "recall_exec_map",
                     "recall_session_context",
                     "recall_show",
                     "recall_related",
@@ -627,6 +659,14 @@ class RemoteMcpContractTest(unittest.TestCase):
             20,
         )
         self.assertEqual(
+            canonical_tools["recall_scope"]["properties"]["limit"]["maximum"],
+            80,
+        )
+        self.assertEqual(
+            canonical_tools["recall_exec_map"]["properties"]["targets"]["maxItems"],
+            80,
+        )
+        self.assertEqual(
             canonical_tools["recall_exec"]["properties"]["timeout_seconds"][
                 "maximum"
             ],
@@ -797,6 +837,75 @@ class RemoteMcpContractTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(raw)["error"]["code"], -32602)
         self.assertNotIn("exec", {call[0] for call in store.calls})
+
+    def test_scope_and_parallel_exec_are_bounded_and_principal_scoped(self) -> None:
+        document_id = "ldoc_0123456789abcdef0123456789abcdef"
+        store = PolicyStore()
+        with McpHttpServer(store) as server:
+            status, _, raw = server.request(
+                "POST",
+                request(
+                    "tools/call",
+                    params={
+                        "name": "recall_scope",
+                        "arguments": {
+                            "filters": {
+                                "person": "Synthetic Person",
+                                "person_relation": "contributor",
+                                "since": "2026-08-08T00:00:00Z",
+                                "until": "2026-08-09T00:00:00Z",
+                            },
+                            "limit": 40,
+                            "offset": 0,
+                        },
+                    },
+                ),
+                token="synthetic-human-read",
+                protocol="2025-11-25",
+            )
+        self.assertEqual(status, 200)
+        self.assertIn("result", json.loads(raw))
+        self.assertIn(
+            (
+                "scope",
+                {
+                    "person": "Synthetic Person",
+                    "person_relation": "contributor",
+                    "since": "2026-08-08T00:00:00Z",
+                    "until": "2026-08-09T00:00:00Z",
+                },
+                40,
+                0,
+            ),
+            store.calls,
+        )
+
+        store.calls.clear()
+        with McpHttpServer(store) as server:
+            status, _, raw = server.request(
+                "POST",
+                request(
+                    "tools/call",
+                    params={
+                        "name": "recall_exec_map",
+                        "arguments": {
+                            "targets": [{
+                                "logical_document_id": document_id,
+                                "alias": "d1",
+                            }],
+                            "program": "rg -n --fixed-strings decision /docs",
+                            "max_parallel": 4,
+                            "shard_size": 20,
+                            "timeout_seconds": 17,
+                        },
+                    },
+                ),
+                token="synthetic-human-read",
+                protocol="2025-11-25",
+            )
+        self.assertEqual(status, 200)
+        self.assertIn("result", json.loads(raw))
+        self.assertIn("exec_map", {call[0] for call in store.calls})
 
     def test_exec_provider_failure_is_content_free(self) -> None:
         document_id = "ldoc_0123456789abcdef0123456789abcdef"
