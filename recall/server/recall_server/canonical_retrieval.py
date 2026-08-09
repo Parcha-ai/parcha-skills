@@ -653,13 +653,22 @@ class BoundCanonicalRetrieval:
         limit: int = 10,
         _authorized_source: Any = None,
     ) -> dict[str, Any]:
+        """Search the full-document passage index used by MCP investigation."""
+
+        return self.passage_hints(query, filters, limit)
+
+    def _legacy_chunk_search_for_eval(
+        self,
+        query: str,
+        filters: dict[str, Any] | None = None,
+        limit: int = 10,
+        _authorized_source: Any = None,
+    ) -> dict[str, Any]:
         if not isinstance(query, str) or not query.strip() or len(query) > 8192:
             raise ValueError("invalid canonical search query")
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 20:
             raise ValueError("invalid canonical search limit")
         effective_filters = dict(filters or {})
-        if "person" in effective_filters or "person_relation" in effective_filters:
-            return self.passage_hints(query, effective_filters, limit)
         (
             source_id,
             source_family,

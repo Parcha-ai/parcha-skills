@@ -429,6 +429,28 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
         self.assertEqual(search.call_args.kwargs["since"], "2026-08-08T00:00:00Z")
         self.assertEqual(search.call_args.kwargs["until"], "2026-08-09T00:00:00Z")
 
+    def test_unfiltered_search_uses_full_document_passages(self) -> None:
+        store = ActorRecordingStore()
+        retrieval = BoundCanonicalRetrieval(
+            store,
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=("codex.jsonl:test",),
+        )
+        response = {
+            "results": [],
+            "diagnostics": {"engine": "lossless-passages-v1"},
+        }
+        with mock.patch.object(
+            PassageHintRetrieval,
+            "search",
+            return_value=response,
+        ) as search:
+            result = retrieval.search("Why did we keep the compiled driver?")
+
+        self.assertEqual(result, response)
+        search.assert_called_once()
+
     def test_parallel_exec_fans_out_without_hidden_reduction(self) -> None:
         retrieval = ParallelExecRetrieval()
         document_ids = tuple(f"ldoc_{index:032x}" for index in range(4))
@@ -544,7 +566,9 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
             authorized_sources=("codex.jsonl:test",),
         )
 
-        result = retrieval.search("synthetic canonical deadline query")
+        result = retrieval._legacy_chunk_search_for_eval(
+            "synthetic canonical deadline query"
+        )
 
         self.assertEqual(result["results"], [])
         self.assertEqual(result["diagnostics"]["lexical_mode"], "deadline-exceeded")
@@ -564,7 +588,9 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
             authorized_sources=("codex.jsonl:test",),
         )
 
-        result = retrieval.search("synthetic canonical deadline query")
+        result = retrieval._legacy_chunk_search_for_eval(
+            "synthetic canonical deadline query"
+        )
 
         self.assertEqual(result["results"], [])
         self.assertEqual(result["diagnostics"]["lexical_mode"], "deadline-exceeded")
@@ -595,7 +621,7 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
             "ATI harness decisions implementation verification evidence"
         )
 
-        result = retrieval.search(query)
+        result = retrieval._legacy_chunk_search_for_eval(query)
 
         self.assertEqual(runtime.calls, [query, "harness"])
         self.assertEqual(result["diagnostics"]["semantic_probes"], 2)
@@ -625,7 +651,7 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
             authorized_sources=("codex.jsonl:test",),
         )
 
-        retrieval.search("ATI harness default runtime")
+        retrieval._legacy_chunk_search_for_eval("ATI harness default runtime")
 
         self.assertEqual(len(store.sql), 1)
         for sql in store.sql:
@@ -645,7 +671,9 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
             authorized_sources=("codex.jsonl:test",),
         )
 
-        result = retrieval.search("ATI harness default runtime")
+        result = retrieval._legacy_chunk_search_for_eval(
+            "ATI harness default runtime"
+        )
 
         self.assertEqual(len(store.sql), 1)
         self.assertEqual(result["diagnostics"]["lexical_mode"], "strict-empty")
@@ -660,7 +688,9 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
             authorized_sources=("codex.jsonl:test",),
         )
 
-        retrieval.search("8668a658-a6cf-4358-9d7e-c29e5782c1dd")
+        retrieval._legacy_chunk_search_for_eval(
+            "8668a658-a6cf-4358-9d7e-c29e5782c1dd"
+        )
 
         self.assertIn(
             "ts_rank_cd( chunk.search_vector, "

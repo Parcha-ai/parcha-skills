@@ -412,6 +412,15 @@ ALL_READ_TOOLS = (
         "annotations": {"readOnlyHint": True},
     },
 )
+
+RETRIEVAL_INSTRUCTIONS = (
+    "Use recall_search to find likely full documents, then inspect exact records "
+    "with recall_show or recall_exec before answering. Search hits are hints, not "
+    "proof. For one named topic, make no more than three focused searches and stop "
+    "once the evidence supports the answer. Use recall_scope with recall_exec_map "
+    "only for explicitly broad person, source, or time coverage. Cite only receipts "
+    "returned in opened_receipts."
+)
 CANONICAL_ONLY_READ_TOOLS = frozenset({
     "recall_exec",
     "recall_exec_map",
@@ -896,7 +905,7 @@ def dispatch(
                     "version": "1",
                 },
             },
-            "instructions": "Private, tenant- and source-scoped evidence retrieval.",
+            "instructions": RETRIEVAL_INSTRUCTIONS,
             "ttlMs": 300_000,
             "cacheScope": "private",
         }
@@ -919,6 +928,7 @@ def dispatch(
                 "version": "1",
                 "description": "Private, tenant- and source-scoped evidence retrieval.",
             },
+            "instructions": RETRIEVAL_INSTRUCTIONS,
         }
     elif method == "ping":
         if protocol_version == LATEST_PROTOCOL_VERSION:

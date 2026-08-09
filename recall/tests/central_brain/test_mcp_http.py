@@ -709,6 +709,21 @@ class RemoteMcpContractTest(unittest.TestCase):
         self.assertEqual(capture["tags"]["items"]["maxLength"], 64)
         self.assertIn("pattern", capture["provenance"]["properties"]["uri"])
 
+    def test_initialize_teaches_evidence_first_retrieval(self) -> None:
+        with McpHttpServer(self.store) as server:
+            _, _, raw = server.request(
+                "POST",
+                request(
+                    "initialize",
+                    params={"protocolVersion": "2025-06-18"},
+                ),
+                protocol="2025-06-18",
+            )
+        instructions = json.loads(raw)["result"]["instructions"]
+        self.assertIn("recall_search", instructions)
+        self.assertIn("recall_exec", instructions)
+        self.assertIn("opened_receipts", instructions)
+
     def test_show_uses_timestamp_and_rejects_conflicting_tail_before_store(self) -> None:
         target = "recall://synthetic:codex/item-1?rev=1"
         timestamp = "2026-07-18T02:00:00Z"
