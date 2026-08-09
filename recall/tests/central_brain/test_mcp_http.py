@@ -680,6 +680,14 @@ class RemoteMcpContractTest(unittest.TestCase):
             "recall-scan --broad --fixed",
             canonical_catalog["recall_exec"]["description"],
         )
+        self.assertIn(
+            "recall_exec_map",
+            canonical_catalog["recall_exec"]["description"],
+        )
+        self.assertIn(
+            "shard_size=1",
+            canonical_catalog["recall_exec_map"]["description"],
+        )
         self.assertEqual(
             tools["recall_search"]["properties"]["filters"]["properties"]["person"],
             {"type": "string", "maxLength": 256},

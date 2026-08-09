@@ -244,6 +244,8 @@ ALL_READ_TOOLS = (
             "Run bounded read-only shell over exact full Recall documents selected "
             "by recall_search. Pass only logical_document_id values returned by "
             "search; ordered aliases are mounted at /docs/d1 through /docs/d20. "
+            "Output is shared across targets, so use recall_exec_map with "
+            "shard_size=1 when the same inspection must cover several candidates. "
             "For portable verified search, run `recall-scan --broad --fixed "
             "--pattern TERM --limit N`; ordinary shell and Python are also available. "
             "The sandbox has no network and cannot mutate evidence. Search hits are "
@@ -297,6 +299,8 @@ ALL_READ_TOOLS = (
         "description": (
             "Fan one agent-authored bounded read-only shell program across up "
             "to 80 exact full documents from recall_scope or recall_search. "
+            "Use shard_size=1 to inspect several independent search candidates "
+            "without a large earlier document consuming another's output budget. "
             "Recall splits the admitted targets into bounded shards and runs Archil "
             "sandboxes concurrently; aliases remain stable at /docs/d1 through "
             "/docs/d80. The sandbox is read-only and networkless. Each shard "
@@ -422,8 +426,9 @@ RETRIEVAL_INSTRUCTIONS = (
     "is an alias: material claims require opened evidence using that name or an "
     "explicit alias, otherwise report insufficient evidence. For one named topic, "
     "make no more than three focused searches and stop once the evidence supports "
-    "the answer. Use recall_scope with recall_exec_map "
-    "only for explicitly broad person, source, or time coverage. Cite only receipts "
+    "the answer. Use recall_exec_map with shard_size=1 when the same focused check "
+    "must cover several independent candidates; pair recall_scope with it for broad "
+    "person, source, or time coverage. Cite only receipts "
     "returned in opened_receipts."
 )
 CANONICAL_ONLY_READ_TOOLS = frozenset({
