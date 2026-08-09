@@ -254,8 +254,8 @@ def slack_thread_url(args: argparse.Namespace) -> str:
 
 
 def run_herdr_command(args: argparse.Namespace) -> int:
-    pane_id = str(args.pane or "")
-    cwd = str(Path(args.cwd or Path.cwd()).resolve())
+    pane_id = str(getattr(args, "pane", "") or "")
+    cwd = str(Path(getattr(args, "cwd", None) or Path.cwd()).resolve())
     if args.herdr_command == "status":
         identity = _herdr_identity_for_pane(
             pane_id,

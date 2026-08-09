@@ -2438,6 +2438,35 @@ class NotifierTest(unittest.TestCase):
         ), self.assertRaises(SystemExit):
             self.notifier.slack_thread_url(types.SimpleNamespace(slack_url=None))
 
+    def test_herdr_detach_does_not_require_pane_arguments(self):
+        args = types.SimpleNamespace(
+            herdr_command="detach",
+            bridge_id="brg_0123456789abcdef0123456789abcdef",
+            expected_generation=2,
+            team="T12345678",
+            json=True,
+        )
+        result = {
+            "ok": True,
+            "bridge_id": args.bridge_id,
+            "status": "closed",
+        }
+        with mock.patch.object(
+            self.notifier,
+            "broker_call",
+            return_value=result,
+        ) as broker, mock.patch("builtins.print"):
+            self.assertEqual(self.notifier.run_herdr_command(args), 0)
+
+        broker.assert_called_once_with(
+            {
+                "op": "close",
+                "bridge_id": args.bridge_id,
+                "expected_generation": 2,
+                "team_id": "T12345678",
+            }
+        )
+
     def test_herdr_session_mismatch_fails_closed(self):
         args = types.SimpleNamespace(run_id=None, hermes_session_id=None)
         identity = {

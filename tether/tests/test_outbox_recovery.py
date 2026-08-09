@@ -561,8 +561,7 @@ class OutboxRecoveryTest(unittest.TestCase):
         ), mock.patch.object(
             self.runtime,
             "slack_post",
-            return_value=root_ts,
-        ), mock.patch.object(
+        ) as text_post, mock.patch.object(
             self.runtime,
             "_allocate_slack_upload",
             return_value=(
@@ -577,6 +576,10 @@ class OutboxRecoveryTest(unittest.TestCase):
             "_complete_slack_upload",
             return_value={"ok": True, "files": [{"id": "F12345678"}]},
         ) as complete_upload, mock.patch.object(
+            broker,
+            "_find_staged_root_file",
+            return_value=root_ts,
+        ), mock.patch.object(
             self.store,
             "complete_root_file",
             side_effect=RuntimeError("simulated crash after file acceptance"),
@@ -586,12 +589,18 @@ class OutboxRecoveryTest(unittest.TestCase):
         ):
             broker.handle(request)
 
+        text_post.assert_not_called()
+
         bridge = self.store.create(request)
         self.assertEqual(bridge.status, "active")
         self.assertEqual(bridge.thread_ts, root_ts)
         self.assertEqual(
             complete_upload.call_args.kwargs["thread_ts"],
-            root_ts,
+            None,
+        )
+        self.assertEqual(
+            complete_upload.call_args.kwargs["text"],
+            self.store.root_record(bridge.bridge_id)["payload_text"],
         )
         root = self.store.root_record(bridge.bridge_id)
         self.assertEqual(root["state"], "root_posted")

@@ -2472,7 +2472,11 @@ class Store:
                 and str(row["lease_owner"] or "") == lease_owner
             ):
                 return {"status": "busy"}
-            next_state = "uploading" if row["thread_ts"] else "delivering"
+            next_state = (
+                "uploading"
+                if row["thread_ts"] or row["staged_path"]
+                else "delivering"
+            )
             claimed = db.execute(
                 """
                 UPDATE bridge_roots
@@ -8161,20 +8165,13 @@ class Broker:
         bridge: Bridge,
         file_id: str,
     ) -> str:
-        if (
-            not bridge.thread_ts
-            or not SLACK_FILE_ID_PATTERN.fullmatch(file_id)
-        ):
+        if not SLACK_FILE_ID_PATTERN.fullmatch(file_id):
             return ""
-        _key, message_ts = self._reconcile_target(
-            team_id=bridge.team_id,
-            method="conversations.replies",
-            channel_id=bridge.channel_id,
-            thread_ts=bridge.thread_ts,
-            target_kind="file",
-            target_id=file_id,
-        )
-        return message_ts or ""
+        info = _slack_call(self.token, "files.info", {"file": file_id})
+        item = info.get("file")
+        if not isinstance(item, dict) or str(item.get("id") or "") != file_id:
+            return ""
+        return _file_share_message_ts(item, bridge.channel_id)
 
     def _finish_root_file_locally(
         self,
@@ -8183,11 +8180,30 @@ class Broker:
         file_id: str,
         staged: Any,
         message_ts: str,
+        *,
+        requested_thread_ts: str = "",
     ) -> str:
+        accepted_thread = str(
+            bridge.thread_ts or requested_thread_ts or message_ts
+        )
+        if not accepted_thread:
+            raise RuntimeError(
+                "Slack root attachment has no durable message timestamp"
+            )
+        if not bridge.thread_ts:
+            if not self.store.record_root_post(
+                bridge.bridge_id,
+                lease_id,
+                accepted_thread,
+            ):
+                raise RuntimeError(
+                    "Slack root attachment lost its durable root lease"
+                )
+            bridge = self.store.get(bridge.bridge_id) or bridge
         if not self.store.complete_root_file(
             bridge.bridge_id,
             lease_id,
-            message_ts or str(bridge.thread_ts or ""),
+            message_ts or accepted_thread,
             file_id=file_id,
         ):
             raise RuntimeError(
@@ -8197,12 +8213,12 @@ class Broker:
             target_kind="file",
             team_id=bridge.team_id,
             channel_id=bridge.channel_id,
-            thread_ts=str(bridge.thread_ts or ""),
+            thread_ts=accepted_thread,
             target_id=file_id,
         )
         with contextlib.suppress(OSError):
             staged.path.unlink()
-        return message_ts or str(bridge.thread_ts or "")
+        return message_ts or accepted_thread
 
     def _reconcile_root_file(
         self,
@@ -8212,6 +8228,7 @@ class Broker:
         staged: Any,
         *,
         expected: tuple[str, ...],
+        requested_thread_ts: str = "",
     ) -> str:
         if not self.store.set_root_file_upload_phase(
             bridge.bridge_id,
@@ -8241,6 +8258,7 @@ class Broker:
                 file_id,
                 staged,
                 message_ts,
+                requested_thread_ts=requested_thread_ts,
             )
         if not self.store.set_root_file_upload_phase(
             bridge.bridge_id,
@@ -8263,13 +8281,22 @@ class Broker:
         staged: Any,
         *,
         expected: tuple[str, ...],
+        payload_text: str = "",
+        requested_thread_ts: str = "",
     ) -> str:
+        target_thread_ts = str(
+            bridge.thread_ts or requested_thread_ts or ""
+        )
         self._arm_reconciliation(
             target_kind="file",
             team_id=bridge.team_id,
-            method="conversations.replies",
+            method=(
+                "conversations.replies"
+                if target_thread_ts
+                else "conversations.history"
+            ),
             channel_id=bridge.channel_id,
-            thread_ts=str(bridge.thread_ts or ""),
+            thread_ts=target_thread_ts,
             target_id=file_id,
         )
         if not self.store.set_root_file_upload_phase(
@@ -8288,7 +8315,8 @@ class Broker:
                 bridge.channel_id,
                 file_id,
                 filename=filename,
-                thread_ts=bridge.thread_ts,
+                text=payload_text if not bridge.thread_ts else "",
+                thread_ts=target_thread_ts or None,
             )
         except BaseException:
             self.store.set_root_file_upload_phase(
@@ -8299,6 +8327,30 @@ class Broker:
                 file_id=file_id,
             )
             raise
+        message_ts = target_thread_ts
+        if not message_ts:
+            try:
+                message_ts = self._find_staged_root_file(bridge, file_id)
+            except BaseException:
+                self.store.set_root_file_upload_phase(
+                    bridge.bridge_id,
+                    lease_id,
+                    "completion_uncertain",
+                    expected=("completing",),
+                    file_id=file_id,
+                )
+                raise
+        if not message_ts:
+            self.store.set_root_file_upload_phase(
+                bridge.bridge_id,
+                lease_id,
+                "completion_uncertain",
+                expected=("completing",),
+                file_id=file_id,
+            )
+            raise RuntimeError(
+                "Slack upload succeeded without a file-share timestamp"
+            )
         if not self.store.set_root_file_upload_phase(
             bridge.bridge_id,
             lease_id,
@@ -8315,7 +8367,8 @@ class Broker:
             lease_id,
             file_id,
             staged,
-            str(bridge.thread_ts or ""),
+            message_ts,
+            requested_thread_ts=requested_thread_ts,
         )
 
     def _deliver_root_file(
@@ -8335,12 +8388,18 @@ class Broker:
                 raise RuntimeError(
                     "durable Slack upload completion has no valid file ID"
                 )
+            message_ts = str(claimed.get("file_message_ts") or "")
+            if not message_ts and not bridge.thread_ts:
+                message_ts = self._find_staged_root_file(bridge, file_id)
             return self._finish_root_file_locally(
                 bridge,
                 lease_id,
                 file_id,
                 staged,
-                str(claimed.get("file_message_ts") or bridge.thread_ts or ""),
+                message_ts or str(bridge.thread_ts or ""),
+                requested_thread_ts=str(
+                    claimed.get("requested_thread_ts") or ""
+                ),
             )
 
         if phase in {"completing", "completion_uncertain", "reconciling"}:
@@ -8354,6 +8413,9 @@ class Broker:
                 file_id,
                 staged,
                 expected=(phase,),
+                requested_thread_ts=str(
+                    claimed.get("requested_thread_ts") or ""
+                ),
             )
             if message_ts:
                 return message_ts
@@ -8364,6 +8426,10 @@ class Broker:
                 filename,
                 staged,
                 expected=("completion_uncertain",),
+                payload_text=str(claimed.get("payload_text") or ""),
+                requested_thread_ts=str(
+                    claimed.get("requested_thread_ts") or ""
+                ),
             )
 
         if phase == "bytes_uploaded":
@@ -8378,6 +8444,10 @@ class Broker:
                 filename,
                 staged,
                 expected=("bytes_uploaded",),
+                payload_text=str(claimed.get("payload_text") or ""),
+                requested_thread_ts=str(
+                    claimed.get("requested_thread_ts") or ""
+                ),
             )
 
         if not self.store.begin_root_file_allocation(
@@ -8447,6 +8517,10 @@ class Broker:
             filename,
             staged,
             expected=("bytes_uploaded",),
+            payload_text=str(claimed.get("payload_text") or ""),
+            requested_thread_ts=str(
+                claimed.get("requested_thread_ts") or ""
+            ),
         )
 
     def _deliver_staged_root(self, bridge: Bridge) -> dict[str, Any]:
@@ -8476,6 +8550,19 @@ class Broker:
         thread_ts = str(claimed.get("thread_ts") or "")
         requested_thread_ts = str(claimed.get("requested_thread_ts") or "")
         try:
+            staged = _root_staged_upload(claimed)
+            file_delivered = False
+            if not thread_ts and staged is not None:
+                self._ensure_channel_membership(bridge.channel_id)
+                self._deliver_root_file(
+                    bridge,
+                    claimed,
+                    lease_id,
+                    staged,
+                )
+                bridge = self.store.get(bridge.bridge_id) or bridge
+                thread_ts = str(bridge.thread_ts or requested_thread_ts)
+                file_delivered = True
             if not thread_ts:
                 if previous_state in {"delivering", "uncertain"}:
                     thread_ts = self._find_staged_root(
@@ -8535,8 +8622,7 @@ class Broker:
                 )
                 bridge = self.store.get(bridge.bridge_id) or bridge
 
-            staged = _root_staged_upload(claimed)
-            if staged is not None:
+            if staged is not None and not file_delivered:
                 self._deliver_root_file(
                     bridge,
                     claimed,
