@@ -748,7 +748,13 @@ def main() -> None:
             assert {row["source_id"] for row in conversational["results"]} == {
                 PERSONAL_SOURCE
             }
-            assert conversational["diagnostics"]["lexical_mode"] == "strict-empty"
+            assert conversational["diagnostics"]["engine"] == (
+                "lossless-passages-v1"
+            )
+            assert conversational["diagnostics"]["dense_candidates"] >= 1
+            assert conversational["diagnostics"][
+                "passage_lexical_candidates"
+            ] == 0
 
             unrelated = rpc(
                 server,
@@ -756,8 +762,13 @@ def main() -> None:
                 "recall_search",
                 {"query": "Where did we discuss underwater zebras?"},
             )["result"]["structuredContent"]
-            assert unrelated["diagnostics"]["lexical_candidates"] == 0
-            assert unrelated["diagnostics"]["lexical_mode"] == "strict-empty"
+            assert unrelated["diagnostics"]["engine"] == (
+                "lossless-passages-v1"
+            )
+            assert unrelated["diagnostics"][
+                "passage_lexical_candidates"
+            ] == 0
+            assert unrelated["diagnostics"]["sparse_candidates"] == 0
 
             degraded = rpc(
                 server,
@@ -766,8 +777,11 @@ def main() -> None:
                 {"query": "shared launch marker semantic unavailable"},
             )["result"]["structuredContent"]
             assert degraded["results"] == []
-            assert degraded["diagnostics"]["lexical_mode"] == "strict-empty"
-            assert degraded["diagnostics"]["semantic_status"] == "unavailable"
+            assert degraded["diagnostics"]["dense_status"] == "unavailable"
+            assert degraded["diagnostics"][
+                "passage_lexical_candidates"
+            ] == 0
+            assert degraded["diagnostics"]["sparse_candidates"] == 0
 
             family_routed = rpc(
                 server,
@@ -811,8 +825,15 @@ def main() -> None:
                 "recall_search",
                 {"query": "personal semantic"},
             )["result"]["structuredContent"]
-            assert semantic["results"][0]["receipt"] == personal_receipt
-            assert semantic["diagnostics"]["semantic_candidates"] >= 1
+            semantic_receipts = {
+                receipt
+                for matching_range in semantic["results"][0][
+                    "matching_ranges"
+                ]
+                for receipt in matching_range.get("receipts", [])
+            }
+            assert personal_receipt in semantic_receipts
+            assert semantic["diagnostics"]["dense_candidates"] >= 1
 
             shown = rpc(
                 server,
@@ -1029,9 +1050,19 @@ def main() -> None:
                     {"query": query, "limit": 5},
                 )["result"]["structuredContent"]["results"]
                 latencies.append((time.perf_counter() - started) * 1000)
-                receipts = [row["receipt"] for row in evaluated]
+                receipts = [
+                    receipt
+                    for row in evaluated
+                    for matching_range in row["matching_ranges"]
+                    for receipt in matching_range.get("receipts", [])
+                ]
+                top_receipts = {
+                    receipt
+                    for matching_range in evaluated[0]["matching_ranges"]
+                    for receipt in matching_range.get("receipts", [])
+                } if evaluated else set()
                 recalled += expected in receipts
-                useful += bool(receipts and receipts[0] == expected)
+                useful += expected in top_receipts
             recall_at_5 = recalled / len(eval_cases)
             usefulness = useful / len(eval_cases)
             p95_ms = sorted(latencies)[
@@ -1075,11 +1106,15 @@ def main() -> None:
             )
             deleted_results = deleted["result"]["structuredContent"]["results"]
             assert personal_receipt not in {
-                row["receipt"] for row in deleted_results
+                receipt
+                for row in deleted_results
+                for matching_range in row["matching_ranges"]
+                for receipt in matching_range.get("receipts", [])
             }
             assert all(
-                "shared launch marker" not in row["text"]
+                "shared launch marker" not in matching_range["text"]
                 for row in deleted_results
+                for matching_range in row["matching_ranges"]
             )
             deleted_show = rpc(
                 server,
@@ -1154,9 +1189,11 @@ def main() -> None:
                 "direct_exec_guessed_target_accepts": 0,
                 "direct_exec_cross_brain_attempts": 200,
                 "direct_exec_guessed_target_attempts": 200,
-                "lexical_candidates": 2,
-                "semantic_candidates": semantic["diagnostics"][
-                    "semantic_candidates"
+                "passage_lexical_candidates": semantic["diagnostics"][
+                    "passage_lexical_candidates"
+                ],
+                "dense_candidates": semantic["diagnostics"][
+                    "dense_candidates"
                 ],
                 "tombstoned_search_hits": 0,
                 "tombstoned_show_hits": 0,

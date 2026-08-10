@@ -290,6 +290,18 @@ class PassageHintRetrieval:
                           )
                           AND passage.search_vector @@
                               plainto_tsquery('simple',%s)
+                          AND NOT EXISTS (
+                              SELECT 1
+                                FROM unnest(passage.receipts)
+                                     AS passage_receipt(receipt)
+                                LEFT JOIN canonical_chunks live_chunk
+                                  ON live_chunk.tenant_id=passage.tenant_id
+                                 AND live_chunk.source_id=passage.source_id
+                                 AND live_chunk.receipt=
+                                     passage_receipt.receipt
+                                 AND live_chunk.deleted_at IS NULL
+                               WHERE live_chunk.receipt IS NULL
+                          )
                           AND (%s::timestamptz IS NULL
                                OR passage.last_occurred_at>=%s)
                           AND (%s::timestamptz IS NULL
@@ -441,6 +453,20 @@ class PassageHintRetrieval:
                                   AND embedding.source_id=ANY(%s)
                                   AND embedding.runtime_fingerprint=%s
                                   AND projected.policy_fingerprint=%s
+                                  AND NOT EXISTS (
+                                      SELECT 1
+                                        FROM unnest(passage.receipts)
+                                             AS passage_receipt(receipt)
+                                        LEFT JOIN canonical_chunks live_chunk
+                                          ON live_chunk.tenant_id=
+                                             passage.tenant_id
+                                         AND live_chunk.source_id=
+                                             passage.source_id
+                                         AND live_chunk.receipt=
+                                             passage_receipt.receipt
+                                         AND live_chunk.deleted_at IS NULL
+                                       WHERE live_chunk.receipt IS NULL
+                                  )
                                   AND (%s::timestamptz IS NULL
                                        OR passage.last_occurred_at>=%s)
                                   AND (%s::timestamptz IS NULL
@@ -498,9 +524,25 @@ class PassageHintRetrieval:
                                       embedding.embedding
                                           <=> %s::halfvec AS distance
                                  FROM canonical_passage_embeddings embedding
+                                 JOIN canonical_passages passage
+                                   USING(tenant_id,source_id,passage_id)
                                 WHERE embedding.tenant_id=%s
                                   AND embedding.source_id=ANY(%s)
                                   AND embedding.runtime_fingerprint=%s
+                                  AND NOT EXISTS (
+                                      SELECT 1
+                                        FROM unnest(passage.receipts)
+                                             AS passage_receipt(receipt)
+                                        LEFT JOIN canonical_chunks live_chunk
+                                          ON live_chunk.tenant_id=
+                                             passage.tenant_id
+                                         AND live_chunk.source_id=
+                                             passage.source_id
+                                         AND live_chunk.receipt=
+                                             passage_receipt.receipt
+                                         AND live_chunk.deleted_at IS NULL
+                                       WHERE live_chunk.receipt IS NULL
+                                  )
                                 ORDER BY embedding.embedding
                                          <=> %s::halfvec
                                 LIMIT %s
@@ -545,6 +587,20 @@ class PassageHintRetrieval:
                                        logical_document_id,revision
                                    )
                                 WHERE projected.policy_fingerprint=%s
+                                  AND NOT EXISTS (
+                                      SELECT 1
+                                        FROM unnest(passage.receipts)
+                                             AS passage_receipt(receipt)
+                                        LEFT JOIN canonical_chunks live_chunk
+                                          ON live_chunk.tenant_id=
+                                             passage.tenant_id
+                                         AND live_chunk.source_id=
+                                             passage.source_id
+                                         AND live_chunk.receipt=
+                                             passage_receipt.receipt
+                                         AND live_chunk.deleted_at IS NULL
+                                       WHERE live_chunk.receipt IS NULL
+                                  )
                                   AND (%s::timestamptz IS NULL
                                        OR passage.last_occurred_at>=%s)
                                   AND (%s::timestamptz IS NULL
@@ -766,10 +822,24 @@ class PassageHintRetrieval:
                                       AS distance
                              FROM canonical_passage_embedding_representations
                                   represented
+                             JOIN canonical_passages passage
+                               USING(tenant_id,source_id,passage_id)
                             WHERE represented.tenant_id=%s
                               AND represented.source_id=ANY(%s)
                               AND represented.representation_fingerprint=%s
                               AND represented.{vector_column} IS NOT NULL
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                    FROM unnest(passage.receipts)
+                                         AS passage_receipt(receipt)
+                                    LEFT JOIN canonical_chunks live_chunk
+                                      ON live_chunk.tenant_id=passage.tenant_id
+                                     AND live_chunk.source_id=passage.source_id
+                                     AND live_chunk.receipt=
+                                         passage_receipt.receipt
+                                     AND live_chunk.deleted_at IS NULL
+                                   WHERE live_chunk.receipt IS NULL
+                              )
                             ORDER BY represented.{vector_column}
                                      <=> %s::halfvec
                             LIMIT %s
@@ -804,6 +874,18 @@ class PassageHintRetrieval:
                                    logical_document_id,revision
                                )
                             WHERE projected.policy_fingerprint=%s
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                    FROM unnest(passage.receipts)
+                                         AS passage_receipt(receipt)
+                                    LEFT JOIN canonical_chunks live_chunk
+                                      ON live_chunk.tenant_id=passage.tenant_id
+                                     AND live_chunk.source_id=passage.source_id
+                                     AND live_chunk.receipt=
+                                         passage_receipt.receipt
+                                     AND live_chunk.deleted_at IS NULL
+                                   WHERE live_chunk.receipt IS NULL
+                              )
                               AND (%s::timestamptz IS NULL
                                    OR passage.last_occurred_at>=%s)
                               AND (%s::timestamptz IS NULL
@@ -894,6 +976,18 @@ class PassageHintRetrieval:
                               AND projected.policy_fingerprint=%s
                               AND context.search_vector @@
                                   plainto_tsquery('simple',%s)
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                    FROM unnest(passage.receipts)
+                                         AS passage_receipt(receipt)
+                                    LEFT JOIN canonical_chunks live_chunk
+                                      ON live_chunk.tenant_id=passage.tenant_id
+                                     AND live_chunk.source_id=passage.source_id
+                                     AND live_chunk.receipt=
+                                         passage_receipt.receipt
+                                     AND live_chunk.deleted_at IS NULL
+                                   WHERE live_chunk.receipt IS NULL
+                              )
                               AND (%s::timestamptz IS NULL
                                    OR passage.last_occurred_at>=%s)
                               AND (%s::timestamptz IS NULL
