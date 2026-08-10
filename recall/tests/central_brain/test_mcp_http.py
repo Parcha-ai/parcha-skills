@@ -108,6 +108,23 @@ class FakeStore:
             "timing": {"elapsed_ms": 100.0},
         }
 
+    def execute_parquet_scan(self, program, **arguments):
+        self.calls.append(("scan", program, arguments))
+        return {
+            "provider": "synthetic-archil",
+            "stdout": "synthetic scan",
+            "stderr": "",
+            "exit_code": 0,
+            "complete": True,
+            "stopped_reason": "completed",
+            "output_truncated": False,
+            "opened_receipts": [],
+            "datasets_available": 3,
+            "sources_available": 1,
+            "buckets_available": 1,
+            "projection_pending": 0,
+        }
+
     def show(self, target, *, around, tail, prompts, authorized_source):
         self.calls.append(("show", target, around, tail, prompts, authorized_source))
         return {
@@ -436,6 +453,7 @@ class RemoteMcpContractTest(unittest.TestCase):
                     "recall_scope",
                     "recall_exec",
                     "recall_exec_map",
+                    "recall_scan",
                     "recall_session_context",
                     "recall_show",
                     "recall_related",
@@ -672,9 +690,21 @@ class RemoteMcpContractTest(unittest.TestCase):
             ],
             30,
         )
+        self.assertEqual(
+            canonical_tools["recall_scan"]["properties"]["timeout_seconds"],
+            {"type": "integer", "minimum": 1, "maximum": 240, "default": 60},
+        )
         self.assertIn(
             "/docs/d1",
             canonical_catalog["recall_exec"]["description"],
+        )
+        self.assertIn(
+            "month granularity",
+            canonical_catalog["recall_scan"]["description"],
+        )
+        self.assertIn(
+            "actors.parquet",
+            canonical_catalog["recall_scan"]["description"],
         )
         self.assertIn(
             "recall-scan --broad --fixed",
@@ -931,6 +961,47 @@ class RemoteMcpContractTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("result", json.loads(raw))
         self.assertIn("exec_map", {call[0] for call in store.calls})
+
+    def test_scan_is_one_code_mode_call_with_hard_scope(self) -> None:
+        store = PolicyStore()
+        program = (
+            "duckdb -json -c \"select record_json from "
+            "read_parquet('/datasets/*/*/records.parquet') limit 5\""
+        )
+        filters = {
+            "person": "Synthetic Person",
+            "source_family": "coding_history",
+            "since": "2026-08-01T00:00:00Z",
+            "until": "2026-08-08T00:00:00Z",
+        }
+        with McpHttpServer(store) as server:
+            status, _, raw = server.request(
+                "POST",
+                request(
+                    "tools/call",
+                    params={
+                        "name": "recall_scan",
+                        "arguments": {
+                            "filters": filters,
+                            "program": program,
+                            "timeout_seconds": 120,
+                        },
+                    },
+                ),
+                token="synthetic-human-read",
+                protocol="2025-11-25",
+            )
+        self.assertEqual(status, 200)
+        result = json.loads(raw)["result"]["structuredContent"]
+        self.assertEqual(result["datasets_available"], 3)
+        self.assertIn(
+            (
+                "scan",
+                program,
+                {"filters": filters, "timeout_seconds": 120},
+            ),
+            store.calls,
+        )
 
     def test_exec_provider_failure_is_content_free(self) -> None:
         document_id = "ldoc_0123456789abcdef0123456789abcdef"

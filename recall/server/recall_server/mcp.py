@@ -360,6 +360,71 @@ ALL_READ_TOOLS = (
         "annotations": {"readOnlyHint": True},
     },
     {
+        "name": "recall_scan",
+        "description": (
+            "Run one caller-authored DuckDB/shell program over authorized Parquet "
+            "source/month datasets. Use this code-mode tool for broad person, team, "
+            "source, project, or time analysis instead of issuing many searches. "
+            "Files are mounted under /datasets/sN/YYYY-MM/{documents,records,actors}.parquet "
+            "and the pinned `duckdb` CLI is on PATH. Use DuckDB globs, SQL filters, "
+            "grouping, sampling, and joins; use rg/jq over exact documents only when "
+            "the scan points to evidence needing deeper inspection. The sandbox is "
+            "read-only and networkless. Source filters restrict mounted sources, but "
+            "time is mounted at month granularity: repeat exact occurred_at bounds in "
+            "SQL. Repeat person predicates too; join actors.parquet when relation must "
+            "be exact. "
+            "To open evidence, emit raw complete JSONL with "
+            "`duckdb -noheader -list -c \"SELECT record_json FROM "
+            "read_parquet('/datasets/*/*/records.parquet') ...\"`; "
+            "only verified recall:// values in opened_receipts may be cited."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "filters": {
+                    "type": "object",
+                    "default": {},
+                    "properties": {
+                        "since": TIME_BOUND_SCHEMA,
+                        "until": TIME_BOUND_SCHEMA,
+                        "source_id": {"type": "string"},
+                        "source_family": {"type": "string"},
+                        "source_alias": {"type": "string"},
+                        "source_connector": {"type": "string"},
+                        "person": {"type": "string", "maxLength": 256},
+                        "person_relation": {
+                            "type": "string",
+                            "enum": [
+                                "author", "contributor", "owner", "organizer",
+                                "participant", "attendee",
+                            ],
+                        },
+                    },
+                    "additionalProperties": False,
+                },
+                "program": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 16000,
+                    "description": (
+                        "One shell program. Prefer one DuckDB query that filters and "
+                        "aggregates first, then emits only supporting record_json lines."
+                    ),
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 240,
+                    "default": 60,
+                },
+            },
+            "required": ["program"],
+            "additionalProperties": False,
+        },
+        "outputSchema": {"type": "object"},
+        "annotations": {"readOnlyHint": True},
+    },
+    {
         "name": "recall_session_context",
         "description": (
             "Expand one recall:// receipt inside its authorized source session "
@@ -427,13 +492,15 @@ RETRIEVAL_INSTRUCTIONS = (
     "explicit alias, otherwise report insufficient evidence. For one named topic, "
     "make no more than three focused searches and stop once the evidence supports "
     "the answer. Use recall_exec_map with shard_size=1 when the same focused check "
-    "must cover several independent candidates; pair recall_scope with it for broad "
-    "person, source, or time coverage. Cite only receipts "
+    "must cover several independent candidates. Prefer one recall_scan code-mode "
+    "call for broad person, team, source, project, or time analysis; use DuckDB to "
+    "filter and aggregate the mounted Parquet datasets. Cite only receipts "
     "returned in opened_receipts."
 )
 CANONICAL_ONLY_READ_TOOLS = frozenset({
     "recall_exec",
     "recall_exec_map",
+    "recall_scan",
     "recall_scope",
     "recall_session_context",
 })
@@ -720,6 +787,30 @@ def _call_tool(
             )
         except DeepInspectionError:
             raise McpProtocolError(-32603, "recall_exec_map_failed") from None
+    if name == "recall_scan":
+        _reject_extra(
+            arguments,
+            frozenset({"filters", "program", "timeout_seconds"}),
+        )
+        filters = _object(arguments.get("filters", {}), "filters")
+        program = _string(arguments.get("program"), "program")
+        if len(program.encode()) > 16_000:
+            raise McpProtocolError(-32602, "program must be at most 16000 bytes")
+        timeout_seconds = _integer(
+            arguments.get("timeout_seconds"),
+            "timeout_seconds",
+            default=60,
+            minimum=1,
+            maximum=240,
+        )
+        try:
+            return store.execute_parquet_scan(
+                program,
+                filters=filters,
+                timeout_seconds=timeout_seconds,
+            )
+        except DeepInspectionError:
+            raise McpProtocolError(-32603, "recall_scan_failed") from None
     if name == "recall_session_context":
         _reject_extra(arguments, frozenset({"target", "before", "after"}))
         target = _string(arguments.get("target"), "target")

@@ -9,6 +9,7 @@ from typing import Any
 
 from .logical_evidence_projection import CanonicalLogicalEvidenceProjector
 from .passage_index import CanonicalPassageProjector
+from .parquet_scan import CanonicalParquetScanProjector
 
 
 LOG = logging.getLogger(__name__)
@@ -17,6 +18,7 @@ LOG = logging.getLogger(__name__)
 def run_projection_worker(
     logical: CanonicalLogicalEvidenceProjector,
     passages: CanonicalPassageProjector,
+    scan: CanonicalParquetScanProjector | None = None,
     *,
     tenant_id: str,
     logical_batch_size: int,
@@ -49,6 +51,15 @@ def run_projection_worker(
             max_batches=max_batches_per_cycle,
             concurrency=passage_concurrency,
         )
+        scanned = (
+            scan.project_pending(
+                tenant_id=tenant_id,
+                batch_size=min(4, logical_batch_size),
+                max_batches=max_batches_per_cycle,
+            )
+            if scan is not None
+            else {"status": "complete", "shards": 0, "rows": 0, "stale": 0}
+        )
         documents = logical.project_pending(
             tenant_id=tenant_id,
             batch_size=logical_batch_size,
@@ -61,8 +72,11 @@ def run_projection_worker(
                 if documents["status"] == "complete"
                 and projected["status"] == "complete"
                 and embedded["status"] in {"complete", "disabled"}
+                and scanned["status"] == "complete"
                 and int(documents["documents"]) == 0
                 and int(projected["passages"]) == 0
+                and int(scanned["shards"]) == 0
+                and int(scanned["stale"]) == 0
                 else "pending"
             ),
             "documents": int(documents["documents"]),
@@ -70,13 +84,17 @@ def run_projection_worker(
             "passage_documents": int(projected["documents"]),
             "passages": int(projected["passages"]),
             "embedded": int(embedded["processed"]),
+            "parquet_shards": int(scanned["shards"]),
+            "parquet_rows": int(scanned["rows"]),
+            "parquet_stale": int(scanned["stale"]),
             "stale": int(projected["stale"]),
             "pruned": int(documents["pruned"]),
             "cleanup_failures": int(documents["cleanup_failures"]),
         }
         LOG.info(
             "projection cycle status=%s documents=%s records=%s "
-            "passage_documents=%s passages=%s embedded=%s stale=%s pruned=%s "
+            "passage_documents=%s passages=%s embedded=%s parquet_shards=%s "
+            "parquet_rows=%s parquet_stale=%s stale=%s pruned=%s "
             "cleanup_failures=%s",
             *(
                 result[key]
@@ -87,6 +105,9 @@ def run_projection_worker(
                     "passage_documents",
                     "passages",
                     "embedded",
+                    "parquet_shards",
+                    "parquet_rows",
+                    "parquet_stale",
                     "stale",
                     "pruned",
                     "cleanup_failures",
@@ -102,6 +123,8 @@ def run_projection_worker(
                 "passage_documents",
                 "passages",
                 "embedded",
+                "parquet_shards",
+                "parquet_stale",
                 "stale",
                 "pruned",
             )

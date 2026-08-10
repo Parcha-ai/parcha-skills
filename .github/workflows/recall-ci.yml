@@ -56,6 +56,7 @@ jobs:
             e2e_v2_multitenant_mcp.py \
             e2e_connector_control_web.py \
             e2e_employee_attribution.py \
+            e2e_legacy_actor_backfill.py \
             e2e_session_source_l1.py \
             e2e_semantic_l2.py \
             e2e_capture_mcp.py \

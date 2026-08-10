@@ -64,7 +64,7 @@ infrastructure. The example is synthetic; a live manifest belongs in a private m
 location and contains references, never credential values.
 
 The production database gate requires a standard PostgreSQL URL with
-`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 48,
+`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 50,
 pgvector 0.8.0 or newer, and a runtime role without superuser, database/role creation,
 replication, or RLS-bypass privilege:
 
@@ -305,6 +305,47 @@ Migration 46 adds the employee display name to invitations. Acceptance now
 creates and links the employee actor, and source-local route enrollment binds
 that actor as the source contributor. Apply it before inviting employees; mixed
 schema/application deployment is intentionally unsupported.
+
+Migration 49 repairs actor bindings for legacy `coding_history` sources whose
+owner principal already maps to a brain actor. It deliberately does not infer an
+author for Slack, email, or any other shared source. Migration 50 adds a derived
+Parquet scan plane: one immutable `documents`, `records`, and `actors` shard per
+authorized source and UTC month. Canonical JSONL documents remain the complete
+evidence and only source of truth; Parquet is a disposable typed index for broad
+code-mode analysis. Ingest, replacement, and forget transactions invalidate only
+the affected source-months. Its first application seeds every existing current
+logical document except documents already waiting for repair; those enqueue
+themselves after their repaired revision commits.
+
+Populate or rebuild it independently of ingestion:
+
+```bash
+python -m recall_server.cli backfill-parquet-scan \
+  --tenant tenant:company:example --batch-size 4 --max-batches 100
+```
+
+The managed projection worker continuously drains later invalidations. Before
+enabling `recall_scan`, publish one official DuckDB CLI binary into the private
+evidence archive. Verify its checksum against DuckDB's official install page;
+the command independently rechecks the exact digest before upload:
+
+```bash
+python -m recall_server.cli publish-archil-duckdb \
+  --path /private/duckdb --version 1.5.5 \
+  --sha256 64-lowercase-hex-characters
+```
+
+Configure the returned opaque object identity as
+`RECALL_ARCHIL_DUCKDB_OBJECT_KEY` and `RECALL_ARCHIL_DUCKDB_SHA256`. At execution
+time Recall mounts only shards inside the caller's tenant/source grants, stages
+that checksum-pinned binary into the networkless sandbox, and verifies every
+emitted `recall://` receipt against current canonical evidence before returning
+it in `opened_receipts`. The caller's agent writes one shell/DuckDB program; no
+second retrieval agent or model credential runs inside Recall.
+`recall_scan` defaults to 60 seconds and permits a caller-selected ceiling up to
+240 seconds, below Archil's documented five-minute response limit. The MCP
+client may cancel its own request sooner; Recall does not impose the 30-second
+interactive-document limit on these broad scans.
 
 Enable the canonical v2 write plane only after the archive probe and database
 migrations pass:

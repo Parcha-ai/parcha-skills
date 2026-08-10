@@ -837,6 +837,52 @@ class CanonicalLogicalEvidenceProjector:
             )
         return len(unique)
 
+    @staticmethod
+    def _queue_parquet_scan(
+        connection: Any,
+        *,
+        tenant_id: str,
+        source_id: str,
+        ranges: tuple[tuple[Any, Any], ...],
+        reason: str,
+    ) -> int:
+        """Invalidate only source/month shards touched by a logical change."""
+
+        if not ranges:
+            return 0
+        def timestamp(value: Any) -> datetime:
+            if isinstance(value, datetime):
+                return value
+            if isinstance(value, str):
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                if parsed.tzinfo is not None:
+                    return parsed
+            raise LogicalEvidenceError("logical_evidence_timestamp_invalid")
+
+        starts = [timestamp(value[0]) for value in ranges]
+        ends = [timestamp(value[1]) for value in ranges]
+        result = connection.execute(
+            """INSERT INTO canonical_parquet_scan_queue(
+                   tenant_id,source_id,bucket_start,
+                   generation,reason,changed_at
+               )
+               SELECT %s,%s,month.value::date,1,%s,clock_timestamp()
+                 FROM unnest(%s::timestamptz[],%s::timestamptz[])
+                      AS span(first_at,last_at)
+                 CROSS JOIN LATERAL generate_series(
+                     date_trunc('month',span.first_at),
+                     date_trunc('month',span.last_at),
+                     interval '1 month'
+                 ) month(value)
+                GROUP BY month.value
+               ON CONFLICT(tenant_id,source_id,bucket_start)
+               DO UPDATE SET
+                   generation=canonical_parquet_scan_queue.generation+1,
+                   reason=excluded.reason,changed_at=clock_timestamp()""",
+            (tenant_id, source_id, reason, starts, ends),
+        )
+        return max(0, result.rowcount)
+
     def _schedule_cleanup(
         self,
         references: tuple[dict[str, Any], ...],
@@ -892,6 +938,12 @@ class CanonicalLogicalEvidenceProjector:
                                    WHERE part.tenant_id=queue.tenant_id
                                      AND part.source_id=queue.source_id
                                      AND part.artifact_id=queue.artifact_id
+                                  UNION ALL
+                                  SELECT 1
+                                    FROM canonical_parquet_scan_shards shard
+                                   WHERE shard.tenant_id=queue.tenant_id
+                                     AND shard.source_id=queue.source_id
+                                     AND shard.artifact_id=queue.artifact_id
                               ) AS removable
                          FROM canonical_evidence_cleanup_queue queue
                         WHERE (%s::text IS NULL OR queue.tenant_id=%s)
@@ -1035,7 +1087,8 @@ class CanonicalLogicalEvidenceProjector:
                 ).fetchone()
                 current = connection.execute(
                     """SELECT revision,source_updated_at,receipt_count,
-                              manifest_artifact_id
+                              manifest_artifact_id,first_occurred_at,
+                              last_occurred_at
                          FROM canonical_evidence_documents
                         WHERE tenant_id=%s AND source_id=%s
                           AND native_parent_id=%s""",
@@ -1225,6 +1278,23 @@ class CanonicalLogicalEvidenceProjector:
                         prepared.revision,
                     ),
                 )
+                ranges = [
+                    (prepared.first_occurred_at, prepared.last_occurred_at)
+                ]
+                if current is not None:
+                    ranges.append(
+                        (
+                            current["first_occurred_at"],
+                            current["last_occurred_at"],
+                        )
+                    )
+                self._queue_parquet_scan(
+                    connection,
+                    tenant_id=prepared.tenant_id,
+                    source_id=prepared.source_id,
+                    ranges=tuple(ranges),
+                    reason="logical-update",
+                )
                 deleted = connection.execute(
                     """DELETE FROM canonical_evidence_document_queue
                         WHERE tenant_id=%s AND source_id=%s
@@ -1279,6 +1349,17 @@ class CanonicalLogicalEvidenceProjector:
                     connection,
                     candidate,
                 )
+                old_document = connection.execute(
+                    """SELECT first_occurred_at,last_occurred_at
+                         FROM canonical_evidence_documents
+                        WHERE tenant_id=%s AND source_id=%s
+                          AND native_parent_id=%s""",
+                    (
+                        candidate.tenant_id,
+                        candidate.source_id,
+                        candidate.native_parent_id,
+                    ),
+                ).fetchone()
                 self._enqueue_cleanup(
                     connection,
                     tuple(
@@ -1297,6 +1378,17 @@ class CanonicalLogicalEvidenceProjector:
                         candidate.native_parent_id,
                     ),
                 )
+                if old_document is not None:
+                    self._queue_parquet_scan(
+                        connection,
+                        tenant_id=candidate.tenant_id,
+                        source_id=candidate.source_id,
+                        ranges=((
+                            old_document["first_occurred_at"],
+                            old_document["last_occurred_at"],
+                        ),),
+                        reason="forget",
+                    )
                 deleted = connection.execute(
                     """DELETE FROM canonical_evidence_document_queue
                         WHERE tenant_id=%s AND source_id=%s

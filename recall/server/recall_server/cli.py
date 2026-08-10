@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
+import hashlib
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -33,6 +36,7 @@ from .logical_evidence import LogicalEvidenceProjectionStore
 from .logical_evidence_projection import CanonicalLogicalEvidenceProjector
 from .passage_index import CanonicalPassageProjector
 from .passage_projection import PassagePolicy
+from .parquet_scan import CanonicalParquetScanProjector
 from .passage_worker import run_passage_worker
 from .projection_worker import run_projection_worker
 from .federation import QUALITY_SCORES, SOURCE_FAMILIES
@@ -65,6 +69,10 @@ def main() -> None:
     sub.add_parser("migrate")
     sub.add_parser("archive-check")
     sub.add_parser("evidence-archive-check")
+    publish_duckdb = sub.add_parser("publish-archil-duckdb")
+    publish_duckdb.add_argument("--path", type=Path, required=True)
+    publish_duckdb.add_argument("--version", required=True)
+    publish_duckdb.add_argument("--sha256", required=True)
     capability = sub.add_parser("capability-check")
     capability.add_argument(
         "--profile", choices=("production", "local-fixture"), default="production"
@@ -195,6 +203,11 @@ def main() -> None:
         default=5,
     )
     passage_worker.add_argument("--once", action="store_true")
+    parquet_backfill = sub.add_parser("backfill-parquet-scan")
+    parquet_backfill.add_argument("--tenant", required=True)
+    parquet_backfill.add_argument("--source")
+    parquet_backfill.add_argument("--batch-size", type=int, default=4)
+    parquet_backfill.add_argument("--max-batches", type=int, default=10)
     projection_worker = sub.add_parser("projection-worker")
     projection_worker.add_argument("--tenant", required=True)
     projection_worker.add_argument("--target-tokens", type=int, default=1024)
@@ -408,6 +421,35 @@ def main() -> None:
                 file=sys.stderr,
             )
             raise SystemExit(2) from None
+        return
+    if args.command == "publish-archil-duckdb":
+        if (
+            not args.path.is_file()
+            or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", args.version) is None
+        ):
+            raise ValueError("DuckDB tool artifact is invalid")
+        payload = args.path.read_bytes()
+        digest = hashlib.sha256(payload).hexdigest()
+        if (
+            not 1_000_000 <= len(payload) <= 100_000_000
+            or digest != args.sha256
+        ):
+            raise ValueError("DuckDB tool artifact is invalid")
+        reference = build_evidence_archive_store().put_raw(
+            tenant_id="tenant:system:tools",
+            source_id="source:system:tools",
+            native_id=f"archil-duckdb:{args.version}:linux-amd64",
+            payload=payload,
+            media_type="application/vnd.duckdb.cli",
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+        print(json.dumps({
+            "status": "published",
+            "version": args.version,
+            "object_key": reference["object_key"],
+            "content_sha256": reference["content_sha256"],
+            "size_bytes": reference["size_bytes"],
+        }, sort_keys=True))
         return
     if not args.dsn:
         ap.error("--dsn or RECALL_DATABASE_URL is required")
@@ -638,6 +680,28 @@ def main() -> None:
                 once=args.once,
             )
         print(json.dumps(result, sort_keys=True))
+    elif args.command == "backfill-parquet-scan":
+        projector = CanonicalParquetScanProjector(
+            store,
+            LogicalEvidenceProjectionStore(build_evidence_archive_store()),
+        )
+        seeded = projector.seed_backfill(
+            tenant_id=args.tenant,
+            source_id=args.source,
+        )
+        print(
+            json.dumps(
+                {
+                    "seeded": seeded,
+                    **projector.project_pending(
+                        tenant_id=args.tenant,
+                        batch_size=args.batch_size,
+                        max_batches=args.max_batches,
+                    ),
+                },
+                sort_keys=True,
+            )
+        )
     elif args.command == "projection-worker":
         logical = CanonicalLogicalEvidenceProjector(
             store,
@@ -658,11 +722,16 @@ def main() -> None:
             ),
             bound_tenant_id=args.tenant,
         )
+        scan = CanonicalParquetScanProjector(
+            store,
+            LogicalEvidenceProjectionStore(build_evidence_archive_store()),
+        )
         print(
             json.dumps(
                 run_projection_worker(
                     logical,
                     passages,
+                    scan,
                     tenant_id=args.tenant,
                     logical_batch_size=args.logical_batch_size,
                     passage_batch_size=args.passage_batch_size,

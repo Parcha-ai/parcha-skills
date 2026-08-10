@@ -40,6 +40,7 @@ from .logical_evidence import LogicalEvidenceProjectionStore
 from .logical_evidence_projection import CanonicalLogicalEvidenceProjector
 from .passage_index import CanonicalPassageProjector
 from .passage_projection import DEFAULT_PASSAGE_POLICY
+from .parquet_scan import CanonicalParquetScanProjector
 
 
 SAFE_WORKER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{2,127}\Z")
@@ -89,6 +90,7 @@ def _private_root(path: Path) -> Path:
 def _run_projection_cycle(
     logical: CanonicalLogicalEvidenceProjector,
     passages: CanonicalPassageProjector,
+    scan: CanonicalParquetScanProjector,
 ) -> dict[str, int | str]:
     logical_result = logical.project_pending(
         tenant_id=None,
@@ -107,6 +109,11 @@ def _run_projection_cycle(
         batch_size=MANAGED_PASSAGE_EMBED_BATCH_SIZE,
         max_batches=MANAGED_PROJECTION_MAX_BATCHES,
     )
+    scan_result = scan.project_pending(
+        tenant_id=None,
+        batch_size=4,
+        max_batches=MANAGED_PROJECTION_MAX_BATCHES,
+    )
     return {
         "status": "complete",
         "logical_documents": int(logical_result["documents"]),
@@ -114,6 +121,9 @@ def _run_projection_cycle(
         "passage_documents": int(passage_result["documents"]),
         "passages": int(passage_result["passages"]),
         "passage_embeddings": int(embedding_result["processed"]),
+        "parquet_shards": int(scan_result["shards"]),
+        "parquet_rows": int(scan_result["rows"]),
+        "parquet_stale": int(scan_result["stale"]),
     }
 
 
@@ -611,7 +621,7 @@ def run_managed_worker(
         ),
     )
     projection_enabled = os.environ.get("RECALL_MANAGED_PROJECTIONS_ENABLED") == "1"
-    logical_projector = passage_projector = None
+    logical_projector = passage_projector = scan_projector = None
     if projection_enabled:
         evidence_projection = LogicalEvidenceProjectionStore(
             build_evidence_archive_store(),
@@ -627,6 +637,10 @@ def run_managed_worker(
             evidence_projection,
             policy=DEFAULT_PASSAGE_POLICY,
         )
+        scan_projector = CanonicalParquetScanProjector(
+            store,
+            evidence_projection,
+        )
     cycles = committed = failed = projection_failures = 0
     while True:
         result = worker.run_once()
@@ -637,12 +651,20 @@ def run_managed_worker(
             "passage_documents": 0,
             "passages": 0,
             "passage_embeddings": 0,
+            "parquet_shards": 0,
+            "parquet_rows": 0,
+            "parquet_stale": 0,
         }
-        if logical_projector is not None and passage_projector is not None:
+        if (
+            logical_projector is not None
+            and passage_projector is not None
+            and scan_projector is not None
+        ):
             try:
                 projection = _run_projection_cycle(
                     logical_projector,
                     passage_projector,
+                    scan_projector,
                 )
             except Exception as error:
                 projection_failures += 1
@@ -678,6 +700,8 @@ def run_managed_worker(
                 "logical_documents",
                 "passage_documents",
                 "passage_embeddings",
+                "parquet_shards",
+                "parquet_stale",
             )
         )
         time.sleep(
