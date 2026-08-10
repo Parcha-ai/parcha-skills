@@ -1259,6 +1259,20 @@ class BoundCanonicalRetrieval:
         lexical_query = " ".join(informative) if informative else query
         actor_ids: tuple[str, ...] | None = None
         if person is not None:
+            sources = self._actor_sources(
+                person,
+                relation,
+                sources,
+                deadline_at,
+            )
+            if not sources:
+                return {
+                    "results": [],
+                    "diagnostics": {
+                        "engine": "lossless-passages-v1",
+                        "reason": "no-person-sources",
+                    },
+                }
             with self.store.connect() as connection:
                 rows = connection.execute(
                     """SELECT DISTINCT actor.actor_id
