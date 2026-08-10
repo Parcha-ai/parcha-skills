@@ -51,7 +51,7 @@ class _Passages:
 
 
 class ProjectionWorkerTest(unittest.TestCase):
-    def test_runs_the_dependency_chain_in_one_cycle(self):
+    def test_services_downstream_before_expensive_upstream_work(self):
         calls: list[str] = []
         result = run_projection_worker(
             _Logical(calls),  # type: ignore[arg-type]
@@ -66,11 +66,28 @@ class ProjectionWorkerTest(unittest.TestCase):
             interval_seconds=5,
             once=True,
         )
-        self.assertEqual(calls, ["logical", "passages", "embeddings"])
-        self.assertEqual(result["status"], "complete")
+        self.assertEqual(calls, ["embeddings", "passages", "logical"])
+        self.assertEqual(result["status"], "pending")
         self.assertEqual(result["documents"], 2)
         self.assertEqual(result["passages"], 8)
         self.assertEqual(result["embedded"], 8)
+
+    def test_empty_cycle_is_truthfully_complete(self):
+        calls: list[str] = []
+        result = run_projection_worker(
+            _Logical(calls, work=0),  # type: ignore[arg-type]
+            _Passages(calls, work=0),  # type: ignore[arg-type]
+            tenant_id="tenant:company:test",
+            logical_batch_size=25,
+            passage_batch_size=100,
+            embedding_batch_size=128,
+            max_batches_per_cycle=10,
+            upload_concurrency=2,
+            passage_concurrency=4,
+            interval_seconds=5,
+            once=True,
+        )
+        self.assertEqual(result["status"], "complete")
 
     def test_cleanup_failure_does_not_create_a_hot_loop(self):
         calls: list[str] = []
@@ -95,7 +112,7 @@ class ProjectionWorkerTest(unittest.TestCase):
                 interval_seconds=3,
                 sleep=stop,
             )
-        self.assertEqual(calls, ["logical", "passages", "embeddings"])
+        self.assertEqual(calls, ["embeddings", "passages", "logical"])
 
     def test_idle_cycle_sleeps_before_the_next_cycle(self):
         calls: list[str] = []
@@ -121,7 +138,7 @@ class ProjectionWorkerTest(unittest.TestCase):
                 interval_seconds=3,
                 sleep=stop,
             )
-        self.assertEqual(calls, ["logical", "passages", "embeddings"])
+        self.assertEqual(calls, ["embeddings", "passages", "logical"])
 
 
 if __name__ == "__main__":

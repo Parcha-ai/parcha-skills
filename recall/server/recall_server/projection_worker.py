@@ -29,16 +29,19 @@ def run_projection_worker(
     once: bool = False,
     sleep: Callable[[float], Any] = time.sleep,
 ) -> dict[str, int | str]:
-    """Project documents, passages, then vectors in dependency order."""
+    """Service every projection stage without upstream backfill starvation."""
 
     if not 0.1 <= interval_seconds <= 300:
         raise ValueError("projection worker interval is invalid")
     while True:
-        documents = logical.project_pending(
+        # Drain already-ready downstream work before an expensive logical
+        # document batch. New upstream output becomes eligible next cycle;
+        # dependency correctness stays in each projector while searchable
+        # freshness no longer waits behind an unbounded backfill.
+        embedded = passages.embed_pending(
             tenant_id=tenant_id,
-            batch_size=logical_batch_size,
+            batch_size=embedding_batch_size,
             max_batches=max_batches_per_cycle,
-            upload_concurrency=upload_concurrency,
         )
         projected = passages.project_pending(
             tenant_id=tenant_id,
@@ -46,10 +49,11 @@ def run_projection_worker(
             max_batches=max_batches_per_cycle,
             concurrency=passage_concurrency,
         )
-        embedded = passages.embed_pending(
+        documents = logical.project_pending(
             tenant_id=tenant_id,
-            batch_size=embedding_batch_size,
+            batch_size=logical_batch_size,
             max_batches=max_batches_per_cycle,
+            upload_concurrency=upload_concurrency,
         )
         result: dict[str, int | str] = {
             "status": (
@@ -57,6 +61,8 @@ def run_projection_worker(
                 if documents["status"] == "complete"
                 and projected["status"] == "complete"
                 and embedded["status"] in {"complete", "disabled"}
+                and int(documents["documents"]) == 0
+                and int(projected["passages"]) == 0
                 else "pending"
             ),
             "documents": int(documents["documents"]),
