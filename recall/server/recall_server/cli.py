@@ -34,6 +34,7 @@ from .logical_evidence_projection import CanonicalLogicalEvidenceProjector
 from .passage_index import CanonicalPassageProjector
 from .passage_projection import PassagePolicy
 from .passage_worker import run_passage_worker
+from .projection_worker import run_projection_worker
 from .federation import QUALITY_SCORES, SOURCE_FAMILIES
 from .live_providers import (
     LiveProviderError,
@@ -113,12 +114,8 @@ def main() -> None:
     canonical_embedding_worker.add_argument(
         "--max-batches-per-cycle", type=int, default=10
     )
-    canonical_embedding_worker.add_argument(
-        "--parallel-tenants", type=int, default=1
-    )
-    canonical_embedding_worker.add_argument(
-        "--interval-seconds", type=float, default=5
-    )
+    canonical_embedding_worker.add_argument("--parallel-tenants", type=int, default=1)
+    canonical_embedding_worker.add_argument("--interval-seconds", type=float, default=5)
     canonical_embedding_worker.add_argument("--once", action="store_true")
     canonical_evidence = sub.add_parser("backfill-canonical-evidence")
     canonical_evidence.add_argument("--tenant", required=True)
@@ -130,9 +127,7 @@ def main() -> None:
     canonical_evidence_worker.add_argument(
         "--max-batches-per-cycle", type=int, default=10
     )
-    canonical_evidence_worker.add_argument(
-        "--interval-seconds", type=float, default=5
-    )
+    canonical_evidence_worker.add_argument("--interval-seconds", type=float, default=5)
     canonical_evidence_worker.add_argument("--once", action="store_true")
     logical_evidence = sub.add_parser("backfill-logical-evidence")
     logical_evidence.add_argument("--tenant", required=True)
@@ -159,17 +154,13 @@ def main() -> None:
     logical_evidence_worker.add_argument(
         "--max-batches-per-cycle", type=int, default=10
     )
-    logical_evidence_worker.add_argument(
-        "--upload-concurrency", type=int, default=2
-    )
+    logical_evidence_worker.add_argument("--upload-concurrency", type=int, default=2)
     logical_evidence_worker.add_argument(
         "--cursor-fetch-rows",
         type=int,
         default=10_000,
     )
-    logical_evidence_worker.add_argument(
-        "--interval-seconds", type=float, default=5
-    )
+    logical_evidence_worker.add_argument("--interval-seconds", type=float, default=5)
     logical_evidence_worker.add_argument("--once", action="store_true")
     passage_backfill = sub.add_parser("backfill-lossless-passages")
     passage_backfill.add_argument("--tenant", required=True)
@@ -204,6 +195,19 @@ def main() -> None:
         default=5,
     )
     passage_worker.add_argument("--once", action="store_true")
+    projection_worker = sub.add_parser("projection-worker")
+    projection_worker.add_argument("--tenant", required=True)
+    projection_worker.add_argument("--target-tokens", type=int, default=1024)
+    projection_worker.add_argument("--overlap-tokens", type=int, default=128)
+    projection_worker.add_argument("--logical-batch-size", type=int, default=25)
+    projection_worker.add_argument("--passage-batch-size", type=int, default=100)
+    projection_worker.add_argument("--embedding-batch-size", type=int, default=128)
+    projection_worker.add_argument("--max-batches-per-cycle", type=int, default=10)
+    projection_worker.add_argument("--upload-concurrency", type=int, default=2)
+    projection_worker.add_argument("--passage-concurrency", type=int, default=4)
+    projection_worker.add_argument("--cursor-fetch-rows", type=int, default=10_000)
+    projection_worker.add_argument("--interval-seconds", type=float, default=5)
+    projection_worker.add_argument("--once", action="store_true")
     sub.add_parser("export")
     conformance = sub.add_parser("mcp-conformance")
     conformance.add_argument("--config", type=Path, required=True)
@@ -237,9 +241,7 @@ def main() -> None:
     revoke_token.add_argument("name")
     brain = sub.add_parser("brain-provision")
     brain.add_argument("--organization", required=True)
-    brain.add_argument(
-        "--kind", choices=("personal", "company"), required=True
-    )
+    brain.add_argument("--kind", choices=("personal", "company"), required=True)
     brain.add_argument("--display-name", required=True)
     brain.add_argument("--tenant", required=True)
     brain.add_argument("--slug", required=True)
@@ -371,9 +373,7 @@ def main() -> None:
             print(json.dumps(report, sort_keys=True))
         except ConformanceError:
             print(
-                json.dumps(
-                    {"status": "rejected", "code": "mcp_conformance_failed"}
-                ),
+                json.dumps({"status": "rejected", "code": "mcp_conformance_failed"}),
                 file=sys.stderr,
             )
             raise SystemExit(2) from None
@@ -428,12 +428,18 @@ def main() -> None:
                 json.dumps({"status": "rejected", "code": error.code}), file=sys.stderr
             )
             raise SystemExit(2) from None
-    pool_max_size = (
-        max(8, args.concurrency)
-        if args.command
-        in {"backfill-lossless-passages", "lossless-passage-worker"}
-        else None
-    )
+    pool_max_size = None
+    if args.command in {
+        "backfill-lossless-passages",
+        "lossless-passage-worker",
+    }:
+        pool_max_size = max(8, args.concurrency)
+    elif args.command == "projection-worker":
+        pool_max_size = max(
+            8,
+            args.passage_concurrency,
+            args.upload_concurrency,
+        )
     store = BrainStore(
         args.dsn,
         semantic_runtime=SemanticRuntime.from_env(),
@@ -632,6 +638,44 @@ def main() -> None:
                 once=args.once,
             )
         print(json.dumps(result, sort_keys=True))
+    elif args.command == "projection-worker":
+        logical = CanonicalLogicalEvidenceProjector(
+            store,
+            LogicalEvidenceProjectionStore(
+                build_evidence_archive_store(),
+                part_upload_concurrency=min(4, args.upload_concurrency),
+            ),
+            bound_tenant_id=args.tenant,
+            raw_archive=build_archive_store(),
+            cursor_fetch_rows=args.cursor_fetch_rows,
+        )
+        passages = CanonicalPassageProjector(
+            store,
+            LogicalEvidenceProjectionStore(build_evidence_archive_store()),
+            policy=PassagePolicy(
+                target_tokens=args.target_tokens,
+                overlap_tokens=args.overlap_tokens,
+            ),
+            bound_tenant_id=args.tenant,
+        )
+        print(
+            json.dumps(
+                run_projection_worker(
+                    logical,
+                    passages,
+                    tenant_id=args.tenant,
+                    logical_batch_size=args.logical_batch_size,
+                    passage_batch_size=args.passage_batch_size,
+                    embedding_batch_size=args.embedding_batch_size,
+                    max_batches_per_cycle=args.max_batches_per_cycle,
+                    upload_concurrency=args.upload_concurrency,
+                    passage_concurrency=args.passage_concurrency,
+                    interval_seconds=args.interval_seconds,
+                    once=args.once,
+                ),
+                sort_keys=True,
+            )
+        )
     elif args.command == "export":
         for envelope in store.export_raw():
             print(json.dumps(envelope, sort_keys=True))
@@ -678,11 +722,7 @@ def main() -> None:
             tenant_id=args.tenant,
             principal_id=args.principal,
             principal_kind=args.principal_kind,
-            scopes=[
-                scope.strip()
-                for scope in args.scopes.split(",")
-                if scope.strip()
-            ],
+            scopes=[scope.strip() for scope in args.scopes.split(",") if scope.strip()],
             expires_in_days=args.expires_in_days,
         )
         payload = (json.dumps(credential, sort_keys=True) + "\n").encode()
@@ -702,9 +742,7 @@ def main() -> None:
     elif args.command == "mcp-token-revoke":
         print(json.dumps({"revoked": store.revoke_mcp_token(args.name)}))
     elif args.command == "admin-token-create":
-        credential = ControlPlane(
-            store, SecretBox.from_env(), {}
-        ).create_admin_token(
+        credential = ControlPlane(store, SecretBox.from_env(), {}).create_admin_token(
             args.name,
             principal_id=args.principal,
             expires_in_days=args.expires_in_days,
