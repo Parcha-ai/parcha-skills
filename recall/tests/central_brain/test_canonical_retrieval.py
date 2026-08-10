@@ -344,6 +344,10 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
         )
 
         self.assertEqual(result["results"], [])
+        self.assertEqual(
+            result["diagnostics"]["sparse_status"],
+            "skipped-actor-scope",
+        )
         resolver_sql = next(
             value for value in store.sql if "FROM brain_actors actor" in value
         )
@@ -354,7 +358,7 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
             if "canonical_passage_actors" in value
             or "canonical_evidence_document_actors" in value
         )
-        self.assertEqual(arm_sql.count("actor.actor_id=ANY(%s)"), 2)
+        self.assertEqual(arm_sql.count("actor.actor_id=ANY(%s)"), 1)
         self.assertGreaterEqual(
             inspect.getsource(PassageHintRetrieval.search).count(
                 "actor.actor_id=ANY(%s)"
@@ -380,6 +384,10 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
             if "FROM canonical_passages passage" in sql
         )
         self.assertEqual(lexical_values[2], ["codex:linux:test"])
+        self.assertFalse(any(
+            "FROM canonical_chunks chunk" in sql
+            for sql in store.sql
+        ))
 
     def test_scope_is_content_free_complete_and_actor_time_bounded(self) -> None:
         store = ScopeStore()

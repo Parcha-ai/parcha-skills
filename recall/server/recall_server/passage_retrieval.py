@@ -331,10 +331,17 @@ class PassageHintRetrieval:
             except SearchDeadlineExceeded:
                 lexical = []
                 lexical_status = "deadline-exceeded"
-        with self.store.connect() as connection:
-            try:
-                sparse = self.store._execute_bounded(
-                    connection,
+        if actor_ids is not None:
+            # Actor-scoped retrieval is served from the passage projection.
+            # Its legacy chunk fallback can consume the shared deadline before
+            # dense recall gets a turn on large employee histories.
+            sparse = []
+            sparse_status = "skipped-actor-scope"
+        else:
+            with self.store.connect() as connection:
+                try:
+                    sparse = self.store._execute_bounded(
+                        connection,
                     """SELECT event.source_id,
                               evidence.logical_document_id,
                               evidence.revision,evidence.native_parent_id,
@@ -404,13 +411,13 @@ class PassageHintRetrieval:
                         until,
                         until,
                         candidate_limit,
-                    ),
-                    deadline_at,
-                ).fetchall()
-                sparse_status = "ok"
-            except SearchDeadlineExceeded:
-                sparse = []
-                sparse_status = "deadline-exceeded"
+                        ),
+                        deadline_at,
+                    ).fetchall()
+                    sparse_status = "ok"
+                except SearchDeadlineExceeded:
+                    sparse = []
+                    sparse_status = "deadline-exceeded"
 
         dense: list[dict[str, Any]] = []
         runtime = self.store.semantic_runtime
