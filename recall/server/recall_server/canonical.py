@@ -305,11 +305,10 @@ class CanonicalPlane:
                    JOIN brain_access_grants access
                      ON access.tenant_id=space.tenant_id
                     AND access.permission IN ('owner','admin','read')
-                   JOIN brain_invitations invitation
-                     ON invitation.tenant_id=space.tenant_id
-                    AND invitation.accepted_principal_id=access.principal_id
-                    AND invitation.accepted_at IS NOT NULL
-                    AND invitation.revoked_at IS NULL
+                   JOIN brain_memberships reader_membership
+                     ON reader_membership.organization_id=space.organization_id
+                    AND reader_membership.principal_id=access.principal_id
+                    AND reader_membership.role IN ('owner','admin','member')
                   WHERE space.tenant_id=%s AND space.brain_kind='company'
                ON CONFLICT(tenant_id,principal_id,source_id)
                DO UPDATE SET permission=CASE
@@ -1129,9 +1128,7 @@ class CanonicalPlane:
                     )
 
                 if new_rows:
-                    affected_native_ids = [
-                        item["native_id"] for item in new_rows
-                    ]
+                    affected_native_ids = [item["native_id"] for item in new_rows]
                     if is_tombstone_batch:
                         affected_native_ids = _linked_native_ids_batch(
                             connection,
