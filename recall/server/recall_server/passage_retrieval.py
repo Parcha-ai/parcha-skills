@@ -196,6 +196,7 @@ class PassageHintRetrieval:
         policy_fingerprint: str,
         actor_ids: tuple[str, ...] | None = None,
         actor_relations: tuple[str, ...] | None = None,
+        actor_scope: bool = False,
     ) -> None:
         if actor_ids is not None and (
             not isinstance(actor_ids, tuple)
@@ -211,12 +212,15 @@ class PassageHintRetrieval:
             or actor_ids is None
         ):
             raise ValueError("invalid actor relation scope")
+        if not isinstance(actor_scope, bool):
+            raise ValueError("invalid actor scope")
         self.store = store
         self.tenant_id = tenant_id
         self.sources = sources
         self.policy_fingerprint = policy_fingerprint
         self.actor_ids = actor_ids
         self.actor_relations = actor_relations
+        self.actor_scope = actor_scope or actor_ids is not None
 
     def search(
         self,
@@ -331,7 +335,7 @@ class PassageHintRetrieval:
             except SearchDeadlineExceeded:
                 lexical = []
                 lexical_status = "deadline-exceeded"
-        if actor_ids is not None:
+        if self.actor_scope:
             # Actor-scoped retrieval is served from the passage projection.
             # Its legacy chunk fallback can consume the shared deadline before
             # dense recall gets a turn on large employee histories.

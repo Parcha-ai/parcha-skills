@@ -586,6 +586,35 @@ class BoundCanonicalRetrieval:
             return []
         return [row["source_id"] for row in rows]
 
+    def _sources_exclusively_bound_to_actors(
+        self,
+        sources: list[str],
+        actor_ids: tuple[str, ...],
+        deadline_at: float,
+    ) -> bool:
+        """Whether every selected source belongs only to the target actor."""
+
+        if not sources or not actor_ids:
+            return False
+        try:
+            with self.store.connect() as connection:
+                rows = self.store._execute_bounded(
+                    connection,
+                    """SELECT binding.source_id
+                         FROM canonical_source_actor_bindings binding
+                        WHERE binding.tenant_id=%s
+                          AND binding.source_id=ANY(%s)
+                        GROUP BY binding.source_id
+                       HAVING count(DISTINCT binding.actor_id)=1
+                          AND bool_and(binding.actor_id=ANY(%s))
+                        ORDER BY binding.source_id""",
+                    (self.tenant_id, sources, list(actor_ids)),
+                    deadline_at,
+                ).fetchall()
+        except SearchDeadlineExceeded:
+            return False
+        return {row["source_id"] for row in rows} == set(sources)
+
     def _sources(
         self,
         *,
@@ -1291,13 +1320,25 @@ class BoundCanonicalRetrieval:
                     (self.tenant_id, person.strip(), person.strip()),
                 ).fetchall()
             actor_ids = tuple(row["actor_id"] for row in rows)
+        passage_actor_ids = actor_ids
+        if (
+            relation is None
+            and actor_ids is not None
+            and self._sources_exclusively_bound_to_actors(
+                sources,
+                actor_ids,
+                deadline_at,
+            )
+        ):
+            passage_actor_ids = None
         response = PassageHintRetrieval(
             self.store,
             tenant_id=self.tenant_id,
             sources=sources,
             policy_fingerprint=self.passage_policy.fingerprint,
-            actor_ids=actor_ids,
+            actor_ids=passage_actor_ids,
             actor_relations=(relation,) if relation is not None else None,
+            actor_scope=person is not None,
         ).search(
             query,
             lexical_query=lexical_query,
