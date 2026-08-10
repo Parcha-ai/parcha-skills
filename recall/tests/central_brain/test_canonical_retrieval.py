@@ -85,6 +85,10 @@ class RecordingStore:
 
 
 class ActorRecordingStore(RecordingStore):
+    def __init__(self, *, exclusive_binding: bool = True) -> None:
+        super().__init__()
+        self.exclusive_binding = exclusive_binding
+
     @contextmanager
     def connect(self):
         yield self
@@ -106,6 +110,12 @@ class ActorRecordingStore(RecordingStore):
         self.deadlines.append(deadline_at)
         if "FROM canonical_passage_actors linked" in sql:
             return Rows([{"source_id": "codex:linux:test"}])
+        if "FROM canonical_source_actor_bindings binding" in sql:
+            return Rows(
+                [{"source_id": "codex:linux:test"}]
+                if self.exclusive_binding
+                else []
+            )
         return Rows([])
 
 
@@ -344,6 +354,10 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
         )
 
         self.assertEqual(result["results"], [])
+        self.assertEqual(
+            result["diagnostics"]["sparse_status"],
+            "skipped-actor-scope",
+        )
         resolver_sql = next(
             value for value in store.sql if "FROM brain_actors actor" in value
         )
@@ -354,7 +368,7 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
             if "canonical_passage_actors" in value
             or "canonical_evidence_document_actors" in value
         )
-        self.assertEqual(arm_sql.count("actor.actor_id=ANY(%s)"), 2)
+        self.assertEqual(arm_sql.count("actor.actor_id=ANY(%s)"), 1)
         self.assertGreaterEqual(
             inspect.getsource(PassageHintRetrieval.search).count(
                 "actor.actor_id=ANY(%s)"
@@ -380,6 +394,67 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
             if "FROM canonical_passages passage" in sql
         )
         self.assertEqual(lexical_values[2], ["codex:linux:test"])
+        self.assertFalse(any(
+            "FROM canonical_chunks chunk" in sql
+            for sql in store.sql
+        ))
+
+    def test_exclusive_person_sources_skip_redundant_passage_actor_filter(
+        self,
+    ) -> None:
+        store = ActorRecordingStore()
+        retrieval = BoundCanonicalRetrieval(
+            store,
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=(
+                "codex:linux:test",
+                "claude:linux:unrelated",
+            ),
+        )
+
+        result = retrieval.passage_hints(
+            "What did Alice work on?",
+            filters={"person": "Alice"},
+        )
+
+        self.assertEqual(
+            result["diagnostics"]["sparse_status"],
+            "skipped-actor-scope",
+        )
+        lexical_values = next(
+            values
+            for sql, values in zip(store.sql, store.values, strict=True)
+            if "FROM canonical_passages passage" in sql
+        )
+        self.assertEqual(lexical_values[2], ["codex:linux:test"])
+        self.assertIsNone(lexical_values[4])
+
+    def test_shared_person_source_keeps_exact_passage_actor_filter(
+        self,
+    ) -> None:
+        store = ActorRecordingStore(exclusive_binding=False)
+        retrieval = BoundCanonicalRetrieval(
+            store,
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=("codex:linux:test",),
+        )
+
+        retrieval.passage_hints(
+            "What did Alice work on?",
+            filters={"person": "Alice"},
+        )
+
+        lexical_values = next(
+            values
+            for sql, values in zip(store.sql, store.values, strict=True)
+            if "FROM canonical_passages passage" in sql
+        )
+        self.assertEqual(
+            lexical_values[4],
+            ["actor_0123456789abcdef0123456789abcdef"],
+        )
 
     def test_scope_is_content_free_complete_and_actor_time_bounded(self) -> None:
         store = ScopeStore()
