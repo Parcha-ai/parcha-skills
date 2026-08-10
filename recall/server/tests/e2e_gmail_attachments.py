@@ -233,8 +233,12 @@ def main() -> None:
             "principal_id": principal_id,
             "authorized_sources": [source_id],
         })
-        attachment_hits = retrieval.search(marker, {"source_id": source_id})["results"]
-        parent_hits = retrieval.search(
+        # This connector lifecycle intentionally stops before the asynchronous
+        # logical-document and passage projectors covered by their own E2E.
+        attachment_hits = retrieval._legacy_chunk_search_for_eval(
+            marker, {"source_id": source_id},
+        )["results"]
+        parent_hits = retrieval._legacy_chunk_search_for_eval(
             "Synthetic parent message body", {"source_id": source_id},
         )["results"]
         if not attachment_hits or retrieval.show(attachment_hits[0]["receipt"]) is None:
@@ -254,8 +258,10 @@ def main() -> None:
         if deleted["acked"] != 1 or deleted["archived"] != 1:
             raise RuntimeError("upstream Gmail tombstone did not commit")
         if (
-            retrieval.search(marker, {"source_id": source_id})["results"]
-            or retrieval.search(
+            retrieval._legacy_chunk_search_for_eval(
+                marker, {"source_id": source_id},
+            )["results"]
+            or retrieval._legacy_chunk_search_for_eval(
                 "Synthetic parent message body", {"source_id": source_id},
             )["results"]
         ):
@@ -278,7 +284,12 @@ def main() -> None:
     })
     if forget["raw_deleted"] != 3 or forget["projections_deleted"] != 0:
         raise RuntimeError("parent forget did not cascade to attachment artifacts")
-    if fake_r2.objects or retrieval.search(marker, {"source_id": source_id})["results"]:
+    if (
+        fake_r2.objects
+        or retrieval._legacy_chunk_search_for_eval(
+            marker, {"source_id": source_id},
+        )["results"]
+    ):
         raise RuntimeError("forgotten attachment remained retrievable")
     for native_id, payload, media_type in (
         (parent_native_id, b"parent", "application/json"),

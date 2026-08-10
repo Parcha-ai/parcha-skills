@@ -154,6 +154,7 @@ ALL_READ_TOOLS = (
                         "source_id": {"type": "string"},
                         "source_family": {"type": "string"},
                         "source_alias": {"type": "string"},
+                        "source_connector": {"type": "string"},
                         "person": {"type": "string", "maxLength": 256},
                         "person_relation": {
                             "type": "string",
@@ -183,11 +184,68 @@ ALL_READ_TOOLS = (
         "annotations": {"readOnlyHint": True},
     },
     {
+        "name": "recall_scope",
+        "description": (
+            "Enumerate the complete authorized full-document scope for exact "
+            "person, source, and time constraints without semantic ranking or "
+            "document prose. Use this for broad coverage questions, then pass "
+            "the returned logical_document_id values to recall_exec_map. Page "
+            "until complete is true."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "filters": {
+                    "type": "object",
+                    "default": {},
+                    "properties": {
+                        "since": TIME_BOUND_SCHEMA,
+                        "until": TIME_BOUND_SCHEMA,
+                        "source_id": {"type": "string"},
+                        "source_family": {"type": "string"},
+                        "source_alias": {"type": "string"},
+                        "source_connector": {"type": "string"},
+                        "person": {"type": "string", "maxLength": 256},
+                        "person_relation": {
+                            "type": "string",
+                            "enum": [
+                                "author",
+                                "contributor",
+                                "owner",
+                                "organizer",
+                                "participant",
+                                "attendee",
+                            ],
+                        },
+                    },
+                    "additionalProperties": False,
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 80,
+                    "default": 40,
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 10000,
+                    "default": 0,
+                },
+            },
+            "additionalProperties": False,
+        },
+        "outputSchema": {"type": "object"},
+        "annotations": {"readOnlyHint": True},
+    },
+    {
         "name": "recall_exec",
         "description": (
             "Run bounded read-only shell over exact full Recall documents selected "
             "by recall_search. Pass only logical_document_id values returned by "
             "search; ordered aliases are mounted at /docs/d1 through /docs/d20. "
+            "Output is shared across targets, so use recall_exec_map with "
+            "shard_size=1 when the same inspection must cover several candidates. "
             "For portable verified search, run `recall-scan --broad --fixed "
             "--pattern TERM --limit N`; ordinary shell and Python are also available. "
             "The sandbox has no network and cannot mutate evidence. Search hits are "
@@ -222,6 +280,71 @@ ALL_READ_TOOLS = (
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 16000,
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 30,
+                    "default": 20,
+                },
+            },
+            "required": ["targets", "program"],
+            "additionalProperties": False,
+        },
+        "outputSchema": {"type": "object"},
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "recall_exec_map",
+        "description": (
+            "Fan one agent-authored bounded read-only shell program across up "
+            "to 80 exact full documents from recall_scope or recall_search. "
+            "Use shard_size=1 to inspect several independent search candidates "
+            "without a large earlier document consuming another's output budget. "
+            "Recall splits the admitted targets into bounded shards and runs Archil "
+            "sandboxes concurrently; aliases remain stable at /docs/d1 through "
+            "/docs/d80. The sandbox is read-only and networkless. Each shard "
+            "returns bounded stdout and only verified opened_receipts may be cited."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "targets": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 80,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "logical_document_id": {
+                                "type": "string",
+                                "pattern": r"^ldoc_[0-9a-f]{32}$",
+                            },
+                            "alias": {
+                                "type": "string",
+                                "pattern": r"^d(?:[1-9]|[1-7][0-9]|80)$",
+                            },
+                        },
+                        "required": ["logical_document_id", "alias"],
+                        "additionalProperties": False,
+                    },
+                },
+                "program": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 16000,
+                },
+                "max_parallel": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 8,
+                    "default": 4,
+                },
+                "shard_size": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 20,
+                    "default": 20,
                 },
                 "timeout_seconds": {
                     "type": "integer",
@@ -293,8 +416,25 @@ ALL_READ_TOOLS = (
         "annotations": {"readOnlyHint": True},
     },
 )
+
+RETRIEVAL_INSTRUCTIONS = (
+    "Use recall_search to find likely full documents, then inspect exact records "
+    "with recall_show or recall_exec before answering. Search hits are hints, not "
+    "proof. Treat each named part of the question as an evidence gap and inspect "
+    "enough distinct candidates to support each part; the best evidence may rank "
+    "below the first result. Never infer that an unfamiliar project or person name "
+    "is an alias: material claims require opened evidence using that name or an "
+    "explicit alias, otherwise report insufficient evidence. For one named topic, "
+    "make no more than three focused searches and stop once the evidence supports "
+    "the answer. Use recall_exec_map with shard_size=1 when the same focused check "
+    "must cover several independent candidates; pair recall_scope with it for broad "
+    "person, source, or time coverage. Cite only receipts "
+    "returned in opened_receipts."
+)
 CANONICAL_ONLY_READ_TOOLS = frozenset({
     "recall_exec",
+    "recall_exec_map",
+    "recall_scope",
     "recall_session_context",
 })
 CANONICAL_READ_TOOLS = tuple(
@@ -424,6 +564,41 @@ def _reject_extra(arguments: dict, allowed: frozenset[str]) -> None:
         raise McpProtocolError(-32602, f"unknown tool arguments: {', '.join(unknown)}")
 
 
+def _exec_targets(
+    value: Any,
+    *,
+    maximum: int,
+) -> tuple[tuple[str, ...], dict[str, str]]:
+    if not isinstance(value, list) or not 1 <= len(value) <= maximum:
+        raise McpProtocolError(
+            -32602,
+            f"targets must contain 1 to {maximum} documents",
+        )
+    logical_document_ids: list[str] = []
+    document_aliases: dict[str, str] = {}
+    for target in value:
+        if not isinstance(target, dict):
+            raise McpProtocolError(-32602, "each target must be an object")
+        _reject_extra(target, frozenset({"logical_document_id", "alias"}))
+        document_id = _string(target.get("logical_document_id"), "logical_document_id")
+        alias = _string(target.get("alias"), "alias")
+        if re.fullmatch(r"ldoc_[0-9a-f]{32}", document_id) is None:
+            raise McpProtocolError(-32602, "logical_document_id is invalid")
+        if (
+            re.fullmatch(r"d[1-9][0-9]?", alias) is None
+            or int(alias[1:]) > maximum
+        ):
+            raise McpProtocolError(
+                -32602,
+                f"alias must be d1 through d{maximum}",
+            )
+        if document_id in document_aliases or alias in document_aliases.values():
+            raise McpProtocolError(-32602, "targets must be unique")
+        logical_document_ids.append(document_id)
+        document_aliases[document_id] = alias
+    return tuple(logical_document_ids), document_aliases
+
+
 def _call_tool(
     store,
     principal: dict,
@@ -434,6 +609,24 @@ def _call_tool(
         "authorized_sources",
         principal.get("source_id"),
     )
+    if name == "recall_scope":
+        _reject_extra(arguments, frozenset({"filters", "limit", "offset"}))
+        filters = _object(arguments.get("filters", {}), "filters")
+        limit = _integer(
+            arguments.get("limit"),
+            "limit",
+            default=40,
+            minimum=1,
+            maximum=80,
+        )
+        offset = _integer(
+            arguments.get("offset"),
+            "offset",
+            default=0,
+            minimum=0,
+            maximum=10_000,
+        )
+        return store.scope_documents(filters=filters, limit=limit, offset=offset)
     if name == "recall_search":
         _reject_extra(arguments, frozenset({"query", "filters", "limit"}))
         query = _string(arguments.get("query"), "query")
@@ -450,28 +643,10 @@ def _call_tool(
         return store.search(query, filters, limit, authorized_source)
     if name == "recall_exec":
         _reject_extra(arguments, frozenset({"targets", "program", "timeout_seconds"}))
-        targets = arguments.get("targets")
-        if not isinstance(targets, list) or not 1 <= len(targets) <= 20:
-            raise McpProtocolError(-32602, "targets must contain 1 to 20 documents")
-        logical_document_ids: list[str] = []
-        document_aliases: dict[str, str] = {}
-        for target in targets:
-            if not isinstance(target, dict):
-                raise McpProtocolError(-32602, "each target must be an object")
-            _reject_extra(target, frozenset({"logical_document_id", "alias"}))
-            document_id = _string(
-                target.get("logical_document_id"),
-                "logical_document_id",
-            )
-            alias = _string(target.get("alias"), "alias")
-            if re.fullmatch(r"ldoc_[0-9a-f]{32}", document_id) is None:
-                raise McpProtocolError(-32602, "logical_document_id is invalid")
-            if re.fullmatch(r"d(?:[1-9]|1[0-9]|20)", alias) is None:
-                raise McpProtocolError(-32602, "alias must be d1 through d20")
-            if document_id in document_aliases or alias in document_aliases.values():
-                raise McpProtocolError(-32602, "targets must be unique")
-            logical_document_ids.append(document_id)
-            document_aliases[document_id] = alias
+        logical_document_ids, document_aliases = _exec_targets(
+            arguments.get("targets"),
+            maximum=20,
+        )
         program = _string(arguments.get("program"), "program")
         if len(program.encode()) > 16_000:
             raise McpProtocolError(-32602, "program must be at most 16000 bytes")
@@ -485,7 +660,7 @@ def _call_tool(
         try:
             return store.execute_agent_program(
                 program,
-                logical_document_ids=tuple(logical_document_ids),
+                logical_document_ids=logical_document_ids,
                 document_aliases=document_aliases,
                 record_spans={document_id: () for document_id in logical_document_ids},
                 routing_receipts={
@@ -495,6 +670,56 @@ def _call_tool(
             )
         except DeepInspectionError:
             raise McpProtocolError(-32603, "recall_exec_failed") from None
+    if name == "recall_exec_map":
+        _reject_extra(
+            arguments,
+            frozenset({
+                "targets",
+                "program",
+                "max_parallel",
+                "shard_size",
+                "timeout_seconds",
+            }),
+        )
+        logical_document_ids, document_aliases = _exec_targets(
+            arguments.get("targets"),
+            maximum=80,
+        )
+        program = _string(arguments.get("program"), "program")
+        if len(program.encode()) > 16_000:
+            raise McpProtocolError(-32602, "program must be at most 16000 bytes")
+        max_parallel = _integer(
+            arguments.get("max_parallel"),
+            "max_parallel",
+            default=4,
+            minimum=1,
+            maximum=8,
+        )
+        shard_size = _integer(
+            arguments.get("shard_size"),
+            "shard_size",
+            default=20,
+            minimum=1,
+            maximum=20,
+        )
+        timeout_seconds = _integer(
+            arguments.get("timeout_seconds"),
+            "timeout_seconds",
+            default=20,
+            minimum=1,
+            maximum=30,
+        )
+        try:
+            return store.execute_agent_program_parallel(
+                program,
+                logical_document_ids=logical_document_ids,
+                document_aliases=document_aliases,
+                timeout_seconds=timeout_seconds,
+                max_parallel=max_parallel,
+                shard_size=shard_size,
+            )
+        except DeepInspectionError:
+            raise McpProtocolError(-32603, "recall_exec_map_failed") from None
     if name == "recall_session_context":
         _reject_extra(arguments, frozenset({"target", "before", "after"}))
         target = _string(arguments.get("target"), "target")
@@ -690,7 +915,7 @@ def dispatch(
                     "version": "1",
                 },
             },
-            "instructions": "Private, tenant- and source-scoped evidence retrieval.",
+            "instructions": RETRIEVAL_INSTRUCTIONS,
             "ttlMs": 300_000,
             "cacheScope": "private",
         }
@@ -713,6 +938,7 @@ def dispatch(
                 "version": "1",
                 "description": "Private, tenant- and source-scoped evidence retrieval.",
             },
+            "instructions": RETRIEVAL_INSTRUCTIONS,
         }
     elif method == "ping":
         if protocol_version == LATEST_PROTOCOL_VERSION:

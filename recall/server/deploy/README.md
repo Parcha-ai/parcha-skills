@@ -64,7 +64,7 @@ infrastructure. The example is synthetic; a live manifest belongs in a private m
 location and contains references, never credential values.
 
 The production database gate requires a standard PostgreSQL URL with
-`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 47,
+`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 48,
 pgvector 0.8.0 or newer, and a runtime role without superuser, database/role creation,
 replication, or RLS-bypass privilege:
 

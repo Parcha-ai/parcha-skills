@@ -227,7 +227,11 @@ class PassageHintRetrieval:
         until: str | None,
         limit: int,
         include_arms: bool = False,
+        deadline_at: float | None = None,
     ) -> dict[str, Any]:
+        started_at = time.monotonic()
+        if deadline_at is None:
+            deadline_at = started_at + self.store.search_deadline_ms / 1000
         candidate_limit = min(400, max(80, limit * 20))
         actor_ids = list(self.actor_ids) if self.actor_ids is not None else None
         actor_relations = (
@@ -286,6 +290,18 @@ class PassageHintRetrieval:
                           )
                           AND passage.search_vector @@
                               plainto_tsquery('simple',%s)
+                          AND NOT EXISTS (
+                              SELECT 1
+                                FROM unnest(passage.receipts)
+                                     AS passage_receipt(receipt)
+                                LEFT JOIN canonical_chunks live_chunk
+                                  ON live_chunk.tenant_id=passage.tenant_id
+                                 AND live_chunk.source_id=passage.source_id
+                                 AND live_chunk.receipt=
+                                     passage_receipt.receipt
+                                 AND live_chunk.deleted_at IS NULL
+                               WHERE live_chunk.receipt IS NULL
+                          )
                           AND (%s::timestamptz IS NULL
                                OR passage.last_occurred_at>=%s)
                           AND (%s::timestamptz IS NULL
@@ -309,8 +325,7 @@ class PassageHintRetrieval:
                         until,
                         candidate_limit,
                     ),
-                    time.monotonic()
-                    + self.store.search_deadline_ms / 1000,
+                    deadline_at,
                 ).fetchall()
                 lexical_status = "ok"
             except SearchDeadlineExceeded:
@@ -390,8 +405,7 @@ class PassageHintRetrieval:
                         until,
                         candidate_limit,
                     ),
-                    time.monotonic()
-                    + self.store.search_deadline_ms / 1000,
+                    deadline_at,
                 ).fetchall()
                 sparse_status = "ok"
             except SearchDeadlineExceeded:
@@ -439,6 +453,20 @@ class PassageHintRetrieval:
                                   AND embedding.source_id=ANY(%s)
                                   AND embedding.runtime_fingerprint=%s
                                   AND projected.policy_fingerprint=%s
+                                  AND NOT EXISTS (
+                                      SELECT 1
+                                        FROM unnest(passage.receipts)
+                                             AS passage_receipt(receipt)
+                                        LEFT JOIN canonical_chunks live_chunk
+                                          ON live_chunk.tenant_id=
+                                             passage.tenant_id
+                                         AND live_chunk.source_id=
+                                             passage.source_id
+                                         AND live_chunk.receipt=
+                                             passage_receipt.receipt
+                                         AND live_chunk.deleted_at IS NULL
+                                       WHERE live_chunk.receipt IS NULL
+                                  )
                                   AND (%s::timestamptz IS NULL
                                        OR passage.last_occurred_at>=%s)
                                   AND (%s::timestamptz IS NULL
@@ -496,9 +524,25 @@ class PassageHintRetrieval:
                                       embedding.embedding
                                           <=> %s::halfvec AS distance
                                  FROM canonical_passage_embeddings embedding
+                                 JOIN canonical_passages passage
+                                   USING(tenant_id,source_id,passage_id)
                                 WHERE embedding.tenant_id=%s
                                   AND embedding.source_id=ANY(%s)
                                   AND embedding.runtime_fingerprint=%s
+                                  AND NOT EXISTS (
+                                      SELECT 1
+                                        FROM unnest(passage.receipts)
+                                             AS passage_receipt(receipt)
+                                        LEFT JOIN canonical_chunks live_chunk
+                                          ON live_chunk.tenant_id=
+                                             passage.tenant_id
+                                         AND live_chunk.source_id=
+                                             passage.source_id
+                                         AND live_chunk.receipt=
+                                             passage_receipt.receipt
+                                         AND live_chunk.deleted_at IS NULL
+                                       WHERE live_chunk.receipt IS NULL
+                                  )
                                 ORDER BY embedding.embedding
                                          <=> %s::halfvec
                                 LIMIT %s
@@ -543,6 +587,20 @@ class PassageHintRetrieval:
                                        logical_document_id,revision
                                    )
                                 WHERE projected.policy_fingerprint=%s
+                                  AND NOT EXISTS (
+                                      SELECT 1
+                                        FROM unnest(passage.receipts)
+                                             AS passage_receipt(receipt)
+                                        LEFT JOIN canonical_chunks live_chunk
+                                          ON live_chunk.tenant_id=
+                                             passage.tenant_id
+                                         AND live_chunk.source_id=
+                                             passage.source_id
+                                         AND live_chunk.receipt=
+                                             passage_receipt.receipt
+                                         AND live_chunk.deleted_at IS NULL
+                                       WHERE live_chunk.receipt IS NULL
+                                  )
                                   AND (%s::timestamptz IS NULL
                                        OR passage.last_occurred_at>=%s)
                                   AND (%s::timestamptz IS NULL
@@ -568,10 +626,7 @@ class PassageHintRetrieval:
                             until,
                             candidate_limit,
                         ),
-                        (
-                            time.monotonic()
-                            + self.store.search_deadline_ms / 1000
-                        ),
+                        deadline_at,
                     ).fetchall()
             except (
                 json.JSONDecodeError,
@@ -602,6 +657,16 @@ class PassageHintRetrieval:
                 "dense_status": dense_status,
                 "passage_lexical_status": lexical_status,
                 "sparse_status": sparse_status,
+                "elapsed_ms": round(
+                    (time.monotonic() - started_at) * 1000,
+                    3,
+                ),
+                "deadline_ms": self.store.search_deadline_ms,
+                "deadline_exceeded": "deadline-exceeded" in {
+                    dense_status,
+                    lexical_status,
+                    sparse_status,
+                },
             },
         }
         if include_arms:
@@ -757,10 +822,24 @@ class PassageHintRetrieval:
                                       AS distance
                              FROM canonical_passage_embedding_representations
                                   represented
+                             JOIN canonical_passages passage
+                               USING(tenant_id,source_id,passage_id)
                             WHERE represented.tenant_id=%s
                               AND represented.source_id=ANY(%s)
                               AND represented.representation_fingerprint=%s
                               AND represented.{vector_column} IS NOT NULL
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                    FROM unnest(passage.receipts)
+                                         AS passage_receipt(receipt)
+                                    LEFT JOIN canonical_chunks live_chunk
+                                      ON live_chunk.tenant_id=passage.tenant_id
+                                     AND live_chunk.source_id=passage.source_id
+                                     AND live_chunk.receipt=
+                                         passage_receipt.receipt
+                                     AND live_chunk.deleted_at IS NULL
+                                   WHERE live_chunk.receipt IS NULL
+                              )
                             ORDER BY represented.{vector_column}
                                      <=> %s::halfvec
                             LIMIT %s
@@ -795,6 +874,18 @@ class PassageHintRetrieval:
                                    logical_document_id,revision
                                )
                             WHERE projected.policy_fingerprint=%s
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                    FROM unnest(passage.receipts)
+                                         AS passage_receipt(receipt)
+                                    LEFT JOIN canonical_chunks live_chunk
+                                      ON live_chunk.tenant_id=passage.tenant_id
+                                     AND live_chunk.source_id=passage.source_id
+                                     AND live_chunk.receipt=
+                                         passage_receipt.receipt
+                                     AND live_chunk.deleted_at IS NULL
+                                   WHERE live_chunk.receipt IS NULL
+                              )
                               AND (%s::timestamptz IS NULL
                                    OR passage.last_occurred_at>=%s)
                               AND (%s::timestamptz IS NULL
@@ -885,6 +976,18 @@ class PassageHintRetrieval:
                               AND projected.policy_fingerprint=%s
                               AND context.search_vector @@
                                   plainto_tsquery('simple',%s)
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                    FROM unnest(passage.receipts)
+                                         AS passage_receipt(receipt)
+                                    LEFT JOIN canonical_chunks live_chunk
+                                      ON live_chunk.tenant_id=passage.tenant_id
+                                     AND live_chunk.source_id=passage.source_id
+                                     AND live_chunk.receipt=
+                                         passage_receipt.receipt
+                                     AND live_chunk.deleted_at IS NULL
+                                   WHERE live_chunk.receipt IS NULL
+                              )
                               AND (%s::timestamptz IS NULL
                                    OR passage.last_occurred_at>=%s)
                               AND (%s::timestamptz IS NULL
