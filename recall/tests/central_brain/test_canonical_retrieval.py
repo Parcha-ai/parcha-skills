@@ -99,6 +99,15 @@ class ActorRecordingStore(RecordingStore):
             }])
         return Rows([])
 
+    def _execute_bounded(self, _connection, sql, values, deadline_at):
+        self.sql.append(" ".join(sql.split()))
+        self.values.append(tuple(values))
+        self.deadlines = getattr(self, "deadlines", [])
+        self.deadlines.append(deadline_at)
+        if "FROM canonical_passage_actors linked" in sql:
+            return Rows([{"source_id": "codex:linux:test"}])
+        return Rows([])
+
 
 class AgentExecStore:
     semantic_runtime = None
@@ -323,7 +332,10 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
             store,
             tenant_id="tenant:test",
             principal_id="principal:test",
-            authorized_sources=("codex:linux:test",),
+            authorized_sources=(
+                "codex:linux:test",
+                "claude:linux:unrelated",
+            ),
         )
 
         result = retrieval.passage_hints(
@@ -353,6 +365,21 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
             "actor_0123456789abcdef0123456789abcdef",
             repr(store.values),
         )
+        linked_source_values = next(
+            values
+            for sql, values in zip(store.sql, store.values, strict=True)
+            if "FROM canonical_passage_actors linked" in sql
+        )
+        self.assertEqual(
+            linked_source_values[1],
+            ["claude:linux:unrelated", "codex:linux:test"],
+        )
+        lexical_values = next(
+            values
+            for sql, values in zip(store.sql, store.values, strict=True)
+            if "FROM canonical_passages passage" in sql
+        )
+        self.assertEqual(lexical_values[2], ["codex:linux:test"])
 
     def test_scope_is_content_free_complete_and_actor_time_bounded(self) -> None:
         store = ScopeStore()
