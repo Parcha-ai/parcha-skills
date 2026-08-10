@@ -342,6 +342,7 @@ export XDG_STATE_HOME="$TEST_ROOT/state"
 export HERMES_HOME="$TEST_ROOT/hermes"
 export CODEX_HOME="$TEST_ROOT/codex"
 export HERMES_BIN="$TEST_ROOT/bin/hermes"
+export TETHER_TEST_SYSTEM_GATEWAY_ACTIVE=0
 install -d -m 700 "$HOME" "$CODEX_HOME" "$(dirname "$HERMES_BIN")"
 
 cat >"$HERMES_BIN" <<'EOF'

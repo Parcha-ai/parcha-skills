@@ -18,6 +18,9 @@ max_reply_sentences = 3
 retention_days = 30
 codex_binary = "codex"
 claude_binary = "claude"
+# For a long-lived gateway, prefer an absolute stable launcher when its PATH
+# can resolve a different installed agent version than interactive shells.
+# claude_binary = "/home/you/.local/bin/claude"
 codex_resume_args = []
 claude_resume_args = []
 # Zellij-only bridges are created only when the pane currently runs one of

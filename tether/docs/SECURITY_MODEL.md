@@ -1,6 +1,6 @@
 # Tether Security Model
 
-This document describes the security boundary of Tether `0.2.0-beta.1`,
+This document describes the security boundary of Tether `0.3.0-beta.1`,
 binding protocol 2, and database schema 15. The implementation and tests are
 authoritative.
 
@@ -161,6 +161,11 @@ Zellij identity includes host boot ID, PID and start ticks, executable identity
 and path hash, terminal, session, pane, and adapter. Tether re-resolves the
 foreground process instead of trusting a pane label or stale PID.
 
+Herdr identity includes a private same-user socket, protocol, terminal and pane
+IDs, an occupant-bound agent name, the official native session reference, and
+the same process-incarnation evidence. Tether does not trust Herdr display
+titles or a reusable pane ID as authorization.
+
 ### Verified Zellij delivery
 
 Tether writes the request to a private inbox, stages an instruction, verifies
@@ -173,6 +178,27 @@ The foreground process can change between the last check and Enter, and a
 screen marker cannot prove semantic consumption. An ambiguous submission
 becomes `uncertain` and is not retried automatically.
 
+### Verified Herdr delivery
+
+Tether revalidates the named agent, official native session, terminal, adapter,
+and process before calling Herdr `agent.prompt`, then validates the returned
+agent and process again. A live handoff may rotate only Herdr's internal
+terminal ID; Tether accepts that rotation only when the occupant name, native
+session, and remaining process-incarnation evidence are unchanged. Prompt text
+stays in the private socket request body.
+Cancellation uses `agent.send_keys` only after the same endpoint check.
+
+Herdr has no conditional expected-revision prompt or durable Tether turn ID.
+The occupant-bound name prevents a replacement agent from inheriting the old
+target, while ambiguous acceptance remains durable `uncertain` state requiring
+operator resolution.
+
+Herdr plugin commands run unsandboxed as the current Unix user. Tether treats
+their pane, selection, and clicked-link context only as a hint and revalidates
+the exact endpoint. Selected Slack links cross into the popup through a
+single-use owner-only file; message bodies use stdin and neither appears in
+Herdr's plugin command argv or command log.
+
 ### Detached continuation
 
 Detached Codex and Claude Code continuations use configured binaries, pinned
@@ -184,7 +210,8 @@ Evidence:
 [`tests/test_process_identity_hardening.py`](../tests/test_process_identity_hardening.py),
 [`tests/test_cwd_identity.py`](../tests/test_cwd_identity.py),
 [`tests/test_native_delivery_safety.py`](../tests/test_native_delivery_safety.py),
-and [`tests/test_zellij_cancellation.py`](../tests/test_zellij_cancellation.py).
+[`tests/test_herdr_endpoint.py`](../tests/test_herdr_endpoint.py), and
+[`tests/test_zellij_cancellation.py`](../tests/test_zellij_cancellation.py).
 
 ## Credentials and sensitive data
 

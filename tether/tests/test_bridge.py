@@ -327,9 +327,9 @@ class StoreTest(unittest.TestCase):
                 self.assertEqual(
                     {key: canonical[key] for key in source},
                     source,
-                    "canonical BindingV2 metadata may be added, but source identity must be preserved",
+                    "canonical BindingV3 metadata may be added, but source identity must be preserved",
                 )
-                self.assertEqual(canonical["binding_version"], "2")
+                self.assertEqual(canonical["binding_version"], "3")
                 self.assertEqual(canonical["binding_state"], "verified")
         _, legacy_headless = self.runtime._canonical_source(
             "headless_run",
@@ -775,7 +775,7 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(bridge.owner_user_id, "*", "Hermes's explicit allowlist is shared by default")
         self.assertEqual(status["allowed_user_count"], 2)
         self.assertEqual(status["implementation"], "tether")
-        self.assertEqual(status["protocol_version"], 5)
+        self.assertEqual(status["protocol_version"], 6)
         self.assertNotIn("allowed_users", status, "status reports readiness, never identities")
 
     def test_shared_channel_rejects_accidental_owner_restriction(self):
@@ -1484,9 +1484,20 @@ class CredentialBoundaryTest(unittest.TestCase):
         stale.chmod(0o600)
         os.utime(stale, (0, 0))
 
+        staged_instruction = ""
+        dump_snapshots = []
+
         def run(command, **_kwargs):
+            nonlocal staged_instruction
+            if "write-chars" in command:
+                staged_instruction += command[-1]
             if "dump-screen" in command:
-                return types.SimpleNamespace(stdout=f"prompt contains {marker}", stderr="", returncode=0)
+                dump_snapshots.append(staged_instruction)
+                return types.SimpleNamespace(
+                    stdout=staged_instruction,
+                    stderr="",
+                    returncode=0,
+                )
             return types.SimpleNamespace(stdout="", stderr="", returncode=0)
 
         with mock.patch.object(
@@ -1503,12 +1514,31 @@ class CredentialBoundaryTest(unittest.TestCase):
         commands = [call.args[0] for call in invoked.call_args_list]
         self.assertTrue(any("write-chars" in command for command in commands))
         self.assertTrue(any("send-keys" in command and "Enter" in command for command in commands))
-        self.assertEqual(sum("dump-screen" in command for command in commands), 2)
+        dump_commands = [
+            command for command in commands if "dump-screen" in command
+        ]
+        self.assertEqual(len(dump_commands), 2)
+        self.assertNotIn("--full", dump_commands[0])
+        self.assertIn("--full", dump_commands[1])
         self.assertGreaterEqual(identity.call_count, 2)
-        written = next(
+        written = "".join(
             command[-1] for command in commands
             if "write-chars" in command
         )
+        self.assertGreater(len([
+            command for command in commands if "write-chars" in command
+        ]), 1)
+        self.assertTrue(all(
+            command[-2] == "--"
+            for command in commands if "write-chars" in command
+        ))
+        self.assertEqual(len(dump_snapshots), 2)
+        self.assertLessEqual(
+            len(dump_snapshots[0]),
+            self.runtime.ZELLIJ_WRITE_CHUNK_CHARS,
+        )
+        self.assertIn(marker, dump_snapshots[0])
+        self.assertEqual(dump_snapshots[1], written)
         self.assertIn("--reply-key " + marker, written)
         self.assertIn("at most one Slack message", written)
         self.assertIn("Default to 50 words", written)
@@ -1998,7 +2028,7 @@ class NativeBindingContractTest(unittest.TestCase):
         def run(command, **_kwargs):
             nonlocal staged_instruction
             if "write-chars" in command:
-                staged_instruction = command[-1]
+                staged_instruction += command[-1]
             if "dump-screen" in command:
                 return types.SimpleNamespace(
                     stdout=staged_instruction, stderr="", returncode=0
@@ -2078,6 +2108,12 @@ class NotifierTest(unittest.TestCase):
             "HERMES_HOME": str(self.home / ".hermes"),
             "XDG_DATA_HOME": str(self.home / "data"),
             "XDG_CONFIG_HOME": str(self.home / "config"),
+            "HERDR_ENV": "",
+            "HERDR_SESSION": "",
+            "HERDR_SOCKET_PATH": "",
+            "HERDR_PANE_ID": "",
+            "HERDR_TAB_ID": "",
+            "HERDR_WORKSPACE_ID": "",
         }
         self.env_patch = mock.patch.dict(os.environ, env, clear=False)
         self.env_patch.start()
@@ -2288,6 +2324,143 @@ class NotifierTest(unittest.TestCase):
         self.assertEqual(source["zellij_pane_id"], "7")
         self.assertEqual(source["pane_command_hash"], "abc123")
         self.assertEqual(source["process_identity"], process_identity(agent="claude"))
+
+    def test_herdr_official_session_is_sufficient_for_native_capture(self):
+        args = types.SimpleNamespace(run_id=None, hermes_session_id=None)
+        identity = {
+            "herdr_session": "pilot",
+            "herdr_socket_path": str(self.home / "herdr.sock"),
+            "herdr_terminal_id": "term_6583153c2a1b81",
+            "herdr_pane_id": "w1:p1",
+            "herdr_agent_name": "tether_0123456789abcdef",
+            "herdr_agent_session_source": "codex_notify",
+            "herdr_agent_session_kind": "thread_id",
+            "herdr_agent_session_value": "codex-session",
+            "herdr_protocol": "19",
+            "native_session_id": "codex-session",
+            "pane_agent": "codex",
+            "process_identity": "herdr-proc-v1:exact",
+        }
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HERDR_ENV": "1",
+                "HERDR_SESSION": "pilot",
+                "HERDR_SOCKET_PATH": str(self.home / "herdr.sock"),
+                "HERDR_PANE_ID": "w1:p1",
+            },
+            clear=True,
+        ), mock.patch.object(
+            self.notifier,
+            "herdr_agent_identity",
+            return_value=identity,
+        ) as capture:
+            kind, source = self.notifier.detected_source(args)
+        self.assertEqual(kind, "codex_session")
+        self.assertEqual(source["session_id"], "codex-session")
+        self.assertEqual(source["herdr_terminal_id"], "term_6583153c2a1b81")
+        self.assertNotIn("native_session_id", source)
+        capture.assert_called_once_with(
+            str(self.home / "herdr.sock"),
+            "w1:p1",
+            "pilot",
+            str(pathlib.Path.cwd()),
+        )
+
+    def test_default_herdr_session_does_not_require_session_environment(self):
+        args = types.SimpleNamespace(run_id=None, hermes_session_id=None)
+        identity = {
+            "herdr_session": "default",
+            "herdr_socket_path": str(self.home / "herdr.sock"),
+            "herdr_terminal_id": "term_6583153c2a1b81",
+            "herdr_pane_id": "w1:p1",
+            "herdr_agent_name": "tether_0123456789abcdef",
+            "herdr_agent_session_source": "codex_notify",
+            "herdr_agent_session_kind": "thread_id",
+            "herdr_agent_session_value": "codex-session",
+            "herdr_protocol": "19",
+            "native_session_id": "codex-session",
+            "pane_agent": "codex",
+            "process_identity": "herdr-proc-v1:exact",
+        }
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HERDR_ENV": "1",
+                "HERDR_SOCKET_PATH": str(self.home / "herdr.sock"),
+                "HERDR_PANE_ID": "w1:p1",
+            },
+            clear=True,
+        ), mock.patch.object(
+            self.notifier,
+            "herdr_agent_identity",
+            return_value=identity,
+        ) as capture:
+            kind, source = self.notifier.detected_source(args)
+
+        self.assertEqual(kind, "codex_session")
+        self.assertEqual(source["herdr_session"], "default")
+        capture.assert_called_once_with(
+            str(self.home / "herdr.sock"),
+            "w1:p1",
+            "default",
+            str(pathlib.Path.cwd()),
+        )
+
+    def test_slack_thread_url_parser_is_strict_and_canonical(self):
+        channel, thread_ts = self.notifier.parse_slack_thread_url(
+            "https://workspace.slack.com/archives/C12345678/p1234567890123456"
+        )
+        self.assertEqual(channel, "C12345678")
+        self.assertEqual(thread_ts, "1234567890.123456")
+        for invalid in (
+            "http://workspace.slack.com/archives/C12345678/p1234567890123456",
+            "https://workspace.slack.com/archives/C12345678/p1234567890123456?token=x",
+            "https://evil.example/archives/C12345678/p1234567890123456",
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(SystemExit):
+                self.notifier.parse_slack_thread_url(invalid)
+
+    def test_herdr_attach_reads_slack_url_from_bounded_stdin(self):
+        expected = "https://workspace.slack.com/archives/C12345678/p1234567890123456"
+        stream = io.TextIOWrapper(io.BytesIO((expected + "\n").encode("utf-8")))
+        with mock.patch.object(self.notifier.sys, "stdin", stream):
+            actual = self.notifier.slack_thread_url(
+                types.SimpleNamespace(slack_url=None)
+            )
+        self.assertEqual(actual, expected)
+
+        oversized = io.TextIOWrapper(
+            io.BytesIO(b"x" * (self.notifier.MAX_SLACK_URL_BYTES + 1))
+        )
+        with mock.patch.object(
+            self.notifier.sys, "stdin", oversized
+        ), self.assertRaises(SystemExit):
+            self.notifier.slack_thread_url(types.SimpleNamespace(slack_url=None))
+
+    def test_herdr_session_mismatch_fails_closed(self):
+        args = types.SimpleNamespace(run_id=None, hermes_session_id=None)
+        identity = {
+            "herdr_terminal_id": "term_6583153c2a1b81",
+            "native_session_id": "official-session",
+            "pane_agent": "codex",
+        }
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HERDR_ENV": "1",
+                "HERDR_SESSION": "pilot",
+                "HERDR_SOCKET_PATH": str(self.home / "herdr.sock"),
+                "HERDR_PANE_ID": "w1:p1",
+                "CODEX_THREAD_ID": "different-session",
+            },
+            clear=True,
+        ), mock.patch.object(
+            self.notifier,
+            "herdr_agent_identity",
+            return_value=identity,
+        ), self.assertRaisesRegex(SystemExit, "does not match"):
+            self.notifier.detected_source(args)
 
     def test_zellij_only_source_captures_process_identity(self):
         args = types.SimpleNamespace(run_id=None, hermes_session_id=None)
@@ -3134,6 +3307,18 @@ class PluginRoutingTest(unittest.TestCase):
         self.assertEqual(recovered_again, 0)
         self.assertEqual(adapter.events[0]["text"], "did you see this?")
         self.assertTrue(adapter.events[0]["_tether_polled"])
+
+    def test_reply_poller_skips_participation_without_workspace(self):
+        self.plugin.store.mark_participation(
+            "", "C12345678", "123.456",
+        )
+
+        class Adapter:
+            def _get_client(self, _channel, team_id=None):
+                raise AssertionError("incomplete participation must not be polled")
+
+        recovered = asyncio.run(self.plugin._poll_recent_replies(Adapter()))
+        self.assertEqual(recovered, 0)
 
     def test_reply_poller_recovers_peer_bot_thread_turns_when_enabled(self):
         bridge = self.make_bridge(owner="*")
