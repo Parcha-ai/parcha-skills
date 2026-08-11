@@ -871,11 +871,26 @@ class Collector:
                 return candidate
             text_chars //= 2
 
-    def _versioned_record_content(self, native_id: str, content: dict, *, was_active: bool) -> dict:
+    def _versioned_record_content(
+        self,
+        native_id: str,
+        content: dict,
+        *,
+        was_active: bool,
+        force_revision: bool = False,
+    ) -> dict:
         clean = sanitize(content)
         base_sha = hashlib.sha256(canonical_json(clean)).hexdigest()
         row = self.db.execute("SELECT generation,base_content_sha256 FROM record_generations WHERE native_id=?", (native_id,)).fetchone()
-        generation = 0 if row is None else int(row["generation"]) + int(not was_active or row["base_content_sha256"] != base_sha)
+        generation = (
+            int(force_revision)
+            if row is None
+            else int(row["generation"]) + int(
+                force_revision
+                or not was_active
+                or row["base_content_sha256"] != base_sha
+            )
+        )
         self.db.execute(
             "INSERT INTO record_generations(native_id,generation,base_content_sha256) VALUES (?,?,?) "
             "ON CONFLICT(native_id) DO UPDATE SET generation=excluded.generation,base_content_sha256=excluded.base_content_sha256",
@@ -928,8 +943,15 @@ class Collector:
 
     def _scan(self) -> dict:
         scan_id = hashlib.sha256(f"{time.time_ns()}:{os.getpid()}".encode()).hexdigest()[:16]
-        summary = {"files_seen": 0, "records_queued": 0, "tombstones_queued": 0,
-                   "parse_errors": 0, "partial_files": 0, "scan_complete": True}
+        summary = {
+            "files_seen": 0,
+            "records_queued": 0,
+            "restored_records_queued": 0,
+            "tombstones_queued": 0,
+            "parse_errors": 0,
+            "partial_files": 0,
+            "scan_complete": True,
+        }
         scan_started = time.monotonic()
         records_seen = 0
         bounded = False
@@ -963,7 +985,10 @@ class Collector:
                 path_text = str(path)
                 row = self.db.execute("SELECT * FROM files WHERE path=?", (path_text,)).fetchone()
                 current_fingerprint = fingerprint(path, stat.st_size)
-                if row and not row["status"].startswith("scanning-") and row["size"] == stat.st_size and row["mtime_ns"] == stat.st_mtime_ns and row["fingerprint"] == current_fingerprint:
+                restoring_tombstone = bool(
+                    row and row["status"] in {"tombstone", "scanning-restore"}
+                )
+                if row and not restoring_tombstone and not row["status"].startswith("scanning-") and row["size"] == stat.st_size and row["mtime_ns"] == stat.st_mtime_ns and row["fingerprint"] == current_fingerprint:
                     self.db.execute("UPDATE files SET last_scan_id=? WHERE path=?", (scan_id, path_text))
                     continue
                 resume_mode = row["status"].removeprefix("scanning-") if row and row["status"].startswith("scanning-") else None
@@ -971,10 +996,25 @@ class Collector:
                     mode = resume_mode
                     file_scan_id = row["last_scan_id"]
                 else:
-                    mode = "append" if row and stat.st_size > row["size"] and fingerprint(path, row["size"]) == row["fingerprint"] else ("full" if row else "new")
+                    mode = (
+                        "restore"
+                        if restoring_tombstone
+                        else "append"
+                        if row
+                        and stat.st_size > row["size"]
+                        and fingerprint(path, row["size"]) == row["fingerprint"]
+                        else "full"
+                        if row
+                        else "new"
+                    )
                     file_scan_id = scan_id
                     if mode != "append":
                         self.db.execute("DELETE FROM scan_members WHERE path=?", (path_text,))
+                    if restoring_tombstone:
+                        self.db.execute(
+                            "UPDATE files SET committed_offset=0 WHERE path=?",
+                            (path_text,),
+                        )
                 append = mode == "append"
                 start_offset = int(row["scanned_offset"]) if append or resume_mode else 0
                 old_active = {item["native_id"]: item for item in self.db.execute("SELECT * FROM active_records WHERE path=?", (path_text,))}
@@ -1009,6 +1049,7 @@ class Collector:
                         native_id,
                         content,
                         was_active=native_id in old_active,
+                        force_revision=restoring_tombstone,
                     )
                     envelope = self._bounded_record_envelope(
                         path=path,
@@ -1022,6 +1063,9 @@ class Collector:
                     )
                     if self._queue(path, envelope, line_end):
                         summary["records_queued"] += 1
+                        summary["restored_records_queued"] += int(
+                            restoring_tombstone
+                        )
                     self.db.execute(
                         "INSERT INTO active_records(path,native_id,content_sha256,start_offset,end_offset) VALUES (?,?,?,?,?) "
                         "ON CONFLICT(path,native_id) DO UPDATE SET content_sha256=excluded.content_sha256,start_offset=excluded.start_offset,end_offset=excluded.end_offset",
@@ -1709,7 +1753,21 @@ class Collector:
                        WHERE location.lifecycle='archived'
                          AND location.status='current'
                          AND (files.path IS NULL OR files.status='tombstone'
-                              OR files.committed_offset!=files.scanned_offset)"""
+                              OR files.committed_offset!=files.scanned_offset
+                              OR EXISTS (
+                                  SELECT 1 FROM outbox
+                                   WHERE outbox.path=location.path
+                                     AND outbox.state='pending'
+                              ))"""
+                ).fetchone()[0],
+                "archive_pending_records": self.db.execute(
+                    """SELECT count(*)
+                         FROM outbox
+                         JOIN codex_session_locations location
+                           ON location.path=outbox.path
+                        WHERE location.lifecycle='archived'
+                          AND location.status='current'
+                          AND outbox.state='pending'"""
                 ).fetchone()[0],
             })
         if include_dead_letters:

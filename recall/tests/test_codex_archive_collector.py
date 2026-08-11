@@ -279,9 +279,13 @@ class CodexArchiveCollectorTest(unittest.TestCase):
 
         migrated = self.collector()
         result = migrated.scan()
-        self.assertEqual(result["records_queued"], 0)
+        self.assertEqual(result["records_queued"], 2)
+        self.assertEqual(result["restored_records_queued"], 2)
         self.assertEqual(result["tombstones_queued"], 0)
-        self.assertEqual(self._rows(migrated), receipts)
+        self.assertCountEqual(
+            [row for row in self._rows(migrated) if row[1] is not None],
+            receipts,
+        )
         self.assertEqual(
             migrated.db.execute(
                 "SELECT record_key FROM codex_sessions"
@@ -289,7 +293,74 @@ class CodexArchiveCollectorTest(unittest.TestCase):
             legacy_key,
         )
         self.assertEqual(migrated.doctor()["archive_backlog"], 1)
+        self.assertEqual(migrated.doctor()["archive_pending_records"], 2)
+        self.assertEqual(migrated.flush()["acked"], 2)
+        self.assertEqual(migrated.doctor()["archive_backlog"], 0)
+        self.assertEqual(migrated.doctor()["archive_pending_records"], 0)
+        self.assertEqual(
+            {
+                row[0]
+                for row in migrated.db.execute(
+                    "SELECT generation FROM record_generations"
+                )
+            },
+            {1},
+        )
+        self.assertEqual(migrated.scan()["records_queued"], 0)
         migrated.close()
+
+    def test_tombstoned_archive_restore_resumes_without_duplicates(self) -> None:
+        session_id = "019f1111-2222-7333-8444-555555555555"
+        source = self.active / f"rollout-{session_id}.jsonl"
+        _rollout(source, session_id)
+        initial = self.collector()
+        self.assertEqual(initial.scan()["records_queued"], 2)
+        self.assertEqual(initial.flush()["acked"], 2)
+        initial.close()
+
+        target = self.archived / source.name
+        source.replace(target)
+        single_root = Collector(
+            root=self.active,
+            harness="codex",
+            source_id="codex:linux:synthetic",
+            spool_path=self.spool,
+            endpoint=self.endpoint,
+            token="synthetic-test-token",
+            max_scan_records=100_000,
+            max_scan_seconds=60,
+        )
+        self.assertEqual(single_root.scan()["tombstones_queued"], 2)
+        self.assertEqual(single_root.flush()["acked"], 2)
+        single_root.close()
+
+        restoring = self.collector(max_scan_records=1)
+        first = restoring.scan()
+        self.assertFalse(first["scan_complete"])
+        self.assertEqual(first["restored_records_queued"], 1)
+        restoring.close()
+
+        resumed = self.collector()
+        second = resumed.scan()
+        self.assertEqual(second["restored_records_queued"], 1)
+        self.assertEqual(resumed.doctor()["archive_pending_records"], 2)
+        pending = resumed.pending_envelopes()
+        self.assertEqual(len(pending), 2)
+        self.assertEqual(
+            len({item["native_id"] for item in pending}),
+            2,
+        )
+        self.assertEqual(
+            {
+                item["content"]["_recall_collector_generation"]
+                for item in pending
+            },
+            {1},
+        )
+        self.assertEqual(resumed.flush()["acked"], 2)
+        self.assertEqual(resumed.doctor()["archive_backlog"], 0)
+        self.assertEqual(resumed.scan()["records_queued"], 0)
+        resumed.close()
 
     def test_identical_duplicate_prefers_active_and_divergence_fails_closed(self) -> None:
         session_id = "019f1111-2222-7333-8444-555555555555"

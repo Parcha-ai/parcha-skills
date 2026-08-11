@@ -54,3 +54,34 @@ duplicate records. Divergent copies with one native session ID are quarantined
 as an identity conflict and never generate deletion or replacement traffic.
 `doctor` reports active/archive coverage, conflicts, quarantine, duplicates,
 and archive backlog using counts only.
+
+## Repairing an operational tombstone
+
+An older or misconfigured single-root collector can report an archived rollout
+as deleted before the multi-root collector sees it. Multi-root discovery repairs
+that operational tombstone through the normal collector path. It re-emits the
+same native record IDs with one new collector generation, waits for the normal
+ingest acknowledgement, and then clears the archive backlog. A restart during
+the repair resumes from the durable spool without creating another record.
+
+The canonical plane consequently retains an auditable lifecycle for each
+identity: original live revision, operational tombstone, restored live revision.
+Logical-evidence and Parquet projectors consume only the restored current state,
+so one restored session becomes one current logical document and one current
+Parquet generation—not parallel copies of pre- and post-move data.
+
+This reconciliation does not override an explicit canonical forget. Forget
+tombstones remain authoritative and continue to fence archive reads and later
+ingest. Operational restoration is limited to a local collector tombstone for a
+session that still exists in a configured, healthy archive root.
+
+The content-free restoration scorecard is:
+
+```bash
+PYTHONPATH=recall python3 recall/scripts/eval_codex_archive_l2.py
+```
+
+It exercises 100 randomized archived sessions, an interrupted repair, stable
+native IDs, exactly one restore generation, acknowledgement drainage, and a
+subsequent no-op scan. The fresh-PostgreSQL E2E additionally proves the complete
+collector-to-canonical-to-logical-evidence-to-Parquet path.
