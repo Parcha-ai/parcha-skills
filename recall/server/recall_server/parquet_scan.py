@@ -108,6 +108,23 @@ def _parquet_bytes(rows: list[dict[str, Any]], schema: Any) -> bytes:
     return _parquet_table_bytes(pa.Table.from_pylist(rows, schema=schema))
 
 
+def _estimated_row_bytes(row: dict[str, Any]) -> int:
+    """Cheaply bound an Arrow conversion without copying record text."""
+
+    size = 64 * len(row)
+    for value in row.values():
+        if isinstance(value, (str, bytes)):
+            size += len(value)
+        elif isinstance(value, (list, tuple)):
+            size += sum(
+                len(item) if isinstance(item, (str, bytes)) else 16
+                for item in value
+            )
+        else:
+            size += 16
+    return max(1, size)
+
+
 def _parquet_parts(
     rows: list[dict[str, Any]],
     schema: Any,
@@ -119,9 +136,9 @@ def _parquet_parts(
     if not 1 <= maximum_bytes <= MAX_PARQUET_OBJECT_BYTES:
         raise ParquetScanError("parquet_scan_budget_invalid")
     started = time.perf_counter()
-    table = pa.Table.from_pylist(rows, schema=schema)
-    arrow_ms = round((time.perf_counter() - started) * 1_000)
     if not rows:
+        table = pa.Table.from_pylist(rows, schema=schema)
+        arrow_ms = round((time.perf_counter() - started) * 1_000)
         payload = _parquet_table_bytes(table)
         if len(payload) > maximum_bytes:
             raise ParquetScanError("parquet_scan_record_too_large")
@@ -133,29 +150,38 @@ def _parquet_parts(
             round((time.perf_counter() - started) * 1_000) - arrow_ms,
         )
         return [(payload, 0)]
-    raw_slice_bytes = min(PARQUET_RAW_SLICE_BYTES, maximum_bytes * 2 // 3)
-    rows_per_slice = max(
-        1,
-        min(
-            len(rows),
-            int(len(rows) * raw_slice_bytes / max(1, table.nbytes)),
-        ),
-    )
-    pending = [
-        (start, min(len(rows), start + rows_per_slice))
-        for start in range(0, len(rows), rows_per_slice)
-    ]
+    slice_bytes = min(PARQUET_RAW_SLICE_BYTES, maximum_bytes * 2 // 3)
+    intervals: list[tuple[int, int]] = []
+    interval_start = interval_bytes = 0
+    for ordinal, row in enumerate(rows):
+        row_bytes = _estimated_row_bytes(row)
+        if ordinal > interval_start and interval_bytes + row_bytes > slice_bytes:
+            intervals.append((interval_start, ordinal))
+            interval_start = ordinal
+            interval_bytes = 0
+        interval_bytes += row_bytes
+    intervals.append((interval_start, len(rows)))
     parts: list[tuple[int, bytes, int]] = []
-    while pending:
-        start, end = pending.pop()
-        payload = _parquet_table_bytes(table.slice(start, end - start))
-        if len(payload) <= maximum_bytes:
-            parts.append((start, payload, end - start))
-            continue
-        if end - start <= 1:
-            raise ParquetScanError("parquet_scan_record_too_large")
-        middle = start + (end - start) // 2
-        pending.extend(((middle, end), (start, middle)))
+    arrow_ms = arrow_bytes = 0
+    for start, end in intervals:
+        arrow_started = time.perf_counter()
+        table = pa.Table.from_pylist(rows[start:end], schema=schema)
+        arrow_ms += round((time.perf_counter() - arrow_started) * 1_000)
+        arrow_bytes += table.nbytes
+        pending = [(start, table)]
+        while pending:
+            offset, candidate = pending.pop()
+            payload = _parquet_table_bytes(candidate)
+            if len(payload) <= maximum_bytes:
+                parts.append((offset, payload, candidate.num_rows))
+                continue
+            if candidate.num_rows <= 1:
+                raise ParquetScanError("parquet_scan_record_too_large")
+            left_rows = candidate.num_rows // 2
+            pending.extend((
+                (offset + left_rows, candidate.slice(left_rows)),
+                (offset, candidate.slice(0, left_rows)),
+            ))
     result = [
         (payload, row_count)
         for _, payload, row_count in sorted(parts, key=lambda value: value[0])
@@ -164,7 +190,7 @@ def _parquet_parts(
         "parquet encode rows=%s arrow_bytes=%s parts=%s arrow_ms=%s "
         "encode_ms=%s",
         len(rows),
-        table.nbytes,
+        arrow_bytes,
         len(result),
         arrow_ms,
         round((time.perf_counter() - started) * 1_000) - arrow_ms,
