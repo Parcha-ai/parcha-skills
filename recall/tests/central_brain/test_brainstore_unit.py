@@ -719,6 +719,8 @@ class EmployeeActorRetrofitContractTest(unittest.TestCase):
         )
         queue_sql, queue_params = queue_call.args
         self.assertIn("canonical_evidence_document_queue", queue_sql)
+        self.assertIn("'backfill'", queue_sql)
+        self.assertNotIn("actor-binding", queue_sql)
         self.assertEqual(
             queue_params,
             ("tenant:company:test", [source_b, source_a]),
