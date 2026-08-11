@@ -37,6 +37,48 @@ def actor_id_for_principal(tenant_id: str, principal_id: str) -> str:
     ).hexdigest()[:32]
 
 
+def actor_id_for_employee_key(tenant_id: str, employee_key: str) -> str:
+    """Derive a stable provisional actor before that employee signs in."""
+
+    if (
+        not isinstance(tenant_id, str)
+        or not tenant_id
+        or not isinstance(employee_key, str)
+        or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{1,63}", employee_key)
+    ):
+        raise ValueError("invalid employee actor key")
+    return "actor_" + hashlib.sha256(
+        f"{tenant_id}\0employee\0{employee_key}".encode()
+    ).hexdigest()[:32]
+
+
+def claimable_actor_for_display_name(
+    connection: Any,
+    *,
+    tenant_id: str,
+    display_name: str,
+) -> str | None:
+    """Resolve one unclaimed provisional human actor without guessing."""
+
+    rows = connection.execute(
+        """SELECT actor.actor_id
+             FROM brain_actors actor
+             LEFT JOIN brain_actor_principals principal
+               ON principal.tenant_id=actor.tenant_id
+              AND principal.actor_id=actor.actor_id
+            WHERE actor.tenant_id=%s
+              AND actor.actor_kind='human'
+              AND actor.active
+              AND lower(actor.display_name)=lower(%s)
+            GROUP BY actor.actor_id
+           HAVING count(principal.principal_id)=0
+            ORDER BY actor.actor_id
+            LIMIT 2""",
+        (tenant_id, display_name),
+    ).fetchall()
+    return rows[0]["actor_id"] if len(rows) == 1 else None
+
+
 def normalized_external_subject(value: str) -> str:
     if not isinstance(value, str):
         raise ValueError("invalid actor subject")

@@ -28,6 +28,11 @@ except ModuleNotFoundError:
 
 from recall_server import SCHEMA_VERSION
 from recall_server import cli as server_cli
+from recall_server.actor_attribution import (
+    actor_id_for_employee_key,
+    actor_id_for_principal,
+    claimable_actor_for_display_name,
+)
 from recall_server.app import Handler, serve, serve_unix, validate_http_profile
 from recall_server.capture import build_capture_event
 from recall_server.db import (
@@ -569,6 +574,171 @@ class SourceScopedReadContractTest(unittest.TestCase):
         self.assertIn("i.source_id = ANY(%s)", where)
         self.assertEqual(params, [[]])
 
+
+class EmployeeActorRetrofitContractTest(unittest.TestCase):
+    def test_employee_key_is_stable_and_separate_from_login_identity(self) -> None:
+        first = actor_id_for_employee_key("tenant:company:test", "employee-1")
+        self.assertEqual(
+            first,
+            actor_id_for_employee_key("tenant:company:test", "employee-1"),
+        )
+        self.assertRegex(first, r"^actor_[0-9a-f]{32}$")
+        self.assertNotEqual(
+            first,
+            actor_id_for_principal("tenant:company:test", "principal:employee-1"),
+        )
+        for invalid in ("", "UPPER", "has space", "x" * 65):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                actor_id_for_employee_key("tenant:company:test", invalid)
+
+    def test_invitation_claims_only_one_exact_unlinked_actor(self) -> None:
+        connection = mock.MagicMock()
+        connection.execute.return_value.fetchall.return_value = [
+            {"actor_id": "actor_" + "a" * 32}
+        ]
+        self.assertEqual(
+            claimable_actor_for_display_name(
+                connection,
+                tenant_id="tenant:company:test",
+                display_name="Employee One",
+            ),
+            "actor_" + "a" * 32,
+        )
+        sql, params = connection.execute.call_args.args
+        self.assertIn("HAVING count(principal.principal_id)=0", sql)
+        self.assertEqual(params, ("tenant:company:test", "Employee One"))
+
+        connection.execute.return_value.fetchall.return_value = [
+            {"actor_id": "actor_" + "a" * 32},
+            {"actor_id": "actor_" + "b" * 32},
+        ]
+        self.assertIsNone(
+            claimable_actor_for_display_name(
+                connection,
+                tenant_id="tenant:company:test",
+                display_name="Employee One",
+            )
+        )
+
+    def test_new_coding_profile_binds_its_owner_actor_when_unattributed(self) -> None:
+        results = []
+        for value in (
+            {"exists": 1},
+            None,
+            {"tenant_id": "tenant:company:test", "source_id": "codex:linux:new"},
+            None,
+            None,
+        ):
+            result = mock.MagicMock()
+            result.fetchone.return_value = value
+            results.append(result)
+        results[3].rowcount = 3
+        connection = mock.MagicMock()
+        connection.execute.side_effect = results
+        context = mock.MagicMock()
+        context.__enter__.return_value = connection
+        store = BrainStore("postgresql://synthetic.invalid/recall")
+        store.connect = mock.MagicMock(return_value=context)
+
+        configured = store.set_source_profile({
+            "source_id": "codex:linux:new",
+            "family": "coding_history",
+            "quality": "trusted",
+            "freshness_half_life_days": 30,
+        })
+        self.assertEqual(configured["status"], "configured")
+        binding_sql = connection.execute.call_args_list[2].args[0]
+        self.assertIn("NOT EXISTS", binding_sql)
+        self.assertIn("brain_actor_principals", binding_sql)
+        queue_sql = connection.execute.call_args_list[3].args[0]
+        self.assertIn("canonical_evidence_document_queue", queue_sql)
+
+    def test_retrofit_binds_exact_coding_sources_and_requeues_projections(self) -> None:
+        source_a = "codex:linux:employee-1"
+        source_b = "claude:linux:employee-1"
+        actor_id = actor_id_for_employee_key("tenant:company:test", "employee-1")
+        results = []
+        for value in (
+            [{"source_id": source_b}, {"source_id": source_a}],
+            [],
+            None,
+            {"display_name": "Employee One", "actor_kind": "human", "active": True},
+            None,
+            None,
+            [{"source_id": source_b}, {"source_id": source_a}],
+            None,
+        ):
+            result = mock.MagicMock()
+            if isinstance(value, list):
+                result.fetchall.return_value = value
+            else:
+                result.fetchone.return_value = value
+            results.append(result)
+        results[-1].rowcount = 2
+        connection = mock.MagicMock()
+        connection.execute.side_effect = results
+        context = mock.MagicMock()
+        context.__enter__.return_value = connection
+        store = BrainStore("postgresql://synthetic.invalid/recall")
+        store.connect = mock.MagicMock(return_value=context)
+
+        self.assertEqual(
+            store.bind_coding_sources_to_employee(
+                tenant_id="tenant:company:test",
+                employee_key="employee-1",
+                display_name=" Employee One ",
+                source_ids=[source_a, source_b],
+            ),
+            {
+                "status": "bound",
+                "actor_id": actor_id,
+                "sources": 2,
+                "new_bindings": 2,
+                "queued_documents": 2,
+            },
+        )
+        binding_sql, binding_params = connection.execute.call_args_list[-2].args
+        self.assertIn("canonical_source_actor_bindings", binding_sql)
+        self.assertEqual(
+            binding_params,
+            ("tenant:company:test", actor_id, [source_b, source_a]),
+        )
+        queue_sql, queue_params = connection.execute.call_args_list[-1].args
+        self.assertIn("canonical_evidence_document_queue", queue_sql)
+        self.assertEqual(
+            queue_params,
+            ("tenant:company:test", [source_b, source_a]),
+        )
+
+    def test_retrofit_rejects_duplicate_or_non_coding_sources(self) -> None:
+        store = BrainStore("postgresql://synthetic.invalid/recall")
+        store.connect = mock.MagicMock()
+        with self.assertRaisesRegex(ValueError, "invalid employee source binding"):
+            store.bind_coding_sources_to_employee(
+                tenant_id="tenant:company:test",
+                employee_key="employee-1",
+                display_name="Employee One",
+                source_ids=["codex:linux:one", "codex:linux:one"],
+            )
+        store.connect.assert_not_called()
+
+        result = mock.MagicMock()
+        result.fetchall.return_value = [{"source_id": "codex:linux:one"}]
+        connection = mock.MagicMock()
+        connection.execute.return_value = result
+        context = mock.MagicMock()
+        context.__enter__.return_value = connection
+        store.connect.return_value = context
+        with self.assertRaisesRegex(ValueError, "requires coding-history sources"):
+            store.bind_coding_sources_to_employee(
+                tenant_id="tenant:company:test",
+                employee_key="employee-1",
+                display_name="Employee One",
+                source_ids=["codex:linux:one", "slack:company:one"],
+            )
+
+
+class SourceScopedResolveContractTest(unittest.TestCase):
     def test_resolve_filters_by_the_authenticated_collector_source(self) -> None:
         connection = mock.MagicMock()
         connection.execute.return_value.fetchone.return_value = None
