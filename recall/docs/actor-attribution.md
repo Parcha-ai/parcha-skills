@@ -81,10 +81,11 @@ python -m recall_server.cli employee-source-bind \
   --source claude:linux:employee-device
 ```
 
-The command accepts only `coding_history` sources, rejects a source already
-bound to another contributor, and requeues the affected derived documents. It
-does not rewrite raw artifacts or canonical events. The opaque employee key is
-stable within the tenant and is not an authentication identifier. If a future
+The command accepts only existing or unprofiled canonical coding sources,
+creates a missing `coding_history` profile, rejects conflicting contributors,
+adopts one unambiguous existing contributor, and requeues the affected derived
+documents. It does not rewrite raw artifacts or canonical events. The opaque
+employee key is stable within the tenant and is not an authentication identifier. If a future
 invitation has the same exact display name and there is exactly one unclaimed
 provisional actor, acceptance links the login principal to that actor. An
 ambiguous name never guesses.

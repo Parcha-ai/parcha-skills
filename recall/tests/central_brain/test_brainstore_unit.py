@@ -657,26 +657,32 @@ class EmployeeActorRetrofitContractTest(unittest.TestCase):
         source_a = "codex:linux:employee-1"
         source_b = "claude:linux:employee-1"
         actor_id = actor_id_for_employee_key("tenant:company:test", "employee-1")
-        results = []
-        for value in (
-            [{"source_id": source_b}, {"source_id": source_a}],
-            [],
-            None,
-            {"display_name": "Employee One", "actor_kind": "human", "active": True},
-            None,
-            None,
-            [{"source_id": source_b}, {"source_id": source_a}],
-            None,
-        ):
+        def execute(sql, _params):
             result = mock.MagicMock()
-            if isinstance(value, list):
-                result.fetchall.return_value = value
-            else:
-                result.fetchone.return_value = value
-            results.append(result)
-        results[-1].rowcount = 2
+            if "SELECT source.source_id,source.owner_principal_id" in sql:
+                result.fetchall.return_value = [
+                    {"source_id": source_b, "owner_principal_id": "owner", "family": None},
+                    {"source_id": source_a, "owner_principal_id": "owner", "family": None},
+                ]
+            elif "SELECT DISTINCT binding.actor_id" in sql:
+                result.fetchall.return_value = []
+            elif "lower(display_name)=lower" in sql:
+                result.fetchall.return_value = []
+            elif "SELECT display_name,actor_kind,active" in sql:
+                result.fetchone.return_value = {
+                    "display_name": "Employee One",
+                    "actor_kind": "human",
+                    "active": True,
+                }
+            elif "INSERT INTO canonical_source_actor_bindings" in sql:
+                result.fetchall.return_value = [
+                    {"source_id": source_b}, {"source_id": source_a},
+                ]
+            elif "INSERT INTO canonical_evidence_document_queue" in sql:
+                result.rowcount = 2
+            return result
         connection = mock.MagicMock()
-        connection.execute.side_effect = results
+        connection.execute.side_effect = execute
         context = mock.MagicMock()
         context.__enter__.return_value = connection
         store = BrainStore("postgresql://synthetic.invalid/recall")
@@ -697,18 +703,70 @@ class EmployeeActorRetrofitContractTest(unittest.TestCase):
                 "queued_documents": 2,
             },
         )
-        binding_sql, binding_params = connection.execute.call_args_list[-2].args
+        binding_call = next(
+            call for call in connection.execute.call_args_list
+            if "INSERT INTO canonical_source_actor_bindings" in call.args[0]
+        )
+        binding_sql, binding_params = binding_call.args
         self.assertIn("canonical_source_actor_bindings", binding_sql)
         self.assertEqual(
             binding_params,
             ("tenant:company:test", actor_id, [source_b, source_a]),
         )
-        queue_sql, queue_params = connection.execute.call_args_list[-1].args
+        queue_call = next(
+            call for call in connection.execute.call_args_list
+            if "INSERT INTO canonical_evidence_document_queue" in call.args[0]
+        )
+        queue_sql, queue_params = queue_call.args
         self.assertIn("canonical_evidence_document_queue", queue_sql)
         self.assertEqual(
             queue_params,
             ("tenant:company:test", [source_b, source_a]),
         )
+
+    def test_retrofit_adopts_one_existing_source_actor(self) -> None:
+        actor_id = "actor_" + "a" * 32
+        source_ids = ["claude:linux:one", "codex:linux:one"]
+
+        def execute(sql, _params):
+            result = mock.MagicMock()
+            if "SELECT source.source_id,source.owner_principal_id" in sql:
+                result.fetchall.return_value = [
+                    {"source_id": value, "owner_principal_id": "owner", "family": "coding_history"}
+                    for value in source_ids
+                ]
+            elif "SELECT DISTINCT binding.actor_id" in sql:
+                result.fetchall.return_value = [{"actor_id": actor_id}]
+            elif "lower(display_name)=lower" in sql:
+                result.fetchall.return_value = []
+            elif "SELECT display_name,actor_kind,active" in sql:
+                result.fetchone.return_value = {
+                    "display_name": "Employee One", "actor_kind": "human", "active": True,
+                }
+            elif "INSERT INTO canonical_source_actor_bindings" in sql:
+                result.fetchall.return_value = []
+            elif "INSERT INTO canonical_evidence_document_queue" in sql:
+                result.rowcount = 2
+            return result
+
+        connection = mock.MagicMock()
+        connection.execute.side_effect = execute
+        context = mock.MagicMock()
+        context.__enter__.return_value = connection
+        store = BrainStore("postgresql://synthetic.invalid/recall")
+        store.connect = mock.MagicMock(return_value=context)
+        result = store.bind_coding_sources_to_employee(
+            tenant_id="tenant:company:test",
+            employee_key="employee-1",
+            display_name="Employee One",
+            source_ids=source_ids,
+        )
+        self.assertEqual(result["actor_id"], actor_id)
+        self.assertEqual(result["new_bindings"], 0)
+        self.assertTrue(any(
+            "UPDATE brain_actors" in call.args[0]
+            for call in connection.execute.call_args_list
+        ))
 
     def test_retrofit_rejects_duplicate_or_non_coding_sources(self) -> None:
         store = BrainStore("postgresql://synthetic.invalid/recall")
@@ -722,10 +780,13 @@ class EmployeeActorRetrofitContractTest(unittest.TestCase):
             )
         store.connect.assert_not_called()
 
-        result = mock.MagicMock()
-        result.fetchall.return_value = [{"source_id": "codex:linux:one"}]
         connection = mock.MagicMock()
-        connection.execute.return_value = result
+        source_result = mock.MagicMock()
+        source_result.fetchall.return_value = [
+            {"source_id": "codex:linux:one", "owner_principal_id": "owner", "family": None},
+            {"source_id": "slack:company:one", "owner_principal_id": "owner", "family": "communications"},
+        ]
+        connection.execute.return_value = source_result
         context = mock.MagicMock()
         context.__enter__.return_value = connection
         store.connect.return_value = context
