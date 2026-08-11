@@ -9766,10 +9766,28 @@ def _process_agent(
 ) -> tuple[str, int]:
     try:
         executable_path = str(Path(executable).resolve(strict=True))
-    except (FileNotFoundError, PermissionError, OSError):
+    except FileNotFoundError:
+        # An in-place agent auto-update deletes the running release's file, so
+        # its path no longer resolves even though the process is still the
+        # genuine agent. Fall back to the unresolved path: it is only ever
+        # matched against the trusted set below, so an unknown path still
+        # yields no agent.
+        executable_path = str(executable)
+    except (PermissionError, OSError):
         return "", 0
     for agent, paths in trusted_paths.items():
         if agent in allowed and executable_path in paths:
+            return agent, 3
+    # A release removed by an in-place update cannot appear in the on-disk
+    # trusted set, so an exact match is impossible for a session that upgraded
+    # mid-flight. Accept a path sitting directly alongside an already-trusted
+    # release (same install root); callers separately prove the process owns
+    # the pane's foreground process group.
+    candidate = Path(executable_path)
+    for agent, paths in trusted_paths.items():
+        if agent not in allowed:
+            continue
+        if any(candidate.parent == Path(known).parent for known in paths):
             return agent, 3
     runtime = Path(executable_path).name
     if runtime in {
@@ -9830,6 +9848,26 @@ def _trusted_agent_paths(
         except (NativeContinuationError, FileNotFoundError, PermissionError, OSError):
             continue
         trusted[declared_agent].add(canonical)
+        # An agent that auto-updates in place installs each release into its own
+        # sibling entry under a versions/ root and repoints the launcher symlink.
+        # A session started before the update still runs the older sibling, which
+        # is the same trusted install.
+        canonical_path = Path(canonical)
+        for parent in canonical_path.parents:
+            if parent.name != "versions":
+                continue
+            suffix = canonical_path.relative_to(parent).parts[1:]
+            try:
+                # A release may be a file (…/versions/<semver>) or a directory
+                # (…/versions/<semver>/bin/<agent>); accept both.
+                siblings = list(parent.iterdir())
+            except OSError:
+                break
+            for sibling in siblings:
+                trusted[declared_agent].add(
+                    str(sibling.joinpath(*suffix)) if suffix else str(sibling)
+                )
+            break
     return {agent: paths for agent, paths in trusted.items() if paths}
 
 
@@ -9907,7 +9945,21 @@ def _zellij_agent_process(
             ]
             try:
                 executable_link = process_dir / "exe"
-                executable_path = str(executable_link.resolve(strict=True))
+                try:
+                    executable_path = str(executable_link.resolve(strict=True))
+                except FileNotFoundError:
+                    # The running agent's binary was replaced on disk by an
+                    # in-place auto-update. /proc/<pid>/exe then resolves to
+                    # "<path> (deleted)" and strict resolution raises, which the
+                    # outer handler would swallow — dropping the only valid
+                    # candidate and silently breaking pane binding for the rest
+                    # of the session.
+                    raw_target = os.readlink(executable_link)
+                    executable_path = (
+                        raw_target[: -len(" (deleted)")]
+                        if raw_target.endswith(" (deleted)")
+                        else raw_target
+                    )
                 executable_stat = executable_link.stat()
             except (FileNotFoundError, PermissionError, OSError):
                 continue

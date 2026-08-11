@@ -441,5 +441,59 @@ class ProcessIdentityHardeningTest(unittest.TestCase):
         self.assertEqual(raised.exception.code, "process_identity_missing")
 
 
+class AgentAutoUpdateTrustTest(unittest.TestCase):
+    """An in-place agent update must not invalidate a running session.
+
+    Claude Code (and Codex) install each release under a ``versions/`` root and
+    repoint the launcher symlink, deleting the previous release. A session
+    started before the update keeps executing the deleted binary, so
+    ``/proc/<pid>/exe`` resolves to ``"<path> (deleted)"``. Before this was
+    handled, the strict resolution raised, the candidate was silently dropped,
+    and the session could no longer post to Slack at all.
+    """
+
+    def setUp(self):
+        self.home = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: None)
+        self.runtime = load_runtime(self.home)
+        self.versions = self.home / ".local" / "share" / "claude" / "versions"
+        self.versions.mkdir(parents=True)
+        self.current = self.versions / "2.0.2"
+        self.current.write_text("#!/bin/sh\n", encoding="utf-8")
+        self.current.chmod(0o755)
+
+    def test_sibling_release_is_trusted(self):
+        older = self.versions / "2.0.1"
+        older.write_text("#!/bin/sh\n", encoding="utf-8")
+        older.chmod(0o755)
+        with mock.patch.object(
+            self.runtime, "_resolve_executable", return_value=str(self.current)
+        ):
+            trusted = self.runtime._trusted_agent_paths(
+                self.runtime.Config(), {"claude"}
+            )
+        self.assertIn(str(older), trusted["claude"])
+
+    def test_deleted_release_still_resolves_as_the_agent(self):
+        """The running release was removed by the update, so it can never appear
+        in an on-disk listing — an exact match is impossible by construction."""
+        deleted = str(self.versions / "2.0.1")
+        trusted = {"claude": {str(self.current)}}
+        agent, quality = self.runtime._process_agent(
+            deleted, ["claude"], {"claude"}, trusted
+        )
+        self.assertEqual(agent, "claude")
+        self.assertEqual(quality, 3)
+
+    def test_untrusted_binary_is_still_rejected(self):
+        """The fallback is bounded to the trusted install root."""
+        trusted = {"claude": {str(self.current)}}
+        agent, quality = self.runtime._process_agent(
+            "/usr/bin/python3", ["python3"], {"claude"}, trusted
+        )
+        self.assertEqual(agent, "")
+        self.assertEqual(quality, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
