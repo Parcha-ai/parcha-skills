@@ -140,6 +140,52 @@ class LogicalPartUploadTests(unittest.TestCase):
     def test_default_part_size_is_bounded_for_interactive_scans(self) -> None:
         self.assertEqual(DEFAULT_PART_BYTES, 4 * 1024 * 1024)
 
+    def test_uploaded_parts_keep_exact_time_bounds_across_clock_regression(
+        self,
+    ) -> None:
+        archive = _ConcurrentArchive()
+        source = "source:parallel"
+        times = (
+            "2026-08-03T00:00:00Z",
+            "2026-08-01T00:00:00Z",
+            "2026-08-02T00:00:00Z",
+        )
+        records = tuple(
+            LogicalEvidenceRecord(
+                ordinal=ordinal,
+                event_native_id=f"event:bounded:{ordinal}",
+                event_kind="transcript_record",
+                occurred_at=occurred_at,
+                roles=("assistant",),
+                receipts=(
+                    f"recall://{source}/event-bounded-{ordinal}"
+                    f"?rev=1#item=0",
+                ),
+                segment_ordinal=0,
+                segment_count=1,
+                text="x" * 700,
+            )
+            for ordinal, occurred_at in enumerate(times)
+        )
+
+        upload = LogicalEvidenceProjectionStore(archive).put_records(
+            tenant_id="tenant:parallel",
+            source_id=source,
+            native_parent_id="session:bounded",
+            revision=1,
+            records=records,
+            part_bytes=1_024,
+        )
+
+        self.assertEqual(
+            [part.first_occurred_at for part in upload.prepared.parts],
+            list(times),
+        )
+        self.assertEqual(
+            [part.last_occurred_at for part in upload.prepared.parts],
+            list(times),
+        )
+
     def test_indivisible_large_record_gets_its_own_bounded_part(self) -> None:
         archive = _ConcurrentArchive()
         projection = LogicalEvidenceProjectionStore(archive)
