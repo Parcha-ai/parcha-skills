@@ -325,9 +325,11 @@ python -m recall_server.cli backfill-parquet-scan \
 ```
 
 The managed projection worker continuously drains later invalidations. Before
-enabling `recall_scan`, publish one official DuckDB CLI binary into the private
-evidence archive. Verify its checksum against DuckDB's official install page;
-the command independently rechecks the exact digest before upload:
+enabling `recall_scan`, publish the official `duckdb_cli-linux-arm64` binary
+into the private evidence archive. Archil serverless execution runs on aarch64;
+an amd64 binary stages successfully but cannot execute. Verify the release
+asset checksum against DuckDB's official release metadata; the command
+independently rechecks the uncompressed binary's exact digest before upload:
 
 ```bash
 python -m recall_server.cli publish-archil-duckdb \

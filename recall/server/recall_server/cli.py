@@ -438,7 +438,10 @@ def main() -> None:
         reference = build_evidence_archive_store().put_raw(
             tenant_id="tenant:system:tools",
             source_id="source:system:tools",
-            native_id=f"archil-duckdb:{args.version}:linux-amd64",
+            # Archil serverless execution currently runs on aarch64. Keep the
+            # architecture in the immutable source identity so an x86 build
+            # cannot silently replace the executable used by recall_scan.
+            native_id=f"archil-duckdb:{args.version}:linux-arm64",
             payload=payload,
             media_type="application/vnd.duckdb.cli",
             created_at=datetime.now(timezone.utc).isoformat(),
