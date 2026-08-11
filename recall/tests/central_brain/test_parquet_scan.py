@@ -31,6 +31,33 @@ class _Evidence:
         self.archive = archive
 
 
+class _SeedResult:
+    rowcount = 1
+
+
+class _SeedConnection:
+    def __init__(self):
+        self.query = ""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return None
+
+    def execute(self, query, _parameters):
+        self.query = query
+        return _SeedResult()
+
+
+class _SeedStore:
+    def __init__(self):
+        self.connection = _SeedConnection()
+
+    def connect(self):
+        return self.connection
+
+
 def _part() -> dict:
     return {
         "tenant_id": "tenant:test",
@@ -95,6 +122,14 @@ class _BuildProbe(CanonicalParquetScanProjector):
 
 
 class ParquetScanContractTest(unittest.TestCase):
+    def test_seed_deduplicates_documents_in_one_source_month_before_upsert(self):
+        store = _SeedStore()
+        projector = CanonicalParquetScanProjector(store, _Evidence(None))
+        self.assertEqual(projector.seed_backfill(tenant_id="tenant:test"), 1)
+        self.assertIn("SELECT DISTINCT", store.connection.query)
+        self.assertIn("statement_timestamp()", store.connection.query)
+        self.assertNotIn("'backfill',clock_timestamp()", store.connection.query)
+
     def test_bucket_must_be_the_first_utc_calendar_day(self):
         self.assertEqual(_month("2026-08-01"), date(2026, 8, 1))
         with self.assertRaisesRegex(ParquetScanError, "bucket_invalid"):
