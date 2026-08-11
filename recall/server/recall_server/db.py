@@ -679,19 +679,57 @@ class BrainStore:
         with self.connect() as conn:
             with conn.transaction():
                 sources = conn.execute(
-                    """SELECT source.source_id
+                    """SELECT source.source_id,source.owner_principal_id,
+                              profile.family
                          FROM canonical_sources source
-                         JOIN source_profiles profile
+                         LEFT JOIN source_profiles profile
                            ON profile.source_id=source.source_id
                         WHERE source.tenant_id=%s
                           AND source.source_id=ANY(%s)
-                          AND profile.family='coding_history'
                         ORDER BY source.source_id
                         FOR SHARE OF source""",
                     (tenant_id, normalized_sources),
                 ).fetchall()
-                if [row["source_id"] for row in sources] != normalized_sources:
+                if (
+                    [row["source_id"] for row in sources] != normalized_sources
+                    or any(
+                        row["family"] not in {None, "coding_history"}
+                        for row in sources
+                    )
+                ):
                     raise ValueError("employee binding requires coding-history sources")
+                conn.execute(
+                    """INSERT INTO sources(id,principal_id)
+                       SELECT source.source_id,source.owner_principal_id
+                         FROM canonical_sources source
+                        WHERE source.tenant_id=%s
+                          AND source.source_id=ANY(%s)
+                       ON CONFLICT DO NOTHING""",
+                    (tenant_id, normalized_sources),
+                )
+                conn.execute(
+                    """INSERT INTO source_profiles(
+                           source_id,family,quality,freshness_half_life_days
+                       )
+                       SELECT source.source_id,'coding_history','trusted',30
+                         FROM canonical_sources source
+                        WHERE source.tenant_id=%s
+                          AND source.source_id=ANY(%s)
+                       ON CONFLICT DO NOTHING""",
+                    (tenant_id, normalized_sources),
+                )
+                existing_bindings = conn.execute(
+                    """SELECT DISTINCT binding.actor_id
+                         FROM canonical_source_actor_bindings binding
+                        WHERE binding.tenant_id=%s
+                          AND binding.source_id=ANY(%s)
+                          AND binding.relation='contributor'
+                        ORDER BY binding.actor_id
+                        LIMIT 2""",
+                    (tenant_id, normalized_sources),
+                ).fetchall()
+                if len(existing_bindings) > 1:
+                    raise ValueError("coding source already belongs to another employee")
                 exact_name = conn.execute(
                     """SELECT actor_id
                          FROM brain_actors
@@ -703,9 +741,17 @@ class BrainStore:
                 ).fetchall()
                 if len(exact_name) > 1:
                     raise ValueError("employee display name is ambiguous")
-                actor_id = (
-                    exact_name[0]["actor_id"] if exact_name else provisional_actor_id
+                existing_actor_id = (
+                    existing_bindings[0]["actor_id"] if existing_bindings else None
                 )
+                named_actor_id = exact_name[0]["actor_id"] if exact_name else None
+                if (
+                    existing_actor_id is not None
+                    and named_actor_id is not None
+                    and existing_actor_id != named_actor_id
+                ):
+                    raise ValueError("coding source already belongs to another employee")
+                actor_id = existing_actor_id or named_actor_id or provisional_actor_id
                 conn.execute(
                     """INSERT INTO brain_actors(
                            tenant_id,actor_id,actor_kind,display_name
@@ -713,6 +759,13 @@ class BrainStore:
                        ON CONFLICT(tenant_id,actor_id) DO NOTHING""",
                     (tenant_id, actor_id, normalized_name),
                 )
+                if existing_actor_id is not None:
+                    conn.execute(
+                        """UPDATE brain_actors
+                              SET display_name=%s,updated_at=now()
+                            WHERE tenant_id=%s AND actor_id=%s""",
+                        (normalized_name, tenant_id, actor_id),
+                    )
                 actor = conn.execute(
                     """SELECT display_name,actor_kind,active
                          FROM brain_actors
@@ -726,19 +779,6 @@ class BrainStore:
                     or actor["display_name"].casefold() != normalized_name.casefold()
                 ):
                     raise ValueError("employee actor key conflicts")
-                conflicting = conn.execute(
-                    """SELECT DISTINCT binding.source_id,binding.actor_id
-                         FROM canonical_source_actor_bindings binding
-                        WHERE binding.tenant_id=%s
-                          AND binding.source_id=ANY(%s)
-                          AND binding.relation='contributor'
-                          AND binding.actor_id<>%s
-                        ORDER BY binding.source_id,binding.actor_id
-                        LIMIT 1""",
-                    (tenant_id, normalized_sources, actor_id),
-                ).fetchone()
-                if conflicting is not None:
-                    raise ValueError("coding source already belongs to another employee")
                 conn.execute(
                     """INSERT INTO brain_actor_aliases(
                            tenant_id,actor_id,alias
