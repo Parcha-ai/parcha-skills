@@ -25,6 +25,7 @@ COPY --chown=10001:10001 collector /opt/recall/collector
 COPY --chown=10001:10001 privacy /opt/recall/privacy
 COPY --chown=10001:10001 scripts/install_gws.py /opt/recall/scripts/install_gws.py
 COPY --chown=10001:10001 skills/recall/scripts/recall.py /opt/skills/recall/scripts/recall.py
+COPY --chown=10001:10001 skills/recall/scripts/codex_identity.py /opt/skills/recall/scripts/codex_identity.py
 
 RUN python /opt/recall/scripts/install_gws.py \
       --target x86_64-unknown-linux-gnu \

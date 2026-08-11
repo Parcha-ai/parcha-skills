@@ -18,6 +18,7 @@ on:
       - "recall/privacy/**"
       - "recall/scripts/install_gws.py"
       - "recall/skills/recall/scripts/recall.py"
+      - "recall/skills/recall/scripts/codex_identity.py"
       - ".github/workflows/recall-image.yml"
   workflow_dispatch:
 

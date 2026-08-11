@@ -905,7 +905,13 @@ RECALL_DATABASE_URL=... python -m recall_server.cli source-alias-set cowork cowo
 
 Linux history collectors use `recall-collector@.service` with separate `claude` and `codex`
 environment/token files. Issue one source-scoped credential per unit, install the two example
-environment files with mode 0600 after replacing every value, then enable the instances:
+environment files with mode 0600 after replacing every value.
+
+The Codex example configures both the active and archived rollout roots; both feed one
+stable session ledger and one source-scoped credential. Create both directories before starting
+the unit; an unavailable configured archive root fails closed. Claude remains single-root.
+
+Then enable the instances:
 
 ```bash
 install -m 0644 ~/services/recall-brain/recall/server/deploy/recall-collector@.service ~/.config/systemd/user/

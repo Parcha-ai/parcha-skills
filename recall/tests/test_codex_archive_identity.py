@@ -5,7 +5,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from collector.codex_identity import resolve_codex_session_identity
+from skills.recall.scripts.codex_identity import (
+    resolve_codex_session_identity,
+    stable_codex_record_key,
+)
 
 
 CORPUS = Path(__file__).parent / "codex_archive_identity_v1" / "corpus.jsonl"
@@ -59,6 +62,15 @@ class CodexArchiveIdentityContractTest(unittest.TestCase):
             target.write_text("{}\n")
             with self.assertRaisesRegex(ValueError, "bounds"):
                 resolve_codex_session_identity(target, max_records=0)
+
+    def test_stable_record_key_is_case_normalized_and_path_independent(self) -> None:
+        session_id = "019F1111-2222-7333-8444-555555555555"
+        self.assertEqual(
+            stable_codex_record_key(session_id),
+            stable_codex_record_key(session_id.casefold()),
+        )
+        with self.assertRaisesRegex(ValueError, "unsafe"):
+            stable_codex_record_key(" unsafe ")
 
 
 if __name__ == "__main__":

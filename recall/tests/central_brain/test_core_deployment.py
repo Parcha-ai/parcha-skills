@@ -382,6 +382,7 @@ class ContainerContractTest(unittest.TestCase):
             "recall/privacy/**",
             "recall/scripts/install_gws.py",
             "recall/skills/recall/scripts/recall.py",
+            "recall/skills/recall/scripts/codex_identity.py",
         ):
             self.assertIn(f'"{runtime_input}"', workflow)
 

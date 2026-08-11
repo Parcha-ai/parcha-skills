@@ -14,6 +14,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from skills.recall.scripts.codex_identity import (
+    codex_session_id_from_filename,
+    codex_session_id_from_record,
+    resolve_codex_session_identity,
+    stable_codex_record_key,
+)
 from privacy.policy import PrivacyPolicy, summarize_receipts
 from privacy.transport import open_no_redirect
 
@@ -97,7 +103,8 @@ class Collector:
                  max_scan_records: int = DEFAULT_MAX_SCAN_RECORDS,
                  max_scan_seconds: float = DEFAULT_MAX_SCAN_SECONDS,
                  bulk_manifest_archive: bool = False,
-                 bulk_bundle_records: int = 500):
+                 bulk_bundle_records: int = 500,
+                 archive_root: Path | None = None):
         if harness not in {"claude", "codex"}:
             raise ValueError("harness must be claude or codex")
         if visibility not in {"private", "shared"}:
@@ -131,6 +138,20 @@ class Collector:
         ):
             raise ValueError("bulk_bundle_records must be between 1 and 10000")
         self.root = Path(root).expanduser().resolve()
+        self.archive_root = (
+            Path(archive_root).expanduser().resolve()
+            if archive_root is not None
+            else None
+        )
+        if self.archive_root is not None:
+            if harness != "codex":
+                raise ValueError("archive_root is supported only for codex")
+            if (
+                self.archive_root == self.root
+                or self.archive_root.is_relative_to(self.root)
+                or self.root.is_relative_to(self.archive_root)
+            ):
+                raise ValueError("codex roots must be separate")
         self.harness = harness
         self.source_id = source_id
         self.spool_path = Path(spool_path).expanduser()
@@ -152,6 +173,7 @@ class Collector:
         self.max_scan_seconds = float(max_scan_seconds)
         self.bulk_manifest_archive = bulk_manifest_archive
         self.bulk_bundle_records = bulk_bundle_records
+        self._codex_path_keys: dict[str, str] = {}
         self.shard_count = 1
         self.shard_index = 0
         self.spool_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -163,6 +185,8 @@ class Collector:
         self.db.execute("PRAGMA busy_timeout=30000")
         self.db.execute("PRAGMA synchronous=FULL")
         self._migrate()
+        if self.harness == "codex":
+            self._migrate_codex_state()
         self._migrate_privacy_state()
 
     def _migrate(self) -> None:
@@ -224,6 +248,32 @@ class Collector:
         self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES ('collector_version',?)", (str(COLLECTOR_VERSION),))
         self.db.commit()
 
+    def _migrate_codex_state(self) -> None:
+        self.db.executescript("""
+        CREATE INDEX IF NOT EXISTS outbox_path_idx ON outbox(path);
+        CREATE TABLE IF NOT EXISTS codex_sessions(
+          session_id TEXT PRIMARY KEY,
+          record_key TEXT NOT NULL UNIQUE,
+          canonical_path TEXT NOT NULL UNIQUE,
+          lifecycle TEXT NOT NULL CHECK(lifecycle IN ('active','archived')),
+          status TEXT NOT NULL CHECK(status IN ('resolved','identity_conflict')),
+          first_seen_at REAL NOT NULL,
+          last_seen_at REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS codex_session_locations(
+          path TEXT PRIMARY KEY,
+          session_id TEXT,
+          lifecycle TEXT NOT NULL CHECK(lifecycle IN ('active','archived')),
+          size INTEGER NOT NULL,
+          mtime_ns INTEGER NOT NULL,
+          status TEXT NOT NULL CHECK(status IN (
+            'current','duplicate','identity_conflict','identity_unavailable',
+            'unsafe_metadata','missing')),
+          last_scan_id TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS codex_locations_session_idx
+          ON codex_session_locations(session_id,status);
+        """)
+        self.db.commit()
+
     def _migrate_privacy_state(self) -> None:
         state = f"{self.privacy.mode}:{self.privacy.apply({}).policy_version}"
         previous = self.db.execute("SELECT value FROM meta WHERE key='privacy_policy_state'").fetchone()
@@ -266,23 +316,378 @@ class Collector:
         self.db.execute("DELETE FROM meta WHERE key='running_started_epoch'")
 
     def discover(self) -> list[Path]:
-        if not self.root.exists():
-            return []
         pattern = "rollout-*.jsonl" if self.harness == "codex" else "*.jsonl"
-        paths = [path for path in self.root.rglob(pattern) if path.is_file()]
-        return sorted(
-            paths,
-            key=lambda path: (path.stat().st_mtime_ns, str(path)),
-            reverse=True,
-        )
+        roots = [self.root]
+        if self.harness == "codex" and self.archive_root is not None:
+            if not self.archive_root.is_dir():
+                raise CollectorRuntimeError("archive_unavailable")
+            roots.append(self.archive_root)
+        result: list[Path] = []
+        for root in roots:
+            if not root.exists():
+                continue
+            paths = [path for path in root.rglob(pattern) if path.is_file()]
+            result.extend(sorted(
+                paths,
+                key=lambda path: (path.stat().st_mtime_ns, str(path)),
+                reverse=True,
+            ))
+        return result
 
-    def _file_key(self, path: Path) -> str:
+    def _legacy_file_key(self, path: Path) -> str:
         relative = str(path.relative_to(self.root))
         return hashlib.sha256((self.harness + "\x1f" + relative).encode()).hexdigest()[:24]
+
+    def _file_key(self, path: Path) -> str:
+        if self.harness != "codex":
+            return self._legacy_file_key(path)
+        path_text = str(path)
+        cached = self._codex_path_keys.get(path_text)
+        if cached is not None:
+            return cached
+        row = self.db.execute(
+            "SELECT record_key FROM codex_sessions WHERE canonical_path=?",
+            (path_text,),
+        ).fetchone()
+        if row is None:
+            raise CollectorRuntimeError("codex_identity_unavailable")
+        self._codex_path_keys[path_text] = row["record_key"]
+        return row["record_key"]
 
     @staticmethod
     def _path_shard(path: str) -> int:
         return int.from_bytes(hashlib.sha256(path.encode()).digest()[:8], "big") & ((1 << 63) - 1)
+
+    def _codex_lifecycle(self, path: Path) -> str:
+        if self.archive_root is not None and path.is_relative_to(self.archive_root):
+            return "archived"
+        return "active"
+
+    @staticmethod
+    def _content_digest(path: Path) -> str:
+        value = hashlib.sha256()
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                value.update(chunk)
+        return value.hexdigest()
+
+    def _legacy_codex_session_map(self) -> dict[str, list[str]]:
+        result: dict[str, list[str]] = {}
+        for file_row in self.db.execute("SELECT path FROM files ORDER BY path"):
+            path = file_row["path"]
+            filename_id = codex_session_id_from_filename(Path(path))
+            if filename_id is not None:
+                result.setdefault(filename_id, []).append(path)
+                continue
+            rows = self.db.execute(
+                "SELECT envelope_json FROM outbox WHERE path=? "
+                "ORDER BY start_offset,id LIMIT 128",
+                (path,),
+            )
+            for row in rows:
+                try:
+                    envelope = json.loads(row["envelope_json"])
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                session_id = codex_session_id_from_record(
+                    envelope.get("content") if isinstance(envelope, dict) else None
+                )
+                if session_id is None:
+                    continue
+                result.setdefault(session_id, []).append(path)
+                break
+        return result
+
+    def _protect_codex_ledger_path(self, path: str, scan_id: str) -> None:
+        self.db.execute(
+            "UPDATE files SET last_scan_id=? WHERE path=? AND status!='tombstone'",
+            (scan_id, path),
+        )
+
+    def _rebind_codex_path(self, old_path: str, new_path: str) -> bool:
+        if old_path == new_path:
+            return True
+        tables = ("files", "active_records", "scan_members", "outbox", "dead_letters")
+        if any(
+            self.db.execute(
+                f"SELECT 1 FROM {table} WHERE path=? LIMIT 1",
+                (new_path,),
+            ).fetchone()
+            for table in tables
+        ):
+            return False
+        self.db.execute("SAVEPOINT codex_rebind")
+        try:
+            for table in ("files", "active_records", "scan_members", "dead_letters"):
+                self.db.execute(
+                    f"UPDATE {table} SET path=? WHERE path=?",
+                    (new_path, old_path),
+                )
+            self.db.execute(
+                "UPDATE outbox SET path=?,shard_key=? WHERE path=?",
+                (new_path, self._path_shard(new_path), old_path),
+            )
+            self.db.execute("RELEASE codex_rebind")
+        except sqlite3.IntegrityError:
+            self.db.execute("ROLLBACK TO codex_rebind")
+            self.db.execute("RELEASE codex_rebind")
+            return False
+        return True
+
+    def _prepare_codex_discovery(
+        self,
+        paths: list[Path],
+        scan_id: str,
+        summary: dict[str, Any],
+    ) -> list[Path]:
+        """Resolve all roots before scanning and reconcile pure path moves."""
+
+        entries: list[dict[str, Any]] = []
+        groups: dict[str, list[dict[str, Any]]] = {}
+        quarantined = 0
+        self._codex_path_keys.clear()
+        for ordinal, path in enumerate(paths):
+            stat = path.stat()
+            path_text = str(path)
+            lifecycle = self._codex_lifecycle(path)
+            location = self.db.execute(
+                "SELECT * FROM codex_session_locations WHERE path=?",
+                (path_text,),
+            ).fetchone()
+            unchanged = (
+                location is not None
+                and int(location["size"]) == stat.st_size
+                and int(location["mtime_ns"]) == stat.st_mtime_ns
+                and location["lifecycle"] == lifecycle
+            )
+            if (
+                unchanged
+                and location["session_id"] is not None
+            ):
+                session_id = location["session_id"]
+                identity_status = "resolved"
+            elif (
+                unchanged
+                and location["status"] in {
+                    "identity_unavailable", "unsafe_metadata"
+                }
+            ):
+                session_id = None
+                identity_status = location["status"]
+            else:
+                identity = resolve_codex_session_identity(path)
+                session_id = identity.native_session_id
+                identity_status = identity.status
+            preliminary = "current" if session_id is not None else identity_status
+            cached_current = bool(
+                unchanged
+                and session_id is not None
+                and location["status"] == "current"
+            )
+            if not cached_current:
+                self.db.execute(
+                    """INSERT INTO codex_session_locations(
+                         path,session_id,lifecycle,size,mtime_ns,status,last_scan_id)
+                       VALUES (?,?,?,?,?,?,?)
+                       ON CONFLICT(path) DO UPDATE SET
+                         session_id=excluded.session_id,
+                         lifecycle=excluded.lifecycle,
+                         size=excluded.size,
+                         mtime_ns=excluded.mtime_ns,
+                         status=excluded.status,
+                         last_scan_id=excluded.last_scan_id""",
+                    (
+                        path_text, session_id, lifecycle, stat.st_size,
+                        stat.st_mtime_ns, preliminary, scan_id,
+                    ),
+                )
+            entry = {
+                "path": path,
+                "path_text": path_text,
+                "lifecycle": lifecycle,
+                "session_id": session_id,
+                "ordinal": ordinal,
+                "cached_current": cached_current,
+            }
+            entries.append(entry)
+            if session_id is None:
+                quarantined += 1
+                self._protect_codex_ledger_path(path_text, scan_id)
+            else:
+                groups.setdefault(session_id, []).append(entry)
+
+        selected: list[dict[str, Any]] = []
+        legacy_map: dict[str, list[str]] | None = None
+        conflicts = 0
+        duplicate_sessions = 0
+        for session_id, candidates in groups.items():
+            candidates.sort(
+                key=lambda item: (
+                    item["lifecycle"] != "active",
+                    item["ordinal"],
+                )
+            )
+            divergent = False
+            if len(candidates) > 1:
+                duplicate_sessions += 1
+                self.db.executemany(
+                    "UPDATE codex_session_locations SET last_scan_id=? WHERE path=?",
+                    [
+                        (scan_id, item["path_text"])
+                        for item in candidates
+                        if item["cached_current"]
+                    ],
+                )
+                divergent = len({
+                    self._content_digest(item["path"])
+                    for item in candidates
+                }) > 1
+            session = self.db.execute(
+                "SELECT * FROM codex_sessions WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+            if divergent:
+                conflicts += 1
+                self.db.execute(
+                    "UPDATE codex_session_locations SET status='identity_conflict' "
+                    "WHERE session_id=? AND last_scan_id=?",
+                    (session_id, scan_id),
+                )
+                if session is not None:
+                    self.db.execute(
+                        "UPDATE codex_sessions SET status='identity_conflict',last_seen_at=? "
+                        "WHERE session_id=?",
+                        (time.time(), session_id),
+                    )
+                    self._protect_codex_ledger_path(
+                        session["canonical_path"], scan_id
+                    )
+                for item in candidates:
+                    self._protect_codex_ledger_path(item["path_text"], scan_id)
+                continue
+
+            chosen = candidates[0]
+            if (
+                len(candidates) == 1
+                and chosen["cached_current"]
+                and session is not None
+                and session["canonical_path"] == chosen["path_text"]
+                and session["status"] == "resolved"
+            ):
+                self._codex_path_keys[chosen["path_text"]] = session["record_key"]
+                selected.append(chosen)
+                continue
+            if session is None:
+                direct_legacy = [
+                    item["path_text"] for item in candidates
+                    if self.db.execute(
+                        "SELECT 1 FROM files WHERE path=? AND status!='tombstone'",
+                        (item["path_text"],),
+                    ).fetchone()
+                ]
+                if not direct_legacy:
+                    if legacy_map is None:
+                        legacy_map = self._legacy_codex_session_map()
+                    direct_legacy = legacy_map.get(session_id, [])
+                direct_legacy = sorted(set(direct_legacy))
+                if len(direct_legacy) > 1:
+                    conflicts += 1
+                    self.db.execute(
+                        "UPDATE codex_session_locations SET status='identity_conflict' "
+                        "WHERE session_id=? AND last_scan_id=?",
+                        (session_id, scan_id),
+                    )
+                    for legacy_path in direct_legacy:
+                        self._protect_codex_ledger_path(legacy_path, scan_id)
+                    continue
+                legacy_path = direct_legacy[0] if direct_legacy else None
+                record_key = (
+                    self._legacy_file_key(Path(legacy_path))
+                    if legacy_path is not None
+                    else stable_codex_record_key(session_id)
+                )
+                canonical_path = legacy_path or chosen["path_text"]
+                now = time.time()
+                self.db.execute(
+                    """INSERT INTO codex_sessions(
+                         session_id,record_key,canonical_path,lifecycle,status,
+                         first_seen_at,last_seen_at)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (
+                        session_id, record_key, canonical_path,
+                        chosen["lifecycle"], "resolved", now, now,
+                    ),
+                )
+                session = self.db.execute(
+                    "SELECT * FROM codex_sessions WHERE session_id=?",
+                    (session_id,),
+                ).fetchone()
+
+            assert session is not None
+            old_path = session["canonical_path"]
+            if not self._rebind_codex_path(old_path, chosen["path_text"]):
+                conflicts += 1
+                self.db.execute(
+                    "UPDATE codex_sessions SET status='identity_conflict',last_seen_at=? "
+                    "WHERE session_id=?",
+                    (time.time(), session_id),
+                )
+                self.db.execute(
+                    "UPDATE codex_session_locations SET status='identity_conflict' "
+                    "WHERE session_id=? AND last_scan_id=?",
+                    (session_id, scan_id),
+                )
+                self._protect_codex_ledger_path(old_path, scan_id)
+                continue
+            self.db.execute(
+                """UPDATE codex_sessions
+                   SET canonical_path=?,lifecycle=?,status='resolved',last_seen_at=?
+                   WHERE session_id=?""",
+                (
+                    chosen["path_text"], chosen["lifecycle"], time.time(),
+                    session_id,
+                ),
+            )
+            self.db.execute(
+                "UPDATE codex_session_locations SET status='duplicate' "
+                "WHERE session_id=? AND last_scan_id=?",
+                (session_id, scan_id),
+            )
+            self.db.execute(
+                "UPDATE codex_session_locations SET status='current' WHERE path=?",
+                (chosen["path_text"],),
+            )
+            self._codex_path_keys[chosen["path_text"]] = session["record_key"]
+            for duplicate in candidates[1:]:
+                self._protect_codex_ledger_path(duplicate["path_text"], scan_id)
+            selected.append(chosen)
+
+        discovered_paths = {item["path_text"] for item in entries}
+        missing_paths = [
+            row["path"]
+            for row in self.db.execute(
+                "SELECT path FROM codex_session_locations WHERE status!='missing'"
+            )
+            if row["path"] not in discovered_paths
+        ]
+        self.db.executemany(
+            "UPDATE codex_session_locations SET status='missing' WHERE path=?",
+            [(path,) for path in missing_paths],
+        )
+        selected.sort(key=lambda item: item["ordinal"])
+        summary.update({
+            "active_files_seen": sum(
+                item["lifecycle"] == "active" for item in entries
+            ),
+            "archive_files_seen": sum(
+                item["lifecycle"] == "archived" for item in entries
+            ),
+            "identity_conflicts": conflicts,
+            "quarantined_files": quarantined,
+            "duplicate_sessions": duplicate_sessions,
+        })
+        self.db.commit()
+        return [item["path"] for item in selected]
 
     def _envelope(self, path: Path, native_id: str, kind: str, content: Any,
                   occurred_at: str, start: int, end: int,
@@ -542,6 +947,8 @@ class Collector:
         )
         try:
             paths = self.discover()
+            if self.harness == "codex":
+                paths = self._prepare_codex_discovery(paths, scan_id, summary)
             for path in paths:
                 if (
                     records_seen >= self.max_scan_records
@@ -1209,7 +1616,24 @@ class Collector:
         return maximum
 
     def doctor(self, *, include_dead_letters: bool = True) -> dict:
-        disk = {str(path) for path in self.discover()}
+        if self.harness == "codex":
+            active_disk = {
+                str(path) for path in self.root.rglob("rollout-*.jsonl")
+                if path.is_file()
+            }
+            archive_disk = {
+                str(path)
+                for path in (
+                    self.archive_root.rglob("rollout-*.jsonl")
+                    if self.archive_root is not None
+                    and self.archive_root.is_dir()
+                    else ()
+                )
+                if path.is_file()
+            }
+            disk = active_disk | archive_disk
+        else:
+            disk = {str(path) for path in self.discover()}
         ledger = {row["path"] for row in self.db.execute("SELECT path FROM files WHERE status != 'tombstone'")}
         total_lines = self.db.execute("SELECT count(*) AS n FROM active_records").fetchone()["n"]
         parse_errors = self.db.execute("SELECT count(*) AS n FROM dead_letters").fetchone()["n"]
@@ -1242,6 +1666,52 @@ class Collector:
             "running": "running_started_epoch" in metadata,
             "scan_complete": metadata.get("last_scan_complete") == "1",
         }
+        if self.harness == "codex":
+            locations = {
+                row["path"]: row
+                for row in self.db.execute(
+                    "SELECT path,lifecycle,status FROM codex_session_locations "
+                    "WHERE status!='missing'"
+                )
+            }
+            result.update({
+                "active_disk_files": len(active_disk),
+                "archive_disk_files": len(archive_disk),
+                "archive_root_available": (
+                    self.archive_root is None or self.archive_root.is_dir()
+                ),
+                "active_coverage_percent": (
+                    100.0 if not active_disk else
+                    100.0 * len(active_disk & locations.keys()) / len(active_disk)
+                ),
+                "archive_coverage_percent": (
+                    100.0 if not archive_disk else
+                    100.0 * len(archive_disk & locations.keys()) / len(archive_disk)
+                ),
+                "identity_conflicts": self.db.execute(
+                    "SELECT count(DISTINCT session_id) FROM codex_session_locations "
+                    "WHERE status='identity_conflict' AND session_id IS NOT NULL"
+                ).fetchone()[0],
+                "quarantined_files": self.db.execute(
+                    "SELECT count(*) FROM codex_session_locations WHERE status IN "
+                    "('identity_unavailable','unsafe_metadata')"
+                ).fetchone()[0],
+                "duplicate_sessions": self.db.execute(
+                    "SELECT count(*) FROM ("
+                    "SELECT session_id FROM codex_session_locations "
+                    "WHERE status!='missing' AND session_id IS NOT NULL "
+                    "GROUP BY session_id HAVING count(*)>1)"
+                ).fetchone()[0],
+                "archive_backlog": self.db.execute(
+                    """SELECT count(*)
+                       FROM codex_session_locations location
+                       LEFT JOIN files ON files.path=location.path
+                       WHERE location.lifecycle='archived'
+                         AND location.status='current'
+                         AND (files.path IS NULL OR files.status='tombstone'
+                              OR files.committed_offset!=files.scanned_offset)"""
+                ).fetchone()[0],
+            })
         if include_dead_letters:
             result["dead_letters"] = [dict(row) for row in self.db.execute("SELECT path,byte_offset,error_code,error_summary FROM dead_letters ORDER BY id")]
         return result
