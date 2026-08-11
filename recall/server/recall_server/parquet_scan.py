@@ -1123,10 +1123,17 @@ class CanonicalParquetScanProjector:
             raise ParquetScanError("parquet_scan_budget_invalid")
         committed = stale = rows = contended = 0
         for _ in range(max_batches):
-            candidates = self._pending(tenant_id=tenant_id, limit=batch_size)
+            candidate_limit = min(32, batch_size + 7)
+            candidates = self._pending(
+                tenant_id=tenant_id,
+                limit=candidate_limit,
+            )
             if not candidates:
                 break
+            batch_completed = 0
             for candidate in candidates:
+                if batch_completed >= batch_size:
+                    break
                 with self._candidate_lease(candidate) as acquired:
                     if not acquired:
                         contended += 1
@@ -1135,12 +1142,14 @@ class CanonicalParquetScanProjector:
                     status = self._commit(candidate, upload)
                     if status == "committed":
                         committed += 1
+                        batch_completed += 1
                         rows += sum(upload.row_counts.values())
                     else:
                         stale += 1
+                        batch_completed += 1
                         if upload.created:
                             self._schedule_cleanup(upload.references.values())
-            if len(candidates) < batch_size:
+            if len(candidates) < candidate_limit:
                 break
         return {
             "status": "complete",

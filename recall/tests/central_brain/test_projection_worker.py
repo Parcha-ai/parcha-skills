@@ -51,10 +51,18 @@ class _Passages:
 
 
 class _Scan:
-    def __init__(self, calls: list[str], *, work: int = 1, stale: int = 0):
+    def __init__(
+        self,
+        calls: list[str],
+        *,
+        work: int = 1,
+        stale: int = 0,
+        contended: int = 0,
+    ):
         self.calls = calls
         self.work = work
         self.stale = stale
+        self.contended = contended
 
     def project_pending(self, **_kwargs):
         self.calls.append("scan")
@@ -63,6 +71,7 @@ class _Scan:
             "shards": self.work,
             "rows": self.work * 10,
             "stale": self.stale,
+            "contended": self.contended,
         }
 
 
@@ -108,6 +117,25 @@ class ProjectionWorkerTest(unittest.TestCase):
         )
         self.assertEqual(result["status"], "pending")
         self.assertEqual(result["parquet_stale"], 1)
+
+    def test_contended_scan_is_visible_and_not_truthfully_complete(self):
+        calls: list[str] = []
+        result = run_projection_worker(
+            _Logical(calls, work=0),  # type: ignore[arg-type]
+            _Passages(calls, work=0),  # type: ignore[arg-type]
+            _Scan(calls, work=0, contended=1),  # type: ignore[arg-type]
+            tenant_id="tenant:company:test",
+            logical_batch_size=25,
+            passage_batch_size=100,
+            embedding_batch_size=128,
+            max_batches_per_cycle=10,
+            upload_concurrency=2,
+            passage_concurrency=4,
+            interval_seconds=5,
+            once=True,
+        )
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(result["parquet_contended"], 1)
 
     def test_empty_cycle_is_truthfully_complete(self):
         calls: list[str] = []

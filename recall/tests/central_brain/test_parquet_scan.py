@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import unittest
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from unittest import mock
 
@@ -13,6 +14,7 @@ from recall_server.parquet_scan import (
     CanonicalParquetScanProjector,
     ParquetScanError,
     ScanCandidate,
+    ScanUpload,
     _month,
     _parquet_bytes,
     _parquet_parts,
@@ -203,6 +205,45 @@ class _CheckpointProbe(CanonicalParquetScanProjector):
         self.checkpoints.append(len(bounds))
 
 
+class _WindowProbe(CanonicalParquetScanProjector):
+    def __init__(self):
+        super().__init__(None, _Evidence(None))
+        self.pending_limits = []
+        self.built = []
+
+    def _pending(self, *, tenant_id, limit):
+        self.pending_limits.append((tenant_id, limit))
+        base = _candidate()
+        return [
+            ScanCandidate(
+                base.tenant_id,
+                source_id,
+                base.bucket_start,
+                base.generation,
+                base.changed_at,
+            )
+            for source_id in ("source:locked", "source:ready", "source:later")
+        ]
+
+    @contextmanager
+    def _candidate_lease(self, candidate):
+        yield candidate.source_id != "source:locked"
+
+    def _build(self, candidate):
+        self.built.append(candidate.source_id)
+        return ScanUpload(
+            "a" * 64,
+            {},
+            {("records", 0): 1},
+            None,
+            None,
+            False,
+        )
+
+    def _commit(self, _candidate, _upload):
+        return "committed"
+
+
 class ParquetScanContractTest(unittest.TestCase):
     def test_seed_deduplicates_documents_in_one_source_month_before_upsert(self):
         store = _SeedStore()
@@ -237,6 +278,18 @@ class ParquetScanContractTest(unittest.TestCase):
             owned.connection.calls[0][1],
             owned.connection.calls[1][1],
         )
+
+    def test_contended_head_does_not_hide_the_next_ready_candidate(self):
+        projector = _WindowProbe()
+        result = projector.project_pending(
+            tenant_id="tenant:test",
+            batch_size=1,
+            max_batches=1,
+        )
+        self.assertEqual(projector.pending_limits, [("tenant:test", 8)])
+        self.assertEqual(projector.built, ["source:ready"])
+        self.assertEqual(result["shards"], 1)
+        self.assertEqual(result["contended"], 1)
 
     def test_typed_parquet_round_trip_preserves_large_record_json(self):
         row = {

@@ -58,7 +58,13 @@ def run_projection_worker(
                 max_batches=max_batches_per_cycle,
             )
             if scan is not None
-            else {"status": "complete", "shards": 0, "rows": 0, "stale": 0}
+            else {
+                "status": "complete",
+                "shards": 0,
+                "rows": 0,
+                "stale": 0,
+                "contended": 0,
+            }
         )
         documents = logical.project_pending(
             tenant_id=tenant_id,
@@ -77,6 +83,7 @@ def run_projection_worker(
                 and int(projected["passages"]) == 0
                 and int(scanned["shards"]) == 0
                 and int(scanned["stale"]) == 0
+                and int(scanned["contended"]) == 0
                 else "pending"
             ),
             "documents": int(documents["documents"]),
@@ -87,6 +94,7 @@ def run_projection_worker(
             "parquet_shards": int(scanned["shards"]),
             "parquet_rows": int(scanned["rows"]),
             "parquet_stale": int(scanned["stale"]),
+            "parquet_contended": int(scanned["contended"]),
             "stale": int(projected["stale"]),
             "pruned": int(documents["pruned"]),
             "cleanup_failures": int(documents["cleanup_failures"]),
@@ -94,7 +102,8 @@ def run_projection_worker(
         LOG.info(
             "projection cycle status=%s documents=%s records=%s "
             "passage_documents=%s passages=%s embedded=%s parquet_shards=%s "
-            "parquet_rows=%s parquet_stale=%s stale=%s pruned=%s "
+            "parquet_rows=%s parquet_stale=%s parquet_contended=%s "
+            "stale=%s pruned=%s "
             "cleanup_failures=%s",
             *(
                 result[key]
@@ -108,6 +117,7 @@ def run_projection_worker(
                     "parquet_shards",
                     "parquet_rows",
                     "parquet_stale",
+                    "parquet_contended",
                     "stale",
                     "pruned",
                     "cleanup_failures",
