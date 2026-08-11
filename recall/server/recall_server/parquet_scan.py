@@ -5,10 +5,9 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
-import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import orjson
 import pyarrow as pa
@@ -117,8 +116,7 @@ def _estimated_row_bytes(row: dict[str, Any]) -> int:
             size += len(value)
         elif isinstance(value, (list, tuple)):
             size += sum(
-                len(item) if isinstance(item, (str, bytes)) else 16
-                for item in value
+                len(item) if isinstance(item, (str, bytes)) else 16 for item in value
             )
         else:
             size += 16
@@ -143,8 +141,7 @@ def _parquet_parts(
         if len(payload) > maximum_bytes:
             raise ParquetScanError("parquet_scan_record_too_large")
         LOG.info(
-            "parquet encode rows=0 arrow_bytes=%s parts=1 arrow_ms=%s "
-            "encode_ms=%s",
+            "parquet encode rows=0 arrow_bytes=%s parts=1 arrow_ms=%s encode_ms=%s",
             table.nbytes,
             arrow_ms,
             round((time.perf_counter() - started) * 1_000) - arrow_ms,
@@ -178,17 +175,18 @@ def _parquet_parts(
             if candidate.num_rows <= 1:
                 raise ParquetScanError("parquet_scan_record_too_large")
             left_rows = candidate.num_rows // 2
-            pending.extend((
-                (offset + left_rows, candidate.slice(left_rows)),
-                (offset, candidate.slice(0, left_rows)),
-            ))
+            pending.extend(
+                (
+                    (offset + left_rows, candidate.slice(left_rows)),
+                    (offset, candidate.slice(0, left_rows)),
+                )
+            )
     result = [
         (payload, row_count)
         for _, payload, row_count in sorted(parts, key=lambda value: value[0])
     ]
     LOG.info(
-        "parquet encode rows=%s arrow_bytes=%s parts=%s arrow_ms=%s "
-        "encode_ms=%s",
+        "parquet encode rows=%s arrow_bytes=%s parts=%s arrow_ms=%s encode_ms=%s",
         len(rows),
         arrow_bytes,
         len(result),
@@ -202,49 +200,55 @@ def _schemas() -> dict[str, Any]:
     utc = pa.timestamp("us", tz="UTC")
     strings = pa.list_(pa.string())
     return {
-        "documents": pa.schema([
-            ("schema_version", pa.int16()),
-            ("tenant_id", pa.string()),
-            ("source_id", pa.string()),
-            ("logical_document_id", pa.string()),
-            ("revision", pa.int32()),
-            ("first_occurred_at", utc),
-            ("last_occurred_at", utc),
-            ("record_count", pa.int64()),
-            ("part_count", pa.int32()),
-            ("document_content_sha256", pa.string()),
-            ("actor_ids", strings),
-            ("actor_names", strings),
-            ("actor_relations", strings),
-        ]),
-        "records": pa.schema([
-            ("schema_version", pa.int16()),
-            ("tenant_id", pa.string()),
-            ("source_id", pa.string()),
-            ("logical_document_id", pa.string()),
-            ("revision", pa.int32()),
-            ("ordinal", pa.int64()),
-            ("occurred_at", utc),
-            ("event_kind", pa.string()),
-            ("roles", strings),
-            ("receipts", strings),
-            ("actor_ids", strings),
-            ("actor_names", strings),
-            ("actor_relations", strings),
-            ("search_text", pa.large_string()),
-            ("record_json", pa.large_string()),
-        ]),
-        "actors": pa.schema([
-            ("schema_version", pa.int16()),
-            ("tenant_id", pa.string()),
-            ("source_id", pa.string()),
-            ("logical_document_id", pa.string()),
-            ("revision", pa.int32()),
-            ("record_ordinal", pa.int64()),
-            ("actor_id", pa.string()),
-            ("display_name", pa.string()),
-            ("relation", pa.string()),
-        ]),
+        "documents": pa.schema(
+            [
+                ("schema_version", pa.int16()),
+                ("tenant_id", pa.string()),
+                ("source_id", pa.string()),
+                ("logical_document_id", pa.string()),
+                ("revision", pa.int32()),
+                ("first_occurred_at", utc),
+                ("last_occurred_at", utc),
+                ("record_count", pa.int64()),
+                ("part_count", pa.int32()),
+                ("document_content_sha256", pa.string()),
+                ("actor_ids", strings),
+                ("actor_names", strings),
+                ("actor_relations", strings),
+            ]
+        ),
+        "records": pa.schema(
+            [
+                ("schema_version", pa.int16()),
+                ("tenant_id", pa.string()),
+                ("source_id", pa.string()),
+                ("logical_document_id", pa.string()),
+                ("revision", pa.int32()),
+                ("ordinal", pa.int64()),
+                ("occurred_at", utc),
+                ("event_kind", pa.string()),
+                ("roles", strings),
+                ("receipts", strings),
+                ("actor_ids", strings),
+                ("actor_names", strings),
+                ("actor_relations", strings),
+                ("search_text", pa.large_string()),
+                ("record_json", pa.large_string()),
+            ]
+        ),
+        "actors": pa.schema(
+            [
+                ("schema_version", pa.int16()),
+                ("tenant_id", pa.string()),
+                ("source_id", pa.string()),
+                ("logical_document_id", pa.string()),
+                ("revision", pa.int32()),
+                ("record_ordinal", pa.int64()),
+                ("actor_id", pa.string()),
+                ("display_name", pa.string()),
+                ("relation", pa.string()),
+            ]
+        ),
     }
 
 
@@ -271,6 +275,7 @@ class ScanUpload:
 class DocumentProjection:
     records: list[dict[str, Any]]
     actors: list[dict[str, Any]]
+    record_count: int
     first_occurred_at: datetime | None
     last_occurred_at: datetime | None
     part_bounds: tuple[PartTimeBound, ...]
@@ -286,6 +291,104 @@ class PartTimeBound:
     content_sha256: str
     first_occurred_at: datetime
     last_occurred_at: datetime
+
+
+class _StreamingUpload:
+    """Upload bounded Parquet parts without retaining a month of projected rows."""
+
+    def __init__(
+        self,
+        projector: "CanonicalParquetScanProjector",
+        candidate: ScanCandidate,
+        *,
+        generation: str,
+        created_at: datetime,
+    ):
+        self.projector = projector
+        self.candidate = candidate
+        self.generation = generation
+        self.created_at = created_at
+        self.schemas = _schemas()
+        self.buffers = {dataset: [] for dataset in SCAN_DATASETS}
+        self.buffer_bytes = {dataset: 0 for dataset in SCAN_DATASETS}
+        self.references: dict[tuple[str, int], dict[str, Any]] = {}
+        self.row_counts: dict[tuple[str, int], int] = {}
+        self.part_indexes = {dataset: 0 for dataset in SCAN_DATASETS}
+        self.rows_seen = {dataset: 0 for dataset in SCAN_DATASETS}
+        self.flushes = 0
+        self.upload_ms = 0
+        self.maximum_buffer_bytes = 0
+
+    def add(self, dataset: str, row: dict[str, Any]) -> None:
+        row_bytes = _estimated_row_bytes(row)
+        if self.buffers[dataset] and (
+            self.buffer_bytes[dataset] + row_bytes > PARQUET_RAW_SLICE_BYTES
+        ):
+            self._flush(dataset)
+        self.buffers[dataset].append(row)
+        self.buffer_bytes[dataset] += row_bytes
+        self.maximum_buffer_bytes = max(
+            self.maximum_buffer_bytes,
+            self.buffer_bytes[dataset],
+        )
+        self.rows_seen[dataset] += 1
+
+    def _flush(self, dataset: str, *, allow_empty: bool = False) -> None:
+        rows = self.buffers[dataset]
+        if not rows and not allow_empty:
+            return
+        self.buffers[dataset] = []
+        self.buffer_bytes[dataset] = 0
+        for payload, row_count in _parquet_parts(rows, self.schemas[dataset]):
+            shard_index = self.part_indexes[dataset]
+            identity = (dataset, shard_index)
+            uploaded_at = time.perf_counter()
+            self.references[identity] = self.projector.archive.put_raw(
+                tenant_id=self.candidate.tenant_id,
+                source_id=self.candidate.source_id,
+                native_id=(
+                    f"parquet-scan:{self.candidate.bucket_start.isoformat()}:"
+                    f"{dataset}:{shard_index}:{self.generation}"
+                ),
+                payload=payload,
+                media_type=PARQUET_MEDIA_TYPE,
+                created_at=self.created_at.isoformat().replace("+00:00", "Z"),
+            )
+            self.upload_ms += round((time.perf_counter() - uploaded_at) * 1_000)
+            self.row_counts[identity] = row_count
+            self.part_indexes[dataset] += 1
+        self.flushes += 1
+
+    def finish(
+        self,
+        *,
+        first: datetime,
+        last: datetime,
+    ) -> ScanUpload:
+        for dataset in SCAN_DATASETS:
+            self._flush(dataset, allow_empty=self.rows_seen[dataset] == 0)
+        LOG.info(
+            "parquet stream documents=%s records=%s actors=%s parts=%s "
+            "flushes=%s max_buffer_bytes=%s upload_ms=%s",
+            self.rows_seen["documents"],
+            self.rows_seen["records"],
+            self.rows_seen["actors"],
+            len(self.references),
+            self.flushes,
+            self.maximum_buffer_bytes,
+            self.upload_ms,
+        )
+        return ScanUpload(
+            self.generation,
+            self.references,
+            self.row_counts,
+            first,
+            last,
+            True,
+        )
+
+    def abort(self) -> None:
+        self.projector._schedule_cleanup(self.references.values())
 
 
 class CanonicalParquetScanProjector:
@@ -418,17 +521,19 @@ class CanonicalParquetScanProjector:
     def _actor_columns(
         links: Iterable[dict[str, Any]],
     ) -> tuple[list[str], list[str], list[str]]:
-        ordered = sorted({
-            (
-                str(link.get("actor_id", "")),
-                str(link.get("display_name", "")),
-                str(link.get("relation", "")),
-            )
-            for link in links
-            if isinstance(link, dict)
-            and link.get("actor_id")
-            and link.get("relation")
-        })
+        ordered = sorted(
+            {
+                (
+                    str(link.get("actor_id", "")),
+                    str(link.get("display_name", "")),
+                    str(link.get("relation", "")),
+                )
+                for link in links
+                if isinstance(link, dict)
+                and link.get("actor_id")
+                and link.get("relation")
+            }
+        )
         return (
             [value[0] for value in ordered],
             [value[1] for value in ordered],
@@ -453,6 +558,9 @@ class CanonicalParquetScanProjector:
         bucket_start: datetime,
         bucket_end: datetime,
         record_budget: int,
+        record_sink: Callable[[dict[str, Any]], None] | None = None,
+        actor_sink: Callable[[dict[str, Any]], None] | None = None,
+        collect: bool = True,
     ) -> DocumentProjection:
         document_links = document.get("actor_links") or []
         actor_names = {
@@ -463,6 +571,7 @@ class CanonicalParquetScanProjector:
         records: list[dict[str, Any]] = []
         actors: list[dict[str, Any]] = []
         discovered_bounds: list[PartTimeBound] = []
+        record_count = 0
         first = last = None
         for part in document["parts"]:
             known_first = part.get("first_occurred_at")
@@ -498,7 +607,7 @@ class CanonicalParquetScanProjector:
                 )
                 if not bucket_start <= occurred_at < bucket_end:
                     continue
-                if len(records) >= record_budget:
+                if record_count >= record_budget:
                     raise ParquetScanError("parquet_scan_budget_exceeded")
                 links = record.get("actor_links")
                 if not isinstance(links, list):
@@ -515,7 +624,7 @@ class CanonicalParquetScanProjector:
                 ordinal = int(record.get("ordinal", -1))
                 if ordinal < 0:
                     raise ParquetScanError("parquet_scan_record_invalid")
-                records.append({
+                projected_record = {
                     "schema_version": SCAN_SCHEMA_VERSION,
                     "tenant_id": candidate.tenant_id,
                     "source_id": candidate.source_id,
@@ -534,8 +643,13 @@ class CanonicalParquetScanProjector:
                         record,
                         option=orjson.OPT_SORT_KEYS,
                     ).decode(),
-                })
-                actors.extend(
+                }
+                if record_sink is not None:
+                    record_sink(projected_record)
+                if collect:
+                    records.append(projected_record)
+                record_count += 1
+                projected_actors = [
                     {
                         "schema_version": SCAN_SCHEMA_VERSION,
                         "tenant_id": candidate.tenant_id,
@@ -543,13 +657,19 @@ class CanonicalParquetScanProjector:
                         "logical_document_id": document["logical_document_id"],
                         "revision": int(document["revision"]),
                         "record_ordinal": ordinal,
-                        "actor_id": str(link["actor_id"]),
-                        "display_name": str(link.get("display_name", "")),
-                        "relation": str(link["relation"]),
+                        "actor_id": actor_id,
+                        "display_name": display_name,
+                        "relation": relation,
                     }
-                    for link in enriched
-                    if link.get("actor_id") and link.get("relation")
-                )
+                    for actor_id, display_name, relation in zip(
+                        ids, names, relations, strict=True
+                    )
+                ]
+                if actor_sink is not None:
+                    for projected_actor in projected_actors:
+                        actor_sink(projected_actor)
+                if collect:
+                    actors.extend(projected_actors)
                 first = occurred_at if first is None else min(first, occurred_at)
                 last = occurred_at if last is None else max(last, occurred_at)
             if known_first is None:
@@ -573,6 +693,7 @@ class CanonicalParquetScanProjector:
         return DocumentProjection(
             records,
             actors,
+            record_count,
             first,
             last,
             tuple(discovered_bounds),
@@ -624,9 +745,8 @@ class CanonicalParquetScanProjector:
                     candidate.bucket_start,
                 ),
             ).fetchall()
-        if (
-            {row["dataset"] for row in rows} != set(SCAN_DATASETS)
-            or any(row["generation_sha256"] != generation for row in rows)
+        if {row["dataset"] for row in rows} != set(SCAN_DATASETS) or any(
+            row["generation_sha256"] != generation for row in rows
         ):
             return None
         return ScanUpload(
@@ -636,8 +756,7 @@ class CanonicalParquetScanProjector:
                 for row in rows
             },
             {
-                (row["dataset"], int(row["shard_index"])):
-                    int(row["row_count"])
+                (row["dataset"], int(row["shard_index"])): int(row["row_count"])
                 for row in rows
             },
             rows[0]["first_occurred_at"],
@@ -653,53 +772,41 @@ class CanonicalParquetScanProjector:
             with connection.transaction():
                 self._enqueue_cleanup(connection, references)
 
-    def _upload(
+    @staticmethod
+    def _generation(candidate: ScanCandidate, documents: list[dict[str, Any]]) -> str:
+        digest = hashlib.sha256(
+            f"recall.parquet-scan.v{SCAN_SCHEMA_VERSION}\0"
+            f"{candidate.bucket_start.isoformat()}\n".encode()
+        )
+        for document in documents:
+            ids, names, relations = CanonicalParquetScanProjector._actor_columns(
+                document.get("actor_links") or []
+            )
+            digest.update(
+                orjson.dumps(
+                    {
+                        "actors": list(zip(ids, names, relations, strict=True)),
+                        "content": document["document_content_sha256"],
+                        "document": document["logical_document_id"],
+                        "revision": int(document["revision"]),
+                    },
+                    option=orjson.OPT_SORT_KEYS,
+                )
+            )
+        return digest.hexdigest()
+
+    def _streaming_upload(
         self,
         candidate: ScanCandidate,
         *,
         generation: str,
-        rows: dict[str, list[dict[str, Any]]],
-        first: datetime,
-        last: datetime,
         created_at: datetime,
-    ) -> ScanUpload:
-        references: dict[tuple[str, int], dict[str, Any]] = {}
-        row_counts: dict[tuple[str, int], int] = {}
-        attempt = uuid.uuid4().hex
-        try:
-            schemas = _schemas()
-            for dataset in SCAN_DATASETS:
-                for shard_index, (payload, row_count) in enumerate(
-                    _parquet_parts(rows[dataset], schemas[dataset])
-                ):
-                    identity = (dataset, shard_index)
-                    references[identity] = self.archive.put_raw(
-                        tenant_id=candidate.tenant_id,
-                        source_id=candidate.source_id,
-                        native_id=(
-                            f"parquet-scan:{candidate.bucket_start.isoformat()}:"
-                            f"{dataset}:{shard_index}:{generation[:16]}:{attempt}"
-                        ),
-                        payload=payload,
-                        media_type=PARQUET_MEDIA_TYPE,
-                        created_at=created_at.isoformat().replace("+00:00", "Z"),
-                    )
-                    row_counts[identity] = row_count
-        except Exception as error:
-            try:
-                self._schedule_cleanup(references.values())
-            except Exception:
-                raise ParquetScanError(
-                    "parquet_scan_cleanup_enqueue_failed"
-                ) from error
-            raise
-        return ScanUpload(
-            generation,
-            references,
-            row_counts,
-            first,
-            last,
-            True,
+    ) -> _StreamingUpload:
+        return _StreamingUpload(
+            self,
+            candidate,
+            generation=generation,
+            created_at=created_at,
         )
 
     def _build(self, candidate: ScanCandidate) -> ScanUpload:
@@ -716,151 +823,132 @@ class CanonicalParquetScanProjector:
             datetime.min.time(),
             tzinfo=timezone.utc,
         )
-        rows: dict[str, list[dict[str, Any]]] = {
-            dataset: [] for dataset in SCAN_DATASETS
-        }
-        digest = hashlib.sha256(
-            f"recall.parquet-scan.v{SCAN_SCHEMA_VERSION}\0"
-            f"{candidate.bucket_start.isoformat()}\n".encode()
-        )
-        first = last = None
-        discovered_bounds: list[PartTimeBound] = []
-        for document in documents:
-            links = document.get("actor_links") or []
-            projected = self._project_document(
-                candidate,
-                document,
-                bucket_start=bucket_start,
-                bucket_end=bucket_end,
-                record_budget=MAX_SCAN_RECORDS - len(rows["records"]),
-            )
-            discovered_bounds.extend(projected.part_bounds)
-            if not projected.records:
-                continue
-            if (
-                projected.first_occurred_at is None
-                or projected.last_occurred_at is None
-            ):
-                raise ParquetScanError("parquet_scan_state_invalid")
-            ids, names, relations = self._actor_columns(links)
-            rows["documents"].append({
-                "schema_version": SCAN_SCHEMA_VERSION,
-                "tenant_id": candidate.tenant_id,
-                "source_id": candidate.source_id,
-                "logical_document_id": document["logical_document_id"],
-                "revision": int(document["revision"]),
-                "first_occurred_at": projected.first_occurred_at,
-                "last_occurred_at": projected.last_occurred_at,
-                "record_count": len(projected.records),
-                "part_count": int(document["part_count"]),
-                "document_content_sha256": document["document_content_sha256"],
-                "actor_ids": ids,
-                "actor_names": names,
-                "actor_relations": relations,
-            })
-            rows["records"].extend(projected.records)
-            rows["actors"].extend(projected.actors)
-            rows["actors"].extend(
-                {
-                    "schema_version": SCAN_SCHEMA_VERSION,
-                    "tenant_id": candidate.tenant_id,
-                    "source_id": candidate.source_id,
-                    "logical_document_id": document["logical_document_id"],
-                    "revision": int(document["revision"]),
-                    "record_ordinal": None,
-                    "actor_id": str(link["actor_id"]),
-                    "display_name": str(link.get("display_name", "")),
-                    "relation": str(link["relation"]),
-                }
-                for link in links
-                if isinstance(link, dict)
-                and link.get("actor_id")
-                and link.get("relation")
-            )
-            digest.update(orjson.dumps({
-                "actors": list(zip(ids, names, relations, strict=True)),
-                "content": document["document_content_sha256"],
-                "document": document["logical_document_id"],
-                "revision": int(document["revision"]),
-            }, option=orjson.OPT_SORT_KEYS))
-            first = (
-                projected.first_occurred_at
-                if first is None
-                else min(first, projected.first_occurred_at)
-            )
-            last = (
-                projected.last_occurred_at
-                if last is None
-                else max(last, projected.last_occurred_at)
-            )
-        self._persist_part_bounds(discovered_bounds)
-        projected_at = time.perf_counter()
-        generation = digest.hexdigest()
-        if not rows["documents"]:
-            LOG.info(
-                "parquet build documents=%s records=0 metadata_ms=%s "
-                "project_ms=%s publish_ms=0 total_ms=%s",
-                len(documents),
-                metadata_ms,
-                round((projected_at - started) * 1_000) - metadata_ms,
-                round((projected_at - started) * 1_000),
-            )
-            return ScanUpload(generation, {}, {}, None, None, False)
-        rows["actors"] = sorted(
-            {
-                (
-                    row["logical_document_id"],
-                    row["revision"],
-                    row["record_ordinal"],
-                    row["actor_id"],
-                    row["relation"],
-                ): row
-                for row in rows["actors"]
-            }.values(),
-            key=lambda row: (
-                row["logical_document_id"],
-                row["record_ordinal"] is not None,
-                -1 if row["record_ordinal"] is None else row["record_ordinal"],
-                row["actor_id"],
-                row["relation"],
-            ),
-        )
+        generation = self._generation(candidate, documents)
         current = self._current_upload(candidate, generation)
         if current is not None:
             finished = time.perf_counter()
             LOG.info(
                 "parquet build documents=%s records=%s metadata_ms=%s "
-                "project_ms=%s publish_ms=0 total_ms=%s reused=true",
-                len(rows["documents"]),
-                len(rows["records"]),
+                "stream_ms=0 upload_ms=0 total_ms=%s reused=true",
+                len(documents),
+                sum(
+                    row_count
+                    for (dataset, _), row_count in current.row_counts.items()
+                    if dataset == "records"
+                ),
                 metadata_ms,
-                round((projected_at - started) * 1_000) - metadata_ms,
                 round((finished - started) * 1_000),
             )
             return current
-        if first is None or last is None:
-            raise ParquetScanError("parquet_scan_state_invalid")
-        publish_started = time.perf_counter()
-        upload = self._upload(
+        upload = self._streaming_upload(
             candidate,
             generation=generation,
-            rows=rows,
-            first=first,
-            last=last,
             created_at=bucket_start,
         )
+        first = last = None
+        discovered_bounds: list[PartTimeBound] = []
+        try:
+            for document in documents:
+                links = document.get("actor_links") or []
+                projected = self._project_document(
+                    candidate,
+                    document,
+                    bucket_start=bucket_start,
+                    bucket_end=bucket_end,
+                    record_budget=(MAX_SCAN_RECORDS - upload.rows_seen["records"]),
+                    record_sink=lambda row: upload.add("records", row),
+                    actor_sink=lambda row: upload.add("actors", row),
+                    collect=False,
+                )
+                discovered_bounds.extend(projected.part_bounds)
+                if projected.record_count == 0:
+                    continue
+                if (
+                    projected.first_occurred_at is None
+                    or projected.last_occurred_at is None
+                ):
+                    raise ParquetScanError("parquet_scan_state_invalid")
+                ids, names, relations = self._actor_columns(links)
+                upload.add(
+                    "documents",
+                    {
+                        "schema_version": SCAN_SCHEMA_VERSION,
+                        "tenant_id": candidate.tenant_id,
+                        "source_id": candidate.source_id,
+                        "logical_document_id": document["logical_document_id"],
+                        "revision": int(document["revision"]),
+                        "first_occurred_at": projected.first_occurred_at,
+                        "last_occurred_at": projected.last_occurred_at,
+                        "record_count": projected.record_count,
+                        "part_count": int(document["part_count"]),
+                        "document_content_sha256": (
+                            document["document_content_sha256"]
+                        ),
+                        "actor_ids": ids,
+                        "actor_names": names,
+                        "actor_relations": relations,
+                    },
+                )
+                for actor_id, display_name, relation in zip(
+                    ids, names, relations, strict=True
+                ):
+                    upload.add(
+                        "actors",
+                        {
+                            "schema_version": SCAN_SCHEMA_VERSION,
+                            "tenant_id": candidate.tenant_id,
+                            "source_id": candidate.source_id,
+                            "logical_document_id": document["logical_document_id"],
+                            "revision": int(document["revision"]),
+                            "record_ordinal": None,
+                            "actor_id": actor_id,
+                            "display_name": display_name,
+                            "relation": relation,
+                        },
+                    )
+                first = (
+                    projected.first_occurred_at
+                    if first is None
+                    else min(first, projected.first_occurred_at)
+                )
+                last = (
+                    projected.last_occurred_at
+                    if last is None
+                    else max(last, projected.last_occurred_at)
+                )
+            self._persist_part_bounds(discovered_bounds)
+            if upload.rows_seen["documents"] == 0:
+                finished = time.perf_counter()
+                LOG.info(
+                    "parquet build documents=%s records=0 metadata_ms=%s "
+                    "stream_ms=%s upload_ms=0 total_ms=%s reused=false",
+                    len(documents),
+                    metadata_ms,
+                    round((finished - started) * 1_000) - metadata_ms,
+                    round((finished - started) * 1_000),
+                )
+                return ScanUpload(generation, {}, {}, None, None, False)
+            if first is None or last is None:
+                raise ParquetScanError("parquet_scan_state_invalid")
+            result = upload.finish(first=first, last=last)
+        except Exception as error:
+            try:
+                upload.abort()
+            except Exception:
+                raise ParquetScanError("parquet_scan_cleanup_enqueue_failed") from error
+            raise
         finished = time.perf_counter()
         LOG.info(
             "parquet build documents=%s records=%s metadata_ms=%s "
-            "project_ms=%s publish_ms=%s total_ms=%s reused=false",
-            len(rows["documents"]),
-            len(rows["records"]),
+            "stream_ms=%s upload_ms=%s total_ms=%s reused=false",
+            upload.rows_seen["documents"],
+            upload.rows_seen["records"],
             metadata_ms,
-            round((projected_at - started) * 1_000) - metadata_ms,
-            round((finished - publish_started) * 1_000),
+            round((finished - started) * 1_000) - metadata_ms,
+            upload.upload_ms,
             round((finished - started) * 1_000),
         )
-        return upload
+        return result
 
     @staticmethod
     def _enqueue_cleanup(connection: Any, references: Iterable[dict[str, Any]]) -> None:
