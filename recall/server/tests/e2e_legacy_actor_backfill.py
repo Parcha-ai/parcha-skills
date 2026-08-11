@@ -380,7 +380,8 @@ def main() -> None:
             deep_inspector=inspector,
         )
         scanned = scan_bound.execute_parquet_scan(
-            "duckdb -json -c 'select record_json from read_parquet(\"/datasets/*/*/records.parquet\")'",
+            "duckdb -json -c 'select record_json from "
+            "read_parquet(\"/datasets/*/*/records-part-*.parquet\")'",
             filters={
                 "person": owner,
                 "source_family": "coding_history",

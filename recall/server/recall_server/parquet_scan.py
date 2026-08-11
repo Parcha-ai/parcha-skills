@@ -17,6 +17,7 @@ PARQUET_MEDIA_TYPE = "application/vnd.apache.parquet"
 SCAN_SCHEMA_VERSION = 1
 SCAN_DATASETS = ("documents", "records", "actors")
 MAX_SCAN_RECORDS = 5_000_000
+MAX_PARQUET_OBJECT_BYTES = 48 * 1024 * 1024
 
 
 class ParquetScanError(RuntimeError):
@@ -98,6 +99,34 @@ def _parquet_bytes(rows: list[dict[str, Any]], schema: Any) -> bytes:
     return sink.getvalue().to_pybytes()
 
 
+def _parquet_parts(
+    rows: list[dict[str, Any]],
+    schema: Any,
+    *,
+    maximum_bytes: int = MAX_PARQUET_OBJECT_BYTES,
+) -> list[tuple[bytes, int]]:
+    """Encode ordered, independently readable parts below the archive ceiling."""
+
+    if not 1 <= maximum_bytes <= MAX_PARQUET_OBJECT_BYTES:
+        raise ParquetScanError("parquet_scan_budget_invalid")
+    pending = [(0, len(rows))]
+    parts: list[tuple[int, bytes, int]] = []
+    while pending:
+        start, end = pending.pop()
+        payload = _parquet_bytes(rows[start:end], schema)
+        if len(payload) <= maximum_bytes:
+            parts.append((start, payload, end - start))
+            continue
+        if end - start <= 1:
+            raise ParquetScanError("parquet_scan_record_too_large")
+        middle = start + (end - start) // 2
+        pending.extend(((middle, end), (start, middle)))
+    return [
+        (payload, row_count)
+        for _, payload, row_count in sorted(parts, key=lambda value: value[0])
+    ]
+
+
 def _schemas() -> dict[str, Any]:
     utc = pa.timestamp("us", tz="UTC")
     strings = pa.list_(pa.string())
@@ -160,8 +189,8 @@ class ScanCandidate:
 @dataclass(frozen=True)
 class ScanUpload:
     generation_sha256: str
-    references: dict[str, dict[str, Any]]
-    row_counts: dict[str, int]
+    references: dict[tuple[str, int], dict[str, Any]]
+    row_counts: dict[tuple[str, int], int]
     first_occurred_at: datetime | None
     last_occurred_at: datetime | None
     created: bool
@@ -418,7 +447,7 @@ class CanonicalParquetScanProjector:
             rows = connection.execute(
                 """SELECT * FROM canonical_parquet_scan_shards
                     WHERE tenant_id=%s AND source_id=%s AND bucket_start=%s
-                    ORDER BY dataset""",
+                    ORDER BY dataset,shard_index""",
                 (
                     candidate.tenant_id,
                     candidate.source_id,
@@ -426,15 +455,21 @@ class CanonicalParquetScanProjector:
                 ),
             ).fetchall()
         if (
-            len(rows) != len(SCAN_DATASETS)
-            or {row["dataset"] for row in rows} != set(SCAN_DATASETS)
+            {row["dataset"] for row in rows} != set(SCAN_DATASETS)
             or any(row["generation_sha256"] != generation for row in rows)
         ):
             return None
         return ScanUpload(
             generation,
-            {row["dataset"]: _reference(row) for row in rows},
-            {row["dataset"]: int(row["row_count"]) for row in rows},
+            {
+                (row["dataset"], int(row["shard_index"])): _reference(row)
+                for row in rows
+            },
+            {
+                (row["dataset"], int(row["shard_index"])):
+                    int(row["row_count"])
+                for row in rows
+            },
             rows[0]["first_occurred_at"],
             rows[0]["last_occurred_at"],
             False,
@@ -458,22 +493,28 @@ class CanonicalParquetScanProjector:
         last: datetime,
         created_at: datetime,
     ) -> ScanUpload:
-        references: dict[str, dict[str, Any]] = {}
+        references: dict[tuple[str, int], dict[str, Any]] = {}
+        row_counts: dict[tuple[str, int], int] = {}
         attempt = uuid.uuid4().hex
         try:
             schemas = _schemas()
             for dataset in SCAN_DATASETS:
-                references[dataset] = self.archive.put_raw(
-                    tenant_id=candidate.tenant_id,
-                    source_id=candidate.source_id,
-                    native_id=(
-                        f"parquet-scan:{candidate.bucket_start.isoformat()}:"
-                        f"{dataset}:{generation[:16]}:{attempt}"
-                    ),
-                    payload=_parquet_bytes(rows[dataset], schemas[dataset]),
-                    media_type=PARQUET_MEDIA_TYPE,
-                    created_at=created_at.isoformat().replace("+00:00", "Z"),
-                )
+                for shard_index, (payload, row_count) in enumerate(
+                    _parquet_parts(rows[dataset], schemas[dataset])
+                ):
+                    identity = (dataset, shard_index)
+                    references[identity] = self.archive.put_raw(
+                        tenant_id=candidate.tenant_id,
+                        source_id=candidate.source_id,
+                        native_id=(
+                            f"parquet-scan:{candidate.bucket_start.isoformat()}:"
+                            f"{dataset}:{shard_index}:{generation[:16]}:{attempt}"
+                        ),
+                        payload=payload,
+                        media_type=PARQUET_MEDIA_TYPE,
+                        created_at=created_at.isoformat().replace("+00:00", "Z"),
+                    )
+                    row_counts[identity] = row_count
         except Exception as error:
             try:
                 self._schedule_cleanup(references.values())
@@ -485,7 +526,7 @@ class CanonicalParquetScanProjector:
         return ScanUpload(
             generation,
             references,
-            {dataset: len(rows[dataset]) for dataset in SCAN_DATASETS},
+            row_counts,
             first,
             last,
             True,
@@ -699,16 +740,16 @@ class CanonicalParquetScanProjector:
                         candidate.bucket_start,
                     ),
                 )
-                for dataset, reference in upload.references.items():
+                for (dataset, shard_index), reference in upload.references.items():
                     connection.execute(
                         """INSERT INTO canonical_parquet_scan_shards(
-                               tenant_id,source_id,bucket_start,dataset,
+                               tenant_id,source_id,bucket_start,dataset,shard_index,
                                generation_sha256,artifact_id,storage_backend,
                                object_key,content_sha256,size_bytes,media_type,
                                encryption,version_id,row_count,
                                first_occurred_at,last_occurred_at,created_at
                            ) VALUES (
-                               %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                               %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                                %s,%s,%s,%s
                            )""",
                         (
@@ -716,6 +757,7 @@ class CanonicalParquetScanProjector:
                             candidate.source_id,
                             candidate.bucket_start,
                             dataset,
+                            shard_index,
                             upload.generation_sha256,
                             reference["artifact_id"],
                             reference["storage_backend"],
@@ -725,7 +767,7 @@ class CanonicalParquetScanProjector:
                             reference["media_type"],
                             reference["encryption"],
                             reference["version_id"],
-                            upload.row_counts[dataset],
+                            upload.row_counts[(dataset, shard_index)],
                             upload.first_occurred_at,
                             upload.last_occurred_at,
                             reference["created_at"],

@@ -54,6 +54,7 @@ class ArchilBenchmarkTests(unittest.TestCase):
                 "source_id": "source:private:never-rendered",
                 "bucket_start": date(2026, 8, 1),
                 "dataset": dataset,
+                "shard_index": 0,
                 "object_key": f"objects/{index:02x}/" + f"{index:064x}",
                 "content_sha256": f"{index + 10:064x}",
                 "row_count": 7 if dataset == "records" else 1,
@@ -75,9 +76,9 @@ class ArchilBenchmarkTests(unittest.TestCase):
         self.assertEqual(
             set(cohorts[0].aliases.values()),
             {
-                "s1/2026-08/actors.parquet",
-                "s1/2026-08/documents.parquet",
-                "s1/2026-08/records.parquet",
+                "s1/2026-08/actors-part-00000.parquet",
+                "s1/2026-08/documents-part-00000.parquet",
+                "s1/2026-08/records-part-00000.parquet",
             },
         )
 

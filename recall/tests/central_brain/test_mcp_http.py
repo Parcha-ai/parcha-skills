@@ -703,7 +703,7 @@ class RemoteMcpContractTest(unittest.TestCase):
             canonical_catalog["recall_scan"]["description"],
         )
         self.assertIn(
-            "actors.parquet",
+            "actors-part-*.parquet",
             canonical_catalog["recall_scan"]["description"],
         )
         self.assertIn(
@@ -966,7 +966,7 @@ class RemoteMcpContractTest(unittest.TestCase):
         store = PolicyStore()
         program = (
             "duckdb -json -c \"select record_json from "
-            "read_parquet('/datasets/*/*/records.parquet') limit 5\""
+            "read_parquet('/datasets/*/*/records-part-*.parquet') limit 5\""
         )
         filters = {
             "person": "Synthetic Person",
