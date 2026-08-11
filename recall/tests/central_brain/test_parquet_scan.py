@@ -13,7 +13,6 @@ from recall_server.parquet_scan import (
     CanonicalParquetScanProjector,
     ParquetScanError,
     ScanCandidate,
-    ScanUpload,
     _month,
     _parquet_bytes,
     _parquet_parts,
@@ -25,15 +24,57 @@ class _Archive:
     def __init__(self, record: dict):
         self.record = record
         self.reads = 0
+        self.uploads = []
 
     def read_raw(self, _reference):
         self.reads += 1
         return json.dumps(self.record, sort_keys=True).encode() + b"\n"
 
+    def put_raw(self, **values):
+        self.uploads.append(values)
+        ordinal = len(self.uploads)
+        return {
+            "tenant_id": values["tenant_id"],
+            "source_id": values["source_id"],
+            "artifact_id": f"artifact:{ordinal}",
+            "storage_backend": "memory",
+            "object_key": f"objects/{ordinal}",
+            "content_sha256": f"{ordinal:064x}",
+            "size_bytes": len(values["payload"]),
+            "media_type": values["media_type"],
+            "encryption": "test",
+            "version_id": f"v{ordinal}",
+            "created_at": values["created_at"],
+        }
+
 
 class _Evidence:
     def __init__(self, archive):
         self.archive = archive
+
+
+class _ManyRecordArchive(_Archive):
+    def __init__(self, count: int):
+        super().__init__({})
+        self.count = count
+
+    def read_raw(self, _reference):
+        self.reads += 1
+        return b"".join(
+            json.dumps(
+                {
+                    "ordinal": ordinal,
+                    "occurred_at": "2026-08-05T12:00:00Z",
+                    "event_kind": "transcript_record",
+                    "roles": ["assistant"],
+                    "receipts": [f"recall://source:test/doc?rev=1#item={ordinal}"],
+                    "text": f"context-{ordinal}-" + "x" * 20_000,
+                },
+                sort_keys=True,
+            ).encode()
+            + b"\n"
+            for ordinal in range(self.count)
+        )
 
 
 class _SeedResult:
@@ -88,11 +129,13 @@ def _document(display_name: str) -> dict:
         "revision": 1,
         "part_count": 1,
         "document_content_sha256": "b" * 64,
-        "actor_links": [{
-            "actor_id": "actor:employee",
-            "display_name": display_name,
-            "relation": "contributor",
-        }],
+        "actor_links": [
+            {
+                "actor_id": "actor:employee",
+                "display_name": display_name,
+                "relation": "contributor",
+            }
+        ],
         "parts": [_part()],
     }
 
@@ -117,16 +160,6 @@ class _BuildProbe(CanonicalParquetScanProjector):
 
     def _current_upload(self, _candidate, _generation):
         return None
-
-    def _upload(self, _candidate, *, generation, rows, first, last, created_at):
-        return ScanUpload(
-            generation,
-            {},
-            {(name, 0): len(values) for name, values in rows.items()},
-            first,
-            last,
-            True,
-        )
 
 
 class _CheckpointProbe(CanonicalParquetScanProjector):
@@ -177,8 +210,7 @@ class ParquetScanContractTest(unittest.TestCase):
     def test_multipart_parquet_is_bounded_ordered_and_lossless(self):
         schema = pa.schema([("ordinal", pa.int64()), ("value", pa.binary())])
         rows = [
-            {"ordinal": ordinal, "value": os.urandom(4_000)}
-            for ordinal in range(12)
+            {"ordinal": ordinal, "value": os.urandom(4_000)} for ordinal in range(12)
         ]
         parts = _parquet_parts(rows, schema, maximum_bytes=35_000)
         self.assertGreater(len(parts), 1)
@@ -192,8 +224,7 @@ class ParquetScanContractTest(unittest.TestCase):
     def test_multipart_encodes_each_bounded_arrow_slice_once(self):
         schema = pa.schema([("ordinal", pa.int64()), ("value", pa.binary())])
         rows = [
-            {"ordinal": ordinal, "value": os.urandom(4_000)}
-            for ordinal in range(12)
+            {"ordinal": ordinal, "value": os.urandom(4_000)} for ordinal in range(12)
         ]
         encoded_rows = []
 
@@ -217,6 +248,37 @@ class ParquetScanContractTest(unittest.TestCase):
         self.assertEqual(sum(encoded_rows), len(rows))
         self.assertLess(max(encoded_rows), len(rows))
         self.assertEqual(sum(row_count for _, row_count in parts), len(rows))
+
+    def test_build_streams_month_records_through_bounded_uploads(self):
+        archive = _ManyRecordArchive(30)
+        projector = _BuildProbe(_document("Employee"), archive)
+
+        with mock.patch(
+            "recall_server.parquet_scan.PARQUET_RAW_SLICE_BYTES",
+            100_000,
+        ):
+            result = projector._build(_candidate())
+
+        record_uploads = [
+            upload for upload in archive.uploads if ":records:" in upload["native_id"]
+        ]
+        self.assertGreater(len(record_uploads), 5)
+        self.assertEqual(
+            sum(
+                count
+                for (dataset, _), count in result.row_counts.items()
+                if dataset == "records"
+            ),
+            30,
+        )
+        restored = []
+        for upload in record_uploads:
+            restored.extend(
+                pq.read_table(pa.BufferReader(upload["payload"]))
+                .column("ordinal")
+                .to_pylist()
+            )
+        self.assertEqual(restored, list(range(30)))
 
     def test_one_unshardable_record_fails_content_free(self):
         schema = pa.schema([("value", pa.binary())])
@@ -287,9 +349,7 @@ class ParquetScanContractTest(unittest.TestCase):
             "text": "older context",
         }
         part = _part()
-        part["first_occurred_at"] = datetime(
-            2026, 7, 5, 12, tzinfo=timezone.utc
-        )
+        part["first_occurred_at"] = datetime(2026, 7, 5, 12, tzinfo=timezone.utc)
         part["last_occurred_at"] = part["first_occurred_at"]
         document = _document("Employee")
         document["parts"] = [part]
@@ -347,22 +407,26 @@ class ParquetScanContractTest(unittest.TestCase):
             "event_kind": "transcript_record",
             "roles": ["user"],
             "receipts": ["recall://source:test/doc?rev=1#item=0"],
-            "actor_links": [{
-                "actor_id": "actor:employee",
-                "relation": "contributor",
-            }],
+            "actor_links": [
+                {
+                    "actor_id": "actor:employee",
+                    "relation": "contributor",
+                }
+            ],
             "text": "employee prompt",
         }
-        first = _BuildProbe(_document("First Name"), _Archive(record))._build(
-            _candidate()
-        )
-        same = _BuildProbe(_document("First Name"), _Archive(record))._build(
-            _candidate()
-        )
+        first_archive = _Archive(record)
+        same_archive = _Archive(record)
+        first = _BuildProbe(_document("First Name"), first_archive)._build(_candidate())
+        same = _BuildProbe(_document("First Name"), same_archive)._build(_candidate())
         renamed = _BuildProbe(_document("Renamed"), _Archive(record))._build(
             _candidate()
         )
         self.assertEqual(first.generation_sha256, same.generation_sha256)
+        self.assertEqual(
+            [upload["native_id"] for upload in first_archive.uploads],
+            [upload["native_id"] for upload in same_archive.uploads],
+        )
         self.assertNotEqual(first.generation_sha256, renamed.generation_sha256)
 
 
