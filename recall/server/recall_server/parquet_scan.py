@@ -195,7 +195,7 @@ class CanonicalParquetScanProjector:
                        generation,reason,changed_at
                    )
                    SELECT DISTINCT document.tenant_id,document.source_id,
-                          month.value::date,1,'backfill',clock_timestamp()
+                          month.value::date,1,'backfill',statement_timestamp()
                      FROM canonical_evidence_documents document
                      CROSS JOIN LATERAL generate_series(
                          date_trunc('month',document.first_occurred_at),
