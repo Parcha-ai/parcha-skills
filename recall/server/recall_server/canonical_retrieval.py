@@ -1230,6 +1230,327 @@ class BoundCanonicalRetrieval:
             },
         }
 
+    @staticmethod
+    def _empty_parquet_scan(
+        *,
+        sources_available: int,
+        pending: int = 0,
+    ) -> dict[str, Any]:
+        return {
+            "provider": "parquet",
+            "stdout": "",
+            "stderr": "",
+            "exit_code": 0,
+            "complete": pending == 0,
+            "stopped_reason": "projection_pending" if pending else "completed",
+            "output_truncated": False,
+            "timing": None,
+            "opened_receipts": [],
+            "datasets_available": 0,
+            "sources_available": sources_available,
+            "buckets_available": 0,
+            "projection_pending": pending,
+        }
+
+    def _parquet_person_sources(
+        self,
+        sources: list[str],
+        *,
+        person: str,
+        relation: str | None,
+        deadline_at: float,
+    ) -> list[str]:
+        try:
+            with self.store.connect() as connection:
+                rows = self.store._execute_bounded(
+                    connection,
+                    """SELECT DISTINCT linked.source_id
+                         FROM canonical_evidence_document_actors linked
+                         JOIN brain_actors actor
+                           ON actor.tenant_id=linked.tenant_id
+                          AND actor.actor_id=linked.actor_id
+                         LEFT JOIN brain_actor_aliases alias
+                           ON alias.tenant_id=actor.tenant_id
+                          AND alias.actor_id=actor.actor_id
+                          AND alias.searchable
+                        WHERE linked.tenant_id=%s
+                          AND linked.source_id=ANY(%s)
+                          AND actor.active
+                          AND (
+                              lower(actor.display_name)=lower(%s)
+                              OR lower(alias.alias)=lower(%s)
+                          )
+                          AND (%s::text IS NULL OR linked.relation=%s)
+                        ORDER BY linked.source_id
+                        LIMIT 256""",
+                    (
+                        self.tenant_id,
+                        sources,
+                        person,
+                        person,
+                        relation,
+                        relation,
+                    ),
+                    deadline_at,
+                ).fetchall()
+        except SearchDeadlineExceeded:
+            raise DeepInspectionError("parquet_scan_scope_deadline") from None
+        return [row["source_id"] for row in rows]
+
+    def _parquet_shards(
+        self,
+        sources: list[str],
+        *,
+        since: datetime | None,
+        until: datetime | None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        values = (self.tenant_id, sources, since, since, until, until)
+        with self.store.connect() as connection:
+            rows = connection.execute(
+                """SELECT source_id,bucket_start,dataset,
+                          object_key,content_sha256
+                     FROM canonical_parquet_scan_shards
+                    WHERE tenant_id=%s AND source_id=ANY(%s)
+                      AND (
+                          %s::timestamptz IS NULL OR bucket_start >=
+                          date_trunc('month',%s::timestamptz)::date
+                      )
+                      AND (
+                          %s::timestamptz IS NULL OR bucket_start <=
+                          date_trunc('month',%s::timestamptz)::date
+                      )
+                    ORDER BY source_id,bucket_start,dataset""",
+                values,
+            ).fetchall()
+            pending = connection.execute(
+                """SELECT count(*) AS count
+                     FROM canonical_parquet_scan_queue
+                    WHERE tenant_id=%s AND source_id=ANY(%s)
+                      AND (
+                          %s::timestamptz IS NULL OR bucket_start >=
+                          date_trunc('month',%s::timestamptz)::date
+                      )
+                      AND (
+                          %s::timestamptz IS NULL OR bucket_start <=
+                          date_trunc('month',%s::timestamptz)::date
+                      )""",
+                values,
+            ).fetchone()["count"]
+        return rows, int(pending)
+
+    def _verify_parquet_receipts(
+        self,
+        receipts: list[str],
+        *,
+        sources: list[str],
+        since: datetime | None,
+        until: datetime | None,
+        person: str | None,
+        relation: str | None,
+    ) -> None:
+        if not receipts:
+            return
+        with self.store.connect() as connection:
+            rows = connection.execute(
+                """SELECT DISTINCT chunk.receipt
+                     FROM canonical_chunks chunk
+                     JOIN canonical_documents canonical
+                       USING(tenant_id,source_id,document_id)
+                     JOIN canonical_events event
+                       USING(tenant_id,source_id,event_id)
+                     JOIN canonical_evidence_documents evidence
+                       ON evidence.tenant_id=event.tenant_id
+                      AND evidence.source_id=event.source_id
+                      AND evidence.native_parent_id=coalesce(
+                          event.native_parent_id,event.native_id
+                      )
+                    WHERE chunk.tenant_id=%s
+                      AND chunk.source_id=ANY(%s)
+                      AND chunk.receipt=ANY(%s)
+                      AND (%s::timestamptz IS NULL OR event.occurred_at>=%s)
+                      AND (%s::timestamptz IS NULL OR event.occurred_at<=%s)
+                      AND (
+                          %s::text IS NULL
+                          OR EXISTS (
+                              SELECT 1
+                                FROM (
+                                      SELECT attributed.actor_id,
+                                             attributed.relation
+                                        FROM canonical_event_actors attributed
+                                       WHERE attributed.tenant_id=event.tenant_id
+                                         AND attributed.source_id=event.source_id
+                                         AND attributed.event_id=event.event_id
+                                      UNION
+                                      SELECT binding.actor_id,binding.relation
+                                        FROM canonical_source_actor_bindings binding
+                                       WHERE binding.tenant_id=event.tenant_id
+                                         AND binding.source_id=event.source_id
+                                ) link
+                                JOIN brain_actors actor
+                                  ON actor.tenant_id=event.tenant_id
+                                 AND actor.actor_id=link.actor_id
+                                LEFT JOIN brain_actor_aliases alias
+                                  ON alias.tenant_id=actor.tenant_id
+                                 AND alias.actor_id=actor.actor_id
+                                 AND alias.searchable
+                               WHERE (
+                                     lower(actor.display_name)=lower(%s)
+                                     OR lower(alias.alias)=lower(%s)
+                                 )
+                                 AND (
+                                     %s::text IS NULL
+                                     OR link.relation=%s
+                                 )
+                          )
+                      )
+                      AND chunk.deleted_at IS NULL
+                      AND canonical.is_current
+                      AND canonical.deleted_at IS NULL""",
+                (
+                    self.tenant_id,
+                    sources,
+                    receipts,
+                    since,
+                    since,
+                    until,
+                    until,
+                    person,
+                    person,
+                    person,
+                    relation,
+                    relation,
+                ),
+            ).fetchall()
+        if set(receipts) != {row["receipt"] for row in rows}:
+            raise DeepInspectionError("deep_inspector_receipt_scope_violation")
+
+    def execute_parquet_scan(
+        self,
+        program: str,
+        *,
+        filters: dict[str, Any] | None,
+        timeout_seconds: int,
+    ) -> dict[str, Any]:
+        """Run caller-authored DuckDB over authorized source/month projections."""
+
+        if (
+            self.deep_inspector is None
+            or not callable(getattr(self.deep_inspector, "execute_scan", None))
+        ):
+            raise DeepInspectionError("parquet_scan_not_configured")
+        if (
+            not isinstance(program, str)
+            or not program.strip()
+            or len(program.encode()) > 16_000
+            or isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, int)
+            or not 1 <= timeout_seconds <= 240
+        ):
+            raise DeepInspectionError("parquet_scan_request_invalid")
+        effective = dict(filters or {})
+        person = effective.pop("person", None)
+        relation = effective.pop("person_relation", None)
+        if person is not None and (
+            not isinstance(person, str)
+            or not person.strip()
+            or len(person) > 256
+        ):
+            raise DeepInspectionError("parquet_scan_request_invalid")
+        if relation is not None and (
+            relation not in ACTOR_RELATIONS or person is None
+        ):
+            raise DeepInspectionError("parquet_scan_request_invalid")
+        (
+            source_id,
+            source_family,
+            source_alias,
+            source_connector,
+            since,
+            until,
+        ) = self._filters(effective)
+        sources = self._sources(
+            source_id=source_id,
+            source_family=source_family,
+            source_alias=source_alias,
+            source_connector=source_connector,
+        )
+        deadline_at = time.monotonic() + self.store.search_deadline_ms / 1000
+        if person is not None:
+            sources = self._parquet_person_sources(
+                sources,
+                person=person.strip(),
+                relation=relation,
+                deadline_at=deadline_at,
+            )
+        if not sources:
+            return self._empty_parquet_scan(sources_available=0)
+        rows, pending = self._parquet_shards(
+            sources,
+            since=since,
+            until=until,
+        )
+        if not rows:
+            return self._empty_parquet_scan(
+                sources_available=len(sources),
+                pending=pending,
+            )
+        if len(rows) > 511:
+            raise DeepInspectionError("parquet_scan_scope_too_large")
+        source_aliases = {
+            value: f"s{index}"
+            for index, value in enumerate(
+                sorted({row["source_id"] for row in rows}),
+                start=1,
+            )
+        }
+        objects = tuple(
+            AgentExecObject(
+                object_key=row["object_key"],
+                content_sha256=row["content_sha256"],
+            )
+            for row in rows
+        )
+        dataset_aliases = {
+            row["object_key"]: (
+                f"{source_aliases[row['source_id']]}/"
+                f"{row['bucket_start'].isoformat()[:7]}/"
+                f"{row['dataset']}.parquet"
+            )
+            for row in rows
+        }
+        result = self.deep_inspector.execute_scan(
+            tenant_id=self.tenant_id,
+            program=program,
+            objects=objects,
+            dataset_aliases=dataset_aliases,
+            timeout_seconds=timeout_seconds,
+        )
+        stdout = result.get("stdout")
+        if not isinstance(stdout, str):
+            raise DeepInspectionError("deep_inspector_result_invalid_execution")
+        mentioned = agent_evidence_receipts(stdout)
+        self._verify_parquet_receipts(
+            mentioned,
+            sources=sources,
+            since=since,
+            until=until,
+            person=person,
+            relation=relation,
+        )
+        buckets = {
+            (row["source_id"], row["bucket_start"])
+            for row in rows
+        }
+        return {
+            **result,
+            "opened_receipts": mentioned,
+            "datasets_available": len(rows),
+            "sources_available": len(source_aliases),
+            "buckets_available": len(buckets),
+            "projection_pending": pending,
+            "complete": bool(result.get("complete")) and pending == 0,
+        }
+
     def passage_hints(
         self,
         query: str,

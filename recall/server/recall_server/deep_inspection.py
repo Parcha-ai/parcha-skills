@@ -36,13 +36,32 @@ AGENT_EVIDENCE_LINE_RE = re.compile(
     rf"^RECALL_EVIDENCE[ \t]+({RECEIPT_TOKEN_PATTERN})[ \t]*$",
     re.MULTILINE,
 )
+EXEC_TIMING_LINE_RE = re.compile(
+    r"^RECALL_EXEC_TIMING_V1\t"
+    r"(wrapper_start|payload_ready|namespace_start|stage_start|objects_ready|"
+    r"views_ready|tool_ready|stage_end|sandbox_ready|program_start|program_end)"
+    r"\t([0-9]{10,20})$"
+)
+EXEC_TIMING_ORDER = (
+    "wrapper_start",
+    "payload_ready",
+    "namespace_start",
+    "stage_start",
+    "objects_ready",
+    "views_ready",
+    "tool_ready",
+    "stage_end",
+    "sandbox_ready",
+    "program_start",
+    "program_end",
+)
 EVIDENCE_RECORD_KEYS = frozenset({
-    "content",
     "event_native_id",
     "occurred_at",
     "ordinal",
     "receipts",
 })
+EVIDENCE_RECORD_BODY_KEYS = frozenset({"content", "text", "content_fragment"})
 
 
 class DeepInspectionError(RuntimeError):
@@ -51,6 +70,103 @@ class DeepInspectionError(RuntimeError):
     def __init__(self, code: str):
         self.code = code
         super().__init__(code)
+
+
+def _execution_timing(
+    stderr: str,
+    upstream: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """Strip content-free wrapper markers and expose attributable durations."""
+
+    visible: list[str] = []
+    markers: dict[str, int] = {}
+    for raw_line in stderr.splitlines(keepends=True):
+        line = raw_line.rstrip("\r\n")
+        match = EXEC_TIMING_LINE_RE.fullmatch(line)
+        if match is None:
+            visible.append(raw_line)
+            continue
+        phase, raw = match.groups()
+        value = int(raw)
+        if phase == "program_end":
+            markers[phase] = value
+        else:
+            markers.setdefault(phase, value)
+    timing = {
+        key: upstream.get(key)
+        for key in ("totalMs", "queueMs", "executeMs")
+    }
+    if set(markers) == set(EXEC_TIMING_ORDER):
+        ordered = [markers[phase] for phase in EXEC_TIMING_ORDER]
+        if ordered == sorted(ordered):
+            intervals = {
+                f"{left}_to_{right}Ms": round((end - start) / 1_000, 3)
+                for left, right, start, end in zip(
+                    EXEC_TIMING_ORDER[:-1],
+                    EXEC_TIMING_ORDER[1:],
+                    ordered[:-1],
+                    ordered[1:],
+                    strict=True,
+                )
+            }
+            wrapper_ms = round((ordered[-1] - ordered[0]) / 1_000, 3)
+            execute_ms = upstream.get("executeMs")
+            timing["phases"] = {
+                **intervals,
+                "wrapperMs": wrapper_ms,
+                "archilUnobservedExecuteMs": (
+                    round(max(float(execute_ms) - wrapper_ms, 0), 3)
+                    if isinstance(execute_ms, (int, float))
+                    and not isinstance(execute_ms, bool)
+                    else None
+                ),
+            }
+    return "".join(visible), timing
+
+
+def _execution_result(data: dict[str, Any]) -> dict[str, Any]:
+    """Validate and bound one Archil execution response."""
+
+    stdout = data.get("stdout")
+    stderr = data.get("stderr", "")
+    exit_code = data.get("exitCode")
+    timing = data.get("timing")
+    if (
+        not isinstance(stdout, str)
+        or not isinstance(stderr, str)
+        or isinstance(exit_code, bool)
+        or not isinstance(exit_code, int)
+        or not isinstance(timing, dict)
+    ):
+        raise DeepInspectionError("deep_inspector_result_invalid_execution")
+    visible_stderr, measured_timing = _execution_timing(stderr, timing)
+    stdout_bytes = stdout.encode()
+    stderr_bytes = visible_stderr.encode()
+    truncated = (
+        len(stdout_bytes) > MAX_AGENT_EXEC_OUTPUT_BYTES
+        or len(stderr_bytes) > 8_000
+    )
+    timed_out = exit_code in {124, 137}
+    return {
+        "provider": "archil",
+        "stdout": stdout_bytes[:MAX_AGENT_EXEC_OUTPUT_BYTES].decode(
+            errors="ignore"
+        ),
+        "stderr": stderr_bytes[:8_000].decode(errors="ignore"),
+        "exit_code": exit_code,
+        "complete": exit_code == 0 and not truncated,
+        "stopped_reason": (
+            "timeout"
+            if timed_out
+            else "output_limit"
+            if truncated
+            else "completed"
+            if exit_code == 0
+            else "nonzero_exit"
+        ),
+        "output_truncated": truncated,
+        "timing": measured_timing,
+    }
 
 
 class HttpTransport(Protocol):
@@ -155,6 +271,7 @@ def agent_evidence_receipts(stdout: str) -> list[str]:
         if (
             not isinstance(record, dict)
             or not EVIDENCE_RECORD_KEYS.issubset(record)
+            or not EVIDENCE_RECORD_BODY_KEYS.intersection(record)
             or not isinstance(record["receipts"], list)
         ):
             continue
@@ -277,6 +394,8 @@ def _agent_exec_command(
     record_spans: dict[str, tuple[tuple[int, int], ...]],
     routing_receipts: dict[str, tuple[str, ...]],
     timeout_seconds: int,
+    dataset_aliases: dict[str, str] | None = None,
+    tool_object: AgentExecObject | None = None,
 ) -> str:
     """Build a content-addressed, no-network view for an agent-authored program."""
 
@@ -323,15 +442,43 @@ def _agent_exec_command(
             sort_keys=True,
         ).encode()
     )
+    encoded_datasets = encode(
+        json.dumps(
+            dataset_aliases or {},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    )
+    encoded_tool = encode(
+        json.dumps(
+            (
+                {
+                    "object_key": tool_object.object_key,
+                    "content_sha256": tool_object.content_sha256,
+                }
+                if tool_object is not None
+                else None
+            ),
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    )
     stage_script = r"""
-import base64,gzip,json,pathlib,re,subprocess,sys
+import base64,gzip,hashlib,json,pathlib,re,shutil,subprocess,sys,time
+def mark(name):
+    print(f"RECALL_EXEC_TIMING_V1\t{name}\t{time.time_ns()//1000}",file=sys.stderr,flush=True)
+mark("stage_start")
 items=json.loads(gzip.decompress(base64.b64decode(sys.argv[1])))
 aliases=json.loads(gzip.decompress(base64.b64decode(sys.argv[2])))
+datasets=json.loads(gzip.decompress(base64.b64decode(sys.argv[3])))
+tool=json.loads(gzip.decompress(base64.b64decode(sys.argv[4])))
 source=pathlib.Path("/mnt/archil/evidence").resolve()
 target=pathlib.Path("/tmp/recall-authorized").resolve()
 docs=pathlib.Path("/tmp/recall-docs").resolve()
+dataset_root=pathlib.Path("/tmp/recall-datasets").resolve()
 target.mkdir(mode=0o700,parents=True,exist_ok=True)
 docs.mkdir(mode=0o700,parents=True,exist_ok=True)
+dataset_root.mkdir(mode=0o700,parents=True,exist_ok=True)
 for item in items:
     relative=pathlib.PurePosixPath(item["object_key"])
     if relative.is_absolute() or ".." in relative.parts:
@@ -346,6 +493,7 @@ for item in items:
     dst.touch(mode=0o400,exist_ok=False)
     subprocess.run(["mount","--bind",str(src),str(dst)],check=True)
     subprocess.run(["mount","-o","remount,bind,ro",str(dst)],check=True)
+mark("objects_ready")
 manifest_by_document={}
 for path in target.rglob("*"):
     if not path.is_file() or path.stat().st_size > 100000:
@@ -380,7 +528,36 @@ for document_id,alias in aliases.items():
         (document_dir/f"part-{ordinal:05d}.jsonl").symlink_to(
             "/mnt/archil/evidence/"+object_key
         )
+for object_key,alias in datasets.items():
+    if not re.fullmatch(
+        r"s[1-9][0-9]{0,2}/[0-9]{4}-[0-9]{2}/(?:documents|records|actors)\.parquet",
+        alias,
+    ):
+        raise SystemExit(64)
+    src=(target/pathlib.Path(object_key)).resolve()
+    if target not in src.parents or not src.is_file():
+        raise SystemExit(66)
+    dst=(dataset_root/pathlib.Path(alias)).resolve()
+    if dataset_root not in dst.parents:
+        raise SystemExit(64)
+    dst.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+    dst.symlink_to("/mnt/archil/evidence/"+object_key)
+mark("views_ready")
+if tool is not None:
+    src=(target/pathlib.Path(tool["object_key"])).resolve()
+    if target not in src.parents or not src.is_file():
+        raise SystemExit(66)
+    if hashlib.sha256(src.read_bytes()).hexdigest()!=tool["content_sha256"]:
+        raise SystemExit(66)
+    shutil.copyfile(src,"/tmp/recall-agent/duckdb")
+    pathlib.Path("/tmp/recall-agent/duckdb").chmod(0o500)
+mark("tool_ready")
+mark("stage_end")
 """.strip()
+    mark_script = r"""#!/usr/bin/env bash
+printf 'RECALL_EXEC_TIMING_V1\t%s\t%s\n' "$1" "${EPOCHREALTIME/./}" >&2
+""".strip()
+    encoded_mark = encode(mark_script.encode())
     inflate_script = (
         "import base64,gzip,sys;sys.stdout.buffer.write("
         "gzip.decompress(base64.b64decode(sys.argv[1])))"
@@ -397,6 +574,7 @@ for document_id,alias in aliases.items():
         )
 
     inner_command = " && ".join([
+        "/tmp/recall-agent/recall-mark namespace_start",
         (
             "python3 -c "
             + shlex.quote(stage_script)
@@ -404,12 +582,20 @@ for document_id,alias in aliases.items():
             + shlex.quote(payload)
             + " "
             + shlex.quote(encoded_aliases)
+            + " "
+            + shlex.quote(encoded_datasets)
+            + " "
+            + shlex.quote(encoded_tool)
         ),
         "mount --rbind /tmp/recall-authorized /mnt/archil/evidence",
         "mount -o remount,bind,ro /mnt/archil/evidence",
         "mkdir -p /docs",
         "mount --bind /tmp/recall-docs /docs",
         "mount -o remount,bind,ro /docs",
+        "mkdir -p /datasets",
+        "mount --bind /tmp/recall-datasets /datasets",
+        "mount -o remount,bind,ro /datasets",
+        "/tmp/recall-agent/recall-mark sandbox_ready",
         (
             "exec env -i HOME=/tmp "
             "PATH=/tmp/recall-agent:/usr/local/bin:/usr/bin:/bin "
@@ -417,10 +603,12 @@ for document_id,alias in aliases.items():
             "LC_ALL=C bash -c "
             + shlex.quote(
                 "set -o pipefail; "
+                "/tmp/recall-agent/recall-mark program_start; "
                 f"timeout --signal=KILL {timeout_seconds}s "
                 "bash /tmp/recall-agent/program.sh | "
                 f"head -c {MAX_AGENT_EXEC_OUTPUT_BYTES}; "
                 "code=${PIPESTATUS[0]}; "
+                "/tmp/recall-agent/recall-mark program_end; "
                 "[ \"$code\" -eq 141 ] && exit 0; exit \"$code\""
             )
         ),
@@ -428,19 +616,27 @@ for document_id,alias in aliases.items():
     return "\n".join([
         "set -eu",
         "umask 077",
+        (
+            "printf 'RECALL_EXEC_TIMING_V1\\twrapper_start\\t%s\\n' "
+            '"${EPOCHREALTIME/./}" >&2'
+        ),
         # Archil may reuse an execution host. Remove every per-run staging
         # directory so a prior alias cannot make the next mkdir fail.
-        "rm -rf /tmp/recall-authorized /tmp/recall-agent /tmp/recall-docs",
+        "rm -rf /tmp/recall-authorized /tmp/recall-agent /tmp/recall-docs "
+        "/tmp/recall-datasets",
         "mkdir -p /tmp/recall-agent",
         inflate(encoded_program, "/tmp/recall-agent/program.sh"),
         inflate(encoded_scan, "/tmp/recall-agent/recall-scan"),
         inflate(encoded_pointers, "/tmp/recall-agent/pointers.json"),
+        inflate(encoded_mark, "/tmp/recall-agent/recall-mark"),
         "chmod 0500 /tmp/recall-agent/program.sh",
         "chmod 0500 /tmp/recall-agent/recall-scan",
+        "chmod 0500 /tmp/recall-agent/recall-mark",
         "chmod 0400 /tmp/recall-agent/pointers.json",
+        "/tmp/recall-agent/recall-mark payload_ready",
         (
             "unshare --user --map-root-user --net --mount --pid --fork "
-            "--mount-proc sh -c "
+            "--mount-proc bash -c "
             + shlex.quote(inner_command)
         ),
     ])
@@ -568,6 +764,7 @@ class ArchilDeepInspector:
         api_key: str,
         disk_id: str,
         region: str,
+        duckdb_tool: AgentExecObject | None = None,
         transport: HttpTransport | None = None,
     ) -> None:
         if (
@@ -582,6 +779,7 @@ class ArchilDeepInspector:
         self.api_key = api_key
         self.disk_id = disk_id
         self.region = region
+        self.duckdb_tool = duckdb_tool
         self.transport = transport or UrllibTransport()
 
     def execute(
@@ -699,48 +897,73 @@ class ArchilDeepInspector:
             or not isinstance(response.get("data"), dict)
         ):
             raise DeepInspectionError("deep_inspector_unavailable")
-        data = response["data"]
-        stdout = data.get("stdout")
-        stderr = data.get("stderr", "")
-        exit_code = data.get("exitCode")
-        timing = data.get("timing")
+        return _execution_result(response["data"])
+
+    def execute_scan(
+        self,
+        *,
+        tenant_id: str,
+        program: str,
+        objects: tuple[AgentExecObject, ...],
+        dataset_aliases: dict[str, str],
+        timeout_seconds: int,
+    ) -> dict[str, Any]:
+        """Run DuckDB beside only authorized source/month Parquet shards."""
+
         if (
-            not isinstance(stdout, str)
-            or not isinstance(stderr, str)
-            or isinstance(exit_code, bool)
-            or not isinstance(exit_code, int)
-            or not isinstance(timing, dict)
+            self.duckdb_tool is None
+            or not isinstance(tenant_id, str)
+            or not tenant_id
+            or not isinstance(program, str)
+            or not program.strip()
+            or len(program.encode()) > MAX_AGENT_PROGRAM_BYTES
+            or not isinstance(objects, tuple)
+            or not 1 <= len(objects) <= 511
+            or any(not isinstance(item, AgentExecObject) for item in objects)
+            or not isinstance(dataset_aliases, dict)
+            or set(dataset_aliases) != {item.object_key for item in objects}
+            or len(set(dataset_aliases.values())) != len(dataset_aliases)
+            or any(
+                not isinstance(alias, str)
+                or re.fullmatch(
+                    r"s[1-9][0-9]{0,2}/[0-9]{4}-[0-9]{2}/"
+                    r"(?:documents|records|actors)\.parquet",
+                    alias,
+                ) is None
+                for alias in dataset_aliases.values()
+            )
+            or isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, int)
+            or not 1 <= timeout_seconds <= 240
         ):
-            raise DeepInspectionError("deep_inspector_result_invalid_execution")
-        stdout_bytes = stdout.encode()
-        stderr_bytes = stderr.encode()
-        truncated = (
-            len(stdout_bytes) > MAX_AGENT_EXEC_OUTPUT_BYTES
-            or len(stderr_bytes) > 8_000
+            raise DeepInspectionError("deep_inspector_exec_invalid")
+        command = _agent_exec_command(
+            program=program,
+            objects=(*objects, self.duckdb_tool),
+            document_aliases={},
+            record_spans={},
+            routing_receipts={},
+            timeout_seconds=timeout_seconds,
+            dataset_aliases=dataset_aliases,
+            tool_object=self.duckdb_tool,
         )
-        bounded_stdout = stdout_bytes[:MAX_AGENT_EXEC_OUTPUT_BYTES].decode(
-            errors="ignore"
-        )
-        bounded_stderr = stderr_bytes[:8_000].decode(errors="ignore")
-        timed_out = exit_code in {124, 137}
-        return {
-            "provider": "archil",
-            "stdout": bounded_stdout,
-            "stderr": bounded_stderr,
-            "exit_code": exit_code,
-            "complete": exit_code == 0 and not truncated,
-            "stopped_reason": (
-                "timeout"
-                if timed_out
-                else "output_limit"
-                if truncated
-                else "completed"
-                if exit_code == 0
-                else "nonzero_exit"
-            ),
-            "output_truncated": truncated,
-            "timing": {
-                key: timing.get(key)
-                for key in ("totalMs", "queueMs", "executeMs")
+        if len(command.encode()) > MAX_ARCHIL_COMMAND_BYTES:
+            raise DeepInspectionError("deep_inspector_request_too_large")
+        response = self.transport.post(
+            url=REGION_ENDPOINTS[self.region] + "/api/exec",
+            headers={"Authorization": self.api_key},
+            body={
+                "disks": {
+                    "evidence": {"disk": self.disk_id, "readOnly": True}
+                },
+                "command": command,
             },
-        }
+            timeout=timeout_seconds + AGENT_EXEC_STAGE_GRACE_SECONDS,
+        )
+        if (
+            not isinstance(response, dict)
+            or response.get("success") is not True
+            or not isinstance(response.get("data"), dict)
+        ):
+            raise DeepInspectionError("deep_inspector_unavailable")
+        return _execution_result(response["data"])

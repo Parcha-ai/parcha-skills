@@ -39,13 +39,24 @@ class FakePassageProjector:
         return {"processed": 5}
 
 
+class FakeScanProjector:
+    def __init__(self):
+        self.calls = []
+
+    def project_pending(self, **kwargs):
+        self.calls.append(kwargs)
+        return {"shards": 1, "rows": 13, "stale": 0}
+
+
 class ManagedWorkerComposioTests(unittest.TestCase):
     def test_managed_projection_cycle_drains_logical_passages_and_embeddings(self):
         logical = FakeLogicalProjector()
         passages = FakePassageProjector()
+        scan = FakeScanProjector()
         result = _run_projection_cycle(
             logical,
             passages,
+            scan,
         )
         self.assertEqual(
             result,
@@ -56,6 +67,9 @@ class ManagedWorkerComposioTests(unittest.TestCase):
                 "passage_documents": 2,
                 "passages": 5,
                 "passage_embeddings": 5,
+                "parquet_shards": 1,
+                "parquet_rows": 13,
+                "parquet_stale": 0,
             },
         )
         self.assertEqual(
@@ -73,6 +87,7 @@ class ManagedWorkerComposioTests(unittest.TestCase):
         self.assertEqual(passages.project_calls[0]["batch_size"], 20)
         self.assertEqual(passages.project_calls[0]["concurrency"], 4)
         self.assertEqual(passages.embed_calls[0]["batch_size"], 100)
+        self.assertEqual(scan.calls[0]["tenant_id"], None)
 
     def test_private_root_normalizes_provider_mount_mode_without_following_links(
         self,

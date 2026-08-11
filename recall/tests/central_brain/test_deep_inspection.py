@@ -31,6 +31,7 @@ from recall_server.evidence_projection import (
     EvidenceProjectionError,
     EvidenceProjectionStore,
 )
+from recall_server.deep_inspection_runtime import build_deep_inspector
 
 TENANT = "tenant:company:synthetic"
 SOURCE = "source:company:synthetic"
@@ -72,6 +73,63 @@ class RecordingTransport:
 
 
 class DeepInspectionContractTests(unittest.TestCase):
+    def test_archil_timing_separates_wrapper_phases_from_execute_time(self):
+        phases = (
+            "wrapper_start",
+            "payload_ready",
+            "namespace_start",
+            "stage_start",
+            "objects_ready",
+            "views_ready",
+            "tool_ready",
+            "stage_end",
+            "sandbox_ready",
+            "program_start",
+            "program_end",
+        )
+        origin = 1_000_000_000_000_000
+        stderr = "\n".join([
+            "program warning",
+            *(
+                f"RECALL_EXEC_TIMING_V1\t{phase}\t{origin + index * 1_000}"
+                for index, phase in enumerate(phases)
+            ),
+        ]) + "\n"
+        transport = RecordingTransport({
+            "success": True,
+            "data": {
+                "stdout": "done\n",
+                "stderr": stderr,
+                "exitCode": 0,
+                "timing": {
+                    "totalMs": 23,
+                    "queueMs": 3,
+                    "executeMs": 20,
+                },
+            },
+        })
+        result = ArchilDeepInspector(
+            api_key="synthetic-key",
+            disk_id="dsk-0123456789abcdef",
+            region="aws-us-west-2",
+            transport=transport,
+        ).execute(
+            tenant_id=TENANT,
+            program="true",
+            objects=(AgentExecObject(
+                object_key="objects/aa/" + "a" * 64,
+                content_sha256="c" * 64,
+            ),),
+            record_spans={},
+            routing_receipts={},
+            timeout_seconds=10,
+        )
+        self.assertEqual(result["stderr"], "program warning\n")
+        measured = result["timing"]["phases"]
+        self.assertEqual(measured["wrapperMs"], 10)
+        self.assertEqual(measured["program_start_to_program_endMs"], 1)
+        self.assertEqual(measured["archilUnobservedExecuteMs"], 10)
+
     def test_archil_http_failures_keep_only_safe_status_classes(self):
         expected = {
             401: "deep_inspector_authentication_failed",
@@ -863,11 +921,12 @@ class DeepInspectionContractTests(unittest.TestCase):
             command,
         )
         self.assertIn('subprocess.run(["mount","--bind"', command)
-        self.assertNotIn("shutil", command)
-        self.assertNotIn("hashlib", command)
+        self.assertIn("hashlib.sha256", command)
+        self.assertIn("shutil.copyfile", command)
         self.assertIn("env -i HOME=/tmp", command)
         self.assertIn("bash /tmp/recall-agent/program.sh", command)
         self.assertIn("head -c 40000", command)
+        self.assertIn("RECALL_EXEC_TIMING_V1", command)
         self.assertIn(
             "RECALL_POINTERS_PATH=/tmp/recall-agent/pointers.json",
             command,
@@ -879,6 +938,70 @@ class DeepInspectionContractTests(unittest.TestCase):
         )
         self.assertIn("mount -o remount,bind,ro /docs", command)
         self.assertNotIn("synthetic-key", json.dumps(call["body"]))
+
+    def test_parquet_scan_stages_verified_duckdb_and_authorized_datasets(self):
+        transport = RecordingTransport({
+            "success": True,
+            "data": {
+                "stdout": "one row\n",
+                "stderr": "",
+                "exitCode": 0,
+                "timing": {"totalMs": 12, "queueMs": 2, "executeMs": 10},
+            },
+        })
+        tool = AgentExecObject(
+            object_key="objects/dd/" + "d" * 64,
+            content_sha256="e" * 64,
+        )
+        data = AgentExecObject(
+            object_key="objects/aa/" + "a" * 64,
+            content_sha256="b" * 64,
+        )
+        result = ArchilDeepInspector(
+            api_key="synthetic-key",
+            disk_id="dsk-0123456789abcdef",
+            region="aws-us-west-2",
+            duckdb_tool=tool,
+            transport=transport,
+        ).execute_scan(
+            tenant_id=TENANT,
+            program=(
+                "duckdb -json -c \"select count(*) from "
+                "read_parquet('/datasets/s1/2026-08/records.parquet')\""
+            ),
+            objects=(data,),
+            dataset_aliases={
+                data.object_key: "s1/2026-08/records.parquet"
+            },
+            timeout_seconds=120,
+        )
+        self.assertTrue(result["complete"])
+        self.assertEqual(transport.calls[0]["timeout"], 165)
+        command = transport.calls[0]["body"]["command"]
+        self.assertNotIn("select count", command)
+        self.assertIn("/tmp/recall-agent/duckdb", command)
+        self.assertIn("/tmp/recall-datasets", command)
+        self.assertIn("mount --bind /tmp/recall-datasets /datasets", command)
+        self.assertNotIn("synthetic-key", command)
+
+    def test_runtime_duckdb_identity_is_paired_and_validated(self):
+        base = {
+            "RECALL_DEEP_INSPECTOR": "archil",
+            "ARCHIL_API_KEY": "synthetic-key",
+            "RECALL_ARCHIL_DISK_ID": "dsk-0123456789abcdef",
+            "RECALL_ARCHIL_REGION": "aws-us-west-2",
+        }
+        with self.assertRaisesRegex(ValueError, "configuration is incomplete"):
+            build_deep_inspector(mock.Mock(), {
+                **base,
+                "RECALL_ARCHIL_DUCKDB_OBJECT_KEY": "objects/dd/" + "d" * 64,
+            })
+        inspector = build_deep_inspector(mock.Mock(), {
+            **base,
+            "RECALL_ARCHIL_DUCKDB_OBJECT_KEY": "objects/dd/" + "d" * 64,
+            "RECALL_ARCHIL_DUCKDB_SHA256": "e" * 64,
+        })
+        self.assertEqual(inspector.duckdb_tool.content_sha256, "e" * 64)
 
     def test_agent_exec_compresses_broad_routing_manifests(self):
         transport = RecordingTransport({
@@ -986,6 +1109,19 @@ class DeepInspectionContractTests(unittest.TestCase):
         self.assertEqual(
             agent_evidence_receipts(f"RECALL_EVIDENCE {RECEIPT}"),
             [],
+        )
+
+    def test_agent_evidence_accepts_canonical_text_records(self):
+        record = {
+            "text": "privacy processed evidence",
+            "event_native_id": "native:plain",
+            "occurred_at": "2026-08-05T00:00:00Z",
+            "ordinal": 0,
+            "receipts": [RECEIPT],
+        }
+        self.assertEqual(
+            agent_evidence_receipts(json.dumps(record)),
+            [RECEIPT],
         )
 
     def test_agent_exec_timeout_is_bounded_twenty_out_of_twenty(self):
