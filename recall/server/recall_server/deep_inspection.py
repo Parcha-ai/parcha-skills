@@ -618,7 +618,7 @@ printf 'RECALL_EXEC_TIMING_V1\t%s\t%s\n' "$1" "${EPOCHREALTIME/./}" >&2
         "umask 077",
         (
             "printf 'RECALL_EXEC_TIMING_V1\\twrapper_start\\t%s\\n' "
-            '"${EPOCHREALTIME/./}" >&2'
+            '"$(date +%s%6N)" >&2'
         ),
         # Archil may reuse an execution host. Remove every per-run staging
         # directory so a prior alias cannot make the next mkdir fail.

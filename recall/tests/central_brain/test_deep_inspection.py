@@ -983,6 +983,18 @@ class DeepInspectionContractTests(unittest.TestCase):
         self.assertIn("/tmp/recall-datasets", command)
         self.assertIn("mount --bind /tmp/recall-datasets /datasets", command)
         self.assertNotIn("synthetic-key", command)
+        outer_marker = "\n".join(command.splitlines()[:3])
+        marker_result = subprocess.run(
+            ["/bin/sh", "-c", outer_marker],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(marker_result.returncode, 0)
+        self.assertRegex(
+            marker_result.stderr,
+            r"^RECALL_EXEC_TIMING_V1\twrapper_start\t[0-9]{16}\n$",
+        )
 
     def test_runtime_duckdb_identity_is_paired_and_validated(self):
         base = {
