@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -18,6 +19,9 @@ SCAN_SCHEMA_VERSION = 1
 SCAN_DATASETS = ("documents", "records", "actors")
 MAX_SCAN_RECORDS = 5_000_000
 MAX_PARQUET_OBJECT_BYTES = 48 * 1024 * 1024
+PART_TIME_BOUND_CHECKPOINT = 128
+
+LOG = logging.getLogger(__name__)
 
 
 class ParquetScanError(RuntimeError):
@@ -202,6 +206,19 @@ class DocumentProjection:
     actors: list[dict[str, Any]]
     first_occurred_at: datetime | None
     last_occurred_at: datetime | None
+    part_bounds: tuple[PartTimeBound, ...]
+
+
+@dataclass(frozen=True)
+class PartTimeBound:
+    tenant_id: str
+    source_id: str
+    logical_document_id: str
+    revision: int
+    part_ordinal: int
+    content_sha256: str
+    first_occurred_at: datetime
+    last_occurred_at: datetime
 
 
 class CanonicalParquetScanProjector:
@@ -306,10 +323,19 @@ class CanonicalParquetScanProjector:
                     WHERE document.tenant_id=%s AND document.source_id=%s
                       AND document.last_occurred_at >= %s
                       AND document.first_occurred_at < %s
+                      AND (
+                          part.first_occurred_at IS NULL
+                          OR (
+                              part.last_occurred_at >= %s
+                              AND part.first_occurred_at < %s
+                          )
+                      )
                     ORDER BY part.logical_document_id,part.part_ordinal""",
                 (
                     candidate.tenant_id,
                     candidate.source_id,
+                    candidate.bucket_start,
+                    bucket_end,
                     candidate.bucket_start,
                     bucket_end,
                 ),
@@ -369,9 +395,22 @@ class CanonicalParquetScanProjector:
         }
         records: list[dict[str, Any]] = []
         actors: list[dict[str, Any]] = []
+        discovered_bounds: list[PartTimeBound] = []
         first = last = None
         for part in document["parts"]:
+            known_first = part.get("first_occurred_at")
+            known_last = part.get("last_occurred_at")
+            if (known_first is None) != (known_last is None):
+                raise ParquetScanError("parquet_scan_state_invalid")
+            if known_first is not None:
+                part_first = _timestamp(known_first)
+                part_last = _timestamp(known_last)
+                if part_first > part_last:
+                    raise ParquetScanError("parquet_scan_state_invalid")
+                if part_last < bucket_start or part_first >= bucket_end:
+                    continue
             payload = self.archive.read_raw(_reference(part))
+            observed_first = observed_last = None
             for line in payload.splitlines():
                 try:
                     record = orjson.loads(line)
@@ -380,6 +419,16 @@ class CanonicalParquetScanProjector:
                 if not isinstance(record, dict):
                     raise ParquetScanError("parquet_scan_record_invalid")
                 occurred_at = _timestamp(record.get("occurred_at"))
+                observed_first = (
+                    occurred_at
+                    if observed_first is None
+                    else min(observed_first, occurred_at)
+                )
+                observed_last = (
+                    occurred_at
+                    if observed_last is None
+                    else max(observed_last, occurred_at)
+                )
                 if not bucket_start <= occurred_at < bucket_end:
                     continue
                 if len(records) >= record_budget:
@@ -436,7 +485,61 @@ class CanonicalParquetScanProjector:
                 )
                 first = occurred_at if first is None else min(first, occurred_at)
                 last = occurred_at if last is None else max(last, occurred_at)
-        return DocumentProjection(records, actors, first, last)
+            if known_first is None:
+                if observed_first is None or observed_last is None:
+                    raise ParquetScanError("parquet_scan_record_invalid")
+                discovered_bounds.append(
+                    PartTimeBound(
+                        tenant_id=candidate.tenant_id,
+                        source_id=candidate.source_id,
+                        logical_document_id=document["logical_document_id"],
+                        revision=int(document["revision"]),
+                        part_ordinal=int(part["part_ordinal"]),
+                        content_sha256=str(part["content_sha256"]),
+                        first_occurred_at=observed_first,
+                        last_occurred_at=observed_last,
+                    )
+                )
+                if len(discovered_bounds) >= PART_TIME_BOUND_CHECKPOINT:
+                    self._persist_part_bounds(discovered_bounds)
+                    discovered_bounds.clear()
+        return DocumentProjection(
+            records,
+            actors,
+            first,
+            last,
+            tuple(discovered_bounds),
+        )
+
+    def _persist_part_bounds(self, bounds: list[PartTimeBound]) -> None:
+        if not bounds:
+            return
+        with self.store.connect() as connection:
+            with connection.transaction():
+                with connection.cursor() as cursor:
+                    cursor.executemany(
+                        """UPDATE canonical_evidence_document_parts
+                              SET first_occurred_at=%s,last_occurred_at=%s
+                            WHERE tenant_id=%s AND source_id=%s
+                              AND logical_document_id=%s AND revision=%s
+                              AND part_ordinal=%s AND content_sha256=%s
+                              AND first_occurred_at IS NULL
+                              AND last_occurred_at IS NULL""",
+                        [
+                            (
+                                bound.first_occurred_at,
+                                bound.last_occurred_at,
+                                bound.tenant_id,
+                                bound.source_id,
+                                bound.logical_document_id,
+                                bound.revision,
+                                bound.part_ordinal,
+                                bound.content_sha256,
+                            )
+                            for bound in bounds
+                        ],
+                    )
+        LOG.info("parquet part time bounds observed=%s", len(bounds))
 
     def _current_upload(
         self,
@@ -552,6 +655,7 @@ class CanonicalParquetScanProjector:
             f"{candidate.bucket_start.isoformat()}\n".encode()
         )
         first = last = None
+        discovered_bounds: list[PartTimeBound] = []
         for document in documents:
             links = document.get("actor_links") or []
             projected = self._project_document(
@@ -561,6 +665,7 @@ class CanonicalParquetScanProjector:
                 bucket_end=bucket_end,
                 record_budget=MAX_SCAN_RECORDS - len(rows["records"]),
             )
+            discovered_bounds.extend(projected.part_bounds)
             if not projected.records:
                 continue
             if (
@@ -619,6 +724,7 @@ class CanonicalParquetScanProjector:
                 if last is None
                 else max(last, projected.last_occurred_at)
             )
+        self._persist_part_bounds(discovered_bounds)
         generation = digest.hexdigest()
         if not rows["documents"]:
             return ScanUpload(generation, {}, {}, None, None, False)

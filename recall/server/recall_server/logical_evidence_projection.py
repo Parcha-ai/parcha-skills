@@ -1187,10 +1187,11 @@ class CanonicalLogicalEvidenceProjector:
                                part_ordinal,artifact_id,storage_backend,object_key,
                                content_sha256,size_bytes,media_type,encryption,
                                version_id,first_record_ordinal,
-                               last_record_ordinal,receipt_count,created_at
+                               last_record_ordinal,first_occurred_at,
+                               last_occurred_at,receipt_count,created_at
                            ) VALUES (
                                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                               %s,%s,%s,%s
+                               %s,%s,%s,%s,%s,%s
                            )""",
                         [
                             (
@@ -1209,6 +1210,8 @@ class CanonicalLogicalEvidenceProjector:
                                 reference["version_id"],
                                 part.first_record_ordinal,
                                 part.last_record_ordinal,
+                                part.first_occurred_at,
+                                part.last_occurred_at,
                                 part.receipt_count,
                                 reference["created_at"],
                             )

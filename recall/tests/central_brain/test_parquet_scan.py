@@ -23,8 +23,10 @@ from recall_server.parquet_scan import (
 class _Archive:
     def __init__(self, record: dict):
         self.record = record
+        self.reads = 0
 
     def read_raw(self, _reference):
+        self.reads += 1
         return json.dumps(self.record, sort_keys=True).encode() + b"\n"
 
 
@@ -64,6 +66,7 @@ def _part() -> dict:
     return {
         "tenant_id": "tenant:test",
         "source_id": "source:test",
+        "part_ordinal": 0,
         "artifact_id": "artifact:test",
         "storage_backend": "filesystem",
         "object_key": "objects/test",
@@ -72,6 +75,8 @@ def _part() -> dict:
         "media_type": "application/x-ndjson",
         "encryption": "filesystem-private",
         "version_id": "v1",
+        "first_occurred_at": datetime(2026, 8, 5, 12, tzinfo=timezone.utc),
+        "last_occurred_at": datetime(2026, 8, 5, 12, tzinfo=timezone.utc),
         "created_at": datetime(2026, 8, 1, tzinfo=timezone.utc),
     }
 
@@ -121,6 +126,15 @@ class _BuildProbe(CanonicalParquetScanProjector):
             last,
             True,
         )
+
+
+class _CheckpointProbe(CanonicalParquetScanProjector):
+    def __init__(self, archive: _Archive):
+        super().__init__(None, _Evidence(archive))
+        self.checkpoints = []
+
+    def _persist_part_bounds(self, bounds):
+        self.checkpoints.append(len(bounds))
 
 
 class ParquetScanContractTest(unittest.TestCase):
@@ -202,6 +216,99 @@ class ParquetScanContractTest(unittest.TestCase):
         )
         self.assertEqual(result.records[0]["actor_ids"], [])
         self.assertEqual(result.actors, [])
+
+    def test_legacy_part_discovers_exact_bounds_once(self):
+        record = {
+            "ordinal": 0,
+            "occurred_at": "2026-08-05T12:00:00Z",
+            "event_kind": "transcript_record",
+            "roles": ["user"],
+            "receipts": ["recall://source:test/doc?rev=1#item=0"],
+            "text": "useful context",
+        }
+        part = _part()
+        part["first_occurred_at"] = None
+        part["last_occurred_at"] = None
+        document = _document("Employee")
+        document["parts"] = [part]
+        archive = _Archive(record)
+        projector = CanonicalParquetScanProjector(None, _Evidence(archive))
+        result = projector._project_document(
+            _candidate(),
+            document,
+            bucket_start=datetime(2026, 8, 1, tzinfo=timezone.utc),
+            bucket_end=datetime(2026, 9, 1, tzinfo=timezone.utc),
+            record_budget=10,
+        )
+        self.assertEqual(archive.reads, 1)
+        self.assertEqual(len(result.part_bounds), 1)
+        self.assertEqual(
+            result.part_bounds[0].first_occurred_at,
+            datetime(2026, 8, 5, 12, tzinfo=timezone.utc),
+        )
+
+    def test_known_nonoverlapping_part_is_not_downloaded(self):
+        record = {
+            "ordinal": 0,
+            "occurred_at": "2026-07-05T12:00:00Z",
+            "event_kind": "transcript_record",
+            "roles": ["user"],
+            "receipts": ["recall://source:test/doc?rev=1#item=0"],
+            "text": "older context",
+        }
+        part = _part()
+        part["first_occurred_at"] = datetime(
+            2026, 7, 5, 12, tzinfo=timezone.utc
+        )
+        part["last_occurred_at"] = part["first_occurred_at"]
+        document = _document("Employee")
+        document["parts"] = [part]
+        archive = _Archive(record)
+        result = CanonicalParquetScanProjector(
+            None, _Evidence(archive)
+        )._project_document(
+            _candidate(),
+            document,
+            bucket_start=datetime(2026, 8, 1, tzinfo=timezone.utc),
+            bucket_end=datetime(2026, 9, 1, tzinfo=timezone.utc),
+            record_budget=10,
+        )
+        self.assertEqual(archive.reads, 0)
+        self.assertEqual(result.records, [])
+        self.assertEqual(result.part_bounds, ())
+
+    def test_legacy_bound_discovery_checkpoints_large_documents(self):
+        record = {
+            "ordinal": 0,
+            "occurred_at": "2026-08-05T12:00:00Z",
+            "event_kind": "transcript_record",
+            "roles": ["user"],
+            "receipts": ["recall://source:test/doc?rev=1#item=0"],
+            "text": "useful context",
+        }
+        parts = []
+        for ordinal in range(129):
+            part = _part()
+            part["part_ordinal"] = ordinal
+            part["first_occurred_at"] = None
+            part["last_occurred_at"] = None
+            parts.append(part)
+        document = _document("Employee")
+        document["parts"] = parts
+        archive = _Archive(record)
+        projector = _CheckpointProbe(archive)
+
+        result = projector._project_document(
+            _candidate(),
+            document,
+            bucket_start=datetime(2026, 8, 1, tzinfo=timezone.utc),
+            bucket_end=datetime(2026, 9, 1, tzinfo=timezone.utc),
+            record_budget=200,
+        )
+
+        self.assertEqual(projector.checkpoints, [128])
+        self.assertEqual(len(result.part_bounds), 1)
+        self.assertEqual(archive.reads, 129)
 
     def test_generation_changes_when_actor_projection_changes(self):
         record = {
