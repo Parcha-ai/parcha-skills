@@ -184,6 +184,22 @@ ALL_READ_TOOLS = (
         "annotations": {"readOnlyHint": True},
     },
     {
+        "name": "recall_people",
+        "description": (
+            "List active people explicitly bound to the caller's authorized "
+            "sources. Returns only actor IDs, display names, source IDs, source "
+            "families, and ownership relations—never message content or provider "
+            "identifiers. Use this before recall_scan for team-wide questions."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+        "outputSchema": {"type": "object"},
+        "annotations": {"readOnlyHint": True},
+    },
+    {
         "name": "recall_scope",
         "description": (
             "Enumerate the complete authorized full-document scope for exact "
@@ -493,14 +509,15 @@ RETRIEVAL_INSTRUCTIONS = (
     "explicit alias, otherwise report insufficient evidence. For one named topic, "
     "make no more than three focused searches and stop once the evidence supports "
     "the answer. Use recall_exec_map with shard_size=1 when the same focused check "
-    "must cover several independent candidates. Prefer one recall_scan code-mode "
-    "call for broad person, team, source, project, or time analysis; use DuckDB to "
+    "must cover several independent candidates. For team-wide questions, call "
+    "recall_people once, then prefer one recall_scan code-mode call; use DuckDB to "
     "filter and aggregate the mounted Parquet datasets. Cite only receipts "
     "returned in opened_receipts."
 )
 CANONICAL_ONLY_READ_TOOLS = frozenset({
     "recall_exec",
     "recall_exec_map",
+    "recall_people",
     "recall_scan",
     "recall_scope",
     "recall_session_context",
@@ -677,6 +694,9 @@ def _call_tool(
         "authorized_sources",
         principal.get("source_id"),
     )
+    if name == "recall_people":
+        _reject_extra(arguments, frozenset())
+        return store.list_people()
     if name == "recall_scope":
         _reject_extra(arguments, frozenset({"filters", "limit", "offset"}))
         filters = _object(arguments.get("filters", {}), "filters")

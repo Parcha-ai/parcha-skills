@@ -216,6 +216,34 @@ class ScopeStore(RecordingStore):
         }])
 
 
+class PeopleStore(RecordingStore):
+    @contextmanager
+    def connect(self):
+        yield self
+
+    def _execute_bounded(self, _connection, sql, values, deadline_at):
+        self.deadlines = getattr(self, "deadlines", [])
+        self.deadlines.append(deadline_at)
+        self.sql.append(" ".join(sql.split()))
+        self.values.append(tuple(values))
+        return Rows([
+            {
+                "actor_id": "actor_" + "1" * 32,
+                "display_name": "Alice Example",
+                "source_id": "codex:linux:alice",
+                "relation": "owner",
+                "family": "coding_history",
+            },
+            {
+                "actor_id": "actor_" + "1" * 32,
+                "display_name": "Alice Example",
+                "source_id": "claude:linux:alice",
+                "relation": "owner",
+                "family": "coding_history",
+            },
+        ])
+
+
 class ParallelExecStore:
     semantic_runtime = None
 
@@ -369,10 +397,17 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
             or "canonical_evidence_document_actors" in value
         )
         self.assertEqual(arm_sql.count("actor.actor_id=ANY(%s)"), 1)
+        retrieval_source = "\n".join(
+            inspect.getsource(method)
+            for method in (
+                PassageHintRetrieval._lexical_candidates,
+                PassageHintRetrieval._sparse_candidates,
+                PassageHintRetrieval._dense_scope_passage_count,
+                PassageHintRetrieval._dense_candidates,
+            )
+        )
         self.assertGreaterEqual(
-            inspect.getsource(PassageHintRetrieval.search).count(
-                "actor.actor_id=ANY(%s)"
-            ),
+            retrieval_source.count("actor.actor_id=ANY(%s)"),
             3,
         )
         self.assertIn(
@@ -498,6 +533,33 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
         )
         self.assertIn("canonical_evidence_document_actors", scope_sql)
         self.assertIn("document.last_occurred_at>=%s", scope_sql)
+
+    def test_people_is_content_free_and_restricted_to_authorized_sources(
+        self,
+    ) -> None:
+        store = PeopleStore()
+        retrieval = BoundCanonicalRetrieval(
+            store,
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=(
+                "codex:linux:alice",
+                "claude:linux:alice",
+            ),
+        )
+
+        result = retrieval.list_people()
+
+        self.assertTrue(result["complete"])
+        self.assertEqual(len(result["people"]), 1)
+        self.assertEqual(result["people"][0]["display_name"], "Alice Example")
+        self.assertEqual(len(result["people"][0]["sources"]), 2)
+        self.assertNotIn("email", json.dumps(result).casefold())
+        self.assertNotIn("alias", json.dumps(result).casefold())
+        self.assertEqual(
+            store.values[0][1],
+            ["codex:linux:alice", "claude:linux:alice"],
+        )
 
     def test_filtered_search_preserves_query_semantics(self) -> None:
         store = ActorRecordingStore()

@@ -653,6 +653,86 @@ class BoundCanonicalRetrieval:
                 sources &= {row["source_id"]} if row else set()
         return sorted(sources)
 
+    def list_people(self) -> dict[str, Any]:
+        """List active people explicitly bound to the caller's sources."""
+
+        started_at = time.monotonic()
+        if not self.authorized_sources:
+            return {
+                "people": [],
+                "complete": True,
+                "diagnostics": {
+                    "engine": "canonical-people-v1",
+                    "elapsed_ms": 0.0,
+                },
+            }
+        deadline_at = started_at + self.store.search_deadline_ms / 1000
+        try:
+            with self.store.connect() as connection:
+                rows = self.store._execute_bounded(
+                    connection,
+                    """SELECT actor.actor_id,actor.display_name,
+                              binding.source_id,binding.relation,
+                              profile.family
+                         FROM canonical_source_actor_bindings binding
+                         JOIN brain_actors actor
+                           ON actor.tenant_id=binding.tenant_id
+                          AND actor.actor_id=binding.actor_id
+                         LEFT JOIN source_profiles profile
+                           ON profile.source_id=binding.source_id
+                        WHERE binding.tenant_id=%s
+                          AND binding.source_id=ANY(%s)
+                          AND actor.active
+                          AND actor.actor_kind='human'
+                        ORDER BY lower(actor.display_name),actor.actor_id,
+                                 binding.source_id,binding.relation
+                        LIMIT 1024""",
+                    (self.tenant_id, list(self.authorized_sources)),
+                    deadline_at,
+                ).fetchall()
+        except SearchDeadlineExceeded:
+            return {
+                "people": [],
+                "complete": False,
+                "diagnostics": {
+                    "engine": "canonical-people-v1",
+                    "status": "deadline-exceeded",
+                    "elapsed_ms": round(
+                        (time.monotonic() - started_at) * 1000,
+                        3,
+                    ),
+                },
+            }
+        people: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            person = people.setdefault(
+                row["actor_id"],
+                {
+                    "actor_id": row["actor_id"],
+                    "display_name": row["display_name"],
+                    "sources": [],
+                },
+            )
+            source = {
+                "source_id": row["source_id"],
+                "relation": row["relation"],
+            }
+            if row.get("family") is not None:
+                source["family"] = row["family"]
+            person["sources"].append(source)
+        return {
+            "people": list(people.values()),
+            "complete": len(rows) < 1024,
+            "diagnostics": {
+                "engine": "canonical-people-v1",
+                "status": "ok",
+                "elapsed_ms": round(
+                    (time.monotonic() - started_at) * 1000,
+                    3,
+                ),
+            },
+        }
+
     @staticmethod
     def _row(row: dict[str, Any], score: float) -> dict[str, Any]:
         text, clipped = bounded_search_text(row["text_redacted"])

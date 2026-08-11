@@ -16,6 +16,7 @@ from .passage_representations import FINGERPRINT_RE, VECTOR_COLUMNS
 
 
 MAX_BUNDLE_SEARCH_WORKERS = 4
+MAX_EXACT_DENSE_SCOPE_PASSAGES = 20_000
 
 
 def collapse_document_candidates(
@@ -222,30 +223,20 @@ class PassageHintRetrieval:
         self.actor_relations = actor_relations
         self.actor_scope = actor_scope or actor_ids is not None
 
-    def search(
+    def _lexical_candidates(
         self,
-        query: str,
-        *,
         lexical_query: str,
+        *,
         since: str | None,
         until: str | None,
-        limit: int,
-        include_arms: bool = False,
-        deadline_at: float | None = None,
-    ) -> dict[str, Any]:
-        started_at = time.monotonic()
-        if deadline_at is None:
-            deadline_at = started_at + self.store.search_deadline_ms / 1000
-        candidate_limit = min(400, max(80, limit * 20))
-        actor_ids = list(self.actor_ids) if self.actor_ids is not None else None
-        actor_relations = (
-            list(self.actor_relations)
-            if self.actor_relations is not None
-            else None
-        )
-        with self.store.connect() as connection:
-            try:
-                lexical = self.store._execute_bounded(
+        candidate_limit: int,
+        actor_ids: list[str] | None,
+        actor_relations: list[str] | None,
+        deadline_at: float,
+    ) -> tuple[list[dict[str, Any]], str]:
+        try:
+            with self.store.connect() as connection:
+                rows = self.store._execute_bounded(
                     connection,
                     """SELECT passage.source_id,
                               passage.logical_document_id,
@@ -331,21 +322,27 @@ class PassageHintRetrieval:
                     ),
                     deadline_at,
                 ).fetchall()
-                lexical_status = "ok"
-            except SearchDeadlineExceeded:
-                lexical = []
-                lexical_status = "deadline-exceeded"
+        except SearchDeadlineExceeded:
+            return [], "deadline-exceeded"
+        return rows, "ok"
+
+    def _sparse_candidates(
+        self,
+        lexical_query: str,
+        *,
+        since: str | None,
+        until: str | None,
+        candidate_limit: int,
+        actor_ids: list[str] | None,
+        actor_relations: list[str] | None,
+        deadline_at: float,
+    ) -> tuple[list[dict[str, Any]], str]:
         if self.actor_scope:
-            # Actor-scoped retrieval is served from the passage projection.
-            # Its legacy chunk fallback can consume the shared deadline before
-            # dense recall gets a turn on large employee histories.
-            sparse = []
-            sparse_status = "skipped-actor-scope"
-        else:
+            return [], "skipped-actor-scope"
+        try:
             with self.store.connect() as connection:
-                try:
-                    sparse = self.store._execute_bounded(
-                        connection,
+                rows = self.store._execute_bounded(
+                    connection,
                     """SELECT event.source_id,
                               evidence.logical_document_id,
                               evidence.revision,evidence.native_parent_id,
@@ -415,105 +412,59 @@ class PassageHintRetrieval:
                         until,
                         until,
                         candidate_limit,
-                        ),
-                        deadline_at,
-                    ).fetchall()
-                    sparse_status = "ok"
-                except SearchDeadlineExceeded:
-                    sparse = []
-                    sparse_status = "deadline-exceeded"
+                    ),
+                    deadline_at,
+                ).fetchall()
+        except SearchDeadlineExceeded:
+            return [], "deadline-exceeded"
+        return rows, "ok"
 
-        dense: list[dict[str, Any]] = []
-        runtime = self.store.semantic_runtime
-        dense_status = "disabled" if runtime is None else "ok"
-        if runtime is not None:
-            try:
-                bounded = getattr(runtime, "embed_query_bounded", None)
-                vector = (
-                    bounded(query)
-                    if bounded is not None
-                    else runtime.embed_query(query)
-                )
-                temporal_scope = since is not None or until is not None
-                dense_oversample = 50 if temporal_scope else 5
-                exact_scope = (
-                    actor_ids is not None
-                    or temporal_scope
-                    or len(self.sources) == 1
-                )
-                if exact_scope:
-                    # pgvector's approximate index applies selective SQL
-                    # predicates after traversing its nearest graph. Freeze the
-                    # authorized source/time/person subset first, then rank
-                    # exactly inside it so a valid narrow slice cannot starve.
-                    nearest_sql = """WITH eligible AS MATERIALIZED (
-                               SELECT embedding.tenant_id,
-                                      embedding.source_id,
-                                      embedding.passage_id,
-                                      embedding.embedding
-                                 FROM canonical_passage_embeddings embedding
-                                 JOIN canonical_passages passage
-                                   USING(tenant_id,source_id,passage_id)
-                                 JOIN canonical_passage_documents projected
-                                   USING(
-                                       tenant_id,source_id,
-                                       logical_document_id,
-                                       revision,policy_fingerprint
-                                   )
-                                WHERE embedding.tenant_id=%s
-                                  AND embedding.source_id=ANY(%s)
-                                  AND embedding.runtime_fingerprint=%s
-                                  AND projected.policy_fingerprint=%s
-                                  AND NOT EXISTS (
-                                      SELECT 1
-                                        FROM unnest(passage.receipts)
-                                             AS passage_receipt(receipt)
-                                        LEFT JOIN canonical_chunks live_chunk
-                                          ON live_chunk.tenant_id=
-                                             passage.tenant_id
-                                         AND live_chunk.source_id=
-                                             passage.source_id
-                                         AND live_chunk.receipt=
-                                             passage_receipt.receipt
-                                         AND live_chunk.deleted_at IS NULL
-                                       WHERE live_chunk.receipt IS NULL
-                                  )
-                                  AND (%s::timestamptz IS NULL
-                                       OR passage.last_occurred_at>=%s)
-                                  AND (%s::timestamptz IS NULL
-                                       OR passage.first_occurred_at<=%s)
-                                  AND (
-                                      %s::text[] IS NULL
-                                      OR EXISTS (
-                                          SELECT 1
-                                            FROM canonical_passage_actors actor
-                                           WHERE actor.tenant_id=
-                                                 embedding.tenant_id
-                                             AND actor.source_id=
-                                                 embedding.source_id
-                                             AND actor.passage_id=
-                                                 embedding.passage_id
-                                             AND actor.actor_id=ANY(%s)
-                                             AND (
-                                                 %s::text[] IS NULL
-                                                 OR actor.relation=ANY(%s)
-                                             )
-                                      )
-                                  )
-                           ), nearest AS MATERIALIZED (
-                               SELECT eligible.tenant_id,
-                                      eligible.source_id,
-                                      eligible.passage_id,
-                                      eligible.embedding
-                                          <=> %s::halfvec AS distance
-                                 FROM eligible
-                                ORDER BY eligible.embedding <=> %s::halfvec
-                                LIMIT %s
-                           )"""
-                    nearest_values = (
+    def _dense_scope_passage_count(
+        self,
+        *,
+        since: str | None,
+        until: str | None,
+        actor_ids: list[str] | None,
+        actor_relations: list[str] | None,
+        deadline_at: float,
+    ) -> int | None:
+        try:
+            with self.store.connect() as connection:
+                row = self.store._execute_bounded(
+                    connection,
+                    """SELECT COALESCE(sum(projected.passage_count),0) AS count
+                         FROM canonical_passage_documents projected
+                         JOIN canonical_evidence_documents evidence
+                           USING(
+                               tenant_id,source_id,logical_document_id,revision
+                           )
+                        WHERE projected.tenant_id=%s
+                          AND projected.source_id=ANY(%s)
+                          AND projected.policy_fingerprint=%s
+                          AND (%s::timestamptz IS NULL
+                               OR evidence.last_occurred_at>=%s)
+                          AND (%s::timestamptz IS NULL
+                               OR evidence.first_occurred_at<=%s)
+                          AND (
+                              %s::text[] IS NULL
+                              OR EXISTS (
+                                  SELECT 1
+                                    FROM canonical_evidence_document_actors actor
+                                   WHERE actor.tenant_id=projected.tenant_id
+                                     AND actor.source_id=projected.source_id
+                                     AND actor.logical_document_id=
+                                         projected.logical_document_id
+                                     AND actor.revision=projected.revision
+                                     AND actor.actor_id=ANY(%s)
+                                     AND (
+                                         %s::text[] IS NULL
+                                         OR actor.relation=ANY(%s)
+                                     )
+                              )
+                          )""",
+                    (
                         self.tenant_id,
                         self.sources,
-                        runtime.passage_fingerprint,
                         self.policy_fingerprint,
                         since,
                         since,
@@ -523,134 +474,296 @@ class PassageHintRetrieval:
                         actor_ids,
                         actor_relations,
                         actor_relations,
-                        vector,
-                        vector,
-                        candidate_limit * dense_oversample,
-                    )
-                else:
-                    nearest_sql = """WITH nearest AS MATERIALIZED (
-                               SELECT embedding.tenant_id,
-                                      embedding.source_id,
-                                      embedding.passage_id,
-                                      embedding.embedding
-                                          <=> %s::halfvec AS distance
-                                 FROM canonical_passage_embeddings embedding
-                                 JOIN canonical_passages passage
-                                   USING(tenant_id,source_id,passage_id)
-                                WHERE embedding.tenant_id=%s
-                                  AND embedding.source_id=ANY(%s)
-                                  AND embedding.runtime_fingerprint=%s
-                                  AND NOT EXISTS (
+                    ),
+                    deadline_at,
+                ).fetchone()
+        except SearchDeadlineExceeded:
+            return None
+        return int(row["count"]) if row is not None else None
+
+    def _dense_candidates(
+        self,
+        query: str,
+        *,
+        since: str | None,
+        until: str | None,
+        candidate_limit: int,
+        actor_ids: list[str] | None,
+        actor_relations: list[str] | None,
+        deadline_at: float,
+    ) -> tuple[list[dict[str, Any]], str, str, int | None]:
+        runtime = self.store.semantic_runtime
+        if runtime is None:
+            return [], "disabled", "disabled", None
+        try:
+            bounded = getattr(runtime, "embed_query_bounded", None)
+            vector = (
+                bounded(query)
+                if bounded is not None
+                else runtime.embed_query(query)
+            )
+            temporal_scope = since is not None or until is not None
+            dense_oversample = 50 if temporal_scope else 5
+            scope_passages = self._dense_scope_passage_count(
+                since=since,
+                until=until,
+                actor_ids=actor_ids,
+                actor_relations=actor_relations,
+                deadline_at=deadline_at,
+            )
+            exact_scope = (
+                scope_passages is not None
+                and scope_passages <= MAX_EXACT_DENSE_SCOPE_PASSAGES
+            )
+            if exact_scope:
+                dense_strategy = "exact-scoped"
+                nearest_sql = """WITH eligible AS MATERIALIZED (
+                           SELECT embedding.tenant_id,
+                                  embedding.source_id,
+                                  embedding.passage_id,
+                                  embedding.embedding
+                             FROM canonical_passage_embeddings embedding
+                             JOIN canonical_passages passage
+                               USING(tenant_id,source_id,passage_id)
+                             JOIN canonical_passage_documents projected
+                               USING(
+                                   tenant_id,source_id,
+                                   logical_document_id,
+                                   revision,policy_fingerprint
+                               )
+                            WHERE embedding.tenant_id=%s
+                              AND embedding.source_id=ANY(%s)
+                              AND embedding.runtime_fingerprint=%s
+                              AND projected.policy_fingerprint=%s
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                    FROM unnest(passage.receipts)
+                                         AS passage_receipt(receipt)
+                                    LEFT JOIN canonical_chunks live_chunk
+                                      ON live_chunk.tenant_id=passage.tenant_id
+                                     AND live_chunk.source_id=passage.source_id
+                                     AND live_chunk.receipt=passage_receipt.receipt
+                                     AND live_chunk.deleted_at IS NULL
+                                   WHERE live_chunk.receipt IS NULL
+                              )
+                              AND (%s::timestamptz IS NULL
+                                   OR passage.last_occurred_at>=%s)
+                              AND (%s::timestamptz IS NULL
+                                   OR passage.first_occurred_at<=%s)
+                              AND (
+                                  %s::text[] IS NULL
+                                  OR EXISTS (
                                       SELECT 1
-                                        FROM unnest(passage.receipts)
-                                             AS passage_receipt(receipt)
-                                        LEFT JOIN canonical_chunks live_chunk
-                                          ON live_chunk.tenant_id=
-                                             passage.tenant_id
-                                         AND live_chunk.source_id=
-                                             passage.source_id
-                                         AND live_chunk.receipt=
-                                             passage_receipt.receipt
-                                         AND live_chunk.deleted_at IS NULL
-                                       WHERE live_chunk.receipt IS NULL
+                                        FROM canonical_passage_actors actor
+                                       WHERE actor.tenant_id=embedding.tenant_id
+                                         AND actor.source_id=embedding.source_id
+                                         AND actor.passage_id=embedding.passage_id
+                                         AND actor.actor_id=ANY(%s)
+                                         AND (
+                                             %s::text[] IS NULL
+                                             OR actor.relation=ANY(%s)
+                                         )
                                   )
-                                ORDER BY embedding.embedding
-                                         <=> %s::halfvec
-                                LIMIT %s
-                           )"""
-                    nearest_values = (
-                        vector,
-                        self.tenant_id,
-                        self.sources,
-                        runtime.passage_fingerprint,
-                        vector,
-                        candidate_limit * dense_oversample,
-                    )
-                dense_sql = nearest_sql + """, ranked_documents AS MATERIALIZED (
-                               SELECT DISTINCT ON (
-                                          passage.logical_document_id
-                                      )
-                                      passage.source_id,
-                                      passage.logical_document_id,
-                                      passage.revision,
-                                      evidence.native_parent_id,
-                                      evidence.first_occurred_at,
-                                      evidence.last_occurred_at,
-                                      evidence.manifest_object_key,
-                                      evidence.manifest_content_sha256,
-                                      passage.passage_id,
-                                      passage.ordinal AS passage_ordinal,
-                                      passage.spans,passage.receipts,
-                                      passage.text_redacted,
-                                      nearest.distance
-                                 FROM nearest
-                                 JOIN canonical_passages passage
-                                   USING(tenant_id,source_id,passage_id)
-                                 JOIN canonical_passage_documents projected
-                                   USING(
-                                       tenant_id,source_id,
-                                       logical_document_id,
-                                       revision,policy_fingerprint
-                                   )
-                                 JOIN canonical_evidence_documents evidence
-                                   USING(
-                                       tenant_id,source_id,
-                                       logical_document_id,revision
-                                   )
-                                WHERE projected.policy_fingerprint=%s
-                                  AND NOT EXISTS (
-                                      SELECT 1
-                                        FROM unnest(passage.receipts)
-                                             AS passage_receipt(receipt)
-                                        LEFT JOIN canonical_chunks live_chunk
-                                          ON live_chunk.tenant_id=
-                                             passage.tenant_id
-                                         AND live_chunk.source_id=
-                                             passage.source_id
-                                         AND live_chunk.receipt=
-                                             passage_receipt.receipt
-                                         AND live_chunk.deleted_at IS NULL
-                                       WHERE live_chunk.receipt IS NULL
-                                  )
-                                  AND (%s::timestamptz IS NULL
-                                       OR passage.last_occurred_at>=%s)
-                                  AND (%s::timestamptz IS NULL
-                                       OR passage.first_occurred_at<=%s)
-                                ORDER BY passage.logical_document_id,
-                                         nearest.distance,
-                                         passage.last_occurred_at DESC,
-                                         passage.passage_id
-                           )
-                           SELECT *,1-distance AS score
-                             FROM ranked_documents
-                            ORDER BY distance,last_occurred_at DESC,passage_id
-                            LIMIT %s"""
-                with self.store.connect() as connection:
-                    dense = self.store._execute_bounded(
-                        connection,
-                        dense_sql,
-                        nearest_values + (
-                            self.policy_fingerprint,
-                            since,
-                            since,
-                            until,
-                            until,
-                            candidate_limit,
-                        ),
-                        deadline_at,
-                    ).fetchall()
-            except (
-                json.JSONDecodeError,
-                SearchDeadlineExceeded,
-                TimeoutError,
-                urllib.error.URLError,
-            ) as error:
-                dense = []
-                dense_status = (
-                    "deadline-exceeded"
-                    if isinstance(error, SearchDeadlineExceeded)
-                    else "unavailable"
+                              )
+                       ), nearest AS MATERIALIZED (
+                           SELECT eligible.tenant_id,
+                                  eligible.source_id,
+                                  eligible.passage_id,
+                                  eligible.embedding <=> %s::halfvec AS distance
+                             FROM eligible
+                            ORDER BY eligible.embedding <=> %s::halfvec
+                            LIMIT %s
+                       )"""
+                nearest_values = (
+                    self.tenant_id,
+                    self.sources,
+                    runtime.passage_fingerprint,
+                    self.policy_fingerprint,
+                    since,
+                    since,
+                    until,
+                    until,
+                    actor_ids,
+                    actor_ids,
+                    actor_relations,
+                    actor_relations,
+                    vector,
+                    vector,
+                    candidate_limit * dense_oversample,
                 )
+            else:
+                dense_strategy = "ann-oversampled"
+                nearest_sql = """WITH nearest AS MATERIALIZED (
+                           SELECT embedding.tenant_id,
+                                  embedding.source_id,
+                                  embedding.passage_id,
+                                  embedding.embedding <=> %s::halfvec AS distance
+                             FROM canonical_passage_embeddings embedding
+                             JOIN canonical_passages passage
+                               USING(tenant_id,source_id,passage_id)
+                            WHERE embedding.tenant_id=%s
+                              AND embedding.source_id=ANY(%s)
+                              AND embedding.runtime_fingerprint=%s
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                    FROM unnest(passage.receipts)
+                                         AS passage_receipt(receipt)
+                                    LEFT JOIN canonical_chunks live_chunk
+                                      ON live_chunk.tenant_id=passage.tenant_id
+                                     AND live_chunk.source_id=passage.source_id
+                                     AND live_chunk.receipt=passage_receipt.receipt
+                                     AND live_chunk.deleted_at IS NULL
+                                   WHERE live_chunk.receipt IS NULL
+                              )
+                            ORDER BY embedding.embedding <=> %s::halfvec
+                            LIMIT %s
+                       )"""
+                nearest_values = (
+                    vector,
+                    self.tenant_id,
+                    self.sources,
+                    runtime.passage_fingerprint,
+                    vector,
+                    candidate_limit * dense_oversample,
+                )
+            dense_sql = nearest_sql + """, ranked_documents AS MATERIALIZED (
+                           SELECT DISTINCT ON (passage.logical_document_id)
+                                  passage.source_id,
+                                  passage.logical_document_id,
+                                  passage.revision,
+                                  evidence.native_parent_id,
+                                  evidence.first_occurred_at,
+                                  evidence.last_occurred_at,
+                                  evidence.manifest_object_key,
+                                  evidence.manifest_content_sha256,
+                                  passage.passage_id,
+                                  passage.ordinal AS passage_ordinal,
+                                  passage.spans,passage.receipts,
+                                  passage.text_redacted,
+                                  nearest.distance
+                             FROM nearest
+                             JOIN canonical_passages passage
+                               USING(tenant_id,source_id,passage_id)
+                             JOIN canonical_passage_documents projected
+                               USING(
+                                   tenant_id,source_id,logical_document_id,
+                                   revision,policy_fingerprint
+                               )
+                             JOIN canonical_evidence_documents evidence
+                               USING(
+                                   tenant_id,source_id,
+                                   logical_document_id,revision
+                               )
+                            WHERE projected.policy_fingerprint=%s
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                    FROM unnest(passage.receipts)
+                                         AS passage_receipt(receipt)
+                                    LEFT JOIN canonical_chunks live_chunk
+                                      ON live_chunk.tenant_id=passage.tenant_id
+                                     AND live_chunk.source_id=passage.source_id
+                                     AND live_chunk.receipt=passage_receipt.receipt
+                                     AND live_chunk.deleted_at IS NULL
+                                   WHERE live_chunk.receipt IS NULL
+                              )
+                              AND (%s::timestamptz IS NULL
+                                   OR passage.last_occurred_at>=%s)
+                              AND (%s::timestamptz IS NULL
+                                   OR passage.first_occurred_at<=%s)
+                            ORDER BY passage.logical_document_id,
+                                     nearest.distance,
+                                     passage.last_occurred_at DESC,
+                                     passage.passage_id
+                       )
+                       SELECT *,1-distance AS score
+                         FROM ranked_documents
+                        ORDER BY distance,last_occurred_at DESC,passage_id
+                        LIMIT %s"""
+            with self.store.connect() as connection:
+                rows = self.store._execute_bounded(
+                    connection,
+                    dense_sql,
+                    nearest_values + (
+                        self.policy_fingerprint,
+                        since,
+                        since,
+                        until,
+                        until,
+                        candidate_limit,
+                    ),
+                    deadline_at,
+                ).fetchall()
+        except (
+            json.JSONDecodeError,
+            SearchDeadlineExceeded,
+            TimeoutError,
+            urllib.error.URLError,
+        ) as error:
+            return (
+                [],
+                "deadline-exceeded"
+                if isinstance(error, SearchDeadlineExceeded)
+                else "unavailable",
+                "unavailable",
+                None,
+            )
+        return rows, "ok", dense_strategy, scope_passages
+
+    def search(
+        self,
+        query: str,
+        *,
+        lexical_query: str,
+        since: str | None,
+        until: str | None,
+        limit: int,
+        include_arms: bool = False,
+        deadline_at: float | None = None,
+    ) -> dict[str, Any]:
+        """Run independent hint arms concurrently and retain partial success."""
+
+        started_at = time.monotonic()
+        if deadline_at is None:
+            deadline_at = started_at + self.store.search_deadline_ms / 1000
+        candidate_limit = min(400, max(80, limit * 20))
+        actor_ids = list(self.actor_ids) if self.actor_ids is not None else None
+        actor_relations = (
+            list(self.actor_relations)
+            if self.actor_relations is not None
+            else None
+        )
+        common = {
+            "since": since,
+            "until": until,
+            "candidate_limit": candidate_limit,
+            "actor_ids": actor_ids,
+            "actor_relations": actor_relations,
+            "deadline_at": deadline_at,
+        }
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            lexical_future = executor.submit(
+                self._lexical_candidates,
+                lexical_query,
+                **common,
+            )
+            sparse_future = executor.submit(
+                self._sparse_candidates,
+                lexical_query,
+                **common,
+            )
+            dense_future = executor.submit(
+                self._dense_candidates,
+                query,
+                **common,
+            )
+            lexical, lexical_status = lexical_future.result()
+            sparse, sparse_status = sparse_future.result()
+            (
+                dense,
+                dense_status,
+                dense_strategy,
+                dense_scope_passages,
+            ) = dense_future.result()
         legs = (
             ("dense", 0.55, dense),
             ("passage-lexical", 0.30, lexical),
@@ -666,6 +779,8 @@ class PassageHintRetrieval:
                 "passage_lexical_candidates": len(lexical),
                 "sparse_candidates": len(sparse),
                 "dense_status": dense_status,
+                "dense_strategy": dense_strategy,
+                "dense_scope_passages": dense_scope_passages,
                 "passage_lexical_status": lexical_status,
                 "sparse_status": sparse_status,
                 "elapsed_ms": round(
@@ -678,6 +793,7 @@ class PassageHintRetrieval:
                     lexical_status,
                     sparse_status,
                 },
+                "partial_results_preserved": bool(results),
             },
         }
         if include_arms:
