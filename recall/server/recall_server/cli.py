@@ -259,6 +259,11 @@ def main() -> None:
     brain.add_argument("--tenant", required=True)
     brain.add_argument("--slug", required=True)
     brain.add_argument("--owner-principal", required=True)
+    bind_employee = sub.add_parser("employee-source-bind")
+    bind_employee.add_argument("--tenant", required=True)
+    bind_employee.add_argument("--employee-key", required=True)
+    bind_employee.add_argument("--display-name", required=True)
+    bind_employee.add_argument("--source", action="append", required=True)
     create_mcp_token = sub.add_parser("mcp-token-create")
     create_mcp_token.add_argument("name")
     create_mcp_token.add_argument("--tenant", required=True)
@@ -784,6 +789,18 @@ def main() -> None:
                     brain_kind=args.kind,
                     slug=args.slug,
                     owner_principal_id=args.owner_principal,
+                ),
+                sort_keys=True,
+            )
+        )
+    elif args.command == "employee-source-bind":
+        print(
+            json.dumps(
+                store.bind_coding_sources_to_employee(
+                    tenant_id=args.tenant,
+                    employee_key=args.employee_key,
+                    display_name=args.display_name,
+                    source_ids=args.source,
                 ),
                 sort_keys=True,
             )
