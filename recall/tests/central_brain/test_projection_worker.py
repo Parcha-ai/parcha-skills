@@ -11,23 +11,26 @@ class _Logical:
         calls: list[str],
         *,
         work: int = 2,
+        pending: int = 0,
         pruned: int = 0,
         cleanup_failures: int = 0,
     ):
         self.calls = calls
         self.work = work
+        self.pending = pending
         self.pruned = pruned
         self.cleanup_failures = cleanup_failures
 
     def project_pending(self, **_kwargs):
         self.calls.append("logical")
         return {
-            "status": "complete",
+            "status": "complete" if self.pending == 0 else "pending",
             "documents": self.work,
             "records": self.work * 3,
             "batches": 1,
             "cleanup_failures": self.cleanup_failures,
             "pruned": self.pruned,
+            "pending": self.pending,
         }
 
 
@@ -76,7 +79,7 @@ class _Scan:
 
 
 class ProjectionWorkerTest(unittest.TestCase):
-    def test_services_downstream_before_expensive_upstream_work(self):
+    def test_services_downstream_then_coalesces_scan_after_upstream_work(self):
         calls: list[str] = []
         result = run_projection_worker(
             _Logical(calls),  # type: ignore[arg-type]
@@ -92,12 +95,33 @@ class ProjectionWorkerTest(unittest.TestCase):
             interval_seconds=5,
             once=True,
         )
-        self.assertEqual(calls, ["embeddings", "passages", "scan", "logical"])
+        self.assertEqual(calls, ["embeddings", "passages", "logical", "scan"])
         self.assertEqual(result["status"], "pending")
         self.assertEqual(result["documents"], 2)
         self.assertEqual(result["passages"], 8)
         self.assertEqual(result["embedded"], 8)
         self.assertEqual(result["parquet_shards"], 1)
+
+    def test_defers_scan_until_logical_backfill_is_drained(self):
+        calls: list[str] = []
+        result = run_projection_worker(
+            _Logical(calls, work=100, pending=8_547),  # type: ignore[arg-type]
+            _Passages(calls, work=0),  # type: ignore[arg-type]
+            _Scan(calls, work=4),  # type: ignore[arg-type]
+            tenant_id="tenant:company:test",
+            logical_batch_size=100,
+            passage_batch_size=100,
+            embedding_batch_size=500,
+            max_batches_per_cycle=1,
+            upload_concurrency=2,
+            passage_concurrency=2,
+            interval_seconds=5,
+            once=True,
+        )
+        self.assertEqual(calls, ["embeddings", "passages", "logical"])
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(result["logical_pending"], 8_547)
+        self.assertEqual(result["parquet_shards"], 0)
 
     def test_stale_scan_keeps_the_worker_pending_for_retry(self):
         calls: list[str] = []
