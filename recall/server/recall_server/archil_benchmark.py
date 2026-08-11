@@ -37,12 +37,12 @@ class Cohort:
 def _cohorts(store: BrainStore, tenant_id: str) -> tuple[Cohort, ...]:
     with store.connect() as connection:
         rows = connection.execute(
-            """SELECT source_id,bucket_start,dataset,object_key,
+            """SELECT source_id,bucket_start,dataset,shard_index,object_key,
                       content_sha256,row_count,size_bytes,
                       first_occurred_at,last_occurred_at
                  FROM canonical_parquet_scan_shards
                 WHERE tenant_id=%s
-                ORDER BY source_id,bucket_start,dataset""",
+                ORDER BY source_id,bucket_start,dataset,shard_index""",
             (tenant_id,),
         ).fetchall()
     grouped: dict[tuple[str, date], list[dict[str, Any]]] = defaultdict(list)
@@ -56,10 +56,11 @@ def _cohorts(store: BrainStore, tenant_id: str) -> tuple[Cohort, ...]:
             "records",
         }:
             continue
-        records = next(row for row in shards if row["dataset"] == "records")
+        records = [row for row in shards if row["dataset"] == "records"]
         aliases = {
             row["object_key"]: (
-                f"s1/{bucket_start.isoformat()[:7]}/{row['dataset']}.parquet"
+                f"s1/{bucket_start.isoformat()[:7]}/{row['dataset']}"
+                f"-part-{int(row['shard_index']):05d}.parquet"
             )
             for row in shards
         }
@@ -73,17 +74,17 @@ def _cohorts(store: BrainStore, tenant_id: str) -> tuple[Cohort, ...]:
                 for row in shards
             ),
             aliases=aliases,
-            rows=int(records["row_count"]),
+            rows=sum(int(row["row_count"]) for row in records),
             bytes=sum(int(row["size_bytes"]) for row in shards),
-            first_occurred_at=records["first_occurred_at"],
-            last_occurred_at=records["last_occurred_at"],
+            first_occurred_at=min(row["first_occurred_at"] for row in records),
+            last_occurred_at=max(row["last_occurred_at"] for row in records),
         ))
     return tuple(cohorts)
 
 
 def _program(variant: str, cohort: Cohort) -> str:
-    records = "/datasets/*/*/records.parquet"
-    actors = "/datasets/*/*/actors.parquet"
+    records = "/datasets/*/*/records-part-*.parquet"
+    actors = "/datasets/*/*/actors-part-*.parquet"
     if variant == "stage_only":
         return "true"
     if variant == "duckdb_start":

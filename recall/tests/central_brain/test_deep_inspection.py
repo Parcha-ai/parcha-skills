@@ -967,11 +967,11 @@ class DeepInspectionContractTests(unittest.TestCase):
             tenant_id=TENANT,
             program=(
                 "duckdb -json -c \"select count(*) from "
-                "read_parquet('/datasets/s1/2026-08/records.parquet')\""
+                "read_parquet('/datasets/s1/2026-08/records-part-*.parquet')\""
             ),
             objects=(data,),
             dataset_aliases={
-                data.object_key: "s1/2026-08/records.parquet"
+                data.object_key: "s1/2026-08/records-part-00000.parquet"
             },
             timeout_seconds=120,
         )

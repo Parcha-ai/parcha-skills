@@ -1307,7 +1307,7 @@ class BoundCanonicalRetrieval:
         values = (self.tenant_id, sources, since, since, until, until)
         with self.store.connect() as connection:
             rows = connection.execute(
-                """SELECT source_id,bucket_start,dataset,
+                """SELECT source_id,bucket_start,dataset,shard_index,
                           object_key,content_sha256
                      FROM canonical_parquet_scan_shards
                     WHERE tenant_id=%s AND source_id=ANY(%s)
@@ -1319,7 +1319,7 @@ class BoundCanonicalRetrieval:
                           %s::timestamptz IS NULL OR bucket_start <=
                           date_trunc('month',%s::timestamptz)::date
                       )
-                    ORDER BY source_id,bucket_start,dataset""",
+                    ORDER BY source_id,bucket_start,dataset,shard_index""",
                 values,
             ).fetchall()
             pending = connection.execute(
@@ -1514,7 +1514,7 @@ class BoundCanonicalRetrieval:
             row["object_key"]: (
                 f"{source_aliases[row['source_id']]}/"
                 f"{row['bucket_start'].isoformat()[:7]}/"
-                f"{row['dataset']}.parquet"
+                f"{row['dataset']}-part-{int(row['shard_index']):05d}.parquet"
             )
             for row in rows
         }

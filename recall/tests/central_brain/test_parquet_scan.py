@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from datetime import date, datetime, timezone
 
@@ -14,6 +15,7 @@ from recall_server.parquet_scan import (
     ScanUpload,
     _month,
     _parquet_bytes,
+    _parquet_parts,
     _schemas,
 )
 
@@ -114,7 +116,7 @@ class _BuildProbe(CanonicalParquetScanProjector):
         return ScanUpload(
             generation,
             {},
-            {name: len(values) for name, values in rows.items()},
+            {(name, 0): len(values) for name, values in rows.items()},
             first,
             last,
             True,
@@ -156,6 +158,30 @@ class ParquetScanContractTest(unittest.TestCase):
         payload = _parquet_bytes([row], _schemas()["records"])
         result = pq.read_table(pa.BufferReader(payload)).to_pylist()
         self.assertEqual(result, [row])
+
+    def test_multipart_parquet_is_bounded_ordered_and_lossless(self):
+        schema = pa.schema([("ordinal", pa.int64()), ("value", pa.binary())])
+        rows = [
+            {"ordinal": ordinal, "value": os.urandom(4_000)}
+            for ordinal in range(12)
+        ]
+        parts = _parquet_parts(rows, schema, maximum_bytes=35_000)
+        self.assertGreater(len(parts), 1)
+        self.assertTrue(all(len(payload) <= 35_000 for payload, _ in parts))
+        self.assertEqual(sum(row_count for _, row_count in parts), len(rows))
+        restored = []
+        for payload, _ in parts:
+            restored.extend(pq.read_table(pa.BufferReader(payload)).to_pylist())
+        self.assertEqual(restored, rows)
+
+    def test_one_unshardable_record_fails_content_free(self):
+        schema = pa.schema([("value", pa.binary())])
+        with self.assertRaisesRegex(ParquetScanError, "record_too_large"):
+            _parquet_parts(
+                [{"value": os.urandom(20_000)}],
+                schema,
+                maximum_bytes=5_000,
+            )
 
     def test_record_attribution_never_falls_back_to_all_document_actors(self):
         record = {
