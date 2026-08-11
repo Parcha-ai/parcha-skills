@@ -22,6 +22,12 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+if __package__:
+    from .codex_identity import resolve_codex_session_identity, stable_codex_record_key
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from codex_identity import resolve_codex_session_identity, stable_codex_record_key
+
 SCHEMA_VERSION = "4"
 PARSER_VERSION = 1
 MAX_TOOL_INPUT = 2048
@@ -1596,6 +1602,11 @@ def export_root_for(path: Path, harness: str) -> Path:
 
 
 def session_file_key(path: Path, root: Path, harness: str) -> str:
+    if harness == "codex":
+        identity = resolve_codex_session_identity(path)
+        if identity.native_session_id is None:
+            raise ValueError("Codex session identity is unavailable")
+        return stable_codex_record_key(identity.native_session_id)
     relative = str(path.resolve().relative_to(root.resolve()))
     return hashlib.sha256((harness + "\x1f" + relative).encode()).hexdigest()[:24]
 

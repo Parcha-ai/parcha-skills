@@ -4,12 +4,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
-from collector.codex_identity import resolve_codex_session_identity
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from skills.recall.scripts.codex_identity import resolve_codex_session_identity
 
 
 def _digest(path: Path) -> str:

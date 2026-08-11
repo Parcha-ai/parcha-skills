@@ -4,11 +4,14 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import sys
 import tempfile
 import time
 from pathlib import Path
 
-from collector.codex_identity import resolve_codex_session_identity
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from skills.recall.scripts.codex_identity import resolve_codex_session_identity
 from collector.collector import Collector
 
 
@@ -39,7 +42,12 @@ def _rollout(path: Path) -> None:
     )
 
 
-def _collector(root: Path, spool: Path) -> Collector:
+def _collector(
+    root: Path,
+    spool: Path,
+    *,
+    archive_root: Path | None = None,
+) -> Collector:
     return Collector(
         root=root,
         harness="codex",
@@ -49,6 +57,7 @@ def _collector(root: Path, spool: Path) -> Collector:
         token="unused",
         max_scan_records=10_000,
         max_scan_seconds=60,
+        archive_root=archive_root,
     )
 
 
@@ -81,12 +90,33 @@ def measure() -> dict:
         archive_envelopes = archive_collector.pending_envelopes()
         archive_parent = archive_envelopes[0]["native_parent_id"]
         archive_ids = [item["native_id"] for item in archive_envelopes]
+        archive_collector.close()
+
+        multi_active = root / "multi" / "sessions"
+        multi_archived = root / "multi" / "archived_sessions"
+        multi_active_path = multi_active / "2026" / "08" / "10" / filename
+        multi_archived_path = multi_archived / filename
+        _rollout(multi_active_path)
+        multi_archived.mkdir(parents=True)
+        multi = _collector(
+            multi_active,
+            root / "multi.db",
+            archive_root=multi_archived,
+        )
+        multi.scan()
+        multi_before = multi.pending_envelopes()
+        multi_parent = multi_before[0]["native_parent_id"]
+        multi_ids = [item["native_id"] for item in multi_before]
+        multi_archived_path.parent.mkdir(parents=True, exist_ok=True)
+        multi_active_path.replace(multi_archived_path)
+        multi_move = multi.scan()
+        multi_after = multi.pending_envelopes()
         no_op_samples = []
         for _ in range(20):
             started = time.perf_counter()
-            archive_collector.scan()
+            multi.scan()
             no_op_samples.append((time.perf_counter() - started) * 1000)
-        archive_collector.close()
+        multi.close()
 
         return {
             "contract": "recall.codex-archive-baseline.v1",
@@ -98,9 +128,16 @@ def measure() -> dict:
                 len(archive_discovered) / 1
             ),
             "current_single_root_archive_coverage": 0.0,
-            "move_tombstones": moved["tombstones_queued"],
-            "move_parent_identity_invariant": active_parent == archive_parent,
-            "move_record_identity_invariant": active_ids == archive_ids,
+            "single_root_move_tombstones": moved["tombstones_queued"],
+            "single_root_parent_identity_invariant": active_parent == archive_parent,
+            "single_root_record_identity_invariant": active_ids == archive_ids,
+            "move_tombstones": multi_move["tombstones_queued"],
+            "move_parent_identity_invariant": (
+                multi_parent == multi_after[0]["native_parent_id"]
+            ),
+            "move_record_identity_invariant": (
+                multi_ids == [item["native_id"] for item in multi_after]
+            ),
             "initial_records_queued": initial["records_queued"],
             "archive_records_queued_fresh_spool": archive_scan["records_queued"],
             "noop_scan_ms": {

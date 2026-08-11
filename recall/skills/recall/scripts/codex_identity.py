@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -28,12 +29,6 @@ class CodexSessionIdentity:
     native_session_id: str | None
     basis: str | None
 
-    @property
-    def stable_parent_id(self) -> str | None:
-        if self.native_session_id is None:
-            return None
-        return "codex-session-" + self.native_session_id
-
 
 def _safe_native_id(value: object) -> str | None:
     if not isinstance(value, str):
@@ -48,11 +43,35 @@ def _safe_native_id(value: object) -> str | None:
     return candidate.casefold()
 
 
-def _filename_uuid(path: Path) -> str | None:
+def codex_session_id_from_filename(path: Path) -> str | None:
+    """Return the final rollout filename UUID without reading the file."""
+
     matches = UUID.findall(path.stem)
     if not matches:
         return None
     return matches[-1].casefold()
+
+
+def codex_session_id_from_record(record: object) -> str | None:
+    """Return a safe native ID only for a Codex session metadata record."""
+
+    if not isinstance(record, dict) or record.get("type") != "session_meta":
+        return None
+    payload = record.get("payload")
+    if not isinstance(payload, dict) or "id" not in payload:
+        return None
+    return _safe_native_id(payload.get("id"))
+
+
+def stable_codex_record_key(session_id: str) -> str:
+    """Return the path-independent key used by every Codex export surface."""
+
+    safe_session_id = _safe_native_id(session_id)
+    if safe_session_id is None:
+        raise ValueError("unsafe Codex session identity")
+    return hashlib.sha256(
+        ("codex-session\x1f" + safe_session_id).encode()
+    ).hexdigest()[:24]
 
 
 def resolve_codex_session_identity(
@@ -73,7 +92,7 @@ def resolve_codex_session_identity(
 
     if max_bytes < 1 or max_records < 1:
         raise ValueError("identity bounds must be positive")
-    filename_id = _filename_uuid(path)
+    filename_id = codex_session_id_from_filename(path)
     metadata_ids: list[str] = []
     unsafe_metadata = False
     consumed = 0
@@ -95,12 +114,11 @@ def resolve_codex_session_identity(
             payload = record.get("payload")
             if not isinstance(payload, dict) or "id" not in payload:
                 continue
-            native_id = _safe_native_id(payload.get("id"))
+            native_id = codex_session_id_from_record(record)
             if native_id is None:
                 unsafe_metadata = True
-            else:
-                if native_id not in metadata_ids:
-                    metadata_ids.append(native_id)
+            elif native_id not in metadata_ids:
+                metadata_ids.append(native_id)
 
     if unsafe_metadata:
         return CodexSessionIdentity("unsafe_metadata", None, None)
