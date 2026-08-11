@@ -104,6 +104,38 @@ class _SeedStore:
         return self.connection
 
 
+class _LeaseResult:
+    def __init__(self, acquired: bool):
+        self.acquired = acquired
+
+    def fetchone(self):
+        return {"acquired": self.acquired}
+
+
+class _LeaseConnection:
+    def __init__(self, acquired: bool):
+        self.acquired = acquired
+        self.calls = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return None
+
+    def execute(self, query, parameters):
+        self.calls.append((query, parameters))
+        return _LeaseResult(self.acquired)
+
+
+class _LeaseStore:
+    def __init__(self, acquired: bool):
+        self.connection = _LeaseConnection(acquired)
+
+    def connect(self):
+        return self.connection
+
+
 def _part() -> dict:
     return {
         "tenant_id": "tenant:test",
@@ -184,6 +216,27 @@ class ParquetScanContractTest(unittest.TestCase):
         self.assertEqual(_month("2026-08-01"), date(2026, 8, 1))
         with self.assertRaisesRegex(ParquetScanError, "bucket_invalid"):
             _month("2026-08-02")
+
+    def test_candidate_lease_skips_contention_and_unlocks_ownership(self):
+        contended = _LeaseStore(False)
+        with CanonicalParquetScanProjector(
+            contended, _Evidence(None)
+        )._candidate_lease(_candidate()) as acquired:
+            self.assertFalse(acquired)
+        self.assertEqual(len(contended.connection.calls), 1)
+        self.assertIn("pg_try_advisory_lock", contended.connection.calls[0][0])
+
+        owned = _LeaseStore(True)
+        with CanonicalParquetScanProjector(
+            owned, _Evidence(None)
+        )._candidate_lease(_candidate()) as acquired:
+            self.assertTrue(acquired)
+        self.assertEqual(len(owned.connection.calls), 2)
+        self.assertIn("pg_advisory_unlock", owned.connection.calls[1][0])
+        self.assertEqual(
+            owned.connection.calls[0][1],
+            owned.connection.calls[1][1],
+        )
 
     def test_typed_parquet_round_trip_preserves_large_record_json(self):
         row = {
