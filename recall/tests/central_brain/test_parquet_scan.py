@@ -189,7 +189,7 @@ class ParquetScanContractTest(unittest.TestCase):
             restored.extend(pq.read_table(pa.BufferReader(payload)).to_pylist())
         self.assertEqual(restored, rows)
 
-    def test_multipart_builds_one_arrow_table_and_encodes_each_slice_once(self):
+    def test_multipart_encodes_each_bounded_arrow_slice_once(self):
         schema = pa.schema([("ordinal", pa.int64()), ("value", pa.binary())])
         rows = [
             {"ordinal": ordinal, "value": os.urandom(4_000)}
