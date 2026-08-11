@@ -61,6 +61,7 @@ jobs:
             e2e_semantic_l2.py \
             e2e_capture_mcp.py \
             e2e_codex_projection.py \
+            e2e_codex_archive_restore.py \
             e2e_connector_host.py \
             e2e_integration_activation.py \
             e2e_connector_registry.py \
