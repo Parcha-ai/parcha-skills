@@ -5,9 +5,10 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Iterator
 
 import orjson
 import pyarrow as pa
@@ -448,6 +449,34 @@ class CanonicalParquetScanProjector:
             )
             for row in rows
         ]
+
+    @contextmanager
+    def _candidate_lease(self, candidate: ScanCandidate) -> Iterator[bool]:
+        """Hold a database-session lease while one source-month is built."""
+
+        identity = (
+            "parquet-scan-build\x1f"
+            + candidate.tenant_id
+            + "\x1f"
+            + candidate.source_id
+            + "\x1f"
+            + candidate.bucket_start.isoformat()
+        )
+        with self.store.connect() as connection:
+            acquired = connection.execute(
+                "SELECT pg_try_advisory_lock(hashtextextended(%s,0)) AS acquired",
+                (identity,),
+            ).fetchone()["acquired"]
+            if acquired is not True:
+                yield False
+                return
+            try:
+                yield True
+            finally:
+                connection.execute(
+                    "SELECT pg_advisory_unlock(hashtextextended(%s,0))",
+                    (identity,),
+                )
 
     def _documents(self, candidate: ScanCandidate) -> list[dict[str, Any]]:
         bucket_end = _next_month(candidate.bucket_start)
@@ -1092,21 +1121,25 @@ class CanonicalParquetScanProjector:
     ) -> dict[str, int | str]:
         if not 1 <= batch_size <= 32 or not 1 <= max_batches <= 100:
             raise ParquetScanError("parquet_scan_budget_invalid")
-        committed = stale = rows = 0
+        committed = stale = rows = contended = 0
         for _ in range(max_batches):
             candidates = self._pending(tenant_id=tenant_id, limit=batch_size)
             if not candidates:
                 break
             for candidate in candidates:
-                upload = self._build(candidate)
-                status = self._commit(candidate, upload)
-                if status == "committed":
-                    committed += 1
-                    rows += sum(upload.row_counts.values())
-                else:
-                    stale += 1
-                    if upload.created:
-                        self._schedule_cleanup(upload.references.values())
+                with self._candidate_lease(candidate) as acquired:
+                    if not acquired:
+                        contended += 1
+                        continue
+                    upload = self._build(candidate)
+                    status = self._commit(candidate, upload)
+                    if status == "committed":
+                        committed += 1
+                        rows += sum(upload.row_counts.values())
+                    else:
+                        stale += 1
+                        if upload.created:
+                            self._schedule_cleanup(upload.references.values())
             if len(candidates) < batch_size:
                 break
         return {
@@ -1114,4 +1147,5 @@ class CanonicalParquetScanProjector:
             "shards": committed,
             "rows": rows,
             "stale": stale,
+            "contended": contended,
         }
