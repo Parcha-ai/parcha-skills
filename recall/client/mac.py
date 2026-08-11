@@ -40,7 +40,10 @@ V2_IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._/@+-]{1,255}\Z")
 MAX_INGEST_BYTES = 8_000_000
 MAX_INGEST_EVENTS = 500
 MAX_CANONICAL_INGEST_EVENTS = 1_000
-MAX_CANONICAL_ARCHIVE_BYTES = 8_000_000
+# Base64 plus the largest valid identity envelope stays below the server's
+# 12 MiB HTTP boundary. This covers incompressible oversized transcript rows
+# without weakening the request bound.
+MAX_CANONICAL_ARCHIVE_BYTES = 9_000_000
 MAX_CANONICAL_ARCHIVE_ATTEMPTS = 5
 MAX_EXPORT_BYTES = 256_000_000
 MAX_ARCHIVE_MEMBERS = 10_000
