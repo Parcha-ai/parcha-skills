@@ -4,6 +4,7 @@ import json
 import os
 import unittest
 from datetime import date, datetime, timezone
+from unittest import mock
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -187,6 +188,35 @@ class ParquetScanContractTest(unittest.TestCase):
         for payload, _ in parts:
             restored.extend(pq.read_table(pa.BufferReader(payload)).to_pylist())
         self.assertEqual(restored, rows)
+
+    def test_multipart_builds_one_arrow_table_and_encodes_each_slice_once(self):
+        schema = pa.schema([("ordinal", pa.int64()), ("value", pa.binary())])
+        rows = [
+            {"ordinal": ordinal, "value": os.urandom(4_000)}
+            for ordinal in range(12)
+        ]
+        encoded_rows = []
+
+        def encode(table):
+            encoded_rows.append(table.num_rows)
+            sink = pa.BufferOutputStream()
+            pq.write_table(
+                table,
+                sink,
+                compression="zstd",
+                use_dictionary=False,
+            )
+            return sink.getvalue().to_pybytes()
+
+        with mock.patch(
+            "recall_server.parquet_scan._parquet_table_bytes",
+            side_effect=encode,
+        ):
+            parts = _parquet_parts(rows, schema, maximum_bytes=45_000)
+
+        self.assertEqual(sum(encoded_rows), len(rows))
+        self.assertLess(max(encoded_rows), len(rows))
+        self.assertEqual(sum(row_count for _, row_count in parts), len(rows))
 
     def test_one_unshardable_record_fails_content_free(self):
         schema = pa.schema([("value", pa.binary())])

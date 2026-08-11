@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -19,6 +20,7 @@ SCAN_SCHEMA_VERSION = 1
 SCAN_DATASETS = ("documents", "records", "actors")
 MAX_SCAN_RECORDS = 5_000_000
 MAX_PARQUET_OBJECT_BYTES = 48 * 1024 * 1024
+PARQUET_RAW_SLICE_BYTES = 32 * 1024 * 1024
 PART_TIME_BOUND_CHECKPOINT = 128
 
 LOG = logging.getLogger(__name__)
@@ -87,8 +89,7 @@ def _reference(row: dict[str, Any], prefix: str = "") -> dict[str, Any]:
     }
 
 
-def _parquet_bytes(rows: list[dict[str, Any]], schema: Any) -> bytes:
-    table = pa.Table.from_pylist(rows, schema=schema)
+def _parquet_table_bytes(table: Any) -> bytes:
     sink = pa.BufferOutputStream()
     pq.write_table(
         table,
@@ -103,6 +104,10 @@ def _parquet_bytes(rows: list[dict[str, Any]], schema: Any) -> bytes:
     return sink.getvalue().to_pybytes()
 
 
+def _parquet_bytes(rows: list[dict[str, Any]], schema: Any) -> bytes:
+    return _parquet_table_bytes(pa.Table.from_pylist(rows, schema=schema))
+
+
 def _parquet_parts(
     rows: list[dict[str, Any]],
     schema: Any,
@@ -113,11 +118,37 @@ def _parquet_parts(
 
     if not 1 <= maximum_bytes <= MAX_PARQUET_OBJECT_BYTES:
         raise ParquetScanError("parquet_scan_budget_invalid")
-    pending = [(0, len(rows))]
+    started = time.perf_counter()
+    table = pa.Table.from_pylist(rows, schema=schema)
+    arrow_ms = round((time.perf_counter() - started) * 1_000)
+    if not rows:
+        payload = _parquet_table_bytes(table)
+        if len(payload) > maximum_bytes:
+            raise ParquetScanError("parquet_scan_record_too_large")
+        LOG.info(
+            "parquet encode rows=0 arrow_bytes=%s parts=1 arrow_ms=%s "
+            "encode_ms=%s",
+            table.nbytes,
+            arrow_ms,
+            round((time.perf_counter() - started) * 1_000) - arrow_ms,
+        )
+        return [(payload, 0)]
+    raw_slice_bytes = min(PARQUET_RAW_SLICE_BYTES, maximum_bytes * 2 // 3)
+    rows_per_slice = max(
+        1,
+        min(
+            len(rows),
+            int(len(rows) * raw_slice_bytes / max(1, table.nbytes)),
+        ),
+    )
+    pending = [
+        (start, min(len(rows), start + rows_per_slice))
+        for start in range(0, len(rows), rows_per_slice)
+    ]
     parts: list[tuple[int, bytes, int]] = []
     while pending:
         start, end = pending.pop()
-        payload = _parquet_bytes(rows[start:end], schema)
+        payload = _parquet_table_bytes(table.slice(start, end - start))
         if len(payload) <= maximum_bytes:
             parts.append((start, payload, end - start))
             continue
@@ -125,10 +156,20 @@ def _parquet_parts(
             raise ParquetScanError("parquet_scan_record_too_large")
         middle = start + (end - start) // 2
         pending.extend(((middle, end), (start, middle)))
-    return [
+    result = [
         (payload, row_count)
         for _, payload, row_count in sorted(parts, key=lambda value: value[0])
     ]
+    LOG.info(
+        "parquet encode rows=%s arrow_bytes=%s parts=%s arrow_ms=%s "
+        "encode_ms=%s",
+        len(rows),
+        table.nbytes,
+        len(result),
+        arrow_ms,
+        round((time.perf_counter() - started) * 1_000) - arrow_ms,
+    )
+    return result
 
 
 def _schemas() -> dict[str, Any]:
@@ -636,7 +677,9 @@ class CanonicalParquetScanProjector:
         )
 
     def _build(self, candidate: ScanCandidate) -> ScanUpload:
+        started = time.perf_counter()
         documents = self._documents(candidate)
+        metadata_ms = round((time.perf_counter() - started) * 1_000)
         bucket_start = datetime.combine(
             candidate.bucket_start,
             datetime.min.time(),
@@ -725,8 +768,17 @@ class CanonicalParquetScanProjector:
                 else max(last, projected.last_occurred_at)
             )
         self._persist_part_bounds(discovered_bounds)
+        projected_at = time.perf_counter()
         generation = digest.hexdigest()
         if not rows["documents"]:
+            LOG.info(
+                "parquet build documents=%s records=0 metadata_ms=%s "
+                "project_ms=%s publish_ms=0 total_ms=%s",
+                len(documents),
+                metadata_ms,
+                round((projected_at - started) * 1_000) - metadata_ms,
+                round((projected_at - started) * 1_000),
+            )
             return ScanUpload(generation, {}, {}, None, None, False)
         rows["actors"] = sorted(
             {
@@ -749,10 +801,21 @@ class CanonicalParquetScanProjector:
         )
         current = self._current_upload(candidate, generation)
         if current is not None:
+            finished = time.perf_counter()
+            LOG.info(
+                "parquet build documents=%s records=%s metadata_ms=%s "
+                "project_ms=%s publish_ms=0 total_ms=%s reused=true",
+                len(rows["documents"]),
+                len(rows["records"]),
+                metadata_ms,
+                round((projected_at - started) * 1_000) - metadata_ms,
+                round((finished - started) * 1_000),
+            )
             return current
         if first is None or last is None:
             raise ParquetScanError("parquet_scan_state_invalid")
-        return self._upload(
+        publish_started = time.perf_counter()
+        upload = self._upload(
             candidate,
             generation=generation,
             rows=rows,
@@ -760,6 +823,18 @@ class CanonicalParquetScanProjector:
             last=last,
             created_at=bucket_start,
         )
+        finished = time.perf_counter()
+        LOG.info(
+            "parquet build documents=%s records=%s metadata_ms=%s "
+            "project_ms=%s publish_ms=%s total_ms=%s reused=false",
+            len(rows["documents"]),
+            len(rows["records"]),
+            metadata_ms,
+            round((projected_at - started) * 1_000) - metadata_ms,
+            round((finished - publish_started) * 1_000),
+            round((finished - started) * 1_000),
+        )
+        return upload
 
     @staticmethod
     def _enqueue_cleanup(connection: Any, references: Iterable[dict[str, Any]]) -> None:
