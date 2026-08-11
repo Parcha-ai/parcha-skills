@@ -628,7 +628,7 @@ class BrainStore:
                )
                SELECT event.tenant_id,event.source_id,
                       coalesce(event.native_parent_id,event.native_id),
-                      1,'actor-binding',clock_timestamp()
+                      1,'backfill',clock_timestamp()
                  FROM canonical_events event
                  JOIN canonical_documents document
                    ON document.tenant_id=event.tenant_id
@@ -643,7 +643,7 @@ class BrainStore:
                ON CONFLICT(tenant_id,source_id,native_parent_id)
                DO UPDATE SET
                    generation=canonical_evidence_document_queue.generation+1,
-                   reason='actor-binding',changed_at=clock_timestamp()""",
+                   reason='backfill',changed_at=clock_timestamp()""",
             (tenant_id, source_ids),
         )
         return max(0, result.rowcount)
