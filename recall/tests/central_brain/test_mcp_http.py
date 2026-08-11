@@ -98,6 +98,21 @@ class FakeStore:
             "diagnostics": {"engine": "canonical-scope-v1"},
         }
 
+    def list_people(self):
+        self.calls.append(("people",))
+        return {
+            "people": [{
+                "actor_id": "actor_0123456789abcdef0123456789abcdef",
+                "display_name": "Synthetic Employee",
+                "sources": [{
+                    "source_id": "source:synthetic:company",
+                    "relation": "owner",
+                }],
+            }],
+            "complete": True,
+            "diagnostics": {"engine": "canonical-people-v1"},
+        }
+
     def execute_agent_program_parallel(self, program, **arguments):
         self.calls.append(("exec_map", program, arguments))
         return {
@@ -450,6 +465,7 @@ class RemoteMcpContractTest(unittest.TestCase):
                 }
                 self.assertEqual(names, {
                     "recall_search",
+                    "recall_people",
                     "recall_scope",
                     "recall_exec",
                     "recall_exec_map",
@@ -458,6 +474,23 @@ class RemoteMcpContractTest(unittest.TestCase):
                     "recall_show",
                     "recall_related",
                 })
+
+                status, _, raw = server.request(
+                    "POST",
+                    request("tools/call", params={
+                        "name": "recall_people",
+                        "arguments": {},
+                    }),
+                    token="synthetic-human-read",
+                    protocol="2025-11-25",
+                )
+                self.assertEqual(status, 200)
+                people = json.loads(raw)["result"]["structuredContent"]
+                self.assertEqual(
+                    people["people"][0]["display_name"],
+                    "Synthetic Employee",
+                )
+                self.assertNotIn("email", json.dumps(people).casefold())
 
                 status, _, raw = server.request(
                     "POST",
