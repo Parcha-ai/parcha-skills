@@ -104,6 +104,7 @@ class Collector:
                  max_scan_seconds: float = DEFAULT_MAX_SCAN_SECONDS,
                  bulk_manifest_archive: bool = False,
                  bulk_bundle_records: int = 500,
+                 defer_scan_flush: bool = False,
                  archive_root: Path | None = None):
         if harness not in {"claude", "codex"}:
             raise ValueError("harness must be claude or codex")
@@ -130,6 +131,8 @@ class Collector:
             raise ValueError("max_scan_seconds must be between 0.1 and 300")
         if type(bulk_manifest_archive) is not bool:
             raise ValueError("bulk_manifest_archive must be a boolean")
+        if type(defer_scan_flush) is not bool:
+            raise ValueError("defer_scan_flush must be a boolean")
         if bulk_manifest_archive and archive is None:
             raise ValueError("bulk manifest archive requires canonical runtime")
         if (
@@ -173,6 +176,7 @@ class Collector:
         self.max_scan_seconds = float(max_scan_seconds)
         self.bulk_manifest_archive = bulk_manifest_archive
         self.bulk_bundle_records = bulk_bundle_records
+        self.defer_scan_flush = defer_scan_flush
         self._codex_path_keys: dict[str, str] = {}
         self.shard_count = 1
         self.shard_index = 0
@@ -956,7 +960,7 @@ class Collector:
         records_seen = 0
         bounded = False
         privacy_receipts = []
-        if self.brain_writer is not None:
+        if self.brain_writer is not None and not self.defer_scan_flush:
             self.flush()
         executor = (
             ThreadPoolExecutor(max_workers=self.archive_workers)
@@ -978,7 +982,11 @@ class Collector:
                 ):
                     bounded = True
                     break
-                if summary["files_seen"] and self.brain_writer is not None:
+                if (
+                    summary["files_seen"]
+                    and self.brain_writer is not None
+                    and not self.defer_scan_flush
+                ):
                     self.flush()
                 summary["files_seen"] += 1
                 stat = path.stat()
@@ -1187,7 +1195,10 @@ class Collector:
                                     commit_pending()
                             self._save_file_progress(path_text, stat, current_fingerprint, complete_end, "scanning-" + mode, file_scan_id)
                             self.db.commit()
-                            if self.brain_writer is not None:
+                            if (
+                                self.brain_writer is not None
+                                and not self.defer_scan_flush
+                            ):
                                 self.flush()
                 if self.bulk_manifest_archive:
                     commit_bulk()

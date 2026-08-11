@@ -1212,6 +1212,78 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(collector.flush()["acked"], 1)
         collector.close()
 
+    def test_deferred_scan_keeps_durable_backlog_for_sharded_flush(self) -> None:
+        (self.root / "first.jsonl").write_text(claude_line("first record"))
+        (self.root / "second.jsonl").write_text(claude_line("second record"))
+        ingested: list[dict] = []
+
+        class Archive:
+            def put_raw(inner, **kwargs):
+                digest = hashlib.sha256(kwargs["payload"]).hexdigest()
+                return {
+                    "contract": "recall.artifact-ref.v1",
+                    "schema_version": 1,
+                    "tenant_id": kwargs["tenant_id"],
+                    "source_id": kwargs["source_id"],
+                    "artifact_id": "art_" + digest[:32],
+                    "storage_backend": "s3",
+                    "object_key": "objects/aa/" + digest,
+                    "content_sha256": digest,
+                    "size_bytes": len(kwargs["payload"]),
+                    "media_type": kwargs["media_type"],
+                    "encryption": "sse-s3",
+                    "version_id": "synthetic-version",
+                    "created_at": kwargs["created_at"],
+                }
+
+        class Writer:
+            def ingest(inner, events):
+                ingested.extend(events)
+                return {
+                    "status": "committed",
+                    "inserted": len(events),
+                    "duplicate_events": 0,
+                    "receipts": [
+                        f"recall://{event['source_id']}/{event['native_id']}?rev=1"
+                        for event in events
+                    ],
+                    "replay": False,
+                }
+
+        def deferred() -> Collector:
+            return Collector(
+                root=self.root,
+                harness="claude",
+                source_id="claude:linux:test",
+                spool_path=self.spool,
+                endpoint=self.endpoint,
+                token="test-token-not-a-secret",
+                principal_id="owner",
+                privacy=PrivacyPolicy(mode="scrub"),
+                brain_writer=Writer(),
+                archive=Archive(),
+                tenant_id="tenant:personal",
+                defer_scan_flush=True,
+            )
+
+        collector = deferred()
+        self.assertEqual(collector.scan()["records_queued"], 2)
+        self.assertEqual(collector.doctor()["pending"], 2)
+        self.assertEqual(ingested, [])
+        collector.close()
+
+        resumed = deferred()
+        self.assertEqual(resumed.scan()["records_queued"], 0)
+        acked = 0
+        for shard in range(2):
+            resumed.shard_count = 2
+            resumed.shard_index = shard
+            acked += resumed.flush()["acked"]
+        self.assertEqual(acked, 2)
+        self.assertEqual(len(ingested), 2)
+        self.assertEqual(resumed.doctor()["pending"], 0)
+        resumed.close()
+
     def test_canonical_scan_flushes_durable_backlog_before_new_source_work(self) -> None:
         transcript = self.root / "session.jsonl"
         transcript.write_text(claude_line("durable backlog"))
