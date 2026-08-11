@@ -19,6 +19,7 @@ from client.mac import (
     CanonicalBrainWriter,
     CanonicalClientError,
     ExportImporter,
+    MAX_CANONICAL_ARCHIVE_BYTES,
     MAX_CANONICAL_INGEST_EVENTS,
     MAX_INGEST_BYTES,
     MemoryClient,
@@ -460,6 +461,44 @@ class CanonicalV2ClientTest(unittest.TestCase):
                 created_at="2026-07-20T00:00:00Z",
             )
         opened.assert_not_called()
+
+    def test_archive_payload_ceiling_fits_server_wire_boundary(self) -> None:
+        archive = CanonicalArchiveClient(
+            endpoint="https://brain.example.invalid",
+            token="synthetic",
+            source_id="source:personal",
+            tenant_id="tenant:personal",
+            principal_id="principal:owner",
+        )
+        payload = b"x" * MAX_CANONICAL_ARCHIVE_BYTES
+        with mock.patch(
+            "client.mac.open_no_redirect",
+            return_value=FakeResponse(201, {"status": "synthetic"}),
+        ) as opened:
+            archive.put_raw(
+                tenant_id="tenant:personal",
+                source_id="source:personal",
+                native_id="native:maximum",
+                payload=payload,
+                media_type="application/octet-stream",
+                created_at="2026-08-11T00:00:00Z",
+            )
+        request = opened.call_args.args[0]
+        self.assertLessEqual(len(request.data), 12 * 1024 * 1024)
+
+        with (
+            mock.patch("client.mac.open_no_redirect") as rejected,
+            self.assertRaises(ValueError),
+        ):
+            archive.put_raw(
+                tenant_id="tenant:personal",
+                source_id="source:personal",
+                native_id="native:over-maximum",
+                payload=payload + b"x",
+                media_type="application/octet-stream",
+                created_at="2026-08-11T00:00:00Z",
+            )
+        rejected.assert_not_called()
 
     def test_archive_retries_transient_transport_failure_idempotently(self) -> None:
         payload = b'{"raw":"synthetic-retry"}'
