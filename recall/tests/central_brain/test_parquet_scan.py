@@ -232,6 +232,9 @@ class _BuildProbe(CanonicalParquetScanProjector):
     def _current_upload(self, _candidate, _generation):
         return None
 
+    def _legacy_upload(self, _candidate):
+        return None
+
     def _passages(self, _candidate):
         return self.passages
 
@@ -528,6 +531,52 @@ class ParquetScanContractTest(unittest.TestCase):
         restored = pq.read_table(pa.BufferReader(upload["payload"])).to_pylist()
         self.assertEqual(restored[0]["text"], "exact visible prompt")
         self.assertEqual(restored[0]["receipts"], passage["receipts"])
+
+    def test_passage_upgrade_reuses_immutable_evidence_without_reading_raw_parts(self):
+        archive = _Archive({})
+        passage = {
+            "logical_document_id": "document:test",
+            "revision": 1,
+            "passage_id": "psg_" + "a" * 32,
+            "ordinal": 0,
+            "first_occurred_at": datetime(2026, 8, 5, 12, tzinfo=timezone.utc),
+            "last_occurred_at": datetime(2026, 8, 5, 12, tzinfo=timezone.utc),
+            "token_count": 3,
+            "roles": ["user"],
+            "receipts": ["recall://source:test/doc?rev=1#item=0"],
+            "actor_ids": ["actor:employee"],
+            "actor_names": ["Employee"],
+            "actor_relations": ["contributor"],
+            "text_redacted": "exact visible prompt",
+        }
+        legacy = ScanUpload(
+            "b" * 64,
+            {
+                (dataset, 0): {
+                    **_part(),
+                    "artifact_id": f"artifact:{dataset}",
+                    "object_key": f"objects/{dataset}",
+                    "media_type": "application/vnd.apache.parquet",
+                }
+                for dataset in ("documents", "records", "actors")
+            },
+            {(dataset, 0): 1 for dataset in ("documents", "records", "actors")},
+            datetime(2026, 8, 5, 12, tzinfo=timezone.utc),
+            datetime(2026, 8, 5, 12, tzinfo=timezone.utc),
+            False,
+        )
+        projector = _BuildProbe(_document("Employee"), archive, passages=[passage])
+        with mock.patch.object(projector, "_legacy_upload", return_value=legacy):
+            result = projector._build(_candidate())
+
+        self.assertEqual(archive.reads, 0)
+        self.assertEqual(len(archive.uploads), 1)
+        self.assertIn(":passages:", archive.uploads[0]["native_id"])
+        self.assertEqual(
+            {dataset for dataset, _ in result.references},
+            {"documents", "passages", "records", "actors"},
+        )
+        self.assertEqual(result.references[("records", 0)]["artifact_id"], "artifact:records")
 
     def test_one_unshardable_record_fails_content_free(self):
         schema = pa.schema([("value", pa.binary())])
