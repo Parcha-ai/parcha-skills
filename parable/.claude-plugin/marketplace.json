@@ -11,7 +11,7 @@
     {
       "name": "parable",
       "source": "./",
-      "version": "0.1.29",
+      "version": "0.1.30",
       "description": "Multi-model orchestration or explicit solo execution with one exact model and delegation disabled.",
       "author": {
         "name": "Parcha Labs",

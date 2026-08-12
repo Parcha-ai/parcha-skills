@@ -306,6 +306,26 @@ class TestClaudeLaunch(unittest.TestCase):
         self.assertNotIn(parable.CLAUDE_CONTEXT_ENV, kwargs["env"])
         self.assertNotIn(parable.CLAUDE_AUTO_COMPACT_PCT_ENV, kwargs["env"])
 
+    def test_resume_preflight_uses_parent_window_not_mixed_cast_env(self):
+        calls = []
+
+        def run(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError("a 1M Fable resume must not precompact at the cast ceiling")
+
+        forwarded, note = parable.prepare_claude_resume(
+            ["--continue"],
+            "claude",
+            {parable.CLAUDE_CONTEXT_ENV: "372000"},
+            {"claude-sonnet-5"},
+            run=run,
+            target_ceiling=1_000_000,
+        )
+
+        self.assertEqual(forwarded, ["--continue"])
+        self.assertIsNone(note)
+        self.assertEqual(calls, [])
+
     def test_resume_preflight_compacts_oversized_context_with_sonnet(self):
         calls = []
         reports = []
@@ -782,6 +802,40 @@ class TestClaudeLaunch(unittest.TestCase):
         _argv, env = parable.build_claude_launch(unknown, [], explicit, solo=True)
         self.assertEqual(env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "256000")
         self.assertEqual(env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], "75")
+
+    def test_fable_parent_keeps_1m_window_with_mixed_cast(self):
+        cfg = parable.config_with_claude_brain(self.cfg(), "claude-fable-5")
+        cfg["executors"]["sol_exact"] = {
+            "provider": "claude",
+            "model": "gpt-5.6-sol",
+            "use_for": "Long implementation.",
+        }
+        argv, env = parable.build_claude_launch(
+            cfg,
+            [],
+            {"CLIPROXY_API_KEY": "x"},
+            available={"claude-fable-5", "gpt-5.6-sol", "kimi-k3"},
+        )
+
+        # Claude Code otherwise treats the proxied Fable id as a 200k model.
+        self.assertEqual(argv[1:3], ["--model", "claude-fable-5[1m]"])
+        # MAX_CONTEXT applies to the non-Claude cast without shrinking Fable.
+        self.assertEqual(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "372000")
+        # These controls are process-wide. Setting either from the cast's 372k
+        # ceiling caps the Fable parent and caused compaction around 135k.
+        self.assertNotIn("CLAUDE_CODE_AUTO_COMPACT_WINDOW", env)
+        self.assertNotIn("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", env)
+
+    def test_fable_solo_uses_1m_marker_without_process_wide_compaction_override(self):
+        cfg = parable.config_with_claude_brain(self.cfg(), "claude-fable-5")
+        argv, env = parable.build_claude_launch(
+            cfg, [], {"CLIPROXY_API_KEY": "x"}, solo=True
+        )
+
+        self.assertEqual(argv[1:3], ["--model", "claude-fable-5[1m]"])
+        self.assertNotIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS", env)
+        self.assertNotIn("CLAUDE_CODE_AUTO_COMPACT_WINDOW", env)
+        self.assertNotIn("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", env)
 
     def test_context_ktok_config_field_is_validated(self):
         cfg = self.cfg()

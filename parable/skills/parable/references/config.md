@@ -88,34 +88,41 @@ agent synchronization, launches that model as the parent, removes agent-team ena
 `--disallowedTools Agent` to Claude Code. It rejects `--brain`, `--model`, `--agent`, `--agents`,
 and caller-supplied allowed/disallowed-tool overrides so the single-agent contract cannot be weakened.
 
-### Context ceiling for proxied non-Anthropic models
+### Context ceilings for proxied models
 
-Claude Code does not know the real context window of models it does not recognize: it assumes
-200k, or 1M when the parent carries a `[1m]`/long-context marker — and for a proxied non-Anthropic
-model both guesses are wrong, so auto-compact fires far too late and the session dies with an
-upstream `400 Your input exceeds the context window` error. Parable fixes this at launch by
-setting both `CLAUDE_CODE_MAX_CONTEXT_TOKENS` and the independently evaluated
-`CLAUDE_CODE_AUTO_COMPACT_WINDOW` to the real ceiling, plus
-`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=75` to leave room for tool results and the compaction request:
+Claude Code treats an unmarked proxied Claude-family model as 200k, even when the provider grants
+the model a 1M window. Parable therefore launches known 1M Claude-family parents with Claude
+Code's native `[1m]` selector while retaining the bare exact id for catalog validation and proxy
+routing.
 
-- **Solo mode** uses the selected model's exact window.
-- **Multi-model mode** uses the minimum window across the brain and every enabled non-Claude
-  proxy model in the cast (Claude Code applies the variable only to non-`claude-` models, so
-  Anthropic parents and subagents are never handicapped). An unknown model counts as Claude
-  Code's own 200k fallback rather than raising the ceiling blindly.
+Non-Claude models still need an explicit ceiling. Parable sets
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` to their real window. When the **parent itself is non-Claude**, it
+also sets `CLAUDE_CODE_AUTO_COMPACT_WINDOW` to that ceiling and
+`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=75` to leave room for tool results and the compaction request.
+Those last two controls are process-wide, so Parable deliberately does not derive them from a
+mixed cast when the parent is Fable or another Claude-family model; doing so would shrink a 1M
+Fable session to the cast's smaller window.
+
+- **Solo mode** uses `[1m]` for a known 1M Claude-family model. A non-Claude solo model receives
+  its exact ceiling and the 75% safety threshold.
+- **Multi-model mode** gives a Claude-family parent its native marked window, while
+  `CLAUDE_CODE_MAX_CONTEXT_TOKENS` remains the minimum across enabled non-Claude proxy models in
+  the cast. An unknown non-Claude model counts as Claude Code's own 200k fallback rather than
+  raising the assumed ceiling blindly.
 - Built-in windows come from the pinned proxy's own model registry (gpt-5.6-sol/terra/luna
   372k, grok-4.5 500k, kimi-k3 1M via upstream `k3` normalization, Claude 5-class 1M). Override
   or extend per executor with `context_ktok`.
-- User-provided values always win independently. When you provide only
-  `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, Parable uses that value for the auto-compact window too;
-  an explicit `CLAUDE_CODE_AUTO_COMPACT_WINDOW` or `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` is never
+- User-provided values always win independently. For a non-Claude parent, when you provide only
+  `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, Parable uses that value for the auto-compact window too. An
+  explicit `CLAUDE_CODE_AUTO_COMPACT_WINDOW` or `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` is never
   overwritten. An unknown solo model leaves all three variables unset unless you explicitly
   provide a context ceiling.
 
-The launch line reports both controls (`context ceiling 372,000 tokens; auto-compact 75%`) and
-the startup card shows each model's real window (`· 372k ctx`). For Sol, 75% starts compaction
-near 279k instead of waiting until roughly 353k; this leaves about 74k of headroom below the
-Codex route's 353.4k effective input window.
+The launch line reports the parent window and any separate non-Claude cast ceiling; the startup
+card shows each model's real window (`· 372k ctx`). For a Sol parent, 75% starts compaction near
+279k instead of waiting until roughly 353k; this leaves about 74k of headroom below the Codex
+route's 353.4k effective input window. A Fable parent retains its 1M window and Claude Code's
+native auto-compaction policy.
 
 Those environment controls protect future turns, but they cannot repair a saved conversation
 that is already larger than a newly selected model's window. On explicit CLI resumes

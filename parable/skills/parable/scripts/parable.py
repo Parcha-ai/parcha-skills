@@ -105,12 +105,14 @@ CLAUDE_AUTO_COMPACT_PCT_ENV = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
 # sessions have been rejected as early as ~321k, so 75% triggers near 279k and
 # leaves roughly 74k before the Codex effective window (353.4k).
 CLAUDE_AUTO_COMPACT_PCT = 75
+CLAUDE_LONG_CONTEXT_MARKER = "[1m]"
 CLAUDE_RESUME_COMPACT_MODEL = "claude-sonnet-5[1m]"
 CLAUDE_RESUME_COMPACT_BASE_MODEL = "claude-sonnet-5"
 CLAUDE_RESUME_COMPACT_WINDOW = 1_000_000
 CLAUDE_RESUME_CHECK_TIMEOUT_SECONDS = 180
 CLAUDE_RESUME_COMPACT_TIMEOUT_SECONDS = 900
 CLAUDE_RESUME_HEARTBEAT_SECONDS = 60
+PARABLE_CONTEXT_FAILURE_RECOVERY_ENV = "PARABLE_CONTEXT_FAILURE_RECOVERY"
 CLAUDE_RESUME_COMPACT_PROMPT = (
     "/compact preserve the active task, user requirements, decisions, changed files, "
     "remaining work, and verification evidence"
@@ -598,10 +600,10 @@ def build_claude_launch(cfg: dict, forwarded: list[str], environ: dict[str, str]
         launch_env.pop(inherited, None)
     if solo:
         launch_env.pop("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", None)
-    # Give Claude Code both the request ceiling and the separate window it
-    # uses for auto-compaction calculations. The percentage override is
-    # applied to the latter; setting only MAX_CONTEXT does not reliably arm
-    # compaction for an unrecognized proxied model. User values always win.
+    # MAX_CONTEXT teaches Claude Code the real ceiling of proxied non-Claude
+    # models. AUTO_COMPACT_WINDOW and its percentage are process-wide, though:
+    # setting them from a mixed cast also caps a Claude-family parent. Keep
+    # those two controls scoped to a non-Claude parent. User values always win.
     ceiling = claude_context_ceiling(
         cfg, claude["brain_model"], solo=solo, available=available
     )
@@ -609,17 +611,23 @@ def build_claude_launch(cfg: dict, forwarded: list[str], environ: dict[str, str]
         if ceiling is not None:
             launch_env[CLAUDE_CONTEXT_ENV] = str(ceiling)
     effective_ceiling = launch_env.get(CLAUDE_CONTEXT_ENV)
-    if effective_ceiling and not source_env.get(CLAUDE_AUTO_COMPACT_WINDOW_ENV):
+    parent_is_claude = is_claude_family_model(claude["brain_model"])
+    if (
+        effective_ceiling
+        and not parent_is_claude
+        and not source_env.get(CLAUDE_AUTO_COMPACT_WINDOW_ENV)
+    ):
         launch_env[CLAUDE_AUTO_COMPACT_WINDOW_ENV] = effective_ceiling
     if (
         effective_ceiling
+        and not parent_is_claude
         and not source_env.get(CLAUDE_AUTO_COMPACT_PCT_ENV)
     ):
         launch_env[CLAUDE_AUTO_COMPACT_PCT_ENV] = str(CLAUDE_AUTO_COMPACT_PCT)
     isolation = ["--disallowedTools", "Agent"] if solo else []
     argv = [
         claude.get("binary", "claude"),
-        "--model", claude["brain_model"],
+        "--model", claude_cli_model(cfg, claude["brain_model"]),
         *isolation,
         *args,
     ]
@@ -746,6 +754,7 @@ def prepare_claude_resume(
     *,
     run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     report: Callable[[str], None] | None = None,
+    target_ceiling: int | None = None,
 ) -> tuple[list[str], str | None]:
     """Compact an oversized resumed session before a smaller model loads it.
 
@@ -768,12 +777,16 @@ def prepare_claude_resume(
     scan = forwarded[:forwarded.index("--")] if "--" in forwarded else forwarded
     if "--fork-session" in scan:
         return forwarded, "forked resume selected; pre-compaction skipped"
-    raw_ceiling = launch_env.get(CLAUDE_CONTEXT_ENV)
-    try:
-        target_ceiling = int(raw_ceiling) if raw_ceiling else None
-    except ValueError as exc:
-        raise RuntimeError(f"invalid {CLAUDE_CONTEXT_ENV}={raw_ceiling!r}") from exc
-    if target_ceiling is None or target_ceiling >= CLAUDE_RESUME_COMPACT_WINDOW:
+    if target_ceiling is None:
+        raw_ceiling = launch_env.get(CLAUDE_CONTEXT_ENV)
+        try:
+            target_ceiling = int(raw_ceiling) if raw_ceiling else None
+        except ValueError as exc:
+            raise RuntimeError(f"invalid {CLAUDE_CONTEXT_ENV}={raw_ceiling!r}") from exc
+    force_compact = launch_env.get(PARABLE_CONTEXT_FAILURE_RECOVERY_ENV) == "1"
+    if target_ceiling is None or (
+        target_ceiling >= CLAUDE_RESUME_COMPACT_WINDOW and not force_compact
+    ):
         return forwarded, None
     if CLAUDE_RESUME_COMPACT_BASE_MODEL not in available:
         raise RuntimeError(
@@ -786,6 +799,7 @@ def prepare_claude_resume(
         CLAUDE_CONTEXT_ENV,
         CLAUDE_AUTO_COMPACT_PCT_ENV,
         CLAUDE_AUTO_COMPACT_WINDOW_ENV,
+        PARABLE_CONTEXT_FAILURE_RECOVERY_ENV,
     ):
         preflight_env.pop(name, None)
     common = [
@@ -854,7 +868,7 @@ def prepare_claude_resume(
     exact = [*forwarded[:start], "--resume", session_id, *forwarded[end:]]
     used_tokens = _context_token_count(str(context.get("result") or ""))
     safe_tokens = target_ceiling * CLAUDE_AUTO_COMPACT_PCT // 100
-    if used_tokens < safe_tokens:
+    if used_tokens < safe_tokens and not force_compact:
         return exact, f"{used_tokens:,} tokens fit the {safe_tokens:,}-token safe start"
 
     if report:
@@ -1015,20 +1029,42 @@ def model_context_window(cfg: dict, model: str) -> int | None:
     return MODEL_CONTEXT_WINDOWS.get(model)
 
 
+def is_claude_family_model(model: str) -> bool:
+    """Whether Claude Code applies its native Claude-family window rules."""
+    return model.lower().startswith("claude-")
+
+
+def claude_cli_model(cfg: dict, model: str) -> str:
+    """Return the model selector that makes Claude Code honor the real window.
+
+    The proxy catalog and Parable configuration retain the exact bare model id.
+    ``[1m]`` is Claude Code's own context selector and is stripped before the
+    request reaches the provider. Without it, even Fable is treated as 200k.
+    """
+    if model.endswith(CLAUDE_LONG_CONTEXT_MARKER):
+        return model
+    window = model_context_window(cfg, model)
+    if is_claude_family_model(model) and window == 1_000_000:
+        return model + CLAUDE_LONG_CONTEXT_MARKER
+    return model
+
+
 def claude_context_ceiling(cfg: dict, brain_model: str, *, solo: bool = False,
                            available: set[str] | None = None) -> int | None:
     """The CLAUDE_CODE_MAX_CONTEXT_TOKENS value for a launch, or None to not set it.
 
     Claude Code honors this env var only for models whose id does not start
     with "claude-", and it is process-wide — one value covers the parent and
-    every subagent. Solo has exactly one model, so it gets that model's window.
-    A multi-model launch takes the minimum window across the brain and every
-    available non-Claude cast model in the launch snapshot, treating unknown
-    windows as Claude Code's own 200k fallback so an unknown model never raises
-    the assumed ceiling. Anthropic models ignore the env var, so the min never
-    handicaps them.
+    every subagent. A non-Claude solo launch gets that model's window; a
+    Claude-family solo launch uses Claude Code's native long-context marker
+    instead. A multi-model launch takes the minimum window across the brain and
+    every available non-Claude cast model in the launch snapshot, treating
+    unknown windows as Claude Code's own 200k fallback so an unknown model never
+    raises the assumed ceiling. Claude-family models ignore this env var.
     """
     if solo:
+        if is_claude_family_model(brain_model):
+            return None
         return model_context_window(cfg, brain_model)
     models = {brain_model}
     models.update(
@@ -1303,6 +1339,7 @@ def cmd_claude(args: argparse.Namespace) -> int:
             forwarded, resume_note = prepare_claude_resume(
                 forwarded, argv[0], launch_env, available,
                 report=lambda message: print(f"resume: {message}", flush=True),
+                target_ceiling=model_context_window(cfg, brain_model),
             )
             argv, launch_env = build_claude_launch(
                 launch_cfg, forwarded, solo=True, available=available
@@ -1324,6 +1361,7 @@ def cmd_claude(args: argparse.Namespace) -> int:
             forwarded, resume_note = prepare_claude_resume(
                 forwarded, argv[0], launch_env, available,
                 report=lambda message: print(f"resume: {message}", flush=True),
+                target_ceiling=model_context_window(cfg, brain_model),
             )
             argv, launch_env = build_claude_launch(
                 launch_cfg, forwarded, available=available
@@ -1335,8 +1373,11 @@ def cmd_claude(args: argparse.Namespace) -> int:
         print(f"parable: {exc}", file=sys.stderr)
         return 1
     ceiling = launch_env.get(CLAUDE_CONTEXT_ENV)
+    parent_window = model_context_window(cfg, brain_model)
     compact_pct = launch_env.get(CLAUDE_AUTO_COMPACT_PCT_ENV)
-    context_note = f"; context ceiling {int(ceiling):,} tokens" if ceiling else ""
+    context_note = f"; parent context {parent_window:,} tokens" if parent_window else ""
+    if ceiling and (parent_window is None or int(ceiling) != parent_window):
+        context_note += f"; non-Claude cast ceiling {int(ceiling):,} tokens"
     if compact_pct:
         context_note += f"; auto-compact {compact_pct}%"
     if solo_selector is not None:
