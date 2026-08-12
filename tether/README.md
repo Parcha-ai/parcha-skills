@@ -4,7 +4,7 @@ Tether binds a Slack thread to the Codex, Claude Code, Herdr, Zellij, Hermes, or
 headless run that created it. Hermes owns the Slack credential. Local clients
 use an owner-only Unix socket and do not receive that credential.
 
-`0.3.0-beta.1` is a pre-release. This source tree uses BindingV3 and database schema 15.
+`0.3.0-beta.1` is a pre-release. This source tree uses BindingV3 and database schema 16.
 Read [Compatibility](docs/COMPATIBILITY.md) before upgrading an existing host.
 
 ## Supported boundary
@@ -39,6 +39,10 @@ Local CLI
 Each bridge stores one source, one continuation endpoint, one Slack thread, an
 operator policy, and a monotonic binding generation. Rebind and close increment
 the generation, which fences stale ingress and delivery attempts.
+
+One continuation endpoint may own multiple bridges and therefore multiple
+independent Slack threads. Tether routes ingress by exact workspace, channel,
+and thread, and serializes agent turns across every bridge sharing the endpoint.
 
 A Tether-created thread root is durable local proof that the bridge owns that
 thread for ambient replies. `tether attach` binds an existing thread but does

@@ -574,12 +574,13 @@ class HerdrEndpointTest(unittest.TestCase):
         })
 
         self.assertTrue(result["bound"])
+        self.assertEqual(result["binding_count"], 1)
         self.assertEqual(result["bridge"]["channel_id"], "C12345678")
         serialized = json.dumps(result)
         self.assertNotIn("codex-session-1", serialized)
         self.assertNotIn("herdr.sock", serialized)
 
-    def test_stable_identity_migration_keeps_work_owner_over_newer_duplicate(self):
+    def test_stable_identity_migration_preserves_all_threads(self):
         store = self.runtime.Store(self.home / "bridges.db")
         first = store.create({
             "source_kind": "codex_session",
@@ -652,11 +653,42 @@ class HerdrEndpointTest(unittest.TestCase):
         reopened = self.runtime.Store(store.path)
 
         self.assertEqual(reopened.get(first.bridge_id).status, "active")
-        migrated = reopened.get(second.bridge_id)
-        self.assertEqual(migrated.status, "closed")
+        self.assertEqual(reopened.get(second.bridge_id).status, "active")
+
+    def test_context_lookup_returns_all_threads_for_one_endpoint(self):
+        store = self.runtime.Store(self.home / "bridges.db")
+        bridges = []
+        for index, channel in enumerate(("C12345678", "C87654321"), start=1):
+            bridge = store.create({
+                "source_kind": "codex_session",
+                "source": self.source(),
+                "owner_user_id": "*",
+                "team_id": "T12345678",
+                "channel_id": channel,
+                "idempotency_key": f"herdr-context-multi-{index}",
+            })
+            bridges.append(
+                store.bind(bridge.bridge_id, f"1234567890.{index:06d}")
+            )
+        broker = self.runtime.Broker(
+            "unused",
+            store=store,
+            verified_workspace_team_id="T12345678",
+        )
+
+        result = broker._herdr_context({
+            "herdr_terminal_id": "term_7654321fedcba98",
+            "herdr_agent_name": "tether_fedcba9876543210",
+            "herdr_agent_session_value": "codex-session-1",
+            "herdr_agent": "codex",
+        })
+
+        self.assertTrue(result["bound"])
+        self.assertEqual(result["binding_count"], 2)
+        self.assertIsNone(result["bridge"])
         self.assertEqual(
-            migrated.binding_error_code,
-            "endpoint_conflict_migrated",
+            {item["bridge_id"] for item in result["bridges"]},
+            {bridge.bridge_id for bridge in bridges},
         )
 
     def test_delivery_revalidates_before_and_after_atomic_prompt(self):

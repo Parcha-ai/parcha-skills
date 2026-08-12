@@ -174,7 +174,7 @@ SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
 CONFIG_VERSION = 1
 BINDING_VERSION = 3
 SUPPORTED_BINDING_VERSIONS = frozenset({1, 2, BINDING_VERSION})
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 RECONCILIATION_PAGE_LIMIT = 15
 RECONCILIATION_INTERVAL_SECONDS = 60
 RECONCILIATION_MAX_PAGES = 1_000
@@ -1882,61 +1882,14 @@ class Store:
               )
             """
         )
-        # Endpoint identity can intentionally become more stable between
-        # releases (for example, Herdr agent names are ephemeral across a
-        # restart). Drop the old uniqueness index inside this migration
-        # transaction before recomputing keys, then deterministically close
-        # older duplicate owners and recreate it below.
+        # A native endpoint owns a session, not a Slack thread. One session may
+        # own many independently fenced threads, so endpoint identity is an
+        # indexed routing/serialization key rather than a uniqueness key.
         db.execute("DROP INDEX IF EXISTS bridge_endpoint_owner")
         cls._backfill_bindings(db)
-        duplicate_keys = db.execute(
-            """
-            SELECT endpoint_key FROM bridges
-            WHERE endpoint_key!='' AND status IN ('pending','active')
-            GROUP BY endpoint_key HAVING count(*) > 1
-            """
-        ).fetchall()
-        for duplicate in duplicate_keys:
-            rows = db.execute(
-                """
-                SELECT bridge_id FROM bridges
-                WHERE endpoint_key=? AND status IN ('pending','active')
-                ORDER BY
-                  CASE WHEN
-                    EXISTS (
-                      SELECT 1 FROM bridge_events
-                      WHERE bridge_events.bridge_id=bridges.bridge_id
-                        AND bridge_events.state IN (
-                          'queued','pending','processing','prepared','submitting',
-                          'uncertain','awaiting_ack','replying'
-                        )
-                    ) OR EXISTS (
-                      SELECT 1 FROM thread_ingress
-                      WHERE thread_ingress.bridge_id=bridges.bridge_id
-                        AND thread_ingress.state IN (
-                          'pending','processing','uncertain'
-                        )
-                    )
-                    THEN 0 ELSE 1
-                  END,
-                  updated_at DESC,created_at DESC,rowid DESC
-                """,
-                (duplicate["endpoint_key"],),
-            ).fetchall()
-            for stale in rows[1:]:
-                db.execute(
-                    """
-                    UPDATE bridges
-                    SET status='closed',binding_state='rebind_required',
-                        binding_error_code='endpoint_conflict_migrated',
-                        updated_at=CURRENT_TIMESTAMP
-                    WHERE bridge_id=?
-                    """,
-                    (stale["bridge_id"],),
-                )
         db.execute(
             """
-            CREATE UNIQUE INDEX IF NOT EXISTS bridge_endpoint_owner
+            CREATE INDEX IF NOT EXISTS bridge_endpoint_lookup
             ON bridges(endpoint_key)
             WHERE endpoint_key!='' AND status IN ('pending','active')
             """
@@ -2253,39 +2206,32 @@ class Store:
                     )
                 return existing
             bridge_id = "brg_" + uuid.uuid4().hex
-            try:
-                db.execute(
-                    """
-                    INSERT INTO bridges(
-                      bridge_id,source_kind,source_json,owner_user_id,team_id,
-                      channel_id,thread_ts,idempotency_key,status,binding_version,
-                      binding_generation,binding_state,binding_error_code,
-                      endpoint_key
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    """,
-                    (
-                        bridge_id,
-                        kind,
-                        json.dumps(persisted_source, separators=(",", ":")),
-                        owner,
-                        team,
-                        channel,
-                        request.get("thread_ts"),
-                        idempotency_key,
-                        "pending",
-                        binding.version,
-                        1,
-                        binding.state,
-                        None,
-                        endpoint_key,
-                    ),
-                )
-            except sqlite3.IntegrityError as exc:
-                if "bridges.endpoint_key" in str(exc):
-                    raise ValueError(
-                        "native endpoint already has an active Tether binding"
-                    ) from exc
-                raise
+            db.execute(
+                """
+                INSERT INTO bridges(
+                  bridge_id,source_kind,source_json,owner_user_id,team_id,
+                  channel_id,thread_ts,idempotency_key,status,binding_version,
+                  binding_generation,binding_state,binding_error_code,
+                  endpoint_key
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    bridge_id,
+                    kind,
+                    json.dumps(persisted_source, separators=(",", ":")),
+                    owner,
+                    team,
+                    channel,
+                    request.get("thread_ts"),
+                    idempotency_key,
+                    "pending",
+                    binding.version,
+                    1,
+                    binding.state,
+                    None,
+                    endpoint_key,
+                ),
+            )
             row = db.execute("SELECT * FROM bridges WHERE bridge_id=?", (bridge_id,)).fetchone()
             return self.decode(row)  # type: ignore[return-value]
 
@@ -2769,14 +2715,14 @@ class Store:
             ).fetchone()
             return self.decode(row)
 
-    def find_herdr_endpoint(
+    def find_herdr_endpoints(
         self,
         terminal_id: str,
         agent_name: str,
         native_session_value: str,
         agent: str,
-    ) -> Bridge | None:
-        """Resolve one active Herdr binding without trusting plugin context as authority."""
+    ) -> list[Bridge]:
+        """Resolve active Herdr threads without trusting plugin context as authority."""
         if not HERDR_TERMINAL_ID_PATTERN.fullmatch(terminal_id):
             raise ValueError("invalid Herdr terminal ID")
         if not HERDR_AGENT_NAME_PATTERN.fullmatch(agent_name):
@@ -2801,9 +2747,32 @@ class Store:
                 and source.get("herdr_agent_session_value") == native_session_value
             ):
                 matches.append(bridge)
-        if len(matches) > 1:
-            raise ValueError("multiple active bindings match this Herdr agent")
-        return matches[0] if matches else None
+        return matches
+
+    def endpoint_queued_bridge_ids(self, bridge_id: str) -> list[str]:
+        """Return queued sibling threads for one native endpoint, oldest first."""
+        with self.connect() as db:
+            anchor = db.execute(
+                "SELECT endpoint_key FROM bridges WHERE bridge_id=?",
+                (bridge_id,),
+            ).fetchone()
+            if anchor is None or not str(anchor["endpoint_key"] or ""):
+                return []
+            return [
+                str(row["bridge_id"])
+                for row in db.execute(
+                    """
+                    SELECT b.bridge_id,min(e.created_at) AS oldest
+                    FROM bridges AS b
+                    JOIN bridge_events AS e ON e.bridge_id=b.bridge_id
+                    WHERE b.endpoint_key=? AND b.status='active'
+                      AND e.state='queued'
+                    GROUP BY b.bridge_id
+                    ORDER BY oldest,b.bridge_id
+                    """,
+                    (str(anchor["endpoint_key"]),),
+                ).fetchall()
+            ]
 
     def bridge_work_counts(self, bridge_id: str) -> dict[str, int]:
         with self.connect() as db:
@@ -2858,15 +2827,26 @@ class Store:
             blocked_bridges = int(
                 db.execute(
                     """
-                    SELECT count(DISTINCT queued.bridge_id)
-                    FROM bridge_events AS queued
-                    WHERE queued.state='queued'
+                    SELECT count(DISTINCT queued_event.bridge_id)
+                    FROM bridge_events AS queued_event
+                    JOIN bridges AS queued_bridge
+                      ON queued_bridge.bridge_id=queued_event.bridge_id
+                    WHERE queued_event.state='queued'
                       AND EXISTS (
-                        SELECT 1 FROM bridge_events AS active
-                        WHERE active.bridge_id=queued.bridge_id
-                          AND active.state IN (
-                            'processing','prepared','submitting','uncertain',
-                            'awaiting_ack','replying'
+                        SELECT 1
+                        FROM bridge_attempts AS active_attempt
+                        JOIN bridges AS active_bridge
+                          ON active_bridge.bridge_id=active_attempt.bridge_id
+                        WHERE active_attempt.state IN (
+                            'prepared','submitting','uncertain','awaiting_ack',
+                            'replying'
+                          )
+                          AND (
+                            active_attempt.bridge_id=queued_event.bridge_id
+                            OR (
+                              queued_bridge.endpoint_key!=''
+                              AND active_bridge.endpoint_key=queued_bridge.endpoint_key
+                            )
                           )
                       )
                     """
@@ -2938,37 +2918,30 @@ class Store:
                 (bridge_id, generation),
             ).fetchone():
                 raise ValueError("binding has claimed or pending Slack ingress")
-            try:
-                cursor = db.execute(
-                    """
-                    UPDATE bridges
-                    SET source_kind=?,source_json=?,binding_version=?,
-                        binding_generation=binding_generation+1,binding_state=?,
-                        binding_error_code=NULL,endpoint_key=?,
-                        updated_at=CURRENT_TIMESTAMP
-                    WHERE bridge_id=? AND status='active'
-                      AND binding_generation=?
-                    """,
-                    (
-                        source_kind,
-                        json.dumps(
-                            persisted_source,
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        ),
-                        binding.version,
-                        binding.state,
-                        endpoint_key,
-                        bridge_id,
-                        generation,
+            cursor = db.execute(
+                """
+                UPDATE bridges
+                SET source_kind=?,source_json=?,binding_version=?,
+                    binding_generation=binding_generation+1,binding_state=?,
+                    binding_error_code=NULL,endpoint_key=?,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE bridge_id=? AND status='active'
+                  AND binding_generation=?
+                """,
+                (
+                    source_kind,
+                    json.dumps(
+                        persisted_source,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
                     ),
-                )
-            except sqlite3.IntegrityError as exc:
-                if "bridges.endpoint_key" in str(exc):
-                    raise ValueError(
-                        "native endpoint already has an active Tether binding"
-                    ) from exc
-                raise
+                    binding.version,
+                    binding.state,
+                    endpoint_key,
+                    bridge_id,
+                    generation,
+                ),
+            )
             if cursor.rowcount != 1:
                 raise ValueError("active bridge not found")
             db.execute(
@@ -5247,11 +5220,12 @@ class Store:
             or delivery_kind not in {"zellij", "herdr", "detached_native"}
         ):
             return False
+        endpoint_busy = False
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             bridge = db.execute(
                 """
-                SELECT binding_generation FROM bridges
+                SELECT binding_generation,endpoint_key FROM bridges
                 WHERE bridge_id=? AND status='active'
                 """,
                 (bridge_id,),
@@ -5264,56 +5238,84 @@ class Store:
             rows = db.execute(statement, (bridge_id, *event_ids)).fetchall()
             if {str(row["event_id"]) for row in rows} != set(event_ids):
                 return False
-            try:
-                db.execute(
+            endpoint_key = str(bridge["endpoint_key"] or "")
+            endpoint_busy = bool(
+                endpoint_key
+                and db.execute(
                     """
-                    INSERT INTO bridge_attempts(
-                      attempt_id,reply_key,bridge_id,binding_generation,
-                      delivery_kind,state
-                    ) VALUES(?,?,?,?,?,'prepared')
+                    SELECT 1
+                    FROM bridge_attempts AS attempt
+                    JOIN bridges AS owner ON owner.bridge_id=attempt.bridge_id
+                    WHERE owner.endpoint_key=? AND attempt.attempt_id!=?
+                      AND attempt.state IN (
+                        'prepared','submitting','uncertain','awaiting_ack',
+                        'replying'
+                      )
+                    LIMIT 1
                     """,
-                    (
-                        attempt_id,
-                        attempt_id,
-                        bridge_id,
-                        binding_generation,
-                        delivery_kind,
-                    ),
-                )
-            except sqlite3.IntegrityError:
-                existing = db.execute(
-                    """
-                    SELECT bridge_id,binding_generation,delivery_kind,state
-                    FROM bridge_attempts WHERE attempt_id=?
-                    """,
-                    (attempt_id,),
+                    (endpoint_key, attempt_id),
                 ).fetchone()
-                if (
-                    existing is None
-                    or str(existing["bridge_id"]) != bridge_id
-                    or int(existing["binding_generation"]) != binding_generation
-                    or str(existing["delivery_kind"]) != delivery_kind
-                    or str(existing["state"]) != "requeued"
-                ):
-                    return False
-                reset = db.execute(
-                    """
-                    UPDATE bridge_attempts
-                    SET state='prepared',ack_kind=NULL,message_ts=NULL,
-                        error_code=NULL,submitted_at=NULL,acknowledged_at=NULL,
-                        updated_at=CURRENT_TIMESTAMP
-                    WHERE attempt_id=? AND bridge_id=? AND state='requeued'
-                    """,
-                    (attempt_id, bridge_id),
-                )
-                if reset.rowcount != 1:
-                    return False
-            statement = f"UPDATE bridge_events SET state='prepared',attempt_id=?,binding_generation=?,updated_at=CURRENT_TIMESTAMP WHERE bridge_id=? AND state='processing' AND event_id IN ({placeholders})"  # nosec
-            db.execute(
-                statement,
-                (attempt_id, binding_generation, bridge_id, *event_ids),
             )
-            return True
+            if endpoint_busy:
+                statement = f"UPDATE bridge_events SET state='queued',attempt_id=NULL,error=NULL,updated_at=CURRENT_TIMESTAMP WHERE bridge_id=? AND state='processing' AND event_id IN ({placeholders})"  # nosec
+                db.execute(statement, (bridge_id, *event_ids))
+            else:
+                try:
+                    db.execute(
+                        """
+                        INSERT INTO bridge_attempts(
+                          attempt_id,reply_key,bridge_id,binding_generation,
+                          delivery_kind,state
+                        ) VALUES(?,?,?,?,?,'prepared')
+                        """,
+                        (
+                            attempt_id,
+                            attempt_id,
+                            bridge_id,
+                            binding_generation,
+                            delivery_kind,
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    existing = db.execute(
+                        """
+                        SELECT bridge_id,binding_generation,delivery_kind,state
+                        FROM bridge_attempts WHERE attempt_id=?
+                        """,
+                        (attempt_id,),
+                    ).fetchone()
+                    if (
+                        existing is None
+                        or str(existing["bridge_id"]) != bridge_id
+                        or int(existing["binding_generation"]) != binding_generation
+                        or str(existing["delivery_kind"]) != delivery_kind
+                        or str(existing["state"]) != "requeued"
+                    ):
+                        return False
+                    reset = db.execute(
+                        """
+                        UPDATE bridge_attempts
+                        SET state='prepared',ack_kind=NULL,message_ts=NULL,
+                            error_code=NULL,submitted_at=NULL,acknowledged_at=NULL,
+                            updated_at=CURRENT_TIMESTAMP
+                        WHERE attempt_id=? AND bridge_id=? AND state='requeued'
+                        """,
+                        (attempt_id, bridge_id),
+                    )
+                    if reset.rowcount != 1:
+                        return False
+                statement = f"UPDATE bridge_events SET state='prepared',attempt_id=?,binding_generation=?,updated_at=CURRENT_TIMESTAMP WHERE bridge_id=? AND state='processing' AND event_id IN ({placeholders})"  # nosec
+                db.execute(
+                    statement,
+                    (attempt_id, binding_generation, bridge_id, *event_ids),
+                )
+        if endpoint_busy:
+            raise NativeContinuationError(
+                "another Slack thread is already using this native session",
+                code="endpoint_busy",
+                binding_id=bridge_id,
+            )
+        return True
 
     def mark_attempt_submitting(
         self,
@@ -8010,34 +8012,48 @@ class Broker:
         agent_name = str(request.get("herdr_agent_name") or "")
         native_session = str(request.get("herdr_agent_session_value") or "")
         agent = str(request.get("herdr_agent") or "")
-        bridge = self.store.find_herdr_endpoint(
+        bridges = self.store.find_herdr_endpoints(
             terminal_id,
             agent_name,
             native_session,
             agent,
         )
-        if bridge is None:
+        if not bridges:
             return {
                 "ok": True,
                 "bound": False,
                 "agent": agent,
+                "binding_count": 0,
+                "bridges": [],
                 "queued": 0,
                 "uncertain": 0,
             }
-        counts = self.store.bridge_work_counts(bridge.bridge_id)
-        return {
-            "ok": True,
-            "bound": True,
-            "agent": agent,
-            "bridge": {
+        records = []
+        queued = 0
+        uncertain = 0
+        for bridge in bridges:
+            counts = self.store.bridge_work_counts(bridge.bridge_id)
+            queued += counts["queued"]
+            uncertain += counts["uncertain"]
+            records.append({
                 "bridge_id": bridge.bridge_id,
                 "status": bridge.status,
                 "binding_state": bridge.binding_state,
                 "binding_generation": bridge.binding_generation,
                 "channel_id": bridge.channel_id,
                 "thread_ts": bridge.thread_ts or "",
-            },
-            **counts,
+                "queued": counts["queued"],
+                "uncertain": counts["uncertain"],
+            })
+        return {
+            "ok": True,
+            "bound": True,
+            "agent": agent,
+            "binding_count": len(records),
+            "bridge": records[0] if len(records) == 1 else None,
+            "bridges": records,
+            "queued": queued,
+            "uncertain": uncertain,
         }
 
     def _identity(self) -> dict[str, Any]:
@@ -10819,10 +10835,18 @@ def _live_attempt_instruction(
         f"python3 {shlex.quote(str(notifier))} reply "
         f"--bridge-id {bridge.bridge_id} --reply-key {marker} --text-stdin"
     )
+    history_command = (
+        f"python3 {shlex.quote(str(notifier))} thread "
+        f"--channel {shlex.quote(bridge.channel_id)} "
+        f"--thread-ts {shlex.quote(str(bridge.thread_ts or ''))}"
+    )
     instruction = (
-        f"[Hermes Slack follow-up batch; {marker}] Read and handle the complete request in "
+        f"[Hermes Slack follow-up batch; {marker}; bridge {bridge.bridge_id}; "
+        f"thread {bridge.channel_id}/{bridge.thread_ts}] Read and handle the complete request in "
         f"{shlex.quote(str(inbox_path))}, then delete that file. "
-        "Handle it as one turn. Check the current thread/task state before responding. "
+        "This turn belongs only to that exact Slack thread; do not answer it from another "
+        "Tether thread's context. Handle it as one turn. If prior thread context is needed, "
+        f"read the exact thread with: {history_command}. "
         "Post at most one Slack message for this entire batch, only when a useful response is needed; "
         "do not post a second status summary or courtesy acknowledgment. Default to 50 words and "
         "3 sentences; exceed that only when necessary for a complete or safe answer. Never suppress "
@@ -11352,50 +11376,7 @@ def deliver_zellij(
             "captured Zellij pane now hosts a different process",
             binding_id=bridge.bridge_id,
         )
-    notifier = RUNTIME_HOME / "tether_notify.py"
-    marker = attempt_id or ("att_" + uuid.uuid4().hex[:24])
-    if not REPLY_KEY_PATTERN.fullmatch(marker):
-        raise ValueError("invalid Zellij delivery attempt ID")
-    inbox_dir = RUNTIME_HOME / "inbox"
-    RUNTIME_HOME.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    security.secure_state_directory(RUNTIME_HOME, create=True)
-    security.secure_state_directory(inbox_dir, create=True)
-    now = time.time()
-    for pattern in ("att_*.txt", "tether-*.txt"):
-        for stale in inbox_dir.glob(pattern):
-            with contextlib.suppress(OSError):
-                if not stale.is_symlink() and now - stale.stat().st_mtime > 86_400:
-                    stale.unlink()
-    inbox_path = inbox_dir / f"{marker}.txt"
-    payload = text + "\n"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        descriptor = os.open(inbox_path, flags, 0o600)
-    except FileExistsError:
-        if security.read_private_text(inbox_path) != payload:
-            raise NativeContinuationError(
-                "Zellij delivery inbox already contains different content",
-                code="terminal_submit_uncertain",
-            )
-    else:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as inbox:
-            inbox.write(payload)
-    reply_command = (
-        f"python3 {shlex.quote(str(notifier))} reply "
-        f"--bridge-id {bridge.bridge_id} --reply-key {marker} --text-stdin"
-    )
-    instruction = (
-        f"[Hermes Slack follow-up batch; {marker}] Read and handle the complete request in "
-        f"{shlex.quote(str(inbox_path))}, then delete that file. "
-        "Handle it as one turn. Check the current thread/task state before responding. "
-        "Post at most one Slack message for this entire batch, only when a useful response is needed; "
-        "do not post a second status summary or courtesy acknowledgment. Default to 50 words and "
-        "3 sentences; exceed that only when necessary for a complete or safe answer. Never suppress "
-        "a useful answer solely to meet the length target. If no new response is needed, submit "
-        f"NO_REPLY. Provide the response on standard input, never in argv, to: {reply_command}"
-    )
+    marker, instruction = _live_attempt_instruction(bridge, text, attempt_id)
     target = pane if pane.startswith(("terminal_", "plugin_")) else "terminal_" + pane
     zellij = _resolve_executable("zellij")
     write_accepted = False

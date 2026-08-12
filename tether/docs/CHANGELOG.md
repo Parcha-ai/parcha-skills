@@ -27,6 +27,10 @@
 
 ## Unreleased
 
+- Allows one Codex, Claude Code, Herdr, Zellij, Hermes, or headless endpoint to
+  own multiple independent Slack threads. Exact thread routing and reply keys
+  remain per bridge, while the durable ledger serializes agent turns across the
+  shared endpoint and wakes the next queued sibling after acknowledgment.
 - Keeps Herdr bindings attached across a host or Herdr restart when the exact
   pane, official native-session reference, agent runtime, and trusted live
   executable still agree, even if Herdr rotates its terminal ID and agent name.

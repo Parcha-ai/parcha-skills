@@ -1,14 +1,14 @@
 # Tether Architecture
 
 This document describes Tether `0.3.0-beta.1`, binding protocol 3, database
-schema 15, and broker protocol 6. The implementation is authoritative:
+schema 16, and broker protocol 6. The implementation is authoritative:
 [`runtime/bridge_runtime.py`](../runtime/bridge_runtime.py),
 [`runtime/plugin/__init__.py`](../runtime/plugin/__init__.py), and
 [`runtime/routing.py`](../runtime/routing.py).
 
 ## Scope
 
-Tether connects one Slack thread to one continuation endpoint:
+Tether connects each Slack thread to one continuation endpoint:
 
 - a verified Zellij pane;
 - a verified Herdr agent;
@@ -18,6 +18,12 @@ Tether connects one Slack thread to one continuation endpoint:
 
 Tether owns admission, routing, durable delivery state, and Slack writes. It
 does not own agent reasoning, tool authorization, or host sandboxing.
+
+An endpoint may own many Slack threads. Each thread remains a separate bridge
+with its own root, exact routing key, generation, event queue, attempt ledger,
+and reply key. The Store permits many active bridges with the same endpoint key
+but atomically permits only one open agent turn for that endpoint. Acknowledging
+that turn wakes the oldest queued sibling thread.
 
 ## Components
 
@@ -108,8 +114,8 @@ increments the generation, and moves still-queued events to the new
 generation.
 
 Close applies the same fence. It also rejects an incomplete root outbox and
-releases thread participation and endpoint ownership only after the bridge is
-safe to close.
+releases thread participation only after the bridge is safe to close. Closing
+one bridge does not detach sibling threads owned by the same endpoint.
 
 Primary evidence:
 [`tests/test_bridge_lifecycle.py`](../tests/test_bridge_lifecycle.py) and
@@ -316,20 +322,20 @@ transport limit is `MAX_TEXT`, currently 35,000 characters.
 
 ## Schema and upgrades
 
-The current SQLite schema is 15. Store startup:
+The current SQLite schema is 16. Store startup:
 
 1. rejects a database with a newer schema;
 2. opens an immediate transaction;
 3. applies additive migrations and binding backfills;
-4. writes `PRAGMA user_version=15`; and
+4. writes `PRAGMA user_version=16`; and
 5. recovers safe pre-I/O attempts.
 
-Legacy or incomplete native bindings become `rebind_required`. Migration also
-closes older duplicate owners before enforcing unique active endpoint
-ownership.
+Legacy or incomplete native bindings become `rebind_required`. Endpoint keys
+are backfilled as non-unique serialization keys, preserving every active Slack
+thread that shares a session.
 
 The installer snapshots managed files and plugin state, not the database. A
-code rollback does not downgrade schema 15. Back up `bridges.db` and its WAL/SHM
+code rollback does not downgrade schema 16. Back up `bridges.db` and its WAL/SHM
 sidecars before crossing a schema boundary.
 
 ## Operator recovery

@@ -243,12 +243,25 @@ def _draw(screen: Any, status: dict[str, Any], notice: str) -> None:
     height, width = screen.getmaxyx()
     bound = bool(status.get("bound"))
     bridge = status.get("bridge") if isinstance(status.get("bridge"), dict) else {}
+    binding_count = int(status.get("binding_count") or (1 if bridge else 0))
+    binding_label = (
+        f"{binding_count} active threads"
+        if binding_count > 1
+        else bridge.get("binding_state", "active")
+        if bound
+        else "unbound"
+    )
+    thread_label = (
+        "select by exact thread in CLI"
+        if binding_count > 1
+        else f"{bridge.get('channel_id', '-')} / {bridge.get('thread_ts', '-')}"
+    )
     lines = [
         "+ TETHER / HERDR " + "-" * max(0, min(48, width - 18)),
         f"agent       {status.get('agent') or 'unknown'}",
         f"pane        {status.get('pane_id') or 'unavailable'}",
-        f"binding     {bridge.get('binding_state', 'active') if bound else 'unbound'}",
-        f"thread      {bridge.get('channel_id', '-')} / {bridge.get('thread_ts', '-')}",
+        f"binding     {binding_label}",
+        f"thread      {thread_label}",
         f"generation  {bridge.get('binding_generation', '-')}",
         f"queue       {status.get('queued', 0)} pending / {status.get('uncertain', 0)} uncertain",
         "",
@@ -301,7 +314,7 @@ def _run_action(
         return f"Attached thread {result.get('thread_ts', '')}."
     if key == "r":
         if not bridge:
-            return "No active binding to rebind."
+            return "Select one exact thread with `tether rebind` when this pane owns multiple threads."
         if not _confirm(screen, 14, "rebind"):
             return "Rebind cancelled."
         result = run_json([
@@ -312,7 +325,7 @@ def _run_action(
         return f"Rebound generation {result.get('binding_generation', '')}."
     if key == "d":
         if not bridge:
-            return "No active binding to detach."
+            return "Select one exact bridge with `tether close` when this pane owns multiple threads."
         if not _confirm(screen, 14, "detach"):
             return "Detach cancelled."
         result = run_json([

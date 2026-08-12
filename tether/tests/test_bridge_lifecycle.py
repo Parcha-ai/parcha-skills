@@ -105,7 +105,7 @@ class BridgeLifecycleTest(unittest.TestCase):
         bridge = self.store.create(self.request(key, pane=pane))
         return self.store.bind(bridge.bridge_id, thread)
 
-    def test_exact_native_endpoint_has_one_active_owner(self):
+    def test_exact_native_endpoint_can_own_multiple_active_threads(self):
         first = self.bind("first", pane="7", thread="123.001")
         duplicate = self.request(
             "second",
@@ -113,20 +113,34 @@ class BridgeLifecycleTest(unittest.TestCase):
             session_id="codex-different-session-id",
         )
         duplicate["channel_id"] = "C87654321"
-        with self.assertRaisesRegex(
-            ValueError,
-            "native endpoint already has an active Tether binding",
-        ):
-            self.store.create(duplicate)
+        second = self.store.create(duplicate)
+        second = self.store.bind(second.bridge_id, "123.002")
 
         other = self.bind("third", pane="8", thread="123.003")
+        self.assertNotEqual(first.bridge_id, second.bridge_id)
         self.assertNotEqual(first.bridge_id, other.bridge_id)
+        with self.store.connect() as database:
+            keys = {
+                row[0]
+                for row in database.execute(
+                    "SELECT endpoint_key FROM bridges WHERE bridge_id IN (?,?)",
+                    (first.bridge_id, second.bridge_id),
+                )
+            }
+        self.assertEqual(len(keys), 1)
 
-    def test_migration_keeps_newest_duplicate_endpoint_owner(self):
+    def test_migration_preserves_duplicate_endpoint_threads(self):
         older = self.bind("older", pane="7", thread="123.010")
         newer = self.bind("newer", pane="8", thread="123.011")
         with self.store.connect() as database:
-            database.execute("DROP INDEX bridge_endpoint_owner")
+            database.execute("DROP INDEX bridge_endpoint_lookup")
+            database.execute(
+                """
+                CREATE UNIQUE INDEX bridge_endpoint_owner
+                ON bridges(endpoint_key)
+                WHERE endpoint_key!='' AND status IN ('pending','active')
+                """
+            )
             older_source = database.execute(
                 "SELECT source_kind,source_json,endpoint_key FROM bridges "
                 "WHERE bridge_id=?",
@@ -149,26 +163,27 @@ class BridgeLifecycleTest(unittest.TestCase):
             database.execute(
                 """
                 UPDATE bridges
-                SET source_kind=?,source_json=?,endpoint_key=?,
+                SET source_kind=?,source_json=?,
                     updated_at='2026-07-27 00:00:00'
                 WHERE bridge_id=?
                 """,
                 (
                     older_source["source_kind"],
                     older_source["source_json"],
-                    older_source["endpoint_key"],
                     newer.bridge_id,
                 ),
             )
 
         reopened = self.runtime.Store(self.store.path)
         self.assertEqual(reopened.get(newer.bridge_id).status, "active")
-        migrated = reopened.get(older.bridge_id)
-        self.assertEqual(migrated.status, "closed")
-        self.assertEqual(
-            migrated.binding_error_code,
-            "endpoint_conflict_migrated",
-        )
+        self.assertEqual(reopened.get(older.bridge_id).status, "active")
+        with reopened.connect() as database:
+            indexes = {
+                row[1]: bool(row[2])
+                for row in database.execute("PRAGMA index_list(bridges)")
+            }
+        self.assertNotIn("bridge_endpoint_owner", indexes)
+        self.assertFalse(indexes["bridge_endpoint_lookup"])
 
     def test_rebind_moves_queued_work_to_new_generation(self):
         bridge = self.bind("queued-rebind")

@@ -1,7 +1,7 @@
 # Tether Security Model
 
 This document describes the security boundary of Tether `0.3.0-beta.1`,
-binding protocol 2, and database schema 15. The implementation and tests are
+binding protocol 3, and database schema 16. The implementation and tests are
 authoritative.
 
 ## Scope
@@ -42,8 +42,8 @@ and Tether. Processes under that UID are mutually trusted. Put mutually
 untrusted agents in separate accounts or hosts.
 
 The local SQLite database is the coordination boundary. One-writer routing and
-endpoint uniqueness are not distributed across databases, hosts, or unrelated
-Slack integrations.
+endpoint-wide turn serialization are not distributed across databases, hosts,
+or unrelated Slack integrations.
 
 ## Principals
 
@@ -324,7 +324,7 @@ Evidence:
 - Slack ephemeral notices and native media uploads are best-effort.
 - Same-UID code can access Tether's local authority and owner-only state.
 - SQLite availability and integrity are required for coordination.
-- One-writer and endpoint uniqueness do not span hosts or databases.
+- One-writer and endpoint-wide turn serialization do not span hosts or databases.
 - Polling may recover slowly or not at all under Slack limits and token
   restrictions.
 - State is private by filesystem permissions, not encrypted by Tether.

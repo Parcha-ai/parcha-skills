@@ -1205,6 +1205,54 @@ class StoreTest(unittest.TestCase):
         self.assertEqual({result["thread_ts"] for result in results}, {"123.456"})
         self.assertEqual(sorted(result["deduplicated"] for result in results), [False, True])
 
+    def test_same_session_can_create_and_route_multiple_root_threads(self):
+        broker = self.runtime.Broker(
+            "test-token",
+            self.store,
+            verified_workspace_team_id="T12345678",
+        )
+        base = {
+            "op": "notify",
+            "source_kind": "headless_run",
+            "source": {"run_id": "shared-root-session", "cwd": "/tmp/project"},
+            "channel_id": "C12345678",
+            "owner_user_id": "*",
+        }
+        timestamps = iter(("123.456", "123.789"))
+        with mock.patch.dict(
+            os.environ,
+            {"SLACK_ALLOWED_USERS": "U12345678"},
+            clear=False,
+        ), mock.patch.object(
+            broker,
+            "_ensure_channel_membership",
+        ), mock.patch.object(
+            self.runtime,
+            "slack_post",
+            side_effect=lambda *_args, **_kwargs: next(timestamps),
+        ) as post:
+            first = broker.handle({
+                **base,
+                "text": "first independent update",
+                "idempotency_key": "shared-root-first",
+            })
+            second = broker.handle({
+                **base,
+                "text": "second independent update",
+                "idempotency_key": "shared-root-second",
+            })
+
+        self.assertEqual(post.call_count, 2)
+        self.assertNotEqual(first["bridge_id"], second["bridge_id"])
+        self.assertEqual(
+            self.store.find_thread("T12345678", "C12345678", "123.456").bridge_id,
+            first["bridge_id"],
+        )
+        self.assertEqual(
+            self.store.find_thread("T12345678", "C12345678", "123.789").bridge_id,
+            second["bridge_id"],
+        )
+
 
 class CredentialBoundaryTest(unittest.TestCase):
     def setUp(self):
@@ -1540,6 +1588,10 @@ class CredentialBoundaryTest(unittest.TestCase):
         self.assertIn(marker, dump_snapshots[0])
         self.assertEqual(dump_snapshots[1], written)
         self.assertIn("--reply-key " + marker, written)
+        self.assertIn("bridge brg_test", written)
+        self.assertIn("thread C12345678/123.456", written)
+        self.assertIn(" thread --channel C12345678 --thread-ts 123.456", written)
+        self.assertIn("only to that exact Slack thread", written)
         self.assertIn("at most one Slack message", written)
         self.assertIn("Default to 50 words", written)
         self.assertIn("--text-stdin", written)

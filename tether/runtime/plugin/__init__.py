@@ -2715,6 +2715,8 @@ def _suppress_bridge_reaction(event, gateway):
 
 def _failure_reason(exc: Exception) -> str:
     code = str(getattr(exc, "code", "") or "")
+    if code == "endpoint_busy":
+        return "another Slack thread is already using this native session"
     if code == "terminal_submit_not_started":
         return "the live session was not ready before submission; retry is safe"
     if code in {
@@ -2992,6 +2994,8 @@ def _recover_queued_events():
                         error_code = str(
                             getattr(exc, "code", type(exc).__name__)
                         )
+                        if error_code == "endpoint_busy":
+                            break
                         log.error(
                             "Recovered bridge reply failed for %s [%s]: %s",
                             bridge_id,
@@ -3041,7 +3045,7 @@ def _recover_queued_events():
         raise
 
 
-def _schedule_bridge_drain(bridge_id: str) -> None:
+def _schedule_one_bridge_drain(bridge_id: str) -> bool:
     context = state.dispatch_context.get(bridge_id)
     if context is not None:
         loop, gateway, platform = context
@@ -3051,9 +3055,26 @@ def _schedule_bridge_drain(bridge_id: str) -> None:
 
         try:
             loop.call_soon_threadsafe(schedule)
-            return
+            return True
         except RuntimeError:
             state.dispatch_context.pop(bridge_id, None)
+    return False
+
+
+def _schedule_bridge_drain(bridge_id: str) -> None:
+    candidates = (
+        store.endpoint_queued_bridge_ids(bridge_id)
+        if store is not None
+        else []
+    )
+    if not candidates:
+        candidates = [bridge_id]
+    needs_recovery = False
+    for candidate in candidates:
+        if not _schedule_one_bridge_drain(candidate):
+            needs_recovery = True
+    if not needs_recovery:
+        return
     with state.recovery_lock:
         state.recovery_wake_counter += 1
         if state.recovery_worker_started:
@@ -3111,6 +3132,8 @@ async def _drain_bridge(bridge_id, gateway, platform):
                 error_code = str(
                     getattr(exc, "code", type(exc).__name__)
                 )
+                if error_code == "endpoint_busy":
+                    return
                 if attempt_id is None:
                     _finish_batch(items, f"{type(exc).__name__}: {reason}")
                 elif store.attempt_state(attempt_id, bridge.bridge_id) in {
