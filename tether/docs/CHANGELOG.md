@@ -27,6 +27,14 @@
 
 ## Unreleased
 
+- Keeps Herdr bindings attached across a host or Herdr restart when the exact
+  pane, official native-session reference, agent runtime, and trusted live
+  executable still agree, even if Herdr rotates its terminal ID and agent name.
+- Separates read-only Herdr preflight failures from ambiguous terminal writes,
+  safely requeues legacy preflight failures, and prevents one such record from
+  permanently blocking every later thread reply.
+- Makes `tether status` and `tether doctor` fail visibly on unresolved delivery
+  blockers and report queued, uncertain, and blocked-thread counts.
 - Posts a Slack control notice when a bridge reply fails so threads are not
   silently abandoned.
 - Adds idempotent `team_id` backfill migration for legacy bridges, and skips

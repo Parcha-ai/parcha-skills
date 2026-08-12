@@ -226,6 +226,7 @@ class HerdrEndpointTest(unittest.TestCase):
             **{
                 **binding.__dict__,
                 "herdr_terminal_id": "term_7654321fedcba98",
+                "herdr_agent_name": "tether_fedcba9876543210",
             }
         )
         self.assertEqual(
@@ -445,6 +446,102 @@ class HerdrEndpointTest(unittest.TestCase):
         self.assertEqual(agent["terminal_id"], rotated_terminal)
         self.assertEqual(pane_id, "w1:p1")
 
+    def test_reboot_keeps_binding_by_pane_and_native_session(self):
+        canonical = self.runtime.Store.validate_source("codex_session", self.source())
+        binding = types.SimpleNamespace(**{
+            "herdr_socket_path": canonical["herdr_socket_path"],
+            "herdr_agent_name": canonical["herdr_agent_name"],
+            "herdr_terminal_id": canonical["herdr_terminal_id"],
+            "herdr_pane_id": canonical["herdr_pane_id"],
+            "herdr_agent_session_source": canonical["herdr_agent_session_source"],
+            "herdr_agent_session_kind": canonical["herdr_agent_session_kind"],
+            "herdr_agent_session_value": canonical["herdr_agent_session_value"],
+            "pane_agent": canonical["pane_agent"],
+            "process_identity": canonical["process_identity"],
+        })
+        rotated = {
+            "name": "tether_fedcba9876543210",
+            "terminal_id": "term_7654321fedcba98",
+            "pane_id": canonical["herdr_pane_id"],
+            "agent": "codex",
+            "launch_pending": False,
+            "agent_session": {
+                "source": canonical["herdr_agent_session_source"],
+                "agent": "codex",
+                "kind": canonical["herdr_agent_session_kind"],
+                "value": canonical["herdr_agent_session_value"],
+            },
+        }
+        missing_name = self.runtime.NativeContinuationError(
+            "old Herdr name is gone",
+            code="native_continuation_failed",
+        )
+        responses = (
+            {"type": "pong", "protocol": 19},
+            missing_name,
+            {"type": "agent_info", "agent": rotated},
+            {"type": "pane_process_info", "process_info": {"pane_id": "w1:p1"}},
+        )
+        restarted_identity = self.process_identity(
+            boot="00000000-0000-4000-8000-000000000002",
+            pid=300,
+            start="30000",
+            terminal=rotated["terminal_id"],
+        )
+        with mock.patch.object(
+            self.runtime, "_herdr_call", side_effect=responses
+        ) as call, mock.patch.object(
+            self.runtime,
+            "_herdr_process_identity",
+            return_value=restarted_identity,
+        ):
+            agent, pane_id = self.runtime._current_herdr_agent(binding)
+
+        self.assertEqual(agent["name"], "tether_fedcba9876543210")
+        self.assertEqual(pane_id, canonical["herdr_pane_id"])
+        self.assertEqual(
+            call.call_args_list[2].args[2],
+            {"target": canonical["herdr_pane_id"]},
+        )
+
+    def test_reboot_fallback_rejects_a_different_native_session(self):
+        canonical = self.runtime.Store.validate_source("codex_session", self.source())
+        binding = types.SimpleNamespace(**{
+            "herdr_socket_path": canonical["herdr_socket_path"],
+            "herdr_agent_name": canonical["herdr_agent_name"],
+            "herdr_terminal_id": canonical["herdr_terminal_id"],
+            "herdr_pane_id": canonical["herdr_pane_id"],
+            "herdr_agent_session_source": canonical["herdr_agent_session_source"],
+            "herdr_agent_session_kind": canonical["herdr_agent_session_kind"],
+            "herdr_agent_session_value": canonical["herdr_agent_session_value"],
+            "pane_agent": canonical["pane_agent"],
+            "process_identity": canonical["process_identity"],
+        })
+        replacement = {
+            "name": "tether_fedcba9876543210",
+            "terminal_id": "term_7654321fedcba98",
+            "pane_id": canonical["herdr_pane_id"],
+            "agent": "codex",
+            "launch_pending": False,
+            "agent_session": {
+                "source": canonical["herdr_agent_session_source"],
+                "agent": "codex",
+                "kind": canonical["herdr_agent_session_kind"],
+                "value": "different-session",
+            },
+        }
+        responses = (
+            {"type": "pong", "protocol": 19},
+            self.runtime.NativeContinuationError("old name is gone"),
+            {"type": "agent_info", "agent": replacement},
+        )
+        with mock.patch.object(
+            self.runtime, "_herdr_call", side_effect=responses
+        ), self.assertRaises(self.runtime.NativeContinuationError) as raised:
+            self.runtime._current_herdr_agent(binding)
+
+        self.assertEqual(raised.exception.code, "process_identity_changed")
+
     def test_live_handoff_still_rejects_replaced_process(self):
         self.assertFalse(
             self.runtime._same_herdr_process_identity(
@@ -471,7 +568,7 @@ class HerdrEndpointTest(unittest.TestCase):
         )
         result = broker._herdr_context({
             "herdr_terminal_id": "term_7654321fedcba98",
-            "herdr_agent_name": "tether_0123456789abcdef",
+            "herdr_agent_name": "tether_fedcba9876543210",
             "herdr_agent_session_value": "codex-session-1",
             "herdr_agent": "codex",
         })
@@ -481,6 +578,86 @@ class HerdrEndpointTest(unittest.TestCase):
         serialized = json.dumps(result)
         self.assertNotIn("codex-session-1", serialized)
         self.assertNotIn("herdr.sock", serialized)
+
+    def test_stable_identity_migration_keeps_work_owner_over_newer_duplicate(self):
+        store = self.runtime.Store(self.home / "bridges.db")
+        first = store.create({
+            "source_kind": "codex_session",
+            "source": self.source(),
+            "owner_user_id": "*",
+            "team_id": "T12345678",
+            "channel_id": "C12345678",
+            "idempotency_key": "herdr-migration-first",
+        })
+        store.bind(first.bridge_id, "1234567890.123456")
+        self.assertTrue(
+            store.enqueue_event(
+                "1785000100.000001",
+                first.bridge_id,
+                "durable queued work",
+            )
+        )
+        second_source = self.source(
+            session_id="codex-session-2",
+            herdr_terminal_id="term_7654321fedcba98",
+            herdr_pane_id="w1:p2",
+            herdr_agent_name="tether_fedcba9876543210",
+            herdr_agent_session_value="codex-session-2",
+            process_identity=self.process_identity(
+                pid=201,
+                start="20001",
+                terminal="term_7654321fedcba98",
+            ),
+        )
+        second = store.create({
+            "source_kind": "codex_session",
+            "source": second_source,
+            "owner_user_id": "*",
+            "team_id": "T12345678",
+            "channel_id": "C87654321",
+            "idempotency_key": "herdr-migration-second",
+        })
+        store.bind(second.bridge_id, "1234567890.654321")
+
+        # Simulate two bindings created by the previous name-based endpoint
+        # key: their stored keys remain distinct even though their canonical
+        # durable Herdr identity now agrees.
+        rotated_same_session = self.source(
+            herdr_terminal_id="term_7654321fedcba98",
+            herdr_agent_name="tether_fedcba9876543210",
+            process_identity=self.process_identity(
+                pid=201,
+                start="20001",
+                terminal="term_7654321fedcba98",
+            ),
+        )
+        with store.connect() as database:
+            database.execute(
+                "UPDATE bridges SET updated_at='2026-08-11 00:00:00' "
+                "WHERE bridge_id=?",
+                (first.bridge_id,),
+            )
+            database.execute(
+                """
+                UPDATE bridges
+                SET source_json=?,updated_at='2026-08-12 00:00:00'
+                WHERE bridge_id=?
+                """,
+                (
+                    json.dumps(rotated_same_session, sort_keys=True),
+                    second.bridge_id,
+                ),
+            )
+
+        reopened = self.runtime.Store(store.path)
+
+        self.assertEqual(reopened.get(first.bridge_id).status, "active")
+        migrated = reopened.get(second.bridge_id)
+        self.assertEqual(migrated.status, "closed")
+        self.assertEqual(
+            migrated.binding_error_code,
+            "endpoint_conflict_migrated",
+        )
 
     def test_delivery_revalidates_before_and_after_atomic_prompt(self):
         canonical = self.runtime.Store.validate_source(
@@ -499,7 +676,7 @@ class HerdrEndpointTest(unittest.TestCase):
         prompted = {
             "type": "agent_prompted",
             "agent": {
-                "name": "tether_0123456789abcdef",
+                "name": "tether_fedcba9876543210",
                 "terminal_id": "term_7654321fedcba98",
                 "agent": "codex",
             },
@@ -508,7 +685,10 @@ class HerdrEndpointTest(unittest.TestCase):
             self.runtime,
             "_current_herdr_agent",
             return_value=(
-                {"terminal_id": "term_7654321fedcba98"},
+                {
+                    "name": "tether_fedcba9876543210",
+                    "terminal_id": "term_7654321fedcba98",
+                },
                 "w1:p1",
             ),
         ) as current, mock.patch.object(
@@ -530,11 +710,39 @@ class HerdrEndpointTest(unittest.TestCase):
         self.assertEqual(
             call.call_args.args[2],
             {
-                "target": "tether_0123456789abcdef",
+                "target": "tether_fedcba9876543210",
                 "text": "private instruction",
             },
         )
         self.assertTrue(call.call_args.kwargs["mutation"])
+
+    def test_delivery_preflight_failure_is_proven_not_started(self):
+        canonical = self.runtime.Store.validate_source(
+            "codex_session", self.source()
+        )
+        bridge = types.SimpleNamespace(
+            bridge_id="brg_0123456789abcdef01234567",
+            source_kind="codex_session",
+            source=canonical,
+            binding_version=3,
+            binding_state="verified",
+            binding_error_code="",
+            delivery_policy="native_required",
+            endpoint_kind="herdr_agent",
+        )
+        with mock.patch.object(
+            self.runtime,
+            "_current_herdr_agent",
+            side_effect=self.runtime.NativeContinuationError(
+                "Herdr agent unavailable",
+                code="native_continuation_failed",
+            ),
+        ), self.assertRaises(self.runtime.NativeContinuationError) as raised:
+            self.runtime.deliver_herdr(
+                bridge, "follow-up", "att_0123456789abcdef"
+            )
+
+        self.assertEqual(raised.exception.code, "terminal_submit_not_started")
 
 
 if __name__ == "__main__":

@@ -801,6 +801,37 @@ class TetherCliTest(unittest.TestCase):
         )
         self.assertEqual(payload["status"]["protocol_version"], 6)
 
+    def test_doctor_fails_on_unresolved_delivery_blocker(self) -> None:
+        self.write_managed_install(harness="codex")
+        with FakeBroker(
+            self.root,
+            lambda _request: self.response(
+                {
+                    "ok": True,
+                    "implementation": "tether",
+                    "protocol_version": 6,
+                    "allowed_user_count": 1,
+                    "owner_configured": True,
+                    "slack_transport_connected": True,
+                    "reply_poll_healthy": True,
+                    "peer_uid_enforced": True,
+                    "root_refused": True,
+                    "queued_delivery_count": 10,
+                    "uncertain_delivery_count": 1,
+                    "blocked_bridge_count": 1,
+                }
+            ),
+        ) as broker:
+            result = self.run_cli("doctor", socket_path=broker.path)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "FAIL durable delivery blocked: unresolved=1 "
+            "blocked_threads=1; run tether unresolved",
+            result.stdout,
+        )
+        self.assertIn("WARN queued Slack follow-ups=10", result.stdout)
+
     def test_doctor_fails_when_a_managed_file_drifted(self) -> None:
         self.write_managed_install(harness="codex")
         runtime = self.root / "data" / "tether" / "bridge_runtime.py"

@@ -1163,15 +1163,29 @@ function statusLines(status) {
   } else {
     lines.push("WARN best-effort Slack polling health has not been observed");
   }
+  const uncertain = Number(status.uncertain_delivery_count || 0);
+  const blocked = Number(status.blocked_bridge_count || 0);
+  const queued = Number(status.queued_delivery_count || 0);
+  if (uncertain > 0 || blocked > 0) {
+    lines.push(
+      `FAIL durable delivery blocked: unresolved=${uncertain} blocked_threads=${blocked}; run tether unresolved`,
+    );
+  } else {
+    lines.push("ok durable delivery queue has no unresolved blockers");
+  }
+  if (queued > 0) {
+    lines.push(`WARN queued Slack follow-ups=${queued}`);
+  }
   return lines;
 }
 
 async function runStatus(options) {
   const status = await brokerCall({ op: "status" }, options);
+  const checks = statusLines(status);
   if (options.json) {
     writeJson(process.stdout, status);
   } else {
-    process.stdout.write(`${statusLines(status).join("\n")}\n`);
+    process.stdout.write(`${checks.join("\n")}\n`);
   }
   const failed = status.implementation !== "tether" ||
     !Number.isInteger(status.protocol_version) ||
@@ -1180,7 +1194,8 @@ async function runStatus(options) {
     status.root_refused !== true ||
     !status.owner_configured ||
     !(status.allowed_user_count > 0) ||
-    status.slack_transport_connected !== true;
+    status.slack_transport_connected !== true ||
+    checks.some((line) => line.startsWith("FAIL"));
   return failed ? 1 : 0;
 }
 

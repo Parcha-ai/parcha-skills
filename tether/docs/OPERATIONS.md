@@ -175,8 +175,8 @@ tether maintenance
 
 | Command | Use |
 | --- | --- |
-| `status` | Show local plugin, broker, binding, and queue state |
-| `doctor` | Validate compatibility, broker privacy, allowlists, plugin protocol, and ingress readiness |
+| `status` | Show local plugin, broker, binding, and durable delivery state; exit nonzero when delivery is blocked |
+| `doctor` | Validate compatibility, broker privacy, allowlists, plugin protocol, ingress readiness, and unresolved delivery blockers |
 | `unresolved` | List uncertain Hermes ingress and native attempts that require an operator decision |
 | `maintenance` | Run bounded retention and recovery maintenance |
 
@@ -220,6 +220,11 @@ Native ingress transferred to an attempt cannot be retried directly; resolve
 the attempt. Rebind and close remain blocked while related work is uncertain.
 Repeating the same terminal decision is safe; a conflicting decision fails
 closed.
+
+A read-only Herdr identity preflight that proves `agent.prompt` was never sent
+is retryable and is recovered automatically. Tether still retains any failure
+that occurred during or after terminal submission as `uncertain`; those cases
+require the operator decision above.
 
 ## Message input
 

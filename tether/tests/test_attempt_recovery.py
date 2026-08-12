@@ -142,6 +142,44 @@ class AttemptRecoveryTest(unittest.TestCase):
                     text=text,
                 )
 
+    def test_delivery_health_reports_head_of_line_blocking(self):
+        bridge = self._bound_bridge("delivery-health")
+        attempt_id = self._attempt(
+            bridge,
+            event_id="1785000000.000901",
+            awaiting_ack=False,
+        )
+        self.assertTrue(
+            self.store.mark_attempt_submitting(
+                attempt_id,
+                bridge.bridge_id,
+                bridge.binding_generation,
+            )
+        )
+        self.assertTrue(
+            self.store.mark_attempt_uncertain(
+                attempt_id,
+                bridge.bridge_id,
+                "terminal_submit_uncertain",
+            )
+        )
+        self.assertTrue(
+            self.store.enqueue_event(
+                "1785000000.000902",
+                bridge.bridge_id,
+                "later follow-up",
+            )
+        )
+
+        self.assertEqual(
+            self.store.delivery_health(),
+            {
+                "queued_delivery_count": 1,
+                "uncertain_delivery_count": 1,
+                "blocked_bridge_count": 1,
+            },
+        )
+
     def test_wrong_bridge_reply_key_cannot_post_or_suppress(self):
         for index, text in enumerate(("completed", "NO_REPLY"), start=1):
             with self.subTest(text=text):
@@ -781,6 +819,48 @@ class PluginAttemptRecoveryTest(unittest.TestCase):
                 (attempt_id,),
             ).fetchone()[0]
         self.assertEqual(delivery_kind, "herdr")
+
+    def test_restart_requeues_legacy_safe_herdr_preflight_failure(self):
+        bridge = self._herdr_bridge("herdr-safe-preflight")
+        event_id = "1785000100.000249"
+        items = self._claimed_item(bridge, event_id)
+        attempt_id = self.runtime.delivery_attempt_id(
+            bridge.bridge_id,
+            [item["event_id"] for item in items],
+            bridge.binding_generation,
+        )
+        self.assertTrue(
+            self.plugin.store.prepare_delivery_attempt(
+                [event_id],
+                bridge.bridge_id,
+                bridge.binding_generation,
+                attempt_id,
+                delivery_kind="herdr",
+            )
+        )
+        self.assertTrue(
+            self.plugin.store.mark_attempt_submitting(
+                attempt_id,
+                bridge.bridge_id,
+                bridge.binding_generation,
+            )
+        )
+        self.assertTrue(
+            self.plugin.store.mark_attempt_uncertain(
+                attempt_id,
+                bridge.bridge_id,
+                "native_continuation_failed",
+            )
+        )
+
+        restarted = self.runtime.Store(self.plugin.store.path)
+        claimed = restarted.claim_event_batch(bridge.bridge_id)
+
+        self.assertEqual([item["event_id"] for item in claimed], [event_id])
+        self.assertEqual(
+            restarted.attempt_state(attempt_id, bridge.bridge_id),
+            "requeued",
+        )
 
     def test_bound_herdr_cancel_interrupts_and_closes_exact_attempt(self):
         bridge = self._herdr_bridge("herdr-cancel")

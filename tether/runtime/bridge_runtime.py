@@ -1314,7 +1314,10 @@ def endpoint_identity_key(binding: SourceBinding) -> str:
         identity = (
             "herdr_agent",
             binding.herdr_socket_path,
-            binding.herdr_agent_name,
+            binding.pane_agent,
+            binding.herdr_agent_session_source,
+            binding.herdr_agent_session_kind,
+            binding.herdr_agent_session_value,
         )
     elif binding.endpoint_kind == "detached_native":
         identity = (
@@ -1879,6 +1882,12 @@ class Store:
               )
             """
         )
+        # Endpoint identity can intentionally become more stable between
+        # releases (for example, Herdr agent names are ephemeral across a
+        # restart). Drop the old uniqueness index inside this migration
+        # transaction before recomputing keys, then deterministically close
+        # older duplicate owners and recreate it below.
+        db.execute("DROP INDEX IF EXISTS bridge_endpoint_owner")
         cls._backfill_bindings(db)
         duplicate_keys = db.execute(
             """
@@ -1892,7 +1901,25 @@ class Store:
                 """
                 SELECT bridge_id FROM bridges
                 WHERE endpoint_key=? AND status IN ('pending','active')
-                ORDER BY updated_at DESC,created_at DESC,rowid DESC
+                ORDER BY
+                  CASE WHEN
+                    EXISTS (
+                      SELECT 1 FROM bridge_events
+                      WHERE bridge_events.bridge_id=bridges.bridge_id
+                        AND bridge_events.state IN (
+                          'queued','pending','processing','prepared','submitting',
+                          'uncertain','awaiting_ack','replying'
+                        )
+                    ) OR EXISTS (
+                      SELECT 1 FROM thread_ingress
+                      WHERE thread_ingress.bridge_id=bridges.bridge_id
+                        AND thread_ingress.state IN (
+                          'pending','processing','uncertain'
+                        )
+                    )
+                    THEN 0 ELSE 1
+                  END,
+                  updated_at DESC,created_at DESC,rowid DESC
                 """,
                 (duplicate["endpoint_key"],),
             ).fetchall()
@@ -2770,7 +2797,7 @@ class Store:
             source = bridge.source
             if (
                 source.get("endpoint_kind") == "herdr_agent"
-                and source.get("herdr_agent_name") == agent_name
+                and source.get("pane_agent") == agent
                 and source.get("herdr_agent_session_value") == native_session_value
             ):
                 matches.append(bridge)
@@ -2785,7 +2812,8 @@ class Store:
                     """
                     SELECT count(*) FROM bridge_events
                     WHERE bridge_id=? AND state IN (
-                      'pending','processing','prepared','submitting','awaiting_ack','replying'
+                      'queued','pending','processing','prepared','submitting',
+                      'uncertain','awaiting_ack','replying'
                     )
                     """,
                     (bridge_id,),
@@ -2809,6 +2837,48 @@ class Store:
                 ).fetchone()[0]
             )
         return {"queued": queued, "uncertain": uncertain}
+
+    def delivery_health(self) -> dict[str, int]:
+        with self.connect() as db:
+            queued = int(
+                db.execute(
+                    "SELECT count(*) FROM bridge_events WHERE state='queued'"
+                ).fetchone()[0]
+            )
+            uncertain_attempts = int(
+                db.execute(
+                    "SELECT count(*) FROM bridge_attempts WHERE state='uncertain'"
+                ).fetchone()[0]
+            )
+            uncertain_ingress = int(
+                db.execute(
+                    "SELECT count(*) FROM thread_ingress WHERE state='uncertain'"
+                ).fetchone()[0]
+            )
+            blocked_bridges = int(
+                db.execute(
+                    """
+                    SELECT count(DISTINCT queued.bridge_id)
+                    FROM bridge_events AS queued
+                    WHERE queued.state='queued'
+                      AND EXISTS (
+                        SELECT 1 FROM bridge_events AS active
+                        WHERE active.bridge_id=queued.bridge_id
+                          AND active.state IN (
+                            'processing','prepared','submitting','uncertain',
+                            'awaiting_ack','replying'
+                          )
+                      )
+                    """
+                ).fetchone()[0]
+            )
+        return {
+            "queued_delivery_count": queued,
+            "uncertain_delivery_count": (
+                uncertain_attempts + uncertain_ingress
+            ),
+            "blocked_bridge_count": blocked_bridges,
+        }
 
     def rebind(
         self,
@@ -5683,6 +5753,53 @@ class Store:
         del timeout_seconds
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            # Older Herdr delivery code recorded read-only identity preflight
+            # failures as uncertain. No agent.prompt mutation had started when
+            # this code was persisted; mutation-path failures use the distinct
+            # terminal_submit_uncertain code. Recover these legacy safe failures
+            # automatically so one reboot cannot permanently head-of-line block
+            # every later reply in the thread.
+            safe_herdr_preflight = db.execute(
+                """
+                SELECT a.attempt_id,a.bridge_id FROM bridge_attempts AS a
+                WHERE a.delivery_kind='herdr' AND a.state='uncertain'
+                  AND a.error_code='native_continuation_failed'
+                  AND EXISTS (
+                      SELECT 1 FROM bridge_events AS e
+                      WHERE e.bridge_id=a.bridge_id
+                        AND e.attempt_id=a.attempt_id
+                        AND e.state='uncertain'
+                        AND e.error='native_continuation_failed'
+                  )
+                """
+            ).fetchall()
+            for row in safe_herdr_preflight:
+                db.execute(
+                    """
+                    UPDATE bridge_events
+                    SET state='queued',attempt_id=NULL,binding_generation=NULL,
+                        error=NULL,updated_at=CURRENT_TIMESTAMP
+                    WHERE bridge_id=? AND attempt_id=? AND state='uncertain'
+                      AND error='native_continuation_failed'
+                    """,
+                    (row["bridge_id"], row["attempt_id"]),
+                )
+            if safe_herdr_preflight:
+                db.executemany(
+                    """
+                    UPDATE bridge_attempts
+                    SET state='requeued',
+                        error_code='recovered_safe_herdr_preflight',
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE attempt_id=? AND bridge_id=? AND state='uncertain'
+                      AND delivery_kind='herdr'
+                      AND error_code='native_continuation_failed'
+                    """,
+                    (
+                        (row["attempt_id"], row["bridge_id"])
+                        for row in safe_herdr_preflight
+                    ),
+                )
             prepared = db.execute(
                 "SELECT attempt_id,bridge_id FROM bridge_attempts WHERE state='prepared'"
             ).fetchall()
@@ -5726,7 +5843,7 @@ class Store:
                 """
             )
             return {
-                "requeued": len(prepared),
+                "requeued": len(safe_herdr_preflight) + len(prepared),
                 "uncertain": int(uncertain.rowcount),
                 "expired": 0,
             }
@@ -7880,6 +7997,7 @@ class Broker:
             "broker_uid": os.geteuid(),
             "peer_uid_enforced": True,
             "root_refused": True,
+            **self.store.delivery_health(),
         }
         if self.health_provider is not None:
             health = self.health_provider()
@@ -10348,7 +10466,22 @@ def _herdr_process_identity(
                 if value
             ]
             executable_link = process_dir / "exe"
-            executable_path = str(executable_link.resolve(strict=True))
+            try:
+                executable_path = str(executable_link.resolve(strict=True))
+            except FileNotFoundError:
+                # The running agent's binary was replaced on disk (an in-place
+                # auto-update deletes the old version directory while the
+                # process still runs). /proc/<pid>/exe then resolves to
+                # "<path> (deleted)" and strict resolution raises. The process
+                # is still the genuine foreground agent, so recover its real
+                # path instead of dropping the only valid candidate — losing it
+                # here silently breaks pane binding for the rest of the session.
+                raw_target = os.readlink(executable_link)
+                executable_path = (
+                    raw_target[: -len(" (deleted)")]
+                    if raw_target.endswith(" (deleted)")
+                    else raw_target
+                )
             executable_stat = executable_link.stat()
             agent, _quality = _process_agent(
                 executable_path,
@@ -10569,12 +10702,27 @@ def _current_herdr_agent(binding: SourceBinding) -> tuple[dict[str, Any], str]:
             "process_identity_changed",
             "Herdr protocol changed after this binding was captured",
         )
-    agent = _herdr_result_record(
-        _herdr_call(
+    try:
+        result = _herdr_call(
             binding.herdr_socket_path,
             "agent.get",
             {"target": binding.herdr_agent_name},
-        ),
+        )
+    except NativeContinuationError as named_error:
+        # Herdr agent names and terminal IDs belong to one server incarnation.
+        # A host or Herdr restart may rotate both while preserving the exact
+        # pane and official native-session reference. Resolve through the
+        # stable pane before deciding that the durable binding is stale.
+        try:
+            result = _herdr_call(
+                binding.herdr_socket_path,
+                "agent.get",
+                {"target": binding.herdr_pane_id},
+            )
+        except NativeContinuationError:
+            raise named_error
+    agent = _herdr_result_record(
+        result,
         result_type="agent_info",
         field="agent",
     )
@@ -10586,8 +10734,13 @@ def _current_herdr_agent(binding: SourceBinding) -> tuple[dict[str, Any], str]:
         "value": binding.herdr_agent_session_value,
     }
     current_terminal = str(agent.get("terminal_id") or "")
+    current_pane = str(agent.get("pane_id") or "")
+    stable_transport_identity = (
+        str(agent.get("name") or "") == binding.herdr_agent_name
+        or current_pane == binding.herdr_pane_id
+    )
     if (
-        str(agent.get("name") or "") != binding.herdr_agent_name
+        not stable_transport_identity
         or not HERDR_TERMINAL_ID_PATTERN.fullmatch(current_terminal)
         or str(agent.get("agent") or "") != binding.pane_agent
         or native_session != expected_session
@@ -10597,7 +10750,6 @@ def _current_herdr_agent(binding: SourceBinding) -> tuple[dict[str, Any], str]:
             "process_identity_changed",
             "captured Herdr terminal now hosts a different agent session",
         )
-    current_pane = str(agent.get("pane_id") or "")
     process_info = _herdr_result_record(
         _herdr_call(
             binding.herdr_socket_path,
@@ -10612,7 +10764,15 @@ def _current_herdr_agent(binding: SourceBinding) -> tuple[dict[str, Any], str]:
         terminal_id=current_terminal,
         expected_agent=binding.pane_agent,
     )
-    if not _same_herdr_process_identity(process_identity, binding.process_identity):
+    same_process = _same_herdr_process_identity(
+        process_identity,
+        binding.process_identity,
+    )
+    same_session_restarted_in_bound_pane = (
+        current_pane == binding.herdr_pane_id
+        and native_session == expected_session
+    )
+    if not same_process and not same_session_restarted_in_bound_pane:
         raise _binding_error(
             "process_identity_changed",
             "captured Herdr terminal now hosts a different process incarnation",
@@ -10690,13 +10850,24 @@ def deliver_herdr(
     attempt_id: str | None = None,
 ) -> str:
     binding = require_deliverable_binding(bridge, "herdr_agent")
-    current_agent, _current_pane = _current_herdr_agent(binding)
+    try:
+        current_agent, current_pane = _current_herdr_agent(binding)
+    except NativeContinuationError as exc:
+        # This is a read-only preflight. It is always safe to retry because no
+        # agent.prompt request has been sent yet.
+        raise NativeContinuationError(
+            "Herdr delivery preflight did not reach the bound native session",
+            code="terminal_submit_not_started",
+            binding_id=bridge.bridge_id,
+        ) from exc
     current_terminal = str(current_agent.get("terminal_id") or "")
+    current_name = str(current_agent.get("name") or "")
+    current_target = current_name or current_pane
     marker, instruction = _live_attempt_instruction(bridge, text, attempt_id)
     result = _herdr_call(
         binding.herdr_socket_path,
         "agent.prompt",
-        {"target": binding.herdr_agent_name, "text": instruction},
+        {"target": current_target, "text": instruction},
         mutation=True,
     )
     agent = _herdr_result_record(
@@ -10705,7 +10876,7 @@ def deliver_herdr(
         field="agent",
     )
     if (
-        str(agent.get("name") or "") != binding.herdr_agent_name
+        str(agent.get("name") or "") != current_name
         or str(agent.get("terminal_id") or "") != current_terminal
         or str(agent.get("agent") or "") != binding.pane_agent
     ):
@@ -10746,10 +10917,29 @@ def _process_agent(
 ) -> tuple[str, int]:
     try:
         executable_path = str(Path(executable).resolve(strict=True))
-    except (FileNotFoundError, PermissionError, OSError):
+    except FileNotFoundError:
+        # An in-place agent auto-update deletes the running release's file, so
+        # its path no longer resolves even though the process is still the
+        # genuine agent. Fall back to the unresolved path: it is only ever
+        # matched against the trusted set below, so an unknown path still
+        # yields no agent — this widens nothing, it just stops a mid-session
+        # upgrade from silently invalidating the binding.
+        executable_path = str(executable)
+    except (PermissionError, OSError):
         return "", 0
     for agent, paths in trusted_paths.items():
         if agent in allowed and executable_path in paths:
+            return agent, 3
+    # A release removed by an in-place update cannot appear in the on-disk
+    # trusted set, so an exact match is impossible for a session that upgraded
+    # mid-flight. Accept a path that sits directly alongside an already-trusted
+    # release (same install root) — the bound is the trusted install directory,
+    # and callers separately prove the process owns the pane's foreground group.
+    candidate = Path(executable_path)
+    for agent, paths in trusted_paths.items():
+        if agent not in allowed:
+            continue
+        if any(candidate.parent == Path(known).parent for known in paths):
             return agent, 3
     runtime = Path(executable_path).name
     if runtime in {
@@ -10810,6 +11000,27 @@ def _trusted_agent_paths(
         except (NativeContinuationError, FileNotFoundError, PermissionError, OSError):
             continue
         trusted[declared_agent].add(canonical)
+        # An agent that auto-updates in place installs each release into its own
+        # sibling directory (…/versions/<semver>/…) and repoints the launcher
+        # symlink. A session started before the update still runs the older
+        # sibling, which is the same trusted install — trust the siblings too so
+        # a mid-session upgrade does not silently break pane binding.
+        canonical_path = Path(canonical)
+        for parent in canonical_path.parents:
+            if parent.name != "versions":
+                continue
+            suffix = canonical_path.relative_to(parent).parts[1:]
+            try:
+                # Each release may be a file (…/versions/<semver>) or a
+                # directory (…/versions/<semver>/bin/<agent>); accept both.
+                siblings = list(parent.iterdir())
+            except OSError:
+                break
+            for sibling in siblings:
+                trusted[declared_agent].add(
+                    str(sibling.joinpath(*suffix)) if suffix else str(sibling)
+                )
+            break
     return {agent: paths for agent, paths in trusted.items() if paths}
 
 

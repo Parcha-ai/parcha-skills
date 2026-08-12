@@ -2714,6 +2714,15 @@ def _suppress_bridge_reaction(event, gateway):
 
 
 def _failure_reason(exc: Exception) -> str:
+    code = str(getattr(exc, "code", "") or "")
+    if code == "terminal_submit_not_started":
+        return "the live session was not ready before submission; retry is safe"
+    if code in {
+        "binding_rebind_required",
+        "process_identity_changed",
+        "cwd_identity_changed",
+    }:
+        return "the bound live session identity changed and must be revalidated"
     text = str(exc).lower()
     if "credential helper" in text:
         return (
@@ -2980,12 +2989,19 @@ def _recover_queued_events():
                         _run_recovered_event(bridge, items)
                     except Exception as exc:
                         reason = _failure_reason(exc)
+                        error_code = str(
+                            getattr(exc, "code", type(exc).__name__)
+                        )
                         log.error(
-                            "Recovered bridge reply failed for %s: %s",
+                            "Recovered bridge reply failed for %s [%s]: %s",
                             bridge_id,
+                            error_code,
                             reason,
                         )
-                        if reason != _CANCELLED_REASON:
+                        if (
+                            reason != _CANCELLED_REASON
+                            and error_code != "terminal_submit_not_started"
+                        ):
                             notice_seed = str(items[0]["event_id"])
                             try:
                                 broker_call({
@@ -3092,6 +3108,9 @@ async def _drain_bridge(bridge_id, gateway, platform):
                     )
             except Exception as exc:
                 reason = _failure_reason(exc)
+                error_code = str(
+                    getattr(exc, "code", type(exc).__name__)
+                )
                 if attempt_id is None:
                     _finish_batch(items, f"{type(exc).__name__}: {reason}")
                 elif store.attempt_state(attempt_id, bridge.bridge_id) in {
@@ -3103,11 +3122,20 @@ async def _drain_bridge(bridge_id, gateway, platform):
                         bridge.bridge_id,
                         f"{type(exc).__name__}: {reason}",
                     )
-                log.error("Bridge reply failed for %s: %s", bridge.bridge_id, reason)
+                log.error(
+                    "Bridge reply failed for %s [%s]: %s",
+                    bridge.bridge_id,
+                    error_code,
+                    reason,
+                )
                 cancelled = (
                     cancellation is not None and cancellation.is_set()
                 )
-                if not cancelled and reason != _CANCELLED_REASON:
+                if (
+                    not cancelled
+                    and reason != _CANCELLED_REASON
+                    and error_code != "terminal_submit_not_started"
+                ):
                     notice_seed = attempt_id or str(items[0]["event_id"])
                     asyncio.get_running_loop().create_task(
                         _post_control_notice(
