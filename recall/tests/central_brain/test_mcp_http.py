@@ -134,7 +134,7 @@ class FakeStore:
             "stopped_reason": "completed",
             "output_truncated": False,
             "opened_receipts": [],
-            "datasets_available": 3,
+            "datasets_available": 4,
             "sources_available": 1,
             "buckets_available": 1,
             "projection_pending": 0,
@@ -1042,7 +1042,7 @@ class RemoteMcpContractTest(unittest.TestCase):
             )
         self.assertEqual(status, 200)
         result = json.loads(raw)["result"]["structuredContent"]
-        self.assertEqual(result["datasets_available"], 3)
+        self.assertEqual(result["datasets_available"], 4)
         self.assertIn(
             (
                 "scan",
