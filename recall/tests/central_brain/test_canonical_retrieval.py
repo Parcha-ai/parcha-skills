@@ -314,6 +314,67 @@ class ParallelExecRetrieval(BoundCanonicalRetrieval):
 
 
 class CanonicalRetrievalDeadlineTest(unittest.TestCase):
+    def test_parquet_scan_stages_only_dataset_families_named_by_program(self) -> None:
+        class Inspector:
+            calls = []
+
+            @classmethod
+            def execute_scan(cls, **arguments):
+                cls.calls.append(arguments)
+                return {
+                    "provider": "synthetic-archil",
+                    "stdout": "[]",
+                    "stderr": "",
+                    "exit_code": 0,
+                    "complete": True,
+                    "stopped_reason": "completed",
+                    "output_truncated": False,
+                    "objects_unavailable": 0,
+                    "timing": {"totalMs": 1},
+                }
+
+        class Retrieval(BoundCanonicalRetrieval):
+            def _sources(self, **_arguments):
+                return ["source:test"]
+
+            def _parquet_shards(self, _sources, *, since, until):
+                return ([
+                    {
+                        "source_id": "source:test",
+                        "bucket_start": date(2026, 8, 1),
+                        "dataset": dataset,
+                        "shard_index": 0,
+                        "object_key": f"objects/{index:02x}/" + f"{index:x}" * 64,
+                        "content_sha256": f"{index + 4:x}" * 64,
+                    }
+                    for index, dataset in enumerate(
+                        ("documents", "passages", "records", "actors"),
+                        start=1,
+                    )
+                ], 0)
+
+            def _verify_parquet_receipts(self, *_arguments, **_keywords):
+                return None
+
+        result = Retrieval(
+            DeadlineStore(),
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=("source:test",),
+            deep_inspector=Inspector(),
+        ).execute_parquet_scan(
+            "duckdb -json -c \"select * from read_parquet("
+            "'/datasets/*/*/passages-part-*.parquet')\"",
+            filters={},
+            timeout_seconds=60,
+        )
+        self.assertEqual(result["datasets_available"], 1)
+        self.assertEqual(len(Inspector.calls[-1]["objects"]), 1)
+        self.assertIn(
+            "passages-part-",
+            next(iter(Inspector.calls[-1]["dataset_aliases"].values())),
+        )
+
     def test_parquet_scan_caps_stdout_at_sixteen_kibibytes_truthfully(self) -> None:
         class Inspector:
             @staticmethod

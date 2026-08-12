@@ -414,7 +414,7 @@ def main() -> None:
         )
         assert len(scanned["opened_receipts"]) == 1
         assert scanned["sources_available"] == 1
-        assert scanned["datasets_available"] == 4
+        assert scanned["datasets_available"] == 1
         assert all(
             alias.startswith("s1/2026-08/")
             for alias in inspector.calls[0]["dataset_aliases"].values()
