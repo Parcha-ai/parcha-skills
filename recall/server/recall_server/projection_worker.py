@@ -51,26 +51,30 @@ def run_projection_worker(
             max_batches=max_batches_per_cycle,
             concurrency=passage_concurrency,
         )
+        documents = logical.project_pending(
+            tenant_id=tenant_id,
+            batch_size=logical_batch_size,
+            max_batches=max_batches_per_cycle,
+            upload_concurrency=upload_concurrency,
+        )
+        # Parquet shards are source/month materializations of the authoritative
+        # logical documents. During a large retrofit, every logical batch can
+        # dirty the same shards. Wait until that queue drains so each dirty
+        # shard is rebuilt once instead of rewriting the corpus every cycle.
         scanned = (
             scan.project_pending(
                 tenant_id=tenant_id,
                 batch_size=min(4, logical_batch_size),
                 max_batches=max_batches_per_cycle,
             )
-            if scan is not None
+            if scan is not None and int(documents.get("pending", 0)) == 0
             else {
-                "status": "complete",
+                "status": "deferred" if scan is not None else "complete",
                 "shards": 0,
                 "rows": 0,
                 "stale": 0,
                 "contended": 0,
             }
-        )
-        documents = logical.project_pending(
-            tenant_id=tenant_id,
-            batch_size=logical_batch_size,
-            max_batches=max_batches_per_cycle,
-            upload_concurrency=upload_concurrency,
         )
         result: dict[str, int | str] = {
             "status": (
@@ -87,6 +91,7 @@ def run_projection_worker(
                 else "pending"
             ),
             "documents": int(documents["documents"]),
+            "logical_pending": int(documents.get("pending", 0)),
             "records": int(documents["records"]),
             "passage_documents": int(projected["documents"]),
             "passages": int(projected["passages"]),
@@ -100,7 +105,7 @@ def run_projection_worker(
             "cleanup_failures": int(documents["cleanup_failures"]),
         }
         LOG.info(
-            "projection cycle status=%s documents=%s records=%s "
+            "projection cycle status=%s documents=%s logical_pending=%s records=%s "
             "passage_documents=%s passages=%s embedded=%s parquet_shards=%s "
             "parquet_rows=%s parquet_stale=%s parquet_contended=%s "
             "stale=%s pruned=%s "
@@ -110,6 +115,7 @@ def run_projection_worker(
                 for key in (
                     "status",
                     "documents",
+                    "logical_pending",
                     "records",
                     "passage_documents",
                     "passages",

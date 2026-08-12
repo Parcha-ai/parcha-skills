@@ -1606,8 +1606,15 @@ class CanonicalLogicalEvidenceProjector:
             cleanup_failures += int(cleanup["failures"])
             cleanup_completed += int(cleanup["completed"])
             cleanup_pending = int(cleanup["pending"])
+        with self.store.connect() as connection:
+            pending = connection.execute(
+                """SELECT count(*) AS count
+                     FROM canonical_evidence_document_queue
+                    WHERE (%s::text IS NULL OR tenant_id=%s)""",
+                (tenant_id, tenant_id),
+            ).fetchone()["count"]
         return {
-            "status": "complete",
+            "status": "complete" if int(pending) == 0 else "pending",
             "documents": documents,
             "records": records,
             "receipts": receipts,
@@ -1618,6 +1625,7 @@ class CanonicalLogicalEvidenceProjector:
             "cleanup_completed": cleanup_completed,
             "cleanup_failures": cleanup_failures,
             "cleanup_pending": cleanup_pending,
+            "pending": int(pending),
             "source_races": source_races,
             "pruned": pruned,
         }
