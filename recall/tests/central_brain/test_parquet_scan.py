@@ -107,6 +107,36 @@ class _SeedStore:
         return self.connection
 
 
+class _CurrentUploadResult:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def fetchall(self):
+        return self.rows
+
+
+class _CurrentUploadConnection:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return None
+
+    def execute(self, _query, _parameters):
+        return _CurrentUploadResult(self.rows)
+
+
+class _CurrentUploadStore:
+    def __init__(self, rows):
+        self.connection = _CurrentUploadConnection(rows)
+
+    def connect(self):
+        return self.connection
+
+
 class _LeaseResult:
     def __init__(self, acquired: bool):
         self.acquired = acquired
@@ -357,6 +387,18 @@ class ParquetScanContractTest(unittest.TestCase):
         self.assertIn("'documents','passages','records','actors'", migration)
         self.assertIn("canonical_parquet_scan_queue", migration)
         self.assertIn("version=53", migration)
+
+    def test_upgrade_rejects_a_legacy_three_dataset_upload_for_safe_rebuild(self):
+        generation = "a" * 64
+        rows = [
+            {"dataset": dataset, "generation_sha256": generation}
+            for dataset in ("documents", "records", "actors")
+        ]
+        projector = CanonicalParquetScanProjector(
+            _CurrentUploadStore(rows),
+            _Evidence(None),
+        )
+        self.assertIsNone(projector._current_upload(_candidate(), generation))
 
     def test_multipart_parquet_is_bounded_ordered_and_lossless(self):
         schema = pa.schema([("ordinal", pa.int64()), ("value", pa.binary())])
