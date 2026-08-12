@@ -1570,6 +1570,13 @@ class BoundCanonicalRetrieval:
             since=since,
             until=until,
         )
+        referenced_datasets = {
+            dataset
+            for dataset in ("documents", "passages", "records", "actors")
+            if re.search(rf"(?<![A-Za-z0-9_-]){dataset}-part-", program)
+        }
+        if referenced_datasets:
+            rows = [row for row in rows if row["dataset"] in referenced_datasets]
         if not rows:
             return self._empty_parquet_scan(
                 sources_available=len(sources),

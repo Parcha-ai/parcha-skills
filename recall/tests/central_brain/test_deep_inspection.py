@@ -987,6 +987,8 @@ class DeepInspectionContractTests(unittest.TestCase):
         self.assertIn("/tmp/recall-agent/duckdb", command)
         self.assertIn("/tmp/recall-datasets", command)
         self.assertIn("mount --bind /tmp/recall-datasets /datasets", command)
+        self.assertIn("allow_missing=sys.argv[5]==\"1\"", command)
+        self.assertIn("find /datasets -type l -print -quit", command)
         self.assertNotIn("synthetic-key", command)
         outer_marker = "\n".join(command.splitlines()[:3])
         marker_result = subprocess.run(
@@ -1000,6 +1002,46 @@ class DeepInspectionContractTests(unittest.TestCase):
             marker_result.stderr,
             r"^RECALL_EXEC_TIMING_V1\twrapper_start\t[0-9]{16}\n$",
         )
+
+    def test_parquet_scan_reports_s3_sync_lag_as_incomplete_not_success(self):
+        transport = RecordingTransport({
+            "success": True,
+            "data": {
+                "stdout": "[]\n",
+                "stderr": (
+                    "RECALL_EXEC_VISIBILITY_V1\tobjects_unavailable\t2\n"
+                ),
+                "exitCode": 0,
+                "timing": {"totalMs": 12, "queueMs": 2, "executeMs": 10},
+            },
+        })
+        result = ArchilDeepInspector(
+            api_key="synthetic-key",
+            disk_id="dsk-0123456789abcdef",
+            region="aws-us-west-2",
+            duckdb_tool=AgentExecObject(
+                object_key="objects/dd/" + "d" * 64,
+                content_sha256="e" * 64,
+            ),
+            transport=transport,
+        ).execute_scan(
+            tenant_id=TENANT,
+            program="duckdb -json -c 'select 1'",
+            objects=(AgentExecObject(
+                object_key="objects/aa/" + "a" * 64,
+                content_sha256="b" * 64,
+            ),),
+            dataset_aliases={
+                "objects/aa/" + "a" * 64:
+                    "s1/2026-08/passages-part-00000.parquet",
+            },
+            timeout_seconds=120,
+        )
+        self.assertEqual(result["exit_code"], 0)
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["stopped_reason"], "source_sync_pending")
+        self.assertEqual(result["objects_unavailable"], 2)
+        self.assertEqual(result["stderr"], "")
 
     def test_runtime_duckdb_identity_is_paired_and_validated(self):
         base = {
