@@ -7,6 +7,7 @@ import threading
 import time
 import unittest
 from contextlib import contextmanager
+from datetime import date
 from pathlib import Path
 from unittest import mock
 
@@ -313,6 +314,55 @@ class ParallelExecRetrieval(BoundCanonicalRetrieval):
 
 
 class CanonicalRetrievalDeadlineTest(unittest.TestCase):
+    def test_parquet_scan_caps_stdout_at_sixteen_kibibytes_truthfully(self) -> None:
+        class Inspector:
+            @staticmethod
+            def execute_scan(**_arguments):
+                return {
+                    "provider": "synthetic-archil",
+                    "stdout": "é" * 20_000,
+                    "stderr": "",
+                    "exit_code": 0,
+                    "complete": True,
+                    "stopped_reason": "completed",
+                    "output_truncated": False,
+                    "timing": {"totalMs": 1},
+                }
+
+        class Retrieval(BoundCanonicalRetrieval):
+            def _sources(self, **_arguments):
+                return ["source:test"]
+
+            def _parquet_shards(self, _sources, *, since, until):
+                return ([{
+                    "source_id": "source:test",
+                    "bucket_start": date(2026, 8, 1),
+                    "dataset": "passages",
+                    "shard_index": 0,
+                    "object_key": "objects/aa/" + "a" * 64,
+                    "content_sha256": "b" * 64,
+                }], 0)
+
+            def _verify_parquet_receipts(self, *_arguments, **_keywords):
+                return None
+
+        result = Retrieval(
+            DeadlineStore(),
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=("source:test",),
+            deep_inspector=Inspector(),
+        ).execute_parquet_scan(
+            "duckdb -json -c 'select 1'",
+            filters={},
+            timeout_seconds=60,
+        )
+        self.assertLessEqual(len(result["stdout"].encode()), 16 * 1024)
+        self.assertFalse(result["complete"])
+        self.assertTrue(result["output_truncated"])
+        self.assertEqual(result["stopped_reason"], "output_limit")
+        self.assertEqual(result["opened_receipts"], [])
+
     def test_uuid_routes_exactly_even_when_the_question_has_other_terms(self) -> None:
         session_id = "8668a658-a6cf-4358-9d7e-c29e5782c1dd"
         self.assertEqual(

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from evals.parquet_pointer import evaluate, fixture, run
+from evals.parquet_pointer import evaluate, evaluate_plan_open, fixture, run
 
 
 class ParquetPointerEvalTest(unittest.TestCase):
@@ -12,6 +12,9 @@ class ParquetPointerEvalTest(unittest.TestCase):
         self.assertEqual(result["candidate_recall"], 1.0)
         self.assertEqual(result["exact_identifier_recall"], 1.0)
         self.assertEqual(result["positive_receipt_support"], 1.0)
+        self.assertEqual(result["opened_receipt_support"], 1.0)
+        self.assertTrue(result["plan_open_passed"])
+        self.assertLessEqual(result["max_candidates_per_open"], 20)
         self.assertGreaterEqual(result["physical_reduction"], 10.0)
         self.assertEqual(
             set(result["by_stratum"]),
@@ -43,6 +46,14 @@ class ParquetPointerEvalTest(unittest.TestCase):
         result = evaluate(passages, cases, complete=False)
         self.assertEqual(result["candidate_recall"], 1.0)
         self.assertFalse(result["passed"])
+
+    def test_missing_authoritative_raw_receipts_fails_plan_open(self):
+        raw, passages, cases = fixture()
+        without_receipts = [{**row, "receipts": []} for row in raw]
+        result = evaluate_plan_open(without_receipts, passages, cases)
+        self.assertEqual(result["candidate_recall"], 1.0)
+        self.assertEqual(result["opened_receipt_support"], 0.0)
+        self.assertFalse(result["plan_open_passed"])
 
 
 if __name__ == "__main__":
