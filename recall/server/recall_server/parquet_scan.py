@@ -385,8 +385,11 @@ class _StreamingUpload:
         *,
         first: datetime,
         last: datetime,
+        datasets: tuple[str, ...] = SCAN_DATASETS,
     ) -> ScanUpload:
-        for dataset in SCAN_DATASETS:
+        if not datasets or not set(datasets) <= set(SCAN_DATASETS):
+            raise ParquetScanError("parquet_scan_dataset_invalid")
+        for dataset in datasets:
             self._flush(dataset, allow_empty=self.rows_seen[dataset] == 0)
         LOG.info(
             "parquet stream documents=%s passages=%s records=%s actors=%s parts=%s "
@@ -869,6 +872,42 @@ class CanonicalParquetScanProjector:
             False,
         )
 
+    def _legacy_upload(self, candidate: ScanCandidate) -> ScanUpload | None:
+        """Reuse the immutable v1 evidence plane while adding passage pointers."""
+
+        with self.store.connect() as connection:
+            rows = connection.execute(
+                """SELECT * FROM canonical_parquet_scan_shards
+                    WHERE tenant_id=%s AND source_id=%s AND bucket_start=%s
+                    ORDER BY dataset,shard_index""",
+                (
+                    candidate.tenant_id,
+                    candidate.source_id,
+                    candidate.bucket_start,
+                ),
+            ).fetchall()
+        legacy_datasets = set(SCAN_DATASETS) - {"passages"}
+        if {row["dataset"] for row in rows} != legacy_datasets:
+            return None
+        first = rows[0]["first_occurred_at"]
+        last = rows[0]["last_occurred_at"]
+        if first is None or last is None:
+            return None
+        return ScanUpload(
+            str(rows[0]["generation_sha256"]),
+            {
+                (row["dataset"], int(row["shard_index"])): _reference(row)
+                for row in rows
+            },
+            {
+                (row["dataset"], int(row["shard_index"])): int(row["row_count"])
+                for row in rows
+            },
+            first,
+            last,
+            False,
+        )
+
     def _schedule_cleanup(self, references: Iterable[dict[str, Any]]) -> None:
         references = tuple(references)
         if not references:
@@ -919,6 +958,30 @@ class CanonicalParquetScanProjector:
             created_at=created_at,
         )
 
+    @staticmethod
+    def _passage_row(
+        candidate: ScanCandidate,
+        passage: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": SCAN_SCHEMA_VERSION,
+            "tenant_id": candidate.tenant_id,
+            "source_id": candidate.source_id,
+            "logical_document_id": passage["logical_document_id"],
+            "revision": int(passage["revision"]),
+            "passage_id": passage["passage_id"],
+            "ordinal": int(passage["ordinal"]),
+            "first_occurred_at": _timestamp(passage["first_occurred_at"]),
+            "last_occurred_at": _timestamp(passage["last_occurred_at"]),
+            "token_count": int(passage["token_count"]),
+            "roles": [str(value) for value in passage["roles"]],
+            "receipts": [str(value) for value in passage["receipts"]],
+            "actor_ids": [str(value) for value in passage["actor_ids"]],
+            "actor_names": [str(value) for value in passage["actor_names"]],
+            "actor_relations": [str(value) for value in passage["actor_relations"]],
+            "text": passage["text_redacted"],
+        }
+
     def _build(self, candidate: ScanCandidate) -> ScanUpload:
         started = time.perf_counter()
         documents = self._documents(candidate)
@@ -950,6 +1013,46 @@ class CanonicalParquetScanProjector:
                 round((finished - started) * 1_000),
             )
             return current
+        legacy = self._legacy_upload(candidate)
+        if legacy is not None:
+            upload = self._streaming_upload(
+                candidate,
+                generation=generation,
+                created_at=bucket_start,
+            )
+            try:
+                for passage in self._passages(candidate):
+                    upload.add("passages", self._passage_row(candidate, passage))
+                passage_upload = upload.finish(
+                    first=legacy.first_occurred_at,
+                    last=legacy.last_occurred_at,
+                    datasets=("passages",),
+                )
+            except Exception as error:
+                try:
+                    upload.abort()
+                except Exception:
+                    raise ParquetScanError(
+                        "parquet_scan_cleanup_enqueue_failed"
+                    ) from error
+                raise
+            result = ScanUpload(
+                generation,
+                {**legacy.references, **passage_upload.references},
+                {**legacy.row_counts, **passage_upload.row_counts},
+                legacy.first_occurred_at,
+                legacy.last_occurred_at,
+                True,
+            )
+            LOG.info(
+                "parquet passage upgrade passages=%s metadata_ms=%s upload_ms=%s "
+                "total_ms=%s reused_evidence=true",
+                upload.rows_seen["passages"],
+                metadata_ms,
+                upload.upload_ms,
+                round((time.perf_counter() - started) * 1_000),
+            )
+            return result
         upload = self._streaming_upload(
             candidate,
             generation=generation,
@@ -959,35 +1062,7 @@ class CanonicalParquetScanProjector:
         discovered_bounds: list[PartTimeBound] = []
         try:
             for passage in self._passages(candidate):
-                upload.add(
-                    "passages",
-                    {
-                        "schema_version": SCAN_SCHEMA_VERSION,
-                        "tenant_id": candidate.tenant_id,
-                        "source_id": candidate.source_id,
-                        "logical_document_id": passage["logical_document_id"],
-                        "revision": int(passage["revision"]),
-                        "passage_id": passage["passage_id"],
-                        "ordinal": int(passage["ordinal"]),
-                        "first_occurred_at": _timestamp(
-                            passage["first_occurred_at"]
-                        ),
-                        "last_occurred_at": _timestamp(
-                            passage["last_occurred_at"]
-                        ),
-                        "token_count": int(passage["token_count"]),
-                        "roles": [str(value) for value in passage["roles"]],
-                        "receipts": [str(value) for value in passage["receipts"]],
-                        "actor_ids": [str(value) for value in passage["actor_ids"]],
-                        "actor_names": [
-                            str(value) for value in passage["actor_names"]
-                        ],
-                        "actor_relations": [
-                            str(value) for value in passage["actor_relations"]
-                        ],
-                        "text": passage["text_redacted"],
-                    },
-                )
+                upload.add("passages", self._passage_row(candidate, passage))
             for document in documents:
                 links = document.get("actor_links") or []
                 projected = self._project_document(
