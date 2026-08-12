@@ -264,9 +264,13 @@ ALL_READ_TOOLS = (
             "shard_size=1 when the same inspection must cover several candidates. "
             "For portable verified search, run `recall-scan --broad --fixed "
             "--pattern TERM --limit N`; ordinary shell and Python are also available. "
+            "The mounted manifest and JSONL parts are symlinks; use tools in "
+            "follow-symlink mode (for example `rg -L`). "
             "The sandbox has no network and cannot mutate evidence. Search hits are "
             "hints, not proof: only recall:// values in opened_receipts are citation "
-            "authority. To cite a match, print its JSONL record. An optional exact "
+            "authority. To cite a match without dumping a large raw line, print one "
+            "JSON object preserving event_native_id, occurred_at, ordinal, receipts, "
+            "and one of content, text, or content_fragment. An optional exact "
             "`RECALL_EVIDENCE <receipt>` line may accompany, never replace, that record."
         ),
         "inputSchema": {
@@ -319,8 +323,11 @@ ALL_READ_TOOLS = (
             "without a large earlier document consuming another's output budget. "
             "Recall splits the admitted targets into bounded shards and runs Archil "
             "sandboxes concurrently; aliases remain stable at /docs/d1 through "
-            "/docs/d80. The sandbox is read-only and networkless. Each shard "
-            "returns bounded stdout and only verified opened_receipts may be cited."
+            "/docs/d80. Mounted JSONL parts are symlinks, so use follow-symlink mode "
+            "such as `rg -L`. The sandbox is read-only and networkless. Each shard "
+            "returns bounded stdout and only verified opened_receipts may be cited. "
+            "For compact proof, emit JSON preserving event_native_id, occurred_at, "
+            "ordinal, receipts, and one of content, text, or content_fragment."
         ),
         "inputSchema": {
             "type": "object",

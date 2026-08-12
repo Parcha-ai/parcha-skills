@@ -748,7 +748,23 @@ class RemoteMcpContractTest(unittest.TestCase):
             canonical_catalog["recall_exec"]["description"],
         )
         self.assertIn(
+            "rg -L",
+            canonical_catalog["recall_exec"]["description"],
+        )
+        self.assertIn(
+            "event_native_id",
+            canonical_catalog["recall_exec"]["description"],
+        )
+        self.assertIn(
             "shard_size=1",
+            canonical_catalog["recall_exec_map"]["description"],
+        )
+        self.assertIn(
+            "rg -L",
+            canonical_catalog["recall_exec_map"]["description"],
+        )
+        self.assertIn(
+            "content_fragment",
             canonical_catalog["recall_exec_map"]["description"],
         )
         self.assertEqual(
