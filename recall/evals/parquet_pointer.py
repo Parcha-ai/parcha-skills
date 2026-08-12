@@ -131,28 +131,17 @@ def evaluate(
     by_stratum: dict[str, dict[str, int]] = {}
     for case in cases:
         stratum = case["stratum"]
+        candidates = _candidate_documents(passages, case)
         if stratum == "fleet_inventory":
-            candidates = {
+            people = {
                 name for row in passages for name in row["actor_names"]
             }
-            passed = len(candidates) == case["expected_count"]
+            passed = len(people) == case["expected_count"]
         elif stratum == "team_time":
-            candidates = {row["logical_document_id"] for row in passages}
             passed = len(candidates) == case["expected_count"]
         elif stratum == "person_time":
-            candidates = {
-                row["logical_document_id"]
-                for row in passages
-                if case["person"] in row["actor_names"]
-            }
             passed = case["expected"] in candidates
         else:
-            needle = case["query"].casefold()
-            candidates = {
-                row["logical_document_id"]
-                for row in passages
-                if needle in row["text"].casefold()
-            }
             passed = (
                 len(candidates) == case.get("expected_count")
                 if "expected_count" in case
@@ -191,11 +180,74 @@ def evaluate(
     }
 
 
+def _candidate_documents(
+    passages: list[dict[str, Any]],
+    case: dict[str, Any],
+) -> set[str]:
+    """Model one passage-plane planning call without answering the question."""
+
+    stratum = case["stratum"]
+    if stratum in {"fleet_inventory", "team_time"}:
+        return {row["logical_document_id"] for row in passages}
+    if stratum == "person_time":
+        return {
+            row["logical_document_id"]
+            for row in passages
+            if case["person"] in row["actor_names"]
+        }
+    needle = case["query"].casefold()
+    return {
+        row["logical_document_id"]
+        for row in passages
+        if needle in row["text"].casefold()
+    }
+
+
+def evaluate_plan_open(
+    raw: list[dict[str, Any]],
+    passages: list[dict[str, Any]],
+    cases: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Prove each planning call can lead to bounded authoritative evidence opens."""
+
+    score = evaluate(passages, cases)
+    receipts_by_document: dict[str, set[str]] = {}
+    for row in raw:
+        receipts_by_document.setdefault(row["logical_document_id"], set()).update(
+            row["receipts"]
+        )
+    positives = 0
+    supported = 0
+    max_candidates = 0
+    for case in cases:
+        candidates = _candidate_documents(passages, case)
+        max_candidates = max(max_candidates, len(candidates))
+        if case["stratum"] == "cold_negative":
+            continue
+        positives += 1
+        supported += int(
+            bool(candidates)
+            and all(receipts_by_document.get(value) for value in candidates)
+        )
+    opened_support = supported / positives
+    return {
+        **score,
+        "planning_calls": len(cases),
+        "max_candidates_per_open": max_candidates,
+        "opened_receipt_support": opened_support,
+        "plan_open_passed": (
+            score["passed"]
+            and opened_support == 1.0
+            and max_candidates <= 20
+        ),
+    }
+
+
 def run() -> dict[str, Any]:
     raw, passages, cases = fixture()
     raw_bytes = len(_parquet_bytes(raw, _schemas()["records"]))
     pointer_bytes = len(_parquet_bytes(passages, _schemas()["passages"]))
-    score = evaluate(passages, cases)
+    score = evaluate_plan_open(raw, passages, cases)
     return {
         "schema_version": "recall.parquet-pointer-eval.v1",
         **score,
