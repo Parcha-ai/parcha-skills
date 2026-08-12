@@ -59,6 +59,23 @@ from .mcp_conformance import (
 from .semantic import SemanticRuntime
 
 
+def _worker_pool_max_size(args: argparse.Namespace) -> int | None:
+    """Size worker pools from real concurrency, not an unrelated floor."""
+
+    if args.command in {
+        "backfill-lossless-passages",
+        "lossless-passage-worker",
+    }:
+        return max(4, args.concurrency)
+    if args.command == "projection-worker":
+        return max(
+            4,
+            args.passage_concurrency,
+            args.upload_concurrency,
+        )
+    return None
+
+
 def main() -> None:
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"), format="%(levelname)s %(message)s"
@@ -478,18 +495,7 @@ def main() -> None:
                 json.dumps({"status": "rejected", "code": error.code}), file=sys.stderr
             )
             raise SystemExit(2) from None
-    pool_max_size = None
-    if args.command in {
-        "backfill-lossless-passages",
-        "lossless-passage-worker",
-    }:
-        pool_max_size = max(8, args.concurrency)
-    elif args.command == "projection-worker":
-        pool_max_size = max(
-            8,
-            args.passage_concurrency,
-            args.upload_concurrency,
-        )
+    pool_max_size = _worker_pool_max_size(args)
     store = BrainStore(
         args.dsn,
         semantic_runtime=SemanticRuntime.from_env(),
