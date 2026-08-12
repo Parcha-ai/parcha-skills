@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
 import contextlib
 import inspect
@@ -1075,6 +1076,31 @@ class DeliberateCaptureContractTest(unittest.TestCase):
 
 
 class SemanticRetrievalConfigurationTest(unittest.TestCase):
+    def test_worker_pool_matches_actual_concurrency_floor(self) -> None:
+        self.assertEqual(
+            server_cli._worker_pool_max_size(argparse.Namespace(
+                command="projection-worker",
+                passage_concurrency=4,
+                upload_concurrency=4,
+            )),
+            4,
+        )
+        self.assertEqual(
+            server_cli._worker_pool_max_size(argparse.Namespace(
+                command="projection-worker",
+                passage_concurrency=6,
+                upload_concurrency=4,
+            )),
+            6,
+        )
+        self.assertEqual(
+            server_cli._worker_pool_max_size(argparse.Namespace(
+                command="lossless-passage-worker",
+                concurrency=2,
+            )),
+            4,
+        )
+
     def test_database_pool_size_is_bounded_deployment_config(self) -> None:
         with mock.patch.dict(
             os.environ,
