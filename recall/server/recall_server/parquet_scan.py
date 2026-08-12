@@ -16,8 +16,8 @@ import pyarrow.parquet as pq
 
 
 PARQUET_MEDIA_TYPE = "application/vnd.apache.parquet"
-SCAN_SCHEMA_VERSION = 1
-SCAN_DATASETS = ("documents", "records", "actors")
+SCAN_SCHEMA_VERSION = 2
+SCAN_DATASETS = ("documents", "passages", "records", "actors")
 MAX_SCAN_RECORDS = 5_000_000
 MAX_PARQUET_OBJECT_BYTES = 48 * 1024 * 1024
 PARQUET_RAW_SLICE_BYTES = 32 * 1024 * 1024
@@ -237,6 +237,26 @@ def _schemas() -> dict[str, Any]:
                 ("record_json", pa.large_string()),
             ]
         ),
+        "passages": pa.schema(
+            [
+                ("schema_version", pa.int16()),
+                ("tenant_id", pa.string()),
+                ("source_id", pa.string()),
+                ("logical_document_id", pa.string()),
+                ("revision", pa.int32()),
+                ("passage_id", pa.string()),
+                ("ordinal", pa.int32()),
+                ("first_occurred_at", utc),
+                ("last_occurred_at", utc),
+                ("token_count", pa.int32()),
+                ("roles", strings),
+                ("receipts", strings),
+                ("actor_ids", strings),
+                ("actor_names", strings),
+                ("actor_relations", strings),
+                ("text", pa.large_string()),
+            ]
+        ),
         "actors": pa.schema(
             [
                 ("schema_version", pa.int16()),
@@ -369,9 +389,10 @@ class _StreamingUpload:
         for dataset in SCAN_DATASETS:
             self._flush(dataset, allow_empty=self.rows_seen[dataset] == 0)
         LOG.info(
-            "parquet stream documents=%s records=%s actors=%s parts=%s "
+            "parquet stream documents=%s passages=%s records=%s actors=%s parts=%s "
             "flushes=%s max_buffer_bytes=%s upload_ms=%s",
             self.rows_seen["documents"],
+            self.rows_seen["passages"],
             self.rows_seen["records"],
             self.rows_seen["actors"],
             len(self.references),
@@ -483,8 +504,16 @@ class CanonicalParquetScanProjector:
         with self.store.connect() as connection:
             documents = connection.execute(
                 """SELECT document.*,
+                          pointer.policy_fingerprint AS passage_policy_fingerprint,
+                          pointer.source_document_sha256 AS passage_source_sha256,
+                          pointer.passage_count,
                           coalesce(attributed.links,'[]'::jsonb) AS actor_links
                      FROM canonical_evidence_documents document
+                     LEFT JOIN canonical_passage_documents pointer
+                       ON pointer.tenant_id=document.tenant_id
+                      AND pointer.source_id=document.source_id
+                      AND pointer.logical_document_id=document.logical_document_id
+                      AND pointer.revision=document.revision
                      LEFT JOIN LATERAL (
                           SELECT jsonb_agg(jsonb_build_object(
                                      'actor_id',link.actor_id,
@@ -545,6 +574,53 @@ class CanonicalParquetScanProjector:
         for document in documents:
             document["parts"] = by_document.get(document["logical_document_id"], [])
         return documents
+
+    def _passages(self, candidate: ScanCandidate) -> Iterator[dict[str, Any]]:
+        """Read the compact pointer plane in physical timestamp order."""
+
+        bucket_end = _next_month(candidate.bucket_start)
+        with self.store.connect() as connection:
+            with connection.cursor(name="parquet_passage_stream") as cursor:
+                cursor.itersize = 2_000
+                cursor.execute(
+                    """SELECT passage.logical_document_id,passage.revision,
+                          passage.passage_id,passage.ordinal,
+                          passage.first_occurred_at,passage.last_occurred_at,
+                          passage.token_count,passage.roles,passage.receipts,
+                          passage.text_redacted,
+                          coalesce(attributed.actor_ids,ARRAY[]::text[]) AS actor_ids,
+                          coalesce(attributed.actor_names,ARRAY[]::text[]) AS actor_names,
+                          coalesce(attributed.actor_relations,ARRAY[]::text[])
+                              AS actor_relations
+                     FROM canonical_passages passage
+                     LEFT JOIN LATERAL (
+                          SELECT array_agg(link.actor_id ORDER BY link.actor_id,link.relation)
+                                     AS actor_ids,
+                                 array_agg(actor.display_name ORDER BY link.actor_id,link.relation)
+                                     AS actor_names,
+                                 array_agg(link.relation ORDER BY link.actor_id,link.relation)
+                                     AS actor_relations
+                            FROM canonical_passage_actors link
+                            JOIN brain_actors actor
+                              ON actor.tenant_id=link.tenant_id
+                             AND actor.actor_id=link.actor_id
+                           WHERE link.tenant_id=passage.tenant_id
+                             AND link.source_id=passage.source_id
+                             AND link.passage_id=passage.passage_id
+                     ) attributed ON true
+                    WHERE passage.tenant_id=%s AND passage.source_id=%s
+                      AND passage.last_occurred_at >= %s
+                      AND passage.first_occurred_at < %s
+                    ORDER BY passage.first_occurred_at,
+                             passage.last_occurred_at,passage.passage_id""",
+                    (
+                        candidate.tenant_id,
+                        candidate.source_id,
+                        candidate.bucket_start,
+                        bucket_end,
+                    ),
+                )
+                yield from cursor
 
     @staticmethod
     def _actor_columns(
@@ -817,6 +893,11 @@ class CanonicalParquetScanProjector:
                         "actors": list(zip(ids, names, relations, strict=True)),
                         "content": document["document_content_sha256"],
                         "document": document["logical_document_id"],
+                        "passage_count": document.get("passage_count"),
+                        "passage_policy": document.get(
+                            "passage_policy_fingerprint"
+                        ),
+                        "passage_source": document.get("passage_source_sha256"),
                         "revision": int(document["revision"]),
                     },
                     option=orjson.OPT_SORT_KEYS,
@@ -877,6 +958,36 @@ class CanonicalParquetScanProjector:
         first = last = None
         discovered_bounds: list[PartTimeBound] = []
         try:
+            for passage in self._passages(candidate):
+                upload.add(
+                    "passages",
+                    {
+                        "schema_version": SCAN_SCHEMA_VERSION,
+                        "tenant_id": candidate.tenant_id,
+                        "source_id": candidate.source_id,
+                        "logical_document_id": passage["logical_document_id"],
+                        "revision": int(passage["revision"]),
+                        "passage_id": passage["passage_id"],
+                        "ordinal": int(passage["ordinal"]),
+                        "first_occurred_at": _timestamp(
+                            passage["first_occurred_at"]
+                        ),
+                        "last_occurred_at": _timestamp(
+                            passage["last_occurred_at"]
+                        ),
+                        "token_count": int(passage["token_count"]),
+                        "roles": [str(value) for value in passage["roles"]],
+                        "receipts": [str(value) for value in passage["receipts"]],
+                        "actor_ids": [str(value) for value in passage["actor_ids"]],
+                        "actor_names": [
+                            str(value) for value in passage["actor_names"]
+                        ],
+                        "actor_relations": [
+                            str(value) for value in passage["actor_relations"]
+                        ],
+                        "text": passage["text_redacted"],
+                    },
+                )
             for document in documents:
                 links = document.get("actor_links") or []
                 projected = self._project_document(
@@ -968,9 +1079,10 @@ class CanonicalParquetScanProjector:
             raise
         finished = time.perf_counter()
         LOG.info(
-            "parquet build documents=%s records=%s metadata_ms=%s "
+            "parquet build documents=%s passages=%s records=%s metadata_ms=%s "
             "stream_ms=%s upload_ms=%s total_ms=%s reused=false",
             upload.rows_seen["documents"],
+            upload.rows_seen["passages"],
             upload.rows_seen["records"],
             metadata_ms,
             round((finished - started) * 1_000) - metadata_ms,

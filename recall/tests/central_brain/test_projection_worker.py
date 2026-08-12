@@ -83,7 +83,7 @@ class ProjectionWorkerTest(unittest.TestCase):
         calls: list[str] = []
         result = run_projection_worker(
             _Logical(calls),  # type: ignore[arg-type]
-            _Passages(calls),  # type: ignore[arg-type]
+            _Passages(calls, work=0),  # type: ignore[arg-type]
             _Scan(calls),  # type: ignore[arg-type]
             tenant_id="tenant:company:test",
             logical_batch_size=25,
@@ -98,9 +98,30 @@ class ProjectionWorkerTest(unittest.TestCase):
         self.assertEqual(calls, ["embeddings", "passages", "logical", "scan"])
         self.assertEqual(result["status"], "pending")
         self.assertEqual(result["documents"], 2)
-        self.assertEqual(result["passages"], 8)
-        self.assertEqual(result["embedded"], 8)
+        self.assertEqual(result["passages"], 0)
+        self.assertEqual(result["embedded"], 0)
         self.assertEqual(result["parquet_shards"], 1)
+
+    def test_defers_scan_until_passage_pointer_plane_is_drained(self):
+        calls: list[str] = []
+        result = run_projection_worker(
+            _Logical(calls, work=0),  # type: ignore[arg-type]
+            _Passages(calls, work=2),  # type: ignore[arg-type]
+            _Scan(calls, work=4),  # type: ignore[arg-type]
+            tenant_id="tenant:company:test",
+            logical_batch_size=25,
+            passage_batch_size=100,
+            embedding_batch_size=128,
+            max_batches_per_cycle=10,
+            upload_concurrency=2,
+            passage_concurrency=4,
+            interval_seconds=5,
+            once=True,
+        )
+        self.assertEqual(calls, ["embeddings", "passages", "logical"])
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(result["passage_documents"], 2)
+        self.assertEqual(result["parquet_shards"], 0)
 
     def test_defers_scan_until_logical_backfill_is_drained(self):
         calls: list[str] = []

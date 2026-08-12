@@ -5,6 +5,7 @@ import os
 import unittest
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
+from pathlib import Path
 from unittest import mock
 
 import pyarrow as pa
@@ -185,15 +186,24 @@ def _candidate() -> ScanCandidate:
 
 
 class _BuildProbe(CanonicalParquetScanProjector):
-    def __init__(self, document: dict, archive: _Archive):
+    def __init__(
+        self,
+        document: dict,
+        archive: _Archive,
+        passages: list[dict] | None = None,
+    ):
         super().__init__(None, _Evidence(archive))
         self.document = document
+        self.passages = passages or []
 
     def _documents(self, _candidate):
         return [self.document]
 
     def _current_upload(self, _candidate, _generation):
         return None
+
+    def _passages(self, _candidate):
+        return self.passages
 
 
 class _CheckpointProbe(CanonicalParquetScanProjector):
@@ -313,6 +323,41 @@ class ParquetScanContractTest(unittest.TestCase):
         result = pq.read_table(pa.BufferReader(payload)).to_pylist()
         self.assertEqual(result, [row])
 
+    def test_passage_pointer_schema_preserves_lossless_text_and_receipts(self):
+        self.assertNotIn("record_json", _schemas()["passages"].names)
+        row = {
+            "schema_version": 2,
+            "tenant_id": "tenant:test",
+            "source_id": "source:test",
+            "logical_document_id": "document:test",
+            "revision": 1,
+            "passage_id": "psg_" + "a" * 32,
+            "ordinal": 3,
+            "first_occurred_at": datetime(2026, 8, 1, tzinfo=timezone.utc),
+            "last_occurred_at": datetime(2026, 8, 2, tzinfo=timezone.utc),
+            "token_count": 512,
+            "roles": ["assistant", "user"],
+            "receipts": ["recall://source:test/doc?rev=1#item=7"],
+            "actor_ids": ["actor:employee"],
+            "actor_names": ["Employee"],
+            "actor_relations": ["contributor"],
+            "text": "exact visible message bytes",
+        }
+        payload = _parquet_bytes([row], _schemas()["passages"])
+        self.assertEqual(
+            pq.read_table(pa.BufferReader(payload)).to_pylist(),
+            [row],
+        )
+
+    def test_passage_plane_migration_rebuilds_and_expands_closed_dataset_enum(self):
+        migration = (
+            Path(__file__).resolve().parents[2]
+            / "server/schema/053_parquet_passage_plane.sql"
+        ).read_text()
+        self.assertIn("'documents','passages','records','actors'", migration)
+        self.assertIn("canonical_parquet_scan_queue", migration)
+        self.assertIn("version=53", migration)
+
     def test_multipart_parquet_is_bounded_ordered_and_lossless(self):
         schema = pa.schema([("ordinal", pa.int64()), ("value", pa.binary())])
         rows = [
@@ -385,6 +430,50 @@ class ParquetScanContractTest(unittest.TestCase):
                 .to_pylist()
             )
         self.assertEqual(restored, list(range(30)))
+
+    def test_build_adds_lossless_passage_pointer_shard(self):
+        archive = _Archive({
+            "ordinal": 0,
+            "occurred_at": "2026-08-05T12:00:00Z",
+            "event_kind": "transcript_record",
+            "roles": ["user"],
+            "receipts": ["recall://source:test/doc?rev=1#item=0"],
+            "text": "canonical record",
+        })
+        passage = {
+            "logical_document_id": "document:test",
+            "revision": 1,
+            "passage_id": "psg_" + "a" * 32,
+            "ordinal": 0,
+            "first_occurred_at": datetime(2026, 8, 5, 12, tzinfo=timezone.utc),
+            "last_occurred_at": datetime(2026, 8, 5, 12, tzinfo=timezone.utc),
+            "token_count": 3,
+            "roles": ["user"],
+            "receipts": ["recall://source:test/doc?rev=1#item=0"],
+            "actor_ids": ["actor:employee"],
+            "actor_names": ["Employee"],
+            "actor_relations": ["contributor"],
+            "text_redacted": "exact visible prompt",
+        }
+        result = _BuildProbe(
+            _document("Employee"),
+            archive,
+            passages=[passage],
+        )._build(_candidate())
+        self.assertEqual(
+            sum(
+                count
+                for (dataset, _), count in result.row_counts.items()
+                if dataset == "passages"
+            ),
+            1,
+        )
+        upload = next(
+            item for item in archive.uploads if ":passages:" in item["native_id"]
+        )
+        restored = pq.read_table(pa.BufferReader(upload["payload"])).to_pylist()
+        self.assertEqual(restored[0]["text"], "exact visible prompt")
+        self.assertEqual(restored[0]["receipts"], passage["receipts"])
 
     def test_one_unshardable_record_fails_content_free(self):
         schema = pa.schema([("value", pa.binary())])
@@ -534,6 +623,20 @@ class ParquetScanContractTest(unittest.TestCase):
             [upload["native_id"] for upload in same_archive.uploads],
         )
         self.assertNotEqual(first.generation_sha256, renamed.generation_sha256)
+
+    def test_generation_changes_when_passage_policy_changes(self):
+        first = _document("Employee")
+        first.update({
+            "passage_policy_fingerprint": "a" * 64,
+            "passage_source_sha256": first["document_content_sha256"],
+            "passage_count": 3,
+        })
+        second = {**first, "passage_policy_fingerprint": "b" * 64}
+        projector = CanonicalParquetScanProjector(None, _Evidence(None))
+        self.assertNotEqual(
+            projector._generation(_candidate(), [first]),
+            projector._generation(_candidate(), [second]),
+        )
 
 
 if __name__ == "__main__":

@@ -37,6 +37,8 @@ from recall_server.logical_evidence_projection import (  # noqa: E402
     CanonicalLogicalEvidenceProjector,
 )
 from recall_server.parquet_scan import CanonicalParquetScanProjector  # noqa: E402
+from recall_server.passage_index import CanonicalPassageProjector  # noqa: E402
+from recall_server.passage_projection import DEFAULT_PASSAGE_POLICY  # noqa: E402
 
 
 SESSION_ID = "019f1111-2222-7333-8444-555555555555"
@@ -268,6 +270,20 @@ def main() -> None:
             assert len(scoped["documents"]) == 1
             assert scoped["documents"][0]["record_count"] == 2
 
+            passages = CanonicalPassageProjector(
+                store,
+                logical_store,
+                policy=DEFAULT_PASSAGE_POLICY,
+                bound_tenant_id=tenant,
+            )
+            passage_result = passages.project_pending(
+                tenant_id=tenant,
+                batch_size=10,
+                max_batches=2,
+                concurrency=2,
+            )
+            assert passage_result["documents"] == 1
+
             parquet = CanonicalParquetScanProjector(store, logical_store)
             parquet_result = parquet.project_pending(
                 tenant_id=tenant,
@@ -291,7 +307,7 @@ def main() -> None:
                 ).fetchone()["count"]
             assert queue_depth == 0
             assert {row["dataset"] for row in shards} == {
-                "actors", "documents", "records",
+                "actors", "documents", "passages", "records",
             }
             assert len({row["generation_sha256"] for row in shards}) == 1
             tables: dict[str, list[dict]] = {}
@@ -301,8 +317,11 @@ def main() -> None:
                 ).to_pylist()
                 tables.setdefault(row["dataset"], []).extend(table)
             assert len(tables["documents"]) == 1
+            assert len(tables["passages"]) == 1
             assert len(tables["records"]) == 2
             assert tables["actors"] == []
+            assert marker in tables["passages"][0]["text"]
+            assert tables["passages"][0]["receipts"]
             assert marker in "\n".join(
                 row["search_text"] for row in tables["records"]
             )
@@ -331,6 +350,7 @@ def main() -> None:
                 "logical_records": 2,
                 "parquet_generations": 1,
                 "parquet_documents": 1,
+                "parquet_passages": 1,
                 "parquet_records": 2,
                 "parquet_queue_depth": 0,
                 "content_in_logs": int(marker in logs.getvalue()),

@@ -6,8 +6,6 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-import pyarrow as pa
-
 from recall_server.parquet_scan import _parquet_bytes, _schemas
 
 
@@ -20,29 +18,6 @@ TOPICS = (
     "collector cadence",
     "tenant isolation",
 )
-
-
-def _pointer_schema() -> Any:
-    utc = pa.timestamp("us", tz="UTC")
-    strings = pa.list_(pa.string())
-    return pa.schema([
-        ("schema_version", pa.int16()),
-        ("tenant_id", pa.string()),
-        ("source_id", pa.string()),
-        ("logical_document_id", pa.string()),
-        ("revision", pa.int32()),
-        ("passage_id", pa.string()),
-        ("ordinal", pa.int32()),
-        ("first_occurred_at", utc),
-        ("last_occurred_at", utc),
-        ("token_count", pa.int32()),
-        ("roles", strings),
-        ("receipts", strings),
-        ("actor_ids", strings),
-        ("actor_names", strings),
-        ("actor_relations", strings),
-        ("text", pa.large_string()),
-    ])
 
 
 def _noise(seed: str, size: int) -> str:
@@ -219,7 +194,7 @@ def evaluate(
 def run() -> dict[str, Any]:
     raw, passages, cases = fixture()
     raw_bytes = len(_parquet_bytes(raw, _schemas()["records"]))
-    pointer_bytes = len(_parquet_bytes(passages, _pointer_schema()))
+    pointer_bytes = len(_parquet_bytes(passages, _schemas()["passages"]))
     score = evaluate(passages, cases)
     return {
         "schema_version": "recall.parquet-pointer-eval.v1",

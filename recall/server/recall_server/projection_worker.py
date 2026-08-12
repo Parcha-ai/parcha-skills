@@ -67,7 +67,12 @@ def run_projection_worker(
                 batch_size=min(4, logical_batch_size),
                 max_batches=max_batches_per_cycle,
             )
-            if scan is not None and int(documents.get("pending", 0)) == 0
+            if (
+                scan is not None
+                and int(documents.get("pending", 0)) == 0
+                and projected["status"] == "complete"
+                and int(projected["documents"]) == 0
+            )
             else {
                 "status": "deferred" if scan is not None else "complete",
                 "shards": 0,

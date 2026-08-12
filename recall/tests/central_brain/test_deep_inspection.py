@@ -957,6 +957,10 @@ class DeepInspectionContractTests(unittest.TestCase):
             object_key="objects/aa/" + "a" * 64,
             content_sha256="b" * 64,
         )
+        passage = AgentExecObject(
+            object_key="objects/cc/" + "c" * 64,
+            content_sha256="f" * 64,
+        )
         result = ArchilDeepInspector(
             api_key="synthetic-key",
             disk_id="dsk-0123456789abcdef",
@@ -967,11 +971,12 @@ class DeepInspectionContractTests(unittest.TestCase):
             tenant_id=TENANT,
             program=(
                 "duckdb -json -c \"select count(*) from "
-                "read_parquet('/datasets/s1/2026-08/records-part-*.parquet')\""
+                "read_parquet('/datasets/s1/2026-08/passages-part-*.parquet')\""
             ),
-            objects=(data,),
+            objects=(data, passage),
             dataset_aliases={
-                data.object_key: "s1/2026-08/records-part-00000.parquet"
+                data.object_key: "s1/2026-08/records-part-00000.parquet",
+                passage.object_key: "s1/2026-08/passages-part-00000.parquet",
             },
             timeout_seconds=120,
         )
