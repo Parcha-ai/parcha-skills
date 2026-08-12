@@ -531,7 +531,7 @@ for document_id,alias in aliases.items():
 for object_key,alias in datasets.items():
     if not re.fullmatch(
         r"s[1-9][0-9]{0,2}/[0-9]{4}-[0-9]{2}/"
-        r"(?:documents|records|actors)-part-[0-9]{5}\.parquet",
+        r"(?:documents|passages|records|actors)-part-[0-9]{5}\.parquet",
         alias,
     ):
         raise SystemExit(64)
@@ -928,7 +928,7 @@ class ArchilDeepInspector:
                 not isinstance(alias, str)
                 or re.fullmatch(
                     r"s[1-9][0-9]{0,2}/[0-9]{4}-[0-9]{2}/"
-                    r"(?:documents|records|actors)-part-[0-9]{5}\.parquet",
+                    r"(?:documents|passages|records|actors)-part-[0-9]{5}\.parquet",
                     alias,
                 ) is None
                 for alias in dataset_aliases.values()
