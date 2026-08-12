@@ -1136,6 +1136,19 @@ class DeepInspectionContractTests(unittest.TestCase):
             [RECEIPT],
         )
 
+    def test_agent_evidence_accepts_compact_projected_records(self):
+        record = {
+            "content_fragment": "bounded evidence selected by the caller",
+            "event_native_id": "native:compact",
+            "occurred_at": "2026-08-11T00:00:00Z",
+            "ordinal": 42,
+            "receipts": [RECEIPT],
+        }
+        self.assertEqual(
+            agent_evidence_receipts(json.dumps(record, separators=(",", ":"))),
+            [RECEIPT],
+        )
+
     def test_agent_exec_timeout_is_bounded_twenty_out_of_twenty(self):
         for _ in range(20):
             transport = RecordingTransport({
