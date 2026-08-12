@@ -11,6 +11,7 @@ import stat
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.parse
 import urllib.request
 from pathlib import Path, PurePosixPath
@@ -25,6 +26,7 @@ from connectors.workspace_rail import GWS_RELEASE, GwsRelease
 
 ALLOWED_MEMBERS = {"CHANGELOG.md", "LICENSE", "README.md", "gws"}
 ALLOWED_DOWNLOAD_HOSTS = {"github.com", "release-assets.githubusercontent.com"}
+DOWNLOAD_ATTEMPTS = 4
 
 
 def release_url(target: str, release: GwsRelease = GWS_RELEASE) -> str:
@@ -41,11 +43,18 @@ def download(target: str, release: GwsRelease = GWS_RELEASE) -> bytes:
     request = urllib.request.Request(
         release_url(target, release), headers={"User-Agent": "recall-gws-installer/1"},
     )
-    with urllib.request.urlopen(request, timeout=60) as response:
-        final = urllib.parse.urlparse(response.geturl())
-        if final.scheme != "https" or final.hostname not in ALLOWED_DOWNLOAD_HOSTS:
-            raise ValueError("gws release redirected to an unapproved host")
-        data = response.read(expected + 1)
+    for attempt in range(DOWNLOAD_ATTEMPTS):
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                final = urllib.parse.urlparse(response.geturl())
+                if final.scheme != "https" or final.hostname not in ALLOWED_DOWNLOAD_HOSTS:
+                    raise ValueError("gws release redirected to an unapproved host")
+                data = response.read(expected + 1)
+            break
+        except OSError:
+            if attempt + 1 == DOWNLOAD_ATTEMPTS:
+                raise
+            time.sleep(2**attempt)
     if len(data) != expected:
         raise ValueError("gws release byte count mismatch")
     return data
