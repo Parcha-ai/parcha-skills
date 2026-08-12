@@ -313,6 +313,9 @@ Parquet scan plane; migration 53 adds its compact `passages` planning dataset.
 Each authorized source and UTC month has `documents`, `passages`, `records`, and
 `actors` shards. Passages contain bounded visible-message text, time, attribution,
 and receipt pointers; records retain complete projected JSON for exact inspection.
+During the one-time passage upgrade, existing immutable `documents`, `records`, and
+`actors` objects are retained and only `passages` is materialized. Later source changes
+continue to take the ordinary full replacement path.
 Canonical JSONL documents remain the complete evidence and only source of truth.
 Ingest, replacement, passage projection, and forget transactions invalidate only
 the affected source-months. First application seeds existing source-months for a
