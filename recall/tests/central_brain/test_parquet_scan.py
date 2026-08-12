@@ -385,8 +385,20 @@ class ParquetScanContractTest(unittest.TestCase):
             / "server/schema/053_parquet_passage_plane.sql"
         ).read_text()
         self.assertIn("'documents','passages','records','actors'", migration)
+        self.assertIn("statement_timestamp()", migration)
+        self.assertNotIn("clock_timestamp()", migration)
         self.assertIn("canonical_parquet_scan_queue", migration)
         self.assertIn("version=53", migration)
+
+    def test_passage_plane_repair_migration_requeues_each_source_month_once(self):
+        migration = (
+            Path(__file__).resolve().parents[2]
+            / "server/schema/054_requeue_parquet_passage_plane.sql"
+        ).read_text()
+        self.assertIn("SELECT DISTINCT shard.tenant_id,shard.source_id,shard.bucket_start", migration)
+        self.assertIn("statement_timestamp()", migration)
+        self.assertNotIn("clock_timestamp()", migration)
+        self.assertIn("version=54", migration)
 
     def test_upgrade_rejects_a_legacy_three_dataset_upload_for_safe_rebuild(self):
         generation = "a" * 64
