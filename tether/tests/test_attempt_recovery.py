@@ -274,7 +274,7 @@ class AttemptRecoveryTest(unittest.TestCase):
             self.assertTrue(
                 self.store.enqueue_event(event_id, bridge.bridge_id, "follow-up")
             )
-            items = self.store.claim_event_batch(bridge.bridge_id)
+            self.store.claim_event_batch(bridge.bridge_id)
             attempt_id = self.runtime.delivery_attempt_id(
                 bridge.bridge_id,
                 [event_id],
