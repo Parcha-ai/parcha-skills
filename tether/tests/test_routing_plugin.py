@@ -1324,6 +1324,36 @@ class RoutingPluginIntegrationTest(unittest.TestCase):
         self.assertEqual(self.adapter.config.extra["allow_bots"], "mentions")
         self.assertFalse(self.adapter.config.extra["strict_mention"])
 
+    def test_exact_ambient_bot_channel_reaches_hermes_without_a_mention(self):
+        raw = self.raw_event(
+            thread_ts="",
+            user="",
+            bot_id=PEER_APP,
+            text="trusted automation payload",
+        )
+        with mock.patch.dict(
+            os.environ,
+            {"TETHER_AMBIENT_BOT_CHANNELS": f"{PEER_APP}:{CHANNEL}"},
+            clear=False,
+        ):
+            self.assertIs(self.ingress(raw), raw)
+
+        decision = raw[self.plugin.ROUTING_DECISION_KEY]
+        self.assertEqual(decision.action, self.plugin.routing.RouteAction.HERMES)
+        self.assertEqual(decision.reason, "trusted_ambient_peer_bot")
+
+    def test_malformed_ambient_bot_channel_entries_fail_closed(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "TETHER_AMBIENT_BOT_CHANNELS": (
+                    f"{PEER_APP},XBAD:{CHANNEL},{PEER_APP}:DBAD,{PEER_APP}:{CHANNEL}:extra"
+                )
+            },
+            clear=False,
+        ):
+            self.assertEqual(self.plugin._ambient_peer_bot_channels(), frozenset())
+
     def test_unique_fresh_participation_lease_allows_ambient_human_reply(self):
         self.plugin.store.mark_participation(TEAM, CHANNEL, THREAD)
         self.client.thread_messages[THREAD] = [

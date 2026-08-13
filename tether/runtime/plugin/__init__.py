@@ -309,6 +309,21 @@ def _csv_env(name: str) -> frozenset[str]:
     )
 
 
+def _ambient_peer_bot_channels() -> frozenset[tuple[str, str]]:
+    routes: set[tuple[str, str]] = set()
+    for value in os.getenv("TETHER_AMBIENT_BOT_CHANNELS", "").split(","):
+        actor_id, separator, channel_id = value.strip().partition(":")
+        if (
+            separator
+            and actor_id.startswith(("B", "U"))
+            and channel_id.startswith(("C", "G"))
+            and actor_id.isalnum()
+            and channel_id.isalnum()
+        ):
+            routes.add((actor_id, channel_id))
+    return frozenset(routes)
+
+
 def _allowed_channels(adapter) -> frozenset[str]:
     resolver = getattr(adapter, "_slack_allowed_channels", None)
     if callable(resolver):
@@ -335,6 +350,7 @@ def _routing_policy(adapter, team_id: str):
         allowed_human_user_ids=frozenset(effective_allowed_users()),
         trusted_peer_user_ids=_allowed_peer_bot_users(),
         trusted_peer_bot_ids=_csv_env("TETHER_ALLOWED_BOT_IDS"),
+        ambient_peer_bot_channels=_ambient_peer_bot_channels(),
         allowed_channel_ids=_allowed_channels(adapter),
     )
 

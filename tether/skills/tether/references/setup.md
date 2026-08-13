@@ -88,6 +88,8 @@ For trusted peer agents:
 ```bash
 TETHER_ALLOWED_BOT_USERS="U01234567,U07654321"
 TETHER_ALLOWED_BOT_IDS="B01234567,B07654321"
+# Optional ambient automation: exact bot/app ID and exact shared channel.
+TETHER_AMBIENT_BOT_CHANNELS="B01234567:C01234567"
 ```
 
 `TETHER_ALLOWED_BOT_USERS` contains Slack bot member IDs.
@@ -95,6 +97,12 @@ TETHER_ALLOWED_BOT_IDS="B01234567,B07654321"
 only identities that may instruct the agent. `tether setup` sets Hermes
 `slack.allow_bots=mentions`; Tether remains the final routing authority for
 explicit mentions and locally owned threads.
+
+Do not use the ambient setting for conversational peer agents. It is for a
+trusted automation that intentionally creates unmentioned root events in one
+approved channel. Every comma-separated entry is an exact `B...:C...`,
+`B...:G...`, `U...:C...`, or `U...:G...` pair; malformed entries and the same
+bot in every other channel fail closed.
 
 ## Configuration
 

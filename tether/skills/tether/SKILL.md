@@ -60,7 +60,9 @@ Tether does not post queue position or periodic working messages.
 Peer agents may collaborate when Hermes uses mention-gated bot ingress and
 `TETHER_ALLOWED_BOT_USERS` or `TETHER_ALLOWED_BOT_IDS` explicitly trusts the
 peer. A trusted peer bot must mention this bot; unrelated bots and unmentioned
-peer turns stay silent. If one message mentions two trusted bots, each app
+peer turns stay silent. An intentionally ambient automation requires a second,
+exact identity-and-channel grant in `TETHER_AMBIENT_BOT_CHANNELS`. If one
+message mentions two trusted bots, each app
 makes its own independent routing decision. In a bound thread, an admitted peer
 turn goes to the exact bound session; Hermes is never a second writer. The
 agent must end its output with a standalone `NO_REPLY` line when no useful

@@ -50,7 +50,7 @@ or unrelated Slack integrations.
 | Principal | Accepted authority | Not implied |
 | --- | --- | --- |
 | Authorized human | Address an allowed bot and continue an eligible thread | Channel membership alone |
-| Trusted peer bot | Address this bot when explicitly mentioned | Ambient bot messages |
+| Trusted peer bot | Address this bot when explicitly mentioned | Ambient bot messages, unless one exact bot/channel automation route is configured |
 | Hermes gateway | Hold Slack credentials and dispatch admitted Hermes turns | Root or Docker authority |
 | Broker peer | Request operations as the broker's Unix UID | Isolation from other same-UID processes |
 | Bound native process | Receive one generation-bound attempt | Any process with the same command name or pane label |
@@ -82,9 +82,11 @@ Thread-root ownership is deliberately narrow:
   not weaken peer-bot mention gates.
 
 Human and peer-bot allowlists are explicit. A peer bot must explicitly mention
-this bot. If another bot is mentioned and this bot is not, this instance stays
-silent. Each named bot may independently handle a message that explicitly
-mentions multiple bots.
+this bot unless an administrator separately grants one exact bot identity and
+shared channel through `TETHER_AMBIENT_BOT_CHANNELS`. The same bot remains
+silent everywhere else. If another bot is mentioned and this bot is not, this
+instance stays silent. Each named bot may independently handle a message that
+explicitly mentions multiple bots.
 
 Evidence:
 [`runtime/routing.py`](../runtime/routing.py),

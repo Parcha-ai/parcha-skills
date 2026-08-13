@@ -128,7 +128,8 @@ The router returns one action and one writer ID. Its precedence is:
 
 1. A mention of another bot without this bot makes this instance silent.
 2. Each explicitly named bot may handle a multi-bot mention in its own app.
-3. A trusted peer bot must explicitly mention this bot.
+3. A trusted peer bot must explicitly mention this bot, unless an administrator
+   granted its exact identity and channel as an ambient automation source.
 4. An authorized human may explicitly address this bot.
 5. An ambient human reply requires a direct message, an exact active owned
    binding, or one fresh and unambiguous participation owner.

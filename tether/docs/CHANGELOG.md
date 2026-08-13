@@ -27,6 +27,9 @@
 
 ## Unreleased
 
+- Adds a fail-closed `TETHER_AMBIENT_BOT_CHANNELS` grant for trusted
+  automations that intentionally create unmentioned root events. Each grant is
+  bound to one exact Slack bot/app identity and one exact shared channel.
 - Makes explicit local attach and rebind operations durably claim their exact
   Slack thread for the current binding generation, so allowlisted humans can
   continue long or multi-bot threads without mentioning Tether. Peer bots stay
