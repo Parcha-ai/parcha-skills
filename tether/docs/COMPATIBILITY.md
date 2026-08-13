@@ -74,11 +74,11 @@ channel threads depending on token type, scopes, and channel membership.
 Tether distinguishes two thread types:
 
 - a thread whose root was posted by Tether has durable local root ownership;
-- an existing thread attached with `tether attach` is bound but does not gain
-  root ownership.
+- an existing thread explicitly attached or rebound by a trusted local client
+  has a durable claim fenced to that binding generation.
 
-This distinction can make ambient replies on attached threads fail closed when
-current ownership evidence is unavailable.
+Both permit unmentioned replies from allowlisted humans. Peer bots remain
+mention-gated, and unclaimed existing threads still fail closed.
 
 ## CLI compatibility
 

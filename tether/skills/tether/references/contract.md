@@ -48,6 +48,12 @@ A bot may participate only when its Slack member ID or bot ID is explicitly
 trusted. Another bot's presence in a thread does not transfer ownership.
 Hermes is not a second writer for a thread bound to a native session.
 
+A Tether-created root proves local thread ownership. A trusted owner-UID
+`attach` or `rebind` also records a durable thread claim fenced to the current
+binding generation. That claim admits unmentioned replies only from allowlisted
+humans; peer bots must still mention this bot. Close or a later rebind fences the
+old claim together with the rest of the binding generation.
+
 ## Delivery
 
 Each admitted event receives an attempt identity derived from the event, not

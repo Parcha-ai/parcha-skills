@@ -76,9 +76,10 @@ Thread-root ownership is deliberately narrow:
 - A root posted through Tether's durable root outbox gives that bridge durable
   ownership of the accepted thread. Ambient replies can use that local proof
   without reading Slack history.
-- `tether attach` binds an existing thread but does not claim that it created
-  the root. Ambient replies fail closed unless another routing rule supplies
-  current, unambiguous ownership evidence.
+- `tether attach` and `tether rebind` are owner-UID local operations that claim
+  one exact existing thread for one binding generation. That claim admits only
+  allowlisted humans; it does not claim authorship of the Slack root and does
+  not weaken peer-bot mention gates.
 
 Human and peer-bot allowlists are explicit. A peer bot must explicitly mention
 this bot. If another bot is mentioned and this bot is not, this instance stays

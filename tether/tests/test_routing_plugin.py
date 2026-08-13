@@ -1191,6 +1191,78 @@ class RoutingPluginIntegrationTest(unittest.TestCase):
         self.assertEqual(decision.action, self.plugin.routing.RouteAction.SILENT)
         self.assertEqual(decision.reason, "active_binding_not_owned")
 
+    def test_explicit_thread_claim_routes_ambient_human_without_history(self):
+        bridge = self.make_bridge("claude_session")
+        bridge = self.plugin.store.claim_thread(
+            bridge.bridge_id,
+            bridge.binding_generation,
+        )
+        self.adapter._tether_user_kinds = {
+            (TEAM, HUMAN): "human",
+            (TEAM, OTHER_HUMAN): "human",
+        }
+        self.client.thread_messages[THREAD] = [
+            {"ts": THREAD, "user": HUMAN, "text": "existing root"},
+            *(
+                {
+                    "ts": f"1785000000.{index:06d}",
+                    "user": OTHER_BOT,
+                    "bot_id": "BOTHER001",
+                    "text": "" if index == 1 else "unrelated bot artifact",
+                }
+                for index in range(1, 20)
+            ),
+        ]
+        self.adapter._get_client = mock.Mock(
+            side_effect=AssertionError(
+                "a durable thread claim must not read Slack history"
+            )
+        )
+        raw = self.raw_event(text="continue in this attached thread")
+
+        decision = asyncio.run(
+            self.plugin._route_slack_event(self.adapter, raw)
+        )
+
+        self.assertEqual(decision.action, self.plugin.routing.RouteAction.NATIVE)
+        self.assertEqual(decision.reason, "active_native_binding")
+        self.assertEqual(decision.bridge_id, bridge.bridge_id)
+
+    def test_explicit_thread_claim_keeps_unauthorized_human_silent(self):
+        bridge = self.make_bridge("claude_session")
+        self.plugin.store.claim_thread(
+            bridge.bridge_id,
+            bridge.binding_generation,
+        )
+        self.adapter._tether_user_kinds = {(TEAM, OTHER_HUMAN): "human"}
+        raw = self.raw_event(user=OTHER_HUMAN, text="continue")
+
+        decision = asyncio.run(
+            self.plugin._route_slack_event(self.adapter, raw)
+        )
+
+        self.assertEqual(decision.action, self.plugin.routing.RouteAction.SILENT)
+        self.assertEqual(decision.reason, "human_not_authorized")
+
+    def test_explicit_thread_claim_keeps_unmentioned_peer_bot_silent(self):
+        bridge = self.make_bridge("claude_session")
+        self.plugin.store.claim_thread(
+            bridge.bridge_id,
+            bridge.binding_generation,
+        )
+        raw = self.raw_event(
+            user=PEER,
+            bot_id=PEER_APP,
+            text="ambient peer update",
+        )
+
+        decision = asyncio.run(
+            self.plugin._route_slack_event(self.adapter, raw)
+        )
+
+        self.assertEqual(decision.action, self.plugin.routing.RouteAction.SILENT)
+        self.assertEqual(decision.reason, "peer_bot_did_not_target_self")
+
     def test_multiple_explicit_bot_mentions_route_each_named_bot(self):
         raw_a = self.raw_event(
             text=f"<@{LOCAL}> <@{PEER}> compare",

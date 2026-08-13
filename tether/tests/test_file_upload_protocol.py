@@ -186,7 +186,7 @@ class FileUploadProtocolTest(unittest.TestCase):
         self.assertIn("slack_file_id", columns)
         self.assertIn("upload_phase", columns)
         self.assertNotIn("upload_url", columns)
-        self.assertEqual(version, 16)
+        self.assertEqual(version, self.runtime.SCHEMA_VERSION)
         self.assertEqual(
             self.store.root_record(bridge.bridge_id)["upload_phase"],
             "reserved",
@@ -285,7 +285,7 @@ class FileUploadProtocolTest(unittest.TestCase):
         with migrated.connect() as database:
             self.assertEqual(
                 int(database.execute("PRAGMA user_version").fetchone()[0]),
-                16,
+                self.runtime.SCHEMA_VERSION,
             )
 
     def test_allocation_failure_is_durable_and_retry_allocates_once(self):

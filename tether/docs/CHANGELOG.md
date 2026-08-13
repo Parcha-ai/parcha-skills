@@ -27,6 +27,10 @@
 
 ## Unreleased
 
+- Makes explicit local attach and rebind operations durably claim their exact
+  Slack thread for the current binding generation, so allowlisted humans can
+  continue long or multi-bot threads without mentioning Tether. Peer bots stay
+  mention-gated and stale generations remain fenced.
 - Allows one Codex, Claude Code, Herdr, Zellij, Hermes, or headless endpoint to
   own multiple independent Slack threads. Exact thread routing and reply keys
   remain per bridge, while the durable ledger serializes agent turns across the

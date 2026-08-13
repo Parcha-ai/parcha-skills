@@ -174,7 +174,7 @@ SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
 CONFIG_VERSION = 1
 BINDING_VERSION = 3
 SUPPORTED_BINDING_VERSIONS = frozenset({1, 2, BINDING_VERSION})
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 RECONCILIATION_PAGE_LIMIT = 15
 RECONCILIATION_INTERVAL_SECONDS = 60
 RECONCILIATION_MAX_PAGES = 1_000
@@ -510,6 +510,7 @@ class Bridge:
     binding_version: int = 1
     binding_state: str = "legacy"
     binding_error_code: str = ""
+    thread_claim_generation: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1420,7 +1421,7 @@ class Store:
                 raise RuntimeError(
                     f"Tether database schema {locked_version} is newer than this runtime"
                 )
-            self._migrate(db)
+            self._migrate(db, observed_version=locked_version)
             db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             db.commit()
             self._secure_sqlite_files()
@@ -1463,7 +1464,12 @@ class Store:
                 delay = min(delay * 2, 0.25)
 
     @classmethod
-    def _migrate(cls, db: sqlite3.Connection) -> None:
+    def _migrate(
+        cls,
+        db: sqlite3.Connection,
+        *,
+        observed_version: int,
+    ) -> None:
         statements = (
             """
             CREATE TABLE IF NOT EXISTS bridges (
@@ -1477,6 +1483,7 @@ class Store:
               binding_state TEXT NOT NULL DEFAULT 'legacy',
               binding_error_code TEXT,
               endpoint_key TEXT NOT NULL DEFAULT '',
+              thread_claim_generation INTEGER,
               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
               updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
@@ -1706,6 +1713,7 @@ class Store:
                 "binding_state": "TEXT NOT NULL DEFAULT 'legacy'",
                 "binding_error_code": "TEXT",
                 "endpoint_key": "TEXT NOT NULL DEFAULT ''",
+                "thread_claim_generation": "INTEGER",
                 "updated_at": "TEXT",
             },
         )
@@ -2024,6 +2032,25 @@ class Store:
                 """,
                 (team,),
             )
+        # Before schema 17, explicit attach/rebind operations created active
+        # bridges without a durable ambient-thread claim. A bridge with no
+        # root outbox is an existing-thread attachment; verified active
+        # attachments were already authorized local operations, so preserve
+        # that authority across upgrade by claiming their current generation.
+        if observed_version < 17:
+            db.execute(
+                """
+                UPDATE bridges
+                SET thread_claim_generation=binding_generation
+                WHERE status='active' AND thread_ts IS NOT NULL
+                  AND binding_state='verified'
+                  AND thread_claim_generation IS NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM bridge_roots
+                    WHERE bridge_roots.bridge_id=bridges.bridge_id
+                  )
+                """
+            )
 
     @staticmethod
     def _add_missing_columns(
@@ -2137,6 +2164,14 @@ class Store:
             str(row["binding_error_code"] or "")
             if "binding_error_code" in keys else ""
         )
+        thread_claim_generation = (
+            int(row["thread_claim_generation"])
+            if (
+                "thread_claim_generation" in keys
+                and row["thread_claim_generation"] is not None
+            )
+            else None
+        )
         source.update({
             "binding_version": str(binding_version),
             "binding_state": binding_state,
@@ -2149,6 +2184,7 @@ class Store:
             binding_version,
             binding_state,
             binding_error,
+            thread_claim_generation,
         )
 
     @staticmethod
@@ -2235,18 +2271,57 @@ class Store:
             row = db.execute("SELECT * FROM bridges WHERE bridge_id=?", (bridge_id,)).fetchone()
             return self.decode(row)  # type: ignore[return-value]
 
-    def bind(self, bridge_id: str, thread_ts: str) -> Bridge:
+    def bind(
+        self,
+        bridge_id: str,
+        thread_ts: str,
+        *,
+        claim_thread: bool = False,
+    ) -> Bridge:
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             db.execute(
                 """
                 UPDATE bridges
-                SET thread_ts=?,status='active',updated_at=CURRENT_TIMESTAMP
+                SET thread_ts=?,status='active',
+                    thread_claim_generation=CASE
+                      WHEN ? THEN binding_generation
+                      ELSE thread_claim_generation
+                    END,
+                    updated_at=CURRENT_TIMESTAMP
                 WHERE bridge_id=? AND status!='closed'
                 """,
-                (thread_ts, bridge_id),
+                (thread_ts, int(claim_thread), bridge_id),
             )
             return self.decode(db.execute("SELECT * FROM bridges WHERE bridge_id=?", (bridge_id,)).fetchone())  # type: ignore[return-value]
+
+    def claim_thread(
+        self,
+        bridge_id: str,
+        expected_generation: int,
+    ) -> Bridge:
+        """Claim ambient human replies for one exact active binding generation."""
+        if expected_generation < 1:
+            raise ValueError("binding generation is invalid")
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            cursor = db.execute(
+                """
+                UPDATE bridges
+                SET thread_claim_generation=binding_generation,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE bridge_id=? AND status='active' AND thread_ts IS NOT NULL
+                  AND binding_generation=? AND binding_state='verified'
+                """,
+                (bridge_id, expected_generation),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("active binding changed before thread claim")
+            row = db.execute(
+                "SELECT * FROM bridges WHERE bridge_id=?",
+                (bridge_id,),
+            ).fetchone()
+            return self.decode(row)  # type: ignore[return-value]
 
     def reserve_root(
         self,
@@ -2924,6 +2999,7 @@ class Store:
                 SET source_kind=?,source_json=?,binding_version=?,
                     binding_generation=binding_generation+1,binding_state=?,
                     binding_error_code=NULL,endpoint_key=?,
+                    thread_claim_generation=binding_generation+1,
                     updated_at=CURRENT_TIMESTAMP
                 WHERE bridge_id=? AND status='active'
                   AND binding_generation=?
@@ -9399,6 +9475,10 @@ class Broker:
         existing = self.store.find(request["team_id"], request["channel_id"], thread_ts)
         if existing is not None:
             if existing.idempotency_key == str(request.get("idempotency_key") or ""):
+                existing = self.store.claim_thread(
+                    existing.bridge_id,
+                    existing.binding_generation,
+                )
                 return {
                     "ok": True,
                     "bridge_id": existing.bridge_id,
@@ -9407,7 +9487,11 @@ class Broker:
                 }
             raise ValueError("Slack thread already has an active Tether binding")
         bridge = self.store.create(request)
-        bridge = self.store.bind(bridge.bridge_id, thread_ts)
+        bridge = self.store.bind(
+            bridge.bridge_id,
+            thread_ts,
+            claim_thread=True,
+        )
         self.store.mark_participation(bridge.team_id, bridge.channel_id, thread_ts)
         return {
             "ok": True,

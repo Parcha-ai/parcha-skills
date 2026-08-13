@@ -45,9 +45,10 @@ independent Slack threads. Tether routes ingress by exact workspace, channel,
 and thread, and serializes agent turns across every bridge sharing the endpoint.
 
 A Tether-created thread root is durable local proof that the bridge owns that
-thread for ambient replies. `tether attach` binds an existing thread but does
-not claim its root; unmentioned replies there fail closed unless ownership can
-be established by the routing rules.
+thread for ambient replies. An explicit local `tether attach` or `tether
+rebind` durably claims an existing thread for its exact binding generation.
+Allowlisted humans can then reply without a mention; peer bots remain
+mention-gated, and replacing the writer still requires an explicit rebind.
 
 Slack Events API delivery is authoritative ingress. The
 `conversations.replies` poller is bounded, best-effort recovery for events

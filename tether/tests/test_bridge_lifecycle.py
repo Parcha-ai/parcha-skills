@@ -201,6 +201,10 @@ class BridgeLifecycleTest(unittest.TestCase):
             rebound.binding_generation,
             bridge.binding_generation + 1,
         )
+        self.assertEqual(
+            rebound.thread_claim_generation,
+            rebound.binding_generation,
+        )
         claimed = self.store.claim_next_event(bridge.bridge_id)
         self.assertEqual(claimed["event_id"], "1785000000.000001")
         with self.store.connect() as database:

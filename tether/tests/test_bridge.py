@@ -409,13 +409,20 @@ class StoreTest(unittest.TestCase):
         path.chmod(0o600)
 
         migrated = self.runtime.Store(path)
-        self.assertEqual(migrated.get("brg_detached").binding_state, "verified")
+        detached = migrated.get("brg_detached")
+        self.assertEqual(detached.binding_state, "verified")
+        self.assertEqual(
+            detached.thread_claim_generation,
+            detached.binding_generation,
+        )
         legacy = migrated.get("brg_legacy_pane")
         self.assertEqual(legacy.binding_state, "rebind_required")
         self.assertEqual(legacy.binding_error_code, "process_identity_missing")
+        self.assertIsNone(legacy.thread_claim_generation)
         invalid = migrated.get("brg_invalid")
         self.assertEqual(invalid.binding_state, "rebind_required")
         self.assertEqual(invalid.binding_error_code, "binding_invalid")
+        self.assertIsNone(invalid.thread_claim_generation)
         with migrated.connect() as database:
             self.assertEqual(
                 database.execute("PRAGMA user_version").fetchone()[0],
@@ -1035,6 +1042,43 @@ class StoreTest(unittest.TestCase):
         bridge = self.store.find("T12345678", "C12345678", "123.456")
         self.assertEqual(bridge.source_kind, "claude_session")
         self.assertEqual(bridge.source["session_id"], "claude-1")
+        self.assertEqual(
+            bridge.thread_claim_generation,
+            bridge.binding_generation,
+        )
+
+    def test_deduplicated_attach_repairs_missing_thread_claim(self):
+        broker = self.runtime.Broker(
+            "test-token",
+            self.store,
+            verified_workspace_team_id="T12345678",
+        )
+        request = {
+            "op": "attach",
+            "source_kind": "claude_session",
+            "source": {"session_id": "claude-1", "cwd": "/tmp/project"},
+            "owner_user_id": "U12345678",
+            "team_id": "T12345678",
+            "channel_id": "C12345678",
+            "thread_ts": "123.456",
+            "idempotency_key": "review-123.456",
+        }
+        first = broker.handle(request)
+        with self.store.connect() as database:
+            database.execute(
+                "UPDATE bridges SET thread_claim_generation=NULL "
+                "WHERE bridge_id=?",
+                (first["bridge_id"],),
+            )
+
+        repeated = broker.handle(request)
+
+        self.assertTrue(repeated["deduplicated"])
+        bridge = self.store.get(first["bridge_id"])
+        self.assertEqual(
+            bridge.thread_claim_generation,
+            bridge.binding_generation,
+        )
 
     def test_attach_refuses_to_replace_active_binding(self):
         broker = self.runtime.Broker("test-token", self.store, verified_workspace_team_id="T12345678")

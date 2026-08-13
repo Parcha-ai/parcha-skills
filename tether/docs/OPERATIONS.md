@@ -269,9 +269,9 @@ poller and Slack-write reconciler share a durable history-read budget:
 - rejection of repeated, malformed, or non-advancing cursors.
 
 This favors duplicate avoidance and Slack compliance over recovery latency.
-Tether-created root ownership does not depend on polling. An explicitly
-attached existing thread does not gain root ownership, so ambient routing there
-may fail closed when ownership evidence is unavailable.
+Tether-created root ownership and explicit attach/rebind thread claims do not
+depend on polling. Unclaimed existing threads still fail closed when ownership
+evidence is unavailable.
 
 ## Retention and state removal
 

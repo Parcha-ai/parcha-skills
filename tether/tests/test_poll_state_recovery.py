@@ -218,7 +218,7 @@ class PollStateRecoveryTest(unittest.TestCase):
                 database.execute("PRAGMA user_version").fetchone()[0]
             )
         self.assertIn("pending_messages_json", columns)
-        self.assertEqual(version, 16)
+        self.assertEqual(version, self.runtime.SCHEMA_VERSION)
 
     def test_corrupt_pending_message_buffer_fails_closed(self):
         thread = "1785000000.000001"

@@ -802,6 +802,7 @@ async def _routing_thread_state(
             return None, "bridge_workspace_unresolved"
         ambient_owned = (
             message.conversation_kind is routing.ConversationKind.DM
+            or bridge.thread_claim_generation == bridge.binding_generation
             or store.owns_thread_root(
                 bridge.bridge_id,
                 message.identity.team_id,

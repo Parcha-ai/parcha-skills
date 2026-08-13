@@ -95,6 +95,9 @@ separate native resume process. Inside Herdr, omit Zellij arguments: Tether
 captures `HERDR_SESSION`, `HERDR_SOCKET_PATH`, and `HERDR_PANE_ID`, then verifies
 Herdr's official native session reference. After attaching, use `tether reply --bridge-id
 ...` for the native session's result. Do not guess a pane or session identity.
+The explicit local attach claims that exact thread for the current binding
+generation, so allowlisted humans may continue it without mentioning the bot.
+Peer bots remain mention-gated. An intentional replacement must use `rebind`.
 
 ## Use inside Herdr
 

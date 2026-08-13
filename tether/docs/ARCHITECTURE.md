@@ -90,16 +90,17 @@ A normal notification first reserves a root outbox. The bridge becomes active
 only after Slack's accepted root timestamp is recorded. `tether attach` binds
 an existing thread directly.
 
-The distinction affects ambient routing:
+Both activation paths establish durable but distinct ambient authority:
 
 - **Tether-created root:** the Store records that the root outbox created the
   accepted thread. That durable fact establishes ambient ownership without a
   Slack history read.
-- **Existing-thread attachment:** the bridge did not create the root and does
-  not gain ambient ownership. An unmentioned reply fails closed unless other
-  routing evidence establishes ownership.
+- **Existing-thread attachment:** the trusted local attach or rebind records a
+  claim for the exact binding generation. Unmentioned allowlisted human replies
+  route to that writer without relying on Slack history. Peer bots remain
+  mention-gated.
 
-See `Store.owns_thread_root` and
+See `Store.owns_thread_root`, `Store.claim_thread`, and
 [`tests/test_routing_plugin.py`](../tests/test_routing_plugin.py).
 
 ### Generation fencing
