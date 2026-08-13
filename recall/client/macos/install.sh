@@ -10,6 +10,7 @@ VISIBILITY=""
 SOURCES=""
 CLAUDE_ROOT="$HOME/.claude/projects"
 CODEX_ROOT="$HOME/.codex/sessions"
+CODEX_ARCHIVE_ROOT="$HOME/.codex/archived_sessions"
 COWORK_ROOT="$HOME/Library/Application Support/Claude/local-agent-mode-sessions"
 IMESSAGE_DATABASE=""
 WHATSAPP_EXPORT=""
@@ -46,6 +47,7 @@ while [ "$#" -gt 0 ]; do
     --sources) SOURCES=$2; shift 2 ;;
     --claude-root) CLAUDE_ROOT=$2; shift 2 ;;
     --codex-root) CODEX_ROOT=$2; shift 2 ;;
+    --codex-archive-root) CODEX_ARCHIVE_ROOT=$2; shift 2 ;;
     --cowork-root) COWORK_ROOT=$2; shift 2 ;;
     --imessage-database) IMESSAGE_DATABASE=$2; shift 2 ;;
     --whatsapp-export) WHATSAPP_EXPORT=$2; shift 2 ;;
@@ -357,6 +359,14 @@ except (KeyError, OSError, TypeError, UnicodeError, ValueError):
     raise SystemExit("package_integrity_failed") from None
 PY
 
+case ",$SOURCES," in *,codex,*)
+  mkdir -p "$CODEX_ARCHIVE_ROOT"
+  [ -d "$CODEX_ARCHIVE_ROOT" ] && [ ! -L "$CODEX_ARCHIVE_ROOT" ] || {
+    echo "Codex archive root must be a non-symlink directory" >&2
+    exit 2
+  }
+;; esac
+
 if [ -L "$PREFIX" ] || [ -L "$LAUNCH_AGENTS" ]; then
   echo "install_location_unsafe" >&2
   exit 1
@@ -369,6 +379,7 @@ mkdir -p "$TRANSACTION/stage/bin" "$TRANSACTION/stage/lib" \
   "$TRANSACTION/old/code" "$TRANSACTION/old/plists"
 cp -R "$SOURCE/lib/client" "$TRANSACTION/stage/lib/client"
 cp -R "$SOURCE/lib/collector" "$TRANSACTION/stage/lib/collector"
+cp -R "$SOURCE/lib/skills" "$TRANSACTION/stage/lib/skills"
 cp -R "$SOURCE/lib/connectors" "$TRANSACTION/stage/lib/connectors"
 cp -R "$SOURCE/lib/contracts" "$TRANSACTION/stage/lib/contracts"
 cp -R "$SOURCE/lib/privacy" "$TRANSACTION/stage/lib/privacy"
@@ -551,28 +562,37 @@ RUNTIME="$PREFIX/runtime/bin/python3"
 write_plist() {
   HARNESS=$1
   ROOT=$2
+  ARCHIVE_ROOT=$3
   SOURCE_ID="$HARNESS:mac:$HOST_ID"
   LABEL="ai.parcha.recall.$HARNESS"
   PLIST="$LAUNCH_AGENTS/$LABEL.plist"
   if [ "$NO_LOAD" -eq 0 ] && command -v launchctl >/dev/null 2>&1; then
     stop_launch_agent "$LABEL"
   fi
-  "$RUNTIME" - "$PLIST" "$LABEL" "$RUNTIME" "$PREFIX/lib" "$ENDPOINT" "$SOURCE_ID" "$HARNESS" "$ROOT" "$PREFIX/state/$HARNESS.db" "$KEYCHAIN_SERVICE" "$VISIBILITY" "$PRIVACY_MODE" <<'PY'
+  "$RUNTIME" - "$PLIST" "$LABEL" "$RUNTIME" "$PREFIX/lib" "$ENDPOINT" "$SOURCE_ID" "$HARNESS" "$ROOT" "$ARCHIVE_ROOT" "$PREFIX/state/$HARNESS.db" "$KEYCHAIN_SERVICE" "$VISIBILITY" "$PRIVACY_MODE" <<'PY'
 import plistlib
 import sys
 
-path, label, program, pythonpath, endpoint, source_id, harness, root, spool, service, visibility, privacy_mode = sys.argv[1:]
+path, label, program, pythonpath, endpoint, source_id, harness, root, archive_root, spool, service, visibility, privacy_mode = sys.argv[1:]
+arguments = [
+    program, "-m", "client.cli", "collect", "--endpoint", endpoint,
+    "--source-id", source_id, "--principal-id", "owner",
+    "--visibility", visibility, "--harness", harness,
+    "--root", root,
+]
+if harness == "codex":
+    if not archive_root:
+        raise SystemExit("codex_archive_root_required")
+    arguments.extend(["--archive-root", archive_root])
+arguments.extend([
+    "--spool", spool,
+    "--max-scan-records", "1000", "--max-scan-seconds", "20",
+    "--keychain-service", service, "--keychain-account", source_id,
+    "--privacy-mode", privacy_mode,
+])
 value = {
     "Label": label,
-    "ProgramArguments": [
-        program, "-m", "client.cli", "collect", "--endpoint", endpoint,
-        "--source-id", source_id, "--principal-id", "owner",
-        "--visibility", visibility, "--harness", harness,
-        "--root", root, "--spool", spool,
-        "--max-scan-records", "1000", "--max-scan-seconds", "20",
-        "--keychain-service", service, "--keychain-account", source_id,
-        "--privacy-mode", privacy_mode,
-    ],
+    "ProgramArguments": arguments,
     "EnvironmentVariables": {
         "PYTHONPATH": pythonpath,
         "RECALL_KEYCHAIN_REFERENCE": "Keychain service/account only",
@@ -821,8 +841,8 @@ PY
   fi
 }
 
-case ",$SOURCES," in *,claude,*) write_plist claude "$CLAUDE_ROOT" ;; esac
-case ",$SOURCES," in *,codex,*) write_plist codex "$CODEX_ROOT" ;; esac
+case ",$SOURCES," in *,claude,*) write_plist claude "$CLAUDE_ROOT" "" ;; esac
+case ",$SOURCES," in *,codex,*) write_plist codex "$CODEX_ROOT" "$CODEX_ARCHIVE_ROOT" ;; esac
 case ",$SOURCES," in *,cowork,*) write_cowork_plist ;; esac
 case ",$SOURCES," in *,imessage,*) write_local_connector_plist imessage ;; esac
 case ",$SOURCES," in *,whatsapp,*) write_local_connector_plist whatsapp ;; esac

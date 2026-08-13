@@ -158,6 +158,8 @@ def application_payloads(source_root: Path, runtime_lock_data: bytes) -> dict[st
         source_root / "client" / "__init__.py": "lib/client/__init__.py",
         source_root / "collector" / "collector.py": "lib/collector/collector.py",
         source_root / "collector" / "__init__.py": "lib/collector/__init__.py",
+        source_root / "skills" / "recall" / "scripts" / "codex_identity.py":
+            "lib/skills/recall/scripts/codex_identity.py",
         source_root / "connectors" / "sdk.py": "lib/connectors/sdk.py",
         source_root / "connectors" / "export_inbox.py": "lib/connectors/export_inbox.py",
         source_root / "connectors" / "cowork_local.py": "lib/connectors/cowork_local.py",

@@ -140,6 +140,23 @@ class MacUtilityLifecycleTest(unittest.TestCase):
             result["sources"]["cowork"]["health"], "invalid_local_state"
         )
 
+    def test_codex_without_archive_root_is_degraded_and_actionable(self) -> None:
+        self._enable("codex")
+        self._state("codex", {
+            "last_scan_at": "195",
+            "last_success_epoch": "100",
+            "last_scan_complete": "1",
+        })
+
+        result = mac_status(prefix=self.prefix, launch_agents=self.agents, now=200)
+
+        value = result["sources"]["codex"]
+        self.assertEqual(value["health"], "degraded")
+        self.assertEqual(value["remediation"], "upgrade_archive_coverage")
+        self.assertFalse(value["archive_root_configured"])
+        self.assertEqual(value["lag_seconds"], 5)
+        self.assertEqual(value["last_ack_age_seconds"], 100)
+
     def test_status_distinguishes_running_stalled_backfill_and_dead_letters(self) -> None:
         self._enable("claude-code")
         state = self.prefix / "state" / SOURCE_SPECS["claude-code"].spool_name
