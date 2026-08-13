@@ -13,10 +13,12 @@ of searching entire transcripts. All commands go through one CLI:
 python3 scripts/recall.py <command>       # relative to this skill directory
 ```
 
-If `RECALL_URL` is set, `RECALL_MODE` is `remote` or `shadow`, or
-`~/.config/recall-brain/client.json` exists, this machine has a central Recall
-Brain configured. In that case, read [references/central-brain.md](references/central-brain.md)
-before running commands. Otherwise everything below is fully local and nothing
+If Recall MCP tools are available in the current agent, immediately
+read [references/central-brain.md](references/central-brain.md)
+before running commands and use those tools directly. Do not run the local CLI
+as a parallel or fallback retrieval path. The same central instructions apply
+when `RECALL_URL` is set, `RECALL_MODE` is `remote` or `shadow`, or
+`~/.config/recall-brain/client.json` exists. Otherwise everything below is fully local and nothing
 touches a network.
 
 ## No index yet? Search anyway

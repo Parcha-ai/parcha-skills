@@ -764,10 +764,14 @@ class PassageHintRetrieval:
                 dense_strategy,
                 dense_scope_passages,
             ) = dense_future.result()
+        # A document containing every informative query term is stronger
+        # evidence than a semantic neighbor. Dense retrieval remains the
+        # fallback for paraphrases, but it must not bury an exact hit merely
+        # because each arm returned candidates.
         legs = (
-            ("dense", 0.55, dense),
+            ("dense", 0.15, dense),
             ("passage-lexical", 0.30, lexical),
-            ("sparse-exact", 0.15, sparse),
+            ("sparse-exact", 0.55, sparse),
         )
         results = collapse_document_candidates(legs, limit=limit)
         response = {
