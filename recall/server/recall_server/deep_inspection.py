@@ -28,6 +28,21 @@ MAX_AGENT_PROGRAM_BYTES = 16_000
 MAX_AGENT_EXEC_OUTPUT_BYTES = 40_000
 MAX_ARCHIL_COMMAND_BYTES = 100_000
 AGENT_EXEC_STAGE_GRACE_SECONDS = 45
+DUCKDB_SCAN_WRAPPER = r'''#!/usr/bin/env bash
+set -eu
+args=()
+for arg in "$@"; do
+    case "$arg" in
+        -readonly|--readonly)
+            # The scan has no database file: DuckDB otherwise applies this flag
+            # to its temporary in-memory catalog and refuses to start. Recall's
+            # evidence and dataset mounts, not the catalog, are read-only.
+            ;;
+        *) args+=("$arg") ;;
+    esac
+done
+exec /tmp/recall-agent/duckdb-real "${args[@]}"
+'''
 RECEIPT_TOKEN_PATTERN = (
     r"recall://[A-Za-z0-9:._@+-]+/[^\s\"'<>()[\]{},;]{1,1900}"
 )
@@ -478,6 +493,7 @@ def _agent_exec_command(
             sort_keys=True,
         ).encode()
     )
+    encoded_duckdb_wrapper = encode(DUCKDB_SCAN_WRAPPER.encode())
     encoded_allow_missing = "1" if allow_missing_objects else "0"
     stage_script = r"""
 import base64,gzip,hashlib,json,pathlib,re,shutil,subprocess,sys,time
@@ -488,7 +504,8 @@ items=json.loads(gzip.decompress(base64.b64decode(sys.argv[1])))
 aliases=json.loads(gzip.decompress(base64.b64decode(sys.argv[2])))
 datasets=json.loads(gzip.decompress(base64.b64decode(sys.argv[3])))
 tool=json.loads(gzip.decompress(base64.b64decode(sys.argv[4])))
-allow_missing=sys.argv[5]=="1"
+duckdb_wrapper=gzip.decompress(base64.b64decode(sys.argv[5]))
+allow_missing=sys.argv[6]=="1"
 source=pathlib.Path("/mnt/archil/evidence").resolve()
 target=pathlib.Path("/tmp/recall-authorized").resolve()
 docs=pathlib.Path("/tmp/recall-docs").resolve()
@@ -580,7 +597,9 @@ if tool is not None:
         raise SystemExit(66)
     if hashlib.sha256(src.read_bytes()).hexdigest()!=tool["content_sha256"]:
         raise SystemExit(66)
-    shutil.copyfile(src,"/tmp/recall-agent/duckdb")
+    shutil.copyfile(src,"/tmp/recall-agent/duckdb-real")
+    pathlib.Path("/tmp/recall-agent/duckdb-real").chmod(0o500)
+    pathlib.Path("/tmp/recall-agent/duckdb").write_bytes(duckdb_wrapper)
     pathlib.Path("/tmp/recall-agent/duckdb").chmod(0o500)
 mark("tool_ready")
 mark("stage_end")
@@ -634,6 +653,8 @@ printf 'RECALL_EXEC_TIMING_V1\t%s\t%s\n' "$1" "${EPOCHREALTIME/./}" >&2
             + shlex.quote(encoded_datasets)
             + " "
             + shlex.quote(encoded_tool)
+            + " "
+            + shlex.quote(encoded_duckdb_wrapper)
             + " "
             + encoded_allow_missing
         ),

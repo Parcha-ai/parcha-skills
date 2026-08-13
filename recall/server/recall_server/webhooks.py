@@ -49,10 +49,12 @@ def build_webhook_event(body: Any, principal: dict[str, Any]) -> WebhookResult:
     source_id = principal.get("source_id")
     principal_id = principal.get("principal_id")
     privacy_mode = principal.get("webhook_privacy_mode")
+    connector_id = principal.get("connector_id", "custom.webhook")
     if (
         not isinstance(source_id, str)
         or not isinstance(principal_id, str)
         or privacy_mode not in {"scrub", "drop"}
+        or connector_id not in {"custom.webhook", "slack.messages"}
     ):
         raise WebhookError("webhook credential is not bound")
     record = body["record"]
@@ -77,9 +79,13 @@ def build_webhook_event(body: Any, principal: dict[str, Any]) -> WebhookResult:
         event_kind = "connector_record"
         content = safe_record
     provenance = {
-        "connector_id": "custom.webhook",
+        "connector_id": connector_id,
         "connector_schema_version": 2,
-        "uri": "connector://custom-webhook",
+        "uri": (
+            "connector://custom-webhook"
+            if connector_id == "custom.webhook"
+            else "connector://slack/events"
+        ),
     }
     event = {
         "schema_version": 1,

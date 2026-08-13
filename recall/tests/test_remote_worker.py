@@ -62,7 +62,10 @@ SELECTORS = {
         "repository": "synthetic-repo",
     },
     "linear.activity": {"team_id": "team-synthetic"},
-    "slack.messages": {"channel_id": "C123"},
+    "slack.messages": {
+        "workspace_id": "T123", "channel_ids": ["C123"],
+        "owner_user_ids": ["U111"],
+    },
     "notion.workspace": {},
     "x.activity": {"user_id": "999", "streams": ["bookmark", "mention", "own"]},
 }

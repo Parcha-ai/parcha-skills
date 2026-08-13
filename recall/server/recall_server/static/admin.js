@@ -168,6 +168,28 @@ function renderGoogle() {
   $("#google-form button[type=submit]").disabled = !available;
 }
 
+function renderSlack() {
+  const available = state.data.providers.some((item) => item.id === "slack");
+  const brain = $("#slack-brain");
+  brain.innerHTML = brainOptions();
+  brain.disabled = !available;
+  $("#slack-enabled").disabled = !available;
+  $("#slack-form button[type=submit]").disabled = !available;
+  const connections = state.data.connections.filter((item) => item.provider === "slack");
+  const active = connections.filter((item) => item.status === "connected");
+  const target = $("#slack-connection");
+  target.replaceChildren();
+  target.append(active.length ? "Connected" : available ? "Not connected" : "Slack OAuth is not configured");
+  connections.forEach((item) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.dataset.connectionId = item.id;
+    button.textContent = "Disconnect Slack";
+    target.append(button);
+  });
+  target.classList.toggle("connected", active.length > 0);
+}
+
 function renderCatalog() {
   const target = $("#integration-grid");
   target.replaceChildren();
@@ -240,6 +262,7 @@ function render() {
   renderBrains();
   renderAccess();
   renderGoogle();
+  renderSlack();
   renderCatalog();
   renderInstallations();
   $(".pulse").classList.add("ready");
@@ -376,6 +399,33 @@ $("#google-form").addEventListener("submit", async (event) => {
   }
 });
 
+$("#slack-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!$("#slack-enabled").checked) return toast("Switch Slack on first.");
+  const tenantId = $("#slack-brain").value;
+  const brain = state.data.brains.find((item) => item.tenant_id === tenantId);
+  if (brain?.brain_kind === "company" && !window.confirm(
+    "Slack content will be available to authorized company members. Continue?"
+  )) return;
+  try {
+    const result = await api("/admin/api/v1/oauth/start", {
+      method: "POST",
+      body: JSON.stringify({
+        provider: "slack",
+        routes: [{
+          connector_id: "slack.messages",
+          tenant_id: tenantId,
+          privacy_mode: "scrub",
+          selectors: { channel_ids: [], owner_user_ids: [] },
+        }],
+      }),
+    });
+    window.location.assign(result.authorization_url);
+  } catch (error) {
+    toast(`Slack authorization did not start: ${error.message}`);
+  }
+});
+
 $("#installation-list").addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-action]");
   if (!button) return;
@@ -408,6 +458,20 @@ $("#google-connection").addEventListener("click", async (event) => {
     await load();
   } catch (error) {
     toast(`Provider remains connected: ${error.message}`);
+  }
+});
+
+$("#slack-connection").addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-connection-id]");
+  if (!button || !window.confirm("Disconnect Slack and revoke its route?")) return;
+  try {
+    await api(`/admin/api/v1/connections/${button.dataset.connectionId}/revoke`, {
+      method: "POST", body: JSON.stringify({}),
+    });
+    toast("Slack disconnected.");
+    await load();
+  } catch (error) {
+    toast(`Slack remains connected: ${error.message}`);
   }
 });
 

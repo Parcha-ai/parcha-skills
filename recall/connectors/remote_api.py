@@ -29,6 +29,7 @@ MAX_AUTHORITY_BYTES = 16_384
 MAX_PARAMETER_BYTES = 4_096
 DEFAULT_MAX_RESPONSE_BYTES = 8_000_000
 MAX_REQUEST_BYTES = 1_000_000
+MAX_BINARY_BYTES = 64 * 1024 * 1024
 
 
 class RemoteApiError(RuntimeError):
@@ -262,6 +263,7 @@ class BoundedJsonRail:
         opener: Callable[..., Any] = open_no_redirect,
         timeout_seconds: int = 30,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+        binary_hosts: tuple[str, ...] = (),
     ):
         self.origin = _validate_origin(origin)
         self.authority_path = Path(authority_path)
@@ -312,6 +314,74 @@ class BoundedJsonRail:
             raise ValueError("invalid remote response bound")
         self.timeout_seconds = timeout_seconds
         self.max_response_bytes = max_response_bytes
+        if (
+            not isinstance(binary_hosts, tuple)
+            or len(binary_hosts) > 8
+            or binary_hosts != tuple(sorted(set(binary_hosts)))
+            or any(
+                not isinstance(host, str)
+                or not re.fullmatch(r"[a-z0-9.-]{1,253}", host)
+                or host.startswith(".") or host.endswith(".") or ".." in host
+                for host in binary_hosts
+            )
+        ):
+            raise ValueError("invalid binary hosts")
+        self.binary_hosts = binary_hosts
+
+    def download_binary(self, url: str, *, maximum_bytes: int = MAX_BINARY_BYTES) -> tuple[bytes, str]:
+        """Fetch one provider-owned artifact from an exact code-owned host allow-list."""
+        parsed = urllib.parse.urlsplit(url) if isinstance(url, str) else None
+        if (
+            parsed is None or parsed.scheme != "https" or parsed.hostname not in self.binary_hosts
+            or parsed.username or parsed.password or parsed.fragment
+            or not parsed.path.startswith("/files-pri/")
+            or not 1 <= maximum_bytes <= MAX_BINARY_BYTES
+        ):
+            raise RemoteApiError("binary_url_invalid")
+        authority = _authority(self.authority_path)
+        request = urllib.request.Request(
+            url,
+            method="GET",
+            headers={
+                "Accept": "*/*",
+                "Authorization": f"{self.authorization_scheme} {authority}",
+                "User-Agent": "recall-remote-connector/1",
+            },
+        )
+        try:
+            response = self.opener(request, timeout=self.timeout_seconds)
+            with response:
+                content_type = str(response.headers.get("Content-Type", "")).split(";", 1)[0]
+                if not re.fullmatch(
+                    r"[a-z0-9][a-z0-9.+-]{0,63}/[a-z0-9][a-z0-9.+-]{0,127}",
+                    content_type,
+                ):
+                    raise RemoteApiError("content_type_invalid")
+                declared = response.headers.get("Content-Length")
+                if declared is not None and (not declared.isdigit() or int(declared) > maximum_bytes):
+                    raise RemoteApiError("response_too_large")
+                chunks = []
+                remaining = maximum_bytes + 1
+                while remaining:
+                    chunk = response.read(min(1_048_576, remaining))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                payload = b"".join(chunks)
+                if not payload or len(payload) > maximum_bytes:
+                    raise RemoteApiError("response_too_large")
+                return payload, content_type
+        except RemoteApiError:
+            raise
+        except urllib.error.HTTPError as error:
+            if 300 <= error.code <= 399:
+                raise RemoteApiError("redirect_rejected") from None
+            if error.code in {401, 403}:
+                raise RemoteApiError("authority_forbidden") from None
+            raise RemoteApiError("upstream_error") from None
+        except (urllib.error.URLError, TimeoutError, OSError):
+            raise RemoteApiError("upstream_unavailable") from None
 
     def request(
         self,
@@ -442,4 +512,5 @@ __all__ = [
     "DEFAULT_MAX_RESPONSE_BYTES",
     "RemoteApiError",
     "RemoteOperation",
+    "MAX_BINARY_BYTES",
 ]

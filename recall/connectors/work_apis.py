@@ -16,6 +16,7 @@ from connectors.sdk import (
     ConnectorUpstreamError,
     SOURCE_ID,
 )
+from connectors.slack_source import normalize_slack_message, normalize_slack_user
 
 
 EPOCH = "1970-01-01T00:00:00Z"
@@ -498,17 +499,103 @@ class LinearActivityConnector:
         )
 
 
+def _slack_cursor(
+    *, phase: str, page: str | None, thread_page: str | None,
+    threads: list[str], thread_index: int, watermark: str, max_seen: str, cycle: int,
+) -> str:
+    value = {
+        "v": 2, "phase": phase, "page": page, "thread_page": thread_page,
+        "threads": threads, "thread_index": thread_index,
+        "watermark": watermark, "max_seen": max_seen, "cycle": cycle,
+    }
+    try:
+        raw = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError):
+        raise ConnectorContractError("connector cursor is invalid") from None
+    if len(raw.encode()) > MAX_VALUE_BYTES:
+        raise ConnectorContractError("connector cursor is invalid")
+    return raw
+
+
+def _slack_state(raw: str | None) -> dict[str, Any]:
+    if raw is None:
+        return {
+            "v": 2, "phase": "history", "page": None, "thread_page": None,
+            "threads": [], "thread_index": 0, "watermark": EPOCH,
+            "max_seen": EPOCH, "cycle": 0,
+        }
+    # Accept the pre-workspace cursor only as a safe history resume.
+    try:
+        value = json.loads(raw, parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()))
+    except (TypeError, json.JSONDecodeError, ValueError):
+        raise ConnectorContractError("connector cursor is invalid") from None
+    if isinstance(value, dict) and value.get("v") == 1:
+        legacy = _state(raw)
+        return {
+            **legacy, "v": 2, "phase": "history", "thread_page": None,
+            "threads": [], "thread_index": 0,
+        }
+    expected = {
+        "v", "phase", "page", "thread_page", "threads", "thread_index",
+        "watermark", "max_seen", "cycle",
+    }
+    if (
+        not isinstance(value, dict) or set(value) != expected or value.get("v") != 2
+        or value.get("phase") not in {"users", "history", "threads"}
+        or not isinstance(value.get("threads"), list)
+        or len(value["threads"]) > 100
+        or any(not isinstance(item, str) or not item for item in value["threads"])
+        or type(value.get("thread_index")) is not int
+        or not 0 <= value["thread_index"] <= len(value["threads"])
+        or type(value.get("cycle")) is not int
+        or not 0 <= value["cycle"] <= 2_147_483_647
+        or any(value.get(key) is not None and not isinstance(value.get(key), str)
+               for key in ("page", "thread_page"))
+    ):
+        raise ConnectorContractError("connector cursor is invalid")
+    _timestamp(value.get("watermark"), "connector watermark")
+    _timestamp(value.get("max_seen"), "connector maximum")
+    if value["phase"] == "threads" and value["thread_index"] >= len(value["threads"]):
+        raise ConnectorContractError("connector cursor is invalid")
+    return value
+
+
 def slack_rail(*, authority_path: Path, **options: Any) -> BoundedJsonRail:
     return BoundedJsonRail(
         origin="https://slack.com",
         authority_path=authority_path,
         authorization_scheme="Bearer",
+        binary_hosts=("files.slack.com",),
         operations={
             "messages.history": RemoteOperation(
                 method="GET",
                 path_template="/api/conversations.history",
                 path_fields=(),
-                query_fields=("channel", "cursor", "inclusive", "limit", "oldest"),
+                query_fields=("channel", "cursor", "inclusive", "latest", "limit", "oldest"),
+            ),
+            "messages.replies": RemoteOperation(
+                method="GET",
+                path_template="/api/conversations.replies",
+                path_fields=(),
+                query_fields=("channel", "cursor", "inclusive", "latest", "limit", "oldest", "ts"),
+            ),
+            "users.list": RemoteOperation(
+                method="GET",
+                path_template="/api/users.list",
+                path_fields=(),
+                query_fields=("cursor", "include_locale", "limit"),
+            ),
+            "channels.list": RemoteOperation(
+                method="GET",
+                path_template="/api/conversations.list",
+                path_fields=(),
+                query_fields=("cursor", "exclude_archived", "limit", "types"),
+            ),
+            "channels.join": RemoteOperation(
+                method="POST",
+                path_template="/api/conversations.join",
+                path_fields=(),
+                query_fields=("channel",),
             ),
         },
         **options,
@@ -518,16 +605,30 @@ def slack_rail(*, authority_path: Path, **options: Any) -> BoundedJsonRail:
 class SlackMessagesConnector:
     connector_id = "slack.messages"
 
-    def __init__(self, *, rail: JsonRail, source_id: str, channel_id: str, page_size: int = 100):
+    def __init__(
+        self, *, rail: JsonRail, source_id: str, workspace_id: str,
+        channel_id: str, owner_user_ids: tuple[str, ...] = (), page_size: int = 100,
+    ):
         if not callable(getattr(rail, "request", None)):
             raise ConnectorContractError("remote rail is invalid")
         self.rail = rail
         self.source_id = _source(source_id)
+        self.workspace_id = _string(workspace_id, "slack workspace")
         self.channel_id = _string(channel_id, "slack channel")
+        if (
+            not isinstance(owner_user_ids, tuple)
+            or any(not isinstance(value, str) or not value for value in owner_user_ids)
+        ):
+            raise ConnectorContractError("slack owner users are invalid")
+        self.owner_user_ids = owner_user_ids
         self.page_size = _page_size(page_size)
 
     def pull(self, cursor: str | None) -> ConnectorPage:
-        state = _state(cursor)
+        state = _slack_state(cursor)
+        if state["phase"] == "users":
+            return self._pull_users(state)
+        if state["phase"] == "threads":
+            return self._pull_thread(state)
         if state["page"] is not None and not isinstance(state["page"], str):
             raise ConnectorContractError("connector cursor is invalid")
         query: dict[str, Any] = {
@@ -560,74 +661,24 @@ class SlackMessagesConnector:
             _optional_string(response.get("error"), "slack error")
             raise ConnectorUpstreamError("connector_upstream_error")
         records_by_id: dict[str, ConnectorRecordV2] = {}
+        threads: list[str] = []
         maximum = state["max_seen"]
         for raw in _items(response.get("messages"), "slack messages"):
             event = _mapping(raw, "slack message")
-            event_ts = _string(event.get("ts"), "slack event timestamp")
-            maximum = _max_timestamp(maximum, _slack_timestamp(event_ts, "slack event timestamp"))
-            subtype = event.get("subtype")
-            if subtype == "message_deleted":
-                deleted_ts = _string(event.get("deleted_ts"), "slack deleted timestamp")
-                records_by_id[f"slack:{deleted_ts}"] = _record(
-                    native_id=f"slack:{deleted_ts}",
-                    occurred_at=_slack_timestamp(event_ts, "slack event timestamp"),
-                    kind="communication_message.v1",
-                    deleted=True,
-                    provenance_uri="connector://slack-messages",
-                )
-                continue
-            message = event
-            edited_at = None
-            if subtype == "message_changed":
-                message = _mapping(event.get("message"), "slack changed message")
-                edited = message.get("edited")
-                if isinstance(edited, dict):
-                    edited_at = _slack_timestamp(edited.get("ts"), "slack edited timestamp")
-            message_ts = _string(message.get("ts"), "slack message timestamp")
-            sent_at = _slack_timestamp(message_ts, "slack message timestamp")
-            user = _optional_string(
-                message.get("user", message.get("bot_id")),
-                "slack author",
+            record = normalize_slack_message(
+                workspace_id=self.workspace_id,
+                channel_id=self.channel_id,
+                value=event,
+                owner_identifiers=self.owner_user_ids,
+                provenance_surface="api",
             )
-            content: dict[str, Any] = {
-                "content_fidelity": "complete",
-                "conversation_id": f"slack-channel:{self.channel_id}",
-                "direction": "system",
-                "message_id": f"slack:{message_ts}",
-                "sent_at": sent_at,
-                "surface": "slack",
-                "text": _text(message.get("text")),
-            }
-            omissions = []
-            if _items(message.get("files"), "slack files"):
-                omissions.append("file_attachments")
-            reply_count = message.get("reply_count", 0)
+            records_by_id[record.native_id] = record
+            maximum = _max_timestamp(maximum, record.occurred_at)
+            reply_count = event.get("reply_count", 0)
             if type(reply_count) is not int or reply_count < 0:
                 raise ConnectorContractError("slack reply count is invalid")
             if reply_count:
-                omissions.append("thread_replies_not_fetched")
-            if omissions:
-                content["content_fidelity"] = "partial"
-                content["content_omissions"] = omissions
-            if user:
-                content["author_id"] = user
-                content["participant_ids"] = [user]
-            if edited_at:
-                content["edited_at"] = edited_at
-            thread_ts = message.get("thread_ts")
-            parent = (
-                f"slack:{_string(thread_ts, 'slack thread timestamp')}"
-                if isinstance(thread_ts, str) and thread_ts != message_ts
-                else f"slack-channel:{self.channel_id}"
-            )
-            records_by_id[f"slack:{message_ts}"] = _record(
-                native_id=f"slack:{message_ts}",
-                parent=parent,
-                occurred_at=sent_at,
-                kind="communication_message.v1",
-                content=content,
-                provenance_uri="connector://slack-messages",
-            )
+                threads.append(_string(event.get("ts"), "slack thread timestamp"))
         metadata = _mapping(response.get("response_metadata", {}), "slack response metadata")
         next_page = metadata.get("next_cursor")
         if next_page == "":
@@ -636,15 +687,127 @@ class SlackMessagesConnector:
         has_more = response.get("has_more")
         if type(has_more) is not bool or has_more != (next_page is not None):
             raise ConnectorContractError("slack pagination is invalid")
-        return ConnectorPage(
-            records=tuple(records_by_id.values()),
-            next_cursor=_cursor(
-                page=next_page,
+        if threads:
+            next_cursor = _slack_cursor(
+                phase="threads", page=next_page, thread_page=None,
+                threads=threads, thread_index=0, watermark=state["watermark"],
+                max_seen=maximum, cycle=state["cycle"],
+            )
+            more = True
+        else:
+            next_cursor = _slack_cursor(
+                phase="history" if has_more else "users", page=next_page,
+                thread_page=None, threads=[],
+                thread_index=0,
                 watermark=state["watermark"] if has_more else maximum,
                 max_seen=maximum,
                 cycle=state["cycle"] if has_more else _next_cycle(state["cycle"]),
-            ),
-            has_more=has_more,
+            )
+            more = has_more
+        return ConnectorPage(
+            records=tuple(records_by_id.values()), next_cursor=next_cursor, has_more=more,
+        )
+
+    def _pull_thread(self, state: dict[str, Any]) -> ConnectorPage:
+        thread_ts = state["threads"][state["thread_index"]]
+        query: dict[str, Any] = {
+            "channel": self.channel_id, "inclusive": True,
+            "limit": self.page_size, "ts": thread_ts,
+        }
+        if state["thread_page"]:
+            query["cursor"] = state["thread_page"]
+        try:
+            response = _mapping(
+                self.rail.request("messages.replies", query=query), "slack response",
+            )
+        except RemoteApiError as error:
+            _translate(error)
+        if response.get("ok") is not True:
+            raise ConnectorUpstreamError("connector_upstream_error")
+        records: dict[str, ConnectorRecordV2] = {}
+        maximum = state["max_seen"]
+        for raw in _items(response.get("messages"), "slack replies"):
+            message = _mapping(raw, "slack reply")
+            record = normalize_slack_message(
+                workspace_id=self.workspace_id, channel_id=self.channel_id,
+                value=message, owner_identifiers=self.owner_user_ids,
+                provenance_surface="api",
+            )
+            records[record.native_id] = record
+            maximum = _max_timestamp(maximum, record.occurred_at)
+        metadata = _mapping(response.get("response_metadata", {}), "slack response metadata")
+        thread_page = metadata.get("next_cursor") or None
+        thread_page = _optional_string(thread_page, "slack thread cursor")
+        has_thread_more = response.get("has_more")
+        if type(has_thread_more) is not bool or has_thread_more != (thread_page is not None):
+            raise ConnectorContractError("slack thread pagination is invalid")
+        index = state["thread_index"]
+        if not has_thread_more:
+            index += 1
+        threads_done = index >= len(state["threads"])
+        if threads_done:
+            history_more = state["page"] is not None
+            next_cursor = _slack_cursor(
+                phase="history" if history_more else "users", page=state["page"],
+                thread_page=None, threads=[],
+                thread_index=0,
+                watermark=state["watermark"] if history_more else maximum,
+                max_seen=maximum,
+                cycle=state["cycle"] if history_more else _next_cycle(state["cycle"]),
+            )
+            more = history_more
+        else:
+            next_cursor = _slack_cursor(
+                phase="threads", page=state["page"],
+                thread_page=thread_page if has_thread_more else None,
+                threads=state["threads"], thread_index=index,
+                watermark=state["watermark"], max_seen=maximum,
+                cycle=state["cycle"],
+            )
+            more = True
+        return ConnectorPage(
+            records=tuple(records.values()), next_cursor=next_cursor, has_more=more,
+        )
+
+    def _pull_users(self, state: dict[str, Any]) -> ConnectorPage:
+        query: dict[str, Any] = {
+            "include_locale": False, "limit": self.page_size,
+        }
+        if state["page"]:
+            query["cursor"] = state["page"]
+        try:
+            response = _mapping(
+                self.rail.request("users.list", query=query), "slack response",
+            )
+        except RemoteApiError as error:
+            _translate(error)
+        if response.get("ok") is not True:
+            raise ConnectorUpstreamError("connector_upstream_error")
+        records: dict[str, ConnectorRecordV2] = {}
+        for raw in _items(response.get("members"), "slack users"):
+            for record in normalize_slack_user(
+                workspace_id=self.workspace_id,
+                value=_mapping(raw, "slack user"),
+                owner_user_ids=self.owner_user_ids,
+            ):
+                records[record.native_id] = record
+        metadata = _mapping(response.get("response_metadata", {}), "slack response metadata")
+        next_page = metadata.get("next_cursor") or None
+        next_page = _optional_string(next_page, "slack users cursor")
+        if next_page:
+            next_cursor = _slack_cursor(
+                phase="users", page=next_page, thread_page=None, threads=[],
+                thread_index=0, watermark=state["watermark"],
+                max_seen=state["max_seen"], cycle=state["cycle"],
+            )
+        else:
+            next_cursor = _slack_cursor(
+                phase="history", page=None, thread_page=None, threads=[],
+                thread_index=0, watermark=state["watermark"],
+                max_seen=state["max_seen"], cycle=state["cycle"],
+            )
+        return ConnectorPage(
+            records=tuple(records.values()), next_cursor=next_cursor, has_more=True,
         )
 
 

@@ -200,6 +200,7 @@ class SlackConnectorTest(unittest.TestCase):
         connector = SlackMessagesConnector(
             rail=rail,
             source_id="synthetic:slack:messages",
+            workspace_id="T123",
             channel_id="C123",
         )
         first = connector.pull(None)
@@ -207,8 +208,8 @@ class SlackConnectorTest(unittest.TestCase):
         self.assertEqual(
             [(record.native_id, record.deleted) for record in first.records],
             [
-                ("slack:1784332800.000100", False),
-                ("slack:1784332799.000050", True),
+                ("slack:T123:C123:1784332800.000100", False),
+                ("slack:T123:C123:1784332799.000050", True),
             ],
         )
         self.assertEqual(first.records[0].content["edited_at"], "2026-07-18T00:00:01.000200Z")
@@ -237,6 +238,7 @@ class SlackConnectorTest(unittest.TestCase):
         connector = SlackMessagesConnector(
             rail=rail,
             source_id="synthetic:slack:messages",
+            workspace_id="T123",
             channel_id="C123",
         )
         cursor = json.dumps({
@@ -352,6 +354,7 @@ class WorkApiRunnerTest(unittest.TestCase):
         cases.append(SlackMessagesConnector(
             rail=slack,
             source_id="synthetic:slack:runner",
+            workspace_id="T123",
             channel_id="C123",
         ))
 

@@ -14,6 +14,10 @@ from connectors.sdk import (
     ConnectorRateLimited,
     ConnectorRecordV2,
 )
+from connectors.source_plugin import (
+    SourcePluginManifest,
+    run_source_plugin_conformance,
+)
 
 
 PRIVATE_CANARY = "conformance-private-canary-77"
@@ -230,6 +234,25 @@ class ConnectorConformanceTest(unittest.TestCase):
                 self.assertEqual(public["status"], "pass")
                 self.assertNotIn("source_id", public)
                 self.assertNotIn(PRIVATE_CANARY, json.dumps(public))
+
+    def test_external_source_plugin_runs_the_identical_conformance_matrix(self):
+        reference = ReferenceFactory("remote")
+
+        class PluginFactory:
+            manifest = SourcePluginManifest(
+                definition=reference.manifest,
+                operations=("backfill", "reconcile"),
+            )
+            source_id = reference.source_id
+
+            @staticmethod
+            def build(scenario):
+                connector = reference.build(scenario)
+                connector.manifest = PluginFactory.manifest
+                return connector
+
+        report = run_source_plugin_conformance(PluginFactory())
+        self.assertEqual(report.passed, report.total)
 
     def test_each_fake_success_mutant_fails_a_named_cell(self):
         mutants = (

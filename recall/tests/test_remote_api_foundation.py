@@ -61,9 +61,9 @@ REMOTE_CONNECTORS = {
     },
     "slack.messages": {
         "family": "communications",
-        "kinds": ("communication_message.v1",),
+        "kinds": ("communication_message.v1", "contact_identity.v1", "document.v1"),
         "auth": "oauth2",
-        "acquisition": ("poll",),
+        "acquisition": ("poll", "webhook"),
     },
     "notion.workspace": {
         "family": "documents",
@@ -101,7 +101,7 @@ class RemoteRegistryTest(unittest.TestCase):
                 self.assertEqual(item.policy.default_privacy_mode, "scrub")
                 self.assertEqual(
                     item.policy.attachment_capability,
-                    connector_id == "google.gmail",
+                    connector_id in {"google.gmail", "slack.messages"},
                 )
                 self.assertEqual(
                     ConnectorDefinitionV3.from_mapping(item.to_public()),
@@ -213,6 +213,38 @@ class RemoteApiRailTest(unittest.TestCase):
             request.get_header("Authorization"),
             "Bearer synthetic-authority",
         )
+
+    def test_binary_download_is_exact_host_bounded_and_authorized(self):
+        captured = []
+
+        def opener(request, *, timeout):
+            captured.append(request)
+            return _Response(b"full attachment", content_type="text/plain")
+
+        with tempfile.TemporaryDirectory() as directory:
+            secret = self.private_secret(Path(directory))
+            rail = BoundedJsonRail(
+                origin="https://slack.com",
+                authority_path=secret,
+                authorization_scheme="Bearer",
+                operations={
+                    "users.list": RemoteOperation(
+                        method="GET", path_template="/api/users.list",
+                        path_fields=(), query_fields=(),
+                    ),
+                },
+                binary_hosts=("files.slack.com",),
+                opener=opener,
+            )
+            payload, media_type = rail.download_binary(
+                "https://files.slack.com/files-pri/T123-F123/document.txt"
+            )
+            self.assertEqual(payload, b"full attachment")
+            self.assertEqual(media_type, "text/plain")
+            self.assertEqual(captured[0].get_header("Authorization"),
+                             "Bearer synthetic-authority")
+            with self.assertRaisesRegex(RemoteApiError, "binary_url_invalid"):
+                rail.download_binary("https://example.invalid/files-pri/private")
 
     def test_code_owned_provider_headers_are_closed_and_cannot_override_authority(self):
         captured = []

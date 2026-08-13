@@ -455,6 +455,106 @@ class GoogleOAuthProvider:
             raise ControlError("google_oauth_revoke_failed", 502) from None
 
 
+class SlackOAuthProvider:
+    """Direct Slack workspace OAuth; the encrypted bot token stays server-side."""
+
+    provider_id = "slack"
+
+    def __init__(
+        self, *, client_id: str, client_secret: str, redirect_uri: str,
+        authorization_endpoint: str = "https://slack.com/oauth/v2/authorize",
+        token_endpoint: str = "https://slack.com/api/oauth.v2.access",
+        revoke_endpoint: str = "https://slack.com/api/auth.revoke",
+    ):
+        if not client_id or not client_secret or len(client_id) > 512 or len(client_secret) > 4096:
+            raise ControlError("slack_oauth_configuration_invalid", 500)
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.redirect_uri = _https_url(redirect_uri, label="slack_redirect_uri")
+        self.authorization_endpoint = _https_url(
+            authorization_endpoint, label="slack_authorization_endpoint"
+        )
+        self.token_endpoint = _https_url(token_endpoint, label="slack_token_endpoint")
+        self.revoke_endpoint = _https_url(revoke_endpoint, label="slack_revoke_endpoint")
+
+    @classmethod
+    def from_env(cls) -> "SlackOAuthProvider":
+        return cls(
+            client_id=os.environ.get("RECALL_SLACK_CLIENT_ID", ""),
+            client_secret=os.environ.get("RECALL_SLACK_CLIENT_SECRET", ""),
+            redirect_uri=os.environ.get("RECALL_SLACK_REDIRECT_URI", ""),
+        )
+
+    def authorization_url(
+        self, *, state: str, code_challenge: str, scopes: tuple[str, ...],
+    ) -> str:
+        del code_challenge  # Slack's v2 app install flow does not implement PKCE.
+        return self.authorization_endpoint + "?" + urlencode({
+            "client_id": self.client_id,
+            "redirect_uri": self.redirect_uri,
+            "scope": ",".join(scopes),
+            "state": state,
+        })
+
+    def exchange(self, *, code: str, code_verifier: str) -> OAuthTokens:
+        del code_verifier
+        if not isinstance(code, str) or not code or len(code) > 4096:
+            raise ControlError("oauth_code_invalid")
+        value = GoogleOAuthProvider._post(self.token_endpoint, {
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "code": code,
+            "redirect_uri": self.redirect_uri,
+        })
+        access_token = value.get("access_token")
+        team = value.get("team")
+        authed_user = value.get("authed_user")
+        scope = value.get("scope")
+        if (
+            value.get("ok") is not True
+            or not isinstance(access_token, str) or not access_token or len(access_token) > 8192
+            or not isinstance(team, dict) or not isinstance(team.get("id"), str)
+            or not isinstance(authed_user, dict) or not isinstance(authed_user.get("id"), str)
+            or not isinstance(scope, str)
+        ):
+            raise ControlError("slack_oauth_token_invalid", 502)
+        granted = tuple(sorted({item.strip() for item in scope.split(",") if item.strip()}))
+        if not granted or len(granted) > 64:
+            raise ControlError("slack_oauth_scope_invalid", 502)
+        return OAuthTokens(
+            subject_id=team["id"],
+            granted_scopes=granted,
+            credentials={
+                "access_token": access_token,
+                "team_id": team["id"],
+                "authed_user_id": authed_user["id"],
+                "token_type": value.get("token_type", "bot"),
+            },
+            expires_at=None,
+        )
+
+    def revoke(self, credentials: dict[str, Any]) -> None:
+        token = credentials.get("access_token")
+        if not isinstance(token, str) or not token:
+            return
+        request = urllib.request.Request(
+            self.revoke_endpoint,
+            data=urlencode({"token": token}).encode(),
+            method="POST",
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+        try:
+            with GoogleOAuthProvider._opener().open(request, timeout=20) as response:
+                value = GoogleOAuthProvider._json(response)
+        except (OSError, urllib.error.HTTPError, urllib.error.URLError):
+            raise ControlError("slack_oauth_revoke_failed", 502) from None
+        if value.get("ok") is not True:
+            raise ControlError("slack_oauth_revoke_failed", 502)
+
+
 class ComposioConnectionBroker:
     """Hosted connect-link broker; provider credentials never enter Recall."""
 
@@ -790,11 +890,21 @@ class ControlPlane:
         )
         if any(composio_values) and not all(composio_values):
             raise ControlError("composio_configuration_invalid", 500)
+        slack_values = (
+            os.environ.get("RECALL_SLACK_CLIENT_ID", ""),
+            os.environ.get("RECALL_SLACK_CLIENT_SECRET", ""),
+            os.environ.get("RECALL_SLACK_REDIRECT_URI", ""),
+            os.environ.get("RECALL_SLACK_SIGNING_SECRET", ""),
+        )
+        if any(slack_values) and not all(slack_values):
+            raise ControlError("slack_oauth_configuration_invalid", 500)
         providers: dict[str, OAuthProvider] = {}
         if all(google_values):
             providers["google"] = GoogleOAuthProvider.from_env()
         if all(composio_values):
             providers["composio"] = ComposioConnectionBroker.from_env()
+        if all(slack_values):
+            providers["slack"] = SlackOAuthProvider.from_env()
         try:
             invitation_email_sender = sender_from_env()
             codex_oauth_client_id, codex_oauth_callback_port = (
@@ -2020,6 +2130,8 @@ class ControlPlane:
                 and connector_id not in GOOGLE_CONNECTORS
             ):
                 raise ControlError("oauth_connector_invalid")
+            if provider_id == "slack" and connector_id != "slack.messages":
+                raise ControlError("oauth_connector_invalid")
             if tenant_id not in brains:
                 raise ControlError("oauth_brain_forbidden", 403)
             try:
@@ -2199,6 +2311,27 @@ class ControlPlane:
             )
         if not _scopes_cover(required_scopes, tokens.granted_scopes):
             raise ControlError("oauth_scope_insufficient", 403)
+        routes = list(context.get("routes", []))
+        if provider_id == "slack":
+            team_id = tokens.credentials.get("team_id")
+            authed_user_id = tokens.credentials.get("authed_user_id")
+            if not isinstance(team_id, str) or not isinstance(authed_user_id, str):
+                raise ControlError("slack_oauth_token_invalid", 502)
+            routes = [
+                {
+                    **route,
+                    "selectors": {
+                        **route["selectors"],
+                        "workspace_id": team_id,
+                        "owner_user_ids": sorted(set(
+                            list(route["selectors"].get("owner_user_ids", []))
+                            + [authed_user_id]
+                        )),
+                        "channel_ids": list(route["selectors"].get("channel_ids", [])),
+                    },
+                }
+                for route in routes
+            ]
         connection_id = uuid.uuid4()
         encrypted = self.secret_box.seal(
             tokens.credentials, purpose=f"provider-connection:{connection_id}"
@@ -2249,7 +2382,7 @@ class ControlPlane:
                             tokens.expires_at,
                         ),
                     )
-                for route in context["routes"]:
+                for route in routes:
                     installation_id = uuid.uuid4()
                     source_id = f"source:{route['connector_id']}:{uuid.uuid4().hex}"
                     connection.execute(
@@ -2416,6 +2549,7 @@ __all__ = [
     "ControlError",
     "ControlPlane",
     "GoogleOAuthProvider",
+    "SlackOAuthProvider",
     "ManagedOAuthStart",
     "OAuthTokens",
     "SecretBox",

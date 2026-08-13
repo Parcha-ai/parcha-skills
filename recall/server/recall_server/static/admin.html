@@ -102,6 +102,27 @@
         </form>
       </article>
 
+      <article class="integration flagship" data-provider="slack">
+        <div class="integration-number">S / 02</div>
+        <div class="integration-copy">
+          <div class="provider-kicker">REMOTE · OAUTH 2.0</div>
+          <h3>Slack</h3>
+          <p>Messages, threads, people, edits, deletions, and file references from every accessible channel.</p>
+          <div id="slack-connection" class="connection-state">Not connected</div>
+        </div>
+        <form id="slack-form" class="route-matrix">
+          <div class="matrix-head"><span>Source</span><span>Destination</span><span>On</span></div>
+          <div class="route-row">
+            <strong>Workspace</strong>
+            <label><span class="sr-only">Slack destination</span><select id="slack-brain"></select></label>
+            <label class="switch"><input id="slack-enabled" type="checkbox" checked><span></span></label>
+          </div>
+          <button class="connect-button" type="submit">
+            <span>Authorize Slack</span><span aria-hidden="true">↗</span>
+          </button>
+        </form>
+      </article>
+
       <div class="integration-grid" id="integration-grid" aria-live="polite"></div>
     </section>
 

@@ -149,7 +149,9 @@ def _selector_defaults(connector_id: str) -> dict[str, Any]:
         },
         "github.activity": {"owner": "", "repository": ""},
         "linear.activity": {"team_id": ""},
-        "slack.messages": {"channel_id": ""},
+        "slack.messages": {
+            "workspace_id": "", "channel_ids": [], "owner_user_ids": [],
+        },
         "notion.workspace": {},
         "x.activity": {"streams": ["authored"], "user_id": ""},
     }.get(connector_id, {})
@@ -389,7 +391,8 @@ class ManagedConnectorWorker:
                 "page_size": (
                     10
                     if connector_id == "google.gmail"
-                    else 25 if connector_id == "x.activity" else 100
+                    else 25 if connector_id == "x.activity"
+                    else 20 if connector_id == "slack.messages" else 100
                 ),
                 "timeout_seconds": 60,
                 "selectors": _selectors(

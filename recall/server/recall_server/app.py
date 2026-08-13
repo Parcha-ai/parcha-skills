@@ -62,11 +62,13 @@ from .mcp import (
 )
 from .semantic import SemanticRuntime
 from .webhooks import WEBHOOK_PATH, WebhookError, build_webhook_event
+from connectors.slack_events import slack_event_to_webhook
 
 LOG = logging.getLogger("recall.brainstore")
 MAX_BODY_BYTES = 12 * 1024 * 1024
 MAX_CANONICAL_EVENTS_BYTES = 8_000_000
 MAX_ADMIN_BODY_BYTES = 64 * 1024
+SLACK_WEBHOOK_PATH = "/webhooks/v1/slack"
 ADMIN_INSTALLATION_ACTION = re.compile(
     r"/admin/api/v1/installations/([0-9a-f-]{36})/actions\Z"
 )
@@ -857,6 +859,29 @@ class Handler(BaseHTTPRequestHandler):
                 except ControlError as error:
                     self.send_json(error.status, {"error": error.code})
                 return
+            if parsed.path == "/admin/oauth/callback/slack":
+                if self.control_plane is None:
+                    self.send_json(503, {"error": "control_plane_unavailable"})
+                    return
+                query = parse_qs(parsed.query, keep_blank_values=True)
+                if (
+                    query.get("error")
+                    or set(query) - {"state", "code"}
+                    or len(query.get("state", [])) != 1
+                    or len(query.get("code", [])) != 1
+                ):
+                    self.send_json(400, {"error": "oauth_callback_invalid"})
+                    return
+                try:
+                    self.control_plane.complete_oauth(
+                        provider_id="slack",
+                        state=query["state"][0],
+                        code=query["code"][0],
+                    )
+                    self.send_redirect("/admin?oauth=connected")
+                except ControlError as error:
+                    self.send_json(error.status, {"error": error.code})
+                return
             if parsed.path == "/admin/oauth/callback/composio":
                 if self.control_plane is None:
                     self.send_json(503, {"error": "control_plane_unavailable"})
@@ -1298,6 +1323,69 @@ class Handler(BaseHTTPRequestHandler):
                 LOG.error("canonical status failed type=%s", type(exc).__name__)
                 self.send_json(503, {"error": "canonical status unavailable"})
             return
+        if path == SLACK_WEBHOOK_PATH:
+            content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().casefold()
+            if content_type != "application/json":
+                self.send_json(415, {"error": "unsupported content type"})
+                return
+            length = self.body_length(256 * 1024)
+            if length is None:
+                return
+            raw = self.rfile.read(length)
+            try:
+                adapted = slack_event_to_webhook(
+                    body=raw,
+                    timestamp=self.headers.get("X-Slack-Request-Timestamp", ""),
+                    signature=self.headers.get("X-Slack-Signature", ""),
+                    signing_secret=os.environ.get("RECALL_SLACK_SIGNING_SECRET", ""),
+                    retry_number=self.headers.get("X-Slack-Retry-Num"),
+                )
+                if adapted.challenge is not None:
+                    self.send_json(200, {"challenge": adapted.challenge})
+                    return
+                if adapted.webhook is None or adapted.workspace_id is None:
+                    raise WebhookError("slack event projection unavailable")
+                with self.store.connect() as connection:
+                    routes = connection.execute(
+                        """SELECT installation.source_id,installation.principal_id,
+                                  installation.privacy_mode
+                             FROM connector_installations installation
+                             JOIN provider_connections provider
+                               ON provider.id=installation.connection_id
+                            WHERE provider.provider='slack'
+                              AND provider.subject_id=%s
+                              AND provider.status='connected'
+                              AND installation.connector_id='slack.messages'
+                              AND installation.state='enabled'""",
+                        (adapted.workspace_id,),
+                    ).fetchall()
+                committed = 0
+                replayed = 0
+                for route in routes:
+                    prepared = build_webhook_event(adapted.webhook, {
+                        "source_id": route["source_id"],
+                        "principal_id": route["principal_id"],
+                        "webhook_privacy_mode": route["privacy_mode"],
+                        "connector_id": "slack.messages",
+                    })
+                    if prepared.event is None:
+                        continue
+                    _acknowledgement, replay = self.store.ingest(
+                        prepared.idempotency_key, [prepared.event],
+                    )
+                    committed += 1
+                    replayed += int(replay)
+                self.send_json(200, {
+                    "status": "accepted", "routes": committed, "replays": replayed,
+                })
+            except (WebhookError, ValueError):
+                self.send_json(400, {"error": "invalid slack webhook"})
+            except IdempotencyConflict:
+                self.send_json(409, {"error": "slack webhook conflict"})
+            except Exception as exc:
+                LOG.error("slack webhook failed type=%s", type(exc).__name__)
+                self.send_json(500, {"error": "slack webhook failed"})
+            return
         if path == WEBHOOK_PATH:
             principal = self.require("webhook")
             if not principal:
@@ -1610,6 +1698,14 @@ def validate_http_profile() -> None:
     )
     if any(composio_values) and not all(composio_values):
         raise RuntimeError("Composio configuration must be complete")
+    slack_values = (
+        os.environ.get("RECALL_SLACK_CLIENT_ID", ""),
+        os.environ.get("RECALL_SLACK_CLIENT_SECRET", ""),
+        os.environ.get("RECALL_SLACK_REDIRECT_URI", ""),
+        os.environ.get("RECALL_SLACK_SIGNING_SECRET", ""),
+    )
+    if any(slack_values) and not all(slack_values):
+        raise RuntimeError("Slack OAuth configuration must be complete")
     if profile in {"public-edge", "public-mcp"}:
         if os.environ.get("RECALL_AUTH_REQUIRED", "0") != "1":
             raise RuntimeError("public HTTP profile requires authentication")

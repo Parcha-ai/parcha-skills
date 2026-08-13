@@ -59,7 +59,10 @@ class PortableServiceArchiveTest(unittest.TestCase):
 
     def test_registry_contract_is_closed_and_source_local(self):
         expected = {
-            "portable.slack": ("communication_message.v1", "slack-archive-sync"),
+            "portable.slack": (
+                ("communication_message.v1", "contact_identity.v1"),
+                "slack-archive-sync",
+            ),
             "portable.notion": ("document.v1", "notion-archive-sync"),
             "portable.x": ("social_post.v1", "x-archive-sync"),
         }
@@ -68,7 +71,9 @@ class PortableServiceArchiveTest(unittest.TestCase):
             self.assertEqual(item.execution_placement, "source_local")
             self.assertEqual(item.acquisition_modes, ("import",))
             self.assertEqual(item.auth.kind, "selected_export")
-            self.assertEqual(item.record_kinds, (kind,))
+            self.assertEqual(
+                item.record_kinds, kind if isinstance(kind, tuple) else (kind,),
+            )
             self.assertEqual(item.command, command)
             self.assertEqual(
                 item.selection_fields,
@@ -78,7 +83,7 @@ class PortableServiceArchiveTest(unittest.TestCase):
             "slack-archive-sync", "--endpoint", "https://brain.example.invalid",
             "--source-id", "portable:slack:test", "--keychain-service", "synthetic",
             "--keychain-account", "portable:slack:test",
-            "--input", "/synthetic/slack.zip", "--archive-id", "workspace-test",
+            "--input", "/synthetic/slack.zip", "--archive-id", "T123",
             "--spool", "/synthetic/slack.db",
         ])
         self.assertEqual(args.privacy_mode, "scrub")
@@ -89,14 +94,15 @@ class PortableServiceArchiveTest(unittest.TestCase):
             "general/2026-01-02.json": json.dumps([{
                 "client_msg_id": "msg-1",
                 "ts": "1767312000.000001",
-                "user": "member-1",
+                "user": "U111",
                 "text": "synthetic first",
             }]),
+            "channels.json": json.dumps([{"id": "C123", "name": "general"}]),
             "users.json": "[]",
         })
         connector = SlackArchiveConnector(
             path=archive, source_id="portable:slack:test",
-            archive_id="workspace-test", owner_identifiers=("member-owner",),
+            archive_id="T123", owner_identifiers=("UOWNER",),
         )
         first = connector.pull(None)
         self.assertEqual(len(first.records), 1)
@@ -109,18 +115,22 @@ class PortableServiceArchiveTest(unittest.TestCase):
             "general/2026-01-02.json": json.dumps([{
                 "client_msg_id": "msg-1",
                 "ts": "1767312000.000001",
-                "user": "member-1",
+                "user": "U111",
                 "text": "synthetic edited",
             }]),
+            "channels.json": json.dumps([{"id": "C123", "name": "general"}]),
         })
         changed = connector.pull(first.next_cursor)
         self.assertEqual(changed.records[0].native_id, native_id)
         self.assertEqual(changed.records[0].content["text"], "synthetic edited")
 
-        empty = self._zip("empty-slack.zip", {"general/2026-01-03.json": "[]"})
+        empty = self._zip("empty-slack.zip", {
+            "general/2026-01-03.json": "[]",
+            "channels.json": json.dumps([{"id": "C123", "name": "general"}]),
+        })
         missing = SlackArchiveConnector(
             path=empty, source_id="portable:slack:test",
-            archive_id="workspace-test",
+            archive_id="T123",
         ).pull(None)
         self.assertEqual(missing.records, ())
 
@@ -213,10 +223,11 @@ class PortableServiceArchiveTest(unittest.TestCase):
             (
                 SlackArchiveConnector,
                 self._zip("private-slack.zip", {
+                    "channels.json": json.dumps([{"id": "C123", "name": "general"}]),
                     "general/2026-01-02.json": json.dumps([{
                         "client_msg_id": "private-1",
                         "ts": "1767312000.000001",
-                        "user": "member-1",
+                        "user": "U111",
                         "text": f"api_key={canary}",
                     }]),
                 }),
@@ -246,7 +257,8 @@ class PortableServiceArchiveTest(unittest.TestCase):
             spool = self.root / f"state-{index}.db"
             runner = ConnectorRunner(
                 connector=connector_type(
-                    path=archive, source_id=source_id, archive_id="archive-test",
+                    path=archive, source_id=source_id,
+                    archive_id=("T123" if connector_type is SlackArchiveConnector else "archive-test"),
                 ),
                 brain=brain,
                 spool_path=spool,
