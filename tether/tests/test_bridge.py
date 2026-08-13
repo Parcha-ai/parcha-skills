@@ -1357,6 +1357,58 @@ class CredentialBoundaryTest(unittest.TestCase):
         with self.assertRaises(self.runtime.NativeContinuationError):
             self.runtime._resolve_credential_helper("credential-helper")
 
+    def test_doctor_executes_the_native_credential_helper(self):
+        self.runtime.CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        self.runtime.CONFIG_PATH.write_text("config_version = 1\n", encoding="utf-8")
+        self.runtime.CONFIG_PATH.chmod(0o600)
+        helper = self.home / "credential-helper"
+        helper.write_text("#!/bin/sh\nprintf '{}'\n", encoding="utf-8")
+        helper.chmod(0o700)
+        config = self.runtime.Config(credential_command=(str(helper),))
+
+        with mock.patch.object(self.runtime, "load_config", return_value=config):
+            _, checks = self.runtime.doctor()
+
+        self.assertIn(
+            "ok native continuation credential helper is executable and valid",
+            checks,
+        )
+
+    def test_doctor_rejects_a_symlinked_native_credential_helper(self):
+        self.runtime.CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        self.runtime.CONFIG_PATH.write_text("config_version = 1\n", encoding="utf-8")
+        self.runtime.CONFIG_PATH.chmod(0o600)
+        helper = self.home / "credential-helper"
+        helper.write_text("#!/bin/sh\nprintf '{}'\n", encoding="utf-8")
+        helper.chmod(0o700)
+        linked_helper = self.home / "credential-helper-link"
+        linked_helper.symlink_to(helper)
+        config = self.runtime.Config(credential_command=(str(linked_helper),))
+
+        with mock.patch.object(self.runtime, "load_config", return_value=config):
+            ok, checks = self.runtime.doctor()
+
+        self.assertFalse(ok)
+        self.assertTrue(any(
+            line.startswith("FAIL native continuation credential helper:")
+            for line in checks
+        ))
+
+    def test_broker_refuses_invalid_credentials_before_opening_traffic(self):
+        helper = self.home / "credential-helper"
+        helper.write_text("#!/bin/sh\nprintf '{}'\n", encoding="utf-8")
+        helper.chmod(0o700)
+        linked_helper = self.home / "credential-helper-link"
+        linked_helper.symlink_to(helper)
+        config = self.runtime.Config(credential_command=(str(linked_helper),))
+        socket_path = self.home / "broker" / "bridge.sock"
+
+        with mock.patch.object(self.runtime, "load_config", return_value=config):
+            with self.assertRaises(self.runtime.NativeContinuationError):
+                self.runtime.start_broker("token", socket_path)
+
+        self.assertFalse(socket_path.exists())
+
     def test_native_child_does_not_inherit_ambient_proxy_credentials(self):
         with mock.patch.dict(
             os.environ,

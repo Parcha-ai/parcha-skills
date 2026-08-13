@@ -9741,6 +9741,13 @@ def start_broker(
         raise RuntimeError(
             "Tether refuses to run as root; use a dedicated non-root account"
         )
+    config = load_config()
+    if config.credential_command:
+        _credential_env_for_metadata({
+            "bridge_id": "broker-startup",
+            "source_kind": "claude_session",
+            "session_id": "broker-startup",
+        }, config)
     security.secure_state_directory(path.parent, create=True)
     if store is None:
         if lock_fd is not None:
@@ -9947,13 +9954,15 @@ def _credential_key_is_forbidden(key: str) -> bool:
     )
 
 
-def _credential_env(bridge: Bridge, config: Config) -> dict[str, str]:
+def _credential_env_for_metadata(
+    metadata: dict[str, str], config: Config,
+) -> dict[str, str]:
     if not config.credential_command:
         return {}
-    metadata = json.dumps({
-        "bridge_id": bridge.bridge_id,
-        "source_kind": bridge.source_kind,
-        "session_id": str(bridge.source.get("session_id") or "")[:128],
+    payload = json.dumps({
+        "bridge_id": str(metadata.get("bridge_id") or "")[:128],
+        "source_kind": str(metadata.get("source_kind") or "")[:128],
+        "session_id": str(metadata.get("session_id") or "")[:128],
     })
     command = [
         _resolve_credential_helper(config.credential_command[0]),
@@ -9961,7 +9970,7 @@ def _credential_env(bridge: Bridge, config: Config) -> dict[str, str]:
     ]
     # Administrator-only config, absolute executable, and shell-free argv.
     result = subprocess.run(  # nosec B603
-        command, input=metadata, env=_base_child_env(), text=True,
+        command, input=payload, env=_base_child_env(), text=True,
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30,
     )
     if result.returncode:
@@ -9982,6 +9991,14 @@ def _credential_env(bridge: Bridge, config: Config) -> dict[str, str]:
     if sum(len(key) + len(value) for key, value in values.items()) > 65_536:
         raise NativeContinuationError("credential helper returned too much data")
     return values
+
+
+def _credential_env(bridge: Bridge, config: Config) -> dict[str, str]:
+    return _credential_env_for_metadata({
+        "bridge_id": bridge.bridge_id,
+        "source_kind": bridge.source_kind,
+        "session_id": str(bridge.source.get("session_id") or "")[:128],
+    }, config)
 
 
 def working_directory_identity(cwd: str) -> dict[str, str]:
@@ -11539,9 +11556,10 @@ def doctor() -> tuple[bool, list[str]]:
 
     checks: list[str] = []
     ok = True
+    config: Config | None = None
     if CONFIG_PATH.exists() or CONFIG_PATH.is_symlink():
         try:
-            load_config()
+            config = load_config()
             checks.append("ok config is owner-only and symlink-safe")
             checks.append("ok optional Tether overrides are valid")
         except Exception as exc:
@@ -11550,6 +11568,21 @@ def doctor() -> tuple[bool, list[str]]:
     else:
         ok = False
         checks.append(f"FAIL missing config at {CONFIG_PATH}")
+    if config is not None and config.credential_command:
+        try:
+            _credential_env_for_metadata({
+                "bridge_id": "doctor",
+                "source_kind": "claude_session",
+                "session_id": "doctor",
+            }, config)
+            checks.append(
+                "ok native continuation credential helper is executable and valid"
+            )
+        except Exception as exc:
+            ok = False
+            checks.append(
+                f"FAIL native continuation credential helper: {safe_error(exc)}"
+            )
     if SOCKET_PATH.is_socket():
         mode = stat.S_IMODE(SOCKET_PATH.stat().st_mode)
         if mode != 0o600:
