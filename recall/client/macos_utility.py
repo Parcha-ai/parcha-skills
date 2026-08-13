@@ -191,6 +191,14 @@ def _source_status(*, prefix: Path, launch_agents: Path, name: str, now: float) 
         and privacy_mode is not None
         and not marker_exists
     )
+    archive_root_configured = None
+    if name == "codex":
+        try:
+            archive_root_configured = bool(
+                _option(_plist_arguments(plist), "--archive-root")
+            )
+        except MacUtilityError:
+            archive_root_configured = False
     state = prefix / "state" / spec.spool_name
     state_exists = state.exists() or state.is_symlink()
     metadata = _metadata(state)
@@ -239,9 +247,11 @@ def _source_status(*, prefix: Path, launch_agents: Path, name: str, now: float) 
                 health = "backfilling"
             else:
                 health = "ready"
+    if enabled and name == "codex" and not archive_root_configured:
+        health = "degraded"
     last_success = None
     if metadata is not None:
-        raw = metadata.get("last_success_epoch", metadata.get("last_scan_at"))
+        raw = metadata.get("last_scan_at", metadata.get("last_success_epoch"))
         try:
             last_success = float(raw) if raw is not None else None
         except (TypeError, ValueError):
@@ -276,7 +286,9 @@ def _source_status(*, prefix: Path, launch_agents: Path, name: str, now: float) 
         "ready": "none",
     }.get(health)
     if health == "degraded":
-        if error_code == "brain_unauthorized":
+        if name == "codex" and not archive_root_configured:
+            remediation = "upgrade_archive_coverage"
+        elif error_code == "brain_unauthorized":
             remediation = "rotate_brain_authority"
         elif error_code == "archive_unavailable":
             remediation = "retry_archive"
@@ -287,7 +299,7 @@ def _source_status(*, prefix: Path, launch_agents: Path, name: str, now: float) 
     checkpointed = bool(metadata and (
         "committed_cursor" in metadata or "last_scan_at" in metadata
     ))
-    return {
+    result = {
         "enabled": enabled,
         "health": health,
         "lag_seconds": lag,
@@ -302,6 +314,9 @@ def _source_status(*, prefix: Path, launch_agents: Path, name: str, now: float) 
         "surface": spec.surface,
         "connector_id": spec.connector_id,
     }
+    if name == "codex":
+        result["archive_root_configured"] = archive_root_configured
+    return result
 
 
 def _launch_target(spec: SourceSpec) -> str:

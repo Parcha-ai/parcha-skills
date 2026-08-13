@@ -776,6 +776,7 @@ class CanonicalCollectorCliTest(unittest.TestCase):
             "--visibility", "private",
             "--harness", "codex",
             "--root", "/synthetic/codex",
+            "--archive-root", "/synthetic/codex-archive",
             "--spool", "/synthetic/state.db",
             "--token-file", "/synthetic/token.json",
             "--privacy-mode", "scrub",
@@ -790,6 +791,10 @@ class CanonicalCollectorCliTest(unittest.TestCase):
             client_cli.main()
 
         self.assertTrue(collector_type.call_args.kwargs["bulk_manifest_archive"])
+        self.assertEqual(
+            collector_type.call_args.kwargs["archive_root"],
+            Path("/synthetic/codex-archive"),
+        )
         collector.close.assert_called_once_with()
 
 

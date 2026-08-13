@@ -323,6 +323,7 @@ def parser() -> argparse.ArgumentParser:
     _privacy(collect)
     collect.add_argument("--harness", choices=("claude", "codex"), required=True)
     collect.add_argument("--root", required=True)
+    collect.add_argument("--archive-root")
     collect.add_argument("--spool", required=True)
     collect.add_argument("--max-scan-records", type=int, default=1000)
     collect.add_argument("--max-scan-seconds", type=float, default=20.0)
@@ -1022,6 +1023,7 @@ def main() -> None:
         canonical = _canonical_clients(common)
         collector = Collector(
             root=Path(args.root), harness=args.harness, source_id=args.source_id,
+            archive_root=(Path(args.archive_root) if args.archive_root else None),
             spool_path=Path(args.spool), endpoint=args.endpoint, token=token,
             principal_id=args.principal_id, visibility=args.visibility,
             privacy=privacy,
