@@ -49,6 +49,10 @@ MAX_CANONICAL_EMBEDDING_BATCH = 5000
 MAX_AGENTIC_MAPS = 5
 MAX_AGENTIC_MAP_FINDINGS = 40
 MAX_AGENTIC_MAP_FINDING_BYTES = 64_000
+MAX_AGENT_EXEC_MAP_SHARDS = 8
+MAX_AGENT_EXEC_MAP_SHARD_STDOUT_BYTES = 20_000
+MAX_AGENT_EXEC_MAP_SHARD_STDERR_BYTES = 2_000
+MAX_PARQUET_SCAN_OUTPUT_BYTES = 16 * 1024
 MONTH_TERMS = frozenset({
     "january",
     "february",
@@ -583,6 +587,35 @@ class BoundCanonicalRetrieval:
             return []
         return [row["source_id"] for row in rows]
 
+    def _sources_exclusively_bound_to_actors(
+        self,
+        sources: list[str],
+        actor_ids: tuple[str, ...],
+        deadline_at: float,
+    ) -> bool:
+        """Whether every selected source belongs only to the target actor."""
+
+        if not sources or not actor_ids:
+            return False
+        try:
+            with self.store.connect() as connection:
+                rows = self.store._execute_bounded(
+                    connection,
+                    """SELECT binding.source_id
+                         FROM canonical_source_actor_bindings binding
+                        WHERE binding.tenant_id=%s
+                          AND binding.source_id=ANY(%s)
+                        GROUP BY binding.source_id
+                       HAVING count(DISTINCT binding.actor_id)=1
+                          AND bool_and(binding.actor_id=ANY(%s))
+                        ORDER BY binding.source_id""",
+                    (self.tenant_id, sources, list(actor_ids)),
+                    deadline_at,
+                ).fetchall()
+        except SearchDeadlineExceeded:
+            return False
+        return {row["source_id"] for row in rows} == set(sources)
+
     def _sources(
         self,
         *,
@@ -621,10 +654,90 @@ class BoundCanonicalRetrieval:
                 sources &= {row["source_id"]} if row else set()
         return sorted(sources)
 
+    def list_people(self) -> dict[str, Any]:
+        """List active people explicitly bound to the caller's sources."""
+
+        started_at = time.monotonic()
+        if not self.authorized_sources:
+            return {
+                "people": [],
+                "complete": True,
+                "diagnostics": {
+                    "engine": "canonical-people-v1",
+                    "elapsed_ms": 0.0,
+                },
+            }
+        deadline_at = started_at + self.store.search_deadline_ms / 1000
+        try:
+            with self.store.connect() as connection:
+                rows = self.store._execute_bounded(
+                    connection,
+                    """SELECT actor.actor_id,actor.display_name,
+                              binding.source_id,binding.relation,
+                              profile.family
+                         FROM canonical_source_actor_bindings binding
+                         JOIN brain_actors actor
+                           ON actor.tenant_id=binding.tenant_id
+                          AND actor.actor_id=binding.actor_id
+                         LEFT JOIN source_profiles profile
+                           ON profile.source_id=binding.source_id
+                        WHERE binding.tenant_id=%s
+                          AND binding.source_id=ANY(%s)
+                          AND actor.active
+                          AND actor.actor_kind='human'
+                        ORDER BY lower(actor.display_name),actor.actor_id,
+                                 binding.source_id,binding.relation
+                        LIMIT 1024""",
+                    (self.tenant_id, list(self.authorized_sources)),
+                    deadline_at,
+                ).fetchall()
+        except SearchDeadlineExceeded:
+            return {
+                "people": [],
+                "complete": False,
+                "diagnostics": {
+                    "engine": "canonical-people-v1",
+                    "status": "deadline-exceeded",
+                    "elapsed_ms": round(
+                        (time.monotonic() - started_at) * 1000,
+                        3,
+                    ),
+                },
+            }
+        people: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            person = people.setdefault(
+                row["actor_id"],
+                {
+                    "actor_id": row["actor_id"],
+                    "display_name": row["display_name"],
+                    "sources": [],
+                },
+            )
+            source = {
+                "source_id": row["source_id"],
+                "relation": row["relation"],
+            }
+            if row.get("family") is not None:
+                source["family"] = row["family"]
+            person["sources"].append(source)
+        return {
+            "people": list(people.values()),
+            "complete": len(rows) < 1024,
+            "diagnostics": {
+                "engine": "canonical-people-v1",
+                "status": "ok",
+                "elapsed_ms": round(
+                    (time.monotonic() - started_at) * 1000,
+                    3,
+                ),
+            },
+        }
+
     @staticmethod
     def _row(row: dict[str, Any], score: float) -> dict[str, Any]:
         text, clipped = bounded_search_text(row["text_redacted"])
-        return {
+        result = {
             "source_id": row["source_id"],
             "native_id": row["native_id"],
             "native_parent_id": row.get("native_parent_id"),
@@ -638,8 +751,23 @@ class BoundCanonicalRetrieval:
             "receipt": row["receipt"],
             "rank": round(score, 8),
         }
+        logical_document_id = row.get("logical_document_id")
+        if isinstance(logical_document_id, str):
+            result["logical_document_id"] = logical_document_id
+        return result
 
     def search(
+        self,
+        query: str,
+        filters: dict[str, Any] | None = None,
+        limit: int = 10,
+        _authorized_source: Any = None,
+    ) -> dict[str, Any]:
+        """Search the full-document passage index used by MCP investigation."""
+
+        return self.passage_hints(query, filters, limit)
+
+    def _legacy_chunk_search_for_eval(
         self,
         query: str,
         filters: dict[str, Any] | None = None,
@@ -651,8 +779,6 @@ class BoundCanonicalRetrieval:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 20:
             raise ValueError("invalid canonical search limit")
         effective_filters = dict(filters or {})
-        if "person" in effective_filters or "person_relation" in effective_filters:
-            return self.passage_hints(query, effective_filters, limit)
         (
             source_id,
             source_family,
@@ -689,9 +815,8 @@ class BoundCanonicalRetrieval:
             }
         candidate_limit = min(100, max(20, limit * 5))
         lexical_candidate_limit = min(2_000, max(200, candidate_limit * 20))
-        lexical_deadline_at = (
-            time.monotonic() + self.store.search_deadline_ms / 1000
-        )
+        started_at = time.monotonic()
+        deadline_at = started_at + self.store.search_deadline_ms / 1000
 
         def lexical_rows(
             connection: Any,
@@ -720,12 +845,18 @@ class BoundCanonicalRetrieval:
                    SELECT candidate.source_id,document.native_id,document.revision,
                           event.native_parent_id,event.occurred_at,event.observed_at,
                           event.created_at,candidate.text_redacted,candidate.receipt,
-                          candidate.score
+                          candidate.score,evidence.logical_document_id
                    FROM candidates candidate
                    JOIN canonical_documents document
                      USING(tenant_id,source_id,document_id)
                    JOIN canonical_events event
                      USING(tenant_id,source_id,event_id)
+                   LEFT JOIN canonical_evidence_documents evidence
+                     ON evidence.tenant_id=event.tenant_id
+                    AND evidence.source_id=event.source_id
+                    AND evidence.native_parent_id=COALESCE(
+                        event.native_parent_id,event.native_id
+                    )
                    WHERE document.is_current
                      AND document.deleted_at IS NULL
                      AND (%s::timestamptz IS NULL OR event.occurred_at>=%s)
@@ -745,41 +876,58 @@ class BoundCanonicalRetrieval:
                     until,
                     candidate_limit,
                 ),
-                lexical_deadline_at,
+                deadline_at,
             ).fetchall()
 
         strict_query = " ".join(informative)
-        try:
-            with self.store.connect() as connection:
-                lexical = lexical_rows(connection, strict_query)
-                lexical_mode = "strict" if lexical else "strict-empty"
-        except SearchDeadlineExceeded:
-            lexical = []
-            lexical_mode = "deadline-exceeded"
-        semantic: list[dict[str, Any]] = []
         runtime = self.store.semantic_runtime
-        semantic_status = "disabled" if runtime is None else "ok"
-        semantic_probe_count = 0
-        if runtime is not None:
+
+        def run_lexical() -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
+            leg_started = time.monotonic()
+            try:
+                with self.store.connect() as connection:
+                    rows = lexical_rows(connection, strict_query)
+                status = "strict" if rows else "strict-empty"
+            except SearchDeadlineExceeded:
+                rows = []
+                status = "deadline-exceeded"
+            return rows, status, {
+                "leg": "lexical",
+                "elapsed_ms": round((time.monotonic() - leg_started) * 1000, 3),
+                "status": status,
+                "candidates": len(rows),
+            }
+
+        def run_semantic() -> tuple[
+            list[dict[str, Any]], str, int, dict[str, Any]
+        ]:
+            leg_started = time.monotonic()
+            embedding_ms = 0.0
+            database_ms = 0.0
+            semantic: list[dict[str, Any]] = []
+            semantic_status = "ok"
+            semantic_probe_count = 0
+
             def semantic_probe(probe_query: str) -> list[dict[str, Any]]:
+                nonlocal embedding_ms, database_ms
+                embedding_started = time.monotonic()
                 bounded_embed = getattr(runtime, "embed_query_bounded", None)
                 vector = (
                     bounded_embed(probe_query)
                     if bounded_embed is not None
                     else runtime.embed_query(probe_query)
                 )
+                embedding_ms += (time.monotonic() - embedding_started) * 1000
                 semantic_candidate_limit = min(
                     5_000,
                     max(1_000, candidate_limit * 50),
                 )
-                semantic_deadline_at = (
-                    time.monotonic()
-                    + self.store.search_deadline_ms / 1000
-                )
-                with self.store.connect() as connection:
-                    return self.store._execute_bounded(
-                        connection,
-                        """WITH candidates AS MATERIALIZED (
+                database_started = time.monotonic()
+                try:
+                    with self.store.connect() as connection:
+                        rows = self.store._execute_bounded(
+                            connection,
+                            """WITH candidates AS MATERIALIZED (
                              SELECT embedding.tenant_id,embedding.source_id,
                                     embedding.chunk_id,
                                     embedding.embedding <=> %s::halfvec AS distance
@@ -795,7 +943,8 @@ class BoundCanonicalRetrieval:
                                   event.native_parent_id,event.occurred_at,
                                   event.observed_at,event.created_at,
                                   chunk.text_redacted,chunk.receipt,
-                                  1-candidate.distance AS score
+                                  1-candidate.distance AS score,
+                                  evidence.logical_document_id
                            FROM candidates candidate
                            JOIN canonical_chunks chunk
                              USING(tenant_id,source_id,chunk_id)
@@ -803,6 +952,12 @@ class BoundCanonicalRetrieval:
                              USING(tenant_id,source_id,document_id)
                            JOIN canonical_events event
                              USING(tenant_id,source_id,event_id)
+                           LEFT JOIN canonical_evidence_documents evidence
+                             ON evidence.tenant_id=event.tenant_id
+                            AND evidence.source_id=event.source_id
+                            AND evidence.native_parent_id=COALESCE(
+                                event.native_parent_id,event.native_id
+                            )
                            WHERE chunk.deleted_at IS NULL
                              AND document.is_current
                              AND document.deleted_at IS NULL
@@ -813,21 +968,26 @@ class BoundCanonicalRetrieval:
                            ORDER BY candidate.distance,
                                     event.occurred_at DESC,chunk.chunk_id
                            LIMIT %s""",
-                        (
-                            vector,
-                            self.tenant_id,
-                            sources,
-                            runtime.fingerprint,
-                            vector,
-                            semantic_candidate_limit,
-                            since,
-                            since,
-                            until,
-                            until,
-                            candidate_limit,
-                        ),
-                        semantic_deadline_at,
-                    ).fetchall()
+                            (
+                                vector,
+                                self.tenant_id,
+                                sources,
+                                runtime.fingerprint,
+                                vector,
+                                semantic_candidate_limit,
+                                since,
+                                since,
+                                until,
+                                until,
+                                candidate_limit,
+                            ),
+                            deadline_at,
+                        ).fetchall()
+                finally:
+                    database_ms += (
+                        time.monotonic() - database_started
+                    ) * 1000
+                return rows
 
             probe_queries = [query]
             if informative:
@@ -857,6 +1017,47 @@ class BoundCanonicalRetrieval:
                         semantic.append(row)
                 if len(semantic) >= candidate_limit:
                     break
+            return semantic, semantic_status, semantic_probe_count, {
+                "leg": "semantic",
+                "elapsed_ms": round((time.monotonic() - leg_started) * 1000, 3),
+                "embedding_ms": round(embedding_ms, 3),
+                "database_ms": round(database_ms, 3),
+                "status": semantic_status,
+                "candidates": len(semantic),
+                "probes": semantic_probe_count,
+            }
+
+        with ThreadPoolExecutor(
+            max_workers=2 if runtime is not None else 1,
+            thread_name_prefix="recall-hybrid-search",
+        ) as executor:
+            lexical_future = executor.submit(run_lexical)
+            semantic_future = (
+                executor.submit(run_semantic) if runtime is not None else None
+            )
+            lexical, lexical_mode, lexical_timing = lexical_future.result()
+            if semantic_future is None:
+                semantic = []
+                semantic_status = "disabled"
+                semantic_probe_count = 0
+                semantic_timing = {
+                    "leg": "semantic",
+                    "elapsed_ms": 0.0,
+                    "embedding_ms": 0.0,
+                    "database_ms": 0.0,
+                    "status": "disabled",
+                    "candidates": 0,
+                    "probes": 0,
+                }
+            else:
+                (
+                    semantic,
+                    semantic_status,
+                    semantic_probe_count,
+                    semantic_timing,
+                ) = semantic_future.result()
+
+        fusion_started = time.monotonic()
         combined: dict[str, tuple[dict[str, Any], float]] = {}
         for weight, rows in ((0.6, lexical), (0.4, semantic)):
             for rank, row in enumerate(rows, start=1):
@@ -871,6 +1072,12 @@ class BoundCanonicalRetrieval:
             key=lambda value: (value[1], value[0]["occurred_at"], value[0]["receipt"]),
             reverse=True,
         )[:limit]
+        fusion_ms = round((time.monotonic() - fusion_started) * 1000, 3)
+        elapsed_ms = round((time.monotonic() - started_at) * 1000, 3)
+        deadline_exceeded = any(
+            item["status"] == "deadline-exceeded"
+            for item in (lexical_timing, semantic_timing)
+        )
         return {
             "results": [self._row(row, score) for row, score in ranked],
             "diagnostics": {
@@ -880,7 +1087,568 @@ class BoundCanonicalRetrieval:
                 "semantic_status": semantic_status,
                 "semantic_probes": semantic_probe_count,
                 "lexical_mode": lexical_mode,
+                "elapsed_ms": elapsed_ms,
+                "deadline_ms": self.store.search_deadline_ms,
+                "deadline_exceeded": deadline_exceeded,
+                "fusion_ms": fusion_ms,
+                "legs": [lexical_timing, semantic_timing],
             },
+        }
+
+    def scope_documents(
+        self,
+        *,
+        filters: dict[str, Any] | None = None,
+        limit: int = 40,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Enumerate exact authorized document boundaries without prose."""
+
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 80
+            or isinstance(offset, bool)
+            or not isinstance(offset, int)
+            or not 0 <= offset <= 10_000
+        ):
+            raise ValueError("invalid canonical scope page")
+        started_at = time.monotonic()
+        deadline_at = started_at + self.store.search_deadline_ms / 1000
+        effective_filters = dict(filters or {})
+        person = effective_filters.pop("person", None)
+        relation = effective_filters.pop("person_relation", None)
+        if person is not None and (
+            not isinstance(person, str)
+            or not person.strip()
+            or len(person) > 256
+        ):
+            raise ValueError("invalid person filter")
+        if relation is not None and relation not in ACTOR_RELATIONS:
+            raise ValueError("invalid person relation filter")
+        if relation is not None and person is None:
+            raise ValueError("person relation requires a person filter")
+        (
+            source_id,
+            source_family,
+            source_alias,
+            source_connector,
+            since,
+            until,
+        ) = self._filters(effective_filters)
+        sources = self._sources(
+            source_id=source_id,
+            source_family=source_family,
+            source_alias=source_alias,
+            source_connector=source_connector,
+        )
+        if not sources:
+            return {
+                "documents": [],
+                "total_documents": 0,
+                "offset": offset,
+                "complete": True,
+                "diagnostics": {
+                    "engine": "canonical-scope-v1",
+                    "status": "ok",
+                    "elapsed_ms": round(
+                        (time.monotonic() - started_at) * 1000,
+                        3,
+                    ),
+                },
+            }
+
+        actor_ids: list[str] | None = None
+        if person is not None:
+            try:
+                with self.store.connect() as connection:
+                    actor_rows = self.store._execute_bounded(
+                        connection,
+                        """SELECT DISTINCT actor.actor_id
+                             FROM brain_actors actor
+                             LEFT JOIN brain_actor_aliases alias
+                               ON alias.tenant_id=actor.tenant_id
+                              AND alias.actor_id=actor.actor_id
+                              AND alias.searchable
+                            WHERE actor.tenant_id=%s
+                              AND actor.active
+                              AND (
+                                  lower(actor.display_name)=lower(%s)
+                                  OR lower(alias.alias)=lower(%s)
+                              )
+                            ORDER BY actor.actor_id
+                            LIMIT 64""",
+                        (self.tenant_id, person.strip(), person.strip()),
+                        deadline_at,
+                    ).fetchall()
+            except SearchDeadlineExceeded:
+                actor_rows = []
+                return {
+                    "documents": [],
+                    "total_documents": None,
+                    "offset": offset,
+                    "complete": False,
+                    "diagnostics": {
+                        "engine": "canonical-scope-v1",
+                        "status": "deadline-exceeded",
+                        "elapsed_ms": round(
+                            (time.monotonic() - started_at) * 1000,
+                            3,
+                        ),
+                    },
+                }
+            actor_ids = [row["actor_id"] for row in actor_rows]
+            if not actor_ids:
+                return {
+                    "documents": [],
+                    "total_documents": 0,
+                    "offset": offset,
+                    "complete": True,
+                    "diagnostics": {
+                        "engine": "canonical-scope-v1",
+                        "status": "ok",
+                        "elapsed_ms": round(
+                            (time.monotonic() - started_at) * 1000,
+                            3,
+                        ),
+                    },
+                }
+
+        try:
+            with self.store.connect() as connection:
+                rows = self.store._execute_bounded(
+                    connection,
+                    """SELECT document.source_id,
+                              document.logical_document_id,document.revision,
+                              document.first_occurred_at,
+                              document.last_occurred_at,
+                              document.record_count,document.part_count
+                         FROM canonical_evidence_documents document
+                        WHERE document.tenant_id=%s
+                          AND document.source_id=ANY(%s)
+                          AND (%s::timestamptz IS NULL
+                               OR document.last_occurred_at>=%s)
+                          AND (%s::timestamptz IS NULL
+                               OR document.first_occurred_at<=%s)
+                          AND (
+                              %s::text[] IS NULL
+                              OR EXISTS (
+                                  SELECT 1
+                                    FROM canonical_evidence_document_actors actor
+                                   WHERE actor.tenant_id=document.tenant_id
+                                     AND actor.source_id=document.source_id
+                                     AND actor.logical_document_id=
+                                         document.logical_document_id
+                                     AND actor.revision=document.revision
+                                     AND actor.actor_id=ANY(%s)
+                                     AND (
+                                         %s::text IS NULL
+                                         OR actor.relation=%s
+                                     )
+                              )
+                          )
+                        ORDER BY document.last_occurred_at DESC,
+                                 document.source_id,
+                                 document.logical_document_id
+                        OFFSET %s LIMIT %s""",
+                    (
+                        self.tenant_id,
+                        sources,
+                        since,
+                        since,
+                        until,
+                        until,
+                        actor_ids,
+                        actor_ids,
+                        relation,
+                        relation,
+                        offset,
+                        limit + 1,
+                    ),
+                    deadline_at,
+                ).fetchall()
+        except SearchDeadlineExceeded:
+            return {
+                "documents": [],
+                "total_documents": None,
+                "offset": offset,
+                "complete": False,
+                "diagnostics": {
+                    "engine": "canonical-scope-v1",
+                    "status": "deadline-exceeded",
+                    "elapsed_ms": round(
+                        (time.monotonic() - started_at) * 1000,
+                        3,
+                    ),
+                },
+            }
+        complete = len(rows) <= limit
+        rows = rows[:limit]
+        documents = [
+            {
+                "source_id": row["source_id"],
+                "logical_document_id": row["logical_document_id"],
+                "revision": int(row["revision"]),
+                "first_occurred_at": _timestamp(row["first_occurred_at"]),
+                "last_occurred_at": _timestamp(row["last_occurred_at"]),
+                "record_count": int(row["record_count"]),
+                "part_count": int(row["part_count"]),
+            }
+            for row in rows
+        ]
+        return {
+            "documents": documents,
+            "total_documents": offset + len(documents) if complete else None,
+            "offset": offset,
+            "complete": complete,
+            "diagnostics": {
+                "engine": "canonical-scope-v1",
+                "status": "ok",
+                "elapsed_ms": round(
+                    (time.monotonic() - started_at) * 1000,
+                    3,
+                ),
+            },
+        }
+
+    @staticmethod
+    def _empty_parquet_scan(
+        *,
+        sources_available: int,
+        pending: int = 0,
+    ) -> dict[str, Any]:
+        return {
+            "provider": "parquet",
+            "stdout": "",
+            "stderr": "",
+            "exit_code": 0,
+            "complete": pending == 0,
+            "stopped_reason": "projection_pending" if pending else "completed",
+            "output_truncated": False,
+            "timing": None,
+            "opened_receipts": [],
+            "datasets_available": 0,
+            "sources_available": sources_available,
+            "buckets_available": 0,
+            "projection_pending": pending,
+        }
+
+    def _parquet_person_sources(
+        self,
+        sources: list[str],
+        *,
+        person: str,
+        relation: str | None,
+        deadline_at: float,
+    ) -> list[str]:
+        try:
+            with self.store.connect() as connection:
+                rows = self.store._execute_bounded(
+                    connection,
+                    """SELECT DISTINCT linked.source_id
+                         FROM canonical_evidence_document_actors linked
+                         JOIN brain_actors actor
+                           ON actor.tenant_id=linked.tenant_id
+                          AND actor.actor_id=linked.actor_id
+                         LEFT JOIN brain_actor_aliases alias
+                           ON alias.tenant_id=actor.tenant_id
+                          AND alias.actor_id=actor.actor_id
+                          AND alias.searchable
+                        WHERE linked.tenant_id=%s
+                          AND linked.source_id=ANY(%s)
+                          AND actor.active
+                          AND (
+                              lower(actor.display_name)=lower(%s)
+                              OR lower(alias.alias)=lower(%s)
+                          )
+                          AND (%s::text IS NULL OR linked.relation=%s)
+                        ORDER BY linked.source_id
+                        LIMIT 256""",
+                    (
+                        self.tenant_id,
+                        sources,
+                        person,
+                        person,
+                        relation,
+                        relation,
+                    ),
+                    deadline_at,
+                ).fetchall()
+        except SearchDeadlineExceeded:
+            raise DeepInspectionError("parquet_scan_scope_deadline") from None
+        return [row["source_id"] for row in rows]
+
+    def _parquet_shards(
+        self,
+        sources: list[str],
+        *,
+        since: datetime | None,
+        until: datetime | None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        values = (self.tenant_id, sources, since, since, until, until)
+        with self.store.connect() as connection:
+            rows = connection.execute(
+                """SELECT source_id,bucket_start,dataset,shard_index,
+                          object_key,content_sha256
+                     FROM canonical_parquet_scan_shards
+                    WHERE tenant_id=%s AND source_id=ANY(%s)
+                      AND (
+                          %s::timestamptz IS NULL OR bucket_start >=
+                          date_trunc('month',%s::timestamptz)::date
+                      )
+                      AND (
+                          %s::timestamptz IS NULL OR bucket_start <=
+                          date_trunc('month',%s::timestamptz)::date
+                      )
+                    ORDER BY source_id,bucket_start,dataset,shard_index""",
+                values,
+            ).fetchall()
+            pending = connection.execute(
+                """SELECT count(*) AS count
+                     FROM canonical_parquet_scan_queue
+                    WHERE tenant_id=%s AND source_id=ANY(%s)
+                      AND (
+                          %s::timestamptz IS NULL OR bucket_start >=
+                          date_trunc('month',%s::timestamptz)::date
+                      )
+                      AND (
+                          %s::timestamptz IS NULL OR bucket_start <=
+                          date_trunc('month',%s::timestamptz)::date
+                      )""",
+                values,
+            ).fetchone()["count"]
+        return rows, int(pending)
+
+    def _verify_parquet_receipts(
+        self,
+        receipts: list[str],
+        *,
+        sources: list[str],
+        since: datetime | None,
+        until: datetime | None,
+        person: str | None,
+        relation: str | None,
+    ) -> None:
+        if not receipts:
+            return
+        with self.store.connect() as connection:
+            rows = connection.execute(
+                """SELECT DISTINCT chunk.receipt
+                     FROM canonical_chunks chunk
+                     JOIN canonical_documents canonical
+                       USING(tenant_id,source_id,document_id)
+                     JOIN canonical_events event
+                       USING(tenant_id,source_id,event_id)
+                     JOIN canonical_evidence_documents evidence
+                       ON evidence.tenant_id=event.tenant_id
+                      AND evidence.source_id=event.source_id
+                      AND evidence.native_parent_id=coalesce(
+                          event.native_parent_id,event.native_id
+                      )
+                    WHERE chunk.tenant_id=%s
+                      AND chunk.source_id=ANY(%s)
+                      AND chunk.receipt=ANY(%s)
+                      AND (%s::timestamptz IS NULL OR event.occurred_at>=%s)
+                      AND (%s::timestamptz IS NULL OR event.occurred_at<=%s)
+                      AND (
+                          %s::text IS NULL
+                          OR EXISTS (
+                              SELECT 1
+                                FROM (
+                                      SELECT attributed.actor_id,
+                                             attributed.relation
+                                        FROM canonical_event_actors attributed
+                                       WHERE attributed.tenant_id=event.tenant_id
+                                         AND attributed.source_id=event.source_id
+                                         AND attributed.event_id=event.event_id
+                                      UNION
+                                      SELECT binding.actor_id,binding.relation
+                                        FROM canonical_source_actor_bindings binding
+                                       WHERE binding.tenant_id=event.tenant_id
+                                         AND binding.source_id=event.source_id
+                                ) link
+                                JOIN brain_actors actor
+                                  ON actor.tenant_id=event.tenant_id
+                                 AND actor.actor_id=link.actor_id
+                                LEFT JOIN brain_actor_aliases alias
+                                  ON alias.tenant_id=actor.tenant_id
+                                 AND alias.actor_id=actor.actor_id
+                                 AND alias.searchable
+                               WHERE (
+                                     lower(actor.display_name)=lower(%s)
+                                     OR lower(alias.alias)=lower(%s)
+                                 )
+                                 AND (
+                                     %s::text IS NULL
+                                     OR link.relation=%s
+                                 )
+                          )
+                      )
+                      AND chunk.deleted_at IS NULL
+                      AND canonical.is_current
+                      AND canonical.deleted_at IS NULL""",
+                (
+                    self.tenant_id,
+                    sources,
+                    receipts,
+                    since,
+                    since,
+                    until,
+                    until,
+                    person,
+                    person,
+                    person,
+                    relation,
+                    relation,
+                ),
+            ).fetchall()
+        if set(receipts) != {row["receipt"] for row in rows}:
+            raise DeepInspectionError("deep_inspector_receipt_scope_violation")
+
+    def execute_parquet_scan(
+        self,
+        program: str,
+        *,
+        filters: dict[str, Any] | None,
+        timeout_seconds: int,
+    ) -> dict[str, Any]:
+        """Run caller-authored DuckDB over authorized source/month projections."""
+
+        if (
+            self.deep_inspector is None
+            or not callable(getattr(self.deep_inspector, "execute_scan", None))
+        ):
+            raise DeepInspectionError("parquet_scan_not_configured")
+        if (
+            not isinstance(program, str)
+            or not program.strip()
+            or len(program.encode()) > 16_000
+            or isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, int)
+            or not 1 <= timeout_seconds <= 240
+        ):
+            raise DeepInspectionError("parquet_scan_request_invalid")
+        effective = dict(filters or {})
+        person = effective.pop("person", None)
+        relation = effective.pop("person_relation", None)
+        if person is not None and (
+            not isinstance(person, str)
+            or not person.strip()
+            or len(person) > 256
+        ):
+            raise DeepInspectionError("parquet_scan_request_invalid")
+        if relation is not None and (
+            relation not in ACTOR_RELATIONS or person is None
+        ):
+            raise DeepInspectionError("parquet_scan_request_invalid")
+        (
+            source_id,
+            source_family,
+            source_alias,
+            source_connector,
+            since,
+            until,
+        ) = self._filters(effective)
+        sources = self._sources(
+            source_id=source_id,
+            source_family=source_family,
+            source_alias=source_alias,
+            source_connector=source_connector,
+        )
+        deadline_at = time.monotonic() + self.store.search_deadline_ms / 1000
+        if person is not None:
+            sources = self._parquet_person_sources(
+                sources,
+                person=person.strip(),
+                relation=relation,
+                deadline_at=deadline_at,
+            )
+        if not sources:
+            return self._empty_parquet_scan(sources_available=0)
+        rows, pending = self._parquet_shards(
+            sources,
+            since=since,
+            until=until,
+        )
+        referenced_datasets = {
+            dataset
+            for dataset in ("documents", "passages", "records", "actors")
+            if re.search(rf"(?<![A-Za-z0-9_-]){dataset}-part-", program)
+        }
+        if referenced_datasets:
+            rows = [row for row in rows if row["dataset"] in referenced_datasets]
+        if not rows:
+            return self._empty_parquet_scan(
+                sources_available=len(sources),
+                pending=pending,
+            )
+        if len(rows) > 511:
+            raise DeepInspectionError("parquet_scan_scope_too_large")
+        source_aliases = {
+            value: f"s{index}"
+            for index, value in enumerate(
+                sorted({row["source_id"] for row in rows}),
+                start=1,
+            )
+        }
+        objects = tuple(
+            AgentExecObject(
+                object_key=row["object_key"],
+                content_sha256=row["content_sha256"],
+            )
+            for row in rows
+        )
+        dataset_aliases = {
+            row["object_key"]: (
+                f"{source_aliases[row['source_id']]}/"
+                f"{row['bucket_start'].isoformat()[:7]}/"
+                f"{row['dataset']}-part-{int(row['shard_index']):05d}.parquet"
+            )
+            for row in rows
+        }
+        result = self.deep_inspector.execute_scan(
+            tenant_id=self.tenant_id,
+            program=program,
+            objects=objects,
+            dataset_aliases=dataset_aliases,
+            timeout_seconds=timeout_seconds,
+        )
+        stdout = result.get("stdout")
+        if not isinstance(stdout, str):
+            raise DeepInspectionError("deep_inspector_result_invalid_execution")
+        stdout_bytes = stdout.encode()
+        if len(stdout_bytes) > MAX_PARQUET_SCAN_OUTPUT_BYTES:
+            stdout = stdout_bytes[:MAX_PARQUET_SCAN_OUTPUT_BYTES].decode(
+                errors="ignore"
+            )
+            result = {
+                **result,
+                "stdout": stdout,
+                "complete": False,
+                "stopped_reason": "output_limit",
+                "output_truncated": True,
+            }
+        mentioned = agent_evidence_receipts(stdout)
+        self._verify_parquet_receipts(
+            mentioned,
+            sources=sources,
+            since=since,
+            until=until,
+            person=person,
+            relation=relation,
+        )
+        buckets = {
+            (row["source_id"], row["bucket_start"])
+            for row in rows
+        }
+        return {
+            **result,
+            "opened_receipts": mentioned,
+            "datasets_available": len(rows),
+            "sources_available": len(source_aliases),
+            "buckets_available": len(buckets),
+            "projection_pending": pending,
+            "complete": bool(result.get("complete")) and pending == 0,
         }
 
     def passage_hints(
@@ -890,6 +1658,9 @@ class BoundCanonicalRetrieval:
         limit: int = 10,
     ) -> dict[str, Any]:
         """Return document/range hints without answering the natural question."""
+
+        started_at = time.monotonic()
+        deadline_at = started_at + self.store.search_deadline_ms / 1000
 
         if not isinstance(query, str) or not query.strip() or len(query) > 8192:
             raise ValueError("invalid passage hint query")
@@ -938,6 +1709,20 @@ class BoundCanonicalRetrieval:
         lexical_query = " ".join(informative) if informative else query
         actor_ids: tuple[str, ...] | None = None
         if person is not None:
+            sources = self._actor_sources(
+                person,
+                relation,
+                sources,
+                deadline_at,
+            )
+            if not sources:
+                return {
+                    "results": [],
+                    "diagnostics": {
+                        "engine": "lossless-passages-v1",
+                        "reason": "no-person-sources",
+                    },
+                }
             with self.store.connect() as connection:
                 rows = connection.execute(
                     """SELECT DISTINCT actor.actor_id
@@ -956,19 +1741,32 @@ class BoundCanonicalRetrieval:
                     (self.tenant_id, person.strip(), person.strip()),
                 ).fetchall()
             actor_ids = tuple(row["actor_id"] for row in rows)
+        passage_actor_ids = actor_ids
+        if (
+            relation is None
+            and actor_ids is not None
+            and self._sources_exclusively_bound_to_actors(
+                sources,
+                actor_ids,
+                deadline_at,
+            )
+        ):
+            passage_actor_ids = None
         response = PassageHintRetrieval(
             self.store,
             tenant_id=self.tenant_id,
             sources=sources,
             policy_fingerprint=self.passage_policy.fingerprint,
-            actor_ids=actor_ids,
+            actor_ids=passage_actor_ids,
             actor_relations=(relation,) if relation is not None else None,
+            actor_scope=person is not None,
         ).search(
             query,
             lexical_query=lexical_query,
             since=since,
             until=until,
             limit=limit,
+            deadline_at=deadline_at,
         )
         if since is None and until is None:
             return response
@@ -977,6 +1775,7 @@ class BoundCanonicalRetrieval:
             sources=sources,
             since=since,
             until=until,
+            deadline_at=deadline_at,
         )
 
     def _clip_passage_hints_to_time_window(
@@ -986,6 +1785,7 @@ class BoundCanonicalRetrieval:
         sources: list[str],
         since: str | None,
         until: str | None,
+        deadline_at: float | None = None,
     ) -> dict[str, Any]:
         """Keep hint text and receipts inside the requested event window."""
 
@@ -1031,12 +1831,26 @@ class BoundCanonicalRetrieval:
                         until,
                         until,
                     ),
-                    time.monotonic()
+                    deadline_at
+                    if deadline_at is not None
+                    else time.monotonic()
                     + self.store.search_deadline_ms / 1000,
                 ).fetchall()
         except SearchDeadlineExceeded:
             diagnostics["time_clip_status"] = "deadline-exceeded"
-            return {**response, "results": [], "diagnostics": diagnostics}
+            diagnostics["time_filter_requires_exec"] = True
+            # Every retrieval arm already applied the document-level time
+            # overlap. Keep those authorized pointers, but remove prose and
+            # receipts whose exact event timestamps could not be verified.
+            pointer_results = [
+                {**document, "matching_ranges": []}
+                for document in response.get("results", ())
+            ]
+            return {
+                **response,
+                "results": pointer_results,
+                "diagnostics": diagnostics,
+            }
         eligible = {row["receipt"]: row for row in rows}
         results = []
         for document in response.get("results", ()):
@@ -1293,6 +2107,211 @@ class BoundCanonicalRetrieval:
             "opened_receipts": mentioned,
             "documents_available": len(admitted_documents),
             "objects_available": len(objects),
+        }
+
+    def execute_agent_program_parallel(
+        self,
+        program: str,
+        *,
+        logical_document_ids: tuple[str, ...],
+        document_aliases: dict[str, str],
+        timeout_seconds: int,
+        max_parallel: int,
+        shard_size: int,
+    ) -> dict[str, Any]:
+        """Fan one agent-authored program across authorized Archil shards."""
+
+        if (
+            not isinstance(program, str)
+            or not program.strip()
+            or len(program.encode()) > 16_000
+            or not isinstance(logical_document_ids, tuple)
+            or not 1 <= len(logical_document_ids) <= 80
+            or len(set(logical_document_ids)) != len(logical_document_ids)
+            or set(document_aliases) != set(logical_document_ids)
+            or len(set(document_aliases.values())) != len(document_aliases)
+            or any(
+                not isinstance(alias, str)
+                or re.fullmatch(r"d[1-9][0-9]?", alias) is None
+                or int(alias[1:]) > 80
+                for alias in document_aliases.values()
+            )
+            or isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, int)
+            or not 1 <= timeout_seconds <= 30
+            or isinstance(max_parallel, bool)
+            or not isinstance(max_parallel, int)
+            or not 1 <= max_parallel <= 8
+            or isinstance(shard_size, bool)
+            or not isinstance(shard_size, int)
+            or not 1 <= shard_size <= 20
+        ):
+            raise DeepInspectionError("deep_inspector_target_invalid")
+        # Fail closed before launching any shard if even one requested
+        # document is not present in this bound tenant/source authority.
+        with self.store.connect() as connection:
+            rows = connection.execute(
+                """SELECT document.logical_document_id,
+                          document.manifest_size_bytes
+                          + COALESCE(SUM(part.size_bytes),0) AS size_bytes
+                     FROM canonical_evidence_documents document
+                     LEFT JOIN canonical_evidence_document_parts part
+                       ON part.tenant_id=document.tenant_id
+                      AND part.source_id=document.source_id
+                      AND part.logical_document_id=
+                          document.logical_document_id
+                      AND part.revision=document.revision
+                    WHERE document.tenant_id=%s
+                      AND document.source_id=ANY(%s)
+                      AND document.logical_document_id=ANY(%s)
+                    GROUP BY document.logical_document_id,
+                             document.manifest_size_bytes""",
+                (
+                    self.tenant_id,
+                    list(self.authorized_sources),
+                    list(logical_document_ids),
+                ),
+            ).fetchall()
+        if {row["logical_document_id"] for row in rows} != set(
+            logical_document_ids
+        ):
+            raise DeepInspectionError("deep_inspector_target_invalid")
+
+        sizes = {
+            row["logical_document_id"]: int(row["size_bytes"])
+            for row in rows
+        }
+        # Keep the aggregate response bounded to eight shard outputs, then
+        # greedily place the largest documents in the currently lightest bin.
+        # This avoids one giant transcript becoming the serial tail of a wave.
+        shard_count = min(
+            MAX_AGENT_EXEC_MAP_SHARDS,
+            (len(logical_document_ids) + shard_size - 1) // shard_size,
+        )
+        effective_shard_size = (
+            len(logical_document_ids) + shard_count - 1
+        ) // shard_count
+        bins: list[tuple[list[str], int]] = [([], 0) for _ in range(shard_count)]
+        order = {value: index for index, value in enumerate(logical_document_ids)}
+        for document_id in sorted(
+            logical_document_ids,
+            key=lambda value: (-sizes[value], order[value]),
+        ):
+            eligible = [
+                index
+                for index, (documents, _total) in enumerate(bins)
+                if len(documents) < effective_shard_size
+            ]
+            destination = min(
+                eligible,
+                key=lambda index: (bins[index][1], len(bins[index][0]), index),
+            )
+            documents, total = bins[destination]
+            documents.append(document_id)
+            bins[destination] = (documents, total + sizes[document_id])
+        shards = tuple(
+            (tuple(documents), total)
+            for documents, total in bins
+            if documents
+        )
+        started_at = time.monotonic()
+
+        def execute(
+            item: tuple[int, tuple[tuple[str, ...], int]],
+        ) -> dict[str, Any]:
+            shard_index, (document_ids, input_bytes) = item
+            try:
+                result = self.execute_agent_program(
+                    program,
+                    logical_document_ids=document_ids,
+                    document_aliases={
+                        document_id: document_aliases[document_id]
+                        for document_id in document_ids
+                    },
+                    record_spans={document_id: () for document_id in document_ids},
+                    routing_receipts={
+                        document_id: () for document_id in document_ids
+                    },
+                    timeout_seconds=timeout_seconds,
+                )
+                stdout = result.get("stdout", "")
+                stderr = result.get("stderr", "")
+                stdout_bytes = stdout.encode()
+                stderr_bytes = stderr.encode()
+                output_truncated = (
+                    len(stdout_bytes) > MAX_AGENT_EXEC_MAP_SHARD_STDOUT_BYTES
+                    or len(stderr_bytes) > MAX_AGENT_EXEC_MAP_SHARD_STDERR_BYTES
+                )
+                if output_truncated:
+                    stdout = stdout_bytes[
+                        :MAX_AGENT_EXEC_MAP_SHARD_STDOUT_BYTES
+                    ].decode(errors="ignore")
+                    stderr = stderr_bytes[
+                        :MAX_AGENT_EXEC_MAP_SHARD_STDERR_BYTES
+                    ].decode(errors="ignore")
+                    # Citation authority follows only evidence still visible to
+                    # the caller after the map response is bounded.
+                    visible_receipts = agent_evidence_receipts(stdout)
+                    result = {
+                        **result,
+                        "stdout": stdout,
+                        "stderr": stderr,
+                        "opened_receipts": visible_receipts,
+                        "complete": False,
+                        "stopped_reason": "output_limit",
+                        "output_truncated": True,
+                    }
+                return {
+                    "shard": shard_index,
+                    "input_bytes": input_bytes,
+                    **result,
+                }
+            except DeepInspectionError:
+                return {
+                    "shard": shard_index,
+                    "input_bytes": input_bytes,
+                    "complete": False,
+                    "stopped_reason": "provider_failure",
+                    "stdout": "",
+                    "stderr": "",
+                    "opened_receipts": [],
+                    "documents_available": len(document_ids),
+                }
+
+        with ThreadPoolExecutor(
+            max_workers=min(max_parallel, len(shards)),
+            thread_name_prefix="recall-archil-map",
+        ) as executor:
+            results = list(executor.map(execute, enumerate(shards)))
+        opened_receipts = list(dict.fromkeys(
+            receipt
+            for result in results
+            for receipt in result.get("opened_receipts", ())
+        ))
+        complete = all(bool(result.get("complete")) for result in results)
+        return {
+            "provider": next(
+                (
+                    result.get("provider")
+                    for result in results
+                    if isinstance(result.get("provider"), str)
+                ),
+                "archil",
+            ),
+            "complete": complete,
+            "stopped_reason": "completed" if complete else "partial_failure",
+            "opened_receipts": opened_receipts,
+            "shards": results,
+            "timing": {
+                "elapsed_ms": round(
+                    (time.monotonic() - started_at) * 1000,
+                    3,
+                ),
+                "shard_count": len(shards),
+                "max_parallel": min(max_parallel, len(shards)),
+                "effective_shard_size": effective_shard_size,
+                "input_bytes": sum(sizes.values()),
+            },
         }
 
     @staticmethod

@@ -50,6 +50,27 @@ Use an explicit `/mcp` suffix for a public or managed MCP endpoint, for example
 MCP tool and fails closed. A URL without `/mcp` preserves the legacy REST
 transport.
 
+### Direct MCP retrieval
+
+When the MCP is installed in an agentic client, the client agent is the retrieval
+agent. Recall does not call another model or return a synthesized answer:
+
+1. Interpret the user's question and call `recall_search` with useful person,
+   source, and UTC time boundaries. Reformulate or split the search when that
+   improves recall; do not treat rank one as the answer.
+2. For exact facts, open a returned `recall://` receipt with `recall_show` or
+   `recall_session_context`.
+3. For synthesis over full or large documents, pass only returned
+   `logical_document_id` values to `recall_exec`. Use the read-only shell,
+   `recall-scan`, Python, `jq`, and ordinary text tools freely inside its bounded,
+   networkless sandbox.
+4. Cite only receipts returned in `opened_receipts`. State a gap when the opened
+   evidence is insufficient; search snippets alone are pointers, not proof.
+
+This keeps planning and semantic judgment in the capable agent the user already
+chose while Recall remains a small authorization, retrieval, execution, and
+evidence-verification service.
+
 For a persistent per-device read profile, use a mode-0600 regular file at
 `~/.config/recall-brain/client.json` with the exact shape
 `{"schema_version":1,"url":"https://brain.example.com/mcp",`

@@ -834,6 +834,7 @@ class McpRemoteHandler(BaseHTTPRequestHandler):
     target_path = "/source/mcp-session.jsonl"
     fail_tool = False
     omit_search_path = False
+    passage_search = False
 
     def log_message(self, *_args):
         pass
@@ -873,19 +874,33 @@ class McpRemoteHandler(BaseHTTPRequestHandler):
             name = body["params"]["name"]
             arguments = body["params"]["arguments"]
             if name == "recall_search":
-                result = {
-                    "occurred_at": "2026-01-01T00:00:00Z",
-                    "cwd": "/work/grep123/project",
-                    "slot": "grep123",
-                    "branch": "feature/mcp",
-                    "surface": "tool_output",
-                    "text": "remote MCP exact deadbeef evidence",
-                    "matched_terms": ["deadbeef"],
-                    "legs": ["exact"],
-                    "receipt": "recall://claude:linux/mcp-session:1?rev=1#item=0",
-                }
-                if not type(self).omit_search_path:
-                    result["path"] = type(self).target_path
+                receipt = "recall://claude:linux/mcp-session:1?rev=1#item=0"
+                if type(self).passage_search:
+                    result = {
+                        "logical_document_id": "ldoc_" + "1" * 32,
+                        "source_id": "claude:linux",
+                        "last_occurred_at": "2026-01-01T00:00:00Z",
+                        "reasons": ["dense", "passage-lexical"],
+                        "matching_ranges": [{
+                            "kind": "dense",
+                            "receipts": [receipt],
+                            "text": "remote MCP passage evidence",
+                        }],
+                    }
+                else:
+                    result = {
+                        "occurred_at": "2026-01-01T00:00:00Z",
+                        "cwd": "/work/grep123/project",
+                        "slot": "grep123",
+                        "branch": "feature/mcp",
+                        "surface": "tool_output",
+                        "text": "remote MCP exact deadbeef evidence",
+                        "matched_terms": ["deadbeef"],
+                        "legs": ["exact"],
+                        "receipt": receipt,
+                    }
+                    if not type(self).omit_search_path:
+                        result["path"] = type(self).target_path
                 value = {
                     "results": [result],
                     "diagnostics": {"deadline_ms": 300, "elapsed_ms": 11.0},
@@ -1085,6 +1100,29 @@ class RemoteTransportTest(unittest.TestCase):
             self.assertEqual(self.call("search", "deadbeef", "--paths")[1].strip(), receipt)
         finally:
             McpRemoteHandler.omit_search_path = False
+            mcp.shutdown()
+            mcp.server_close()
+
+    def test_mcp_search_resolves_lossless_passage_receipts(self):
+        mcp = ThreadingHTTPServer(("127.0.0.1", 0), McpRemoteHandler)
+        thread = threading.Thread(target=mcp.serve_forever, daemon=True)
+        thread.start()
+        McpRemoteHandler.requests = []
+        McpRemoteHandler.passage_search = True
+        os.environ["RECALL_URL"] = f"http://127.0.0.1:{mcp.server_port}/mcp"
+        receipt = "recall://claude:linux/mcp-session:1?rev=1#item=0"
+        try:
+            code, output, error = self.call("search", "passage evidence")
+            self.assertEqual((code, error), (0, ""))
+            self.assertIn(f"1. {receipt}", output)
+            self.assertIn("remote MCP passage evidence", output)
+            self.assertIn("legs=dense,passage-lexical", output)
+            self.assertEqual(
+                self.call("search", "passage evidence", "--paths")[1].strip(),
+                receipt,
+            )
+        finally:
+            McpRemoteHandler.passage_search = False
             mcp.shutdown()
             mcp.server_close()
 

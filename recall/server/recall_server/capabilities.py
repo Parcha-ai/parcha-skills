@@ -40,8 +40,7 @@ WITH expected_tables(name) AS (
         ('mcp_credentials'), ('canonical_chunk_embeddings'),
         ('canonical_embedding_projection_watermarks'),
         ('admin_credentials'), ('admin_sessions'), ('provider_connections'),
-        ('connector_installations'), ('oauth_sessions'), ('control_audit_events'),
-        ('agent_runs')
+        ('connector_installations'), ('oauth_sessions'), ('control_audit_events')
 ), runtime_tables(name) AS (
     SELECT name FROM expected_tables WHERE name <> 'schema_migrations'
 ), expected_sequences(name) AS (
@@ -66,13 +65,13 @@ SELECT
     role.rolbypassrls AS bypass_rls,
     pg_catalog.has_database_privilege(current_database(), 'CONNECT') AS can_connect,
     pg_catalog.has_schema_privilege(current_user, 'public', 'USAGE') AS can_use_schema,
-    (SELECT count(*) = 58 AND COALESCE(bool_and(
+    (SELECT count(*) = 57 AND COALESCE(bool_and(
         pg_catalog.to_regclass(pg_catalog.format('public.%I', name)) IS NOT NULL
         AND pg_catalog.has_table_privilege(
             current_user, pg_catalog.to_regclass(pg_catalog.format('public.%I', name)), 'SELECT'
         )
     ), false) FROM expected_tables) AS can_read_runtime_tables,
-    (SELECT count(*) = 57 AND COALESCE(bool_and(
+    (SELECT count(*) = 56 AND COALESCE(bool_and(
         pg_catalog.to_regclass(pg_catalog.format('public.%I', name)) IS NOT NULL
         AND pg_catalog.has_table_privilege(
             current_user, pg_catalog.to_regclass(pg_catalog.format('public.%I', name)),

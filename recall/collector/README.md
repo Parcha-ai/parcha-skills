@@ -55,7 +55,10 @@ a limit upgrade; it is never counted as acknowledged while dead.
 
 Large backfills may run non-overlapping `flush --shard-count N --shard-index I` workers. Sharding
 is a stable hash of the source path modulo `N`, so one transcript/session is owned by exactly one
-worker and cannot deadlock its projection rows; the steady-state watcher remains a single worker.
+worker and cannot deadlock its projection rows. A bounded backfill scanner may use
+`--defer-scan-flush` (or `RECALL_DEFER_SCAN_FLUSH=1`) so durable spool rows are drained by those
+workers instead of serially between source files. The steady-state watcher retains the safer
+default and remains a single worker.
 
 Structured values whose keys name credentials—including `LITELLM_MASTER_KEY`—are replaced before
 spooling. Non-JSONL files and paths outside the configured root are never discovered.

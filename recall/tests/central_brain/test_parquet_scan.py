@@ -1,0 +1,746 @@
+from __future__ import annotations
+
+import json
+import os
+import unittest
+from contextlib import contextmanager
+from datetime import date, datetime, timezone
+from pathlib import Path
+from unittest import mock
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from recall_server.parquet_scan import (
+    CanonicalParquetScanProjector,
+    ParquetScanError,
+    ScanCandidate,
+    ScanUpload,
+    _month,
+    _parquet_bytes,
+    _parquet_parts,
+    _schemas,
+)
+
+
+class _Archive:
+    def __init__(self, record: dict):
+        self.record = record
+        self.reads = 0
+        self.uploads = []
+
+    def read_raw(self, _reference):
+        self.reads += 1
+        return json.dumps(self.record, sort_keys=True).encode() + b"\n"
+
+    def put_raw(self, **values):
+        self.uploads.append(values)
+        ordinal = len(self.uploads)
+        return {
+            "tenant_id": values["tenant_id"],
+            "source_id": values["source_id"],
+            "artifact_id": f"artifact:{ordinal}",
+            "storage_backend": "memory",
+            "object_key": f"objects/{ordinal}",
+            "content_sha256": f"{ordinal:064x}",
+            "size_bytes": len(values["payload"]),
+            "media_type": values["media_type"],
+            "encryption": "test",
+            "version_id": f"v{ordinal}",
+            "created_at": values["created_at"],
+        }
+
+
+class _Evidence:
+    def __init__(self, archive):
+        self.archive = archive
+
+
+class _ManyRecordArchive(_Archive):
+    def __init__(self, count: int):
+        super().__init__({})
+        self.count = count
+
+    def read_raw(self, _reference):
+        self.reads += 1
+        return b"".join(
+            json.dumps(
+                {
+                    "ordinal": ordinal,
+                    "occurred_at": "2026-08-05T12:00:00Z",
+                    "event_kind": "transcript_record",
+                    "roles": ["assistant"],
+                    "receipts": [f"recall://source:test/doc?rev=1#item={ordinal}"],
+                    "text": f"context-{ordinal}-" + "x" * 20_000,
+                },
+                sort_keys=True,
+            ).encode()
+            + b"\n"
+            for ordinal in range(self.count)
+        )
+
+
+class _SeedResult:
+    rowcount = 1
+
+
+class _SeedConnection:
+    def __init__(self):
+        self.query = ""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return None
+
+    def execute(self, query, _parameters):
+        self.query = query
+        return _SeedResult()
+
+
+class _SeedStore:
+    def __init__(self):
+        self.connection = _SeedConnection()
+
+    def connect(self):
+        return self.connection
+
+
+class _CurrentUploadResult:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def fetchall(self):
+        return self.rows
+
+
+class _CurrentUploadConnection:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return None
+
+    def execute(self, _query, _parameters):
+        return _CurrentUploadResult(self.rows)
+
+
+class _CurrentUploadStore:
+    def __init__(self, rows):
+        self.connection = _CurrentUploadConnection(rows)
+
+    def connect(self):
+        return self.connection
+
+
+class _LeaseResult:
+    def __init__(self, acquired: bool):
+        self.acquired = acquired
+
+    def fetchone(self):
+        return {"acquired": self.acquired}
+
+
+class _LeaseConnection:
+    def __init__(self, acquired: bool):
+        self.acquired = acquired
+        self.calls = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return None
+
+    def execute(self, query, parameters):
+        self.calls.append((query, parameters))
+        return _LeaseResult(self.acquired)
+
+
+class _LeaseStore:
+    def __init__(self, acquired: bool):
+        self.connection = _LeaseConnection(acquired)
+
+    def connect(self):
+        return self.connection
+
+
+def _part() -> dict:
+    return {
+        "tenant_id": "tenant:test",
+        "source_id": "source:test",
+        "part_ordinal": 0,
+        "artifact_id": "artifact:test",
+        "storage_backend": "filesystem",
+        "object_key": "objects/test",
+        "content_sha256": "a" * 64,
+        "size_bytes": 1,
+        "media_type": "application/x-ndjson",
+        "encryption": "filesystem-private",
+        "version_id": "v1",
+        "first_occurred_at": datetime(2026, 8, 5, 12, tzinfo=timezone.utc),
+        "last_occurred_at": datetime(2026, 8, 5, 12, tzinfo=timezone.utc),
+        "created_at": datetime(2026, 8, 1, tzinfo=timezone.utc),
+    }
+
+
+def _document(display_name: str) -> dict:
+    return {
+        "logical_document_id": "document:test",
+        "revision": 1,
+        "part_count": 1,
+        "document_content_sha256": "b" * 64,
+        "actor_links": [
+            {
+                "actor_id": "actor:employee",
+                "display_name": display_name,
+                "relation": "contributor",
+            }
+        ],
+        "parts": [_part()],
+    }
+
+
+def _candidate() -> ScanCandidate:
+    return ScanCandidate(
+        tenant_id="tenant:test",
+        source_id="source:test",
+        bucket_start=date(2026, 8, 1),
+        generation=1,
+        changed_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+    )
+
+
+class _BuildProbe(CanonicalParquetScanProjector):
+    def __init__(
+        self,
+        document: dict,
+        archive: _Archive,
+        passages: list[dict] | None = None,
+    ):
+        super().__init__(None, _Evidence(archive))
+        self.document = document
+        self.passages = passages or []
+
+    def _documents(self, _candidate):
+        return [self.document]
+
+    def _current_upload(self, _candidate, _generation):
+        return None
+
+    def _legacy_upload(self, _candidate):
+        return None
+
+    def _passages(self, _candidate):
+        return self.passages
+
+
+class _CheckpointProbe(CanonicalParquetScanProjector):
+    def __init__(self, archive: _Archive):
+        super().__init__(None, _Evidence(archive))
+        self.checkpoints = []
+
+    def _persist_part_bounds(self, bounds):
+        self.checkpoints.append(len(bounds))
+
+
+class _WindowProbe(CanonicalParquetScanProjector):
+    def __init__(self):
+        super().__init__(None, _Evidence(None))
+        self.pending_limits = []
+        self.built = []
+
+    def _pending(self, *, tenant_id, limit):
+        self.pending_limits.append((tenant_id, limit))
+        base = _candidate()
+        return [
+            ScanCandidate(
+                base.tenant_id,
+                source_id,
+                base.bucket_start,
+                base.generation,
+                base.changed_at,
+            )
+            for source_id in ("source:locked", "source:ready", "source:later")
+        ]
+
+    @contextmanager
+    def _candidate_lease(self, candidate):
+        yield candidate.source_id != "source:locked"
+
+    def _build(self, candidate):
+        self.built.append(candidate.source_id)
+        return ScanUpload(
+            "a" * 64,
+            {},
+            {("records", 0): 1},
+            None,
+            None,
+            False,
+        )
+
+    def _commit(self, _candidate, _upload):
+        return "committed"
+
+
+class ParquetScanContractTest(unittest.TestCase):
+    def test_seed_deduplicates_documents_in_one_source_month_before_upsert(self):
+        store = _SeedStore()
+        projector = CanonicalParquetScanProjector(store, _Evidence(None))
+        self.assertEqual(projector.seed_backfill(tenant_id="tenant:test"), 1)
+        self.assertIn("SELECT DISTINCT", store.connection.query)
+        self.assertIn("statement_timestamp()", store.connection.query)
+        self.assertNotIn("'backfill',clock_timestamp()", store.connection.query)
+
+    def test_bucket_must_be_the_first_utc_calendar_day(self):
+        self.assertEqual(_month("2026-08-01"), date(2026, 8, 1))
+        with self.assertRaisesRegex(ParquetScanError, "bucket_invalid"):
+            _month("2026-08-02")
+
+    def test_candidate_lease_skips_contention_and_unlocks_ownership(self):
+        contended = _LeaseStore(False)
+        with CanonicalParquetScanProjector(
+            contended, _Evidence(None)
+        )._candidate_lease(_candidate()) as acquired:
+            self.assertFalse(acquired)
+        self.assertEqual(len(contended.connection.calls), 1)
+        self.assertIn("pg_try_advisory_lock", contended.connection.calls[0][0])
+
+        owned = _LeaseStore(True)
+        with CanonicalParquetScanProjector(
+            owned, _Evidence(None)
+        )._candidate_lease(_candidate()) as acquired:
+            self.assertTrue(acquired)
+        self.assertEqual(len(owned.connection.calls), 2)
+        self.assertIn("pg_advisory_unlock", owned.connection.calls[1][0])
+        self.assertEqual(
+            owned.connection.calls[0][1],
+            owned.connection.calls[1][1],
+        )
+
+    def test_contended_head_does_not_hide_the_next_ready_candidate(self):
+        projector = _WindowProbe()
+        result = projector.project_pending(
+            tenant_id="tenant:test",
+            batch_size=1,
+            max_batches=1,
+        )
+        self.assertEqual(projector.pending_limits, [("tenant:test", 8)])
+        self.assertEqual(projector.built, ["source:ready"])
+        self.assertEqual(result["shards"], 1)
+        self.assertEqual(result["contended"], 1)
+
+    def test_typed_parquet_round_trip_preserves_large_record_json(self):
+        row = {
+            "schema_version": 1,
+            "tenant_id": "tenant:test",
+            "source_id": "source:test",
+            "logical_document_id": "document:test",
+            "revision": 1,
+            "ordinal": 7,
+            "occurred_at": datetime(2026, 8, 1, tzinfo=timezone.utc),
+            "event_kind": "transcript_record",
+            "roles": ["user"],
+            "receipts": ["recall://source:test/doc?rev=1#item=7"],
+            "actor_ids": ["actor:employee"],
+            "actor_names": ["Employee"],
+            "actor_relations": ["contributor"],
+            "search_text": "useful context",
+            "record_json": "x" * 100_000,
+        }
+        payload = _parquet_bytes([row], _schemas()["records"])
+        result = pq.read_table(pa.BufferReader(payload)).to_pylist()
+        self.assertEqual(result, [row])
+
+    def test_passage_pointer_schema_preserves_lossless_text_and_receipts(self):
+        self.assertNotIn("record_json", _schemas()["passages"].names)
+        row = {
+            "schema_version": 2,
+            "tenant_id": "tenant:test",
+            "source_id": "source:test",
+            "logical_document_id": "document:test",
+            "revision": 1,
+            "passage_id": "psg_" + "a" * 32,
+            "ordinal": 3,
+            "first_occurred_at": datetime(2026, 8, 1, tzinfo=timezone.utc),
+            "last_occurred_at": datetime(2026, 8, 2, tzinfo=timezone.utc),
+            "token_count": 512,
+            "roles": ["assistant", "user"],
+            "receipts": ["recall://source:test/doc?rev=1#item=7"],
+            "actor_ids": ["actor:employee"],
+            "actor_names": ["Employee"],
+            "actor_relations": ["contributor"],
+            "text": "exact visible message bytes",
+        }
+        payload = _parquet_bytes([row], _schemas()["passages"])
+        self.assertEqual(
+            pq.read_table(pa.BufferReader(payload)).to_pylist(),
+            [row],
+        )
+
+    def test_passage_plane_migration_rebuilds_and_expands_closed_dataset_enum(self):
+        migration = (
+            Path(__file__).resolve().parents[2]
+            / "server/schema/053_parquet_passage_plane.sql"
+        ).read_text()
+        self.assertIn("'documents','passages','records','actors'", migration)
+        self.assertIn("statement_timestamp()", migration)
+        self.assertNotIn("clock_timestamp()", migration)
+        self.assertIn("canonical_parquet_scan_queue", migration)
+        self.assertIn("version=53", migration)
+
+    def test_passage_plane_repair_migration_requeues_each_source_month_once(self):
+        migration = (
+            Path(__file__).resolve().parents[2]
+            / "server/schema/054_requeue_parquet_passage_plane.sql"
+        ).read_text()
+        self.assertIn("SELECT DISTINCT shard.tenant_id,shard.source_id,shard.bucket_start", migration)
+        self.assertIn("statement_timestamp()", migration)
+        self.assertNotIn("clock_timestamp()", migration)
+        self.assertIn("version=54", migration)
+
+    def test_upgrade_rejects_a_legacy_three_dataset_upload_for_safe_rebuild(self):
+        generation = "a" * 64
+        rows = [
+            {"dataset": dataset, "generation_sha256": generation}
+            for dataset in ("documents", "records", "actors")
+        ]
+        projector = CanonicalParquetScanProjector(
+            _CurrentUploadStore(rows),
+            _Evidence(None),
+        )
+        self.assertIsNone(projector._current_upload(_candidate(), generation))
+
+    def test_multipart_parquet_is_bounded_ordered_and_lossless(self):
+        schema = pa.schema([("ordinal", pa.int64()), ("value", pa.binary())])
+        rows = [
+            {"ordinal": ordinal, "value": os.urandom(4_000)} for ordinal in range(12)
+        ]
+        parts = _parquet_parts(rows, schema, maximum_bytes=35_000)
+        self.assertGreater(len(parts), 1)
+        self.assertTrue(all(len(payload) <= 35_000 for payload, _ in parts))
+        self.assertEqual(sum(row_count for _, row_count in parts), len(rows))
+        restored = []
+        for payload, _ in parts:
+            restored.extend(pq.read_table(pa.BufferReader(payload)).to_pylist())
+        self.assertEqual(restored, rows)
+
+    def test_multipart_encodes_each_bounded_arrow_slice_once(self):
+        schema = pa.schema([("ordinal", pa.int64()), ("value", pa.binary())])
+        rows = [
+            {"ordinal": ordinal, "value": os.urandom(4_000)} for ordinal in range(12)
+        ]
+        encoded_rows = []
+
+        def encode(table):
+            encoded_rows.append(table.num_rows)
+            sink = pa.BufferOutputStream()
+            pq.write_table(
+                table,
+                sink,
+                compression="zstd",
+                use_dictionary=False,
+            )
+            return sink.getvalue().to_pybytes()
+
+        with mock.patch(
+            "recall_server.parquet_scan._parquet_table_bytes",
+            side_effect=encode,
+        ):
+            parts = _parquet_parts(rows, schema, maximum_bytes=45_000)
+
+        self.assertEqual(sum(encoded_rows), len(rows))
+        self.assertLess(max(encoded_rows), len(rows))
+        self.assertEqual(sum(row_count for _, row_count in parts), len(rows))
+
+    def test_build_streams_month_records_through_bounded_uploads(self):
+        archive = _ManyRecordArchive(30)
+        projector = _BuildProbe(_document("Employee"), archive)
+
+        with mock.patch(
+            "recall_server.parquet_scan.PARQUET_RAW_SLICE_BYTES",
+            100_000,
+        ):
+            result = projector._build(_candidate())
+
+        record_uploads = [
+            upload for upload in archive.uploads if ":records:" in upload["native_id"]
+        ]
+        self.assertGreater(len(record_uploads), 5)
+        self.assertEqual(
+            sum(
+                count
+                for (dataset, _), count in result.row_counts.items()
+                if dataset == "records"
+            ),
+            30,
+        )
+        restored = []
+        for upload in record_uploads:
+            restored.extend(
+                pq.read_table(pa.BufferReader(upload["payload"]))
+                .column("ordinal")
+                .to_pylist()
+            )
+        self.assertEqual(restored, list(range(30)))
+
+    def test_build_adds_lossless_passage_pointer_shard(self):
+        archive = _Archive({
+            "ordinal": 0,
+            "occurred_at": "2026-08-05T12:00:00Z",
+            "event_kind": "transcript_record",
+            "roles": ["user"],
+            "receipts": ["recall://source:test/doc?rev=1#item=0"],
+            "text": "canonical record",
+        })
+        passage = {
+            "logical_document_id": "document:test",
+            "revision": 1,
+            "passage_id": "psg_" + "a" * 32,
+            "ordinal": 0,
+            "first_occurred_at": datetime(2026, 8, 5, 12, tzinfo=timezone.utc),
+            "last_occurred_at": datetime(2026, 8, 5, 12, tzinfo=timezone.utc),
+            "token_count": 3,
+            "roles": ["user"],
+            "receipts": ["recall://source:test/doc?rev=1#item=0"],
+            "actor_ids": ["actor:employee"],
+            "actor_names": ["Employee"],
+            "actor_relations": ["contributor"],
+            "text_redacted": "exact visible prompt",
+        }
+        result = _BuildProbe(
+            _document("Employee"),
+            archive,
+            passages=[passage],
+        )._build(_candidate())
+        self.assertEqual(
+            sum(
+                count
+                for (dataset, _), count in result.row_counts.items()
+                if dataset == "passages"
+            ),
+            1,
+        )
+        upload = next(
+            item for item in archive.uploads if ":passages:" in item["native_id"]
+        )
+        restored = pq.read_table(pa.BufferReader(upload["payload"])).to_pylist()
+        self.assertEqual(restored[0]["text"], "exact visible prompt")
+        self.assertEqual(restored[0]["receipts"], passage["receipts"])
+
+    def test_passage_upgrade_reuses_immutable_evidence_without_reading_raw_parts(self):
+        archive = _Archive({})
+        passage = {
+            "logical_document_id": "document:test",
+            "revision": 1,
+            "passage_id": "psg_" + "a" * 32,
+            "ordinal": 0,
+            "first_occurred_at": datetime(2026, 8, 5, 12, tzinfo=timezone.utc),
+            "last_occurred_at": datetime(2026, 8, 5, 12, tzinfo=timezone.utc),
+            "token_count": 3,
+            "roles": ["user"],
+            "receipts": ["recall://source:test/doc?rev=1#item=0"],
+            "actor_ids": ["actor:employee"],
+            "actor_names": ["Employee"],
+            "actor_relations": ["contributor"],
+            "text_redacted": "exact visible prompt",
+        }
+        legacy = ScanUpload(
+            "b" * 64,
+            {
+                (dataset, 0): {
+                    **_part(),
+                    "artifact_id": f"artifact:{dataset}",
+                    "object_key": f"objects/{dataset}",
+                    "media_type": "application/vnd.apache.parquet",
+                }
+                for dataset in ("documents", "records", "actors")
+            },
+            {(dataset, 0): 1 for dataset in ("documents", "records", "actors")},
+            datetime(2026, 8, 5, 12, tzinfo=timezone.utc),
+            datetime(2026, 8, 5, 12, tzinfo=timezone.utc),
+            False,
+        )
+        projector = _BuildProbe(_document("Employee"), archive, passages=[passage])
+        with mock.patch.object(projector, "_legacy_upload", return_value=legacy):
+            result = projector._build(_candidate())
+
+        self.assertEqual(archive.reads, 0)
+        self.assertEqual(len(archive.uploads), 1)
+        self.assertIn(":passages:", archive.uploads[0]["native_id"])
+        self.assertEqual(
+            {dataset for dataset, _ in result.references},
+            {"documents", "passages", "records", "actors"},
+        )
+        self.assertEqual(result.references[("records", 0)]["artifact_id"], "artifact:records")
+
+    def test_one_unshardable_record_fails_content_free(self):
+        schema = pa.schema([("value", pa.binary())])
+        with self.assertRaisesRegex(ParquetScanError, "record_too_large"):
+            _parquet_parts(
+                [{"value": os.urandom(20_000)}],
+                schema,
+                maximum_bytes=5_000,
+            )
+
+    def test_record_attribution_never_falls_back_to_all_document_actors(self):
+        record = {
+            "ordinal": 0,
+            "occurred_at": "2026-08-05T12:00:00Z",
+            "event_kind": "transcript_record",
+            "roles": ["assistant"],
+            "receipts": ["recall://source:test/doc?rev=1#item=0"],
+            "text": "assistant output",
+        }
+        projector = CanonicalParquetScanProjector(None, _Evidence(_Archive(record)))
+        result = projector._project_document(
+            _candidate(),
+            _document("Employee"),
+            bucket_start=datetime(2026, 8, 1, tzinfo=timezone.utc),
+            bucket_end=datetime(2026, 9, 1, tzinfo=timezone.utc),
+            record_budget=10,
+        )
+        self.assertEqual(result.records[0]["actor_ids"], [])
+        self.assertEqual(result.actors, [])
+
+    def test_legacy_part_discovers_exact_bounds_once(self):
+        record = {
+            "ordinal": 0,
+            "occurred_at": "2026-08-05T12:00:00Z",
+            "event_kind": "transcript_record",
+            "roles": ["user"],
+            "receipts": ["recall://source:test/doc?rev=1#item=0"],
+            "text": "useful context",
+        }
+        part = _part()
+        part["first_occurred_at"] = None
+        part["last_occurred_at"] = None
+        document = _document("Employee")
+        document["parts"] = [part]
+        archive = _Archive(record)
+        projector = CanonicalParquetScanProjector(None, _Evidence(archive))
+        result = projector._project_document(
+            _candidate(),
+            document,
+            bucket_start=datetime(2026, 8, 1, tzinfo=timezone.utc),
+            bucket_end=datetime(2026, 9, 1, tzinfo=timezone.utc),
+            record_budget=10,
+        )
+        self.assertEqual(archive.reads, 1)
+        self.assertEqual(len(result.part_bounds), 1)
+        self.assertEqual(
+            result.part_bounds[0].first_occurred_at,
+            datetime(2026, 8, 5, 12, tzinfo=timezone.utc),
+        )
+
+    def test_known_nonoverlapping_part_is_not_downloaded(self):
+        record = {
+            "ordinal": 0,
+            "occurred_at": "2026-07-05T12:00:00Z",
+            "event_kind": "transcript_record",
+            "roles": ["user"],
+            "receipts": ["recall://source:test/doc?rev=1#item=0"],
+            "text": "older context",
+        }
+        part = _part()
+        part["first_occurred_at"] = datetime(2026, 7, 5, 12, tzinfo=timezone.utc)
+        part["last_occurred_at"] = part["first_occurred_at"]
+        document = _document("Employee")
+        document["parts"] = [part]
+        archive = _Archive(record)
+        result = CanonicalParquetScanProjector(
+            None, _Evidence(archive)
+        )._project_document(
+            _candidate(),
+            document,
+            bucket_start=datetime(2026, 8, 1, tzinfo=timezone.utc),
+            bucket_end=datetime(2026, 9, 1, tzinfo=timezone.utc),
+            record_budget=10,
+        )
+        self.assertEqual(archive.reads, 0)
+        self.assertEqual(result.records, [])
+        self.assertEqual(result.part_bounds, ())
+
+    def test_legacy_bound_discovery_checkpoints_large_documents(self):
+        record = {
+            "ordinal": 0,
+            "occurred_at": "2026-08-05T12:00:00Z",
+            "event_kind": "transcript_record",
+            "roles": ["user"],
+            "receipts": ["recall://source:test/doc?rev=1#item=0"],
+            "text": "useful context",
+        }
+        parts = []
+        for ordinal in range(129):
+            part = _part()
+            part["part_ordinal"] = ordinal
+            part["first_occurred_at"] = None
+            part["last_occurred_at"] = None
+            parts.append(part)
+        document = _document("Employee")
+        document["parts"] = parts
+        archive = _Archive(record)
+        projector = _CheckpointProbe(archive)
+
+        result = projector._project_document(
+            _candidate(),
+            document,
+            bucket_start=datetime(2026, 8, 1, tzinfo=timezone.utc),
+            bucket_end=datetime(2026, 9, 1, tzinfo=timezone.utc),
+            record_budget=200,
+        )
+
+        self.assertEqual(projector.checkpoints, [128])
+        self.assertEqual(len(result.part_bounds), 1)
+        self.assertEqual(archive.reads, 129)
+
+    def test_generation_changes_when_actor_projection_changes(self):
+        record = {
+            "ordinal": 0,
+            "occurred_at": "2026-08-05T12:00:00Z",
+            "event_kind": "transcript_record",
+            "roles": ["user"],
+            "receipts": ["recall://source:test/doc?rev=1#item=0"],
+            "actor_links": [
+                {
+                    "actor_id": "actor:employee",
+                    "relation": "contributor",
+                }
+            ],
+            "text": "employee prompt",
+        }
+        first_archive = _Archive(record)
+        same_archive = _Archive(record)
+        first = _BuildProbe(_document("First Name"), first_archive)._build(_candidate())
+        same = _BuildProbe(_document("First Name"), same_archive)._build(_candidate())
+        renamed = _BuildProbe(_document("Renamed"), _Archive(record))._build(
+            _candidate()
+        )
+        self.assertEqual(first.generation_sha256, same.generation_sha256)
+        self.assertEqual(
+            [upload["native_id"] for upload in first_archive.uploads],
+            [upload["native_id"] for upload in same_archive.uploads],
+        )
+        self.assertNotEqual(first.generation_sha256, renamed.generation_sha256)
+
+    def test_generation_changes_when_passage_policy_changes(self):
+        first = _document("Employee")
+        first.update({
+            "passage_policy_fingerprint": "a" * 64,
+            "passage_source_sha256": first["document_content_sha256"],
+            "passage_count": 3,
+        })
+        second = {**first, "passage_policy_fingerprint": "b" * 64}
+        projector = CanonicalParquetScanProjector(None, _Evidence(None))
+        self.assertNotEqual(
+            projector._generation(_candidate(), [first]),
+            projector._generation(_candidate(), [second]),
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

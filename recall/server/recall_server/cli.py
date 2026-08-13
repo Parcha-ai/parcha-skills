@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
+import hashlib
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -33,7 +36,9 @@ from .logical_evidence import LogicalEvidenceProjectionStore
 from .logical_evidence_projection import CanonicalLogicalEvidenceProjector
 from .passage_index import CanonicalPassageProjector
 from .passage_projection import PassagePolicy
+from .parquet_scan import CanonicalParquetScanProjector
 from .passage_worker import run_passage_worker
+from .projection_worker import run_projection_worker
 from .federation import QUALITY_SCORES, SOURCE_FAMILIES
 from .live_providers import (
     LiveProviderError,
@@ -54,6 +59,23 @@ from .mcp_conformance import (
 from .semantic import SemanticRuntime
 
 
+def _worker_pool_max_size(args: argparse.Namespace) -> int | None:
+    """Size worker pools from real concurrency, not an unrelated floor."""
+
+    if args.command in {
+        "backfill-lossless-passages",
+        "lossless-passage-worker",
+    }:
+        return max(4, args.concurrency)
+    if args.command == "projection-worker":
+        return max(
+            4,
+            args.passage_concurrency,
+            args.upload_concurrency,
+        )
+    return None
+
+
 def main() -> None:
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"), format="%(levelname)s %(message)s"
@@ -64,6 +86,10 @@ def main() -> None:
     sub.add_parser("migrate")
     sub.add_parser("archive-check")
     sub.add_parser("evidence-archive-check")
+    publish_duckdb = sub.add_parser("publish-archil-duckdb")
+    publish_duckdb.add_argument("--path", type=Path, required=True)
+    publish_duckdb.add_argument("--version", required=True)
+    publish_duckdb.add_argument("--sha256", required=True)
     capability = sub.add_parser("capability-check")
     capability.add_argument(
         "--profile", choices=("production", "local-fixture"), default="production"
@@ -113,12 +139,8 @@ def main() -> None:
     canonical_embedding_worker.add_argument(
         "--max-batches-per-cycle", type=int, default=10
     )
-    canonical_embedding_worker.add_argument(
-        "--parallel-tenants", type=int, default=1
-    )
-    canonical_embedding_worker.add_argument(
-        "--interval-seconds", type=float, default=5
-    )
+    canonical_embedding_worker.add_argument("--parallel-tenants", type=int, default=1)
+    canonical_embedding_worker.add_argument("--interval-seconds", type=float, default=5)
     canonical_embedding_worker.add_argument("--once", action="store_true")
     canonical_evidence = sub.add_parser("backfill-canonical-evidence")
     canonical_evidence.add_argument("--tenant", required=True)
@@ -130,9 +152,7 @@ def main() -> None:
     canonical_evidence_worker.add_argument(
         "--max-batches-per-cycle", type=int, default=10
     )
-    canonical_evidence_worker.add_argument(
-        "--interval-seconds", type=float, default=5
-    )
+    canonical_evidence_worker.add_argument("--interval-seconds", type=float, default=5)
     canonical_evidence_worker.add_argument("--once", action="store_true")
     logical_evidence = sub.add_parser("backfill-logical-evidence")
     logical_evidence.add_argument("--tenant", required=True)
@@ -159,17 +179,13 @@ def main() -> None:
     logical_evidence_worker.add_argument(
         "--max-batches-per-cycle", type=int, default=10
     )
-    logical_evidence_worker.add_argument(
-        "--upload-concurrency", type=int, default=2
-    )
+    logical_evidence_worker.add_argument("--upload-concurrency", type=int, default=2)
     logical_evidence_worker.add_argument(
         "--cursor-fetch-rows",
         type=int,
         default=10_000,
     )
-    logical_evidence_worker.add_argument(
-        "--interval-seconds", type=float, default=5
-    )
+    logical_evidence_worker.add_argument("--interval-seconds", type=float, default=5)
     logical_evidence_worker.add_argument("--once", action="store_true")
     passage_backfill = sub.add_parser("backfill-lossless-passages")
     passage_backfill.add_argument("--tenant", required=True)
@@ -204,6 +220,24 @@ def main() -> None:
         default=5,
     )
     passage_worker.add_argument("--once", action="store_true")
+    parquet_backfill = sub.add_parser("backfill-parquet-scan")
+    parquet_backfill.add_argument("--tenant", required=True)
+    parquet_backfill.add_argument("--source")
+    parquet_backfill.add_argument("--batch-size", type=int, default=4)
+    parquet_backfill.add_argument("--max-batches", type=int, default=10)
+    projection_worker = sub.add_parser("projection-worker")
+    projection_worker.add_argument("--tenant", required=True)
+    projection_worker.add_argument("--target-tokens", type=int, default=1024)
+    projection_worker.add_argument("--overlap-tokens", type=int, default=128)
+    projection_worker.add_argument("--logical-batch-size", type=int, default=25)
+    projection_worker.add_argument("--passage-batch-size", type=int, default=100)
+    projection_worker.add_argument("--embedding-batch-size", type=int, default=128)
+    projection_worker.add_argument("--max-batches-per-cycle", type=int, default=10)
+    projection_worker.add_argument("--upload-concurrency", type=int, default=2)
+    projection_worker.add_argument("--passage-concurrency", type=int, default=4)
+    projection_worker.add_argument("--cursor-fetch-rows", type=int, default=10_000)
+    projection_worker.add_argument("--interval-seconds", type=float, default=5)
+    projection_worker.add_argument("--once", action="store_true")
     sub.add_parser("export")
     conformance = sub.add_parser("mcp-conformance")
     conformance.add_argument("--config", type=Path, required=True)
@@ -237,13 +271,16 @@ def main() -> None:
     revoke_token.add_argument("name")
     brain = sub.add_parser("brain-provision")
     brain.add_argument("--organization", required=True)
-    brain.add_argument(
-        "--kind", choices=("personal", "company"), required=True
-    )
+    brain.add_argument("--kind", choices=("personal", "company"), required=True)
     brain.add_argument("--display-name", required=True)
     brain.add_argument("--tenant", required=True)
     brain.add_argument("--slug", required=True)
     brain.add_argument("--owner-principal", required=True)
+    bind_employee = sub.add_parser("employee-source-bind")
+    bind_employee.add_argument("--tenant", required=True)
+    bind_employee.add_argument("--employee-key", required=True)
+    bind_employee.add_argument("--display-name", required=True)
+    bind_employee.add_argument("--source", action="append", required=True)
     create_mcp_token = sub.add_parser("mcp-token-create")
     create_mcp_token.add_argument("name")
     create_mcp_token.add_argument("--tenant", required=True)
@@ -371,9 +408,7 @@ def main() -> None:
             print(json.dumps(report, sort_keys=True))
         except ConformanceError:
             print(
-                json.dumps(
-                    {"status": "rejected", "code": "mcp_conformance_failed"}
-                ),
+                json.dumps({"status": "rejected", "code": "mcp_conformance_failed"}),
                 file=sys.stderr,
             )
             raise SystemExit(2) from None
@@ -409,6 +444,38 @@ def main() -> None:
             )
             raise SystemExit(2) from None
         return
+    if args.command == "publish-archil-duckdb":
+        if (
+            not args.path.is_file()
+            or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", args.version) is None
+        ):
+            raise ValueError("DuckDB tool artifact is invalid")
+        payload = args.path.read_bytes()
+        digest = hashlib.sha256(payload).hexdigest()
+        if (
+            not 1_000_000 <= len(payload) <= 100_000_000
+            or digest != args.sha256
+        ):
+            raise ValueError("DuckDB tool artifact is invalid")
+        reference = build_evidence_archive_store().put_raw(
+            tenant_id="tenant:system:tools",
+            source_id="source:system:tools",
+            # Archil serverless execution currently runs on aarch64. Keep the
+            # architecture in the immutable source identity so an x86 build
+            # cannot silently replace the executable used by recall_scan.
+            native_id=f"archil-duckdb:{args.version}:linux-arm64",
+            payload=payload,
+            media_type="application/vnd.duckdb.cli",
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+        print(json.dumps({
+            "status": "published",
+            "version": args.version,
+            "object_key": reference["object_key"],
+            "content_sha256": reference["content_sha256"],
+            "size_bytes": reference["size_bytes"],
+        }, sort_keys=True))
+        return
     if not args.dsn:
         ap.error("--dsn or RECALL_DATABASE_URL is required")
     if args.command == "capability-check":
@@ -428,12 +495,7 @@ def main() -> None:
                 json.dumps({"status": "rejected", "code": error.code}), file=sys.stderr
             )
             raise SystemExit(2) from None
-    pool_max_size = (
-        max(8, args.concurrency)
-        if args.command
-        in {"backfill-lossless-passages", "lossless-passage-worker"}
-        else None
-    )
+    pool_max_size = _worker_pool_max_size(args)
     store = BrainStore(
         args.dsn,
         semantic_runtime=SemanticRuntime.from_env(),
@@ -632,6 +694,71 @@ def main() -> None:
                 once=args.once,
             )
         print(json.dumps(result, sort_keys=True))
+    elif args.command == "backfill-parquet-scan":
+        projector = CanonicalParquetScanProjector(
+            store,
+            LogicalEvidenceProjectionStore(build_evidence_archive_store()),
+        )
+        seeded = projector.seed_backfill(
+            tenant_id=args.tenant,
+            source_id=args.source,
+        )
+        print(
+            json.dumps(
+                {
+                    "seeded": seeded,
+                    **projector.project_pending(
+                        tenant_id=args.tenant,
+                        batch_size=args.batch_size,
+                        max_batches=args.max_batches,
+                    ),
+                },
+                sort_keys=True,
+            )
+        )
+    elif args.command == "projection-worker":
+        logical = CanonicalLogicalEvidenceProjector(
+            store,
+            LogicalEvidenceProjectionStore(
+                build_evidence_archive_store(),
+                part_upload_concurrency=min(4, args.upload_concurrency),
+            ),
+            bound_tenant_id=args.tenant,
+            raw_archive=build_archive_store(),
+            cursor_fetch_rows=args.cursor_fetch_rows,
+        )
+        passages = CanonicalPassageProjector(
+            store,
+            LogicalEvidenceProjectionStore(build_evidence_archive_store()),
+            policy=PassagePolicy(
+                target_tokens=args.target_tokens,
+                overlap_tokens=args.overlap_tokens,
+            ),
+            bound_tenant_id=args.tenant,
+        )
+        scan = CanonicalParquetScanProjector(
+            store,
+            LogicalEvidenceProjectionStore(build_evidence_archive_store()),
+        )
+        print(
+            json.dumps(
+                run_projection_worker(
+                    logical,
+                    passages,
+                    scan,
+                    tenant_id=args.tenant,
+                    logical_batch_size=args.logical_batch_size,
+                    passage_batch_size=args.passage_batch_size,
+                    embedding_batch_size=args.embedding_batch_size,
+                    max_batches_per_cycle=args.max_batches_per_cycle,
+                    upload_concurrency=args.upload_concurrency,
+                    passage_concurrency=args.passage_concurrency,
+                    interval_seconds=args.interval_seconds,
+                    once=args.once,
+                ),
+                sort_keys=True,
+            )
+        )
     elif args.command == "export":
         for envelope in store.export_raw():
             print(json.dumps(envelope, sort_keys=True))
@@ -672,17 +799,25 @@ def main() -> None:
                 sort_keys=True,
             )
         )
+    elif args.command == "employee-source-bind":
+        print(
+            json.dumps(
+                store.bind_coding_sources_to_employee(
+                    tenant_id=args.tenant,
+                    employee_key=args.employee_key,
+                    display_name=args.display_name,
+                    source_ids=args.source,
+                ),
+                sort_keys=True,
+            )
+        )
     elif args.command == "mcp-token-create":
         credential = store.create_mcp_token(
             args.name,
             tenant_id=args.tenant,
             principal_id=args.principal,
             principal_kind=args.principal_kind,
-            scopes=[
-                scope.strip()
-                for scope in args.scopes.split(",")
-                if scope.strip()
-            ],
+            scopes=[scope.strip() for scope in args.scopes.split(",") if scope.strip()],
             expires_in_days=args.expires_in_days,
         )
         payload = (json.dumps(credential, sort_keys=True) + "\n").encode()
@@ -702,9 +837,7 @@ def main() -> None:
     elif args.command == "mcp-token-revoke":
         print(json.dumps({"revoked": store.revoke_mcp_token(args.name)}))
     elif args.command == "admin-token-create":
-        credential = ControlPlane(
-            store, SecretBox.from_env(), {}
-        ).create_admin_token(
+        credential = ControlPlane(store, SecretBox.from_env(), {}).create_admin_token(
             args.name,
             principal_id=args.principal,
             expires_in_days=args.expires_in_days,

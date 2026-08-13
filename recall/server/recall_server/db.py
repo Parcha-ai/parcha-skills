@@ -18,7 +18,11 @@ from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
 
 from . import PROJECTOR_VERSION
-from .actor_attribution import actor_id_for_principal
+from .actor_attribution import (
+    actor_id_for_employee_key,
+    actor_id_for_principal,
+    claimable_actor_for_display_name,
+)
 from .authorization import normalize_verified_email
 from .capture import (
     CAPTURE_ORIGIN_RE,
@@ -136,8 +140,10 @@ class BrainStore:
             raise ValueError("database pool size must be between 4 and 32")
         self.pool_max_size = configured_pool_size
         configured = search_deadline_ms if search_deadline_ms is not None else int(os.environ.get("RECALL_SEARCH_DEADLINE_MS", str(DEFAULT_SEARCH_DEADLINE_MS)))
-        if not 10 <= configured <= 5000:
-            raise ValueError("search deadline must be between 10 and 5000 milliseconds")
+        if not 10 <= configured <= 30_000:
+            raise ValueError(
+                "search deadline must be between 10 and 30000 milliseconds"
+            )
         self.search_deadline_ms = configured
         try:
             similarity = (
@@ -551,29 +557,256 @@ class BrainStore:
     def set_source_profile(self, value: SourceProfile | dict[str, Any]) -> dict[str, Any]:
         profile = value if isinstance(value, SourceProfile) else SourceProfile.from_mapping(value)
         with self.connect() as conn:
-            if not conn.execute("SELECT 1 FROM sources WHERE id=%s", (profile.source_id,)).fetchone():
-                raise ValueError("source profile source does not exist")
-            conn.execute(
-                """INSERT INTO source_profiles(source_id,family,quality,freshness_half_life_days)
-                   VALUES (%s,%s,%s,%s)
-                   ON CONFLICT(source_id) DO UPDATE SET
-                     family=excluded.family,quality=excluded.quality,
-                     freshness_half_life_days=excluded.freshness_half_life_days,
-                     updated_at=now()""",
-                (
-                    profile.source_id, profile.family, profile.quality,
-                    profile.freshness_half_life_days,
-                ),
-            )
-            conn.execute(
-                """INSERT INTO audit_events(operation,source_id,status,metadata)
-                   VALUES ('source.profile',%s,'success',%s)""",
-                (profile.source_id, json.dumps({
-                    "family": profile.family, "quality": profile.quality,
-                    "freshness_half_life_days": profile.freshness_half_life_days,
-                })),
-            )
+            with conn.transaction():
+                if not conn.execute(
+                    "SELECT 1 FROM sources WHERE id=%s", (profile.source_id,)
+                ).fetchone():
+                    raise ValueError("source profile source does not exist")
+                conn.execute(
+                    """INSERT INTO source_profiles(
+                           source_id,family,quality,freshness_half_life_days
+                       ) VALUES (%s,%s,%s,%s)
+                       ON CONFLICT(source_id) DO UPDATE SET
+                         family=excluded.family,quality=excluded.quality,
+                         freshness_half_life_days=excluded.freshness_half_life_days,
+                         updated_at=now()""",
+                    (
+                        profile.source_id, profile.family, profile.quality,
+                        profile.freshness_half_life_days,
+                    ),
+                )
+                if profile.family == "coding_history":
+                    inserted = conn.execute(
+                        """INSERT INTO canonical_source_actor_bindings(
+                               tenant_id,source_id,actor_id,relation
+                           )
+                           SELECT source.tenant_id,source.source_id,
+                                  actor.actor_id,'contributor'
+                             FROM canonical_sources source
+                             JOIN brain_actor_principals actor
+                               ON actor.tenant_id=source.tenant_id
+                              AND actor.principal_id=source.owner_principal_id
+                            WHERE source.source_id=%s
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                    FROM canonical_source_actor_bindings existing
+                                   WHERE existing.tenant_id=source.tenant_id
+                                     AND existing.source_id=source.source_id
+                              )
+                           ON CONFLICT DO NOTHING
+                           RETURNING tenant_id,source_id""",
+                        (profile.source_id,),
+                    ).fetchone()
+                    if inserted is not None:
+                        self._queue_actor_projection(
+                            conn,
+                            tenant_id=inserted["tenant_id"],
+                            source_ids=[inserted["source_id"]],
+                        )
+                conn.execute(
+                    """INSERT INTO audit_events(
+                           operation,source_id,status,metadata
+                       ) VALUES ('source.profile',%s,'success',%s)""",
+                    (profile.source_id, json.dumps({
+                        "family": profile.family, "quality": profile.quality,
+                        "freshness_half_life_days": profile.freshness_half_life_days,
+                    })),
+                )
         return {"status": "configured", **profile.to_mapping()}
+
+    @staticmethod
+    def _queue_actor_projection(
+        connection: Any,
+        *,
+        tenant_id: str,
+        source_ids: list[str],
+    ) -> int:
+        result = connection.execute(
+            """INSERT INTO canonical_evidence_document_queue(
+                   tenant_id,source_id,native_parent_id,
+                   generation,reason,changed_at
+               )
+               SELECT event.tenant_id,event.source_id,
+                      coalesce(event.native_parent_id,event.native_id),
+                      1,'backfill',clock_timestamp()
+                 FROM canonical_events event
+                 JOIN canonical_documents document
+                   ON document.tenant_id=event.tenant_id
+                  AND document.source_id=event.source_id
+                  AND document.event_id=event.event_id
+                  AND document.is_current
+                  AND document.deleted_at IS NULL
+                WHERE event.tenant_id=%s
+                  AND event.source_id=ANY(%s)
+                GROUP BY event.tenant_id,event.source_id,
+                         coalesce(event.native_parent_id,event.native_id)
+               ON CONFLICT(tenant_id,source_id,native_parent_id)
+               DO UPDATE SET
+                   generation=canonical_evidence_document_queue.generation+1,
+                   reason='backfill',changed_at=clock_timestamp()""",
+            (tenant_id, source_ids),
+        )
+        return max(0, result.rowcount)
+
+    def bind_coding_sources_to_employee(
+        self,
+        *,
+        tenant_id: str,
+        employee_key: str,
+        display_name: str,
+        source_ids: list[str],
+    ) -> dict[str, Any]:
+        """Bind legacy coding sources to one stable employee actor."""
+
+        normalized_name = display_name.strip() if isinstance(display_name, str) else ""
+        if (
+            not isinstance(tenant_id, str)
+            or not V2_AUTHORITY_RE.fullmatch(tenant_id)
+            or not 1 <= len(normalized_name) <= 200
+            or not isinstance(source_ids, list)
+            or not 1 <= len(source_ids) <= 32
+            or any(
+                not isinstance(value, str)
+                or not V2_AUTHORITY_RE.fullmatch(value)
+                for value in source_ids
+            )
+        ):
+            raise ValueError("invalid employee source binding")
+        normalized_sources = sorted(set(source_ids))
+        if len(normalized_sources) != len(source_ids):
+            raise ValueError("invalid employee source binding")
+        provisional_actor_id = actor_id_for_employee_key(tenant_id, employee_key)
+        with self.connect() as conn:
+            with conn.transaction():
+                sources = conn.execute(
+                    """SELECT source.source_id,source.owner_principal_id,
+                              profile.family
+                         FROM canonical_sources source
+                         LEFT JOIN source_profiles profile
+                           ON profile.source_id=source.source_id
+                        WHERE source.tenant_id=%s
+                          AND source.source_id=ANY(%s)
+                        ORDER BY source.source_id
+                        FOR SHARE OF source""",
+                    (tenant_id, normalized_sources),
+                ).fetchall()
+                if (
+                    [row["source_id"] for row in sources] != normalized_sources
+                    or any(
+                        row["family"] not in {None, "coding_history"}
+                        for row in sources
+                    )
+                ):
+                    raise ValueError("employee binding requires coding-history sources")
+                conn.execute(
+                    """INSERT INTO sources(id,principal_id)
+                       SELECT source.source_id,source.owner_principal_id
+                         FROM canonical_sources source
+                        WHERE source.tenant_id=%s
+                          AND source.source_id=ANY(%s)
+                       ON CONFLICT DO NOTHING""",
+                    (tenant_id, normalized_sources),
+                )
+                conn.execute(
+                    """INSERT INTO source_profiles(
+                           source_id,family,quality,freshness_half_life_days
+                       )
+                       SELECT source.source_id,'coding_history','trusted',30
+                         FROM canonical_sources source
+                        WHERE source.tenant_id=%s
+                          AND source.source_id=ANY(%s)
+                       ON CONFLICT DO NOTHING""",
+                    (tenant_id, normalized_sources),
+                )
+                existing_bindings = conn.execute(
+                    """SELECT DISTINCT binding.actor_id
+                         FROM canonical_source_actor_bindings binding
+                        WHERE binding.tenant_id=%s
+                          AND binding.source_id=ANY(%s)
+                          AND binding.relation='contributor'
+                        ORDER BY binding.actor_id
+                        LIMIT 2""",
+                    (tenant_id, normalized_sources),
+                ).fetchall()
+                if len(existing_bindings) > 1:
+                    raise ValueError("coding source already belongs to another employee")
+                exact_name = conn.execute(
+                    """SELECT actor_id
+                         FROM brain_actors
+                        WHERE tenant_id=%s AND actor_kind='human' AND active
+                          AND lower(display_name)=lower(%s)
+                        ORDER BY actor_id
+                        LIMIT 2""",
+                    (tenant_id, normalized_name),
+                ).fetchall()
+                if len(exact_name) > 1:
+                    raise ValueError("employee display name is ambiguous")
+                existing_actor_id = (
+                    existing_bindings[0]["actor_id"] if existing_bindings else None
+                )
+                named_actor_id = exact_name[0]["actor_id"] if exact_name else None
+                if (
+                    existing_actor_id is not None
+                    and named_actor_id is not None
+                    and existing_actor_id != named_actor_id
+                ):
+                    raise ValueError("coding source already belongs to another employee")
+                actor_id = existing_actor_id or named_actor_id or provisional_actor_id
+                conn.execute(
+                    """INSERT INTO brain_actors(
+                           tenant_id,actor_id,actor_kind,display_name
+                       ) VALUES (%s,%s,'human',%s)
+                       ON CONFLICT(tenant_id,actor_id) DO NOTHING""",
+                    (tenant_id, actor_id, normalized_name),
+                )
+                if existing_actor_id is not None:
+                    conn.execute(
+                        """UPDATE brain_actors
+                              SET display_name=%s,updated_at=now()
+                            WHERE tenant_id=%s AND actor_id=%s""",
+                        (normalized_name, tenant_id, actor_id),
+                    )
+                actor = conn.execute(
+                    """SELECT display_name,actor_kind,active
+                         FROM brain_actors
+                        WHERE tenant_id=%s AND actor_id=%s""",
+                    (tenant_id, actor_id),
+                ).fetchone()
+                if (
+                    actor is None
+                    or actor["actor_kind"] != "human"
+                    or not actor["active"]
+                    or actor["display_name"].casefold() != normalized_name.casefold()
+                ):
+                    raise ValueError("employee actor key conflicts")
+                conn.execute(
+                    """INSERT INTO brain_actor_aliases(
+                           tenant_id,actor_id,alias
+                       ) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING""",
+                    (tenant_id, actor_id, normalized_name),
+                )
+                inserted = conn.execute(
+                    """INSERT INTO canonical_source_actor_bindings(
+                           tenant_id,source_id,actor_id,relation
+                       )
+                       SELECT %s,source_id,%s,'contributor'
+                         FROM unnest(%s::text[]) source(source_id)
+                       ON CONFLICT DO NOTHING
+                       RETURNING source_id""",
+                    (tenant_id, actor_id, normalized_sources),
+                ).fetchall()
+                queued = self._queue_actor_projection(
+                    conn,
+                    tenant_id=tenant_id,
+                    source_ids=normalized_sources,
+                )
+        return {
+            "status": "bound",
+            "actor_id": actor_id,
+            "sources": len(normalized_sources),
+            "new_bindings": len(inserted),
+            "queued_documents": queued,
+        }
 
     def set_source_alias(self, alias: str, source_id: str) -> dict[str, str]:
         if not isinstance(alias, str) or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{1,63}", alias):
@@ -949,14 +1182,19 @@ class BrainStore:
                        WHERE tenant_id=%s AND principal_id=%s""",
                     (invitation["tenant_id"], principal_id),
                 ).fetchone()
-                actor_id = (
-                    linked_actor["actor_id"]
-                    if linked_actor is not None
-                    else actor_id_for_principal(invitation["tenant_id"], principal_id)
-                )
                 display_name = invitation["actor_display_name"] or normalized_email.split(
                     "@", 1
                 )[0]
+                actor_id = (
+                    linked_actor["actor_id"]
+                    if linked_actor is not None
+                    else claimable_actor_for_display_name(
+                        conn,
+                        tenant_id=invitation["tenant_id"],
+                        display_name=display_name,
+                    )
+                    or actor_id_for_principal(invitation["tenant_id"], principal_id)
+                )
                 conn.execute(
                     """INSERT INTO brain_actors(
                            tenant_id,actor_id,actor_kind,display_name
@@ -1191,28 +1429,6 @@ class BrainStore:
                     """SELECT count(*) AS n FROM items
                     WHERE deleted_at IS NULL AND btrim(text_redacted) <> ''"""
                 ).fetchone()["n"]
-            agent = conn.execute(
-                """SELECT
-                       count(*) FILTER (
-                           WHERE status IN ('queued','running')
-                       ) AS active,
-                       count(*) FILTER (
-                           WHERE status IN ('complete','partial','no_answer')
-                       ) AS completed,
-                       count(*) FILTER (WHERE status='failed') AS failed,
-                       count(*) FILTER (WHERE status='cancelled') AS cancelled,
-                       count(*) FILTER (
-                           WHERE error_code='worker_lost_retryable'
-                       ) AS recovered
-                   FROM agent_runs"""
-            ).fetchone()
-            metrics.update({
-                "agent_runs_active": agent["active"],
-                "agent_runs_completed": agent["completed"],
-                "agent_runs_failed": agent["failed"],
-                "agent_runs_cancelled": agent["cancelled"],
-                "agent_runs_recovered": agent["recovered"],
-            })
             return metrics
 
     def embed_pending(

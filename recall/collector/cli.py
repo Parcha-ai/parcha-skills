@@ -36,6 +36,7 @@ def main() -> None:
     )
     parser.add_argument("--harness", choices=("claude", "codex"), required=True)
     parser.add_argument("--root", required=True)
+    parser.add_argument("--archive-root", default=os.environ.get("RECALL_ARCHIVE_ROOT"))
     parser.add_argument("--source-id", required=True)
     parser.add_argument("--spool", required=True)
     parser.add_argument("--endpoint", default=os.environ.get("RECALL_ENDPOINT", ""))
@@ -71,6 +72,11 @@ def main() -> None:
         "--bulk-bundle-records",
         type=int,
         default=int(os.environ.get("RECALL_BULK_BUNDLE_RECORDS", "500")),
+    )
+    parser.add_argument(
+        "--defer-scan-flush",
+        action="store_true",
+        default=os.environ.get("RECALL_DEFER_SCAN_FLUSH") == "1",
     )
     parser.add_argument(
         "--batch-size",
@@ -138,7 +144,9 @@ def main() -> None:
         max_scan_seconds=args.max_scan_seconds,
         bulk_manifest_archive=args.bulk_manifest_archive,
         bulk_bundle_records=args.bulk_bundle_records,
+        defer_scan_flush=args.defer_scan_flush,
         batch_size=args.batch_size,
+        archive_root=Path(args.archive_root) if args.archive_root else None,
     )
     if args.shard_count < 1 or not 0 <= args.shard_index < args.shard_count:
         parser.error("shard index must be within shard count")

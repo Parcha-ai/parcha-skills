@@ -22,6 +22,12 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+if __package__:
+    from .codex_identity import resolve_codex_session_identity, stable_codex_record_key
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from codex_identity import resolve_codex_session_identity, stable_codex_record_key
+
 SCHEMA_VERSION = "4"
 PARSER_VERSION = 1
 MAX_TOOL_INPUT = 2048
@@ -456,27 +462,66 @@ def remote_execute(args) -> tuple[str, dict]:
         results = response.get("results")
         if not isinstance(results, list):
             raise RemoteRecallError("search response has no results list")
+
+        def passage_receipt(result: dict) -> str | None:
+            ranges = result.get("matching_ranges")
+            if not isinstance(ranges, list):
+                return None
+            for matching_range in ranges:
+                if not isinstance(matching_range, dict):
+                    continue
+                receipts = matching_range.get("receipts")
+                if not isinstance(receipts, list):
+                    continue
+                for receipt in receipts:
+                    if isinstance(receipt, str) and receipt:
+                        return receipt
+            return None
+
         lines = []
         for rank, result in enumerate(results[:args.limit], 1):
-            target = result.get("path") or result.get("receipt")
+            receipt = result.get("receipt") or passage_receipt(result)
+            target = (
+                result.get("path")
+                or receipt
+                or result.get("logical_document_id")
+            )
             if not isinstance(target, str) or not target:
                 raise RemoteRecallError("search result has no resolvable target")
             if args.paths:
                 lines.append(target)
                 continue
             terms = ",".join(str(value) for value in result.get("matched_terms", []))
-            legs = ",".join(sorted(str(value) for value in result.get("legs", [])))
-            snippet = re.sub(r"\s+", " ", str(result.get("text", "")))[:200]
+            reasons = result.get("legs") or result.get("reasons") or []
+            legs = ",".join(sorted(str(value) for value in reasons))
+            text = result.get("text", "")
+            if not text and isinstance(result.get("matching_ranges"), list):
+                text = next((
+                    matching_range.get("text", "")
+                    for matching_range in result["matching_ranges"]
+                    if isinstance(matching_range, dict)
+                    and matching_range.get("text")
+                ), "")
+            snippet = re.sub(r"\s+", " ", str(text))[:200]
             lines.append(
                 f"{rank}. {target}\n"
-                f"   {result.get('occurred_at') or '-'} cwd={result.get('cwd') or '-'} "
+                f"   {result.get('occurred_at') or result.get('last_occurred_at') or '-'} "
+                f"cwd={result.get('cwd') or '-'} "
                 f"slot={result.get('slot') or '-'} branch={result.get('branch') or '-'}\n"
-                f"   [{result.get('surface') or '-'}] {snippet}\n"
-                f"   WHY: terms={terms}; legs={legs}; receipt={result.get('receipt') or '-'}"
+                f"   [{result.get('surface') or 'passage'}] {snippet}\n"
+                f"   WHY: terms={terms}; legs={legs}; receipt={receipt or '-'}"
             )
         receipt_results = []
         for result in results:
-            receipt_result = {key: result.get(key) for key in ("path", "receipt", "legs")}
+            receipt_result = {
+                "path": result.get("path"),
+                "receipt": result.get("receipt") or passage_receipt(result),
+                "legs": result.get("legs") or result.get("reasons"),
+            }
+            if isinstance(result.get("logical_document_id"), str):
+                receipt_result["logical_document_id"] = result[
+                    "logical_document_id"
+                ]
             if isinstance(result.get("evidence"), dict):
                 receipt_result["evidence"] = result["evidence"]
             receipt_results.append(receipt_result)
@@ -1557,6 +1602,11 @@ def export_root_for(path: Path, harness: str) -> Path:
 
 
 def session_file_key(path: Path, root: Path, harness: str) -> str:
+    if harness == "codex":
+        identity = resolve_codex_session_identity(path)
+        if identity.native_session_id is None:
+            raise ValueError("Codex session identity is unavailable")
+        return stable_codex_record_key(identity.native_session_id)
     relative = str(path.resolve().relative_to(root.resolve()))
     return hashlib.sha256((harness + "\x1f" + relative).encode()).hexdigest()[:24]
 

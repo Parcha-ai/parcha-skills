@@ -6,7 +6,6 @@ from __future__ import annotations
 import hashlib
 import http.client
 import json
-import multiprocessing
 import os
 import sys
 import tempfile
@@ -24,17 +23,6 @@ sys.path[:0] = [
 ]
 
 from client.mac import canonical_envelope
-from recall_server.agent import (
-    DelegationContext,
-    RecallAgentService,
-)
-from agent_fakes import ScriptedAgentRunner, ScriptedExecInspector
-from recall_server.agent_runs import (
-    AgentRunCoordinator,
-    AgentRunNotFound,
-    AgentRunUnavailable,
-    PostgresAgentRunBackend,
-)
 from recall_server.app import Handler
 from recall_server.authorization import VerifiedExternalIdentity
 from recall_server.archive import FilesystemArchiveStore
@@ -66,35 +54,6 @@ COMPANY_LATE_SOURCE = "source:company:late:e2e"
 OUTSIDER_SOURCE = "source:company:outsider:e2e"
 OCCURRED = "2026-07-20T07:00:00Z"
 RESOURCE = "https://recall.synthetic.invalid/mcp"
-
-
-def crash_agent_worker(
-    database_url: str,
-    principal: dict,
-    run_id: str,
-) -> None:
-    child_store = BrainStore(database_url)
-    child_backend = PostgresAgentRunBackend(
-        child_store.connect,
-        lease_seconds=15,
-        retention_seconds=3600,
-    )
-    context = DelegationContext.from_principal(principal)
-    claimed = child_backend.claim(
-        context,
-        run_id,
-        lease_owner="synthetic-crashed-worker",
-        now=datetime.now(timezone.utc),
-    )
-    if claimed is None:
-        os._exit(91)
-    with child_store.connect() as connection:
-        connection.execute(
-            """INSERT INTO agent_run_effects_e2e(run_id,effect)
-               VALUES (%s,'canonical_retrieval_started')""",
-            (run_id,),
-        )
-    os._exit(17)
 
 
 class FakeSemanticRuntime:
@@ -174,82 +133,45 @@ def rpc(
     return payload
 
 
-def raw_mcp_message(
-    server: ThreadingHTTPServer,
-    token: str,
-    payload: dict,
-    *,
-    path: str,
-    task_name: str | None = None,
-) -> tuple[int, dict]:
-    body = json.dumps(payload).encode()
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json, text/event-stream",
-        "Content-Type": "application/json",
-        "Content-Length": str(len(body)),
-        "MCP-Protocol-Version": "2026-06-30",
-    }
-    if task_name is not None:
-        headers["Mcp-Name"] = task_name
-    connection = http.client.HTTPConnection(
-        "127.0.0.1", server.server_port, timeout=10
-    )
-    connection.request("POST", path, body=body, headers=headers)
-    response = connection.getresponse()
-    result = json.loads(response.read())
-    connection.close()
-    return response.status, result
+class ScriptedExecInspector:
+    """Synthetic transport that still exercises host receipt verification."""
 
+    def __init__(self, inspector):
+        self.inspector = inspector
 
-def agent_http(
-    server: ThreadingHTTPServer,
-    token: str,
-    tenant_id: str,
-    request: dict,
-) -> tuple[int, dict]:
-    body = json.dumps(request).encode()
-    connection = http.client.HTTPConnection(
-        "127.0.0.1", server.server_port, timeout=10
-    )
-    connection.request(
-        "POST",
-        f"/v1/agent/brains/{tenant_id}/use-recall",
-        body=body,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "Content-Length": str(len(body)),
-        },
-    )
-    response = connection.getresponse()
-    payload = json.loads(response.read())
-    connection.close()
-    return response.status, payload
+    def inspect(self, **arguments):
+        return self.inspector.inspect(**arguments)
 
-
-def agent_lifecycle_http(
-    server: ThreadingHTTPServer,
-    token: str,
-    method: str,
-    path: str,
-    body: dict | None = None,
-) -> tuple[int, dict]:
-    encoded = json.dumps(body).encode() if body is not None else None
-    headers = {"Authorization": f"Bearer {token}"}
-    if encoded is not None:
-        headers.update({
-            "Content-Type": "application/json",
-            "Content-Length": str(len(encoded)),
-        })
-    connection = http.client.HTTPConnection(
-        "127.0.0.1", server.server_port, timeout=10
-    )
-    connection.request(method, path, body=encoded, headers=headers)
-    response = connection.getresponse()
-    payload = json.loads(response.read())
-    connection.close()
-    return response.status, payload
+    def execute(self, **arguments):
+        records = []
+        receipts = []
+        for document_id, values in arguments["routing_receipts"].items():
+            selected = list(dict.fromkeys(values))[-1:]
+            if not selected:
+                continue
+            receipts.extend(selected)
+            records.append({
+                "logical_document_id": document_id,
+                "content": "synthetic transport evidence",
+                "event_native_id": "synthetic-event",
+                "occurred_at": "2026-07-23T00:00:00Z",
+                "ordinal": 0,
+                "receipts": selected,
+            })
+        lines = [json.dumps(record) for record in records]
+        lines.extend(
+            f"RECALL_EVIDENCE {receipt}"
+            for receipt in dict.fromkeys(receipts)
+        )
+        return {
+            "provider": "synthetic-exec",
+            "stdout": "\n".join(lines),
+            "stderr": "",
+            "exit_code": 0,
+            "complete": True,
+            "stopped_reason": "completed",
+            "timing": None,
+        }
 
 
 class SyntheticExternalVerifier:
@@ -429,7 +351,7 @@ def main() -> None:
             native_id="native:personal:e2e",
             text="shared launch marker personal semantic decision",
         )
-        personal_atlas_receipt = ingest(
+        ingest(
             store,
             archive,
             tenant_id=PERSONAL,
@@ -479,7 +401,7 @@ def main() -> None:
                 ),
             ))
         ]
-        late_receipt = ingest(
+        ingest(
             store,
             archive,
             tenant_id=COMPANY,
@@ -709,26 +631,6 @@ def main() -> None:
             evidence_projector,
         )
         Handler.canonical_retrieval = retrieval
-        fixed_agent_time = datetime(
-            2026, 7, 25, 10, 0, tzinfo=timezone.utc
-        )
-        Handler.agent_service = RecallAgentService(
-            ScriptedAgentRunner(),
-            clock=lambda: fixed_agent_time,
-            monotonic=lambda: 10.0,
-        )
-        agent_backend = PostgresAgentRunBackend(
-            store.connect,
-            max_active_per_principal=8,
-            lease_seconds=15,
-            retention_seconds=3600,
-        )
-        Handler.agent_coordinator = AgentRunCoordinator(
-            Handler.agent_service,
-            agent_backend,
-            workers=1,
-            abandon_after_seconds=15,
-        )
         Handler.control_plane = control
         Handler.external_identity_verifier = SyntheticExternalVerifier()
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -759,548 +661,53 @@ def main() -> None:
             assert PERSONAL_SOURCE not in json.dumps(company)
             assert OUTSIDER_SOURCE not in json.dumps(company)
 
-            investigated = rpc(
+            company_document_id = next(
+                row["logical_document_id"]
+                for row in company_results
+                if row["source_id"] == COMPANY_SOURCE
+            )
+            executed = rpc(
                 server,
                 company_token["token"],
-                "recall_investigate",
+                "recall_exec",
                 {
-                    "question": "What changed in the synthetic atlas harness?",
-                    "filters": {
-                        "since": "2026-07-22T00:00:00Z",
-                        "until": "2026-07-24T23:59:59Z",
-                    },
-                    "depth": "deep",
+                    "targets": [{
+                        "logical_document_id": company_document_id,
+                        "alias": "d1",
+                    }],
+                    "program": "rg -n --fixed-strings synthetic /docs/d1",
+                    "timeout_seconds": 7,
                 },
             )["result"]["structuredContent"]
-            assert investigated["question_interpretation"]["time_basis"] == "occurred_at"
-            assert investigated["coverage"]["sessions"] >= 2
-            assert set(investigated["coverage"]["sources"]) == {
-                COMPANY_SOURCE,
-                COMPANY_LATE_SOURCE,
-            }
-            rendered_investigation = json.dumps(investigated)
-            assert PERSONAL_SOURCE not in rendered_investigation
-            assert personal_atlas_receipt not in rendered_investigation
-            assert "strongest-match canary" not in rendered_investigation
-            assert OUTSIDER_SOURCE not in rendered_investigation
-            assert "old imported history" not in rendered_investigation
-            accounting = investigated["coverage"]["source_accounting"]
-            assert set(accounting["searched"]) == {
-                COMPANY_SOURCE,
-                COMPANY_LATE_SOURCE,
-            }
-            assert accounting["filtered"] == []
-            assert accounting["unavailable"] == []
-            assert (
-                len(rendered_investigation.encode())
-                < investigated["diagnostics"]["bounds"]["max_response_bytes"]
-            )
-            returned_receipts = {
-                chunk["receipt"]
-                for item in investigated["investigations"]
-                for event in item["context"]["events"]
-                for chunk in event["chunks"]
-            }
-            assert set(atlas_receipts).issubset(returned_receipts)
-            assert late_receipt in returned_receipts
-            with store.connect() as connection:
-                assert connection.execute(
-                    """SELECT count(DISTINCT receipt) AS n
-                       FROM canonical_chunks
-                       WHERE tenant_id=%s AND receipt=ANY(%s)
-                         AND deleted_at IS NULL""",
-                    (COMPANY, list(returned_receipts)),
-                ).fetchone()["n"] == len(returned_receipts)
-            occurrence_order = [
-                event["occurred_at"]
-                for item in investigated["investigations"]
-                for event in item["context"]["events"]
-            ]
-            assert all(
-                event["time_basis"] == "occurred_at"
-                for item in investigated["investigations"]
-                for event in item["context"]["events"]
-            )
-            assert occurrence_order
+            assert executed["provider"] == "synthetic-exec"
+            assert executed["documents_available"] == 1
+            assert executed["objects_available"] >= 2
+            assert PERSONAL_SOURCE not in json.dumps(executed)
+            assert OUTSIDER_SOURCE not in json.dumps(executed)
 
-            agent_request = {
-                "contract": "recall.agent-request.v1",
-                "schema_version": 1,
-                "request_id": "req_0123456789abcdef",
-                "idempotency_key": "synthetic-company-agent-e2e",
-                "question": "What changed in the synthetic atlas harness?",
-                "depth": "deep",
-                "since": "2026-07-22T00:00:00Z",
-                "until": "2026-07-24T23:59:59Z",
-            }
-            agent_started_at = time.monotonic()
-            agent_http_status, agent_http_started = agent_http(
-                server,
-                company_token["token"],
-                COMPANY,
-                agent_request,
-            )
-            assert agent_http_status == 200
-            assert time.monotonic() - agent_started_at < 0.5
-            assert agent_http_started["run"]["status"] in {"queued", "running"}
-            assert agent_http_started["continuation"]["tool"] == (
-                "recall_agent_result"
-            )
-            agent_http_run_id = agent_http_started["run"]["run_id"]
-
-            agent_mcp_request = {
-                **agent_request,
-                "request_id": "req_1111222233334444",
-                "idempotency_key": "synthetic-company-agent-mcp-compat",
-            }
-            agent_started_at = time.monotonic()
-            agent_mcp_started = rpc(
-                server,
-                company_token["token"],
-                "use_recall",
-                agent_mcp_request,
-                path=f"/mcp/brains/{COMPANY}",
-            )["result"]["structuredContent"]
-            assert time.monotonic() - agent_started_at < 0.5
-            assert agent_mcp_started["run"]["status"] in {"queued", "running"}
-            agent_mcp_run_id = agent_mcp_started["run"]["run_id"]
-
-            agent_path = f"/v1/agent/brains/{COMPANY}/runs"
-            for _attempt in range(100):
-                result_code, agent_http_result = agent_lifecycle_http(
+            personal_document_id = personal_results[0]["logical_document_id"]
+            for index in range(400):
+                denied_target = rpc(
                     server,
                     company_token["token"],
-                    "GET",
-                    f"{agent_path}/{agent_http_run_id}/result",
-                )
-                assert result_code == 200
-                if "result" in agent_http_result:
-                    break
-                time.sleep(0.01)
-            for _attempt in range(100):
-                agent_mcp_result = rpc(
-                    server,
-                    company_token["token"],
-                    "recall_agent_result",
-                    {"run_id": agent_mcp_run_id},
-                    path=f"/mcp/brains/{COMPANY}",
-                )["result"]["structuredContent"]
-                if "result" in agent_mcp_result:
-                    break
-                time.sleep(0.01)
-            for field in ("status", "answer", "claims", "gaps", "citations"):
-                assert agent_http_result["result"][field] == (
-                    agent_mcp_result["result"][field]
-                )
-            assert agent_http_result["result"]["status"] == "partial"
-            agent_receipts = set(agent_http_result["result"]["citations"])
-            assert agent_receipts
-            assert agent_receipts <= returned_receipts, (
-                agent_receipts,
-                returned_receipts,
-            )
-            rendered_agent_trace = json.dumps(agent_http_result["trace"])
-            assert agent_request["question"] not in rendered_agent_trace
-            assert PERSONAL_SOURCE not in rendered_agent_trace
-            assert OUTSIDER_SOURCE not in rendered_agent_trace
-            for forbidden in (
-                '"prompt"',
-                '"answer"',
-                '"payload"',
-                '"token"',
-                '"transcript"',
-            ):
-                assert forbidden not in rendered_agent_trace
-            denied_agent_status, denied_agent = agent_http(
-                server,
-                company_token["token"],
-                PERSONAL,
-                agent_request,
-            )
-            assert denied_agent_status == 401
-            assert denied_agent == {"error": "unauthorized"}
-
-            detached_request = {
-                **agent_request,
-                "request_id": "req_abcdef0123456789",
-                "idempotency_key": "synthetic-company-agent-detached",
-            }
-            detached_path = agent_path
-            detached_status, detached = agent_lifecycle_http(
-                server,
-                company_token["token"],
-                "POST",
-                detached_path,
-                detached_request,
-            )
-            assert detached_status == 202
-            detached_run_id = detached["run"]["run_id"]
-            for _attempt in range(100):
-                status_code, detached_state = agent_lifecycle_http(
-                    server,
-                    company_token["token"],
-                    "GET",
-                    f"{detached_path}/{detached_run_id}",
-                )
-                assert status_code == 200
-                if detached_state["run"]["status"] not in {"queued", "running"}:
-                    break
-                time.sleep(0.01)
-            assert detached_state["run"]["status"] == "partial"
-            result_code, detached_result = agent_lifecycle_http(
-                server,
-                company_token["token"],
-                "GET",
-                f"{detached_path}/{detached_run_id}/result",
-            )
-            assert result_code == 200
-            assert detached_result["result"]["citations"]
-            replay_code, detached_replay = agent_lifecycle_http(
-                server,
-                company_token["token"],
-                "POST",
-                detached_path,
-                detached_request,
-            )
-            assert replay_code == 202
-            assert detached_replay["run"]["run_id"] == detached_run_id
-            denied_status_code, _denied_status = agent_lifecycle_http(
-                server,
-                personal_token["token"],
-                "GET",
-                f"{detached_path}/{detached_run_id}",
-            )
-            assert denied_status_code == 401
-
-            mcp_detached_request = {
-                **agent_request,
-                "request_id": "req_fedcba9876543210",
-                "idempotency_key": "synthetic-company-agent-mcp-detached",
-            }
-            mcp_started = rpc(
-                server,
-                company_token["token"],
-                "recall_agent_start",
-                mcp_detached_request,
-                path=f"/mcp/brains/{COMPANY}",
-            )["result"]["structuredContent"]
-            mcp_run_id = mcp_started["run"]["run_id"]
-            for _attempt in range(100):
-                mcp_state = rpc(
-                    server,
-                    company_token["token"],
-                    "recall_agent_status",
-                    {"run_id": mcp_run_id},
-                    path=f"/mcp/brains/{COMPANY}",
-                )["result"]["structuredContent"]
-                if mcp_state["run"]["status"] not in {"queued", "running"}:
-                    break
-                time.sleep(0.01)
-            assert mcp_state["run"]["status"] == "partial"
-            mcp_result = rpc(
-                server,
-                company_token["token"],
-                "recall_agent_result",
-                {"run_id": mcp_run_id},
-                path=f"/mcp/brains/{COMPANY}",
-            )["result"]["structuredContent"]
-            assert mcp_result["result"]["citations"]
-
-            native_request = {
-                **agent_request,
-                "request_id": "req_9999999999999999",
-                "idempotency_key": "synthetic-company-agent-native-task",
-            }
-            native_status, native_created = raw_mcp_message(
-                server,
-                company_token["token"],
-                {
-                    "jsonrpc": "2.0",
-                    "id": 9,
-                    "method": "tools/call",
-                    "params": {
-                        "name": "use_recall",
-                        "arguments": native_request,
-                        "_meta": {
-                            "io.modelcontextprotocol/clientCapabilities": {
-                                "extensions": {
-                                    "io.modelcontextprotocol/tasks": {},
-                                },
-                            },
-                        },
-                    },
-                },
-                path=f"/mcp/brains/{COMPANY}",
-            )
-            assert native_status == 200
-            assert native_created["result"]["resultType"] == "task"
-            native_task_id = native_created["result"]["taskId"]
-            for _attempt in range(100):
-                native_get_status, native_state = raw_mcp_message(
-                    server,
-                    company_token["token"],
+                    "recall_exec",
                     {
-                        "jsonrpc": "2.0",
-                        "id": 10,
-                        "method": "tasks/get",
-                        "params": {"taskId": native_task_id},
+                        "targets": [{
+                            "logical_document_id": (
+                                personal_document_id
+                                if index % 2 == 0
+                                else f"ldoc_{index + 1:032x}"
+                            ),
+                            "alias": "d1",
+                        }],
+                        "program": "true",
+                        "timeout_seconds": 1,
                     },
-                    path=f"/mcp/brains/{COMPANY}",
-                    task_name=native_task_id,
                 )
-                assert native_get_status == 200
-                if native_state["result"]["status"] != "working":
-                    break
-                time.sleep(0.01)
-            assert native_state["result"]["status"] == "completed"
-            assert native_state["result"]["result"]["structuredContent"][
-                "result"
-            ]["citations"]
-
-            hold = threading.Event()
-            Handler.agent_coordinator._executor.submit(hold.wait)
-            cancel_http_request = {
-                **agent_request,
-                "request_id": "req_1111111111111111",
-                "idempotency_key": "synthetic-company-agent-http-cancel",
-            }
-            cancel_mcp_request = {
-                **agent_request,
-                "request_id": "req_2222222222222222",
-                "idempotency_key": "synthetic-company-agent-mcp-cancel",
-            }
-            _, cancel_http_started = agent_lifecycle_http(
-                server,
-                company_token["token"],
-                "POST",
-                detached_path,
-                cancel_http_request,
-            )
-            cancel_http_run = cancel_http_started["run"]["run_id"]
-            cancel_http_code, cancel_http = agent_lifecycle_http(
-                server,
-                company_token["token"],
-                "POST",
-                f"{detached_path}/{cancel_http_run}/cancel",
-                {},
-            )
-            assert cancel_http_code == 200
-            assert cancel_http["run"]["status"] == "cancelled"
-            cancel_mcp_started = rpc(
-                server,
-                company_token["token"],
-                "recall_agent_start",
-                cancel_mcp_request,
-                path=f"/mcp/brains/{COMPANY}",
-            )["result"]["structuredContent"]
-            cancel_mcp = rpc(
-                server,
-                company_token["token"],
-                "recall_agent_cancel",
-                {"run_id": cancel_mcp_started["run"]["run_id"]},
-                path=f"/mcp/brains/{COMPANY}",
-            )["result"]["structuredContent"]
-            assert cancel_mcp["run"]["status"] == "cancelled"
-            hold.set()
-
-            with store.connect() as connection:
-                durable_runs = connection.execute(
-                    "SELECT count(*) AS value FROM agent_runs WHERE tenant_id=%s",
-                    (COMPANY,),
-                ).fetchone()["value"]
-                stored_traces = connection.execute(
-                    """SELECT trace_events::text AS value
-                         FROM agent_runs WHERE tenant_id=%s""",
-                    (COMPANY,),
-                ).fetchall()
-                agent_columns = {
-                    row["column_name"]
-                    for row in connection.execute(
-                        """SELECT column_name
-                             FROM information_schema.columns
-                            WHERE table_schema='public'
-                              AND table_name='agent_runs'"""
-                    ).fetchall()
+                assert denied_target["error"] == {
+                    "code": -32603,
+                    "message": "recall_exec_failed",
                 }
-            assert durable_runs == 7
-            assert "question" not in agent_columns
-            assert "credential" not in agent_columns
-            for row in stored_traces:
-                rendered_trace = row["value"]
-                assert agent_request["question"] not in rendered_trace
-                for forbidden in ('"prompt"', '"answer"', '"payload"', '"token"'):
-                    assert forbidden not in rendered_trace
-
-            company_principal = store.authenticate_bearer(
-                company_token["token"],
-                "read",
-            )
-            assert company_principal is not None
-            company_principal["authorized_sources"] = (
-                store.authorized_canonical_source_ids(
-                    company_principal["tenant_id"],
-                    company_principal["principal_id"],
-                )
-            )
-            crash_context = DelegationContext.from_principal(company_principal)
-            crash_request = {
-                **agent_request,
-                "request_id": "req_3333333333333333",
-                "idempotency_key": "synthetic-company-agent-worker-crash",
-            }
-            with store.connect() as connection:
-                connection.execute(
-                    """CREATE UNLOGGED TABLE IF NOT EXISTS agent_run_effects_e2e(
-                           run_id text NOT NULL,
-                           effect text NOT NULL
-                       )"""
-                )
-                connection.execute("TRUNCATE agent_run_effects_e2e")
-            crash_created = agent_backend.create(
-                crash_context,
-                crash_request,
-                now=datetime.now(timezone.utc),
-            )
-            process = multiprocessing.get_context("spawn").Process(
-                target=crash_agent_worker,
-                args=(
-                    os.environ["RECALL_DATABASE_URL"],
-                    company_principal,
-                    crash_created.run["run_id"],
-                ),
-            )
-            process.start()
-            process.join(timeout=10)
-            assert process.exitcode == 17
-            with store.connect() as connection:
-                connection.execute(
-                    """UPDATE agent_runs
-                          SET lease_expires_at=now()-interval '1 second'
-                        WHERE tenant_id=%s AND run_id=%s""",
-                    (COMPANY, crash_created.run["run_id"]),
-                )
-            recovered_runs = agent_backend.recover_abandoned(
-                before=datetime.now(timezone.utc),
-                now=datetime.now(timezone.utc),
-            )
-            assert recovered_runs == 1
-            crash_replay = agent_backend.create(
-                crash_context,
-                crash_request,
-                now=datetime.now(timezone.utc),
-            )
-            assert not crash_replay.created
-            assert crash_replay.run["status"] == "failed"
-            assert crash_replay.run["error_code"] == "worker_lost_retryable"
-            with store.connect() as connection:
-                crash_effects = connection.execute(
-                    """SELECT count(*) AS value
-                         FROM agent_run_effects_e2e
-                        WHERE run_id=%s""",
-                    (crash_created.run["run_id"],),
-                ).fetchone()["value"]
-            assert crash_effects == 1
-            other_principal = {
-                **company_principal,
-                "principal_id": "principal:synthetic:other",
-            }
-            try:
-                agent_backend.get(
-                    DelegationContext.from_principal(other_principal),
-                    crash_created.run["run_id"],
-                    now=datetime.now(timezone.utc),
-                )
-                raise AssertionError("cross-principal agent run was visible")
-            except AgentRunNotFound:
-                pass
-
-            bounded_backend = PostgresAgentRunBackend(
-                store.connect,
-                max_active_per_principal=1,
-                lease_seconds=15,
-                retention_seconds=3600,
-            )
-            bounded_request = {
-                **agent_request,
-                "request_id": "req_4444444444444444",
-                "idempotency_key": "synthetic-company-agent-bound-one",
-            }
-            bounded = bounded_backend.create(
-                crash_context,
-                bounded_request,
-                now=datetime.now(timezone.utc),
-            )
-            try:
-                bounded_backend.create(
-                    crash_context,
-                    {
-                        **agent_request,
-                        "request_id": "req_5555555555555555",
-                        "idempotency_key": "synthetic-company-agent-bound-two",
-                    },
-                    now=datetime.now(timezone.utc),
-                )
-                raise AssertionError("agent concurrency bound was bypassed")
-            except AgentRunUnavailable:
-                pass
-            bounded_backend.cancel(
-                crash_context,
-                bounded.run["run_id"],
-                now=datetime.now(timezone.utc),
-            )
-
-            with store.connect() as connection:
-                connection.execute(
-                    """UPDATE agent_runs
-                          SET completed_at=now()-interval '2 hours'
-                        WHERE tenant_id=%s AND run_id=%s""",
-                    (COMPANY, crash_created.run["run_id"]),
-                )
-            pruned_runs = agent_backend.prune(
-                before=datetime.now(timezone.utc) - timedelta(hours=1),
-            )
-            assert pruned_runs == 1
-            with store.connect() as connection:
-                connection.execute("DROP TABLE agent_run_effects_e2e")
-
-            deep = rpc(
-                server,
-                company_token["token"],
-                "recall_deep_search",
-                {
-                    "question": (
-                        "Deep-search full synthetic atlas harness evidence"
-                    ),
-                    "filters": {
-                        "since": "2026-07-22T00:00:00Z",
-                        "until": "2026-07-24T23:59:59Z",
-                    },
-                    "depth": "deep",
-                },
-            )["result"]["structuredContent"]
-            assert deep["status"] == "complete"
-            assert deep["coverage"]["provider"] == "local"
-            assert deep["coverage"]["files_scanned"] >= 2
-            assert deep["findings"]
-            deep_rendered = json.dumps(deep)
-            assert "synthetic atlas harness" in deep_rendered
-            assert PERSONAL_SOURCE not in deep_rendered
-            assert "strongest-match canary" not in deep_rendered
-            assert OUTSIDER_SOURCE not in deep_rendered
-            assert "old imported history" not in deep_rendered
-            deep_receipts = {item["receipt"] for item in deep["findings"]}
-            with store.connect() as connection:
-                assert connection.execute(
-                    """SELECT count(DISTINCT receipt) AS n
-                       FROM canonical_chunks
-                       WHERE tenant_id=%s AND source_id=ANY(%s)
-                         AND receipt=ANY(%s) AND deleted_at IS NULL""",
-                    (
-                        COMPANY,
-                        [COMPANY_SOURCE, COMPANY_LATE_SOURCE],
-                        list(deep_receipts),
-                    ),
-                ).fetchone()["n"] == len(deep_receipts)
 
             context = rpc(
                 server,
@@ -1341,7 +748,13 @@ def main() -> None:
             assert {row["source_id"] for row in conversational["results"]} == {
                 PERSONAL_SOURCE
             }
-            assert conversational["diagnostics"]["lexical_mode"] == "strict-empty"
+            assert conversational["diagnostics"]["engine"] == (
+                "lossless-passages-v1"
+            )
+            assert conversational["diagnostics"]["dense_candidates"] >= 1
+            assert conversational["diagnostics"][
+                "passage_lexical_candidates"
+            ] == 0
 
             unrelated = rpc(
                 server,
@@ -1349,8 +762,13 @@ def main() -> None:
                 "recall_search",
                 {"query": "Where did we discuss underwater zebras?"},
             )["result"]["structuredContent"]
-            assert unrelated["diagnostics"]["lexical_candidates"] == 0
-            assert unrelated["diagnostics"]["lexical_mode"] == "strict-empty"
+            assert unrelated["diagnostics"]["engine"] == (
+                "lossless-passages-v1"
+            )
+            assert unrelated["diagnostics"][
+                "passage_lexical_candidates"
+            ] == 0
+            assert unrelated["diagnostics"]["sparse_candidates"] == 0
 
             degraded = rpc(
                 server,
@@ -1359,8 +777,11 @@ def main() -> None:
                 {"query": "shared launch marker semantic unavailable"},
             )["result"]["structuredContent"]
             assert degraded["results"] == []
-            assert degraded["diagnostics"]["lexical_mode"] == "strict-empty"
-            assert degraded["diagnostics"]["semantic_status"] == "unavailable"
+            assert degraded["diagnostics"]["dense_status"] == "unavailable"
+            assert degraded["diagnostics"][
+                "passage_lexical_candidates"
+            ] == 0
+            assert degraded["diagnostics"]["sparse_candidates"] == 0
 
             family_routed = rpc(
                 server,
@@ -1404,8 +825,15 @@ def main() -> None:
                 "recall_search",
                 {"query": "personal semantic"},
             )["result"]["structuredContent"]
-            assert semantic["results"][0]["receipt"] == personal_receipt
-            assert semantic["diagnostics"]["semantic_candidates"] >= 1
+            semantic_receipts = {
+                receipt
+                for matching_range in semantic["results"][0][
+                    "matching_ranges"
+                ]
+                for receipt in matching_range.get("receipts", [])
+            }
+            assert personal_receipt in semantic_receipts
+            assert semantic["diagnostics"]["dense_candidates"] >= 1
 
             shown = rpc(
                 server,
@@ -1622,9 +1050,19 @@ def main() -> None:
                     {"query": query, "limit": 5},
                 )["result"]["structuredContent"]["results"]
                 latencies.append((time.perf_counter() - started) * 1000)
-                receipts = [row["receipt"] for row in evaluated]
+                receipts = [
+                    receipt
+                    for row in evaluated
+                    for matching_range in row["matching_ranges"]
+                    for receipt in matching_range.get("receipts", [])
+                ]
+                top_receipts = {
+                    receipt
+                    for matching_range in evaluated[0]["matching_ranges"]
+                    for receipt in matching_range.get("receipts", [])
+                } if evaluated else set()
                 recalled += expected in receipts
-                useful += bool(receipts and receipts[0] == expected)
+                useful += expected in top_receipts
             recall_at_5 = recalled / len(eval_cases)
             usefulness = useful / len(eval_cases)
             p95_ms = sorted(latencies)[
@@ -1668,11 +1106,15 @@ def main() -> None:
             )
             deleted_results = deleted["result"]["structuredContent"]["results"]
             assert personal_receipt not in {
-                row["receipt"] for row in deleted_results
+                receipt
+                for row in deleted_results
+                for matching_range in row["matching_ranges"]
+                for receipt in matching_range.get("receipts", [])
             }
             assert all(
-                "shared launch marker" not in row["text"]
+                "shared launch marker" not in matching_range["text"]
                 for row in deleted_results
+                for matching_range in row["matching_ranges"]
             )
             deleted_show = rpc(
                 server,
@@ -1714,10 +1156,6 @@ def main() -> None:
             thread.join(timeout=5)
             Handler.external_identity_verifier = None
             Handler.control_plane = None
-            Handler.agent_service = None
-            if Handler.agent_coordinator is not None:
-                Handler.agent_coordinator.close()
-            Handler.agent_coordinator = None
             for name, value in previous.items():
                 if value is None:
                     os.environ.pop(name, None)
@@ -1745,45 +1183,17 @@ def main() -> None:
                 "plaintext_credential_rows": 0,
                 "empty_grant_hits": 0,
                 "legacy_reads": 0,
-                "investigate_tool_calls": 1,
-                "investigate_sessions": investigated["coverage"]["sessions"],
-                "investigate_sources": len(investigated["coverage"]["sources"]),
-                "investigate_exact_receipts": len(returned_receipts),
-                "investigate_old_source_time_hits": 0,
-                "investigate_session_coverage": 1.0,
-                "investigate_temporal_accuracy": 1.0,
-                "investigate_citation_precision": 1.0,
-                "investigate_unsupported_claim_rate": 0.0,
-                "investigate_response_bytes": len(
-                    json.dumps(investigated).encode()
-                ),
-                "agent_http_calls": 1,
-                "agent_mcp_calls": 1,
-                "agent_transport_parity": 1.0,
-                "agent_exact_receipts": len(agent_receipts),
-                "agent_cross_brain_accepts": 0,
-                "agent_trace_content_leaks": 0,
-                "agent_stored_question_columns": 0,
-                "agent_durable_runs": durable_runs,
-                "agent_idempotent_replays": 1,
-                "agent_http_lifecycle": 1.0,
-                "agent_mcp_lifecycle": 1.0,
-                "agent_native_task_lifecycle": 1.0,
-                "agent_cancellations": 2,
-                "agent_worker_loss_recovered": recovered_runs,
-                "agent_worker_loss_duplicate_effects": crash_effects - 1,
-                "agent_cross_principal_run_hits": 0,
-                "agent_concurrency_overflows": 0,
-                "agent_pruned_runs": pruned_runs,
-                "deep_search_tool_calls": 1,
-                "deep_search_provider": deep["coverage"]["provider"],
-                "deep_search_files": deep["coverage"]["files_scanned"],
-                "deep_search_exact_receipts": len(deep_receipts),
-                "deep_search_cross_tenant_hits": 0,
-                "deep_search_old_source_time_hits": 0,
-                "lexical_candidates": 2,
-                "semantic_candidates": semantic["diagnostics"][
-                    "semantic_candidates"
+                "direct_exec_tool_calls": 1,
+                "direct_exec_documents": executed["documents_available"],
+                "direct_exec_cross_brain_accepts": 0,
+                "direct_exec_guessed_target_accepts": 0,
+                "direct_exec_cross_brain_attempts": 200,
+                "direct_exec_guessed_target_attempts": 200,
+                "passage_lexical_candidates": semantic["diagnostics"][
+                    "passage_lexical_candidates"
+                ],
+                "dense_candidates": semantic["diagnostics"][
+                    "dense_candidates"
                 ],
                 "tombstoned_search_hits": 0,
                 "tombstoned_show_hits": 0,

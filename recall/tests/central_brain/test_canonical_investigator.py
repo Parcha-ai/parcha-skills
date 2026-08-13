@@ -119,6 +119,57 @@ class CanonicalInvestigatorContractTest(unittest.TestCase):
         self.assertNotIn("spans", matching_range)
         self.assertEqual(value["diagnostics"]["time_clip_status"], "ok")
 
+    def test_time_clip_deadline_preserves_document_pointers_without_prose(
+        self,
+    ) -> None:
+        class Store:
+            search_deadline_ms = 25
+
+            @contextmanager
+            def connect(self):
+                yield object()
+
+            @staticmethod
+            def _execute_bounded(_connection, _sql, _values, _deadline_at):
+                raise SearchDeadlineExceeded("synthetic time clip deadline")
+
+        retrieval = BoundCanonicalRetrieval(
+            Store(),
+            tenant_id="tenant:test",
+            principal_id="principal:test",
+            authorized_sources=("codex.jsonl:test",),
+        )
+        value = retrieval._clip_passage_hints_to_time_window(
+            {
+                "results": [{
+                    "source_id": "codex.jsonl:test",
+                    "logical_document_id": "ldoc_" + "1" * 32,
+                    "first_occurred_at": "2026-08-04T00:00:00Z",
+                    "last_occurred_at": "2026-08-06T00:00:00Z",
+                    "matching_ranges": [{
+                        "kind": "dense",
+                        "text": "must not escape after incomplete clipping",
+                        "receipts": [
+                            "recall://codex.jsonl:test/item?rev=1#item=0"
+                        ],
+                    }],
+                }],
+                "diagnostics": {"engine": "lossless-passages-v1"},
+            },
+            sources=["codex.jsonl:test"],
+            since="2026-08-05T00:00:00Z",
+            until="2026-08-06T00:00:00Z",
+            deadline_at=0.0,
+        )
+
+        self.assertEqual(len(value["results"]), 1)
+        self.assertEqual(value["results"][0]["matching_ranges"], [])
+        self.assertEqual(
+            value["diagnostics"]["time_clip_status"],
+            "deadline-exceeded",
+        )
+        self.assertTrue(value["diagnostics"]["time_filter_requires_exec"])
+
     def test_investigate_seeds_from_lossless_passages(self) -> None:
         receipts = tuple(
             f"recall://codex.jsonl:test/event-{index}?rev=1#item=0"

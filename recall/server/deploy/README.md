@@ -64,7 +64,7 @@ infrastructure. The example is synthetic; a live manifest belongs in a private m
 location and contains references, never credential values.
 
 The production database gate requires a standard PostgreSQL URL with
-`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 47,
+`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 54,
 pgvector 0.8.0 or newer, and a runtime role without superuser, database/role creation,
 replication, or RLS-bypass privilege:
 
@@ -306,13 +306,54 @@ creates and links the employee actor, and source-local route enrollment binds
 that actor as the source contributor. Apply it before inviting employees; mixed
 schema/application deployment is intentionally unsupported.
 
-`recall_deep_search` first uses canonical retrieval to select authorized
-candidates, passes only opaque evidence keys and exact allowed receipts to a
-fixed server-owned inspection program, mounts the Archil disk read-only, and
-revalidates every returned receipt. The question is encoded as data and can
-never become a shell command or object path. Interactive executions are bounded
-by file, match, output-byte, and time limits. Use
-`RECALL_DEEP_INSPECTOR=local` for the same contract without third-party compute.
+Migration 49 repairs actor bindings for legacy `coding_history` sources whose
+owner principal already maps to a brain actor. It deliberately does not infer an
+author for Slack, email, or any other shared source. Migration 50 adds a derived
+Parquet scan plane; migration 53 adds its compact `passages` planning dataset.
+Each authorized source and UTC month has `documents`, `passages`, `records`, and
+`actors` shards. Passages contain bounded visible-message text, time, attribution,
+and receipt pointers; records retain complete projected JSON for exact inspection.
+During the one-time passage upgrade, existing immutable `documents`, `records`, and
+`actors` objects are retained and only `passages` is materialized. Later source changes
+continue to take the ordinary full replacement path.
+Canonical JSONL documents remain the complete evidence and only source of truth.
+Ingest, replacement, passage projection, and forget transactions invalidate only
+the affected source-months. First application seeds existing source-months for a
+rebuild after upstream logical and passage projection has drained.
+
+Populate or rebuild it independently of ingestion:
+
+```bash
+python -m recall_server.cli backfill-parquet-scan \
+  --tenant tenant:company:example --batch-size 4 --max-batches 100
+```
+
+The managed projection worker continuously drains later invalidations. Before
+enabling `recall_scan`, publish the official `duckdb_cli-linux-arm64` binary
+into the private evidence archive. Archil serverless execution runs on aarch64;
+an amd64 binary stages successfully but cannot execute. Verify the release
+asset checksum against DuckDB's official release metadata; the command
+independently rechecks the uncompressed binary's exact digest before upload:
+
+```bash
+python -m recall_server.cli publish-archil-duckdb \
+  --path /private/duckdb --version 1.5.5 \
+  --sha256 64-lowercase-hex-characters
+```
+
+Configure the returned opaque object identity as
+`RECALL_ARCHIL_DUCKDB_OBJECT_KEY` and `RECALL_ARCHIL_DUCKDB_SHA256`. At execution
+time Recall mounts only shards inside the caller's tenant/source grants, stages
+that checksum-pinned binary into the networkless sandbox, and verifies every
+emitted `recall://` receipt against current canonical evidence before returning
+it in `opened_receipts`. The caller's agent writes one shell/DuckDB program; no
+second retrieval agent or model credential runs inside Recall.
+`recall_scan` defaults to 60 seconds and permits a caller-selected ceiling up to
+240 seconds, below Archil's documented five-minute response limit. The MCP
+client may cancel its own request sooner; Recall does not impose the 30-second
+interactive-document limit on these broad scans. Scan stdout is capped at 16 KiB
+with explicit truncation and `complete=false`; callers should return compact
+passage-derived candidate IDs and open selected full documents separately.
 
 Enable the canonical v2 write plane only after the archive probe and database
 migrations pass:
@@ -357,75 +398,14 @@ credentials without gaining an implicit cross-brain view. Omit the optional
 `forget` scope for read-only agents; canonical forget also requires an owner
 grant on the exact source.
 
-The outcome-oriented answer façade is disabled by default. Enabling the direct
-Pi runner exposes `use_recall` through MCP and
-`POST /v1/agent/brains/{tenant_id}/use-recall`. The request cannot carry tenant,
-principal, role, source grants, credentials, budgets, or trace policy.
-
-Schema 38 adds durable agent runs. `POST /v1/agent/brains/{tenant}/runs` starts
-detached work; the corresponding run, result, and cancel routes remain bound to
-the authenticated tenant, principal, and current source grants. MCP exposes the
-same compatibility lifecycle as `recall_agent_start`, `recall_agent_status`,
-`recall_agent_result`, and `recall_agent_cancel`. MCP `2026-07-28` clients can
-discover `io.modelcontextprotocol/tasks`, receive a durable native task from
-`use_recall`, poll it with `tasks/get`, cancel it with `tasks/cancel`, or listen
-for full task-state updates through `subscriptions/listen`. The pre-final
-`2026-06-30` task negotiation remains available during the ecosystem rollout.
-Older or non-negotiating clients receive the same durable run immediately and
-continue with the explicit lifecycle tools; `use_recall` never holds an HTTP
-request open for the investigation.
-
-For semantic synthesis, enable the direct open-source Pi worker included in the
-image and configure one explicit OpenAI-compatible endpoint:
-
-```text
-RECALL_AGENT_RUNNER=pi
-RECALL_AGENT_MODEL_BASE_URL=https://api.cerebras.ai/v1
-RECALL_AGENT_MODEL_ALIAS=gpt-oss-120b
-RECALL_AGENT_MODEL_KEY_FILE=/etc/secrets/cerebras-api-key
-```
-
-The Render secret file contains only the Cerebras API key. It must be a
-nonsymlinked regular file owned by the service user or root, with no write or
-execute permission for its group and no permissions for other users. Recall
-reloads it immediately before each child process. The child receives only that
-key, the explicit endpoint, and a minimal process environment. The worker and
-Pi dependencies are built from the checked-in lockfile; no opaque runtime
-artifact is vendored.
-
-On a Greppy host, use the dedicated credential-owning local broker instead.
-Recall passes the literal `not-a-secret` placeholder to Pi; no model bearer
-credential enters Recall or the child:
-
-```text
-RECALL_AGENT_MODEL_BASE_URL=http://<private-greppy-llm-proxy-host>:<port>
-RECALL_AGENT_MODEL_ALIAS=gemma-4-31b
-```
-
-This mode fails closed unless the exact approved URL is loopback, link-local,
-RFC1918, carrier-grade NAT, or the private Docker host gateway. Do not expose
-the broker publicly. A deployment outside that private network supplies an
-HTTPS endpoint and a private model-key file.
-
-Recall and Archil credentials remain in the host.
-
-The child can call only authorized read-only evidence tools. Semantic search is
-a hint; only receipts returned by deep inspection, exact show, or session
-context are citable. The model must finish through `finish`, and Recall
-rejects citations that were not opened in the same turn. Raw reasoning,
-questions, answers, tool arguments, source bodies, and credentials are excluded
-from durable traces.
-
-Lifecycle rows contain authority identifiers, a request hash, opaque handles,
-state, a content-free progress phase, bounded redacted trace events, and terminal
-results. They never contain the original question, credentials, or source bodies.
-Expired worker leases become
-`worker_lost_retryable` terminal failures and are never silently rerun. Active
-runs renew their leases and poll durable cancellation while the Pi process is
-working. Search depth controls bounded tool effort, not a whole-run wall-clock
-deadline. Tune only within the validated bounds using `RECALL_AGENT_WORKERS`,
-`RECALL_AGENT_MAX_ACTIVE_PER_PRINCIPAL`, `RECALL_AGENT_LEASE_SECONDS`, and
-`RECALL_AGENT_RETENTION_SECONDS`.
+The hosted MCP is model-free. The caller's own agent interprets the question,
+uses `recall_search` for high-recall pointers, optionally uses `recall_show`
+for exact context, and runs bounded read-only shell or Python over selected full
+documents with `recall_exec`. Search results are hints; only host-verified
+`opened_receipts` from show or exec authorize citations. Recall owns tenant and
+source grants, exact target resolution, read-only mounting, network isolation,
+resource bounds, and receipt verification. No model key or nested agent runtime
+belongs in the Recall service.
 
 ### Human OAuth and company-brain invitations
 
@@ -778,7 +758,7 @@ continuous WAL archival plus daily base backups; the same blank-database restore
 contract remains the gate.
 
 Searches have a 300ms database-work budget by default. Override it only within the validated
-10–5000ms range with `RECALL_SEARCH_DEADLINE_MS`; the response and service log expose only
+10–30000ms range with `RECALL_SEARCH_DEADLINE_MS`; the response and service log expose only
 content-free per-leg timings, result counts, and the deadline outcome.
 
 Semantic retrieval requires PostgreSQL with pgvector and one explicitly selected embedding
@@ -931,7 +911,13 @@ RECALL_DATABASE_URL=... python -m recall_server.cli source-alias-set cowork cowo
 
 Linux history collectors use `recall-collector@.service` with separate `claude` and `codex`
 environment/token files. Issue one source-scoped credential per unit, install the two example
-environment files with mode 0600 after replacing every value, then enable the instances:
+environment files with mode 0600 after replacing every value.
+
+The Codex example configures both the active and archived rollout roots; both feed one
+stable session ledger and one source-scoped credential. Create both directories before starting
+the unit; an unavailable configured archive root fails closed. Claude remains single-root.
+
+Then enable the instances:
 
 ```bash
 install -m 0644 ~/services/recall-brain/recall/server/deploy/recall-collector@.service ~/.config/systemd/user/

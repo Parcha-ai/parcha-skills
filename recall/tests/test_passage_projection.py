@@ -6,6 +6,7 @@ import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import orjson
@@ -81,7 +82,7 @@ class PassageProjectionTests(unittest.TestCase):
         )
         rendered = " ".join(migration.read_text().split()).casefold()
 
-        self.assertEqual(SCHEMA_VERSION, 47)
+        self.assertEqual(SCHEMA_VERSION, 54)
         self.assertIn(
             "create table if not exists canonical_passage_documents",
             rendered,
@@ -740,7 +741,7 @@ class PassageProjectionTests(unittest.TestCase):
     def test_dense_temporal_scope_is_materialized_before_vector_ranking(
         self,
     ) -> None:
-        source = inspect.getsource(PassageHintRetrieval.search)
+        source = inspect.getsource(PassageHintRetrieval._dense_candidates)
         eligible = source.split(
             "WITH eligible AS MATERIALIZED", 1
         )[1].split("), nearest AS MATERIALIZED", 1)[0]
@@ -756,10 +757,85 @@ class PassageProjectionTests(unittest.TestCase):
         self.assertIn("SELECT DISTINCT ON (", source)
         self.assertIn("passage.logical_document_id", source)
 
+    def test_hybrid_search_arms_run_concurrently_under_one_deadline(self) -> None:
+        source = inspect.getsource(PassageHintRetrieval.search)
+
+        self.assertIn("ThreadPoolExecutor(max_workers=3", source)
+        self.assertIn("self._lexical_candidates", source)
+        self.assertIn("self._sparse_candidates", source)
+        self.assertIn("self._dense_candidates", source)
+        self.assertIn("deadline_at", source)
+
+    def test_slow_dense_arm_cannot_erase_fast_lexical_evidence(self) -> None:
+        retrieval = object.__new__(PassageHintRetrieval)
+        retrieval.store = SimpleNamespace(search_deadline_ms=500)
+        retrieval.actor_ids = None
+        retrieval.actor_relations = None
+        retrieval.policy_fingerprint = "a" * 64
+        barrier = threading.Barrier(3)
+        candidate = {
+            "source_id": "source:test",
+            "logical_document_id": "ldoc_" + "1" * 32,
+            "revision": 1,
+            "native_parent_id": "session:test",
+            "first_occurred_at": "2026-08-03T00:00:00Z",
+            "last_occurred_at": "2026-08-09T00:00:00Z",
+            "manifest_object_key": "objects/01/" + "b" * 64,
+            "manifest_content_sha256": "c" * 64,
+            "passage_id": "psg_" + "2" * 32,
+            "passage_ordinal": 0,
+            "spans": [],
+            "receipts": ["recall://source:test/item?rev=1"],
+            "text_redacted": "Synthetic employee work evidence",
+            "score": 0.9,
+        }
+
+        def lexical(*_args, **_kwargs):
+            barrier.wait(timeout=0.2)
+            return [candidate], "ok"
+
+        def sparse(*_args, **_kwargs):
+            barrier.wait(timeout=0.2)
+            return [], "ok"
+
+        def dense(*_args, **_kwargs):
+            barrier.wait(timeout=0.2)
+            time.sleep(0.05)
+            return [], "deadline-exceeded", "ann-oversampled", 100_000
+
+        retrieval._lexical_candidates = mock.Mock(side_effect=lexical)
+        retrieval._sparse_candidates = mock.Mock(side_effect=sparse)
+        retrieval._dense_candidates = mock.Mock(side_effect=dense)
+
+        result = retrieval.search(
+            "What did everyone work on last week?",
+            lexical_query="everyone work",
+            since="2026-08-03T00:00:00Z",
+            until="2026-08-10T00:00:00Z",
+            limit=20,
+        )
+
+        self.assertEqual(len(result["results"]), 1)
+        self.assertEqual(
+            result["results"][0]["logical_document_id"],
+            candidate["logical_document_id"],
+        )
+        self.assertTrue(result["diagnostics"]["deadline_exceeded"])
+        self.assertTrue(result["diagnostics"]["partial_results_preserved"])
+
+    def test_dense_strategy_is_cardinality_aware_not_time_filter_automatic(
+        self,
+    ) -> None:
+        source = inspect.getsource(PassageHintRetrieval._dense_candidates)
+
+        self.assertIn("_dense_scope_passage_count", source)
+        self.assertIn("MAX_EXACT_DENSE_SCOPE_PASSAGES", source)
+        self.assertNotIn("or temporal_scope\n", source)
+
     def test_dense_person_scope_is_materialized_before_vector_ranking(
         self,
     ) -> None:
-        source = inspect.getsource(PassageHintRetrieval.search)
+        source = inspect.getsource(PassageHintRetrieval._dense_candidates)
         eligible = source.split(
             "WITH eligible AS MATERIALIZED", 1
         )[1].split("), nearest AS MATERIALIZED", 1)[0]

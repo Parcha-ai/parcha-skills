@@ -61,8 +61,10 @@ MCP. After installation, `recall-brain mac-status` must reach `ready` or report
 one closed remediation code. Pause/disable retains the checkpoint, and resume
 continues from the last Brain ACK without replaying committed documents.
 
-`--sources`, `--visibility`, `--claude-root`, `--codex-root`, and
-`--cowork-root` are explicit consent controls. Cowork reads only the nested
+`--sources`, `--visibility`, `--claude-root`, `--codex-root`,
+`--codex-archive-root`, and `--cowork-root` are explicit consent controls.
+The Codex archive root defaults to `~/.codex/archived_sessions`; active and
+archived rollouts share one path-independent session identity. Cowork reads only the nested
 local project JSONL surface; it does not inspect app databases, audit logs,
 attachments, caches, metadata files, browser stores, Desktop, or Downloads.
 On the current macOS release, `ChatGPT.app` is the Codex Desktop runtime and its
@@ -99,8 +101,9 @@ recall-brain mac-reset-local --source cowork --confirm-source cowork
 
 `mac-status` distinguishes starting, running, bounded backfill, ready, degraded,
 stalled, paused, disabled, and invalid local state. Each source reports only
-aggregate pending/dead-letter counts, running and last-Brain-ACK ages, and one
-stable remediation class. A failed scan or Brain acknowledgement cannot be
+aggregate pending/dead-letter counts, recent scan lag, last-Brain-ACK age, and
+one stable remediation class. Codex additionally reports whether archive
+coverage is configured. A failed scan or Brain acknowledgement cannot be
 reported as ready. Claude Code, Codex, Cowork, and the consented ChatGPT export
 inbox run as separate LaunchAgents, so one source cannot hold another source's
 schedule.

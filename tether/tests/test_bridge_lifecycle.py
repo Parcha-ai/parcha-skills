@@ -106,7 +106,13 @@ class BridgeLifecycleTest(unittest.TestCase):
         return self.store.bind(bridge.bridge_id, thread)
 
     def test_exact_native_endpoint_can_own_multiple_active_threads(self):
-        first = self.bind("first", pane="7", thread="123.001")
+        first_request = self.request("first", pane="7")
+        first_pending = self.store.create(first_request)
+        first = self.store.bind(
+            first_pending.bridge_id,
+            "123.001",
+            claim_thread=True,
+        )
         duplicate = self.request(
             "second",
             pane="7",
@@ -114,11 +120,23 @@ class BridgeLifecycleTest(unittest.TestCase):
         )
         duplicate["channel_id"] = "C87654321"
         second = self.store.create(duplicate)
-        second = self.store.bind(second.bridge_id, "123.002")
+        second = self.store.bind(
+            second.bridge_id,
+            "123.002",
+            claim_thread=True,
+        )
 
         other = self.bind("third", pane="8", thread="123.003")
         self.assertNotEqual(first.bridge_id, second.bridge_id)
         self.assertNotEqual(first.bridge_id, other.bridge_id)
+        self.assertEqual(
+            first.thread_claim_generation,
+            first.binding_generation,
+        )
+        self.assertEqual(
+            second.thread_claim_generation,
+            second.binding_generation,
+        )
         with self.store.connect() as database:
             keys = {
                 row[0]

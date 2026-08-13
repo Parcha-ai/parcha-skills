@@ -50,12 +50,12 @@ therefore return a session containing similar words. Each result includes a
 
 ## Install
 
-skills.sh:
+[skills.sh](https://skills.sh/miguelrios/unc-skills/recall):
 
 [View Recall on skills.sh](https://skills.sh/Parcha-ai/parcha-skills/recall).
 
 ```bash
-npx skills add Parcha-ai/parcha-skills --skill recall
+npx skills add miguelrios/unc-skills --skill recall
 ```
 
 Claude Code:

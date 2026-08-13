@@ -1,5 +1,9 @@
 # Agentic map-reduce retrieval
 
+> Historical research note. The hosted nested-agent prototype described below
+> was retired in August 2026. Production Recall is model-free: the MCP caller's
+> agent plans and reduces with `recall_search`, `recall_show`, and `recall_exec`.
+
 ## Objective
 
 Answer natural questions from a large private archive without treating vector
@@ -35,7 +39,7 @@ receipts are the evidence.
 The existing source/session/time structure is Recall's first retrieval
 hierarchy. A generated knowledge graph is not required for the prototype.
 
-## Prototype contract
+## Retired prototype contract
 
 `recall.map_reduce` accepts:
 
@@ -62,8 +66,8 @@ The host:
   semantic judgment that the evidence is sufficient for the map objective;
 - never puts questions, answers, source bodies, or credentials in the trace.
 
-The outer Pi agent is both planner and reducer. Its closed tool catalog keeps
-all storage credentials and authorization in Recall.
+The caller's agent is both planner and reducer. Recall's closed evidence tools
+keep all storage credentials and authorization inside the service boundary.
 
 ## Why this shape
 

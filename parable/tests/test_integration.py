@@ -763,7 +763,7 @@ exit 0
             self.assertEqual(first.stdout.count(handoff), 1)
             self.assertIn(launch, first.stdout)
 
-            installed = home / ".local" / "share" / "parable" / "0.1.29"
+            installed = home / ".local" / "share" / "parable" / "0.1.30"
             durable = home / ".local" / "bin" / "parable"
             self.assertTrue((installed / "bin" / "parable.js").is_file())
             self.assertTrue((installed / "lib" / "onboarding.js").is_file())
@@ -2899,7 +2899,7 @@ for flag, (vendor, record_type) in mapping.items():
                 captured["argv"],
                 [
                     "--plugin-dir", str(welcome_plugin),
-                    "--model", "claude-fable-5", "--print", "hello",
+                    "--model", "claude-fable-5[1m]", "--print", "hello",
                 ],
             )
             self.assertIsNone(captured["welcome_message"])
@@ -2917,18 +2917,18 @@ for flag, (vendor, record_type) in mapping.items():
                 captured["argv"],
                 [
                     "--plugin-dir", str(welcome_plugin),
-                    "--model", "claude-fable-5", "--effort", "high",
+                    "--model", "claude-fable-5[1m]", "--effort", "high",
                 ],
             )
             self.assertIn("_ __   __ _ _ __", captured["welcome_message"])
             self.assertIn("🐢  🐘  🦊", captured["welcome_message"])
             self.assertIn("BRAIN   FABLE · claude-fable-5 · 1M ctx", captured["welcome_message"])
-            # Multi-model cast: ceiling is the min across non-Claude cast
-            # models (gpt-5.6-* at 372k beat kimi-k3's 1M). Anthropic models
-            # ignore the env var, so the brain is unaffected.
+            # Multi-model cast: MAX_CONTEXT teaches non-Claude workers their
+            # safe ceiling, while process-wide auto-compact controls stay out
+            # of the 1M Fable parent's environment.
             self.assertEqual(captured["max_context_tokens"], "372000")
-            self.assertEqual(captured["auto_compact_window"], "372000")
-            self.assertEqual(captured["auto_compact_pct"], "75")
+            self.assertIsNone(captured["auto_compact_window"])
+            self.assertIsNone(captured["auto_compact_pct"])
             self.assertIn("TERRA", captured["welcome_message"])
             self.assertIn("React and frontend", captured["welcome_message"])
             self.assertNotIn(token, captured["welcome_message"])
@@ -2942,7 +2942,7 @@ for flag, (vendor, record_type) in mapping.items():
                 captured["argv"],
                 [
                     "--plugin-dir", str(welcome_plugin),
-                    "--model", "claude-fable-5", "--effort", "high",
+                    "--model", "claude-fable-5[1m]", "--effort", "high",
                     "--dangerously-skip-permissions",
                 ],
             )
@@ -3024,7 +3024,7 @@ for flag, (vendor, record_type) in mapping.items():
                 captured["argv"],
                 [
                     "--plugin-dir", str(welcome_plugin),
-                    "--model", "claude-fable-5", "--dangerously-skip-permissions",
+                    "--model", "claude-fable-5[1m]", "--dangerously-skip-permissions",
                     "--effort", "low", "--print", "direct",
                 ],
             )
@@ -3040,7 +3040,7 @@ for flag, (vendor, record_type) in mapping.items():
                 captured["argv"],
                 [
                     "--plugin-dir", str(welcome_plugin),
-                    "--model", "claude-fable-5", "--print", "auto",
+                    "--model", "claude-fable-5[1m]", "--print", "auto",
                 ],
             )
 
@@ -3093,7 +3093,7 @@ for flag, (vendor, record_type) in mapping.items():
                 captured["argv"],
                 [
                     "--plugin-dir", str(welcome_plugin),
-                    "--model", "claude-fable-5", "--print", "claude-only",
+                    "--model", "claude-fable-5[1m]", "--print", "claude-only",
                 ],
             )
             explicit_sol = self.run_cli(repo, env, "claude", "--brain", "sol")
@@ -3427,9 +3427,8 @@ finally:
             captured_calls = [
                 json.loads(line) for line in calls.read_text().splitlines()
             ]
-            self.assertEqual(len(captured_calls), 3)
+            self.assertEqual(len(captured_calls), 2)
             self.assertNotIn("--resume", captured_calls[0]["argv"])
-            self.assertEqual(captured_calls[1]["argv"][-1], "/context")
             final = captured_calls[-1]["argv"]
             resume_at = final.index("--resume")
             self.assertEqual(final[resume_at + 1], session_id)
@@ -3489,14 +3488,14 @@ finally:
             final = captured_calls[-1]
             self.assertEqual(
                 final["argv"][final["argv"].index("--model") + 1],
-                "gpt-5.6-sol",
+                "claude-fable-5[1m]",
             )
-            self.assertEqual(final["auto_compact_window"], "372000")
+            self.assertIsNone(final["auto_compact_window"])
             events = self.events(case)
             self.assertTrue(any(item["event"] == "signal" for item in events))
             self.assert_pid_gone(events[0]["pid"])
 
-    def test_resume_picker_selection_preflights_before_first_prompt(self):
+    def test_resume_picker_selection_resumes_exact_full_window_session(self):
         with tempfile.TemporaryDirectory() as tmp:
             case = self.setup_case(tmp)
             calls = Path(tmp) / "claude-calls.jsonl"
@@ -3519,42 +3518,25 @@ finally:
             )
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertIn(
-                f"context: resume selected; checking with Sonnet 5, then resuming {session_id}",
+                f"context: resume selected; validating the target window, then resuming {session_id}",
                 proc.stdout,
             )
-            self.assertIn(
-                "resume: compacted 321,400 to 42,000 tokens with Sonnet 5",
-                proc.stdout,
-            )
-            progress = (
-                "resume: compacting 321,400 tokens with Sonnet 5; "
-                "this can take several minutes"
-            )
-            complete = "resume: compacted 321,400 to 42,000 tokens with Sonnet 5"
-            self.assertIn(progress, proc.stdout)
-            self.assertLess(proc.stdout.index(progress), proc.stdout.index(complete))
+            self.assertNotIn("resume: compacting", proc.stdout)
             captured_calls = [
                 json.loads(line) for line in calls.read_text().splitlines()
             ]
-            self.assertEqual(len(captured_calls), 5)
+            self.assertEqual(len(captured_calls), 2)
             initial = captured_calls[0]
             self.assertTrue(initial["resume_picker_recovery"])
             self.assertEqual(initial["argv"].count("--resume"), 1)
             self.assertEqual(initial["argv"][-1], "--resume")
-            for call in captured_calls[1:]:
-                self.assertFalse(call["resume_picker_recovery"])
-                resume_at = call["argv"].index("--resume")
-                self.assertEqual(call["argv"][resume_at + 1], session_id)
-            self.assertTrue(all(
-                call["argv"][call["argv"].index("--model") + 1]
-                == "claude-sonnet-5[1m]"
-                for call in captured_calls[1:4]
-            ))
+            final = captured_calls[1]
+            self.assertFalse(final["resume_picker_recovery"])
+            resume_at = final["argv"].index("--resume")
+            self.assertEqual(final["argv"][resume_at + 1], session_id)
             self.assertEqual(
-                captured_calls[-1]["argv"][
-                    captured_calls[-1]["argv"].index("--model") + 1
-                ],
-                "gpt-5.6-sol",
+                final["argv"][final["argv"].index("--model") + 1],
+                "claude-fable-5[1m]",
             )
             events = self.events(case)
             self.assertTrue(any(item["event"] == "signal" for item in events))

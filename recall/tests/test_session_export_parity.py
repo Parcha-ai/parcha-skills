@@ -31,7 +31,11 @@ class SessionExportParityTest(unittest.TestCase):
             with self.subTest(harness=harness), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary) / harness
                 root.mkdir()
-                name = "session.jsonl" if harness == "claude" else "rollout-fixture.jsonl"
+                name = (
+                    "session.jsonl"
+                    if harness == "claude"
+                    else "rollout-fixture-019f57ed-74e4-79f1-b140-504e97b05cbe.jsonl"
+                )
                 session = root / name
                 shutil.copy(FIXTURES / fixture, session)
                 source_id = f"{harness}:linux:parity"

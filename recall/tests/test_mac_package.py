@@ -313,6 +313,10 @@ class MacPackageTest(unittest.TestCase):
         self.assertIn('"ProgramArguments": [', installer)
         self.assertIn('"-m", "client.cli", "collect"', installer)
         self.assertIn('"PYTHONPATH":', installer)
+        self.assertIn(
+            'cp -R "$SOURCE/lib/skills" "$TRANSACTION/stage/lib/skills"',
+            installer,
+        )
 
     def test_packaged_local_connectors_install_status_disable_and_uninstall(self) -> None:
         archive = self.build("lifecycle.tar.gz")
@@ -445,6 +449,7 @@ class MacPackageTest(unittest.TestCase):
         agents = self.root / "primary-agents"
         claude = self.root / "claude-root"
         codex = self.root / "codex-root"
+        codex_archive = self.root / "codex-archive-root"
         cowork = self.root / "cowork-root"
         inbox = self.root / "chatgpt-inbox"
         for path in (claude, codex, cowork, inbox):
@@ -457,6 +462,7 @@ class MacPackageTest(unittest.TestCase):
             "--keychain-service", "synthetic.reference", "--visibility", "private",
             "--privacy-mode", "scrub", "--sources", "claude,codex,cowork",
             "--claude-root", str(claude), "--codex-root", str(codex),
+            "--codex-archive-root", str(codex_archive),
             "--cowork-root", str(cowork), "--export-inbox", str(inbox),
             "--no-load",
         ], check=True, text=True, capture_output=True)
@@ -493,6 +499,14 @@ class MacPackageTest(unittest.TestCase):
                     arguments[arguments.index("--max-scan-seconds") + 1],
                     "20",
                 )
+            if label == "codex":
+                self.assertEqual(
+                    arguments[arguments.index("--archive-root") + 1],
+                    str(codex_archive),
+                )
+                self.assertTrue(codex_archive.is_dir())
+            elif command == "collect":
+                self.assertNotIn("--archive-root", arguments)
 
         status = subprocess.run([
             str(prefix / "bin" / "recall-brain"), "mac-status",

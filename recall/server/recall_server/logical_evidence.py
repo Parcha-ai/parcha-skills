@@ -196,6 +196,8 @@ class PreparedPart:
     ordinal: int
     first_record_ordinal: int
     last_record_ordinal: int
+    first_occurred_at: str
+    last_occurred_at: str
     receipt_count: int
     payload: bytes
     content_sha256: str
@@ -451,6 +453,10 @@ def prepare_logical_document(
     part_start = 0
     part_record_count = 0
     part_receipt_count = 0
+    part_first_occurred = ""
+    part_last_occurred = ""
+    part_first_time: datetime | None = None
+    part_last_time: datetime | None = None
     parts: list[PreparedPart] = []
     locations: list[PreparedRecordLocation] = []
     first_occurred: str | None = None
@@ -462,14 +468,20 @@ def prepare_logical_document(
     def close_part(last_record: int) -> None:
         nonlocal part_payload, part_start
         nonlocal part_record_count, part_receipt_count
+        nonlocal part_first_occurred, part_last_occurred
+        nonlocal part_first_time, part_last_time
         payload = bytes(part_payload)
         if not payload:
             return
+        if part_first_time is None or part_last_time is None:
+            raise LogicalEvidenceError("logical_evidence_state_invalid")
         parts.append(
             PreparedPart(
                 ordinal=len(parts),
                 first_record_ordinal=part_start,
                 last_record_ordinal=last_record,
+                first_occurred_at=part_first_occurred,
+                last_occurred_at=part_last_occurred,
                 receipt_count=part_receipt_count,
                 payload=payload,
                 content_sha256=hashlib.sha256(payload).hexdigest(),
@@ -479,6 +491,10 @@ def prepare_logical_document(
         part_start = last_record + 1
         part_record_count = 0
         part_receipt_count = 0
+        part_first_occurred = ""
+        part_last_occurred = ""
+        part_first_time = None
+        part_last_time = None
 
     for record in records:
         if (
@@ -504,15 +520,21 @@ def prepare_logical_document(
         part_record_count += 1
         part_receipt_count += len(record.receipts)
         document_digest.update(encoded)
-        if len(encoded) > part_bytes:
-            close_part(record.ordinal)
         occurred = _parsed_timestamp(record.occurred_at)
+        if part_first_time is None or occurred < part_first_time:
+            part_first_time = occurred
+            part_first_occurred = record.occurred_at
+        if part_last_time is None or occurred > part_last_time:
+            part_last_time = occurred
+            part_last_occurred = record.occurred_at
         if first_time is None or occurred < first_time:
             first_time = occurred
             first_occurred = record.occurred_at
         if last_time is None or occurred > last_time:
             last_time = occurred
             last_occurred = record.occurred_at
+        if len(encoded) > part_bytes:
+            close_part(record.ordinal)
         expected_ordinal += 1
     if expected_ordinal == 0 or not locations:
         raise LogicalEvidenceError("logical_evidence_document_invalid")
@@ -668,6 +690,10 @@ class LogicalEvidenceProjectionStore:
         record_count = 0
         receipt_count = 0
         part_created_at = ""
+        part_first_occurred = ""
+        part_last_occurred = ""
+        part_first_time: datetime | None = None
+        part_last_time: datetime | None = None
         first_occurred = ""
         last_occurred = ""
         first_time: datetime | None = None
@@ -721,6 +747,8 @@ class LogicalEvidenceProjectionStore:
                     ordinal=prepared_part.ordinal,
                     first_record_ordinal=prepared_part.first_record_ordinal,
                     last_record_ordinal=prepared_part.last_record_ordinal,
+                    first_occurred_at=prepared_part.first_occurred_at,
+                    last_occurred_at=prepared_part.last_occurred_at,
                     receipt_count=prepared_part.receipt_count,
                     payload=b"",
                     content_sha256=prepared_part.content_sha256,
@@ -752,13 +780,19 @@ class LogicalEvidenceProjectionStore:
         def close_part(last_record: int) -> None:
             nonlocal part_payload, part_start
             nonlocal part_receipt_count, part_created_at
+            nonlocal part_first_occurred, part_last_occurred
+            nonlocal part_first_time, part_last_time
             payload = bytes(part_payload)
             if not payload:
                 return
+            if part_first_time is None or part_last_time is None:
+                raise LogicalEvidenceError("logical_evidence_state_invalid")
             prepared_part = PreparedPart(
                 ordinal=len(parts) + len(pending_parts),
                 first_record_ordinal=part_start,
                 last_record_ordinal=last_record,
+                first_occurred_at=part_first_occurred,
+                last_occurred_at=part_last_occurred,
                 receipt_count=part_receipt_count,
                 payload=payload,
                 content_sha256=hashlib.sha256(payload).hexdigest(),
@@ -788,6 +822,10 @@ class LogicalEvidenceProjectionStore:
             part_start = last_record + 1
             part_receipt_count = 0
             part_created_at = ""
+            part_first_occurred = ""
+            part_last_occurred = ""
+            part_first_time = None
+            part_last_time = None
 
         try:
             for record in records:
@@ -817,6 +855,12 @@ class LogicalEvidenceProjectionStore:
                     )
                 document_digest.update(encoded)
                 occurred = _parsed_timestamp(record.occurred_at)
+                if part_first_time is None or occurred < part_first_time:
+                    part_first_time = occurred
+                    part_first_occurred = record.occurred_at
+                if part_last_time is None or occurred > part_last_time:
+                    part_last_time = occurred
+                    part_last_occurred = record.occurred_at
                 if first_time is None or occurred < first_time:
                     first_time = occurred
                     first_occurred = record.occurred_at

@@ -68,6 +68,31 @@ Raw artifacts and canonical events do **not** need to be re-ingested.
    person-attribution retrieval eval passes; the prior fingerprint remains a
    rollback target.
 
+For legacy local coding sources that were registered outside employee device
+enrollment, bind every Codex/Claude source owned by the same person in one
+idempotent operation:
+
+```bash
+python -m recall_server.cli employee-source-bind \
+  --tenant tenant:company:example \
+  --employee-key stable-employee-key \
+  --display-name "Employee Name" \
+  --source codex:linux:employee-device \
+  --source claude:linux:employee-device
+```
+
+The command accepts only existing or unprofiled canonical coding sources,
+creates a missing `coding_history` profile, rejects conflicting contributors,
+adopts one unambiguous existing contributor, and requeues the affected derived
+documents. It does not rewrite raw artifacts or canonical events. The opaque
+employee key is stable within the tenant and is not an authentication identifier. If a future
+invitation has the same exact display name and there is exactly one unclaimed
+provisional actor, acceptance links the login principal to that actor. An
+ambiguous name never guesses.
+
+New coding sources do not need this retrofit: setting their coding-history
+profile binds the source owner's existing actor when no attribution exists.
+
 Changing an actor's searchable name or aliases must invalidate that actor's
 contextual representations, but never the raw artifact, exact passage text, or
 citations.

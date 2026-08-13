@@ -193,14 +193,16 @@ def main() -> None:
                 (tenant, credential["principal_id"], name),
             ).fetchone()
         assert actor is not None
-        employees.append({
-            "number": str(number),
-            "name": name,
-            "email": email,
-            "principal_id": credential["principal_id"],
-            "actor_id": actor["actor_id"],
-            "invitation_id": invitation["id"],
-        })
+        employees.append(
+            {
+                "number": str(number),
+                "name": name,
+                "email": email,
+                "principal_id": credential["principal_id"],
+                "actor_id": actor["actor_id"],
+                "invitation_id": invitation["id"],
+            }
+        )
 
     with tempfile.TemporaryDirectory(prefix="recall-employee-e2e-") as value:
         archive = FilesystemArchiveStore(
@@ -266,9 +268,7 @@ def main() -> None:
                     }
                     assistant_content = {
                         "type": "assistant",
-                        "message": {
-                            "content": f"assistant claude marker {number}"
-                        },
+                        "message": {"content": f"assistant claude marker {number}"},
                     }
                 user_event = ingest(
                     gateway=gateway,
@@ -296,10 +296,12 @@ def main() -> None:
                     text=f"assistant {harness} marker {number}",
                     harness=harness,
                 )
-                local_event_ids.extend((
-                    (employee["actor_id"], source_id, user_event, "user"),
-                    (employee["actor_id"], source_id, assistant_event, "assistant"),
-                ))
+                local_event_ids.extend(
+                    (
+                        (employee["actor_id"], source_id, user_event, "user"),
+                        (employee["actor_id"], source_id, assistant_event, "assistant"),
+                    )
+                )
 
         slack_source = f"slack:company:employees-{nonce}"
         with store.connect() as connection:
@@ -340,15 +342,13 @@ def main() -> None:
                 ),
                 content={
                     "author_id": slack_subject,
-                    "text": (
-                        f"employee {employee['number']} slack decision marker"
-                    ),
+                    "text": (f"employee {employee['number']} slack decision marker"),
                 },
                 text=f"employee {employee['number']} slack decision marker",
             )
-            local_event_ids.append((
-                employee["actor_id"], slack_source, slack_event, "user"
-            ))
+            local_event_ids.append(
+                (employee["actor_id"], slack_source, slack_event, "user")
+            )
 
         with store.connect() as connection:
             for actor_id, source_id, event_id, role in local_event_ids:
@@ -369,6 +369,13 @@ def main() -> None:
             ).fetchall()
             assert len(bindings) == 8
             assert {row["relation"] for row in bindings} == {"contributor"}
+        expected_company_sources = {
+            slack_source,
+            *(source for values in employee_sources.values() for source in values),
+        }
+        assert set(store.authorized_canonical_source_ids(tenant, owner)) == (
+            expected_company_sources
+        )
 
         logical_store = LogicalEvidenceProjectionStore(archive)
         logical = CanonicalLogicalEvidenceProjector(
@@ -399,11 +406,14 @@ def main() -> None:
             concurrency=4,
         )
         assert passage_result["documents"] == 12
-        assert passages.embed_pending(
-            tenant_id=tenant,
-            batch_size=100,
-            max_batches=2,
-        )["status"] == "complete"
+        assert (
+            passages.embed_pending(
+                tenant_id=tenant,
+                batch_size=100,
+                max_batches=2,
+            )["status"]
+            == "complete"
+        )
         actor_representation = PassageRepresentation(
             "actor-context-employee-e2e",
             runtime,
@@ -422,13 +432,10 @@ def main() -> None:
         assert represented["status"] == "complete"
         for employee in employees:
             assert any(employee["name"] in value for value in runtime.values)
-            sources = tuple(store.authorized_canonical_source_ids(
-                tenant, employee["principal_id"]
-            ))
-            expected_sources = {
-                slack_source,
-                *(source for values in employee_sources.values() for source in values),
-            }
+            sources = tuple(
+                store.authorized_canonical_source_ids(tenant, employee["principal_id"])
+            )
+            expected_sources = expected_company_sources
             assert set(sources) == expected_sources, (
                 employee["number"],
                 sorted(set(sources) - expected_sources),
@@ -446,9 +453,7 @@ def main() -> None:
                 filters={"person": employee["name"]},
                 limit=20,
             )
-            broad_sources = {
-                result["source_id"] for result in broad["results"]
-            }
+            broad_sources = {result["source_id"] for result in broad["results"]}
             expected_employee_sources = {
                 slack_source,
                 *employee_sources[employee["number"]],
@@ -477,9 +482,7 @@ def main() -> None:
                 },
                 limit=20,
             )
-            authored_sources = {
-                result["source_id"] for result in authored["results"]
-            }
+            authored_sources = {result["source_id"] for result in authored["results"]}
             assert authored_sources == expected_employee_sources, (
                 employee["number"],
                 sorted(authored_sources),
@@ -525,14 +528,17 @@ def main() -> None:
             privacy_mode="scrub",
             selectors={},
         )
-        assert control.revoke_brain_invitation(
-            principal_id=owner,
-            invitation_id=removed["invitation_id"],
-        )["status"] == "revoked"
+        assert (
+            control.revoke_brain_invitation(
+                principal_id=owner,
+                invitation_id=removed["invitation_id"],
+            )["status"]
+            == "revoked"
+        )
         assert store.authenticate_bearer(route_before["token"], "write") is None
-        assert store.authorized_canonical_source_ids(
-            tenant, removed["principal_id"]
-        ) == []
+        assert (
+            store.authorized_canonical_source_ids(tenant, removed["principal_id"]) == []
+        )
         with store.connect() as connection:
             preserved = connection.execute(
                 """SELECT count(*) AS count FROM canonical_event_actors
@@ -542,19 +548,24 @@ def main() -> None:
         assert preserved == 3
 
     store.close()
-    print(json.dumps({
-        "status": "pass",
-        "employees": 4,
-        "local_sources": 8,
-        "shared_sources": 1,
-        "logical_documents": 12,
-        "exact_authored_events": 12,
-        "assistant_authorship_false_positives": 0,
-        "cross_employee_filter_leaks": 0,
-        "unauthorized_results": 0,
-        "revoked_collector_writes": 0,
-        "removed_employee_history_preserved": True,
-    }, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "status": "pass",
+                "employees": 4,
+                "local_sources": 8,
+                "shared_sources": 1,
+                "logical_documents": 12,
+                "exact_authored_events": 12,
+                "assistant_authorship_false_positives": 0,
+                "cross_employee_filter_leaks": 0,
+                "unauthorized_results": 0,
+                "revoked_collector_writes": 0,
+                "removed_employee_history_preserved": True,
+            },
+            sort_keys=True,
+        )
+    )
 
 
 if __name__ == "__main__":

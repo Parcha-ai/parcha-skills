@@ -5,7 +5,6 @@ import json
 import os
 import sys
 import threading
-import time
 import types
 import unittest
 from http.server import ThreadingHTTPServer
@@ -26,6 +25,7 @@ except ModuleNotFoundError:
     sys.modules["psycopg.rows"] = psycopg_rows
 
 from recall_server.app import Handler  # noqa: E402
+from recall_server.deep_inspection import DeepInspectionError  # noqa: E402
 
 
 class FakeStore:
@@ -61,11 +61,84 @@ class FakeStore:
             ],
         }
 
-    def investigate(self, question, *, filters, depth, authorized_source):
-        self.calls.append(
-            ("investigate", question, filters, depth, authorized_source)
-        )
-        return {"investigations": [], "coverage": {"sessions": 0}}
+    def execute_agent_program(self, program, **arguments):
+        self.calls.append(("exec", program, arguments))
+        return {
+            "provider": "synthetic-archil",
+            "stdout": "synthetic evidence",
+            "stderr": "",
+            "exit_code": 0,
+            "complete": True,
+            "stopped_reason": "completed",
+            "output_truncated": False,
+            "opened_receipts": [
+                "recall://source:synthetic:company/item-1?rev=1"
+            ],
+            "documents_available": len(arguments["logical_document_ids"]),
+            "objects_available": len(arguments["logical_document_ids"]),
+        }
+
+    def scope_documents(self, *, filters, limit, offset):
+        self.calls.append(("scope", filters, limit, offset))
+        return {
+            "documents": [{
+                "source_id": "source:synthetic:company",
+                "logical_document_id": (
+                    "ldoc_0123456789abcdef0123456789abcdef"
+                ),
+                "revision": 1,
+                "first_occurred_at": "2026-08-08T00:00:00Z",
+                "last_occurred_at": "2026-08-08T01:00:00Z",
+                "record_count": 2,
+                "part_count": 1,
+            }],
+            "total_documents": 1,
+            "offset": offset,
+            "complete": True,
+            "diagnostics": {"engine": "canonical-scope-v1"},
+        }
+
+    def list_people(self):
+        self.calls.append(("people",))
+        return {
+            "people": [{
+                "actor_id": "actor_0123456789abcdef0123456789abcdef",
+                "display_name": "Synthetic Employee",
+                "sources": [{
+                    "source_id": "source:synthetic:company",
+                    "relation": "owner",
+                }],
+            }],
+            "complete": True,
+            "diagnostics": {"engine": "canonical-people-v1"},
+        }
+
+    def execute_agent_program_parallel(self, program, **arguments):
+        self.calls.append(("exec_map", program, arguments))
+        return {
+            "provider": "synthetic-archil",
+            "complete": True,
+            "opened_receipts": [],
+            "shards": [{"shard": 0, "complete": True, "stdout": ""}],
+            "timing": {"elapsed_ms": 100.0},
+        }
+
+    def execute_parquet_scan(self, program, **arguments):
+        self.calls.append(("scan", program, arguments))
+        return {
+            "provider": "synthetic-archil",
+            "stdout": "synthetic scan",
+            "stderr": "",
+            "exit_code": 0,
+            "complete": True,
+            "stopped_reason": "completed",
+            "output_truncated": False,
+            "opened_receipts": [],
+            "datasets_available": 4,
+            "sources_available": 1,
+            "buckets_available": 1,
+            "projection_pending": 0,
+        }
 
     def show(self, target, *, around, tail, prompts, authorized_source):
         self.calls.append(("show", target, around, tail, prompts, authorized_source))
@@ -178,6 +251,12 @@ class OversizedShowStore(FakeStore):
         }
 
 
+class FailingExecStore(PolicyStore):
+    def execute_agent_program(self, program, **arguments):
+        del program, arguments
+        raise DeepInspectionError("private-provider-payload-must-not-escape")
+
+
 class McpHttpServer:
     def __init__(self, store: FakeStore, verifier=None) -> None:
         Handler.store = store
@@ -229,164 +308,6 @@ class McpHttpServer:
         result_headers = {key.casefold(): value for key, value in response.getheaders()}
         connection.close()
         return response.status, result_headers, raw
-
-
-class AsyncTaskCoordinator:
-    def __init__(self) -> None:
-        self.polls = 0
-        self.cancelled = False
-
-    @staticmethod
-    def _run(status: str) -> dict:
-        value = {
-            "contract": "recall.agent-run.v1",
-            "schema_version": 1,
-            "run_id": "run_0123456789abcdef0123456789abcdef",
-            "request_id": "req_0123456789abcdef",
-            "tenant_id": "tenant:synthetic:company",
-            "principal_id": "principal:synthetic:member",
-            "trace_id": "trc_0123456789abcdef0123456789abcdef",
-            "status": status,
-            "status_message": "completed" if status == "complete" else "searching",
-            "attempt": 1,
-            "created_at": "2026-08-07T00:00:00Z",
-            "updated_at": (
-                "2026-08-07T00:00:02Z"
-                if status == "complete"
-                else "2026-08-07T00:00:01Z"
-            ),
-        }
-        if status == "complete":
-            value["completed_at"] = "2026-08-07T00:00:02Z"
-        return value
-
-    def start(self, *_args):
-        return {
-            "run": self._run("running"),
-            "task_id": "tsk_0123456789abcdef0123456789abcdef",
-            "ttl_ms": 60_000,
-        }
-
-    def task_status(self, *_args):
-        self.polls += 1
-        return {
-            "run": self._run(
-                "cancelled"
-                if self.cancelled
-                else "complete" if self.polls >= 2 else "running"
-            ),
-            "task_id": "tsk_0123456789abcdef0123456789abcdef",
-            "ttl_ms": 60_000,
-        }
-
-    @staticmethod
-    def task_result(*_args):
-        return {"answer": "Synthetic durable answer"}
-
-    def task_cancel(self, *_args):
-        self.cancelled = True
-        return {}
-
-    @staticmethod
-    def status(*_args):
-        return {}
-
-    @staticmethod
-    def result(*_args):
-        return {}
-
-    @staticmethod
-    def cancel(*_args):
-        return {}
-
-    def use_recall(self, *_args):
-        started = self.start(None)
-        return {
-            **started,
-            "continuation": {
-                "tool": "recall_agent_result",
-                "arguments": {"run_id": started["run"]["run_id"]},
-                "poll_after_ms": 1000,
-            },
-        }
-
-
-class ModernTaskHttpServer:
-    def __init__(self) -> None:
-        Handler.store = PolicyStore()
-        Handler.agent_service = None
-        Handler.agent_coordinator = AsyncTaskCoordinator()
-        Handler.canonical_retrieval = None
-        Handler.external_identity_verifier = None
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.server.daemon_threads = True
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-
-    def __enter__(self):
-        self.thread.start()
-        return self
-
-    def __exit__(self, *_exc):
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=2)
-        Handler.agent_coordinator = None
-
-    def request(
-        self,
-        body: dict,
-        *,
-        name: str | None = None,
-        protocol: str = "2026-07-28",
-    ):
-        connection, response = self.open(body, name=name, protocol=protocol)
-        raw = response.read()
-        content_type = response.getheader("Content-Type")
-        status = response.status
-        connection.close()
-        return status, content_type, raw
-
-    def open(
-        self,
-        body: dict,
-        *,
-        name: str | None = None,
-        protocol: str = "2026-07-28",
-        route_method: str | None = None,
-    ):
-        payload = json.dumps(body).encode()
-        headers = {
-            "Authorization": "Bearer synthetic-human-read",
-            "Content-Type": "application/json",
-            "Content-Length": str(len(payload)),
-            "Accept": "application/json, text/event-stream",
-            "MCP-Protocol-Version": protocol,
-        }
-        if protocol == "2026-07-28":
-            headers["Mcp-Method"] = route_method or body["method"]
-        if name is not None:
-            headers["Mcp-Name"] = name
-        connection = http.client.HTTPConnection(
-            "127.0.0.1",
-            self.server.server_port,
-            timeout=4,
-        )
-        connection.request("POST", "/mcp", body=payload, headers=headers)
-        response = connection.getresponse()
-        return connection, response
-
-
-def modern_meta() -> dict:
-    return {
-        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-        "io.modelcontextprotocol/clientInfo": {
-            "name": "synthetic-modern-client",
-            "version": "1",
-        },
-        "io.modelcontextprotocol/clientCapabilities": {
-            "extensions": {"io.modelcontextprotocol/tasks": {}},
-        },
-    }
 
 
 def request(method: str, request_id: int = 1, params: dict | None = None) -> dict:
@@ -453,164 +374,6 @@ class RemoteMcpContractTest(unittest.TestCase):
                     "recall_forget",
                 ],
             )
-
-    def test_modern_task_returns_immediately_and_streams_to_completion(self) -> None:
-        request_value = {
-            "contract": "recall.agent-request.v1",
-            "schema_version": 1,
-            "request_id": "req_0123456789abcdef",
-            "idempotency_key": "synthetic-modern-http",
-            "question": "What changed?",
-            "depth": "normal",
-        }
-        with ModernTaskHttpServer() as server:
-            started_at = time.monotonic()
-            status, content_type, raw = server.request(
-                request(
-                    "tools/call",
-                    params={
-                        "name": "use_recall",
-                        "arguments": request_value,
-                        "_meta": modern_meta(),
-                    },
-                ),
-                name="use_recall",
-            )
-            self.assertLess(time.monotonic() - started_at, 0.5)
-            self.assertEqual((status, content_type), (200, "application/json"))
-            task = json.loads(raw)["result"]
-            self.assertEqual((task["resultType"], task["status"]), ("task", "working"))
-
-            connection, response = server.open(request(
-                "subscriptions/listen",
-                request_id=2,
-                params={
-                    "notifications": {"taskIds": [task["taskId"]]},
-                    "_meta": modern_meta(),
-                },
-            ))
-            self.assertEqual(
-                (response.status, response.getheader("Content-Type")),
-                (200, "text/event-stream"),
-            )
-            messages = []
-            while len(messages) < 3:
-                line = response.readline().decode()
-                self.assertTrue(line, "subscription closed before terminal task state")
-                if line.startswith("data: "):
-                    messages.append(json.loads(line.removeprefix("data: ")))
-            response.close()
-            connection.close()
-            self.assertEqual(
-                messages[0]["method"],
-                "notifications/subscriptions/acknowledged",
-            )
-            self.assertEqual(
-                [item["params"]["status"] for item in messages[1:]],
-                ["working", "completed"],
-            )
-            self.assertEqual(
-                messages[-1]["params"]["result"]["structuredContent"]["answer"],
-                "Synthetic durable answer",
-            )
-
-            # A dropped listener never loses the durable result. Re-subscribing
-            # starts with an acknowledgement and the current complete state.
-            connection, response = server.open(request(
-                "subscriptions/listen",
-                request_id=3,
-                params={
-                    "notifications": {"taskIds": [task["taskId"]]},
-                    "_meta": modern_meta(),
-                },
-            ))
-            replayed = []
-            while len(replayed) < 2:
-                line = response.readline().decode()
-                self.assertTrue(line)
-                if line.startswith("data: "):
-                    replayed.append(json.loads(line.removeprefix("data: ")))
-            response.close()
-            connection.close()
-            self.assertEqual(replayed[1]["params"]["status"], "completed")
-
-    def test_legacy_client_gets_immediate_handle_and_can_cancel(self) -> None:
-        request_value = {
-            "contract": "recall.agent-request.v1",
-            "schema_version": 1,
-            "request_id": "req_0123456789abcdef",
-            "idempotency_key": "synthetic-legacy-http",
-            "question": "What changed?",
-            "depth": "normal",
-        }
-        with ModernTaskHttpServer() as server:
-            started_at = time.monotonic()
-            status, _, raw = server.request(
-                request(
-                    "tools/call",
-                    params={"name": "use_recall", "arguments": request_value},
-                ),
-                protocol="2025-11-25",
-            )
-            self.assertLess(time.monotonic() - started_at, 0.5)
-            self.assertEqual(status, 200)
-            handle = json.loads(raw)["result"]["structuredContent"]
-            self.assertEqual(handle["run"]["status"], "running")
-            self.assertEqual(handle["continuation"]["tool"], "recall_agent_result")
-
-            task_id = handle["task_id"]
-            status, _, raw = server.request(
-                request("tasks/cancel", params={"taskId": task_id}),
-                name=task_id,
-                protocol="2026-06-30",
-            )
-            self.assertEqual(status, 200)
-            self.assertEqual(json.loads(raw)["result"], {"resultType": "complete"})
-
-    def test_modern_header_mismatch_and_missing_capability_use_http_errors(self) -> None:
-        with ModernTaskHttpServer() as server:
-            body = request("tools/list", params={"_meta": modern_meta()})
-            connection, response = server.open(body)
-            self.assertEqual(response.status, 200)
-            listed = json.loads(response.read())["result"]
-            connection.close()
-            self.assertEqual(
-                (listed["ttlMs"], listed["cacheScope"]),
-                (300_000, "private"),
-            )
-
-            connection, response = server.open(
-                body,
-                route_method="ping",
-            )
-            self.assertEqual(response.status, 400)
-            self.assertEqual(json.loads(response.read())["error"]["code"], -32020)
-            connection.close()
-
-            body["method"] = "ping"
-            connection, response = server.open(body)
-            self.assertEqual(response.status, 404)
-            self.assertEqual(json.loads(response.read())["error"]["code"], -32601)
-            connection.close()
-
-            body = request(
-                "subscriptions/listen",
-                params={
-                    "notifications": {
-                        "taskIds": ["tsk_0123456789abcdef0123456789abcdef"]
-                    },
-                    "_meta": {
-                        **modern_meta(),
-                        "io.modelcontextprotocol/clientCapabilities": {},
-                    },
-                },
-            )
-            connection, response = server.open(body)
-            self.assertEqual(response.status, 400)
-            error = json.loads(response.read())["error"]
-            connection.close()
-            self.assertEqual(error["code"], -32003)
-            self.assertIn("requiredCapabilities", error["data"])
 
     def test_oauth_resource_challenge_and_default_deny_policy(self) -> None:
         resource = "https://recall.synthetic.invalid/mcp"
@@ -702,12 +465,32 @@ class RemoteMcpContractTest(unittest.TestCase):
                 }
                 self.assertEqual(names, {
                     "recall_search",
-                    "recall_deep_search",
-                    "recall_investigate",
+                    "recall_people",
+                    "recall_scope",
+                    "recall_exec",
+                    "recall_exec_map",
+                    "recall_scan",
                     "recall_session_context",
                     "recall_show",
                     "recall_related",
                 })
+
+                status, _, raw = server.request(
+                    "POST",
+                    request("tools/call", params={
+                        "name": "recall_people",
+                        "arguments": {},
+                    }),
+                    token="synthetic-human-read",
+                    protocol="2025-11-25",
+                )
+                self.assertEqual(status, 200)
+                people = json.loads(raw)["result"]["structuredContent"]
+                self.assertEqual(
+                    people["people"][0]["display_name"],
+                    "Synthetic Employee",
+                )
+                self.assertNotIn("email", json.dumps(people).casefold())
 
                 status, _, raw = server.request(
                     "POST",
@@ -907,9 +690,11 @@ class RemoteMcpContractTest(unittest.TestCase):
                 ]
             },
         )
-        with ModernTaskHttpServer() as server:
+        with McpHttpServer(PolicyStore()) as server:
             _, _, canonical_raw = server.request(
+                "POST",
                 request("tools/list"),
+                token="synthetic-human-read",
                 protocol="2025-11-25",
             )
         canonical_catalog = {
@@ -920,22 +705,76 @@ class RemoteMcpContractTest(unittest.TestCase):
             name: tool["inputSchema"]
             for name, tool in canonical_catalog.items()
         }
-        self.assertIn(
-            "one person/time slice",
-            canonical_catalog["use_recall"]["description"],
-        )
-        self.assertIn(
-            "Never use one broad call as proof of absence",
-            canonical_catalog["use_recall"]["description"],
-        )
-        investigate_filters = canonical_tools["recall_investigate"]["properties"][
-            "filters"
-        ]["properties"]
         self.assertEqual(
-            investigate_filters["person"],
-            {"type": "string", "maxLength": 256},
+            canonical_tools["recall_exec"]["properties"]["targets"]["maxItems"],
+            20,
         )
-        self.assertIn("author", investigate_filters["person_relation"]["enum"])
+        self.assertEqual(
+            canonical_tools["recall_scope"]["properties"]["limit"]["maximum"],
+            80,
+        )
+        self.assertEqual(
+            canonical_tools["recall_exec_map"]["properties"]["targets"]["maxItems"],
+            80,
+        )
+        self.assertEqual(
+            canonical_tools["recall_exec"]["properties"]["timeout_seconds"][
+                "maximum"
+            ],
+            30,
+        )
+        self.assertEqual(
+            canonical_tools["recall_scan"]["properties"]["timeout_seconds"],
+            {"type": "integer", "minimum": 1, "maximum": 240, "default": 60},
+        )
+        self.assertIn(
+            "/docs/d1",
+            canonical_catalog["recall_exec"]["description"],
+        )
+        self.assertIn(
+            "month granularity",
+            canonical_catalog["recall_scan"]["description"],
+        )
+        self.assertIn(
+            "actors-part-*.parquet",
+            canonical_catalog["recall_scan"]["description"],
+        )
+        self.assertIn(
+            "passages-part-*.parquet",
+            canonical_catalog["recall_scan"]["description"],
+        )
+        self.assertIn(
+            "16 KiB",
+            canonical_catalog["recall_scan"]["description"],
+        )
+        self.assertIn(
+            "recall-scan --broad --fixed",
+            canonical_catalog["recall_exec"]["description"],
+        )
+        self.assertIn(
+            "recall_exec_map",
+            canonical_catalog["recall_exec"]["description"],
+        )
+        self.assertIn(
+            "rg -L",
+            canonical_catalog["recall_exec"]["description"],
+        )
+        self.assertIn(
+            "event_native_id",
+            canonical_catalog["recall_exec"]["description"],
+        )
+        self.assertIn(
+            "shard_size=1",
+            canonical_catalog["recall_exec_map"]["description"],
+        )
+        self.assertIn(
+            "rg -L",
+            canonical_catalog["recall_exec_map"]["description"],
+        )
+        self.assertIn(
+            "content_fragment",
+            canonical_catalog["recall_exec_map"]["description"],
+        )
         self.assertEqual(
             tools["recall_search"]["properties"]["filters"]["properties"]["person"],
             {"type": "string", "maxLength": 256},
@@ -964,6 +803,25 @@ class RemoteMcpContractTest(unittest.TestCase):
         self.assertEqual(capture["body"]["maxLength"], 32_000)
         self.assertEqual(capture["tags"]["items"]["maxLength"], 64)
         self.assertIn("pattern", capture["provenance"]["properties"]["uri"])
+
+    def test_initialize_teaches_evidence_first_retrieval(self) -> None:
+        with McpHttpServer(self.store) as server:
+            _, _, raw = server.request(
+                "POST",
+                request(
+                    "initialize",
+                    params={"protocolVersion": "2025-06-18"},
+                ),
+                protocol="2025-06-18",
+            )
+        instructions = json.loads(raw)["result"]["instructions"]
+        self.assertIn("recall_search", instructions)
+        self.assertIn("recall_exec", instructions)
+        self.assertIn("opened_receipts", instructions)
+        self.assertIn("Never infer", instructions)
+        self.assertIn("each named part", instructions)
+        self.assertIn("passages-part-*.parquet", instructions)
+        self.assertIn("planning hints", instructions)
 
     def test_show_uses_timestamp_and_rejects_conflicting_tail_before_store(self) -> None:
         target = "recall://synthetic:codex/item-1?rev=1"
@@ -1023,13 +881,9 @@ class RemoteMcpContractTest(unittest.TestCase):
                 self.assertEqual(json.loads(raw)["error"]["code"], -32602)
                 self.assertNotIn("show", {call[0] for call in self.store.calls})
 
-    def test_investigate_passes_person_and_time_scope_to_store(self) -> None:
-        filters = {
-            "since": "2026-08-05T07:00:00Z",
-            "until": "2026-08-06T07:00:00Z",
-            "person": "Christian",
-            "person_relation": "author",
-        }
+    def test_exec_passes_only_bounded_exact_targets_to_canonical_store(self) -> None:
+        first = "ldoc_0123456789abcdef0123456789abcdef"
+        second = "ldoc_fedcba9876543210fedcba9876543210"
         store = PolicyStore()
         with McpHttpServer(store) as server:
             status, _, raw = server.request(
@@ -1037,11 +891,86 @@ class RemoteMcpContractTest(unittest.TestCase):
                 request(
                     "tools/call",
                     params={
-                        "name": "recall_investigate",
+                        "name": "recall_exec",
                         "arguments": {
-                            "question": "What did Chris do yesterday?",
-                            "filters": filters,
-                            "depth": "deep",
+                            "targets": [
+                                {"logical_document_id": first, "alias": "d1"},
+                                {"logical_document_id": second, "alias": "d2"},
+                            ],
+                            "program": "rg -n --fixed-strings decision /docs",
+                            "timeout_seconds": 17,
+                        },
+                    },
+                ),
+                token="synthetic-human-read",
+                protocol="2025-11-25",
+            )
+        self.assertEqual(status, 200)
+        result = json.loads(raw)["result"]["structuredContent"]
+        self.assertEqual(result["documents_available"], 2)
+        self.assertEqual(result["opened_receipts"], [
+            "recall://source:synthetic:company/item-1?rev=1"
+        ])
+        self.assertIn(
+            (
+                "exec",
+                "rg -n --fixed-strings decision /docs",
+                {
+                    "logical_document_ids": (first, second),
+                    "document_aliases": {first: "d1", second: "d2"},
+                    "record_spans": {first: (), second: ()},
+                    "routing_receipts": {first: (), second: ()},
+                    "timeout_seconds": 17,
+                },
+            ),
+            store.calls,
+        )
+
+    def test_exec_rejects_duplicate_targets_before_store(self) -> None:
+        document_id = "ldoc_0123456789abcdef0123456789abcdef"
+        store = PolicyStore()
+        with McpHttpServer(store) as server:
+            status, _, raw = server.request(
+                "POST",
+                request(
+                    "tools/call",
+                    params={
+                        "name": "recall_exec",
+                        "arguments": {
+                            "targets": [
+                                {"logical_document_id": document_id, "alias": "d1"},
+                                {"logical_document_id": document_id, "alias": "d2"},
+                            ],
+                            "program": "true",
+                        },
+                    },
+                ),
+                token="synthetic-human-read",
+                protocol="2025-11-25",
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw)["error"]["code"], -32602)
+        self.assertNotIn("exec", {call[0] for call in store.calls})
+
+    def test_scope_and_parallel_exec_are_bounded_and_principal_scoped(self) -> None:
+        document_id = "ldoc_0123456789abcdef0123456789abcdef"
+        store = PolicyStore()
+        with McpHttpServer(store) as server:
+            status, _, raw = server.request(
+                "POST",
+                request(
+                    "tools/call",
+                    params={
+                        "name": "recall_scope",
+                        "arguments": {
+                            "filters": {
+                                "person": "Synthetic Person",
+                                "person_relation": "contributor",
+                                "since": "2026-08-08T00:00:00Z",
+                                "until": "2026-08-09T00:00:00Z",
+                            },
+                            "limit": 40,
+                            "offset": 0,
                         },
                     },
                 ),
@@ -1052,14 +981,113 @@ class RemoteMcpContractTest(unittest.TestCase):
         self.assertIn("result", json.loads(raw))
         self.assertIn(
             (
-                "investigate",
-                "What did Chris do yesterday?",
-                filters,
-                "deep",
-                ["source:synthetic:company"],
+                "scope",
+                {
+                    "person": "Synthetic Person",
+                    "person_relation": "contributor",
+                    "since": "2026-08-08T00:00:00Z",
+                    "until": "2026-08-09T00:00:00Z",
+                },
+                40,
+                0,
             ),
             store.calls,
         )
+
+        store.calls.clear()
+        with McpHttpServer(store) as server:
+            status, _, raw = server.request(
+                "POST",
+                request(
+                    "tools/call",
+                    params={
+                        "name": "recall_exec_map",
+                        "arguments": {
+                            "targets": [{
+                                "logical_document_id": document_id,
+                                "alias": "d1",
+                            }],
+                            "program": "rg -n --fixed-strings decision /docs",
+                            "max_parallel": 4,
+                            "shard_size": 20,
+                            "timeout_seconds": 17,
+                        },
+                    },
+                ),
+                token="synthetic-human-read",
+                protocol="2025-11-25",
+            )
+        self.assertEqual(status, 200)
+        self.assertIn("result", json.loads(raw))
+        self.assertIn("exec_map", {call[0] for call in store.calls})
+
+    def test_scan_is_one_code_mode_call_with_hard_scope(self) -> None:
+        store = PolicyStore()
+        program = (
+            "duckdb -json -c \"select record_json from "
+            "read_parquet('/datasets/*/*/records-part-*.parquet') limit 5\""
+        )
+        filters = {
+            "person": "Synthetic Person",
+            "source_family": "coding_history",
+            "since": "2026-08-01T00:00:00Z",
+            "until": "2026-08-08T00:00:00Z",
+        }
+        with McpHttpServer(store) as server:
+            status, _, raw = server.request(
+                "POST",
+                request(
+                    "tools/call",
+                    params={
+                        "name": "recall_scan",
+                        "arguments": {
+                            "filters": filters,
+                            "program": program,
+                            "timeout_seconds": 120,
+                        },
+                    },
+                ),
+                token="synthetic-human-read",
+                protocol="2025-11-25",
+            )
+        self.assertEqual(status, 200)
+        result = json.loads(raw)["result"]["structuredContent"]
+        self.assertEqual(result["datasets_available"], 4)
+        self.assertIn(
+            (
+                "scan",
+                program,
+                {"filters": filters, "timeout_seconds": 120},
+            ),
+            store.calls,
+        )
+
+    def test_exec_provider_failure_is_content_free(self) -> None:
+        document_id = "ldoc_0123456789abcdef0123456789abcdef"
+        with McpHttpServer(FailingExecStore()) as server:
+            status, _, raw = server.request(
+                "POST",
+                request(
+                    "tools/call",
+                    params={
+                        "name": "recall_exec",
+                        "arguments": {
+                            "targets": [
+                                {"logical_document_id": document_id, "alias": "d1"}
+                            ],
+                            "program": "true",
+                        },
+                    },
+                ),
+                token="synthetic-human-read",
+                protocol="2025-11-25",
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(raw)["error"],
+            {"code": -32603, "message": "recall_exec_failed"},
+        )
+        self.assertNotIn(b"private-provider-payload", raw)
 
     def test_search_and_related_bounds_reject_before_store(self) -> None:
         cases = (
