@@ -10,6 +10,7 @@ from server.recall_server.control import (
     ControlError,
     ControlPlane,
     GoogleOAuthProvider,
+    SlackOAuthProvider,
     SecretBox,
 )
 from server.recall_server.app import validate_http_profile
@@ -72,6 +73,36 @@ class GoogleOAuthProviderTests(unittest.TestCase):
                 client_secret="synthetic-secret",
                 redirect_uri="http://recall.example/callback",
             )
+
+
+class SlackOAuthProviderTests(unittest.TestCase):
+    def setUp(self):
+        self.provider = SlackOAuthProvider(
+            client_id="synthetic-client",
+            client_secret="synthetic-secret",
+            redirect_uri="https://recall.example/admin/oauth/callback/slack",
+        )
+
+    def test_authorization_and_exchange_bind_exact_workspace_and_installer(self):
+        url = self.provider.authorization_url(
+            state="s" * 48, code_challenge="ignored",
+            scopes=("channels:history", "users:read"),
+        )
+        query = parse_qs(urlsplit(url).query)
+        self.assertEqual(query["scope"], ["channels:history,users:read"])
+        self.assertEqual(query["state"], ["s" * 48])
+        with patch.object(GoogleOAuthProvider, "_post", return_value={
+            "ok": True,
+            "access_token": "synthetic-bot-token",
+            "scope": "users:read,channels:history",
+            "team": {"id": "T123"},
+            "authed_user": {"id": "U111"},
+        }):
+            tokens = self.provider.exchange(code="synthetic-code", code_verifier="ignored")
+        self.assertEqual(tokens.subject_id, "T123")
+        self.assertEqual(tokens.credentials["team_id"], "T123")
+        self.assertEqual(tokens.credentials["authed_user_id"], "U111")
+        self.assertEqual(tokens.granted_scopes, ("channels:history", "users:read"))
 
 
 class FakeConnectedAccounts:
@@ -440,6 +471,34 @@ class AdminProfileTests(unittest.TestCase):
         with patch.dict(os.environ, partial, clear=True):
             with self.assertRaisesRegex(RuntimeError, "must be complete"):
                 validate_http_profile()
+
+    def test_partial_slack_configuration_fails_closed(self):
+        partial = {
+            "RECALL_ADMIN_WEB_ENABLED": "1",
+            "RECALL_AUTH_REQUIRED": "1",
+            "RECALL_HTTP_PROFILE": "public-mcp",
+            "RECALL_CONTROL_ENCRYPTION_KEY": base64.urlsafe_b64encode(b"k" * 32)
+            .rstrip(b"=").decode(),
+            "RECALL_SLACK_CLIENT_ID": "synthetic-client",
+        }
+        with patch.dict(os.environ, partial, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "must be complete"):
+                validate_http_profile()
+
+    def test_complete_slack_configuration_registers_provider(self):
+        complete = {
+            "RECALL_CONTROL_ENCRYPTION_KEY": base64.urlsafe_b64encode(b"k" * 32)
+            .rstrip(b"=").decode(),
+            "RECALL_SLACK_CLIENT_ID": "synthetic-client",
+            "RECALL_SLACK_CLIENT_SECRET": "synthetic-secret",
+            "RECALL_SLACK_SIGNING_SECRET": "synthetic-signing-secret",
+            "RECALL_SLACK_REDIRECT_URI": (
+                "https://recall.example/admin/oauth/callback/slack"
+            ),
+        }
+        with patch.dict(os.environ, complete, clear=True):
+            plane = ControlPlane.from_env(object())
+            self.assertIsInstance(plane.providers["slack"], SlackOAuthProvider)
 
     def test_complete_composio_configuration_registers_broker(self):
         complete = {

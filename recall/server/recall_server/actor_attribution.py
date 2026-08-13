@@ -20,6 +20,7 @@ ACTOR_RELATIONS = frozenset({
 MAX_ACTOR_LINKS = 64
 MAX_EXTERNAL_SUBJECT_LENGTH = 512
 EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+\Z")
+SLACK_ACTOR_RE = re.compile(r"slack:[A-Z][A-Z0-9]{1,31}:[A-Z][A-Z0-9]{1,31}\Z")
 
 
 def actor_id_for_principal(tenant_id: str, principal_id: str) -> str:
@@ -113,6 +114,11 @@ class ActorIdentityIndex:
         if EMAIL_RE.fullmatch(normalized):
             lookup_connector = "identity"
             lookup_namespace = "email"
+        elif SLACK_ACTOR_RE.fullmatch(normalized):
+            # The workspace-qualified Slack subject is acquisition-independent:
+            # export and API records must resolve to the same employee.
+            lookup_connector = "identity"
+            lookup_namespace = "slack_user"
         if not lookup_connector or not lookup_namespace:
             raise ValueError("invalid actor identity namespace")
         digest = self._blind_index(
@@ -239,6 +245,58 @@ def attribute_canonical_events(
         inserted += max(0, result.rowcount)
     if identity_index is None:
         return inserted
+    derived_identities: list[dict[str, str]] = []
+    for _event_id, connector_id, event in prepared:
+        content = event.get("content") if isinstance(event, dict) else None
+        if (
+            connector_id not in {"slack.messages", "portable.slack"}
+            or not isinstance(content, dict)
+            or content.get("kind") != "contact_identity.v1"
+            or content.get("identifier_type") != "email"
+            or not isinstance(content.get("identifier"), str)
+            or not isinstance(content.get("identity_id"), str)
+            or not content["identity_id"].endswith(":email")
+        ):
+            continue
+        slack_subject = content["identity_id"].removesuffix(":email")
+        if SLACK_ACTOR_RE.fullmatch(slack_subject) is None:
+            continue
+        email_connector, email_namespace, email_digest = identity_index.lookup(
+            tenant_id, connector_id, "identifier", content["identifier"],
+        )
+        slack_connector, slack_namespace, slack_digest = identity_index.lookup(
+            tenant_id, connector_id, "author_id", slack_subject,
+        )
+        derived_identities.append({
+            "email_connector": email_connector,
+            "email_namespace": email_namespace,
+            "email_digest": email_digest,
+            "slack_connector": slack_connector,
+            "slack_namespace": slack_namespace,
+            "slack_digest": slack_digest,
+        })
+    if derived_identities:
+        import json
+
+        connection.execute(
+               """INSERT INTO brain_actor_external_identities(
+                   tenant_id,actor_id,connector_id,namespace,
+                   subject_hmac_sha256
+               )
+               SELECT %s,email.actor_id,derived.slack_connector,
+                      derived.slack_namespace,derived.slack_digest
+                 FROM jsonb_to_recordset(%s::jsonb) AS derived(
+                      email_connector text,email_namespace text,email_digest char(64),
+                      slack_connector text,slack_namespace text,slack_digest char(64)
+                 )
+                 JOIN brain_actor_external_identities email
+                   ON email.tenant_id=%s
+                  AND email.connector_id=derived.email_connector
+                  AND email.namespace=derived.email_namespace
+                  AND email.subject_hmac_sha256=derived.email_digest
+               ON CONFLICT DO NOTHING""",
+            (tenant_id, json.dumps(derived_identities), tenant_id),
+        )
     references: list[dict[str, str]] = []
     for event_id, connector_id, event in prepared:
         for reference in native_actor_references(event):

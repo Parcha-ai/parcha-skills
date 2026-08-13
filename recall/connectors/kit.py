@@ -34,6 +34,15 @@ from connectors.managed_auth import (
     ManagedWakeup,
     verify_nango_wakeup,
 )
+from connectors.source_plugin import (
+    SOURCE_PLUGIN_API_VERSION,
+    SourcePlugin,
+    SourcePluginManifest,
+    WireSourceConnector,
+    pull_source_plugin_wire,
+    run_source_plugin_conformance,
+    validate_source_plugin,
+)
 
 
 CONNECTOR_KIT_API_VERSION = "recall.connector-kit.v1"
@@ -130,4 +139,11 @@ __all__ = [
     "verify_nango_wakeup",
     "decode_page_wire",
     "encode_page_wire",
+    "SOURCE_PLUGIN_API_VERSION",
+    "SourcePlugin",
+    "SourcePluginManifest",
+    "WireSourceConnector",
+    "pull_source_plugin_wire",
+    "run_source_plugin_conformance",
+    "validate_source_plugin",
 ]

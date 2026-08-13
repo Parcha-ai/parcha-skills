@@ -69,10 +69,11 @@ def main() -> None:
         notion = root / "notion.zip"
         x_archive = root / "x.zip"
         write_zip(slack, {
+            "channels.json": json.dumps([{"id": "C123", "name": "general"}]),
             "general/2026-07-17.json": json.dumps([{
                 "client_msg_id": "slack-e2e-1",
                 "ts": "1784282400.000001",
-                "user": "member-e2e",
+                "user": "U111",
                 "text": (
                     "portable slack postgres marker "
                     "api_key=synthetic-portable-slack-canary"
@@ -95,7 +96,7 @@ def main() -> None:
         writer = StoreWriter(store)
         connectors = [
             SlackArchiveConnector(
-                path=slack, source_id=SOURCES[0], archive_id="workspace-e2e",
+                path=slack, source_id=SOURCES[0], archive_id="T123",
             ),
             NotionArchiveConnector(
                 path=notion, source_id=SOURCES[1], archive_id="space-e2e",
@@ -130,10 +131,11 @@ def main() -> None:
 
         slack_id = connectors[0].pull(None).records[0].native_id
         write_zip(slack, {
+            "channels.json": json.dumps([{"id": "C123", "name": "general"}]),
             "general/2026-07-17.json": json.dumps([{
                 "client_msg_id": "slack-e2e-1",
                 "ts": "1784282400.000001",
-                "user": "member-e2e",
+                "user": "U111",
                 "text": "portable slack revised marker",
             }]),
         })
@@ -142,7 +144,7 @@ def main() -> None:
             runner.close()
         remover = ConnectorRunner(
             connector=SlackArchiveConnector(
-                path=slack, source_id=SOURCES[0], archive_id="workspace-e2e",
+                path=slack, source_id=SOURCES[0], archive_id="T123",
                 removed_native_ids=(slack_id,),
             ),
             brain=writer,

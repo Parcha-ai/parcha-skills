@@ -539,6 +539,44 @@ RECALL_COMPOSIO_API_KEY=<scoped server-side project key>
 RECALL_COMPOSIO_REDIRECT_URI=https://<public-host>/admin/oauth/callback/composio
 ```
 
+Slack is a direct managed source. Configure all four values or none; partial
+configuration fails startup closed:
+
+```text
+RECALL_SLACK_CLIENT_ID=<Slack app client ID>
+RECALL_SLACK_CLIENT_SECRET=<Slack app client secret>
+RECALL_SLACK_SIGNING_SECRET=<Slack app signing secret>
+RECALL_SLACK_REDIRECT_URI=https://<public-host>/admin/oauth/callback/slack
+```
+
+Generate a paste-ready Slack app manifest from the exact public origin:
+
+```bash
+python -m connectors.slack_manifest https://<public-host> > /tmp/recall-slack-app.json
+```
+
+Create the Slack app **from a manifest**, paste that JSON, then copy the app's
+client ID, client secret, and signing secret into the deployment secret manager.
+After the deployment is healthy, generate the final manifest with
+`python -m connectors.slack_manifest --events https://<public-host>` and update
+the app from that manifest; Slack can now verify the signed Events URL. No Slack
+token is copied into Recall—the owner completes installation from the Recall
+switchboard and the resulting bot token is encrypted server-side.
+
+Register `https://<public-host>/webhooks/v1/slack` as the Events API request URL
+and subscribe to `message.channels`, `message.groups`, `message.im`, and
+`message.mpim`. The bundled source requests only its declared bot scopes,
+discovers all public channels plus private channels to which it was invited,
+joins public channels, paginates full history and thread replies through a fixed
+cycle upper bound, reconciles users and verified emails, and consumes signed
+edits/deletions live. API polling remains the repair path if events are delayed.
+Files served directly from Slack's private file host are downloaded with the
+same bot authority, bounded at 64 MiB, archived as raw artifacts, and projected
+as stable `document.v1` records; supported text/PDF/Office bodies become
+searchable. A rejected redirect, oversized file, or unavailable binary remains
+an explicit `attachment_bytes` omission on the parent message and is repaired
+by reconciliation when Slack makes it directly available.
+
 Use a stable Recall principal ID as the Composio user ID. The switchboard opens
 one Google toolkit per hosted authorization trip and binds the returned exact
 `ca_...` account to that principal, connector, and brain route. Recall re-reads

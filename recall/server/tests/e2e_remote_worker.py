@@ -108,11 +108,18 @@ def main() -> None:
         "has_more": False,
         "response_metadata": {"next_cursor": ""},
     }
+    slack_users = {
+        "ok": True,
+        "members": [],
+        "response_metadata": {"next_cursor": ""},
+    }
+    slack_join = {"ok": True, "channel": {"id": "C123"}}
     rails = {
         "github.activity": Rail((github_page, github_page)),
         "slack.messages": Rail((
             RemoteApiError("upstream_unavailable"),
-            slack_page,
+            slack_users,
+            slack_join,
             slack_page,
         )),
     }
@@ -162,7 +169,10 @@ def main() -> None:
                     "spool": str(state / "slack.db"),
                     "page_size": 10,
                     "timeout_seconds": 10,
-                    "selectors": {"channel_id": "C123"},
+                    "selectors": {
+                        "workspace_id": "T123", "channel_ids": ["C123"],
+                        "owner_user_ids": ["U111"],
+                    },
                 },
             },
         ]

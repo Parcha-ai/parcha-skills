@@ -58,6 +58,13 @@ class ActorAttributionTests(unittest.TestCase):
         )
         self.assertEqual(calls[0][0], "alice@example.com")
         self.assertEqual(calls[1][0], "U012ABC")
+        self.assertEqual(
+            index.lookup(
+                "tenant:company:one", "portable.slack", "author_id",
+                "slack:T012ABC:U012ABC",
+            ),
+            ("identity", "slack_user", "a" * 64),
+        )
         index.lookup(
             "tenant:company:two",
             "slack",

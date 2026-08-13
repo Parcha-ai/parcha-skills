@@ -134,6 +134,7 @@ def main() -> None:
         SlackMessagesConnector(
             rail=rails[2],
             source_id=sources["slack"],
+            workspace_id="T123",
             channel_id="C123",
         ),
         NotionWorkspaceConnector(

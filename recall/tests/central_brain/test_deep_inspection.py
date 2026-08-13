@@ -15,6 +15,7 @@ from unittest import mock
 from recall_server.archive import FilesystemArchiveStore
 from recall_server.agent_scan import AGENT_SCAN_SCRIPT
 from recall_server.deep_inspection import (
+    DUCKDB_SCAN_WRAPPER,
     AgentExecObject,
     ArchilDeepInspector,
     DeepInspectionBudget,
@@ -984,10 +985,10 @@ class DeepInspectionContractTests(unittest.TestCase):
         self.assertEqual(transport.calls[0]["timeout"], 165)
         command = transport.calls[0]["body"]["command"]
         self.assertNotIn("select count", command)
-        self.assertIn("/tmp/recall-agent/duckdb", command)
+        self.assertIn("/tmp/recall-agent/duckdb-real", command)
         self.assertIn("/tmp/recall-datasets", command)
         self.assertIn("mount --bind /tmp/recall-datasets /datasets", command)
-        self.assertIn("allow_missing=sys.argv[5]==\"1\"", command)
+        self.assertIn("allow_missing=sys.argv[6]==\"1\"", command)
         self.assertIn("find /datasets -type l -print -quit", command)
         self.assertNotIn("synthetic-key", command)
         outer_marker = "\n".join(command.splitlines()[:3])
@@ -1002,6 +1003,28 @@ class DeepInspectionContractTests(unittest.TestCase):
             marker_result.stderr,
             r"^RECALL_EXEC_TIMING_V1\twrapper_start\t[0-9]{16}\n$",
         )
+
+    def test_duckdb_scan_wrapper_ignores_incompatible_catalog_readonly_flag(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            real = root / "duckdb-real"
+            real.write_text("#!/usr/bin/env bash\nprintf '%s\\n' \"$@\"\n")
+            real.chmod(0o700)
+            wrapper = root / "duckdb"
+            wrapper.write_text(
+                DUCKDB_SCAN_WRAPPER.replace(
+                    "/tmp/recall-agent/duckdb-real", str(real)
+                )
+            )
+            wrapper.chmod(0o700)
+            result = subprocess.run(
+                [str(wrapper), "-readonly", "--readonly", "-json", "-c", "select 1"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.splitlines(), ["-json", "-c", "select 1"])
 
     def test_parquet_scan_reports_s3_sync_lag_as_incomplete_not_success(self):
         transport = RecordingTransport({

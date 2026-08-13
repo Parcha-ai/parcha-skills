@@ -44,13 +44,13 @@ from connectors.work_apis import (
     GitHubActivityConnector,
     LinearActivityConnector,
     NotionWorkspaceConnector,
-    SlackMessagesConnector,
     github_rail,
     linear_rail,
     notion_rail,
     slack_rail,
     x_rail,
 )
+from connectors.slack_workspace import SlackWorkspaceConnector
 from connectors.workspace_rail import WorkspaceRail
 from connectors.x_activity import ALLOWED_STREAMS, XActivityConnector
 
@@ -192,7 +192,7 @@ REMOTE_SELECTOR_FIELDS = {
     "google.drive": {"drive_id", "include_document_text", "mime_types"},
     "github.activity": {"owner", "repository"},
     "linear.activity": {"team_id"},
-    "slack.messages": {"channel_id"},
+    "slack.messages": {"workspace_id", "channel_ids", "owner_user_ids"},
     "notion.workspace": set(),
     "x.activity": {"streams", "user_id"},
 }
@@ -245,7 +245,9 @@ def _remote_selectors(connector_id: str, value: Any) -> Mapping[str, Any]:
     elif connector_id == "linear.activity":
         _selector_string(selected["team_id"], "team_id")
     elif connector_id == "slack.messages":
-        _selector_string(selected["channel_id"], "channel_id")
+        _selector_string(selected["workspace_id"], "workspace_id")
+        _selector_strings(selected["channel_ids"], "channel_ids")
+        _selector_strings(selected["owner_user_ids"], "owner_user_ids")
     elif connector_id == "x.activity":
         user_id = _selector_string(selected["user_id"], "user_id")
         if not user_id.isascii() or not user_id.isdigit() or len(user_id) > 19:
@@ -415,7 +417,7 @@ def _build_remote(
         connector_types = {
             "github.activity": GitHubActivityConnector,
             "linear.activity": LinearActivityConnector,
-            "slack.messages": SlackMessagesConnector,
+            "slack.messages": SlackWorkspaceConnector,
             "notion.workspace": NotionWorkspaceConnector,
             "x.activity": XActivityConnector,
         }
@@ -426,6 +428,9 @@ def _build_remote(
         )
         if connector_id == "x.activity":
             selectors["streams"] = tuple(selectors["streams"])
+        elif connector_id == "slack.messages":
+            selectors["channel_ids"] = tuple(selectors["channel_ids"])
+            selectors["owner_user_ids"] = tuple(selectors["owner_user_ids"])
     connector = connector_type(
         rail=rail,
         source_id=source_id,

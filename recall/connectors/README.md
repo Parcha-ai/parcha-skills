@@ -77,14 +77,22 @@ are explicit (`poll`, `watch`, `snapshot`, `import`, or `webhook`). Provider
 scopes remain code-owned strings on the bundled definition, which permits
 non-Google APIs without turning configuration into an operation language.
 
-Third-party workers do not load into Recall Core. They may exchange a single
+Third-party workers do not load into Recall Core. A source plugin implements
+`SourcePluginManifest` plus one `pull(cursor)` operation and exchanges a single
 closed `recall.connector-page.v1` document with a source-scoped host:
 
 ```python
-from connectors.kit import decode_page_wire, encode_page_wire
+from connectors.kit import (
+    SourcePluginManifest, WireSourceConnector, pull_source_plugin_wire,
+)
 
-payload = encode_page_wire(page)
-same_page = decode_page_wire(payload)
+payload = pull_source_plugin_wire(plugin, cursor)
+hosted = WireSourceConnector(
+    manifest=plugin.manifest,
+    source_id="operator-bound-source-id",
+    transport=plugin_process.pull_wire,
+)
+page = hosted.pull(cursor)
 ```
 
 The wire contains only typed records, an opaque next cursor, and `has_more`.
@@ -93,10 +101,12 @@ the host. Unknown versions, fields, record schemas, invalid cursors, non-finite
 JSON, and oversized payloads fail before the runner. The schema is published at
 `contracts/connector_page_v1.json`.
 
-The first kit deliberately provides no entry-point discovery or arbitrary
-worker launcher. Publishers can develop and conformance-test separate workers;
-operators must explicitly pin and run them outside Core until a later signed
-distribution contract is approved.
+The host never imports a plugin, discovers Python entry points, accepts provider
+request recipes, or gives the plugin Brain credentials. The plugin owns its
+provider token; the operator explicitly pins and runs it outside Core. Recall
+owns privacy-before-spool, ACK-before-cursor, replay, and source authority.
+Bundled connectors use the same contract, so a contributed plugin can graduate
+without gaining a second ingestion path.
 
 ### Conformance fixtures
 
@@ -112,6 +122,11 @@ The report contains only the connector ID, fixed cell names, and counts. It
 never includes source IDs, cursors, paths, exception text, records, or provider
 payloads. A publisher should make this matrix part of its own test suite before
 asking for a connector to be bundled.
+
+External publishers call `run_source_plugin_conformance(factory)`. Its factory
+uses the same named scenarios but exposes a `SourcePluginManifest`; the adapter
+then runs the identical Core conformance matrix rather than a plugin-specific
+lookalike.
 
 ### Remote API rail
 
@@ -295,7 +310,9 @@ attachments. ZIP paths, member types, counts, sizes, expansion, and compression
 ratios are bounded before projection.
 
 - Slack follows the official JSON export layout and projects dated channel
-  message files.
+  message files plus user identities. Its `archive_id` must be the real Slack
+  workspace/team ID and the export must contain `channels.json`; this makes an
+  archive message converge exactly with later API and Events API ingestion.
 - Notion projects UTF-8 Markdown and CSV members from the official workspace
   export.
 - X projects own posts from the account archive `data/tweet*.js` files.

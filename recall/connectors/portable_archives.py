@@ -21,6 +21,7 @@ from connectors.portable_pim import (
     _bounded,
 )
 from connectors.sdk import ConnectorContractError, ConnectorRecordV2
+from connectors.slack_source import normalize_slack_message, normalize_slack_user
 
 
 MAX_ARCHIVE_MEMBERS = 100_000
@@ -108,14 +109,46 @@ class SlackArchiveConnector(_SnapshotImport):
     record_kind = "communication_message.v1"
 
     def _live_records(self) -> list[ConnectorRecordV2]:
-        records = {}
-        for member, raw in sorted(_archive_members(self.path).items()):
+        members = _archive_members(self.path)
+        channels: dict[str, str] = {}
+        for catalog_name in ("channels.json", "groups.json", "mpims.json", "dms.json"):
+            raw_catalog = members.get(catalog_name)
+            if raw_catalog is None:
+                continue
+            catalog = _finite_json(raw_catalog, "slack")
+            if not isinstance(catalog, list) or len(catalog) > MAX_RECORDS:
+                raise ConnectorContractError("portable_slack_json_invalid")
+            for value in catalog:
+                if not isinstance(value, dict):
+                    raise ConnectorContractError("portable_slack_json_invalid")
+                channel_id = value.get("id")
+                channel_name = value.get("name") or channel_id
+                if not isinstance(channel_id, str) or not isinstance(channel_name, str):
+                    raise ConnectorContractError("portable_slack_json_invalid")
+                channels[channel_name] = channel_id
+        records: dict[str, ConnectorRecordV2] = {}
+        users_raw = members.get("users.json")
+        if users_raw is not None:
+            users = _finite_json(users_raw, "slack")
+            if not isinstance(users, list) or len(users) > MAX_RECORDS:
+                raise ConnectorContractError("portable_slack_json_invalid")
+            for user in users:
+                for record in normalize_slack_user(
+                    workspace_id=self.archive_id,
+                    value=user,
+                    owner_user_ids=self.owner_identifiers,
+                ):
+                    records[record.native_id] = record
+        for member, raw in sorted(members.items()):
             if not SLACK_MESSAGE_PATH.fullmatch(member):
                 continue
             values = _finite_json(raw, "slack")
             if not isinstance(values, list) or len(values) > MAX_RECORDS:
                 raise ConnectorContractError("portable_slack_json_invalid")
-            channel = member.split("/", 1)[0]
+            channel_name = member.split("/", 1)[0]
+            channel = channels.get(channel_name)
+            if channel is None:
+                raise ConnectorContractError("portable_slack_channel_identity_missing")
             for value in values:
                 if not isinstance(value, dict):
                     raise ConnectorContractError("portable_slack_json_invalid")
@@ -128,43 +161,14 @@ class SlackArchiveConnector(_SnapshotImport):
                     or not isinstance(author, str)
                 ):
                     raise ConnectorContractError("portable_slack_json_invalid")
-                stable = value.get("client_msg_id") or timestamp
-                if not isinstance(stable, str) or not stable:
-                    raise ConnectorContractError("portable_slack_json_invalid")
-                native_id = "slack:" + hashlib.sha256(
-                    f"{self.archive_id}\0{channel}\0{stable}".encode()
-                ).hexdigest()
-                thread = value.get("thread_ts") or timestamp
-                if not isinstance(thread, str):
-                    raise ConnectorContractError("portable_slack_json_invalid")
-                conversation_id = "slack-thread:" + hashlib.sha256(
-                    f"{self.archive_id}\0{channel}\0{thread}".encode()
-                ).hexdigest()
-                occurred_at = _slack_time(timestamp)
-                content = {
-                    "kind": self.record_kind,
-                    "content_fidelity": "complete",
-                    "conversation_id": conversation_id,
-                    "direction": (
-                        "outbound"
-                        if author.lower() in self.owner_identifiers
-                        else "inbound"
-                    ),
-                    "format": "slack-export",
-                    "message_id": native_id,
-                    "author_id": author,
-                    "sent_at": occurred_at,
-                    "surface": "portable_slack",
-                    "text": _bounded(text, "slack_text"),
-                }
-                records[native_id] = ConnectorRecordV2(
-                    schema_version=2,
-                    native_id=native_id,
-                    native_parent_id=conversation_id,
-                    occurred_at=occurred_at,
-                    content=content,
-                    provenance={"uri": f"connector://portable-slack/{native_id}"},
+                record = normalize_slack_message(
+                    workspace_id=self.archive_id,
+                    channel_id=channel,
+                    value=value,
+                    owner_identifiers=self.owner_identifiers,
+                    provenance_surface="archive",
                 )
+                records[record.native_id] = record
         return [records[key] for key in sorted(records)]
 
 
