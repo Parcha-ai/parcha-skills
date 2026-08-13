@@ -614,6 +614,94 @@ class CollectorTest(unittest.TestCase):
         ))
         collector.close()
 
+    def test_missing_large_file_tombstones_are_bounded_and_bulk_archived(self) -> None:
+        transcript = self.root / "missing-large.jsonl"
+        transcript.write_text(
+            "".join(claude_line(f"private-record-{index}") for index in range(1201))
+        )
+        archived = []
+
+        class Archive:
+            def put_raw(self, **kwargs):
+                archived.append(kwargs)
+                digest = hashlib.sha256(kwargs["payload"]).hexdigest()
+                return {
+                    "contract": "recall.artifact-ref.v1",
+                    "schema_version": 1,
+                    "tenant_id": kwargs["tenant_id"],
+                    "source_id": kwargs["source_id"],
+                    "artifact_id": "art_" + digest[:32],
+                    "storage_backend": "s3",
+                    "object_key": "objects/aa/" + digest,
+                    "content_sha256": digest,
+                    "size_bytes": len(kwargs["payload"]),
+                    "media_type": kwargs["media_type"],
+                    "encryption": "sse-s3",
+                    "version_id": "synthetic-version",
+                    "created_at": kwargs["created_at"],
+                }
+
+        class Writer:
+            def ingest(self, events):
+                return {
+                    "status": "committed",
+                    "inserted": len(events),
+                    "duplicate_events": 0,
+                    "receipts": [
+                        f"recall://{event['source_id']}/{event['native_id']}?rev=1"
+                        for event in events
+                    ],
+                    "replay": False,
+                }
+
+        collector = Collector(
+            root=self.root,
+            harness="claude",
+            source_id="claude:linux:test",
+            spool_path=self.spool,
+            endpoint=self.endpoint,
+            token="test-token-not-a-secret",
+            principal_id="owner",
+            privacy=PrivacyPolicy(mode="scrub"),
+            brain_writer=Writer(),
+            archive=Archive(),
+            tenant_id="tenant:personal",
+            bulk_manifest_archive=True,
+            bulk_bundle_records=100,
+            max_scan_records=5000,
+        )
+        self.assertEqual(collector.scan()["records_queued"], 1201)
+        while collector.doctor()["pending"]:
+            collector.flush()
+        self.assertEqual(collector.doctor()["acked"], 1201)
+        archived.clear()
+        collector.max_scan_records = 250
+        transcript.unlink()
+
+        slices = []
+        while True:
+            result = collector.scan()
+            slices.append(result)
+            self.assertLessEqual(result["tombstones_queued"], 250)
+            while collector.doctor()["pending"]:
+                collector.flush()
+            if result["scan_complete"]:
+                break
+
+        self.assertEqual(sum(item["tombstones_queued"] for item in slices), 1201)
+        self.assertEqual(len(slices), 5)
+        self.assertEqual(len(archived), 15)
+        self.assertTrue(all(
+            item["media_type"] == "application/vnd.recall.bulk-manifest+json"
+            for item in archived
+        ))
+        self.assertEqual(
+            collector.db.execute("SELECT count(*) FROM active_records").fetchone()[0],
+            0,
+        )
+        self.assertEqual(collector.doctor()["pending"], 0)
+        collector.close()
+
     def test_canonical_writer_byte_budget_splits_base64_wrapped_batches(self) -> None:
         (self.root / "session.jsonl").write_text(
             "".join(claude_line("x" * 1_000) for _ in range(6))
