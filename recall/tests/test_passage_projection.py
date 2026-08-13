@@ -1027,6 +1027,77 @@ class PassageProjectionTests(unittest.TestCase):
             for item in result["matching_ranges"]
         ))
 
+    def test_exact_sparse_document_precedes_dense_only_documents(self) -> None:
+        def candidate(document: str, kind: str, score: float) -> dict:
+            base = {
+                "source_id": "source:test",
+                "logical_document_id": f"ldoc_{document:0<32}",
+                "revision": 1,
+                "native_parent_id": f"session:{document}",
+                "first_occurred_at": "2026-08-01T00:00:00Z",
+                "last_occurred_at": "2026-08-01T00:10:00Z",
+                "manifest_object_key": "objects/01/" + "a" * 64,
+                "manifest_content_sha256": "b" * 64,
+                "text_redacted": document,
+                "score": score,
+            }
+            if kind == "dense":
+                return {
+                    **base,
+                    "passage_id": f"psg_{document:0<32}",
+                    "passage_ordinal": 0,
+                    "spans": [{"record_ordinal": 0}],
+                    "receipts": [
+                        f"recall://source:test/{document}?rev=1#item=0"
+                    ],
+                }
+            return {
+                **base,
+                "receipt": (
+                    f"recall://source:test/{document}?rev=1#item=0"
+                ),
+            }
+
+        dense = [
+            candidate(f"dense-{index}", "dense", 0.99 - index / 100)
+            for index in range(5)
+        ]
+        exact = candidate("admin-grep-ai", "sparse-exact", 0.01)
+
+        retrieval = PassageHintRetrieval(
+            SimpleNamespace(search_deadline_ms=20_000),
+            tenant_id="tenant:company:test",
+            sources=["source:test"],
+            policy_fingerprint="a" * 64,
+        )
+        with (
+            mock.patch.object(
+                retrieval,
+                "_dense_candidates",
+                return_value=(dense, "ok", "exact-scoped", 6),
+            ),
+            mock.patch.object(
+                retrieval,
+                "_lexical_candidates",
+                return_value=([], "ok"),
+            ),
+            mock.patch.object(
+                retrieval,
+                "_sparse_candidates",
+                return_value=([exact], "ok"),
+            ),
+        ):
+            results = retrieval.search(
+                "when we found the admin.grep.ai issue",
+                lexical_query="admin grep ai issue",
+                since=None,
+                until=None,
+                limit=6,
+            )["results"]
+
+        self.assertEqual(results[0]["native_parent_id"], "session:admin-grep-ai")
+        self.assertEqual(results[0]["reasons"], ["sparse-exact"])
+
     def test_query_rankings_fuse_at_stable_document_boundaries(self) -> None:
         def candidate(document_id: str, score: float, kind: str) -> dict:
             return {
