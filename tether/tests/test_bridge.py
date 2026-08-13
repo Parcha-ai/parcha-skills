@@ -3803,6 +3803,16 @@ class PluginRoutingTest(unittest.TestCase):
         self.assertEqual(len(prompts), 1)
         self.assertIn("first follow-up", prompts[0])
         self.assertIn("latest follow-up", prompts[0])
+        self.assertIn(
+            "Requests to change future behavior, prompts, configuration, or automation "
+            "are actionable work",
+            prompts[0],
+        )
+        self.assertIn(
+            "Do not return NO_REPLY merely because no conversational acknowledgment "
+            "is needed",
+            prompts[0],
+        )
         self.assertEqual(len(adapter.sent), 0)
         self.assertEqual(len(broker_requests), 1)
         self.assertEqual(broker_requests[0]["text"], "Fixed and verified.")

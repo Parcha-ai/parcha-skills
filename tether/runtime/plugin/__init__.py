@@ -2969,6 +2969,10 @@ def _submit_detached_attempt(
             prompt
             + "\n\nReturn one useful Slack update only. Default to 50 words and "
             "3 sentences; exceed that when needed for a complete or safe answer. "
+            "Requests to change future behavior, prompts, configuration, or automation "
+            "are actionable work: make the durable change and report what changed. "
+            "Do not return NO_REPLY merely because no conversational acknowledgment "
+            "is needed. "
             "Return exactly NO_REPLY only if no useful response is needed.",
             cancellation,
             persist_response,
