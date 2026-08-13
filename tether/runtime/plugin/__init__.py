@@ -1468,6 +1468,7 @@ def _hermes_workspace_id(
     return str(
         from_metadata
         or getattr(adapter, "_channel_team", {}).get(chat_id, "")
+        or load_config().team_id
         or ""
     )
 
@@ -2421,18 +2422,33 @@ async def _poll_recent_replies(adapter) -> int:
     hours = _bounded_env_int("TETHER_REPLY_RECOVERY_HOURS", 24, 1, 168)
     workspace_limit = _bounded_env_int("TETHER_REPLY_POLL_BATCH", 10, 1, 25)
     max_pages = _bounded_env_int("TETHER_REPLY_POLL_MAX_PAGES", 25, 1, 100)
+    configured_team_id = load_config().team_id
     bridges = [
         bridge
         for bridge in store.active_bridges()
         if bridge.channel_id and bridge.thread_ts
     ]
-    bridge_keys = {(bridge.team_id, bridge.channel_id, bridge.thread_ts) for bridge in bridges}
+    bridge_keys = {
+        (bridge.team_id or configured_team_id, bridge.channel_id, bridge.thread_ts)
+        for bridge in bridges
+    }
     participating = [
-        item for item in store.recent_participating_threads(hours=max(hours, 168), limit=500)
-        if all(item[1:3]) and item[:3] not in bridge_keys
+        (team_id or configured_team_id, channel_id, thread_ts, updated_at)
+        for team_id, channel_id, thread_ts, updated_at in store.recent_participating_threads(
+            hours=max(hours, 168), limit=500
+        )
+        if channel_id
+        and thread_ts
+        and (team_id or configured_team_id, channel_id, thread_ts) not in bridge_keys
     ]
     targets = [
-        (bridge, bridge.team_id, bridge.channel_id, str(bridge.thread_ts), None)
+        (
+            bridge,
+            bridge.team_id or configured_team_id,
+            bridge.channel_id,
+            str(bridge.thread_ts),
+            None,
+        )
         for bridge in bridges
     ] + [(None, *item) for item in participating]
     skipped_count = sum(1 for target in targets if not target[1])
