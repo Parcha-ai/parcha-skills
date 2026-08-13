@@ -97,6 +97,32 @@ class WorkspaceReleaseTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unapproved"):
                 installer.download("synthetic", pinned)
 
+    def test_download_retries_only_transient_transport_failures(self) -> None:
+        data = b"1234"
+        pinned = release(data)
+
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+            def geturl(self):
+                return "https://release-assets.githubusercontent.com/synthetic"
+
+        with (
+            mock.patch.object(
+                installer.urllib.request,
+                "urlopen",
+                side_effect=[OSError("transient"), OSError("transient"), Response(data)],
+            ) as opened,
+            mock.patch.object(installer.time, "sleep") as slept,
+        ):
+            self.assertEqual(installer.download("synthetic", pinned), data)
+        self.assertEqual(opened.call_count, 3)
+        self.assertEqual([call.args[0] for call in slept.call_args_list], [1, 2])
+
 
 if __name__ == "__main__":
     unittest.main()

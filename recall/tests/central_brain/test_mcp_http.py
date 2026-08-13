@@ -134,7 +134,7 @@ class FakeStore:
             "stopped_reason": "completed",
             "output_truncated": False,
             "opened_receipts": [],
-            "datasets_available": 3,
+            "datasets_available": 4,
             "sources_available": 1,
             "buckets_available": 1,
             "projection_pending": 0,
@@ -740,6 +740,14 @@ class RemoteMcpContractTest(unittest.TestCase):
             canonical_catalog["recall_scan"]["description"],
         )
         self.assertIn(
+            "passages-part-*.parquet",
+            canonical_catalog["recall_scan"]["description"],
+        )
+        self.assertIn(
+            "16 KiB",
+            canonical_catalog["recall_scan"]["description"],
+        )
+        self.assertIn(
             "recall-scan --broad --fixed",
             canonical_catalog["recall_exec"]["description"],
         )
@@ -812,6 +820,8 @@ class RemoteMcpContractTest(unittest.TestCase):
         self.assertIn("opened_receipts", instructions)
         self.assertIn("Never infer", instructions)
         self.assertIn("each named part", instructions)
+        self.assertIn("passages-part-*.parquet", instructions)
+        self.assertIn("planning hints", instructions)
 
     def test_show_uses_timestamp_and_rejects_conflicting_tail_before_store(self) -> None:
         target = "recall://synthetic:codex/item-1?rev=1"
@@ -1042,7 +1052,7 @@ class RemoteMcpContractTest(unittest.TestCase):
             )
         self.assertEqual(status, 200)
         result = json.loads(raw)["result"]["structuredContent"]
-        self.assertEqual(result["datasets_available"], 3)
+        self.assertEqual(result["datasets_available"], 4)
         self.assertIn(
             (
                 "scan",

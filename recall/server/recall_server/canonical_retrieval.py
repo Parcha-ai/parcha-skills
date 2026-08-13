@@ -52,6 +52,7 @@ MAX_AGENTIC_MAP_FINDING_BYTES = 64_000
 MAX_AGENT_EXEC_MAP_SHARDS = 8
 MAX_AGENT_EXEC_MAP_SHARD_STDOUT_BYTES = 20_000
 MAX_AGENT_EXEC_MAP_SHARD_STDERR_BYTES = 2_000
+MAX_PARQUET_SCAN_OUTPUT_BYTES = 16 * 1024
 MONTH_TERMS = frozenset({
     "january",
     "february",
@@ -1569,6 +1570,13 @@ class BoundCanonicalRetrieval:
             since=since,
             until=until,
         )
+        referenced_datasets = {
+            dataset
+            for dataset in ("documents", "passages", "records", "actors")
+            if re.search(rf"(?<![A-Za-z0-9_-]){dataset}-part-", program)
+        }
+        if referenced_datasets:
+            rows = [row for row in rows if row["dataset"] in referenced_datasets]
         if not rows:
             return self._empty_parquet_scan(
                 sources_available=len(sources),
@@ -1608,6 +1616,18 @@ class BoundCanonicalRetrieval:
         stdout = result.get("stdout")
         if not isinstance(stdout, str):
             raise DeepInspectionError("deep_inspector_result_invalid_execution")
+        stdout_bytes = stdout.encode()
+        if len(stdout_bytes) > MAX_PARQUET_SCAN_OUTPUT_BYTES:
+            stdout = stdout_bytes[:MAX_PARQUET_SCAN_OUTPUT_BYTES].decode(
+                errors="ignore"
+            )
+            result = {
+                **result,
+                "stdout": stdout,
+                "complete": False,
+                "stopped_reason": "output_limit",
+                "output_truncated": True,
+            }
         mentioned = agent_evidence_receipts(stdout)
         self._verify_parquet_receipts(
             mentioned,

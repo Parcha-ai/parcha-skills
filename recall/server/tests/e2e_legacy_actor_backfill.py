@@ -26,6 +26,8 @@ from recall_server.logical_evidence_projection import (  # noqa: E402
     CanonicalLogicalEvidenceProjector,
 )
 from recall_server.parquet_scan import CanonicalParquetScanProjector  # noqa: E402
+from recall_server.passage_index import CanonicalPassageProjector  # noqa: E402
+from recall_server.passage_projection import DEFAULT_PASSAGE_POLICY  # noqa: E402
 from recall_server.projectors import canonical_json  # noqa: E402
 
 
@@ -264,6 +266,20 @@ def main() -> None:
         assert len(scoped["documents"]) == 1
         assert scoped["documents"][0]["source_id"] == coding_source
 
+        passages = CanonicalPassageProjector(
+            store,
+            LogicalEvidenceProjectionStore(archive),
+            policy=DEFAULT_PASSAGE_POLICY,
+            bound_tenant_id=tenant,
+        )
+        passage_projection = passages.project_pending(
+            tenant_id=tenant,
+            batch_size=10,
+            max_batches=2,
+            concurrency=2,
+        )
+        assert passage_projection["documents"] == 2
+
         scan = CanonicalParquetScanProjector(
             store,
             LogicalEvidenceProjectionStore(archive),
@@ -282,7 +298,7 @@ def main() -> None:
                 (tenant, coding_source),
             ).fetchall()
         assert [row["dataset"] for row in shards] == [
-            "actors", "documents", "records"
+            "actors", "documents", "passages", "records"
         ]
         import pyarrow as pa
         import pyarrow.parquet as pq
@@ -308,7 +324,13 @@ def main() -> None:
                 pa.BufferReader(archive.read_raw(reference))
             ).to_pylist()
         assert len(tables["documents"]) == 1
+        assert len(tables["passages"]) == 1
         assert len(tables["records"]) == 1
+        assert tables["passages"][0]["text"] == (
+            "legacy actor decision marker"
+        )
+        assert tables["passages"][0]["actor_names"] == [owner]
+        assert tables["passages"][0]["receipts"]
         assert tables["records"][0]["search_text"] == (
             "legacy actor decision marker"
         )
@@ -392,7 +414,7 @@ def main() -> None:
         )
         assert len(scanned["opened_receipts"]) == 1
         assert scanned["sources_available"] == 1
-        assert scanned["datasets_available"] == 3
+        assert scanned["datasets_available"] == 1
         assert all(
             alias.startswith("s1/2026-08/")
             for alias in inspector.calls[0]["dataset_aliases"].values()
@@ -468,12 +490,13 @@ def main() -> None:
         "shared_source_false_attributions": 0,
         "person_scoped_documents": 1,
         "parquet_documents": 1,
+        "parquet_passages": 1,
         "parquet_records": 1,
         "parquet_actor_leaks": 0,
         "parquet_opened_receipts": 1,
         "parquet_unauthorized_receipts": 0,
         "parquet_stale_actor_receipts": 0,
-        "parquet_rebuild_reused_objects": 3,
+        "parquet_rebuild_reused_objects": 4,
         "parquet_upgrade_seeded_stable_sources": 1,
         "parquet_upgrade_skipped_dirty_sources": 1,
         "idempotent": True,

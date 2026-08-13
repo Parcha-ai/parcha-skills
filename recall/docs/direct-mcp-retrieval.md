@@ -14,6 +14,11 @@ The hosted Recall service owns authorization and access to private data.
 - `recall_scope` enumerates exact, content-free document boundaries for person,
   source, and time constraints. It does not spend the search budget embedding a
   question whose universe is already known. Page until `complete` is true.
+- `recall_scan` runs one caller-authored DuckDB/shell program over authorized
+  source/month Parquet. Its compact passage rows are the default planning surface:
+  bounded visible-message text, time, attribution, logical document IDs, and
+  receipt pointers. The output is capped at 16 KiB and passage pointers are hints,
+  not opened evidence.
 - `recall_show` and `recall_session_context` open exact receipt-backed context.
 - `recall_exec` mounts only explicitly selected full documents into a bounded,
   read-only, networkless sandbox. The caller can use `recall-scan`, shell, Python,
@@ -33,12 +38,15 @@ retrieval plan and does not need a model-provider credential.
 
 For a question such as “What did Alice work on yesterday?”, the client should:
 
-1. Call `recall_scope` with the exact person and UTC time bounds.
-2. Page until `complete` is true. A `null` total means more pages remain or the
-   deadline was reached; it never means the partial page is complete.
-3. Write a simple shell, Python, `jq`, or `recall-scan` program that extracts the
-   evidence relevant to the natural-language question.
-4. Call `recall_exec_map` on the scoped document IDs. Use small shards for large
+1. Resolve the people or source boundary when the question supplies one, then call
+   `recall_scan` once with exact UTC bounds and a compact DuckDB program over
+   `passages-part-*.parquet`.
+2. Deduplicate passage IDs across adjacent month buckets and return a bounded set
+   of candidate logical document IDs. Use raw record shards only when required
+   tool output or exact low-level details cannot be present in visible passages.
+3. Treat `complete=false` or `projection_pending>0` as partial planning, never as
+   proof that the missing work does not exist.
+4. Call `recall_exec_map` on the selected document IDs. Use small shards for large
    documents or heterogeneous sessions, and more parallel workers when breadth is
    the bottleneck.
 5. Inspect the shard outputs, run a second targeted program when evidence is thin,

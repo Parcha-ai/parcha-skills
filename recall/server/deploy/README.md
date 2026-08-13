@@ -64,7 +64,7 @@ infrastructure. The example is synthetic; a live manifest belongs in a private m
 location and contains references, never credential values.
 
 The production database gate requires a standard PostgreSQL URL with
-`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 52,
+`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 54,
 pgvector 0.8.0 or newer, and a runtime role without superuser, database/role creation,
 replication, or RLS-bypass privilege:
 
@@ -309,13 +309,17 @@ schema/application deployment is intentionally unsupported.
 Migration 49 repairs actor bindings for legacy `coding_history` sources whose
 owner principal already maps to a brain actor. It deliberately does not infer an
 author for Slack, email, or any other shared source. Migration 50 adds a derived
-Parquet scan plane: one immutable `documents`, `records`, and `actors` shard per
-authorized source and UTC month. Canonical JSONL documents remain the complete
-evidence and only source of truth; Parquet is a disposable typed index for broad
-code-mode analysis. Ingest, replacement, and forget transactions invalidate only
-the affected source-months. Its first application seeds every existing current
-logical document except documents already waiting for repair; those enqueue
-themselves after their repaired revision commits.
+Parquet scan plane; migration 53 adds its compact `passages` planning dataset.
+Each authorized source and UTC month has `documents`, `passages`, `records`, and
+`actors` shards. Passages contain bounded visible-message text, time, attribution,
+and receipt pointers; records retain complete projected JSON for exact inspection.
+During the one-time passage upgrade, existing immutable `documents`, `records`, and
+`actors` objects are retained and only `passages` is materialized. Later source changes
+continue to take the ordinary full replacement path.
+Canonical JSONL documents remain the complete evidence and only source of truth.
+Ingest, replacement, passage projection, and forget transactions invalidate only
+the affected source-months. First application seeds existing source-months for a
+rebuild after upstream logical and passage projection has drained.
 
 Populate or rebuild it independently of ingestion:
 
@@ -347,7 +351,9 @@ second retrieval agent or model credential runs inside Recall.
 `recall_scan` defaults to 60 seconds and permits a caller-selected ceiling up to
 240 seconds, below Archil's documented five-minute response limit. The MCP
 client may cancel its own request sooner; Recall does not impose the 30-second
-interactive-document limit on these broad scans.
+interactive-document limit on these broad scans. Scan stdout is capped at 16 KiB
+with explicit truncation and `complete=false`; callers should return compact
+passage-derived candidate IDs and open selected full documents separately.
 
 Enable the canonical v2 write plane only after the archive probe and database
 migrations pass:
