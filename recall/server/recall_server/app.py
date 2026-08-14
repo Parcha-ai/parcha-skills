@@ -664,6 +664,19 @@ class Handler(BaseHTTPRequestHandler):
         )
         if self.public_edge_profile():
             allowed = allowed or (method == "POST" and path == WEBHOOK_PATH)
+        slack_configured = all(
+            os.environ.get(name)
+            for name in (
+                "RECALL_SLACK_CLIENT_ID",
+                "RECALL_SLACK_CLIENT_SECRET",
+                "RECALL_SLACK_REDIRECT_URI",
+                "RECALL_SLACK_SIGNING_SECRET",
+            )
+        )
+        if slack_configured:
+            allowed = allowed or (
+                method == "POST" and path == SLACK_WEBHOOK_PATH
+            )
         if self.admin_web_enabled():
             allowed = (
                 allowed

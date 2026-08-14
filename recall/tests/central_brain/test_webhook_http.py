@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import http.client
 import json
 import os
 import threading
+import time
 import unittest
 from http.server import ThreadingHTTPServer
 from unittest import mock
@@ -109,6 +112,7 @@ class WebhookServer:
         body: dict | None = None,
         token: str | None = "synthetic-webhook-token",
         content_type: str = "application/json",
+        extra_headers: dict[str, str] | None = None,
     ) -> tuple[int, bytes]:
         payload = json.dumps(body).encode() if body is not None else None
         headers = {}
@@ -120,6 +124,7 @@ class WebhookServer:
         if path == "/mcp":
             headers["Accept"] = "application/json, text/event-stream"
             headers["MCP-Protocol-Version"] = "2025-11-25"
+        headers.update(extra_headers or {})
         connection = http.client.HTTPConnection(
             "127.0.0.1", self.server.server_port, timeout=2
         )
@@ -155,6 +160,39 @@ class WebhookHttpContractTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"RECALL_TRUST_TAILSCALE_HEADERS": "1"}):
             with self.assertRaisesRegex(RuntimeError, "forbids trusted identity"):
                 validate_http_profile()
+
+    def test_configured_slack_webhook_is_public_in_mcp_profile(self):
+        slack = {
+            "RECALL_HTTP_PROFILE": "public-mcp",
+            "RECALL_SLACK_CLIENT_ID": "synthetic-client",
+            "RECALL_SLACK_CLIENT_SECRET": "synthetic-client-secret",
+            "RECALL_SLACK_REDIRECT_URI": (
+                "https://recall.example/admin/oauth/callback/slack"
+            ),
+            "RECALL_SLACK_SIGNING_SECRET": "synthetic-signing-secret",
+        }
+        challenge = {"type": "url_verification", "challenge": "synthetic-challenge"}
+        body = json.dumps(challenge).encode()
+        timestamp = str(int(time.time()))
+        signature = "v0=" + hmac.new(
+            slack["RECALL_SLACK_SIGNING_SECRET"].encode(),
+            f"v0:{timestamp}:".encode() + body,
+            hashlib.sha256,
+        ).hexdigest()
+        with mock.patch.dict(os.environ, slack, clear=False):
+            with WebhookServer(self.store) as server:
+                status, raw = server.request(
+                    "POST",
+                    "/webhooks/v1/slack",
+                    body=challenge,
+                    token=None,
+                    extra_headers={
+                        "X-Slack-Request-Timestamp": timestamp,
+                        "X-Slack-Signature": signature,
+                    },
+                )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw), {"challenge": "synthetic-challenge"})
 
     def test_valid_webhook_is_source_principal_provenance_and_privacy_bound(self):
         canary = "password=synthetic-webhook-canary"
