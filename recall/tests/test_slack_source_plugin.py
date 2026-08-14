@@ -238,6 +238,97 @@ class SlackSourcePluginTest(unittest.TestCase):
                          {"C111", "G222"})
         self.assertTrue(all("latest" in call[1]["query"] for call in history_calls))
 
+    def test_workspace_plugin_streams_more_channels_than_fit_in_one_cursor(self):
+        rail = Rail()
+        channels = [
+            {"id": f"C{index:010d}", "is_private": False, "is_member": False}
+            for index in range(140)
+        ]
+        rail.add("users.list", {
+            "ok": True, "members": [], "response_metadata": {"next_cursor": ""},
+        })
+        rail.add(
+            "channels.list",
+            {
+                "ok": True, "channels": channels[:50],
+                "response_metadata": {"next_cursor": "channels-2"},
+            },
+            {
+                "ok": True, "channels": channels[50:100],
+                "response_metadata": {"next_cursor": "channels-3"},
+            },
+            {
+                "ok": True, "channels": channels[100:],
+                "response_metadata": {"next_cursor": ""},
+            },
+        )
+        rail.add("channels.join", *(
+            {"ok": True, "channel": {"id": channel["id"]}}
+            for channel in channels
+        ))
+        rail.add("messages.history", *(slack_response([]) for _channel in channels))
+        connector = SlackWorkspaceConnector(
+            rail=rail, source_id="synthetic:slack:large-workspace",
+            workspace_id="T123",
+        )
+
+        cursor = None
+        cursor_sizes = []
+        for _ in range(400):
+            page = connector.pull(cursor)
+            cursor = page.next_cursor
+            cursor_sizes.append(len(cursor.encode()))
+            if not page.has_more:
+                break
+        else:
+            self.fail("workspace backfill did not finish")
+
+        history_channels = [
+            call[1]["query"]["channel"] for call in rail.calls
+            if call[0] == "messages.history"
+        ]
+        self.assertEqual(history_channels, [channel["id"] for channel in channels])
+        self.assertEqual(len(set(history_channels)), 140)
+        self.assertEqual(
+            [call[1]["query"].get("cursor") for call in rail.calls
+             if call[0] == "channels.list"],
+            [None, "channels-2", "channels-3"],
+        )
+        self.assertLessEqual(max(cursor_sizes), 4096)
+
+    def test_workspace_plugin_migrates_v1_cursor_by_replaying_its_time_window(self):
+        rail = Rail()
+        rail.add("users.list", {
+            "ok": True, "members": [], "response_metadata": {"next_cursor": ""},
+        })
+        legacy = json.dumps({
+            "v": 1,
+            "phase": "discover",
+            "page": "legacy-page",
+            "channels": ["C123:0"],
+            "channel_index": 0,
+            "threads": [],
+            "thread_index": 0,
+            "thread_page": None,
+            "watermark": "2026-08-01T00:00:00Z",
+            "upper": "2026-08-02T00:00:00Z",
+            "cycle": 3,
+        })
+        connector = SlackWorkspaceConnector(
+            rail=rail, source_id="synthetic:slack:migrate", workspace_id="T123",
+        )
+
+        page = connector.pull(legacy)
+        migrated = json.loads(page.next_cursor)
+
+        self.assertTrue(page.has_more)
+        self.assertEqual(migrated["v"], 2)
+        self.assertEqual(migrated["phase"], "discover")
+        self.assertEqual(migrated["watermark"], "2026-08-01T00:00:00Z")
+        self.assertEqual(migrated["upper"], "2026-08-02T00:00:00Z")
+        self.assertEqual(migrated["cycle"], 3)
+        self.assertEqual(migrated["channels"], [])
+
     def test_workspace_plugin_archives_full_attachment_and_projects_its_text(self):
         rail = Rail()
         rail.add("users.list", {
