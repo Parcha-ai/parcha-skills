@@ -1,109 +1,132 @@
 ---
 name: cascade
-description: Turn a blunt "do X, don't screw it up" task into structured, evidence-gated progress — instead of charging in, plan the work into a cascade of bounded loops, each one development cycle with a self-contained prompt, a checkable evidence-based exit, and a hard bound; a loop's exit triggers the next, and you can run straight through (autonomous) or pause for a go/no-go at every loop boundary (checkpointed). Use when the user names Cascade, says "cascading loops", "work in loops", "go ham" on a multi-cycle project, hands a big/risky/"make no mistakes" task worth planning before building, or asks to plan, advance, resume, or take over a loop chain.
+description: Turn a blunt, risky, or multi-cycle task into a short chain of bounded development loops with explicit authority, evidence-gated exits, honest bound handling, and portable takeover. Use when the user names Cascade, says "cascading loops", "work in loops", or "go ham", or asks to plan, advance, resume, or take over a consequential project that should not be attempted as one unstructured push.
 ---
 
-# Cascade — cascading development loops
+# Cascade
 
-**The move: don't charge at a big task, cascade it.** A blunt prompt — "do X, and make no
-mistakes" — is the signal to STOP and plan first, not to start typing. You replace one
-unstructured push with a **chain** of bounded loops: each loop produces one state change,
-proves it with checkable artifacts, and its EXIT triggers the next loop. Between loops you
-either flow straight through or pause for the user's go/no-go (see Pacing). Nothing advances
-on vibes: an exit criterion that can't be pointed at (a passing test, a live trace file, a
-scoreboard delta, a merged PR verified at HEAD) is not a criterion. This is the same
-discipline the product ships (`loop_until` with an accept contract, bounded rounds, honest at
-the bound) applied to our own development.
+Plan before building. Replace one large push with a short chain of bounded loops. Each loop makes
+one state change, proves it at the actual target, and writes an immutable boundary receipt before
+anything advances. The chain file is the portable contract across Codex, Claude, pi, compaction,
+and handoff; native task systems only mirror it.
 
-## Pick the branch
+## Choose the mode
 
-1. **PLAN** — the user hands a goal, plate, issue, or lever list. Cut it into a chain doc + task graph. Do this before any BUILD.
-2. **ADVANCE** — a chain exists and a loop is mid-flight. Find position, run the next ribbon step.
-3. **TAKEOVER** — resuming after a gap, a compaction, or inheriting another session's chain. Re-evaluate the priors skeptically before advancing — prior-you's conclusions (especially anything inside a noise band) get a fresh read, not automatic trust.
+- **PLAN** — create the chain and task mirrors before BUILD.
+- **ADVANCE** — execute the current loop's next ribbon step.
+- **TAKEOVER** — after a session boundary or handoff, re-ground before advancing.
 
-## Pacing: autonomous vs checkpointed
+At PLAN, front-load anything the user must provide before becoming unavailable: accounts,
+credentials, target choices, destructive-action approval, or product decisions. Never bury a known
+human dependency in a later autonomous loop.
 
-Set at PLAN time and recorded in the chain doc header; infer from the request when obvious
-("go ham" = autonomous; "walk me through it" / high-stakes changes = checkpointed) and ask
-when it isn't.
+## Declare the operating envelope
 
-- **autonomous** (default) — a loop's EXIT triggers the next loop directly; the chain pauses
-  only at declared human gates and AT_BOUND.
-- **checkpointed** — EVERY loop EXIT is a stop: present the exit evidence and ask
-  go / no-go / redirect (AskUserQuestion where available) before the next loop starts. A
-  redirect re-cuts the remaining chain, appended to the doc. Checkpoints are confirmation
-  stops, not design sessions — one question, concrete options.
+The chain frontmatter records:
 
-## Loop anatomy
+- pacing: `autonomous` or `checkpointed`;
+- mutation authority: plan-only, local edits, GitHub writes, publishing, deployment, and destructive
+  actions are separate grants;
+- budget: relevant time, spend, iteration, and context limits;
+- human gates;
+- exact target identity: repository/worktree, branch, HEAD or deployed revision, and runtime;
+- chain status and current loop.
 
-Every loop in the chain doc is specified with exactly these fields:
+Infer pacing only when clear. “Go ham” means autonomous pacing; it never expands mutation authority,
+budget, target scope, or permission to cross a human gate. In checkpointed mode, stop after every
+boundary receipt for one concrete go/no-go/redirect decision.
 
-| Field | Meaning |
+## Cut a short chain
+
+Prefer **2–4 substantive loops before a re-plan gate**. Use agent judgment rather than a mechanical
+line-count rule: one loop should have one state change, one primary acceptance story, and roughly one
+reviewable concern. Split a loop whose proof depends on unrelated subsystems; combine bookkeeping
+that cannot independently change the verdict. Put measurement before intervention when later loops
+claim a delta. Put lower-risk, semantics-preserving changes before riskier prompt or model changes.
+Move a long roadmap into a successor chain instead of pre-authoring a brittle mega-chain.
+
+Every loop has exactly six fields:
+
+| Field | Contract |
 |---|---|
-| `goal` | One sentence. The state change the loop exists to produce. |
-| `prompt` | Self-contained instruction block — enough for a fresh session to execute the loop with zero prior context beyond the chain doc and its named inputs. |
-| `accept` | Evidence-based exit criteria. Every criterion names a **checkable artifact**: a test passing on the pinned runtime, a local trace, a scoreboard JSON with non-null numbers, a merged PR verified at HEAD. |
-| `bound` | Max inner iterations before honest escalation (default: 2 failed PROVE runs, 3 REVIEW→fix rounds). |
-| `exit →` | The loop this one's completion triggers. |
+| `goal` | One-sentence state change. |
+| `prompt` | Self-contained instructions and named inputs for a fresh session. |
+| `accept` | Criterion IDs with checkable evidence and explicit falsifiers. |
+| `bound` | Maximum valid attempts or review/fix rounds. |
+| `at_bound ->` | A predeclared localized repair successor, or `STOP`. |
+| `exit ->` | The normal successor after `COMPLETE` only. |
 
-Ordering rule: **measure before touching anything** — if later loops must show deltas, the
-baseline loop comes first, whatever the standing plan said. Rank levers by risk
-(mechanical → prompt → model), not category momentum: cut the full cost/quality anatomy first,
-then order loops so the provably semantics-preserving levers run before the risky ones.
+An `at_bound ->` repair must remain inside the declared authority and diagnose or repair the failed
+mechanism; it cannot quietly repeat the same loop, weaken acceptance, or jump to the normal successor.
 
-## The ribbon (inner structure, shared by every loop)
+## Execute the ribbon
 
-```
-RE-PLAN   read the chain doc + this loop's prompt + current HEAD; cut a mini-plan for THIS loop only
-BUILD     implement; one concern per PR; targeted git add
-PIN       tests that pin the mechanism AND its fake-success modes explicitly
-PROVE     live run; raw trace saved under ignored .cascade/evidence/<loop>/
-MEASURE   re-run the gate slice (baseline mini-benchmark); record the delta — SKIP when the loop moves no metric (a plain "do X" with no number to track); say so in EXIT.md
-REVIEW    open PR; reviewers auto-fire on open (NO ping); resolve every finding
-MERGE     merge after findings resolved (per standing authority; else wait)
-EXIT      verify each accept criterion against HEAD + the trace — never commit messages;
-          write .cascade/evidence/<loop>/EXIT.md with criterion → evidence pointers; trigger the next loop
-```
+1. **RE-PLAN** — read the chain, current prompt, latest receipt, target HEAD/revision, and native task
+   mirror. Plan only this loop.
+2. **BUILD** — implement one concern. Apply ZEN: simple, general, prompt/agentic-oriented where
+   judgment is the work, beautiful, and dope.
+3. **PIN** — test the mechanism and its plausible fake-success modes.
+4. **PROVE** — run the real claim and retain raw, ignored evidence.
+5. **MEASURE** — record the comparable delta, or an explicit justified `N/A`.
+6. **REVIEW / INTEGRATE** — resolve findings and verify the actual merge candidate or resulting
+   HEAD. A stale, conflicted, unmerged, or differently deployed change is unmet.
+7. **EXIT** — map every criterion to fresh evidence, write the boundary receipt, then transition.
 
-When the harness supports background dispatch or monitoring, use it for judges and long runs
-and interleave independent work. When it does not (stock pi has no background bash), use tmux or
-run the work sequentially; never invent a background primitive the harness does not expose.
+Use background execution only when the harness actually supports it. An infrastructure or
+instrumentation failure does not consume an evidence-attempt bound, but diagnose it and record why;
+only a run that exercised the claim consumes the bound.
 
-## Chain invariants (no exceptions)
+## Use exact boundary states
 
-0. **Plan before you build** — a blunt task gets a chain doc + task graph FIRST; no BUILD before the cascade is cut. This is the whole point; skipping it is skipping the skill.
-1. **No loop advances without its EXIT.md** — criterion → evidence pointer, verified at HEAD.
-2. **Deltas are cumulative** — each EXIT.md carries the running L0→Ln table.
-3. **Regression = unmet criteria**, even if the loop's feature "works." The gate slice is the guard.
-4. **AT_BOUND is a first-class exit** — write EXIT.md with `status: AT_BOUND`, state exactly which criteria are unmet and why, page the user, and STOP that loop. Hitting the bound ≠ done; faking the exit is the one unforgivable move.
-5. **Instrument failures don't count as evidence failures** — a PROVE run that died because the harness/dispatch was miswired gets diagnosed + fixed in its own commit and documented in EXIT.md's bound accounting; only runs that tested the actual claim burn the bound.
-6. **Human gates pause the chain** — a loop whose accept includes user sign-off waits unbounded by design; it never self-advances or times out into fake approval.
-7. **ZEN check on every BUILD** — semantic judgments go to prompts/agentic graders, structural checks to code; domain shape stays in the SOP/prompt, never the engine.
-8. **The chain doc is append-forward** — update it as loops close; when the final re-plan gate fires, the next chain gets a successor doc, not an edit.
+Every loop ends in exactly one state:
 
-## Bookkeeping (set up during PLAN)
+- `COMPLETE` — every current acceptance criterion passed at the verified target. This is the only
+  state that follows `exit ->`.
+- `AT_BOUND` — valid attempts are exhausted with one or more criteria unmet. Write the receipt and
+  either enter the predeclared `at_bound ->` repair or stop/page. Never follow the normal successor.
+- `WAITING_HUMAN` — a declared human decision or approval is required; wait without inventing a
+  timeout or approval.
+- `BLOCKED_EXTERNAL` — required external state or authority is unavailable.
+- `SUPERSEDED` — an append-forward re-plan replaced the unfinished remainder with a named successor.
 
-- **Chain doc** — `.cascade/LOOP_CHAIN_<date>.md`: anatomy table, the ribbon, every loop's five fields, invariants. Template: [references/templates.md](references/templates.md).
-- **Evidence tree** — `.cascade/evidence/<loop-id>-<slug>/` per loop; EXIT.md plus the raw artifacts it points at. Keep `.cascade/` ignored. Publish only a deliberately written, redacted summary when the project needs one; never commit raw transcripts, credentials, absolute home paths, user identifiers, or infrastructure traces.
-- **Task graph** — use the harness's native task graph when one exists. Otherwise keep a checked
-  task table in the chain doc with `blocked by` links. The chain doc is always the portable
-  source of truth; a harness task UI is a synchronized convenience, never the only record.
-- **Final loop = re-plan gate** — the last loop reads the accumulated evidence, writes a verdict with numbers, drafts the next chain from the losing cells, and ends on a human gate.
+There is no “complete except”, “complete with deferred criteria”, partial completion, or retroactive
+weakening of acceptance. Regression means the criterion is unmet.
 
-## Running autonomously
+## Make evidence portable and fresh
 
-When the user says go ham / keep going, keep the chain moving without them driving each step:
+For every criterion, the receipt records: criterion ID, verdict, command/action, runtime/environment,
+target HEAD or deployed revision, timestamp, artifact path and digest when practical, the negative
+case or falsifier checked, and cleanup/rollback notes. Point to artifacts, not commit messages or
+summaries. Keep raw evidence under ignored `.cascade/evidence/<loop>/`; publish only deliberate,
+redacted summaries. When commits are forbidden, identify the candidate as base HEAD plus a
+working-tree or diff digest; HEAD alone does not identify uncommitted proof.
 
-- If the harness supports recurring wakes or lifecycle hooks, arm one with this prompt: read the
-  chain doc plus any native task list for exact position; advance the next ribbon step; honor
-  bounds and human gates. Without recurring wakes, continue in the current session and rely on
-  TAKEOVER from the file-backed chain after a session boundary.
-- Use native monitoring/background execution when available. Otherwise use tmux for a genuinely
-  long process or poll briefly between useful foreground tasks.
-- Report at loop EXITs, not ribbon steps: position, what closed, the delta, what's now running. When asked to report externally, post at exits (e.g. Slack mention in the named channel) — one message per loop exit, not per step.
+The chain file owns definitions, current position, and append-forward history. Only its small
+`Current` block is mutable. Boundary receipts are immutable. A native task must link to its loop and
+receipt; it cannot be marked complete before that receipt exists, and disagreement resolves in favor
+of the file-backed evidence.
 
-## Templates
+## Take over skeptically
 
-Read [references/templates.md](references/templates.md) when writing the chain doc, an EXIT.md,
-or the heartbeat prompt — it carries copy-paste skeletons plus a condensed real example of a
-closed loop's exit.
+On TAKEOVER, read the chain's `Current` block, current loop prompt, latest boundary receipt, exact
+HEAD/deployed revision, and native task mirror. If Recap is installed, use it to recover session or
+compaction context, but treat the chain and target as authoritative. Recheck baseline and noise-band
+priors rather than inheriting conclusions. Confirm repository, worktree, branch, merge freshness,
+runtime, authority, and remaining budget before changing anything. If they disagree, stop or append
+a `SUPERSEDED` re-plan; do not guess the position.
+
+## Close cleanly
+
+At every architecture-changing EXIT, run **POST-ZEN** after ZEN: leave the whole system smaller,
+boring to operate, and maintainable. Prefer one authoritative path, conventional packaging, full
+verification, reusable evals, clear ownership, and tested rollback. Delete superseded paths and
+abstractions. Temporary scaffolding needs an owner and removal gate. For a non-architectural loop,
+record why POST-ZEN is `N/A`.
+
+No loop advances without its receipt. Autonomous chains report at boundaries and continue only when
+the resulting state permits it. The final loop closes with evidence or creates a short successor
+chain from the remaining unknowns; it does not leave a permanent migration tail.
+
+Use [references/templates.md](references/templates.md) for chain and receipt skeletons. Run
+`python3 scripts/validate_cascade.py chain <path>` or `... exit <path>` for structural checks; the
+validator cannot replace semantic review.
