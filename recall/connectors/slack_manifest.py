@@ -7,6 +7,7 @@ import sys
 from urllib.parse import urlsplit
 
 from connectors.registry import definition
+from connectors.slack_source import SLACK_PUBLIC_HISTORY_USER_SCOPES
 
 
 def slack_app_manifest(public_origin: str, *, events: bool = False) -> dict[str, object]:
@@ -27,9 +28,7 @@ def slack_app_manifest(public_origin: str, *, events: bool = False) -> dict[str,
     if events:
         settings["event_subscriptions"] = {
             "request_url": f"{origin}/webhooks/v1/slack",
-            "bot_events": [
-                "message.channels", "message.groups", "message.im", "message.mpim",
-            ],
+            "bot_events": ["message.channels"],
         }
     return {
         "display_information": {
@@ -41,7 +40,10 @@ def slack_app_manifest(public_origin: str, *, events: bool = False) -> dict[str,
         },
         "oauth_config": {
             "redirect_urls": [f"{origin}/admin/oauth/callback/slack"],
-            "scopes": {"bot": scopes},
+            "scopes": {
+                "bot": scopes,
+                "user": list(SLACK_PUBLIC_HISTORY_USER_SCOPES),
+            },
         },
         "settings": settings,
     }

@@ -4,6 +4,7 @@ import unittest
 
 from connectors.registry import definition
 from connectors.slack_manifest import slack_app_manifest
+from connectors.slack_source import SLACK_PUBLIC_HISTORY_USER_SCOPES
 
 
 class SlackManifestTest(unittest.TestCase):
@@ -14,12 +15,20 @@ class SlackManifestTest(unittest.TestCase):
             list(definition("slack.messages").auth.minimum_scopes),
         )
         self.assertEqual(
+            value["oauth_config"]["scopes"]["user"],
+            list(SLACK_PUBLIC_HISTORY_USER_SCOPES),
+        )
+        self.assertEqual(
             value["oauth_config"]["redirect_urls"],
             ["https://recall.example/admin/oauth/callback/slack"],
         )
         self.assertEqual(
             value["settings"]["event_subscriptions"]["request_url"],
             "https://recall.example/webhooks/v1/slack",
+        )
+        self.assertEqual(
+            value["settings"]["event_subscriptions"]["bot_events"],
+            ["message.channels"],
         )
         self.assertNotIn(
             "event_subscriptions", slack_app_manifest("https://recall.example")["settings"],

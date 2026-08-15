@@ -602,6 +602,57 @@ def slack_rail(*, authority_path: Path, **options: Any) -> BoundedJsonRail:
     )
 
 
+class SlackPublicHistoryRail:
+    """Route public history through a user token and live membership through the bot."""
+
+    public_history = True
+    _USER_OPERATIONS = frozenset({
+        "channels.list",
+        "messages.history",
+        "messages.replies",
+    })
+
+    def __init__(self, *, bot_rail: JsonRail, user_rail: JsonRail):
+        if (
+            not callable(getattr(bot_rail, "request", None))
+            or not callable(getattr(user_rail, "request", None))
+            or not callable(getattr(user_rail, "download_binary", None))
+        ):
+            raise ConnectorContractError("slack public history rail is invalid")
+        self.bot_rail = bot_rail
+        self.user_rail = user_rail
+
+    def request(
+        self,
+        operation_id: str,
+        *,
+        path: Mapping[str, Any] | None = None,
+        query: Mapping[str, Any] | None = None,
+        json_body: Mapping[str, Any] | None = None,
+    ) -> Any:
+        rail = self.user_rail if operation_id in self._USER_OPERATIONS else self.bot_rail
+        return rail.request(
+            operation_id,
+            path=path,
+            query=query,
+            json_body=json_body,
+        )
+
+    def download_binary(
+        self, url: str, *, maximum_bytes: int = 64 * 1024 * 1024,
+    ) -> tuple[bytes, str]:
+        return self.user_rail.download_binary(url, maximum_bytes=maximum_bytes)
+
+
+def slack_public_history_rail(
+    *, bot_authority_path: Path, user_authority_path: Path, **options: Any,
+) -> SlackPublicHistoryRail:
+    return SlackPublicHistoryRail(
+        bot_rail=slack_rail(authority_path=bot_authority_path, **options),
+        user_rail=slack_rail(authority_path=user_authority_path, **options),
+    )
+
+
 class SlackMessagesConnector:
     connector_id = "slack.messages"
 
@@ -992,9 +1043,11 @@ __all__ = [
     "LinearActivityConnector",
     "NotionWorkspaceConnector",
     "SlackMessagesConnector",
+    "SlackPublicHistoryRail",
     "github_rail",
     "linear_rail",
     "notion_rail",
     "slack_rail",
+    "slack_public_history_rail",
     "x_rail",
 ]

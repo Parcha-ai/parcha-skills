@@ -10,6 +10,13 @@ from urllib.parse import urlsplit
 from connectors.sdk import ConnectorContractError, ConnectorRecordV2
 
 
+SLACK_PUBLIC_HISTORY_USER_SCOPES = (
+    "channels:history",
+    "channels:read",
+    "files:read",
+)
+
+
 SLACK_ID = re.compile(r"[A-Z][A-Z0-9]{1,31}\Z")
 SLACK_TS = re.compile(r"[0-9]{1,16}(?:\.[0-9]{1,6})?\Z")
 MAX_TEXT_BYTES = 500_000
@@ -260,6 +267,7 @@ def normalize_slack_user(
 
 
 __all__ = [
+    "SLACK_PUBLIC_HISTORY_USER_SCOPES",
     "normalize_slack_message",
     "normalize_slack_user",
     "slack_actor_id",

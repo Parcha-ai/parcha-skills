@@ -72,9 +72,11 @@ def _cursor(value: dict[str, Any]) -> str:
 
 def _initial_state(
     *, watermark: str = EPOCH, upper: str | None = None, cycle: int = 0,
+    public_history: bool = False,
 ) -> dict[str, Any]:
     return {
-        "v": 2,
+        "v": 3,
+        "coverage": "public" if public_history else "member",
         "phase": "users",
         "page": None,
         "discovery_page": None,
@@ -100,9 +102,13 @@ def _valid_time_bounds(value: Mapping[str, Any]) -> bool:
     return True
 
 
-def _state(raw: str | None, configured_channels: tuple[str, ...]) -> dict[str, Any]:
+def _state(
+    raw: str | None,
+    configured_channels: tuple[str, ...],
+    public_history: bool,
+) -> dict[str, Any]:
     if raw is None:
-        return _initial_state()
+        return _initial_state(public_history=public_history)
     try:
         value = json.loads(raw, parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()))
     except (TypeError, json.JSONDecodeError, ValueError):
@@ -131,18 +137,54 @@ def _state(raw: str | None, configured_channels: tuple[str, ...]) -> dict[str, A
         ):
             raise ConnectorContractError("slack workspace cursor is invalid")
         # V1 accumulated the entire workspace in one cursor. Restart its bounded
-        # interval under V2; stable Slack native IDs make the replay idempotent.
+        # interval under V3; stable Slack native IDs make the replay idempotent.
         return _initial_state(
-            watermark=value["watermark"], upper=value["upper"], cycle=value["cycle"],
+            watermark=EPOCH if public_history else value["watermark"],
+            upper=None if public_history else value["upper"],
+            cycle=0 if public_history else value["cycle"],
+            public_history=public_history,
         )
 
-    expected = {
+    v2_expected = {
         "v", "phase", "page", "discovery_page", "channels", "configured_index",
         "channel_index", "threads", "thread_index", "thread_page", "watermark",
         "upper", "cycle", "found",
     }
+    if isinstance(value, dict) and set(value) == v2_expected and value.get("v") == 2:
+        if (
+            value.get("phase") not in {"discover", "users", "history", "threads"}
+            or not isinstance(value.get("channels"), list)
+            or len(value["channels"]) > CHANNEL_BATCH_SIZE
+            or any(not isinstance(item, str) or len(item) > 40 for item in value["channels"])
+            or not isinstance(value.get("threads"), list) or len(value["threads"]) > 100
+            or any(not isinstance(item, str) or len(item) > 32 for item in value["threads"])
+            or type(value.get("configured_index")) is not int
+            or not 0 <= value["configured_index"] <= len(configured_channels)
+            or type(value.get("channel_index")) is not int
+            or not 0 <= value["channel_index"] <= len(value["channels"])
+            or type(value.get("thread_index")) is not int
+            or not 0 <= value["thread_index"] <= len(value["threads"])
+            or type(value.get("cycle")) is not int or value["cycle"] < 0
+            or type(value.get("found")) is not bool
+            or any(value.get(key) is not None and not isinstance(value[key], str)
+                   for key in ("page", "discovery_page", "thread_page"))
+            or not _valid_time_bounds(value)
+        ):
+            raise ConnectorContractError("slack workspace cursor is invalid")
+        # Public-history authority broadens coverage to archived and unjoined
+        # public channels, so replay from epoch once. Stable native IDs dedupe.
+        return _initial_state(
+            watermark=EPOCH if public_history else value["watermark"],
+            upper=None if public_history else value["upper"],
+            cycle=0 if public_history else value["cycle"],
+            public_history=public_history,
+        )
+
+    expected = v2_expected | {"coverage"}
+    expected_coverage = "public" if public_history else "member"
     if (
-        not isinstance(value, dict) or set(value) != expected or value.get("v") != 2
+        not isinstance(value, dict) or set(value) != expected or value.get("v") != 3
+        or value.get("coverage") not in {"member", "public"}
         or value.get("phase") not in {"discover", "users", "history", "threads"}
         or not isinstance(value.get("channels"), list)
         or len(value["channels"]) > CHANNEL_BATCH_SIZE
@@ -170,6 +212,8 @@ def _state(raw: str | None, configured_channels: tuple[str, ...]) -> dict[str, A
         not value["threads"] or value["thread_index"] >= len(value["threads"])
     ):
         raise ConnectorContractError("slack workspace cursor is invalid")
+    if value["coverage"] != expected_coverage:
+        return _initial_state(public_history=public_history)
     return value
 
 
@@ -203,6 +247,7 @@ class SlackWorkspaceConnector:
         self.owner_user_ids = owner_user_ids
         self.channel_ids = channel_ids
         self.page_size = page_size
+        self.public_history = getattr(rail, "public_history", False) is True
 
     def _request(self, operation: str, query: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -211,7 +256,7 @@ class SlackWorkspaceConnector:
             raise ConnectorUpstreamError("connector_upstream_error") from None
 
     def pull(self, cursor: str | None) -> ConnectorPage:
-        state = _state(cursor, self.channel_ids)
+        state = _state(cursor, self.channel_ids, self.public_history)
         return getattr(self, f"_pull_{state['phase']}")(state)
 
     def _page(self, records: list[ConnectorRecordV2], state: dict[str, Any], more: bool) -> ConnectorPage:
@@ -219,8 +264,9 @@ class SlackWorkspaceConnector:
 
     def _pull_discover(self, state: dict[str, Any]) -> ConnectorPage:
         query: dict[str, Any] = {
-            "exclude_archived": True, "limit": CHANNEL_BATCH_SIZE,
-            "types": "public_channel,private_channel,mpim,im",
+            "exclude_archived": not self.public_history,
+            "limit": CHANNEL_BATCH_SIZE,
+            "types": "public_channel",
         }
         if state["discovery_page"]:
             query["cursor"] = state["discovery_page"]
@@ -229,11 +275,9 @@ class SlackWorkspaceConnector:
         for raw in _items(response.get("channels"), "channels", CHANNEL_BATCH_SIZE):
             if not isinstance(raw, dict) or not isinstance(raw.get("id"), str):
                 raise ConnectorContractError("slack channel is invalid")
-            private_channel = bool(raw.get("is_private"))
-            direct = bool(raw.get("is_im") or raw.get("is_mpim"))
-            do_not_join = private_channel or direct
-            if private_channel and not direct and raw.get("is_member") is not True:
+            if raw.get("is_private") or raw.get("is_im") or raw.get("is_mpim"):
                 continue
+            do_not_join = bool(raw.get("is_archived"))
             encoded = f"{raw['id']}:{1 if do_not_join else 0}"
             if encoded not in channels:
                 channels.append(encoded)
@@ -279,7 +323,10 @@ class SlackWorkspaceConnector:
         return {
             **state,
             "phase": "history",
-            "channels": [f"{item}:0" for item in self.channel_ids[start:stop]],
+            "channels": [
+                f"{item}:{1 if self.public_history else 0}"
+                for item in self.channel_ids[start:stop]
+            ],
             "configured_index": stop,
             "channel_index": 0,
             "page": None,
@@ -291,12 +338,12 @@ class SlackWorkspaceConnector:
     @staticmethod
     def _channel(state: dict[str, Any]) -> tuple[str, bool]:
         encoded = state["channels"][state["channel_index"]]
-        channel_id, private = encoded.rsplit(":", 1)
-        return channel_id, private == "1"
+        channel_id, do_not_join = encoded.rsplit(":", 1)
+        return channel_id, do_not_join == "1"
 
     def _pull_history(self, state: dict[str, Any]) -> ConnectorPage:
-        channel_id, private = self._channel(state)
-        if not private and state["page"] is None:
+        channel_id, do_not_join = self._channel(state)
+        if not do_not_join and state["page"] is None:
             self._request("channels.join", {"channel": channel_id})
         query: dict[str, Any] = {
             "channel": channel_id, "inclusive": True, "limit": self.page_size,
@@ -335,7 +382,7 @@ class SlackWorkspaceConnector:
         return self._advance_channel(list(records.values()), state, next_page)
 
     def _pull_threads(self, state: dict[str, Any]) -> ConnectorPage:
-        channel_id, _private = self._channel(state)
+        channel_id, _do_not_join = self._channel(state)
         thread_ts = state["threads"][state["thread_index"]]
         query: dict[str, Any] = {
             "channel": channel_id, "inclusive": True, "limit": self.page_size,
@@ -400,6 +447,7 @@ class SlackWorkspaceConnector:
         return self._page(records, {
             **_initial_state(
                 watermark=state["upper"], upper=_now(), cycle=state["cycle"] + 1,
+                public_history=self.public_history,
             ),
         }, False)
 

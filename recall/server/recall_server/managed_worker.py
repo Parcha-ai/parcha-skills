@@ -24,6 +24,7 @@ from connectors.registry import (
     definition,
 )
 from connectors.workspace_rail import WorkspaceRailError
+from connectors.work_apis import slack_public_history_rail
 from connectors.sdk import (
     ConnectorContractError,
     ConnectorRunner,
@@ -84,6 +85,24 @@ def _private_root(path: Path) -> Path:
         os.close(descriptor)
     if stat.S_IMODE(metadata.st_mode) != 0o700:
         raise ValueError("managed worker state root is not private")
+    return path
+
+
+def _write_private_authority(directory: Path, name: str, payload: bytes) -> Path:
+    if (
+        not isinstance(payload, bytes)
+        or not payload
+        or len(payload) > MAX_CREDENTIAL_BYTES
+        or not re.fullmatch(r"[a-z][a-z0-9-]{2,63}", name)
+    ):
+        raise ControlError("connector_authority_revoked")
+    path = directory / name
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(descriptor, payload)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
     return path
 
 
@@ -312,7 +331,11 @@ class ManagedConnectorWorker:
                 allow_nan=False,
             ).encode()
         else:
-            token = credentials.get("access_token") or credentials.get("token")
+            token = (
+                credentials.get("bot_access_token")
+                or credentials.get("access_token")
+                or credentials.get("token")
+            )
             if not isinstance(token, str) or not token:
                 raise ControlError("connector_authority_revoked")
             payload = token.encode()
@@ -367,19 +390,33 @@ class ManagedConnectorWorker:
                 raise ControlError("connector_authority_revoked")
             rails = {**self.remote_rails, connector_id: composio_rail}
             authority_path = private_directory / "composio-reference"
-        else:
-            authority_path = private_directory / "source-authority"
-            descriptor = os.open(
-                authority_path,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                0o600,
+        elif connector_id == "slack.messages" and (
+            "bot_access_token" in credentials or "user_access_token" in credentials
+        ):
+            bot_token = credentials.get("bot_access_token")
+            user_token = credentials.get("user_access_token")
+            if not all(isinstance(value, str) and value for value in (bot_token, user_token)):
+                raise ControlError("connector_authority_revoked")
+            authority_path = _write_private_authority(
+                private_directory, "slack-bot-authority", bot_token.encode(),
             )
-            try:
-                payload = self._credential_payload(connector_id, credentials)
-                os.write(descriptor, payload)
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
+            user_authority_path = _write_private_authority(
+                private_directory, "slack-user-authority", user_token.encode(),
+            )
+            rails = {
+                **rails,
+                connector_id: slack_public_history_rail(
+                    bot_authority_path=authority_path,
+                    user_authority_path=user_authority_path,
+                    timeout_seconds=60,
+                ),
+            }
+        else:
+            authority_path = _write_private_authority(
+                private_directory,
+                "source-authority",
+                self._credential_payload(connector_id, credentials),
+            )
         options = RemoteOptions.from_mapping(
             connector_id,
             {

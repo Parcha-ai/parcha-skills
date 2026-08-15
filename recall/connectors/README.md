@@ -220,6 +220,23 @@ Factories such as `github_rail(authority_path=...)` read a token lazily from the
 same strict mode-0600 authority file contract. Provider tokens, selectors, raw
 payloads, cursors, and exception details never enter previews or health output.
 
+The hosted Slack connector is public-workspace-only. Its generated app manifest
+requests a bot token for live public-channel events, membership, and workspace
+identity, plus an installing-user token for the complete public history rail.
+That user rail can read active, archived, joined, and unjoined public channels;
+private channels, group messages, and direct messages are outside the connector
+contract. Generate the exact manifest from the `recall` directory with:
+
+```bash
+python -m connectors.slack_manifest --events https://recall.example.com
+```
+
+After adding the user scopes to an existing Slack app, reconnect it once so the
+host receives both authorities. The connector then resets its coverage cursor
+to the epoch and replays public history. Stable Slack message IDs make the
+broader replay idempotent, and only the bot token is used to join active public
+channels or receive live events.
+
 ### X activity
 
 The X adapter can poll bookmarks, mentions, authored posts, and the reverse
