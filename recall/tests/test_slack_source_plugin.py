@@ -189,7 +189,7 @@ class SlackSourcePluginTest(unittest.TestCase):
                 signing_secret=secret, now=now,
             )
 
-    def test_workspace_plugin_discovers_and_scans_every_accessible_channel(self):
+    def test_workspace_plugin_ingests_only_public_active_channels_with_bot_authority(self):
         rail = Rail()
         rail.add("channels.list", {
             "ok": True,
@@ -207,9 +207,6 @@ class SlackSourcePluginTest(unittest.TestCase):
         rail.add("messages.history", slack_response([{
             "type": "message", "ts": "1784332800.000100",
             "user": "U111", "text": "Public channel",
-        }]), slack_response([{
-            "type": "message", "ts": "1784332801.000100",
-            "user": "U222", "text": "Private channel",
         }]))
         connector = SlackWorkspaceConnector(
             rail=rail, source_id="synthetic:slack:workspace",
@@ -226,7 +223,7 @@ class SlackSourcePluginTest(unittest.TestCase):
         self.assertEqual(
             {record.content["text"] for record in records
              if record.content["kind"] == "communication_message.v1"},
-            {"Public channel", "Private channel"},
+            {"Public channel"},
         )
         self.assertEqual(
             [call[1]["query"]["channel"] for call in rail.calls
@@ -235,8 +232,67 @@ class SlackSourcePluginTest(unittest.TestCase):
         )
         history_calls = [call for call in rail.calls if call[0] == "messages.history"]
         self.assertEqual({call[1]["query"]["channel"] for call in history_calls},
-                         {"C111", "G222"})
+                         {"C111"})
         self.assertTrue(all("latest" in call[1]["query"] for call in history_calls))
+        discovery = next(call for call in rail.calls if call[0] == "channels.list")
+        self.assertTrue(discovery[1]["query"]["exclude_archived"])
+        self.assertEqual(discovery[1]["query"]["types"], "public_channel")
+
+    def test_public_history_scans_active_and_archived_public_channels(self):
+        rail = Rail()
+        rail.public_history = True
+        rail.add("users.list", {
+            "ok": True, "members": [], "response_metadata": {"next_cursor": ""},
+        })
+        rail.add("channels.list", {
+            "ok": True,
+            "channels": [
+                {"id": "C111", "is_private": False, "is_archived": False},
+                {"id": "C222", "is_private": False, "is_archived": True},
+                {"id": "G333", "is_private": True, "is_member": True},
+            ],
+            "response_metadata": {"next_cursor": ""},
+        })
+        rail.add("channels.join", {"ok": True, "channel": {"id": "C111"}})
+        rail.add("messages.history", slack_response([{
+            "type": "message", "ts": "1784332800.000100",
+            "user": "U111", "text": "Active public history",
+        }]), slack_response([{
+            "type": "message", "ts": "1684332800.000100",
+            "user": "U222", "text": "Archived public history",
+        }]))
+        connector = SlackWorkspaceConnector(
+            rail=rail, source_id="synthetic:slack:public-history",
+            workspace_id="T123",
+        )
+
+        cursor = None
+        records = []
+        for _ in range(8):
+            page = connector.pull(cursor)
+            records.extend(page.records)
+            cursor = page.next_cursor
+            if not page.has_more:
+                break
+
+        self.assertEqual(
+            {record.content["text"] for record in records
+             if record.content["kind"] == "communication_message.v1"},
+            {"Active public history", "Archived public history"},
+        )
+        discovery = next(call for call in rail.calls if call[0] == "channels.list")
+        self.assertFalse(discovery[1]["query"]["exclude_archived"])
+        self.assertEqual(discovery[1]["query"]["types"], "public_channel")
+        self.assertEqual(
+            [call[1]["query"]["channel"] for call in rail.calls
+             if call[0] == "channels.join"],
+            ["C111"],
+        )
+        self.assertEqual(
+            [call[1]["query"]["channel"] for call in rail.calls
+             if call[0] == "messages.history"],
+            ["C111", "C222"],
+        )
 
     def test_workspace_plugin_streams_more_channels_than_fit_in_one_cursor(self):
         rail = Rail()
@@ -322,12 +378,48 @@ class SlackSourcePluginTest(unittest.TestCase):
         migrated = json.loads(page.next_cursor)
 
         self.assertTrue(page.has_more)
-        self.assertEqual(migrated["v"], 2)
+        self.assertEqual(migrated["v"], 3)
+        self.assertEqual(migrated["coverage"], "member")
         self.assertEqual(migrated["phase"], "discover")
         self.assertEqual(migrated["watermark"], "2026-08-01T00:00:00Z")
         self.assertEqual(migrated["upper"], "2026-08-02T00:00:00Z")
         self.assertEqual(migrated["cycle"], 3)
         self.assertEqual(migrated["channels"], [])
+
+    def test_public_history_upgrade_replays_v2_cursor_from_epoch_once(self):
+        rail = Rail()
+        rail.public_history = True
+        rail.add("users.list", {
+            "ok": True, "members": [], "response_metadata": {"next_cursor": ""},
+        })
+        previous = json.dumps({
+            "v": 2,
+            "phase": "users",
+            "page": None,
+            "discovery_page": None,
+            "channels": [],
+            "configured_index": 0,
+            "channel_index": 0,
+            "threads": [],
+            "thread_index": 0,
+            "thread_page": None,
+            "watermark": "2026-08-01T00:00:00Z",
+            "upper": "2026-08-02T00:00:00Z",
+            "cycle": 3,
+            "found": False,
+        })
+        connector = SlackWorkspaceConnector(
+            rail=rail, source_id="synthetic:slack:public-upgrade",
+            workspace_id="T123",
+        )
+
+        migrated = json.loads(connector.pull(previous).next_cursor)
+
+        self.assertEqual(migrated["v"], 3)
+        self.assertEqual(migrated["coverage"], "public")
+        self.assertEqual(migrated["watermark"], "1970-01-01T00:00:00Z")
+        self.assertEqual(migrated["cycle"], 0)
+        self.assertNotEqual(migrated["upper"], "2026-08-02T00:00:00Z")
 
     def test_workspace_plugin_archives_full_attachment_and_projects_its_text(self):
         rail = Rail()

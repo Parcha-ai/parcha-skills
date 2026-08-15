@@ -17,6 +17,7 @@ from connectors.work_apis import (
     LinearActivityConnector,
     NotionWorkspaceConnector,
     SlackMessagesConnector,
+    SlackPublicHistoryRail,
     github_rail,
     linear_rail,
     notion_rail,
@@ -42,6 +43,12 @@ class FakeRail:
         if isinstance(value, Exception):
             raise value
         return value
+
+    def download_binary(self, url, *, maximum_bytes=64 * 1024 * 1024):
+        self.calls.append(("binary.download", {
+            "url": url, "maximum_bytes": maximum_bytes,
+        }))
+        return b"synthetic", "text/plain"
 
 
 def github_issue(number, *, updated="2026-07-18T01:00:00Z", body="Synthetic issue"):
@@ -164,6 +171,33 @@ class LinearConnectorTest(unittest.TestCase):
 
 
 class SlackConnectorTest(unittest.TestCase):
+    def test_public_history_rail_routes_reads_to_user_and_membership_to_bot(self):
+        bot = FakeRail()
+        user = FakeRail()
+        bot.add("users.list", {"ok": True})
+        bot.add("channels.join", {"ok": True})
+        user.add("channels.list", {"ok": True})
+        user.add("messages.history", {"ok": True})
+        user.add("messages.replies", {"ok": True})
+        rail = SlackPublicHistoryRail(bot_rail=bot, user_rail=user)
+
+        for operation in ("users.list", "channels.join"):
+            rail.request(operation, query={})
+        for operation in ("channels.list", "messages.history", "messages.replies"):
+            rail.request(operation, query={})
+        self.assertEqual(
+            [call[0] for call in bot.calls], ["users.list", "channels.join"],
+        )
+        self.assertEqual(
+            [call[0] for call in user.calls],
+            ["channels.list", "messages.history", "messages.replies"],
+        )
+        self.assertEqual(
+            rail.download_binary("https://files.slack.com/files-pri/T-F/test"),
+            (b"synthetic", "text/plain"),
+        )
+        self.assertTrue(rail.public_history)
+
     def test_opaque_pagination_edit_and_explicit_delete_only(self):
         rail = FakeRail()
         rail.add("messages.history", {

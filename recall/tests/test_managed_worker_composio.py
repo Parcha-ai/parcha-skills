@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from connectors.composio_workspace_rail import ComposioWorkspaceRail
+from connectors.work_apis import SlackPublicHistoryRail
 from server.recall_server.control import ControlError
 from server.recall_server.managed_worker import (
     ManagedConnectorWorker,
@@ -182,6 +183,53 @@ class ManagedWorkerComposioTests(unittest.TestCase):
                 self.assertRaisesRegex(ControlError, "connector_authority_revoked"),
             ):
                 worker._build_default(self.row(), self.credentials(), private)
+
+    def test_slack_dual_authority_is_ephemeral_split_and_public_history_bound(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private = root / "authority"
+            private.mkdir(mode=0o700)
+            worker = self.worker(root)
+            stale_bot_only_rail = object()
+            worker.remote_rails = {"slack.messages": stale_bot_only_rail}
+            row = {
+                "id": "synthetic-slack-installation",
+                "connector_id": "slack.messages",
+                "provider": "slack",
+                "source_id": "synthetic:slack:public-history",
+                "privacy_mode": "scrub",
+                "selectors": {
+                    "workspace_id": "T123",
+                    "channel_ids": [],
+                    "owner_user_ids": ["U111"],
+                },
+            }
+            connector, spool = worker._build_default(row, {
+                "bot_access_token": "synthetic-bot-authority",
+                "user_access_token": "synthetic-user-authority",
+            }, private)
+
+            self.assertIsInstance(connector.rail, SlackPublicHistoryRail)
+            self.assertIsNot(connector.rail, stale_bot_only_rail)
+            self.assertTrue(connector.public_history)
+            self.assertEqual(
+                {path.name for path in private.iterdir()},
+                {"slack-bot-authority", "slack-user-authority"},
+            )
+            self.assertTrue(all(
+                stat.S_IMODE(path.stat().st_mode) == 0o600
+                for path in private.iterdir()
+            ))
+            self.assertEqual(
+                spool, worker.spool_root / "synthetic-slack-installation.db",
+            )
+
+            second_private = root / "incomplete-authority"
+            second_private.mkdir(mode=0o700)
+            with self.assertRaisesRegex(ControlError, "connector_authority_revoked"):
+                worker._build_default(row, {
+                    "bot_access_token": "synthetic-bot-authority",
+                }, second_private)
 
 
 if __name__ == "__main__":

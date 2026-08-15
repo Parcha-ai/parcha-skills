@@ -15,6 +15,7 @@ from server.recall_server.control import (
 )
 from server.recall_server.app import validate_http_profile
 from connectors.workspace_rail import WorkspaceRailError
+from connectors.slack_source import SLACK_PUBLIC_HISTORY_USER_SCOPES
 
 
 class SecretBoxTests(unittest.TestCase):
@@ -90,19 +91,52 @@ class SlackOAuthProviderTests(unittest.TestCase):
         )
         query = parse_qs(urlsplit(url).query)
         self.assertEqual(query["scope"], ["channels:history,users:read"])
+        self.assertEqual(
+            query["user_scope"], [",".join(SLACK_PUBLIC_HISTORY_USER_SCOPES)],
+        )
         self.assertEqual(query["state"], ["s" * 48])
         with patch.object(GoogleOAuthProvider, "_post", return_value={
             "ok": True,
             "access_token": "synthetic-bot-token",
             "scope": "users:read,channels:history",
             "team": {"id": "T123"},
-            "authed_user": {"id": "U111"},
+            "authed_user": {
+                "id": "U111",
+                "access_token": "synthetic-user-token",
+                "scope": ",".join(SLACK_PUBLIC_HISTORY_USER_SCOPES),
+                "token_type": "user",
+            },
         }):
             tokens = self.provider.exchange(code="synthetic-code", code_verifier="ignored")
         self.assertEqual(tokens.subject_id, "T123")
         self.assertEqual(tokens.credentials["team_id"], "T123")
         self.assertEqual(tokens.credentials["authed_user_id"], "U111")
-        self.assertEqual(tokens.granted_scopes, ("channels:history", "users:read"))
+        self.assertEqual(tokens.credentials["bot_access_token"], "synthetic-bot-token")
+        self.assertEqual(tokens.credentials["user_access_token"], "synthetic-user-token")
+        self.assertEqual(
+            tokens.granted_scopes,
+            (
+                "channels:history",
+                "user:channels:history",
+                "user:channels:read",
+                "user:files:read",
+                "users:read",
+            ),
+        )
+
+    def test_exchange_fails_closed_without_complete_public_history_authority(self):
+        with patch.object(GoogleOAuthProvider, "_post", return_value={
+            "ok": True,
+            "access_token": "synthetic-bot-token",
+            "scope": "channels:history,users:read",
+            "team": {"id": "T123"},
+            "authed_user": {
+                "id": "U111",
+                "access_token": "synthetic-user-token",
+                "scope": "channels:read",
+            },
+        }), self.assertRaisesRegex(ControlError, "slack_oauth_scope_invalid"):
+            self.provider.exchange(code="synthetic-code", code_verifier="ignored")
 
 
 class FakeConnectedAccounts:
