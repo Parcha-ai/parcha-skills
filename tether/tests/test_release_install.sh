@@ -7,7 +7,7 @@ umask 077
 
 PACKAGE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPOSITORY_ROOT="$(cd "$PACKAGE_ROOT/.." && pwd)"
-EXPECTED_VERSION="0.2.0-beta.1"
+EXPECTED_VERSION="0.3.0-beta.1"
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 
@@ -157,6 +157,16 @@ esac
 EOF
 chmod 700 "$HERMES_BIN"
 export HERMES_TEST_LOG="$TEST_ROOT/hermes.log"
+export TETHER_TEST_SYSTEM_GATEWAY_ACTIVE=0
+
+HERDR_BIN="$FAKE_BIN/herdr"
+export HERDR_TEST_LOG="$TEST_ROOT/herdr.log"
+cat >"$HERDR_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${HERDR_TEST_LOG:?}"
+EOF
+chmod 700 "$HERDR_BIN"
 
 cat >"$FAKE_BIN/install" <<'EOF'
 #!/usr/bin/env bash
@@ -318,12 +328,16 @@ HERMES_COMPAT="$RUNTIME/hermes_compat.py"
 ROUTING="$RUNTIME/routing.py"
 SECURITY="$RUNTIME/security.py"
 SLACK_PROTOCOL="$RUNTIME/slack_protocol.py"
+HERDR_MANIFEST="$RUNTIME/herdr-plugin/herdr-plugin.toml"
+HERDR_PLUGIN="$RUNTIME/herdr-plugin/tether_plugin.py"
+HERDR_README="$RUNTIME/herdr-plugin/README.md"
 CODEX_SKILL="$CODEX_HOME/skills/tether/SKILL.md"
 CLAUDE_SKILL="$CLAUDE_HOME/skills/tether/SKILL.md"
 
 for path in "$BRIDGE" "$HERMES_COMPAT" "$ROUTING" "$SECURITY" "$SLACK_PROTOCOL" \
   "$RUNTIME/install.sh" "$RUNTIME/package.json" "$LAUNCHER" "$CODEX_SKILL" \
-  "$CLAUDE_SKILL" "$STATE/current.tsv" "$CONFIG"
+  "$CLAUDE_SKILL" "$HERDR_MANIFEST" "$HERDR_PLUGIN" "$HERDR_README" \
+  "$STATE/current.tsv" "$CONFIG"
 do
   assert_file "$path"
 done
@@ -341,8 +355,16 @@ assert_mode "$HERMES_COMPAT" 600
 assert_mode "$ROUTING" 600
 assert_mode "$SECURITY" 600
 assert_mode "$SLACK_PROTOCOL" 600
+assert_mode "$HERDR_MANIFEST" 644
+assert_mode "$HERDR_PLUGIN" 700
 assert_mode "$LAUNCHER" 700
 assert_mode "$CONFIG" 600
+node "$PACKAGE_ROOT/bin/tether.js" upgrade --dry-run --harness=both --herdr
+assert_contains "$HERDR_TEST_LOG" "plugin link $RUNTIME/herdr-plugin"
+node "$PACKAGE_ROOT/bin/tether.js" rollback --dry-run --herdr
+assert_contains "$HERDR_TEST_LOG" "plugin link $RUNTIME/herdr-plugin"
+node "$PACKAGE_ROOT/bin/tether.js" uninstall --dry-run --herdr
+assert_contains "$HERDR_TEST_LOG" "plugin unlink parcha.tether"
 chmod 722 "$LAUNCHER"
 set +e
 "$PACKAGE_ROOT/install.sh" upgrade --dry-run --harness=both \
@@ -493,7 +515,8 @@ assert_equals "$(<"$STATE/last-backup")" "$baseline_last_backup"
 "$REAL_INSTALL" -m 600 "$TEST_ROOT/config.saved" "$CONFIG"
 
 set +e
-HERMES_TEST_FAIL_ON="gateway restart" \
+TETHER_TEST_SYSTEM_GATEWAY_ACTIVE=1 \
+HERMES_TEST_FAIL_ON="gateway restart --system" \
   "$PACKAGE_ROOT/install.sh" upgrade --harness=both --restart \
   >"$TEST_ROOT/restart-failure.out" 2>&1
 restart_failure_rc=$?
@@ -501,6 +524,7 @@ set -e
 [[ "$restart_failure_rc" -eq 74 ]] ||
   fail "restart failure returned $restart_failure_rc instead of 74"
 assert_contains "$TEST_ROOT/restart-failure.out" "restoring the previous state"
+assert_contains "$HERMES_TEST_LOG" "gateway restart --system"
 ! grep -Fq "Installed Tether" "$TEST_ROOT/restart-failure.out" ||
   fail "restart failure reported installation success"
 assert_absent "$STATE/transaction.tsv"

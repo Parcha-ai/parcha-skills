@@ -1,6 +1,6 @@
 {
   "name": "tether",
-  "version": "0.2.0-beta.1",
+  "version": "0.3.0-beta.1",
   "description": "Keep Slack threads attached to their originating agents through Hermes.",
   "author": {"name": "Parcha Labs", "url": "https://parcha.com"},
   "homepage": "https://github.com/Parcha-ai/parcha-skills/tree/main/tether",
