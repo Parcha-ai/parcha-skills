@@ -422,10 +422,17 @@ class LogicalEvidenceUpload:
     manifest: LogicalEvidenceManifest
     manifest_reference: dict[str, Any]
     part_references: tuple[dict[str, Any], ...]
+    created_part_references: tuple[dict[str, Any], ...]
 
     @property
     def all_references(self) -> tuple[dict[str, Any], ...]:
         return (self.manifest_reference, *self.part_references)
+
+    @property
+    def cleanup_references(self) -> tuple[dict[str, Any], ...]:
+        """Objects owned by this attempt, excluding borrowed immutable parts."""
+
+        return (self.manifest_reference, *self.created_part_references)
 
 
 def prepare_logical_document(
@@ -650,6 +657,7 @@ class LogicalEvidenceProjectionStore:
             manifest=manifest,
             manifest_reference=manifest_reference,
             part_references=tuple(part_references),
+            created_part_references=tuple(part_references),
         )
 
     def put_records(
@@ -698,9 +706,12 @@ class LogicalEvidenceProjectionStore:
         last_occurred = ""
         first_time: datetime | None = None
         last_time: datetime | None = None
-        parts: list[PreparedPart] = []
-        manifest_parts: list[ManifestPart] = []
-        part_references: list[dict[str, Any]] = []
+        accepted_parts: dict[
+            int,
+            tuple[PreparedPart, ManifestPart, dict[str, Any]],
+        ] = {}
+        created_part_references: list[dict[str, Any]] = []
+        next_part_ordinal = 0
         pending_parts: deque[
             tuple[PreparedPart, Future[dict[str, Any]]]
         ] = deque()
@@ -732,17 +743,14 @@ class LogicalEvidenceProjectionStore:
         def accept_part(
             prepared_part: PreparedPart,
             reference: dict[str, Any],
+            *,
+            created: bool,
         ) -> None:
-            part_references.append(reference)
-            manifest_parts.append(
-                ManifestPart.from_reference(
-                    prepared=prepared_part,
-                    reference=reference,
-                    tenant_id=tenant_id,
-                    source_id=source_id,
-                )
-            )
-            parts.append(
+            if created:
+                created_part_references.append(reference)
+            if prepared_part.ordinal in accepted_parts:
+                raise LogicalEvidenceError("logical_evidence_state_invalid")
+            accepted_parts[prepared_part.ordinal] = (
                 PreparedPart(
                     ordinal=prepared_part.ordinal,
                     first_record_ordinal=prepared_part.first_record_ordinal,
@@ -752,12 +760,19 @@ class LogicalEvidenceProjectionStore:
                     receipt_count=prepared_part.receipt_count,
                     payload=b"",
                     content_sha256=prepared_part.content_sha256,
-                )
+                ),
+                ManifestPart.from_reference(
+                    prepared=prepared_part,
+                    reference=reference,
+                    tenant_id=tenant_id,
+                    source_id=source_id,
+                ),
+                reference,
             )
 
         def finish_oldest_part() -> None:
             prepared_part, future = pending_parts.popleft()
-            accept_part(prepared_part, future.result())
+            accept_part(prepared_part, future.result(), created=True)
 
         def reusable_part(
             prepared_part: PreparedPart,
@@ -778,6 +793,7 @@ class LogicalEvidenceProjectionStore:
             return reference
 
         def close_part(last_record: int) -> None:
+            nonlocal next_part_ordinal
             nonlocal part_payload, part_start
             nonlocal part_receipt_count, part_created_at
             nonlocal part_first_occurred, part_last_occurred
@@ -788,7 +804,7 @@ class LogicalEvidenceProjectionStore:
             if part_first_time is None or part_last_time is None:
                 raise LogicalEvidenceError("logical_evidence_state_invalid")
             prepared_part = PreparedPart(
-                ordinal=len(parts) + len(pending_parts),
+                ordinal=next_part_ordinal,
                 first_record_ordinal=part_start,
                 last_record_ordinal=last_record,
                 first_occurred_at=part_first_occurred,
@@ -797,13 +813,19 @@ class LogicalEvidenceProjectionStore:
                 payload=payload,
                 content_sha256=hashlib.sha256(payload).hexdigest(),
             )
+            next_part_ordinal += 1
             existing_reference = reusable_part(prepared_part)
             if existing_reference is not None:
-                accept_part(prepared_part, existing_reference)
+                accept_part(
+                    prepared_part,
+                    existing_reference,
+                    created=False,
+                )
             elif part_executor is None:
                 accept_part(
                     prepared_part,
                     publish_part(prepared_part, part_created_at),
+                    created=True,
                 )
             else:
                 if len(pending_parts) >= self.part_upload_concurrency:
@@ -876,6 +898,15 @@ class LogicalEvidenceProjectionStore:
             close_part(record_count - 1)
             while pending_parts:
                 finish_oldest_part()
+            if set(accepted_parts) != set(range(next_part_ordinal)):
+                raise LogicalEvidenceError("logical_evidence_state_invalid")
+            ordered_parts = [
+                accepted_parts[ordinal]
+                for ordinal in range(next_part_ordinal)
+            ]
+            parts = tuple(value[0] for value in ordered_parts)
+            manifest_parts = tuple(value[1] for value in ordered_parts)
+            part_references = tuple(value[2] for value in ordered_parts)
             digest = document_digest.hexdigest()
             evidence_id = _opaque(
                 "evd_",
@@ -897,7 +928,7 @@ class LogicalEvidenceProjectionStore:
                 document_content_sha256=digest,
                 record_count=record_count,
                 receipt_count=receipt_count,
-                parts=tuple(parts),
+                parts=parts,
             )
             manifest = LogicalEvidenceManifest(
                 logical_document_id=document_id,
@@ -912,7 +943,7 @@ class LogicalEvidenceProjectionStore:
                 record_count=record_count,
                 receipt_count=receipt_count,
                 retention_profile=retention_profile,
-                parts=tuple(manifest_parts),
+                parts=manifest_parts,
             )
             manifest_reference = self.archive.put_raw(
                 tenant_id=tenant_id,
@@ -929,10 +960,14 @@ class LogicalEvidenceProjectionStore:
             while pending_parts:
                 prepared_part, future = pending_parts.popleft()
                 try:
-                    accept_part(prepared_part, future.result())
+                    accept_part(
+                        prepared_part,
+                        future.result(),
+                        created=True,
+                    )
                 except Exception:
                     pass
-            for reference in reversed(part_references):
+            for reference in reversed(created_part_references):
                 try:
                     self.archive.delete_raw(reference)
                 except Exception:
@@ -945,7 +980,8 @@ class LogicalEvidenceProjectionStore:
             prepared=prepared,
             manifest=manifest,
             manifest_reference=manifest_reference,
-            part_references=tuple(part_references),
+            part_references=part_references,
+            created_part_references=tuple(created_part_references),
         )
 
     def read_manifest(
