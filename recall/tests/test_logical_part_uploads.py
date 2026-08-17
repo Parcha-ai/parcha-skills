@@ -11,6 +11,7 @@ from server.recall_server.logical_evidence import (
     DEFAULT_PART_BYTES,
     LogicalEvidenceProjectionStore,
     LogicalEvidenceRecord,
+    MANIFEST_MEDIA_TYPE,
 )
 from server.recall_server.logical_evidence_projection import (
     CanonicalLogicalEvidenceProjector,
@@ -18,8 +19,14 @@ from server.recall_server.logical_evidence_projection import (
 
 
 class _ConcurrentArchive:
-    def __init__(self, *, fail_suffix: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        fail_suffix: str | None = None,
+        fail_media_type: str | None = None,
+    ) -> None:
         self.fail_suffix = fail_suffix
+        self.fail_media_type = fail_media_type
         self.active = 0
         self.maximum_active = 0
         self.put_calls = 0
@@ -42,7 +49,9 @@ class _ConcurrentArchive:
             self.maximum_active = max(self.maximum_active, self.active)
         try:
             time.sleep(0.01)
-            if self.fail_suffix and native_id.endswith(self.fail_suffix):
+            if (
+                self.fail_suffix and native_id.endswith(self.fail_suffix)
+            ) or media_type == self.fail_media_type:
                 raise RuntimeError("synthetic upload failure")
             digest = hashlib.sha256(
                 native_id.encode() + b"\0" + payload
@@ -267,6 +276,119 @@ class LogicalPartUploadTests(unittest.TestCase):
             second.manifest_reference["artifact_id"],
         )
         self.assertEqual(archive.put_calls, calls_after_first + 1)
+
+    def test_mixed_changed_and_reused_parts_keep_manifest_order(self) -> None:
+        archive = _ConcurrentArchive()
+        projection = LogicalEvidenceProjectionStore(
+            archive,
+            part_upload_concurrency=4,
+        )
+        original = list(_records(8))
+        first = projection.put_records(
+            tenant_id="tenant:parallel",
+            source_id="source:parallel",
+            native_parent_id="session:mixed",
+            revision=1,
+            records=iter(original),
+            part_bytes=1_024,
+        )
+        changed = original[0]
+        original[0] = LogicalEvidenceRecord(
+            ordinal=changed.ordinal,
+            event_native_id=changed.event_native_id,
+            event_kind=changed.event_kind,
+            occurred_at=changed.occurred_at,
+            roles=changed.roles,
+            receipts=changed.receipts,
+            segment_ordinal=changed.segment_ordinal,
+            segment_count=changed.segment_count,
+            text="changed " + changed.text,
+            canonical_content_bytes=changed.canonical_content_bytes,
+            actor_links=changed.actor_links,
+        )
+
+        second = projection.put_records(
+            tenant_id="tenant:parallel",
+            source_id="source:parallel",
+            native_parent_id="session:mixed",
+            revision=2,
+            records=iter(original),
+            part_bytes=1_024,
+            existing_part_references=first.part_references,
+        )
+
+        self.assertEqual(
+            [part.ordinal for part in second.manifest.parts],
+            list(range(len(second.manifest.parts))),
+        )
+        self.assertNotEqual(
+            first.part_references[0]["artifact_id"],
+            second.part_references[0]["artifact_id"],
+        )
+        self.assertEqual(
+            first.part_references[1:],
+            second.part_references[1:],
+        )
+        self.assertEqual(len(second.created_part_references), 1)
+        self.assertEqual(
+            second.cleanup_references,
+            (
+                second.manifest_reference,
+                *second.created_part_references,
+            ),
+        )
+        self.assertTrue(
+            set(reference["artifact_id"] for reference in first.part_references[1:])
+            .isdisjoint(
+                reference["artifact_id"]
+                for reference in second.cleanup_references
+            )
+        )
+
+    def test_failed_mixed_revision_never_deletes_reused_parts(self) -> None:
+        archive = _ConcurrentArchive()
+        projection = LogicalEvidenceProjectionStore(
+            archive,
+            part_upload_concurrency=4,
+        )
+        original = list(_records(8))
+        first = projection.put_records(
+            tenant_id="tenant:parallel",
+            source_id="source:parallel",
+            native_parent_id="session:mixed-cleanup",
+            revision=1,
+            records=iter(original),
+            part_bytes=1_024,
+        )
+        old_objects = dict(archive.objects)
+        changed = original[0]
+        original[0] = LogicalEvidenceRecord(
+            ordinal=changed.ordinal,
+            event_native_id=changed.event_native_id,
+            event_kind=changed.event_kind,
+            occurred_at=changed.occurred_at,
+            roles=changed.roles,
+            receipts=changed.receipts,
+            segment_ordinal=changed.segment_ordinal,
+            segment_count=changed.segment_count,
+            text="changed " + changed.text,
+            canonical_content_bytes=changed.canonical_content_bytes,
+            actor_links=changed.actor_links,
+        )
+        archive.fail_media_type = MANIFEST_MEDIA_TYPE
+
+        with self.assertRaisesRegex(RuntimeError, "synthetic upload failure"):
+            projection.put_records(
+                tenant_id="tenant:parallel",
+                source_id="source:parallel",
+                native_parent_id="session:mixed-cleanup",
+                revision=2,
+                records=iter(original),
+                part_bytes=1_024,
+                existing_part_references=first.part_references,
+            )
+
+        self.assertEqual(archive.objects, old_objects)
 
     def test_failed_parallel_part_upload_removes_completed_objects(self) -> None:
         archive = _ConcurrentArchive(fail_suffix=":3")

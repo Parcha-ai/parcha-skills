@@ -6,6 +6,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /opt/recall
 
+RUN apt-get update \
+    && apt-get install --only-upgrade --yes --no-install-recommends util-linux \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY connectors/requirements.txt /opt/recall/requirements.txt
 RUN python -m pip install --no-cache-dir --disable-pip-version-check --no-compile \
       -r requirements.txt
