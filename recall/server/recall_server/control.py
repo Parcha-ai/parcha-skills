@@ -47,6 +47,7 @@ from connectors.registry import (
     REGISTRY,
     definition,
 )
+from connectors.slack_source import SLACK_PUBLIC_HISTORY_USER_SCOPES
 
 
 ADMIN_TOKEN_RE = re.compile(r"rca_[A-Za-z0-9_-]{32,128}\Z")
@@ -493,6 +494,7 @@ class SlackOAuthProvider:
             "client_id": self.client_id,
             "redirect_uri": self.redirect_uri,
             "scope": ",".join(scopes),
+            "user_scope": ",".join(SLACK_PUBLIC_HISTORY_USER_SCOPES),
             "state": state,
         })
 
@@ -510,31 +512,54 @@ class SlackOAuthProvider:
         team = value.get("team")
         authed_user = value.get("authed_user")
         scope = value.get("scope")
+        user_access_token = (
+            authed_user.get("access_token") if isinstance(authed_user, dict) else None
+        )
+        user_scope = authed_user.get("scope") if isinstance(authed_user, dict) else None
         if (
             value.get("ok") is not True
             or not isinstance(access_token, str) or not access_token or len(access_token) > 8192
             or not isinstance(team, dict) or not isinstance(team.get("id"), str)
             or not isinstance(authed_user, dict) or not isinstance(authed_user.get("id"), str)
             or not isinstance(scope, str)
+            or not isinstance(user_access_token, str) or not user_access_token
+            or len(user_access_token) > 8192
+            or not isinstance(user_scope, str)
         ):
             raise ControlError("slack_oauth_token_invalid", 502)
-        granted = tuple(sorted({item.strip() for item in scope.split(",") if item.strip()}))
-        if not granted or len(granted) > 64:
+        bot_granted = tuple(sorted({
+            item.strip() for item in scope.split(",") if item.strip()
+        }))
+        user_granted = tuple(sorted({
+            item.strip() for item in user_scope.split(",") if item.strip()
+        }))
+        if (
+            not bot_granted or len(bot_granted) > 64
+            or not user_granted or len(user_granted) > 64
+            or not set(SLACK_PUBLIC_HISTORY_USER_SCOPES).issubset(user_granted)
+        ):
             raise ControlError("slack_oauth_scope_invalid", 502)
+        granted = tuple(sorted(
+            set(bot_granted) | {f"user:{item}" for item in user_granted}
+        ))
         return OAuthTokens(
             subject_id=team["id"],
             granted_scopes=granted,
             credentials={
-                "access_token": access_token,
+                "bot_access_token": access_token,
+                "user_access_token": user_access_token,
+                "bot_granted_scopes": list(bot_granted),
+                "user_granted_scopes": list(user_granted),
                 "team_id": team["id"],
                 "authed_user_id": authed_user["id"],
-                "token_type": value.get("token_type", "bot"),
+                "bot_token_type": value.get("token_type", "bot"),
+                "user_token_type": authed_user.get("token_type", "user"),
             },
             expires_at=None,
         )
 
     def revoke(self, credentials: dict[str, Any]) -> None:
-        token = credentials.get("access_token")
+        token = credentials.get("bot_access_token") or credentials.get("access_token")
         if not isinstance(token, str) or not token:
             return
         request = urllib.request.Request(

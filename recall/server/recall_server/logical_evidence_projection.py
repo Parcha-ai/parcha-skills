@@ -739,7 +739,7 @@ class CanonicalLogicalEvidenceProjector:
             return uploads
         except Exception:
             for upload in completed:
-                self._schedule_cleanup(upload.all_references)
+                self._schedule_cleanup(upload.cleanup_references)
             self.drain_cleanup(
                 tenant_id=candidates[0].tenant_id,
                 limit=5_000,
@@ -901,7 +901,7 @@ class CanonicalLogicalEvidenceProjector:
             tuple(
                 reference
                 for upload in uploads
-                for reference in upload.all_references
+                for reference in upload.cleanup_references
             )
         )
 
@@ -1417,10 +1417,10 @@ class CanonicalLogicalEvidenceProjector:
         try:
             status = self._commit(candidate, upload)
         except Exception:
-            self._schedule_cleanup(upload.all_references)
+            self._schedule_cleanup(upload.cleanup_references)
             raise
         if status == "stale":
-            self._schedule_cleanup(upload.all_references)
+            self._schedule_cleanup(upload.cleanup_references)
         return status
 
     def project_pending(
