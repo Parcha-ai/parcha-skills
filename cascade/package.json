@@ -1,7 +1,7 @@
 {
   "name": "@parcha/cascade",
   "version": "0.1.0",
-  "description": "Evidence-gated development loops for Claude Code, Codex, and pi",
+  "description": "Authority-aware, evidence-gated development loops for Claude Code, Codex, and pi",
   "files": [
     ".claude-plugin/",
     ".codex-plugin/",
@@ -10,7 +10,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "python3 -m unittest discover -s tests -v && python3 -m json.tool .claude-plugin/plugin.json >/dev/null && python3 -m json.tool .codex-plugin/plugin.json >/dev/null",
+    "test": "python3 -B -m unittest discover -s tests -v && python3 -m json.tool .claude-plugin/plugin.json >/dev/null && python3 -m json.tool .codex-plugin/plugin.json >/dev/null",
     "pack:check": "npm pack --dry-run"
   },
   "engines": {

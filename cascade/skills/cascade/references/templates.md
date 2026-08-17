@@ -1,143 +1,162 @@
 # Cascade templates
 
-Copy-paste skeletons for the three artifacts the skill produces, plus a condensed real example.
+Use these skeletons after reading `SKILL.md`. Keep raw artifacts ignored under `.cascade/` and use
+the validator as a structural check, never as the acceptance judge.
 
-## Contents
-- [Chain doc template](#chain-doc-template)
-- [EXIT.md template](#exitmd-template)
-- [Heartbeat prompt template](#heartbeat-prompt-template)
-- [Real example: a closed loop's EXIT.md (condensed)](#real-example)
+## Chain document
 
-## Chain doc template
-
-`.cascade/LOOP_CHAIN_<YYYY-MM-DD>.md`
+`.cascade/LOOP_CHAIN_<YYYY-MM-DD>_<SLUG>.md`
 
 ```markdown
-# The Loop Chain — <project/goal> (<date>)
+---
+cascade_version: 2
+episode_id: <stable-id>
+pacing: autonomous | checkpointed
+status: ACTIVE
+current_loop: L0
+authority: <plan-only/local/GitHub/publish/deploy/destructive grants and exclusions>
+budget: <time, spend, valid attempts, context limits, or none>
+human_gates: <named gates or none>
+target: <repository/worktree; branch; HEAD/deployed revision; dirty/diff digest if uncommitted; runtime>
+---
 
-> <one-line source: the plate/issue/assessment this chain was cut from>. Each loop has a
-> strong self-contained prompt, evidence-based exit criteria (artifacts, traces, deltas —
-> never "it should work"), and a fixed inner structure. A loop's EXIT-CHECK triggers the
-> next loop. Nothing advances on vibes.
->
-> **Pacing:** autonomous | checkpointed <(checkpointed = every loop EXIT stops for
-> go / no-go / redirect before the next loop starts)>
+# <Project> — Cascade
 
-## Loop anatomy
-<the five-field table from SKILL.md, verbatim>
+## Current
 
-## The ribbon
-<the eight-step ribbon from SKILL.md, plus any project-specific live-run protocol:
-runtime pins, required flags, timeouts, output dirs, shared-box etiquette>
+<!-- This is the only mutable block. Keep it small. -->
+L0 is ready. Latest receipt: none. <Any active wait/blocker.>
 
-**Bound + escalation (every loop):** max 3 REVIEW→fix rounds and max 2 failed PROVE runs
-per loop. At the bound: EXIT.md with `status: AT_BOUND`, exactly which criteria are unmet
-and why, then stop — never fake the exit.
+## Authority and budgets
 
-## The chain
+- May: <actions explicitly authorized>.
+- May not: <writes, targets, publication, deployment, destructive actions not authorized>.
+- User-absence preflight: <credentials/choices/approvals resolved now, or none>.
+- Stop conditions: <budget, human gate, target drift, external block>.
 
-**Order rationale:** <why this order — baseline first if later loops must show deltas;
-risk-ranked levers: mechanical → prompt → model>
+## Order rationale
 
-### L0 — <NAME> (<one-line role>)
-- **goal:** <one sentence — the state change>
-- **prompt:**
-  > <self-contained block: files to read, tasks 1..n, protocol to use. A fresh session
-  > with only this doc must be able to execute it.>
+<Why these 2–4 loops; why each is one state change; why this risk order. Name the re-plan gate.>
+
+## Chain
+
+### L0 — <NAME>
+
+- **goal:** <one-sentence state change>
+- **prompt:** <self-contained task, named inputs, target/runtime, proof protocol, rollback>
 - **accept:**
-  1. <checkable artifact>
-  2. <checkable artifact>
-  n. PR merged; criteria verified at HEAD.
-- **bound:** 2 PROVE runs / 3 review rounds.
-- **exit →** L1.
+  1. **L0.1** — <observable claim>; evidence: <artifact>; falsifier: <negative case>.
+  2. **L0.2** — <observable claim>; evidence: <artifact>; falsifier: <negative case>.
+- **bound:** <valid evidence attempts and review/fix rounds>
+- **at_bound ->** STOP | R0 <predeclared localized repair inside authority>
+- **exit ->** L1
 
-### L1 — ... (repeat per loop)
+### L1 — <NAME OR RE-PLAN>
 
-### L<final> — RE-PLAN GATE (human gate)
-- **goal:** verdict with numbers + the next chain drafted from the losing cells.
-- **accept:** verdict doc; user sign-off (the one criterion no trace can satisfy).
-- **bound:** 2 drafts; the sign-off wait is unbounded by design — the chain PAUSES.
-- **exit →** the next chain (this doc gets a successor, not an edit).
+- **goal:** ...
+- **prompt:** ...
+- **accept:** ...
+- **bound:** ...
+- **at_bound ->** STOP
+- **exit ->** COMPLETE | <short successor chain>
 
-## Parallel track (interleave, don't serialize)
-<independent work to run while chain loops wait on review/live runs; same ribbon, own accept>
+## Native task mirror
 
-## Chain invariants
-<the eight invariants from SKILL.md>
+| Task | Blocked by | Loop | Receipt | Mirror status |
+|---|---|---|---|---|
+| <task> | — | L0 | `.cascade/evidence/l0-<slug>/EXIT.md` | pending |
+
+Never mark a mirrored task complete until its receipt exists. The chain and evidence win on conflict.
+
+## TAKEOVER snapshot
+
+Read `Current`, the current prompt, latest receipt, actual HEAD/deployed revision, runtime, authority,
+budget, and native mirror. Use Recap if installed for session context. Recheck noise-band priors and
+stop/re-plan on target drift.
+
+## Invariants
+
+- Only `COMPLETE` follows normal `exit ->`; `AT_BOUND` uses only its declared repair or stops.
+- No acceptance weakening after observation; no advance without a boundary receipt.
+- Receipts and closed-loop history are immutable; replans append a named successor.
+- ZEN applies during BUILD; architecture-changing exits must pass POST-ZEN.
 ```
 
-Then mirror the chain in the harness's native task UI when one exists: one task per loop,
-each blocked by its predecessor, with parallel tracks as unblocked siblings. When no task UI
-exists, add a checked task table with the same dependency links to the chain doc itself.
+Validate with:
 
-## EXIT.md template
+```bash
+python3 <skill-dir>/scripts/validate_cascade.py chain <chain-path>
+```
+
+## Boundary receipt
 
 `.cascade/evidence/<loop-id>-<slug>/EXIT.md`
 
 ```markdown
-# <Loop id> — <NAME> · EXIT (<date>)
+---
+cascade_version: 2
+episode_id: <stable-id>
+loop: L0
+status: COMPLETE | AT_BOUND | WAITING_HUMAN | BLOCKED_EXTERNAL | SUPERSEDED
+target_head: <verified commit/deployed revision, or base HEAD plus candidate diff digest>
+next: L1 | R0 | STOP | WAIT | <successor-chain path>
+---
 
-## Status: COMPLETE | AT_BOUND
+# L0 boundary receipt — <name>
 
-<if AT_BOUND: exactly which criteria are unmet and why; what was tried; page the user.>
+## Bound accounting
 
-## The headline evidence
-<the single strongest artifact: live trace, measurement table, before/after numbers.
-n=1 results labeled as directional, never statistical.>
-
-## What shipped
-| Piece | Where |
-|---|---|
-| <mechanism> | <file/PR> |
-
-## Bound accounting (honest)
-<PROVE runs used, review rounds used. Instrument failures (harness/dispatch miswiring)
-listed separately from evidence failures — each diagnosed + fixed in its own commit;
-they don't burn the bound but must be documented.>
+- Valid evidence attempts: <used>/<bound>, with verdicts.
+- Review/fix rounds: <used>/<bound>.
+- Instrumentation failures: <count and diagnosis; do not charge as evidence attempts>.
 
 ## Accept criteria → evidence
-1. <criterion> — ✅/❌ <pointer: test file + pass line, trace path, PR # verified at HEAD>
-2. ...
 
-## The running delta table (L0→Ln)
-| Loop | Shipped | Headline |
+| ID | Verdict | Evidence |
 |---|---|---|
+| L0.1 | PASS | <artifact and exact observation> |
+| L0.2 | PASS | <artifact and exact observation> |
 
-## exit → <next loop id> (<what it needs to start, incl. anything the user must supply>)
+`COMPLETE` requires every row to be `PASS`. Use `FAIL` for an exhausted claim and `WAIT` for a
+declared human gate. Never write “complete except” or defer a current criterion into the next loop.
+
+## Evidence manifest
+
+| Criterion | Command/action | Runtime/environment | Target | Timestamp | Artifact/digest | Falsifier / negative | Cleanup / rollback |
+|---|---|---|---|---|---|---|---|
+| L0.1 | `<command>` | <pinned runtime> | <HEAD/revision> | <UTC ISO-8601> | <path + digest> | <negative checked> | <cleanup/rollback> |
+
+## POST-ZEN
+
+<For architecture change: what became simpler, what was deleted, one authoritative path, ownership,
+tested rollback, and any temporary scaffold's removal gate. Otherwise: `N/A — <reason>`.>
+
+## Transition
+
+<Exactly one:
+- `COMPLETE`: follow normal `exit ->`.
+- `AT_BOUND`: enter the declared repair successor or STOP/page; never follow normal `exit ->`.
+- `WAITING_HUMAN`: name the declared decision and wait.
+- `BLOCKED_EXTERNAL`: name unavailable state/authority and stop.
+- `SUPERSEDED`: point to the append-forward successor chain.>
 ```
 
-## Heartbeat prompt template
+Validate with:
 
-For a recurring-wake feature, lifecycle hook, or external scheduler when the harness has one:
-
-```
-HEARTBEAT — continue the <project> loop chain autonomously. Read the chain doc (<path>) and
-the harness task list, if present, for exact position. Rules: (1) if a chain loop is mid-flight,
-advance its next ribbon step (RE-PLAN→BUILD→PIN→PROVE→MEASURE→REVIEW→MERGE→EXIT) — use
-background dispatches/judges only when the harness exposes them; (2) if bots reviewed an open PR,
-resolve findings and merge per the etiquette; (3) honor all bounds — AT_BOUND means write
-the report and STOP that loop (page the user in the reply), never silently continue;
-(4) human gates always wait for the user; (5) if genuinely nothing is actionable, say so
-in one line and stop. Keep replies short: position, what was advanced, what's now running.
+```bash
+python3 <skill-dir>/scripts/validate_cascade.py exit <receipt-path>
 ```
 
-## Real example
+## Autonomous continuation prompt
 
-Condensed from a closed loop (L8 — skip-with-receipt, 2026-07-07) showing the parts that
-make an exit honest:
+Use only with a recurring-wake or lifecycle mechanism the harness actually provides:
 
-- **Status line carries nuance:** `COMPLETE (the headline fired NATURALLY; the pareto gate
-  deferred to L9 pending δ)` — deferrals are declared at the exit, with cause, never dropped
-  silently.
-- **Headline evidence is one live trace + one table:** the advisor skipped 4 wrong-entity
-  decoys with justified receipts; cost $0.4624 → $0.3425 (−26%), explicitly labeled `n=1 —
-  directional evidence, not a statistical claim`.
-- **Bound accounting separates instrument from evidence:** 5 PROVE runs, runs 1–4 were
-  instrument failures (dispatch miswiring), each fixed in its own commit — "these four fixes
-  made the custom-SOP dispatch path work end-to-end for the first time — permanent instrument
-  value." Run 5, the first correctly-wired attempt, produced the headline.
-- **A criterion that would be theater gets deferred, not faked:** "running the gate at
-  δ=0.15/n=12 would be theater. The machinery is ready" — deferred to the next loop with the
-  human input it needs named.
-- **Exit names what the next loop needs from the human:** "L9 needs from Miguel: δ
-  (recommend 0.3 at n≈30-40), then the pareto…, and the BUILD/DEFER call."
+```text
+Continue <episode-id>. Read <chain-path>: Current, current loop prompt, latest receipt, authority,
+budget, and target; compare them with the actual worktree/HEAD/runtime and native task mirror. If they
+disagree, stop or append a SUPERSEDED re-plan. Advance one ribbon step. At a boundary, write and
+validate the receipt. COMPLETE follows exit ->. AT_BOUND uses only its declared repair successor or
+stops. WAITING_HUMAN and BLOCKED_EXTERNAL stop. Never widen authority, weaken acceptance, fabricate
+background execution, or mark a native task complete without its receipt. Reply with position,
+boundary evidence if any, and the next permitted action.
+```
