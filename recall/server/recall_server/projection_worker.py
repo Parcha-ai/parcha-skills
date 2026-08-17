@@ -99,6 +99,7 @@ def run_projection_worker(
             "logical_pending": int(documents.get("pending", 0)),
             "records": int(documents["records"]),
             "passage_documents": int(projected["documents"]),
+            "passage_requeued": int(projected.get("requeued", 0)),
             "passages": int(projected["passages"]),
             "embedded": int(embedded["processed"]),
             "parquet_shards": int(scanned["shards"]),
@@ -111,7 +112,8 @@ def run_projection_worker(
         }
         LOG.info(
             "projection cycle status=%s documents=%s logical_pending=%s records=%s "
-            "passage_documents=%s passages=%s embedded=%s parquet_shards=%s "
+            "passage_documents=%s passage_requeued=%s passages=%s embedded=%s "
+            "parquet_shards=%s "
             "parquet_rows=%s parquet_stale=%s parquet_contended=%s "
             "stale=%s pruned=%s "
             "cleanup_failures=%s",
@@ -123,6 +125,7 @@ def run_projection_worker(
                     "logical_pending",
                     "records",
                     "passage_documents",
+                    "passage_requeued",
                     "passages",
                     "embedded",
                     "parquet_shards",
