@@ -18,7 +18,7 @@ from recall_server.canonical_retrieval import (
     CanonicalRetrieval,
 )
 from recall_server.managed_worker import run_managed_worker
-from recall_server.logical_evidence import LogicalEvidenceRecord
+from recall_server.logical_evidence import LogicalEvidenceError, LogicalEvidenceRecord
 from recall_server.logical_evidence_projection import (
     CanonicalLogicalEvidenceProjector,
     _explicit_roles,
@@ -709,6 +709,86 @@ class PassageProjectionTests(unittest.TestCase):
         self.assertNotIn("prepare_pool(concurrency)", source)
         self.assertIn("self.store.pool_max_size - 1", source)
         self.assertIn("PASSAGE_COMMIT_WORKERS", source)
+
+    def test_missing_logical_part_requeues_rebuild_and_yields(self) -> None:
+        class Connection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            @staticmethod
+            def execute(_query, _values):
+                return SimpleNamespace(fetchone=lambda: {"count": 1})
+
+        store = SimpleNamespace(
+            pool_max_size=4,
+            connect=lambda: Connection(),
+        )
+        projector = CanonicalPassageProjector(
+            store,
+            object(),  # type: ignore[arg-type]
+            policy=PassagePolicy(target_tokens=8, overlap_tokens=2),
+        )
+        candidate = PassageCandidate(
+            tenant_id="tenant:company:test",
+            source_id="source:test",
+            logical_document_id="ldoc_" + "a" * 32,
+            revision=4,
+            generation=2,
+            changed_at=datetime.now(timezone.utc),
+            source_document_sha256="b" * 64,
+            manifest_reference={},
+            part_references=(),
+        )
+        projector._pending = mock.Mock(return_value=(candidate,))
+        projector._prepare = mock.Mock(
+            side_effect=LogicalEvidenceError("logical_evidence_not_found")
+        )
+        projector._requeue_missing = mock.Mock(return_value=1)
+
+        result = projector.project_pending(
+            tenant_id="tenant:company:test",
+            batch_size=10,
+            max_batches=10,
+            concurrency=2,
+        )
+
+        self.assertEqual(result["documents"], 0)
+        self.assertEqual(result["requeued"], 1)
+        self.assertEqual(result["batches"], 1)
+        projector._requeue_missing.assert_called_once_with(candidate)
+        projector._pending.assert_called_once()
+
+    def test_unexpected_logical_part_error_still_fails_closed(self) -> None:
+        store = SimpleNamespace(pool_max_size=4)
+        projector = CanonicalPassageProjector(
+            store,
+            object(),  # type: ignore[arg-type]
+            policy=PassagePolicy(target_tokens=8, overlap_tokens=2),
+        )
+        candidate = PassageCandidate(
+            tenant_id="tenant:company:test",
+            source_id="source:test",
+            logical_document_id="ldoc_" + "a" * 32,
+            revision=4,
+            generation=2,
+            changed_at=datetime.now(timezone.utc),
+            source_document_sha256="b" * 64,
+            manifest_reference={},
+            part_references=(),
+        )
+        projector._pending = mock.Mock(return_value=(candidate,))
+        projector._prepare = mock.Mock(
+            side_effect=LogicalEvidenceError("passage_manifest_part_mismatch")
+        )
+
+        with self.assertRaisesRegex(
+            LogicalEvidenceError,
+            "passage_manifest_part_mismatch",
+        ):
+            projector.project_pending(max_batches=1)
 
     def test_revision_projection_reuses_unchanged_content_embeddings(
         self,

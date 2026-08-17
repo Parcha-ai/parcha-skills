@@ -241,6 +241,38 @@ class CanonicalPassageProjector:
             )
         return tuple(candidates)
 
+    def _requeue_missing(self, candidate: PassageCandidate) -> int:
+        """Rebuild a current logical document whose immutable part disappeared."""
+
+        with self.store.connect() as connection:
+            result = connection.execute(
+                """INSERT INTO canonical_evidence_document_queue(
+                       tenant_id,source_id,native_parent_id,generation,
+                       reason,changed_at
+                   )
+                   SELECT evidence.tenant_id,evidence.source_id,
+                          evidence.native_parent_id,1,'backfill',
+                          clock_timestamp()
+                     FROM canonical_evidence_documents evidence
+                    WHERE evidence.tenant_id=%s
+                      AND evidence.source_id=%s
+                      AND evidence.logical_document_id=%s
+                      AND evidence.revision=%s
+                   ON CONFLICT(tenant_id,source_id,native_parent_id)
+                   DO UPDATE SET
+                       generation=
+                           canonical_evidence_document_queue.generation+1,
+                       reason='backfill',
+                       changed_at=clock_timestamp()""",
+                (
+                    candidate.tenant_id,
+                    candidate.source_id,
+                    candidate.logical_document_id,
+                    candidate.revision,
+                ),
+            )
+        return max(0, result.rowcount)
+
     def _prepare(self, candidate: PassageCandidate) -> PreparedPassageDocument:
         manifest = self.logical_projection.read_manifest(
             candidate.manifest_reference,
@@ -567,7 +599,7 @@ class CanonicalPassageProjector:
         if callable(prepare_pool):
             prepare_pool(min(PASSAGE_POOL_WARM_SIZE, concurrency))
         started = time.monotonic()
-        documents = passages = stale = batches = 0
+        documents = passages = stale = requeued = batches = 0
         while batches < max_batches:
             candidates = self._pending(
                 tenant_id=tenant_id,
@@ -579,19 +611,33 @@ class CanonicalPassageProjector:
                 max_workers=min(concurrency, len(candidates)),
                 thread_name_prefix="recall-passage-projector",
             ) as executor:
-                prepared_documents = list(executor.map(self._prepare, candidates))
-            with ThreadPoolExecutor(
-                max_workers=min(
-                    concurrency,
-                    len(prepared_documents),
-                    max(1, self.store.pool_max_size - 1),
-                    PASSAGE_COMMIT_WORKERS,
-                ),
-                thread_name_prefix="recall-passage-commit",
-            ) as executor:
-                statuses = list(
-                    executor.map(self._commit, prepared_documents)
-                )
+                futures = [
+                    (candidate, executor.submit(self._prepare, candidate))
+                    for candidate in candidates
+                ]
+                prepared_documents = []
+                requeued_in_batch = 0
+                for candidate, future in futures:
+                    try:
+                        prepared_documents.append(future.result())
+                    except LogicalEvidenceError as error:
+                        if str(error) != "logical_evidence_not_found":
+                            raise
+                        requeued_in_batch += self._requeue_missing(candidate)
+            statuses: list[str] = []
+            if prepared_documents:
+                with ThreadPoolExecutor(
+                    max_workers=min(
+                        concurrency,
+                        len(prepared_documents),
+                        max(1, self.store.pool_max_size - 1),
+                        PASSAGE_COMMIT_WORKERS,
+                    ),
+                    thread_name_prefix="recall-passage-commit",
+                ) as executor:
+                    statuses = list(
+                        executor.map(self._commit, prepared_documents)
+                    )
             for prepared, status in zip(
                 prepared_documents,
                 statuses,
@@ -602,7 +648,12 @@ class CanonicalPassageProjector:
                     continue
                 documents += 1
                 passages += len(prepared.passages)
+            requeued += requeued_in_batch
             batches += 1
+            if requeued_in_batch:
+                # Yield to the logical projector in the unified worker. The
+                # passage queue remains authoritative and retries next cycle.
+                break
         with self.store.connect() as connection:
             pending = connection.execute(
                 """SELECT count(*) AS count
@@ -616,6 +667,7 @@ class CanonicalPassageProjector:
             "documents": documents,
             "passages": passages,
             "stale": stale,
+            "requeued": requeued,
             "batches": batches,
             "pending": int(pending),
             "elapsed_seconds": round(elapsed_seconds, 3),
