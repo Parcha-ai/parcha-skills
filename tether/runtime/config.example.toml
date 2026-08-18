@@ -6,6 +6,11 @@ default_channel = ""
 default_owner = ""
 team_id = ""
 allowed_users = []
+# Schema migration remains blocked until these non-secret identity fields are
+# set explicitly for this Hermes instance. Do not infer them from a pane or
+# ambient process environment.
+persona_id = ""
+policy_generation = 0
 
 native_timeout_seconds = 1800
 # Slack is a coordination surface, not a run log. These are writing targets,

@@ -325,12 +325,12 @@ transport limit is `MAX_TEXT`, currently 35,000 characters.
 
 ## Schema and upgrades
 
-The current SQLite schema is 16. Store startup:
+The current SQLite schema is 17. Store startup:
 
 1. rejects a database with a newer schema;
 2. opens an immediate transaction;
 3. applies additive migrations and binding backfills;
-4. writes `PRAGMA user_version=16`; and
+4. writes `PRAGMA user_version=17`; and
 5. recovers safe pre-I/O attempts.
 
 Legacy or incomplete native bindings become `rebind_required`. Endpoint keys
@@ -338,8 +338,9 @@ are backfilled as non-unique serialization keys, preserving every active Slack
 thread that shares a session.
 
 The installer snapshots managed files and plugin state, not the database. A
-code rollback does not downgrade schema 17. Back up `bridges.db` and its WAL/SHM
-sidecars before crossing a schema boundary.
+code rollback does not downgrade schema 17. Schema crossing remains disabled
+until one receipt-bound orchestrator owns quiesce, backup, code compatibility,
+database projection, verification, and resume.
 
 ## Operator recovery
 
@@ -349,24 +350,11 @@ List uncertain ingress and native attempts:
 tether unresolved --team T12345678
 ```
 
-After inspecting the exact Slack thread and bound session, apply one explicit
-resolution:
-
-```bash
-tether resolve \
-  --team T12345678 \
-  --kind ingress \
-  --id slack:T12345678:C12345678:1234567890.123456 \
-  --action complete
-```
-
-Actions:
-
-| Action | Ingress | Native attempt |
-| --- | --- | --- |
-| `retry` | Returns uncertain Hermes ingress to `pending`; native ingress must be resolved through its attempt | Requeues its events |
-| `complete` | Marks ingress completed | Marks attempt acknowledged and events delivered |
-| `abandon` | Marks ingress cancelled | Cancels the attempt and fails its events |
+After inspecting the exact Slack thread and bound session, keep the endpoint
+blocked. The legacy same-UID resolve mutation is disabled. Schema-18 supports
+fenced `complete` or `abandon` decisions only behind an attested,
+OS-distinguishable operator authority channel; that channel is not exposed in
+this release. Blind retry is never a native-attempt action.
 
 Resolution is workspace-bound and idempotent for the same terminal choice.
 Rebind and close remain blocked until related uncertain work is resolved.

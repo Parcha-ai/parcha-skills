@@ -593,7 +593,9 @@ build_install_plan() {
   }
   resolve_harness
   add_file "$ROOT_DIR/runtime/bridge_runtime.py" "$RUNTIME_HOME/bridge_runtime.py" 600
+  add_file "$ROOT_DIR/runtime/domain_control.py" "$RUNTIME_HOME/domain_control.py" 600
   add_file "$ROOT_DIR/runtime/domain_schema.py" "$RUNTIME_HOME/domain_schema.py" 600
+  add_file "$ROOT_DIR/runtime/schema_orchestrator.py" "$RUNTIME_HOME/schema_orchestrator.py" 600
   add_file "$ROOT_DIR/runtime/hermes_compat.py" "$RUNTIME_HOME/hermes_compat.py" 600
   add_file "$ROOT_DIR/runtime/routing.py" "$RUNTIME_HOME/routing.py" 600
   add_file "$ROOT_DIR/runtime/security.py" "$RUNTIME_HOME/security.py" 600

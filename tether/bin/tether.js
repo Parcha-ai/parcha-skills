@@ -30,6 +30,7 @@ const runtimeHome = path.join(dataHome, "tether");
 const installedInstaller = path.join(runtimeHome, "install.sh");
 const notifier = path.join(runtimeHome, "tether_notify.py");
 const installedRuntime = path.join(runtimeHome, "bridge_runtime.py");
+const installedSchemaOrchestrator = path.join(runtimeHome, "schema_orchestrator.py");
 const stateHome = path.join(
   process.env.XDG_STATE_HOME || path.join(home, ".local", "state"),
   "tether-installer",
@@ -238,7 +239,7 @@ function skillTargets(root, legacy = false) {
   return targets;
 }
 
-function expectedManagedTargets(metadata) {
+function expectedManagedTargetModes(metadata) {
   const harness = metadata.harness;
   if (!["codex", "claude-code", "both"].includes(harness)) {
     throw new Error("invalid harness");
@@ -270,33 +271,44 @@ function expectedManagedTargets(metadata) {
     throw new Error("Claude legacy shim does not match selected harness");
   }
 
-  const targets = [
-    path.join(runtimeRoot, "bridge_runtime.py"),
-    path.join(runtimeRoot, "domain_schema.py"),
-    path.join(runtimeRoot, "hermes_compat.py"),
-    path.join(runtimeRoot, "routing.py"),
-    path.join(runtimeRoot, "security.py"),
-    path.join(runtimeRoot, "slack_protocol.py"),
-    path.join(runtimeRoot, "tether_notify.py"),
-    path.join(runtimeRoot, "install.sh"),
-    path.join(runtimeRoot, "package.json"),
-    path.join(runtimeRoot, "herdr-plugin", "herdr-plugin.toml"),
-    path.join(runtimeRoot, "herdr-plugin", "tether_plugin.py"),
-    path.join(runtimeRoot, "herdr-plugin", "README.md"),
-    path.join(pluginRoot, "__init__.py"),
-    path.join(pluginRoot, "plugin.yaml"),
-    path.join(localBin, "tether"),
-  ];
+  const targets = new Map([
+    [path.join(runtimeRoot, "bridge_runtime.py"), 0o600],
+    [path.join(runtimeRoot, "domain_control.py"), 0o600],
+    [path.join(runtimeRoot, "domain_schema.py"), 0o600],
+    [path.join(runtimeRoot, "schema_orchestrator.py"), 0o600],
+    [path.join(runtimeRoot, "hermes_compat.py"), 0o600],
+    [path.join(runtimeRoot, "routing.py"), 0o600],
+    [path.join(runtimeRoot, "security.py"), 0o600],
+    [path.join(runtimeRoot, "slack_protocol.py"), 0o600],
+    [path.join(runtimeRoot, "tether_notify.py"), 0o700],
+    [path.join(runtimeRoot, "install.sh"), 0o700],
+    [path.join(runtimeRoot, "package.json"), 0o600],
+    [path.join(runtimeRoot, "herdr-plugin", "herdr-plugin.toml"), 0o644],
+    [path.join(runtimeRoot, "herdr-plugin", "tether_plugin.py"), 0o700],
+    [path.join(runtimeRoot, "herdr-plugin", "README.md"), 0o644],
+    [path.join(pluginRoot, "__init__.py"), 0o600],
+    [path.join(pluginRoot, "plugin.yaml"), 0o644],
+    [path.join(localBin, "tether"), 0o700],
+  ]);
+  const addSkill = (root, includeLegacy) => {
+    for (const target of skillTargets(root, includeLegacy)) {
+      targets.set(target, target.endsWith(".py") ? 0o700 : 0o644);
+    }
+  };
   if (harness === "codex" || harness === "both") {
-    targets.push(...skillTargets(codexRoot, legacyValues.includes("codex")));
+    addSkill(codexRoot, legacyValues.includes("codex"));
   }
   if (harness === "claude-code" || harness === "both") {
-    targets.push(...skillTargets(
+    addSkill(
       claudeRoot,
       legacyValues.includes("claude-code"),
-    ));
+    );
   }
-  return new Set(targets);
+  return targets;
+}
+
+function expectedManagedTargets(metadata) {
+  return new Set(expectedManagedTargetModes(metadata).keys());
 }
 
 function verifyManagedInstall() {
@@ -362,9 +374,9 @@ function verifyManagedInstall() {
   if (rows.length === 0) {
     return { ok: false, line: "FAIL installer manifest has no managed file records" };
   }
-  let expected;
+  let expectedModes;
   try {
-    expected = expectedManagedTargets(metadata);
+    expectedModes = expectedManagedTargetModes(metadata);
   } catch {
     return { ok: false, line: "FAIL installer manifest metadata is invalid" };
   }
@@ -387,11 +399,18 @@ function verifyManagedInstall() {
       const info = fs.lstatSync(target);
       const actualModeBits = info.mode & 0o777;
       const expectedModeBits = Number.parseInt(expectedMode, 8);
-      const modeExpanded = (actualModeBits & ~expectedModeBits) !== 0;
+      const canonicalModeBits = expectedModes.get(target);
+      if (canonicalModeBits === undefined) {
+        drifted += 1;
+        continue;
+      }
+      const modeExpanded = (actualModeBits & ~canonicalModeBits) !== 0;
       const ownerCannotRead = (actualModeBits & 0o400) === 0;
       const ownerCannotExecute =
-        (expectedModeBits & 0o100) !== 0 && (actualModeBits & 0o100) === 0;
+        (canonicalModeBits & 0o100) !== 0 && (actualModeBits & 0o100) === 0;
       if (
+        (expectedModeBits & ~canonicalModeBits) !== 0 ||
+        ((canonicalModeBits & 0o100) !== 0 && (expectedModeBits & 0o100) === 0) ||
         info.isSymbolicLink() ||
         !info.isFile() ||
         (typeof process.getuid === "function" && info.uid !== process.getuid()) ||
@@ -406,6 +425,7 @@ function verifyManagedInstall() {
   } catch {
     drifted += 1;
   }
+  const expected = new Set(expectedModes.keys());
   const missing = [...expected].filter((candidate) => !seen.has(candidate)).length;
   const unexpected = [...seen].filter((candidate) => !expected.has(candidate)).length;
   if (missing || unexpected) {
@@ -483,10 +503,10 @@ function printHelp(command = "") {
     unbind: "tether unbind --bridge-id ID | --channel ID --thread-ts TS [--team ID] [--expected-generation N]",
     post: "tether post --channel ID --thread-ts TS (--text-stdin|--text-fd FD|--text TEXT [deprecated]) --idempotency-key KEY [--team ID]",
     unresolved: "tether unresolved [--team ID] [--json]",
-    resolve: "tether resolve --kind ingress|attempt|reconciliation --id ID --action retry|complete|abandon [--team ID]",
     history: "tether history [--channel ID] [--limit N] [--team ID]",
     thread: "tether thread --channel ID --thread-ts TS [--limit N] [--team ID]",
     herdr: "tether herdr status|create|attach|rebind|detach [options]",
+    schema: "tether schema status [--json]",
   };
   if (command && commandHelp[command]) {
     process.stdout.write(`${commandHelp[command]}\n`);
@@ -501,7 +521,8 @@ Usage:
   tether doctor|status|identity|maintenance [--json]
   tether notify|reply|attach|rebind|close|unbind|post|history|thread [options]
   tether herdr status|create|attach|rebind|detach [options]
-  tether unresolved|resolve [options]
+  tether schema status [--json]
+  tether unresolved [options]
   tether version
 
 Broker options:
@@ -873,7 +894,7 @@ function brokerCall(request, options) {
 function assertNonRoot(command) {
   const mutating = new Set([
     "setup", "install", "upgrade", "rollback", "uninstall", "maintenance",
-    "notify", "reply", "attach", "rebind", "close", "unbind", "post", "resolve", "herdr",
+    "notify", "reply", "attach", "rebind", "close", "unbind", "post", "herdr",
   ]);
   if (
     mutating.has(command) &&
@@ -913,6 +934,36 @@ function runChild(
     );
   }
   return result.status ?? 1;
+}
+
+function runSchemaCommand(argv) {
+  if (argv.includes("--help") || argv.includes("-h")) {
+    printHelp("schema");
+    return 0;
+  }
+  if (!fs.existsSync(installedSchemaOrchestrator)) {
+    throw new CliError(
+      "The installed Tether schema orchestrator is unavailable; reinstall Tether.",
+      EXIT_USAGE,
+      "schema_orchestrator_missing",
+    );
+  }
+  const integrity = verifyManagedInstall();
+  if (!integrity.ok) {
+    throw new CliError(
+      integrity.line,
+      EXIT_USAGE,
+      "managed_install_drift",
+    );
+  }
+  const subcommand = argv.shift();
+  if (subcommand !== "status") {
+    throw new CliError("Unknown schema operation. Use `tether schema --help`.");
+  }
+  const options = parseOptions(argv, optionDefinitions());
+  const childArgs = [installedSchemaOrchestrator, "status"];
+  if (options.json) childArgs.push("--json");
+  return runChild("python3", childArgs, CHILD_TIMEOUT_MS);
 }
 
 function requireInstalledRuntime() {
@@ -1324,12 +1375,11 @@ async function runBrokerCommand(command, argv) {
       definitions = commonRequestOptions();
       break;
     case "resolve":
-      definitions = commonRequestOptions({
-        kind: { type: "value" },
-        id: { type: "value" },
-        action: { type: "value" },
-      });
-      break;
+      throw new CliError(
+        "Tether recovery mutation is disabled until an OS-isolated operator authority channel is active.",
+        EXIT_USAGE,
+        "operator_boundary_unavailable",
+      );
     case "history":
       definitions = commonRequestOptions({
         channel: { type: "value" },
@@ -1373,22 +1423,6 @@ async function runBrokerCommand(command, argv) {
   } else if (command === "unresolved") {
     request = {
       op: "unresolved",
-      team_id: stringValue(options.team),
-    };
-  } else if (command === "resolve") {
-    request = {
-      op: "resolve",
-      kind: requireChoice(
-        options,
-        "kind",
-        ["ingress", "attempt", "reconciliation"],
-      ),
-      id: requireOption(options, "id"),
-      action: requireChoice(
-        options,
-        "action",
-        ["retry", "complete", "abandon"],
-      ),
       team_id: stringValue(options.team),
     };
   } else if (command === "reply") {
@@ -1487,23 +1521,6 @@ async function runBrokerCommand(command, argv) {
   }
 
   const result = await brokerCall(request, options);
-  if (command === "resolve") {
-    if (options.json) {
-      writeJson(process.stdout, {
-        ...result,
-        resolution: {
-          kind: request.kind,
-          id: request.id,
-          action: request.action,
-        },
-      });
-    } else {
-      process.stdout.write(
-        `resolved ${request.kind} ${JSON.stringify(redactText(request.id))} with action=${request.action}\n`,
-      );
-    }
-    return 0;
-  }
   emitResult(command, result, options);
   return 0;
 }
@@ -1546,6 +1563,10 @@ async function main() {
 
   if (command === "herdr") {
     return runNotifier("herdr", argv, {}, CHILD_TIMEOUT_MS);
+  }
+
+  if (command === "schema") {
+    return runSchemaCommand(argv);
   }
 
   if (command === "install" || command === "upgrade") {

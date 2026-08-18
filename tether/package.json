@@ -30,7 +30,9 @@
     "herdr-plugin/tether_plugin.py",
     "install.sh",
     "runtime/bridge_runtime.py",
+    "runtime/domain_control.py",
     "runtime/domain_schema.py",
+    "runtime/schema_orchestrator.py",
     "runtime/compat/hermes-slack-bridge-SKILL.md",
     "runtime/config.example.toml",
     "runtime/hermes_compat.py",
@@ -48,7 +50,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "python3 -m unittest discover -s tests -v && python3 -m py_compile runtime/bridge_runtime.py runtime/domain_schema.py runtime/hermes_compat.py runtime/routing.py runtime/security.py runtime/slack_protocol.py runtime/plugin/__init__.py skills/tether/scripts/tether_notify.py herdr-plugin/tether_plugin.py && python3 -c 'from pathlib import Path; assert \"name: tether\" in Path(\"runtime/plugin/plugin.yaml\").read_text()' && python3 -c 'import tomllib; from pathlib import Path; p=tomllib.loads(Path(\"herdr-plugin/herdr-plugin.toml\").read_text()); assert p[\"id\"] == \"parcha.tether\" and p[\"version\"] == \"0.3.0-beta.1\"' && python3 -m json.tool .claude-plugin/plugin.json >/dev/null && python3 -m json.tool .codex-plugin/plugin.json >/dev/null && python3 -m json.tool .agents/plugins/marketplace.json >/dev/null && node --check bin/tether.js && bash -n install.sh && bash tests/test_release_install.sh && bash tests/test_release_tarball.sh",
+    "test": "python3 -m unittest discover -s tests -v && python3 -m py_compile runtime/bridge_runtime.py runtime/domain_control.py runtime/domain_schema.py runtime/schema_orchestrator.py runtime/hermes_compat.py runtime/routing.py runtime/security.py runtime/slack_protocol.py runtime/plugin/__init__.py skills/tether/scripts/tether_notify.py herdr-plugin/tether_plugin.py && python3 -c 'from pathlib import Path; assert \"name: tether\" in Path(\"runtime/plugin/plugin.yaml\").read_text()' && python3 -c 'import tomllib; from pathlib import Path; p=tomllib.loads(Path(\"herdr-plugin/herdr-plugin.toml\").read_text()); assert p[\"id\"] == \"parcha.tether\" and p[\"version\"] == \"0.3.0-beta.1\"' && python3 -m json.tool .claude-plugin/plugin.json >/dev/null && python3 -m json.tool .codex-plugin/plugin.json >/dev/null && python3 -m json.tool .agents/plugins/marketplace.json >/dev/null && node --check bin/tether.js && bash -n install.sh && bash tests/test_release_install.sh && bash tests/test_release_tarball.sh",
     "test:release": "python3 -m unittest discover -s tests -p 'test_release_*.py' -v && node --check bin/tether.js && bash -n install.sh && bash tests/test_release_install.sh && bash tests/test_release_tarball.sh",
     "pack:check": "npm pack --dry-run"
   },

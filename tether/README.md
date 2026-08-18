@@ -182,19 +182,16 @@ boundary for those operations. A `tether notify --file` root upload uses
 Tether's durable staged upload protocol.
 
 Ambiguous Hermes ingress or native delivery is retained as `uncertain` and is
-not blindly replayed. Inspect it and resolve it explicitly:
+not blindly replayed. Inspect it with:
 
 ```bash
 tether unresolved --team T12345678
-tether resolve \
-  --team T12345678 \
-  --kind attempt \
-  --id att_example \
-  --action retry
 ```
 
-Actions are `retry`, `complete`, or `abandon`. Choose one only after checking
-whether the original operation ran.
+The legacy same-UID `tether resolve` mutation is disabled. It cannot safely
+distinguish an endpoint/model process from an operator. Resolution remains
+unavailable until the service-writer isolation and separate operator authority
+channel are attested; do not retry or manually duplicate ambiguous work.
 
 ## Lifecycle
 
@@ -226,6 +223,20 @@ retains config, bridge state, snapshots, and locally modified managed files:
 tether uninstall --herdr
 ```
 
+Inspect database/runtime compatibility without contacting the broker:
+
+```bash
+tether schema status --json
+```
+
+The command reads only owner-private installed state. It reports the database
+schema, runtime capability, logical-manifest digest, explicit security-domain
+configuration, incomplete schema receipts, and schema-18 domain blockers. The
+schema-18 model is packaged but not activated in this release, so migration
+readiness remains false until the schema-18 runtime and coupled lifecycle
+orchestrator are installed. There is intentionally no manual or force migrate
+command.
+
 Use `--herdr` only when the companion plugin is linked. Rollback reconciles the
 link with the restored payload; uninstall removes the link before deleting
 unchanged managed plugin files.
@@ -240,9 +251,11 @@ UID 0, creates a mode-`0600` socket, and accepts only peers with the broker UID.
 Native child environments are allowlisted and do not inherit Slack
 credentials.
 
-The Unix account is the local authority boundary. Tether does not isolate
-processes that share that UID and does not sandbox agent tools. Put mutually
-untrusted agents in separate accounts or hosts.
+The deployed schema-17 runtime still treats the Unix account as its local
+authority boundary. Mode `0600` and `SO_PEERCRED` do not isolate processes that
+share a UID. Schema-18 native routing and privileged operator resolution must
+remain disabled until the Tether state writer is OS-isolated from endpoint and
+model processes. Put mutually untrusted agents in separate accounts or hosts.
 
 Slack humans and trusted peer bots require explicit allowlists. Channel
 membership alone is not authorization.
@@ -264,7 +277,7 @@ tether maintenance
 | Broker unavailable | Restart Hermes, then run `tether doctor`. |
 | Socket Mode disconnected | Restore Socket Mode; do not rely on polling alone. |
 | Native binding stale | Rebind from the intended live session. |
-| Live terminal delivery uncertain | Inspect that exact Herdr agent or Zellij pane, then use `tether resolve`. |
+| Live terminal delivery uncertain | Inspect the exact endpoint and keep it blocked; operator mutation remains disabled until the isolated authority channel ships. |
 | Upgrade failed | Review automatic rollback; run `tether rollback --restart` if needed. |
 
 ## Development

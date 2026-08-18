@@ -331,12 +331,18 @@ INSTALLED_ROOT="$INSTALL_PREFIX/node_modules/@parcha/tether"
 [[ -x "$INSTALLED_ROOT/install.sh" ]] || fail "tarball omitted executable install.sh"
 [[ -f "$INSTALLED_ROOT/runtime/bridge_runtime.py" ]] ||
   fail "tarball omitted bridge runtime"
+[[ -f "$INSTALLED_ROOT/runtime/domain_control.py" ]] ||
+  fail "tarball omitted domain control runtime"
 [[ -f "$INSTALLED_ROOT/runtime/domain_schema.py" ]] ||
   fail "tarball omitted domain schema runtime"
+[[ -f "$INSTALLED_ROOT/runtime/schema_orchestrator.py" ]] ||
+  fail "tarball omitted schema orchestrator"
 [[ -f "$INSTALLED_ROOT/runtime/slack_protocol.py" ]] ||
   fail "tarball omitted Slack protocol runtime"
 python3 -m py_compile "$INSTALLED_ROOT/runtime/slack_protocol.py"
+python3 -m py_compile "$INSTALLED_ROOT/runtime/domain_control.py"
 python3 -m py_compile "$INSTALLED_ROOT/runtime/domain_schema.py"
+python3 -m py_compile "$INSTALLED_ROOT/runtime/schema_orchestrator.py"
 
 export HOME="$TEST_ROOT/home"
 export XDG_DATA_HOME="$TEST_ROOT/data"

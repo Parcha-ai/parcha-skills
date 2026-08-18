@@ -27,6 +27,22 @@
 
 ## Unreleased
 
+- Adds one schema-18 `BlockingCondition` projection for native uncertainty and
+  endpoint/binding rebind blockers. The August 14 accepted-without-ack shape is
+  visible with its age and blocked-turn count. Operator actions remain hidden
+  until the isolated authority capability is attested; blind retry is never
+  advertised.
+- Adds a fenced, idempotent operator-resolution domain transaction that
+  requires an external authority verifier, terminalizes exact attempt members,
+  and releases the endpoint lease atomically. It is not exposed on the
+  same-UID agent socket.
+- Disables the legacy same-UID broker and CLI recovery mutation until an
+  OS-distinguishable operator authority channel exists.
+- Adds read-only `tether schema status` with database/runtime compatibility,
+  logical-manifest digest, explicit security-domain readiness, incomplete
+  receipt detection, and schema-18 blocker reporting. Schema migration remains
+  disabled until the coupled lifecycle/runtime cutover is implemented.
+
 - Adds a fail-closed `TETHER_AMBIENT_BOT_CHANNELS` grant for trusted
   automations that intentionally create unmentioned root events. Each grant is
   bound to one exact Slack bot/app identity and one exact shared channel.
