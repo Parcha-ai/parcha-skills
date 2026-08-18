@@ -20,7 +20,8 @@ The replacement has three boundaries:
    native attempt state, payload durability, and operator resolution.
 3. A separate root-owned Greppy authority service owns privileged capability
    grants. Tether and the agent can request and consume grants but cannot mint,
-   widen, or persist them in the agent-writable Tether database.
+   widen, or persist them. The Tether database is service-writable and is never
+   writable by an endpoint or model process.
 
 The core relationship is:
 
@@ -133,26 +134,25 @@ Zellij remains a legacy, uncertain-only adapter until it has a native lifecycle
 source. Existing `hermes_session` and `headless_run` sources migrate to explicit
 Hermes-dispatch and headless-job adapters rather than disappearing implicitly.
 
-Each Hermes instance and the native endpoints it is allowed to resume run under
-one dedicated non-root **instance UID**. This preserves the owner-only
-`tether-control.sock` and direct Herdr/Zellij process boundary. Mutually
-untrusted personas require separate UIDs and separate Hermes/Tether instances;
-an endpoint from another UID is not bindable. The control socket is mode 0600,
-bounded and framed, and checks `SO_PEERCRED` against the instance UID. The
-Tether database and durable payload store have the same ownership. There is no
-cross-UID native routing daemon and the root authority service never proxies
-agent prompts.
+Hermes/Tether is the sole state writer. Native endpoint and model processes may
+share an instance UID only when an OS-enforced per-process boundary—such as a
+MAC profile or mount namespace—prevents them from opening the Tether database
+directory (including WAL and SHM), durable payload store, operator socket, and
+authority-registration channel. Otherwise the service writer and endpoint run
+under distinct non-root UIDs, with a narrow authenticated driver/control IPC.
+The root authority service never proxies agent prompts. Mutually untrusted
+personas always use separate endpoint security domains and service instances.
 
-Same UID is an operating convenience, not a process-secret boundary. Before
-loading Slack or authority credentials, the supervised Hermes/Tether process
-must make itself non-dumpable, prevent same-UID ptrace and `/proc` environment
-or file-descriptor inspection, close every unneeded descriptor, and launch
-native children through an explicit environment and FD allowlist. Systemd and
-kernel policy must enforce and report those properties; privileged readiness is
-false if any check fails. A canary must prove that an agent under the instance
-UID cannot read the gateway environment, enumerate or duplicate sensitive FDs,
-or attach with ptrace. Until that proof exists, the current same-UID deployment
-is not a security boundary and privileged capabilities stay disabled.
+Mode 0600 and `SO_PEERCRED` do not isolate processes that share a UID. Before
+loading Slack or authority credentials, the supervised service must also make
+itself non-dumpable, prevent ptrace and `/proc` environment or descriptor
+inspection, close every unneeded descriptor, and launch native children through
+an explicit environment and FD allowlist. Native routing and privileged
+readiness are false unless a canary running as the real endpoint process proves
+that DB/WAL/SHM open or mutation, payload and operator-socket access, authority
+channel access, environment/FD inspection, and ptrace all fail while ordinary
+agent control calls and service-owned writes still succeed. A same-UID file
+mode or peer check alone never satisfies this gate.
 
 ### Root-owned authority service
 
@@ -287,8 +287,10 @@ starts driver reconciliation and, if proof remains unavailable, `uncertain`.
 endpoint incarnation, ordered event keys, reply token, driver request ID,
 receipt cursor, and execution state.
 Every admitted turn must reach exactly one execution terminal:
-`completed_with_response`, `no_reply`, `cancelled`, `failed_before_start`, or an
-operator-resolved terminal. `uncertain` is explicitly nonterminal and visible;
+`completed_with_response`, `no_reply`, `cancelled`, `failed_before_start`,
+`failed`, or an operator-resolved terminal. `failed_before_start` means no
+driver mutation occurred; `failed` means execution started and a definitive
+failed exit was observed. `uncertain` is explicitly nonterminal and visible;
 it blocks only the affected endpoint until resolved.
 
 Execution completion and Slack delivery are separate. A response record stores
@@ -345,11 +347,13 @@ progress messages, if retained, carry their own Hermes idempotency key and have
 no effect on native execution state.
 
 Agent-callable operations and operator operations use distinct authorization.
-The same-UID agent client may capture its endpoint and request `new_root`,
-`attach`, `status`, or `blocked` within its security domain. `resolve`, forced
-rebind/close, and ambiguous-execution decisions require a separate operator
-socket or authority-issued admin handle whose peer is a configured local
-operator; a model process cannot resolve its own attempt.
+An agent client may capture its endpoint and request `new_root`, `attach`,
+`status`, or `blocked` within its security domain. `resolve`, forced rebind or
+close, and ambiguous-execution decisions require a separate operator socket or
+authority-issued admin handle whose peer is OS-distinguishable from the endpoint
+process. Until the state-writer boundary above is proven, `resolve` and
+privileged readiness remain disabled; an API distinction alone does not stop a
+same-UID model from forging database state.
 
 ## Primary flows
 
@@ -434,10 +438,20 @@ paths, or session references.
 ## Migration
 
 1. Freeze black-box behavior and production incident reproducers.
-2. Introduce the first-class endpoint/binding core and driver-owned lifecycle
-   behind one explicitly temporary Hermes compatibility adapter.
-3. Migrate schema 17 through a backed-up forward migration, validate logical
-   before/after hashes, and rehearse restore. Do not mutate live SQLite by hand.
+2. Prove the schema-17 to schema-18 replacement offline: explicit security
+   descriptor, fail-closed quarantine, SQLite-native private backup, logical
+   before/after manifests, atomic failure injection, and a lossless schema-17
+   projection after synthetic post-migration admissions.
+   This L1a proof does not enable schema 18 in the runtime. The durable
+   `new_root` intent/Hermes receipt saga, one `BlockingCondition` operator
+   surface, service-writer isolation, and backup/cutover orchestration are L1b
+   gates; `pending_root` is not enabled before those records and crash tests
+   exist.
+3. Cut over the first-class endpoint/binding core and driver-owned lifecycle
+   behind one explicitly temporary Hermes compatibility adapter. The schema-18
+   release is its own rollback target; rollback to schema 17 is allowed only
+   through the tested projection after quiescing and resolving every open
+   lease. Do not restore an old database or mutate live SQLite by hand.
 4. Land and release the public Hermes contracts. Shadow normalized decisions
    and payload hashes before transferring ingress ownership.
 5. Move one egress operation at a time to the Hermes ledger: send, update,

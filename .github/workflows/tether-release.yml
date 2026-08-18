@@ -421,6 +421,7 @@ jobs:
             "$PWD/dist/$tarball"
           installed="$smoke_root/node_modules/@parcha/tether"
           python -m py_compile "$installed/runtime/slack_protocol.py"
+          python -m py_compile "$installed/runtime/domain_schema.py"
           [[ "$(node "$installed/bin/tether.js" version)" == "tether $RELEASE_VERSION" ]]
 
           sha256="$(sha256sum "dist/$tarball" | awk '{print $1}')"

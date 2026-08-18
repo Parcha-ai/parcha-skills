@@ -272,6 +272,7 @@ function expectedManagedTargets(metadata) {
 
   const targets = [
     path.join(runtimeRoot, "bridge_runtime.py"),
+    path.join(runtimeRoot, "domain_schema.py"),
     path.join(runtimeRoot, "hermes_compat.py"),
     path.join(runtimeRoot, "routing.py"),
     path.join(runtimeRoot, "security.py"),
