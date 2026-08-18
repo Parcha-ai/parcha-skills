@@ -80,6 +80,7 @@ CLIENT_CONFIG_FIELDS = {"schema_version", "url", "token_file"}
 MAX_CLIENT_CONFIG_BYTES = 16_384
 MAX_TOKEN_FILE_BYTES = 16_384
 MAX_REMOTE_RESPONSE_BYTES = 1024 * 1024
+DEFAULT_REMOTE_TIMEOUT_SECONDS = 60.0
 MCP_PROTOCOL_VERSION = "2025-11-25"
 
 
@@ -321,7 +322,9 @@ def _mcp_call(base: str, method: str, path: str, body: dict | None) -> dict:
     try:
         with _open_remote(
             request,
-            timeout=float(os.environ.get("RECALL_TIMEOUT", "15")),
+            timeout=float(
+                os.environ.get("RECALL_TIMEOUT", str(DEFAULT_REMOTE_TIMEOUT_SECONDS))
+            ),
         ) as response:
             rendered = _read_remote_object(response)
     except urllib.error.HTTPError as exc:
@@ -371,7 +374,12 @@ def remote_request(method: str, path: str, body: dict | None = None,
         headers["Idempotency-Key"] = idempotency_key
     request = urllib.request.Request(base + path, data=data, method=method, headers=headers)
     try:
-        with _open_remote(request, timeout=float(os.environ.get("RECALL_TIMEOUT", "15"))) as response:
+        with _open_remote(
+            request,
+            timeout=float(
+                os.environ.get("RECALL_TIMEOUT", str(DEFAULT_REMOTE_TIMEOUT_SECONDS))
+            ),
+        ) as response:
             return _read_remote_object(response)
     except urllib.error.HTTPError as exc:
         try:

@@ -1085,6 +1085,23 @@ class DeepInspectionContractTests(unittest.TestCase):
         })
         self.assertEqual(inspector.duckdb_tool.content_sha256, "e" * 64)
 
+    def test_runtime_rejects_required_or_residual_archil_configuration_when_off(self):
+        for environment in (
+            {"RECALL_DEEP_INSPECTION_REQUIRED": "1"},
+            {"RECALL_ARCHIL_DUCKDB_OBJECT_KEY": "objects/dd/" + "d" * 64},
+            {"RECALL_ARCHIL_DISK_ID": "dsk-0123456789abcdef"},
+        ):
+            with self.subTest(environment=tuple(environment)), self.assertRaisesRegex(
+                ValueError, "configuration is incomplete"
+            ):
+                build_deep_inspector(mock.Mock(), environment)
+
+    def test_runtime_allows_explicitly_optional_off_configuration(self):
+        self.assertIsNone(build_deep_inspector(mock.Mock(), {
+            "RECALL_DEEP_INSPECTOR": "off",
+            "RECALL_DEEP_INSPECTION_REQUIRED": "0",
+        }))
+
     def test_agent_exec_compresses_broad_routing_manifests(self):
         transport = RecordingTransport({
             "success": True,

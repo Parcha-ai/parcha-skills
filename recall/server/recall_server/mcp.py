@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
 from .authorization import allowed_tools, decide
 from .deep_inspection import DeepInspectionError
+
+LOG = logging.getLogger("recall.mcp")
 
 LATEST_PROTOCOL_VERSION = "2026-07-28"
 LATEST_LEGACY_PROTOCOL_VERSION = "2026-06-30"
@@ -651,19 +656,90 @@ def _canonical_forget_enabled(principal: dict) -> bool:
     )
 
 
-def _tools_for(principal: dict) -> tuple[dict, ...]:
+def _unavailable_tools(store: Any) -> frozenset[str]:
+    value = getattr(store, "unavailable_mcp_tools", ())
+    if callable(value):
+        value = value()
+    if not isinstance(value, (tuple, list, set, frozenset)):
+        return frozenset()
+    return frozenset(item for item in value if isinstance(item, str))
+
+
+def _tools_for(principal: dict, store: Any = None) -> tuple[dict, ...]:
+    unavailable = _unavailable_tools(store)
     if principal.get("credential_kind") == "mcp":
         permitted = allowed_tools(principal)
         return tuple(
             CANONICAL_SHOW_TOOL if tool["name"] == "recall_show" else tool
             for tool in READ_TOOLS + CANONICAL_READ_TOOLS + WRITE_TOOLS
-            if tool["name"] in permitted
+            if tool["name"] in permitted and tool["name"] not in unavailable
         )
     if _write_enabled(principal):
         return READ_TOOLS + WRITE_TOOLS
     if _canonical_forget_enabled(principal):
         return READ_TOOLS + (WRITE_TOOLS[1],)
     return READ_TOOLS
+
+
+def _safe_deep_inspection_code(error: DeepInspectionError) -> str:
+    code = getattr(error, "code", "")
+    if isinstance(code, str) and re.fullmatch(
+        r"(?:deep_inspector|parquet_scan)_[a-z0-9_]{1,80}", code
+    ):
+        return code
+    return "deep_inspection_failed"
+
+
+def _run_deep_inspection_tool(
+    name: str,
+    operation: Callable[[], dict[str, Any]],
+) -> dict[str, Any]:
+    started = time.monotonic()
+    try:
+        return operation()
+    except DeepInspectionError as error:
+        elapsed_ms = round((time.monotonic() - started) * 1000, 3)
+        LOG.error(
+            "mcp_tool tool=%s outcome=error code=%s elapsed_ms=%.3f",
+            name,
+            _safe_deep_inspection_code(error),
+            elapsed_ms,
+        )
+        raise McpProtocolError(-32603, f"{name}_failed") from None
+
+
+def _call_tool_observed(
+    store: Any,
+    principal: dict[str, Any],
+    name: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    started = time.monotonic()
+    try:
+        result = _call_tool(store, principal, name, arguments)
+    except McpProtocolError:
+        raise
+    except Exception as error:
+        LOG.error(
+            "mcp_tool tool=%s outcome=error type=%s elapsed_ms=%.3f",
+            name,
+            type(error).__name__,
+            (time.monotonic() - started) * 1000,
+        )
+        raise
+    diagnostics = result.get("diagnostics", {})
+    deadline_exceeded = (
+        diagnostics.get("deadline_exceeded")
+        if isinstance(diagnostics, dict)
+        else None
+    )
+    LOG.info(
+        "mcp_tool tool=%s outcome=ok elapsed_ms=%.3f deadline_exceeded=%s",
+        name,
+        (time.monotonic() - started) * 1000,
+        deadline_exceeded if isinstance(deadline_exceeded, bool) else "unknown",
+    )
+    return result
 
 def _reject_extra(arguments: dict, allowed: frozenset[str]) -> None:
     unknown = sorted(set(arguments) - allowed)
@@ -767,8 +843,9 @@ def _call_tool(
             minimum=1,
             maximum=30,
         )
-        try:
-            return store.execute_agent_program(
+        return _run_deep_inspection_tool(
+            name,
+            lambda: store.execute_agent_program(
                 program,
                 logical_document_ids=logical_document_ids,
                 document_aliases=document_aliases,
@@ -777,9 +854,8 @@ def _call_tool(
                     document_id: () for document_id in logical_document_ids
                 },
                 timeout_seconds=timeout_seconds,
-            )
-        except DeepInspectionError:
-            raise McpProtocolError(-32603, "recall_exec_failed") from None
+            ),
+        )
     if name == "recall_exec_map":
         _reject_extra(
             arguments,
@@ -819,17 +895,17 @@ def _call_tool(
             minimum=1,
             maximum=30,
         )
-        try:
-            return store.execute_agent_program_parallel(
+        return _run_deep_inspection_tool(
+            name,
+            lambda: store.execute_agent_program_parallel(
                 program,
                 logical_document_ids=logical_document_ids,
                 document_aliases=document_aliases,
                 timeout_seconds=timeout_seconds,
                 max_parallel=max_parallel,
                 shard_size=shard_size,
-            )
-        except DeepInspectionError:
-            raise McpProtocolError(-32603, "recall_exec_map_failed") from None
+            ),
+        )
     if name == "recall_scan":
         _reject_extra(
             arguments,
@@ -846,14 +922,14 @@ def _call_tool(
             minimum=1,
             maximum=240,
         )
-        try:
-            return store.execute_parquet_scan(
+        return _run_deep_inspection_tool(
+            name,
+            lambda: store.execute_parquet_scan(
                 program,
                 filters=filters,
                 timeout_seconds=timeout_seconds,
-            )
-        except DeepInspectionError:
-            raise McpProtocolError(-32603, "recall_scan_failed") from None
+            ),
+        )
     if name == "recall_session_context":
         _reject_extra(arguments, frozenset({"target", "before", "after"}))
         target = _string(arguments.get("target"), "target")
@@ -1081,7 +1157,7 @@ def dispatch(
         result = {}
     elif method == "tools/list":
         require_action("mcp.tools.list")
-        result = {"tools": list(_tools_for(principal))}
+        result = {"tools": list(_tools_for(principal, store))}
         if protocol_version == LATEST_PROTOCOL_VERSION:
             result.update({
                 "resultType": "complete",
@@ -1090,14 +1166,14 @@ def dispatch(
             })
     elif method == "tools/call":
         name = _string(params.get("name"), "name")
-        if name not in {tool["name"] for tool in _tools_for(principal)}:
+        if name not in {tool["name"] for tool in _tools_for(principal, store)}:
             if principal.get("credential_kind") == "mcp":
                 require_action(f"mcp.{name}", hide=True)
             raise McpProtocolError(-32602, "unknown tool")
         require_action(f"mcp.{name}", hide=True)
         arguments = _object(params.get("arguments", {}), "arguments")
         result = _tool_result(
-            _call_tool(
+            _call_tool_observed(
                 store,
                 principal,
                 name,

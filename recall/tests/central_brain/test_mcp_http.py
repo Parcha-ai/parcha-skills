@@ -257,6 +257,12 @@ class FailingExecStore(PolicyStore):
         raise DeepInspectionError("private-provider-payload-must-not-escape")
 
 
+class NoDeepInspectionStore(PolicyStore):
+    unavailable_mcp_tools = frozenset({
+        "recall_exec", "recall_exec_map", "recall_scan"
+    })
+
+
 class McpHttpServer:
     def __init__(self, store: FakeStore, verifier=None) -> None:
         Handler.store = store
@@ -629,21 +635,22 @@ class RemoteMcpContractTest(unittest.TestCase):
         self.assertNotIn("capture", {call[0] for call in store.calls})
 
     def test_search_is_natural_language_and_source_scoped(self) -> None:
-        with McpHttpServer(self.store) as server:
-            status, _, raw = server.request(
-                "POST",
-                request(
-                    "tools/call",
-                    params={
-                        "name": "recall_search",
-                        "arguments": {
-                            "query": "What did we decide about the synthetic rollout?",
-                            "limit": 5,
+        with self.assertLogs("recall.mcp", level="INFO") as captured:
+            with McpHttpServer(self.store) as server:
+                status, _, raw = server.request(
+                    "POST",
+                    request(
+                        "tools/call",
+                        params={
+                            "name": "recall_search",
+                            "arguments": {
+                                "query": "What did we decide about the synthetic rollout?",
+                                "limit": 5,
+                            },
                         },
-                    },
-                ),
-                protocol="2025-11-25",
-            )
+                    ),
+                    protocol="2025-11-25",
+                )
         self.assertEqual(status, 200)
         result = json.loads(raw)["result"]
         self.assertFalse(result.get("isError", False))
@@ -661,6 +668,10 @@ class RemoteMcpContractTest(unittest.TestCase):
             ),
             self.store.calls,
         )
+        rendered_logs = "\n".join(captured.output)
+        self.assertIn("tool=recall_search outcome=ok", rendered_logs)
+        self.assertIn("elapsed_ms=", rendered_logs)
+        self.assertNotIn("synthetic rollout", rendered_logs)
 
     def test_declared_tool_bounds_match_the_runtime_contract(self) -> None:
         with McpHttpServer(self.store) as server:
@@ -1064,30 +1075,62 @@ class RemoteMcpContractTest(unittest.TestCase):
 
     def test_exec_provider_failure_is_content_free(self) -> None:
         document_id = "ldoc_0123456789abcdef0123456789abcdef"
-        with McpHttpServer(FailingExecStore()) as server:
-            status, _, raw = server.request(
-                "POST",
-                request(
-                    "tools/call",
-                    params={
-                        "name": "recall_exec",
-                        "arguments": {
-                            "targets": [
-                                {"logical_document_id": document_id, "alias": "d1"}
-                            ],
-                            "program": "true",
+        with self.assertLogs("recall.mcp", level="ERROR") as captured:
+            with McpHttpServer(FailingExecStore()) as server:
+                status, _, raw = server.request(
+                    "POST",
+                    request(
+                        "tools/call",
+                        params={
+                            "name": "recall_exec",
+                            "arguments": {
+                                "targets": [
+                                    {"logical_document_id": document_id, "alias": "d1"}
+                                ],
+                                "program": "true",
+                            },
                         },
-                    },
-                ),
-                token="synthetic-human-read",
-                protocol="2025-11-25",
-            )
+                    ),
+                    token="synthetic-human-read",
+                    protocol="2025-11-25",
+                )
         self.assertEqual(status, 200)
         self.assertEqual(
             json.loads(raw)["error"],
             {"code": -32603, "message": "recall_exec_failed"},
         )
         self.assertNotIn(b"private-provider-payload", raw)
+        rendered_logs = "\n".join(captured.output)
+        self.assertIn("tool=recall_exec outcome=error", rendered_logs)
+        self.assertIn("code=deep_inspection_failed", rendered_logs)
+        self.assertNotIn("private-provider-payload", rendered_logs)
+
+    def test_unavailable_deep_inspection_tools_are_not_advertised_or_callable(self):
+        store = NoDeepInspectionStore()
+        with McpHttpServer(store) as server:
+            _, _, listed = server.request(
+                "POST",
+                request("tools/list"),
+                token="synthetic-human-read",
+                protocol="2025-11-25",
+            )
+            names = {
+                tool["name"] for tool in json.loads(listed)["result"]["tools"]
+            }
+            self.assertTrue(
+                {"recall_exec", "recall_exec_map", "recall_scan"}.isdisjoint(names)
+            )
+            _, _, called = server.request(
+                "POST",
+                request("tools/call", params={
+                    "name": "recall_exec",
+                    "arguments": {},
+                }),
+                token="synthetic-human-read",
+                protocol="2025-11-25",
+            )
+        self.assertEqual(json.loads(called)["error"]["message"], "unknown tool")
+        self.assertNotIn("exec", {call[0] for call in store.calls})
 
     def test_search_and_related_bounds_reject_before_store(self) -> None:
         cases = (
