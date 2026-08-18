@@ -1,7 +1,7 @@
 # Tether Architecture
 
 This document describes Tether `0.3.0-beta.1`, binding protocol 3, database
-schema 16, and broker protocol 6. The implementation is authoritative:
+schema 17, and broker protocol 6. The implementation is authoritative:
 [`runtime/bridge_runtime.py`](../runtime/bridge_runtime.py),
 [`runtime/plugin/__init__.py`](../runtime/plugin/__init__.py), and
 [`runtime/routing.py`](../runtime/routing.py).
@@ -82,7 +82,8 @@ create
 
 `Store.create` is idempotent only when an idempotency key is reused with the
 same source, owner, workspace, channel, and requested thread. A logical native
-endpoint may have only one pending or active bridge in one database.
+endpoint may have many pending or active bridges in one database. Endpoint-wide
+arbitration permits only one open native attempt across those sibling bridges.
 
 ### Activation
 
@@ -337,7 +338,7 @@ are backfilled as non-unique serialization keys, preserving every active Slack
 thread that shares a session.
 
 The installer snapshots managed files and plugin state, not the database. A
-code rollback does not downgrade schema 16. Back up `bridges.db` and its WAL/SHM
+code rollback does not downgrade schema 17. Back up `bridges.db` and its WAL/SHM
 sidecars before crossing a schema boundary.
 
 ## Operator recovery

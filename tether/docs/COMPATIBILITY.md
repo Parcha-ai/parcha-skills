@@ -25,7 +25,7 @@ with an explicit `--run-id`; stock pi sessions cannot be resumed natively.
 
 ## Binding and database upgrade
 
-This source tree uses BindingV3 and SQLite schema 16.
+This source tree uses BindingV3 and SQLite schema 17.
 
 A BindingV3 record contains a concrete source, one delivery endpoint, and a
 monotonic generation. Rebind and close increment the generation. Legacy or
@@ -44,11 +44,11 @@ requires an explicit rebind.
 
 At startup, the Store:
 
-1. rejects a database whose `PRAGMA user_version` is newer than 16;
+1. rejects a database whose `PRAGMA user_version` is newer than 17;
 2. opens an immediate migration transaction;
 3. applies additive schema migrations and binding backfills;
 4. preserves multiple thread bindings for one endpoint and indexes their shared serialization key;
-5. writes schema version 16; and
+5. writes schema version 17; and
 6. recovers attempts that are proven not to have started external I/O.
 
 The installer snapshots managed code and Hermes plugin state, not the
@@ -61,7 +61,7 @@ database. Before upgrading an important host:
 4. Upgrade and start Hermes.
 5. Run `tether doctor`, then test one outbound root and one Socket Mode reply.
 
-Code rollback does not downgrade schema 16. If an older runtime cannot read the
+Code rollback does not downgrade schema 17. If an older runtime cannot read the
 database, restore the backup created for that runtime.
 
 ## Slack compatibility

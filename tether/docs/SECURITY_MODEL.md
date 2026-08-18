@@ -1,7 +1,7 @@
 # Tether Security Model
 
 This document describes the security boundary of Tether `0.3.0-beta.1`,
-binding protocol 3, and database schema 16. The implementation and tests are
+binding protocol 3, and database schema 17. The implementation and tests are
 authoritative.
 
 ## Scope

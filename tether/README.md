@@ -4,7 +4,7 @@ Tether binds a Slack thread to the Codex, Claude Code, Herdr, Zellij, Hermes, or
 headless run that created it. Hermes owns the Slack credential. Local clients
 use an owner-only Unix socket and do not receive that credential.
 
-`0.3.0-beta.1` is a pre-release. This source tree uses BindingV3 and database schema 16.
+`0.3.0-beta.1` is a pre-release. This source tree uses BindingV3 and database schema 17.
 Read [Compatibility](docs/COMPATIBILITY.md) before upgrading an existing host.
 
 ## Supported boundary

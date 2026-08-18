@@ -136,7 +136,7 @@ Rollback does not:
 - restore deleted runtime data; or
 - reverse changes made by an agent or external tool.
 
-If the older runtime cannot read schema 16, stop Hermes and restore the
+If the older runtime cannot read schema 17, stop Hermes and restore the
 database backup created with that runtime. Do not point old code at a newer
 database and keep retrying.
 
