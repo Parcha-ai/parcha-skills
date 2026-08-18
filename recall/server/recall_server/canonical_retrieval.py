@@ -149,6 +149,13 @@ class CanonicalRetrieval:
         self.deep_inspector = deep_inspector
         self.passage_policy = passage_policy or DEFAULT_PASSAGE_POLICY
 
+    @property
+    def unavailable_mcp_tools(self) -> frozenset[str]:
+        """Hide code-mode tools when this deployment has no execution runtime."""
+        if self.deep_inspector is None:
+            return frozenset({"recall_exec", "recall_exec_map", "recall_scan"})
+        return frozenset()
+
     def bind(self, principal: dict[str, Any]) -> BoundCanonicalRetrieval:
         tenant_id = principal.get("tenant_id")
         principal_id = principal.get("principal_id")
@@ -471,6 +478,13 @@ class BoundCanonicalRetrieval:
         self.evidence_projector = evidence_projector
         self.deep_inspector = deep_inspector
         self.passage_policy = passage_policy or DEFAULT_PASSAGE_POLICY
+
+    @property
+    def unavailable_mcp_tools(self) -> frozenset[str]:
+        """Hide code-mode tools when this bound view has no execution runtime."""
+        if self.deep_inspector is None:
+            return frozenset({"recall_exec", "recall_exec_map", "recall_scan"})
+        return frozenset()
 
     @staticmethod
     def _filters(

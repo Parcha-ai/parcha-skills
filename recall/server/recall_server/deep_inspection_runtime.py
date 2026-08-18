@@ -8,6 +8,22 @@ from .deep_inspection import AgentExecObject, ArchilDeepInspector, LocalDeepInsp
 from .evidence_projection import EvidenceProjectionStore
 
 
+ARCHIL_SETTINGS = (
+    "ARCHIL_API_KEY",
+    "RECALL_ARCHIL_DISK_ID",
+    "RECALL_ARCHIL_REGION",
+    "RECALL_ARCHIL_DUCKDB_OBJECT_KEY",
+    "RECALL_ARCHIL_DUCKDB_SHA256",
+)
+
+
+def _enabled(values: Mapping[str, str], name: str) -> bool:
+    value = values.get(name, "0").strip()
+    if value not in {"0", "1"}:
+        raise ValueError(f"{name} must be 0 or 1")
+    return value == "1"
+
+
 def build_deep_inspector(
     projection: EvidenceProjectionStore,
     environment: Mapping[str, str] | None = None,
@@ -16,7 +32,12 @@ def build_deep_inspector(
 ) -> Any:
     values = os.environ if environment is None else environment
     provider = values.get("RECALL_DEEP_INSPECTOR", "off").strip()
+    required = _enabled(values, "RECALL_DEEP_INSPECTION_REQUIRED")
     if provider == "off":
+        # Treat leftover provider configuration as deployment drift instead of
+        # silently serving code-mode tools backed by no runtime.
+        if required or any(values.get(name, "").strip() for name in ARCHIL_SETTINGS):
+            raise ValueError("deep inspector configuration is incomplete")
         return None
     if provider == "local":
         return LocalDeepInspector(projection)

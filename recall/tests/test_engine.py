@@ -1286,6 +1286,9 @@ class RemoteTransportTest(unittest.TestCase):
         self.assertEqual(out, "")
         self.assertIn("remote recall unavailable", err)
 
+    def test_remote_default_timeout_allows_one_minute_for_retrieval(self):
+        self.assertEqual(engine.DEFAULT_REMOTE_TIMEOUT_SECONDS, 60.0)
+
     def test_remote_redirect_never_forwards_bearer_to_destination(self):
         token_file = self.root / "redirect-token.json"
         token_file.write_text(json.dumps({"token": "redirect-secret-token"}))
