@@ -72,7 +72,8 @@ mechanism; it cannot quietly repeat the same loop, weaken acceptance, or jump to
    HEAD. A stale, conflicted, unmerged, or differently deployed change is unmet.
 7. **EXIT** — map every criterion to fresh evidence, write the boundary receipt, then transition.
 
-Use background execution only when the harness actually supports it. An infrastructure or
+Use background execution only when the harness actually supports it: stock pi has no background bash,
+so keep work foreground there or split it into resumable bounded steps. An infrastructure or
 instrumentation failure does not consume an evidence-attempt bound, but diagnose it and record why;
 only a run that exercised the claim consumes the bound.
 
