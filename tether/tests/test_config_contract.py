@@ -53,6 +53,24 @@ class ConfigContractTest(unittest.TestCase):
         self.write("retention_days = 30\n")
         self.assertEqual(self.runtime.load_config(self.config).retention_days, 30)
 
+    def test_explicit_security_domain_identity_is_parsed_without_ambient_defaults(self) -> None:
+        self.write(
+            "config_version = 1\n"
+            'team_id = "T12345678"\n'
+            'allowed_users = ["U12345678", "U87654321"]\n'
+            'persona_id = "primary"\n'
+            "policy_generation = 4\n"
+        )
+        config = self.runtime.load_config(self.config)
+        self.assertEqual(config.persona_id, "primary")
+        self.assertEqual(config.policy_generation, 4)
+        self.assertEqual(config.allowed_users, ("U12345678", "U87654321"))
+
+        self.write("config_version = 1\n")
+        config = self.runtime.load_config(self.config)
+        self.assertEqual(config.persona_id, "")
+        self.assertEqual(config.policy_generation, 0)
+
     def test_future_version_and_unknown_keys_fail_closed(self) -> None:
         self.write("config_version = 2\n")
         with self.assertRaisesRegex(ValueError, "config_version"):
@@ -68,6 +86,9 @@ class ConfigContractTest(unittest.TestCase):
             'codex_binary = ["codex"]\n',
             'claude_binary = ""\n',
             'team_id = ["T12345678"]\n',
+            'persona_id = ["primary"]\n',
+            'policy_generation = "one"\n',
+            'policy_generation = -1\n',
             'codex_resume_args = ["safe", "bad\\u0000argument"]\n',
         )
         for document in invalid_documents:

@@ -98,16 +98,14 @@ Configured word, character, and sentence limits are soft writing targets. They
 do not reject a complete response. The hard transport limit is 35,000
 characters.
 
-The operator recovery commands in this release are:
+The read-only operator recovery command in this release is:
 
 ```bash
 tether unresolved [--team T12345678]
-tether resolve \
-  --team T12345678 \
-  --kind ingress|attempt \
-  --id ID \
-  --action retry|complete|abandon
 ```
+
+The legacy same-UID `tether resolve` mutation is disabled until an
+OS-distinguishable operator authority channel is active.
 
 ## Credential compatibility
 

@@ -86,6 +86,19 @@ poll-only deployment as healthy.
 
 ## Upgrade
 
+First inspect the installed database/runtime pair:
+
+```bash
+tether schema status --json
+```
+
+This command is read-only and does not stop Hermes or migrate the database. It
+fails runtime readiness for an unsafe database file, an incompatible schema,
+or an incomplete schema-operation receipt. Migration readiness additionally
+requires an intact installed manifest and explicit `team_id`, `allowed_users`,
+`persona_id`, and `policy_generation` in Tether config. Ambient Hermes
+allowlists are not accepted as migration authority.
+
 Before crossing a database schema boundary:
 
 1. Stop Hermes.
@@ -109,10 +122,17 @@ On Linux, `--restart` detects an active system-level
 unavailable or the restart fails, the lifecycle command restores the snapshot
 and exits nonzero.
 
-The current schema is 15. Runtime startup rejects a database with a newer
+The active runtime schema is 17. Runtime startup rejects a database with a newer
 schema, upgrades supported older schemas in one immediate transaction, and
 marks legacy or incomplete native bindings `rebind_required`. Rebind those
 sessions explicitly; Tether does not infer a replacement endpoint.
+
+Schema 18 and its reversible offline projection are packaged for the Tether
+replacement, but the schema-17 runtime does not activate them. Do not invoke
+the Python migration functions directly. A later release must couple gateway
+quiescence, the installer lifecycle lock, the database singleton, a verified
+receipt-bound backup, expected-manifest comparison, exact target-runtime boot,
+and predecessor rollback before exposing migration.
 
 If the process is killed during commit, the next lifecycle command reads the
 transaction journal and completes recovery before starting new work.
@@ -198,26 +218,14 @@ result. Do not retry it until the outcome is known.
 
 2. Inspect the exact Slack thread and, for native work, the exact bound
    session.
-3. Record one decision:
+3. Keep the endpoint blocked. The legacy same-UID `tether resolve` mutation is
+   disabled because it cannot distinguish an endpoint/model process from an
+   operator. The schema-18 domain supports `complete` or `abandon` only after
+   service-writer isolation and a separate authority channel are attested, but
+   that operator transport is not exposed in this release.
 
-   ```bash
-   tether resolve \
-     --team T12345678 \
-     --kind attempt \
-     --id att_example \
-     --action complete
-   ```
-
-Actions:
-
-| Action | Use |
-| --- | --- |
-| `retry` | The original Hermes dispatch or native attempt is proven not to have run |
-| `complete` | The original operation is proven to have completed |
-| `abandon` | The outcome cannot be accepted safely; cancel it and begin a new explicit operation |
-
-Native ingress transferred to an attempt cannot be retried directly; resolve
-the attempt. Rebind and close remain blocked while related work is uncertain.
+Do not retry, manually duplicate, rebind, or close related work while its
+outcome is uncertain.
 Repeating the same terminal decision is safe; a conflicting decision fails
 closed.
 
@@ -252,11 +260,11 @@ may exceed it. The enforced transport limit is 35,000 characters.
 | Broker unavailable | Restart Hermes, then run `tether doctor`. |
 | Socket Mode disconnected | Restore Socket Mode. Polling is not a complete substitute. |
 | Native binding stale | Rebind from the intended live session. Never route to another agent as fallback. |
-| Live terminal submission uncertain | Inspect that Herdr agent or Zellij pane, then use `tether resolve`. |
+| Live terminal submission uncertain | Inspect the exact endpoint and keep it blocked; operator mutation remains disabled until the isolated authority channel ships. |
 | Slack write uncertain | Keep one broker running and allow reconciliation; do not post the same text manually. |
 | Install interrupted | Run the same lifecycle command; it recovers the transaction journal first. |
 | Upgrade causes gateway failure | Inspect automatic rollback, then use `tether rollback --restart` if needed. |
-| Schema migration fails | Stop Hermes and restore the matching database backup. |
+| Schema operation is incomplete | Keep Hermes stopped and inspect `tether schema status --json`; do not restore or switch code outside the future receipt-bound orchestrator. |
 
 ## Polling and reconciliation
 
