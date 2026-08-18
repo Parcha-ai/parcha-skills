@@ -44,7 +44,9 @@ runtime = _load_runtime()
 Store = runtime.Store
 broker_call = runtime.broker_call
 continue_native = runtime.continue_native
+deliver_herdr = runtime.deliver_herdr
 deliver_zellij = runtime.deliver_zellij
+interrupt_herdr = runtime.interrupt_herdr
 interrupt_zellij = runtime.interrupt_zellij
 effective_allowed_users = runtime.effective_allowed_users
 load_config = runtime.load_config
@@ -307,6 +309,21 @@ def _csv_env(name: str) -> frozenset[str]:
     )
 
 
+def _ambient_peer_bot_channels() -> frozenset[tuple[str, str]]:
+    routes: set[tuple[str, str]] = set()
+    for value in os.getenv("TETHER_AMBIENT_BOT_CHANNELS", "").split(","):
+        actor_id, separator, channel_id = value.strip().partition(":")
+        if (
+            separator
+            and actor_id.startswith(("B", "U"))
+            and channel_id.startswith(("C", "G"))
+            and actor_id.isalnum()
+            and channel_id.isalnum()
+        ):
+            routes.add((actor_id, channel_id))
+    return frozenset(routes)
+
+
 def _allowed_channels(adapter) -> frozenset[str]:
     resolver = getattr(adapter, "_slack_allowed_channels", None)
     if callable(resolver):
@@ -333,6 +350,7 @@ def _routing_policy(adapter, team_id: str):
         allowed_human_user_ids=frozenset(effective_allowed_users()),
         trusted_peer_user_ids=_allowed_peer_bot_users(),
         trusted_peer_bot_ids=_csv_env("TETHER_ALLOWED_BOT_IDS"),
+        ambient_peer_bot_channels=_ambient_peer_bot_channels(),
         allowed_channel_ids=_allowed_channels(adapter),
     )
 
@@ -800,6 +818,7 @@ async def _routing_thread_state(
             return None, "bridge_workspace_unresolved"
         ambient_owned = (
             message.conversation_kind is routing.ConversationKind.DM
+            or bridge.thread_claim_generation == bridge.binding_generation
             or store.owns_thread_root(
                 bridge.bridge_id,
                 message.identity.team_id,
@@ -1449,6 +1468,7 @@ def _hermes_workspace_id(
     return str(
         from_metadata
         or getattr(adapter, "_channel_team", {}).get(chat_id, "")
+        or load_config().team_id
         or ""
     )
 
@@ -2402,14 +2422,33 @@ async def _poll_recent_replies(adapter) -> int:
     hours = _bounded_env_int("TETHER_REPLY_RECOVERY_HOURS", 24, 1, 168)
     workspace_limit = _bounded_env_int("TETHER_REPLY_POLL_BATCH", 10, 1, 25)
     max_pages = _bounded_env_int("TETHER_REPLY_POLL_MAX_PAGES", 25, 1, 100)
-    bridges = store.active_bridges()
-    bridge_keys = {(bridge.team_id, bridge.channel_id, bridge.thread_ts) for bridge in bridges}
+    configured_team_id = load_config().team_id
+    bridges = [
+        bridge
+        for bridge in store.active_bridges()
+        if bridge.channel_id and bridge.thread_ts
+    ]
+    bridge_keys = {
+        (bridge.team_id or configured_team_id, bridge.channel_id, bridge.thread_ts)
+        for bridge in bridges
+    }
     participating = [
-        item for item in store.recent_participating_threads(hours=max(hours, 168), limit=500)
-        if item[:3] not in bridge_keys
+        (team_id or configured_team_id, channel_id, thread_ts, updated_at)
+        for team_id, channel_id, thread_ts, updated_at in store.recent_participating_threads(
+            hours=max(hours, 168), limit=500
+        )
+        if channel_id
+        and thread_ts
+        and (team_id or configured_team_id, channel_id, thread_ts) not in bridge_keys
     ]
     targets = [
-        (bridge, bridge.team_id, bridge.channel_id, str(bridge.thread_ts), None)
+        (
+            bridge,
+            bridge.team_id or configured_team_id,
+            bridge.channel_id,
+            str(bridge.thread_ts),
+            None,
+        )
         for bridge in bridges
     ] + [(None, *item) for item in participating]
     skipped_count = sum(1 for target in targets if not target[1])
@@ -2708,6 +2747,17 @@ def _suppress_bridge_reaction(event, gateway):
 
 
 def _failure_reason(exc: Exception) -> str:
+    code = str(getattr(exc, "code", "") or "")
+    if code == "endpoint_busy":
+        return "another Slack thread is already using this native session"
+    if code == "terminal_submit_not_started":
+        return "the live session was not ready before submission; retry is safe"
+    if code in {
+        "binding_rebind_required",
+        "process_identity_changed",
+        "cwd_identity_changed",
+    }:
+        return "the bound live session identity changed and must be revalidated"
     text = str(exc).lower()
     if "credential helper" in text:
         return (
@@ -2745,8 +2795,8 @@ def _finish_batch(items, error: str | None = None) -> None:
 
 def _run_recovered_event(bridge, items):
     prompt = _batch_prompt(items)
-    if _has_bound_zellij_pane(bridge):
-        _submit_zellij_attempt(bridge, items, prompt)
+    if _has_bound_live_endpoint(bridge):
+        _submit_live_attempt(bridge, items, prompt)
         return None
     attempt_id, response = _submit_detached_attempt(
         bridge,
@@ -2768,7 +2818,26 @@ def _has_bound_zellij_pane(bridge) -> bool:
     return runtime.source_binding(bridge).endpoint_kind == "zellij_pane"
 
 
-def _submit_zellij_attempt(bridge, items, prompt: str) -> str:
+def _has_bound_live_endpoint(bridge) -> bool:
+    return runtime.source_binding(bridge).endpoint_kind in {
+        "zellij_pane",
+        "herdr_agent",
+    }
+
+
+def _submit_live_attempt(bridge, items, prompt: str) -> str:
+    endpoint = runtime.source_binding(bridge).endpoint_kind
+    if endpoint == "zellij_pane":
+        delivery_kind = "zellij"
+        deliver = deliver_zellij
+    elif endpoint == "herdr_agent":
+        delivery_kind = "herdr"
+        deliver = deliver_herdr
+    else:
+        raise runtime.NativeContinuationError(
+            "binding is not attached to a live terminal endpoint",
+            code="endpoint_mismatch",
+        )
     event_ids = [str(item["event_id"]) for item in items]
     attempt_id = runtime.delivery_attempt_id(
         bridge.bridge_id,
@@ -2780,6 +2849,7 @@ def _submit_zellij_attempt(bridge, items, prompt: str) -> str:
         bridge.bridge_id,
         bridge.binding_generation,
         attempt_id,
+        delivery_kind=delivery_kind,
     ):
         raise runtime.NativeContinuationError(
             "binding changed before pane delivery; retry against the current binding",
@@ -2800,7 +2870,7 @@ def _submit_zellij_attempt(bridge, items, prompt: str) -> str:
             code="binding_generation_changed",
         )
     try:
-        deliver_zellij(bridge, prompt, attempt_id)
+        deliver(bridge, prompt, attempt_id)
     except Exception as exc:
         if store.attempt_state(attempt_id, bridge.bridge_id) in {
             "replying",
@@ -2842,6 +2912,10 @@ def _submit_zellij_attempt(bridge, items, prompt: str) -> str:
             code="binding_generation_changed",
         )
     return attempt_id
+
+
+def _submit_zellij_attempt(bridge, items, prompt: str) -> str:
+    return _submit_live_attempt(bridge, items, prompt)
 
 
 def _submit_detached_attempt(
@@ -2911,6 +2985,10 @@ def _submit_detached_attempt(
             prompt
             + "\n\nReturn one useful Slack update only. Default to 50 words and "
             "3 sentences; exceed that when needed for a complete or safe answer. "
+            "Requests to change future behavior, prompts, configuration, or automation "
+            "are actionable work: make the durable change and report what changed. "
+            "Do not return NO_REPLY merely because no conversational acknowledgment "
+            "is needed. "
             "Return exactly NO_REPLY only if no useful response is needed.",
             cancellation,
             persist_response,
@@ -2950,12 +3028,21 @@ def _recover_queued_events():
                         _run_recovered_event(bridge, items)
                     except Exception as exc:
                         reason = _failure_reason(exc)
+                        error_code = str(
+                            getattr(exc, "code", type(exc).__name__)
+                        )
+                        if error_code == "endpoint_busy":
+                            break
                         log.error(
-                            "Recovered bridge reply failed for %s: %s",
+                            "Recovered bridge reply failed for %s [%s]: %s",
                             bridge_id,
+                            error_code,
                             reason,
                         )
-                        if reason != _CANCELLED_REASON:
+                        if (
+                            reason != _CANCELLED_REASON
+                            and error_code != "terminal_submit_not_started"
+                        ):
                             notice_seed = str(items[0]["event_id"])
                             try:
                                 broker_call({
@@ -2995,7 +3082,7 @@ def _recover_queued_events():
         raise
 
 
-def _schedule_bridge_drain(bridge_id: str) -> None:
+def _schedule_one_bridge_drain(bridge_id: str) -> bool:
     context = state.dispatch_context.get(bridge_id)
     if context is not None:
         loop, gateway, platform = context
@@ -3005,9 +3092,26 @@ def _schedule_bridge_drain(bridge_id: str) -> None:
 
         try:
             loop.call_soon_threadsafe(schedule)
-            return
+            return True
         except RuntimeError:
             state.dispatch_context.pop(bridge_id, None)
+    return False
+
+
+def _schedule_bridge_drain(bridge_id: str) -> None:
+    candidates = (
+        store.endpoint_queued_bridge_ids(bridge_id)
+        if store is not None
+        else []
+    )
+    if not candidates:
+        candidates = [bridge_id]
+    needs_recovery = False
+    for candidate in candidates:
+        if not _schedule_one_bridge_drain(candidate):
+            needs_recovery = True
+    if not needs_recovery:
+        return
     with state.recovery_lock:
         state.recovery_wake_counter += 1
         if state.recovery_worker_started:
@@ -3036,9 +3140,9 @@ async def _drain_bridge(bridge_id, gateway, platform):
             attempt_id: str | None = None
             try:
                 prompt = _batch_prompt(items)
-                if _has_bound_zellij_pane(bridge):
+                if _has_bound_live_endpoint(bridge):
                     attempt_id = await asyncio.to_thread(
-                        _submit_zellij_attempt, bridge, items, prompt
+                        _submit_live_attempt, bridge, items, prompt
                     )
                 else:
                     attempt_id, response = await asyncio.to_thread(
@@ -3048,7 +3152,7 @@ async def _drain_bridge(bridge_id, gateway, platform):
                         prompt,
                         cancellation,
                     )
-                if _has_bound_zellij_pane(bridge):
+                if _has_bound_live_endpoint(bridge):
                     continue
                 if response != "NO_REPLY":
                     await asyncio.to_thread(
@@ -3062,6 +3166,11 @@ async def _drain_bridge(bridge_id, gateway, platform):
                     )
             except Exception as exc:
                 reason = _failure_reason(exc)
+                error_code = str(
+                    getattr(exc, "code", type(exc).__name__)
+                )
+                if error_code == "endpoint_busy":
+                    return
                 if attempt_id is None:
                     _finish_batch(items, f"{type(exc).__name__}: {reason}")
                 elif store.attempt_state(attempt_id, bridge.bridge_id) in {
@@ -3073,11 +3182,20 @@ async def _drain_bridge(bridge_id, gateway, platform):
                         bridge.bridge_id,
                         f"{type(exc).__name__}: {reason}",
                     )
-                log.error("Bridge reply failed for %s: %s", bridge.bridge_id, reason)
+                log.error(
+                    "Bridge reply failed for %s [%s]: %s",
+                    bridge.bridge_id,
+                    error_code,
+                    reason,
+                )
                 cancelled = (
                     cancellation is not None and cancellation.is_set()
                 )
-                if not cancelled and reason != _CANCELLED_REASON:
+                if (
+                    not cancelled
+                    and reason != _CANCELLED_REASON
+                    and error_code != "terminal_submit_not_started"
+                ):
                     notice_seed = attempt_id or str(items[0]["event_id"])
                     asyncio.get_running_loop().create_task(
                         _post_control_notice(
@@ -3113,6 +3231,28 @@ def _interrupt_active_zellij_attempt(bridge) -> int:
         bridge.bridge_id,
         int(active["binding_generation"]),
     )
+
+
+def _interrupt_active_herdr_attempt(bridge) -> int:
+    active = store.active_live_attempt(bridge.bridge_id, "herdr")
+    if active is None:
+        return 0
+    interrupt_herdr(bridge)
+    return store.cancel_live_attempt(
+        str(active["attempt_id"]),
+        bridge.bridge_id,
+        int(active["binding_generation"]),
+        delivery_kind="herdr",
+    )
+
+
+def _interrupt_active_live_attempt(bridge) -> int:
+    endpoint = runtime.source_binding(bridge).endpoint_kind
+    if endpoint == "zellij_pane":
+        return _interrupt_active_zellij_attempt(bridge)
+    if endpoint == "herdr_agent":
+        return _interrupt_active_herdr_attempt(bridge)
+    return 0
 
 
 async def _post_control_notice(
@@ -3301,9 +3441,9 @@ def _dispatch_native_mutation(
         if cancellation is not None:
             cancellation.set()
         try:
-            _interrupt_active_zellij_attempt(dispatch.bridge)
+            _interrupt_active_live_attempt(dispatch.bridge)
         except Exception as exc:
-            active = store.active_zellij_attempt(
+            active = store.active_live_attempt(
                 dispatch.bridge.bridge_id
             )
             if active is not None:
@@ -3313,7 +3453,7 @@ def _dispatch_native_mutation(
                     int(active["binding_generation"]),
                 )
             log.error(
-                "Tether could not verify interruption of the edited Zellij "
+                "Tether could not verify interruption of the edited live terminal "
                 "turn for %s: %s",
                 dispatch.bridge.bridge_id,
                 _failure_reason(exc),
@@ -3380,7 +3520,7 @@ def _dispatch_native_cancel(
         if cancellation is not None:
             cancellation.set()
         try:
-            cancelled_zellij = _interrupt_active_zellij_attempt(
+            cancelled_zellij = _interrupt_active_live_attempt(
                 dispatch.bridge
             )
         except runtime.NativeContinuationError:

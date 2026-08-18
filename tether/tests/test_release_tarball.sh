@@ -331,9 +331,12 @@ INSTALLED_ROOT="$INSTALL_PREFIX/node_modules/@parcha/tether"
 [[ -x "$INSTALLED_ROOT/install.sh" ]] || fail "tarball omitted executable install.sh"
 [[ -f "$INSTALLED_ROOT/runtime/bridge_runtime.py" ]] ||
   fail "tarball omitted bridge runtime"
+[[ -f "$INSTALLED_ROOT/runtime/domain_schema.py" ]] ||
+  fail "tarball omitted domain schema runtime"
 [[ -f "$INSTALLED_ROOT/runtime/slack_protocol.py" ]] ||
   fail "tarball omitted Slack protocol runtime"
 python3 -m py_compile "$INSTALLED_ROOT/runtime/slack_protocol.py"
+python3 -m py_compile "$INSTALLED_ROOT/runtime/domain_schema.py"
 
 export HOME="$TEST_ROOT/home"
 export XDG_DATA_HOME="$TEST_ROOT/data"
@@ -342,6 +345,7 @@ export XDG_STATE_HOME="$TEST_ROOT/state"
 export HERMES_HOME="$TEST_ROOT/hermes"
 export CODEX_HOME="$TEST_ROOT/codex"
 export HERMES_BIN="$TEST_ROOT/bin/hermes"
+export TETHER_TEST_SYSTEM_GATEWAY_ACTIVE=0
 install -d -m 700 "$HOME" "$CODEX_HOME" "$(dirname "$HERMES_BIN")"
 
 cat >"$HERMES_BIN" <<'EOF'

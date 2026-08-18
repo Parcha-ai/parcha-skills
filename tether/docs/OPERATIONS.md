@@ -1,7 +1,7 @@
 # Tether Operations
 
 This runbook covers installation, upgrade, rollback, recovery, and diagnosis
-for Tether `0.2.0-beta.1`.
+for Tether `0.3.0-beta.1`.
 
 ## Managed state
 
@@ -29,11 +29,11 @@ errors. Treat it and its backups as sensitive.
 Use an immutable published version:
 
 ```bash
-npx --yes --package=@parcha/tether@0.2.0-beta.1 \
+npx --yes --package=@parcha/tether@0.3.0-beta.1 \
   tether install --harness=both --dry-run
 
-npx --yes --package=@parcha/tether@0.2.0-beta.1 \
-  tether setup --harness=both
+npx --yes --package=@parcha/tether@0.3.0-beta.1 \
+  tether setup --harness=both --herdr
 ```
 
 Use `--harness=codex` or `--harness=claude-code` when only one harness is
@@ -73,6 +73,13 @@ A production deployment should report:
 - valid Hermes plugin wiring; and
 - connected Slack Events API ingress through Socket Mode.
 
+The gateway and interactive shells must resolve each configured native agent
+binary to the same executable. Long-lived gateway services often have a
+different `PATH`; in that case set `codex_binary` and `claude_binary` in
+`~/.config/tether/config.toml` to stable absolute launchers. After an agent
+upgrade, capture a fresh bridge or explicitly rebind it. Tether deliberately
+rejects a running executable that is not one of the configured trusted paths.
+
 The `conversations.replies` poller is only best-effort recovery. It may be
 rate-limited or unavailable to a bot token for channel threads. Do not accept a
 poll-only deployment as healthy.
@@ -92,9 +99,15 @@ Before crossing a database schema boundary:
 Upgrade the managed payload:
 
 ```bash
-npx --yes --package=@parcha/tether@0.2.0-beta.1 \
-  tether upgrade --harness=both --restart
+npx --yes --package=@parcha/tether@0.3.0-beta.1 \
+  tether upgrade --harness=both --restart --herdr
 ```
+
+On Linux, `--restart` detects an active system-level
+`hermes-gateway.service` and uses Hermes's documented `gateway restart
+--system` command through non-interactive `/usr/bin/sudo`. If that privilege is
+unavailable or the restart fails, the lifecycle command restores the snapshot
+and exits nonzero.
 
 The current schema is 15. Runtime startup rejects a database with a newer
 schema, upgrades supported older schemas in one immediate transaction, and
@@ -109,8 +122,12 @@ transaction journal and completes recovery before starting new work.
 Restore the immediately previous managed payload and recorded plugin state:
 
 ```bash
-tether rollback --restart
+tether rollback --restart --herdr
 ```
+
+Pass `--herdr` when the companion plugin is installed. Tether reconciles the
+global Herdr link with the restored payload: it relinks a restored plugin or
+unlinks it when the restored version predates the plugin.
 
 Rollback does not:
 
@@ -119,15 +136,18 @@ Rollback does not:
 - restore deleted runtime data; or
 - reverse changes made by an agent or external tool.
 
-If the older runtime cannot read schema 15, stop Hermes and restore the
+If the older runtime cannot read schema 17, stop Hermes and restore the
 database backup created with that runtime. Do not point old code at a newer
 database and keep retrying.
 
 ## Uninstall
 
 ```bash
-tether uninstall
+tether uninstall --herdr
 ```
+
+`--herdr` unlinks `parcha.tether` before removing its managed files. Omit it on
+a host where the companion plugin was never linked.
 
 Uninstall disables the plugin and removes only files whose checksums still
 match the installer manifest. It preserves locally modified managed files,
@@ -138,7 +158,7 @@ Because uninstall removes `~/.local/bin/tether`, restore through the same
 immutable package:
 
 ```bash
-npx --yes --package=@parcha/tether@0.2.0-beta.1 \
+npx --yes --package=@parcha/tether@0.3.0-beta.1 \
   tether rollback --restart
 ```
 
@@ -155,8 +175,8 @@ tether maintenance
 
 | Command | Use |
 | --- | --- |
-| `status` | Show local plugin, broker, binding, and queue state |
-| `doctor` | Validate compatibility, broker privacy, allowlists, plugin protocol, and ingress readiness |
+| `status` | Show local plugin, broker, binding, and durable delivery state; exit nonzero when delivery is blocked |
+| `doctor` | Validate compatibility, broker privacy, allowlists, plugin protocol, ingress readiness, and unresolved delivery blockers |
 | `unresolved` | List uncertain Hermes ingress and native attempts that require an operator decision |
 | `maintenance` | Run bounded retention and recovery maintenance |
 
@@ -201,6 +221,11 @@ the attempt. Rebind and close remain blocked while related work is uncertain.
 Repeating the same terminal decision is safe; a conflicting decision fails
 closed.
 
+A read-only Herdr identity preflight that proves `agent.prompt` was never sent
+is retryable and is recovered automatically. Tether still retains any failure
+that occurred during or after terminal submission as `uncertain`; those cases
+require the operator decision above.
+
 ## Message input
 
 Pass Slack text through standard input:
@@ -227,7 +252,7 @@ may exceed it. The enforced transport limit is 35,000 characters.
 | Broker unavailable | Restart Hermes, then run `tether doctor`. |
 | Socket Mode disconnected | Restore Socket Mode. Polling is not a complete substitute. |
 | Native binding stale | Rebind from the intended live session. Never route to another agent as fallback. |
-| Zellij submission uncertain | Inspect that pane, then use `tether resolve`. |
+| Live terminal submission uncertain | Inspect that Herdr agent or Zellij pane, then use `tether resolve`. |
 | Slack write uncertain | Keep one broker running and allow reconciliation; do not post the same text manually. |
 | Install interrupted | Run the same lifecycle command; it recovers the transaction journal first. |
 | Upgrade causes gateway failure | Inspect automatic rollback, then use `tether rollback --restart` if needed. |
@@ -244,9 +269,9 @@ poller and Slack-write reconciler share a durable history-read budget:
 - rejection of repeated, malformed, or non-advancing cursors.
 
 This favors duplicate avoidance and Slack compliance over recovery latency.
-Tether-created root ownership does not depend on polling. An explicitly
-attached existing thread does not gain root ownership, so ambient routing there
-may fail closed when ownership evidence is unavailable.
+Tether-created root ownership and explicit attach/rebind thread claims do not
+depend on polling. Unclaimed existing threads still fail closed when ownership
+evidence is unavailable.
 
 ## Retention and state removal
 

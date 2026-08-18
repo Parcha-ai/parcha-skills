@@ -113,6 +113,12 @@ class TetherCliTest(unittest.TestCase):
             "CLAUDE_CODE_SESSION_ID",
             "ZELLIJ_SESSION_NAME",
             "ZELLIJ_PANE_ID",
+            "HERDR_ENV",
+            "HERDR_SESSION",
+            "HERDR_SOCKET_PATH",
+            "HERDR_PANE_ID",
+            "HERDR_TAB_ID",
+            "HERDR_WORKSPACE_ID",
         ):
             self.base_env.pop(key, None)
 
@@ -164,6 +170,7 @@ class TetherCliTest(unittest.TestCase):
         claude = self.home / ".claude"
         candidates: dict[pathlib.Path, int] = {
             runtime / "bridge_runtime.py": 0o600,
+            runtime / "domain_schema.py": 0o600,
             runtime / "hermes_compat.py": 0o600,
             runtime / "routing.py": 0o600,
             runtime / "security.py": 0o600,
@@ -171,6 +178,9 @@ class TetherCliTest(unittest.TestCase):
             runtime / "tether_notify.py": 0o700,
             runtime / "install.sh": 0o700,
             runtime / "package.json": 0o600,
+            runtime / "herdr-plugin" / "herdr-plugin.toml": 0o644,
+            runtime / "herdr-plugin" / "tether_plugin.py": 0o700,
+            runtime / "herdr-plugin" / "README.md": 0o644,
             plugin / "__init__.py": 0o600,
             plugin / "plugin.yaml": 0o644,
             local_bin / "tether": 0o700,
@@ -456,6 +466,7 @@ class TetherCliTest(unittest.TestCase):
             "    pathlib.Path(os.environ['CAPTURE_PATH']).write_text(json.dumps(request))\n"
             "    return {'thread_ts': '123.456'}\n"
             "def doctor(): return (True, ['ok'])\n"
+            "def herdr_agent_identity(*args): return {}\n"
             "def zellij_pane_identity(*args): return {}\n"
             "def working_directory_identity(cwd): return {'cwd': cwd}\n",
             encoding="utf-8",
@@ -694,7 +705,7 @@ class TetherCliTest(unittest.TestCase):
                 {
                     "ok": True,
                     "implementation": "tether",
-                    "protocol_version": 5,
+                    "protocol_version": 6,
                     "allowed_user_count": 1,
                     "owner_configured": True,
                     "slack_transport_connected": True,
@@ -720,7 +731,7 @@ class TetherCliTest(unittest.TestCase):
                 {
                     "ok": True,
                     "implementation": "tether",
-                    "protocol_version": 5,
+                    "protocol_version": 6,
                     "allowed_user_count": 1,
                     "owner_configured": True,
                     "slack_transport_connected": None,
@@ -745,7 +756,7 @@ class TetherCliTest(unittest.TestCase):
                 {
                     "ok": True,
                     "implementation": "tether",
-                    "protocol_version": 6,
+                    "protocol_version": 7,
                     "allowed_user_count": 1,
                     "owner_configured": True,
                     "slack_transport_connected": True,
@@ -757,7 +768,7 @@ class TetherCliTest(unittest.TestCase):
             result = self.run_cli("status", socket_path=broker.path)
 
         self.assertEqual(result.returncode, 1)
-        self.assertIn("FAIL unsupported broker protocol=6", result.stdout)
+        self.assertIn("FAIL unsupported broker protocol=7", result.stdout)
 
     def test_doctor_json_reports_local_and_broker_checks(self) -> None:
         self.write_managed_install(harness="codex")
@@ -767,7 +778,7 @@ class TetherCliTest(unittest.TestCase):
                 {
                     "ok": True,
                     "implementation": "tether",
-                    "protocol_version": 5,
+                    "protocol_version": 6,
                     "allowed_user_count": 2,
                     "owner_configured": True,
                     "slack_transport_connected": True,
@@ -786,10 +797,41 @@ class TetherCliTest(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertIn("ok broker socket is private", payload["checks"])
         self.assertIn(
-            "ok managed install integrity verified (16 files; harness=codex)",
+            "ok managed install integrity verified (20 files; harness=codex)",
             payload["checks"],
         )
-        self.assertEqual(payload["status"]["protocol_version"], 5)
+        self.assertEqual(payload["status"]["protocol_version"], 6)
+
+    def test_doctor_fails_on_unresolved_delivery_blocker(self) -> None:
+        self.write_managed_install(harness="codex")
+        with FakeBroker(
+            self.root,
+            lambda _request: self.response(
+                {
+                    "ok": True,
+                    "implementation": "tether",
+                    "protocol_version": 6,
+                    "allowed_user_count": 1,
+                    "owner_configured": True,
+                    "slack_transport_connected": True,
+                    "reply_poll_healthy": True,
+                    "peer_uid_enforced": True,
+                    "root_refused": True,
+                    "queued_delivery_count": 10,
+                    "uncertain_delivery_count": 1,
+                    "blocked_bridge_count": 1,
+                }
+            ),
+        ) as broker:
+            result = self.run_cli("doctor", socket_path=broker.path)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "FAIL durable delivery blocked: unresolved=1 "
+            "blocked_threads=1; run tether unresolved",
+            result.stdout,
+        )
+        self.assertIn("WARN queued Slack follow-ups=10", result.stdout)
 
     def test_doctor_fails_when_a_managed_file_drifted(self) -> None:
         self.write_managed_install(harness="codex")
@@ -802,7 +844,7 @@ class TetherCliTest(unittest.TestCase):
                 {
                     "ok": True,
                     "implementation": "tether",
-                    "protocol_version": 5,
+                    "protocol_version": 6,
                     "allowed_user_count": 1,
                     "owner_configured": True,
                     "slack_transport_connected": True,
@@ -834,7 +876,7 @@ class TetherCliTest(unittest.TestCase):
                 {
                     "ok": True,
                     "implementation": "tether",
-                    "protocol_version": 5,
+                    "protocol_version": 6,
                     "allowed_user_count": 1,
                     "owner_configured": True,
                     "slack_transport_connected": True,
@@ -859,7 +901,7 @@ class TetherCliTest(unittest.TestCase):
                 {
                     "ok": True,
                     "implementation": "tether",
-                    "protocol_version": 5,
+                    "protocol_version": 6,
                     "allowed_user_count": 1,
                     "owner_configured": True,
                     "slack_transport_connected": True,
@@ -881,7 +923,7 @@ class TetherCliTest(unittest.TestCase):
                 {
                     "ok": True,
                     "implementation": "tether",
-                    "protocol_version": 5,
+                    "protocol_version": 6,
                     "allowed_user_count": 1,
                     "owner_configured": True,
                     "slack_transport_connected": True,
@@ -893,7 +935,7 @@ class TetherCliTest(unittest.TestCase):
             result = self.run_cli("doctor", socket_path=broker.path)
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn(
-            "ok managed install integrity verified (23 files; harness=both)",
+            "ok managed install integrity verified (27 files; harness=both)",
             result.stdout,
         )
 
@@ -911,7 +953,7 @@ class TetherCliTest(unittest.TestCase):
                 {
                     "ok": True,
                     "implementation": "tether",
-                    "protocol_version": 5,
+                    "protocol_version": 6,
                     "allowed_user_count": 1,
                     "owner_configured": True,
                     "slack_transport_connected": True,
@@ -955,7 +997,7 @@ class TetherCliTest(unittest.TestCase):
                 {
                     "ok": True,
                     "implementation": "tether",
-                    "protocol_version": 5,
+                    "protocol_version": 6,
                     "allowed_user_count": 1,
                     "owner_configured": True,
                     "slack_transport_connected": True,

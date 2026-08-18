@@ -1,6 +1,6 @@
 {
   "name": "@parcha/tether",
-  "version": "0.2.0-beta.1",
+  "version": "0.3.0-beta.1",
   "description": "Slack threads that stay attached to Codex, Claude Code, Zellij, and headless agents through Hermes",
   "bin": {
     "tether": "bin/tether.js"
@@ -10,15 +10,27 @@
     ".claude-plugin/plugin.json",
     ".codex-plugin/plugin.json",
     "bin/tether.js",
+    "docs/ADR-001-TETHER-REPLACEMENT.md",
     "docs/ARCHITECTURE.md",
     "docs/CHANGELOG.md",
     "docs/COMPATIBILITY.md",
+    "docs/HERDR_UPSTREAM_API.md",
     "docs/OPERATIONS.md",
     "docs/RELEASE.md",
     "docs/RELEASING.md",
     "docs/SECURITY_MODEL.md",
+    "evals/incident-corpus.json",
+    "evals/capture_baseline_metrics.py",
+    "evals/capture_provenance.py",
+    "evals/run_cross_repo_contracts.py",
+    "evals/run_incident_corpus.py",
+    "evals/validate_blueprint.py",
+    "herdr-plugin/README.md",
+    "herdr-plugin/herdr-plugin.toml",
+    "herdr-plugin/tether_plugin.py",
     "install.sh",
     "runtime/bridge_runtime.py",
+    "runtime/domain_schema.py",
     "runtime/compat/hermes-slack-bridge-SKILL.md",
     "runtime/config.example.toml",
     "runtime/hermes_compat.py",
@@ -36,7 +48,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "python3 -m unittest discover -s tests -v && python3 -m py_compile runtime/bridge_runtime.py runtime/hermes_compat.py runtime/routing.py runtime/security.py runtime/slack_protocol.py runtime/plugin/__init__.py skills/tether/scripts/tether_notify.py && python3 -c 'from pathlib import Path; assert \"name: tether\" in Path(\"runtime/plugin/plugin.yaml\").read_text()' && python3 -m json.tool .claude-plugin/plugin.json >/dev/null && python3 -m json.tool .codex-plugin/plugin.json >/dev/null && python3 -m json.tool .agents/plugins/marketplace.json >/dev/null && node --check bin/tether.js && bash -n install.sh && bash tests/test_release_install.sh && bash tests/test_release_tarball.sh",
+    "test": "python3 -m unittest discover -s tests -v && python3 -m py_compile runtime/bridge_runtime.py runtime/domain_schema.py runtime/hermes_compat.py runtime/routing.py runtime/security.py runtime/slack_protocol.py runtime/plugin/__init__.py skills/tether/scripts/tether_notify.py herdr-plugin/tether_plugin.py && python3 -c 'from pathlib import Path; assert \"name: tether\" in Path(\"runtime/plugin/plugin.yaml\").read_text()' && python3 -c 'import tomllib; from pathlib import Path; p=tomllib.loads(Path(\"herdr-plugin/herdr-plugin.toml\").read_text()); assert p[\"id\"] == \"parcha.tether\" and p[\"version\"] == \"0.3.0-beta.1\"' && python3 -m json.tool .claude-plugin/plugin.json >/dev/null && python3 -m json.tool .codex-plugin/plugin.json >/dev/null && python3 -m json.tool .agents/plugins/marketplace.json >/dev/null && node --check bin/tether.js && bash -n install.sh && bash tests/test_release_install.sh && bash tests/test_release_tarball.sh",
     "test:release": "python3 -m unittest discover -s tests -p 'test_release_*.py' -v && node --check bin/tether.js && bash -n install.sh && bash tests/test_release_install.sh && bash tests/test_release_tarball.sh",
     "pack:check": "npm pack --dry-run"
   },

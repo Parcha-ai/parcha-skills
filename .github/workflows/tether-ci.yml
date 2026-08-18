@@ -62,9 +62,10 @@ jobs:
           python -m pip install --disable-pip-version-check
           "bandit==1.8.6"
           "ruff==0.15.18"
-      - run: ruff check tether/runtime tether/skills/tether/scripts tether/tests
+      - run: ruff check tether/runtime tether/skills/tether/scripts tether/herdr-plugin tether/tests
       - run: bandit -q -r tether/runtime tether/skills/tether/scripts
       - run: python -m py_compile tether/runtime/slack_protocol.py
+      - run: python -m py_compile tether/runtime/domain_schema.py
       - run: npm ci --ignore-scripts --no-audit --no-fund
         working-directory: tether
       - run: npm test
@@ -114,7 +115,7 @@ jobs:
           python -m pip install --disable-pip-version-check
           "bandit==1.8.6"
           "ruff==0.15.18"
-      - run: ruff check tether/runtime tether/skills/tether/scripts tether/tests
+      - run: ruff check tether/runtime tether/skills/tether/scripts tether/herdr-plugin tether/tests
       - run: bandit -q -r tether/runtime tether/skills/tether/scripts
       - run: npm ci --ignore-scripts --no-audit --no-fund
         working-directory: tether

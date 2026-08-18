@@ -255,14 +255,50 @@ find_hermes() {
   return 1
 }
 
+system_gateway_active() {
+  case "${TETHER_TEST_SYSTEM_GATEWAY_ACTIVE:-}" in
+    0) return 1 ;;
+    1) return 0 ;;
+    "") ;;
+  esac
+  [[ -x /usr/bin/systemctl ]] &&
+    /usr/bin/systemctl is-active --quiet hermes-gateway.service
+}
+
 restart_gateway() {
   [[ "$RESTART" -eq 1 ]] || return 0
   local hermes rc
+  case "${TETHER_TEST_SYSTEM_GATEWAY_ACTIVE:-}" in
+    ""|0|1) ;;
+    *)
+      echo "invalid TETHER_TEST_SYSTEM_GATEWAY_ACTIVE test value" >&2
+      return 2
+      ;;
+  esac
   if ! hermes="$(find_hermes)"; then
     echo "Hermes was not found; requested gateway restart cannot be completed." >&2
     return 74
   fi
-  if "$hermes" gateway restart; then
+  if system_gateway_active; then
+    if [[ "${TETHER_TEST_SYSTEM_GATEWAY_ACTIVE:-}" == "1" ]]; then
+      if "$hermes" gateway restart --system; then
+        return 0
+      else
+        rc=$?
+      fi
+    elif [[ -x /usr/bin/sudo ]]; then
+      if /usr/bin/sudo -n "$hermes" gateway restart --system; then
+        return 0
+      else
+        rc=$?
+      fi
+    else
+      echo "System gateway restart requires /usr/bin/sudo." >&2
+      return 74
+    fi
+    echo "Hermes system gateway restart failed; restoring the previous installation." >&2
+    return "$rc"
+  elif "$hermes" gateway restart; then
     return 0
   else
     rc=$?
@@ -557,6 +593,7 @@ build_install_plan() {
   }
   resolve_harness
   add_file "$ROOT_DIR/runtime/bridge_runtime.py" "$RUNTIME_HOME/bridge_runtime.py" 600
+  add_file "$ROOT_DIR/runtime/domain_schema.py" "$RUNTIME_HOME/domain_schema.py" 600
   add_file "$ROOT_DIR/runtime/hermes_compat.py" "$RUNTIME_HOME/hermes_compat.py" 600
   add_file "$ROOT_DIR/runtime/routing.py" "$RUNTIME_HOME/routing.py" 600
   add_file "$ROOT_DIR/runtime/security.py" "$RUNTIME_HOME/security.py" 600
@@ -564,6 +601,9 @@ build_install_plan() {
   add_file "$SKILL_SOURCE/scripts/tether_notify.py" "$RUNTIME_HOME/tether_notify.py" 700
   add_file "$ROOT_DIR/install.sh" "$RUNTIME_HOME/install.sh" 700
   add_file "$ROOT_DIR/package.json" "$RUNTIME_HOME/package.json" 600
+  add_file "$ROOT_DIR/herdr-plugin/herdr-plugin.toml" "$RUNTIME_HOME/herdr-plugin/herdr-plugin.toml" 644
+  add_file "$ROOT_DIR/herdr-plugin/tether_plugin.py" "$RUNTIME_HOME/herdr-plugin/tether_plugin.py" 700
+  add_file "$ROOT_DIR/herdr-plugin/README.md" "$RUNTIME_HOME/herdr-plugin/README.md" 644
   add_file "$ROOT_DIR/runtime/plugin/__init__.py" "$PLUGIN_HOME/__init__.py" 600
   add_file "$ROOT_DIR/runtime/plugin/plugin.yaml" "$PLUGIN_HOME/plugin.yaml" 644
   add_file "$ROOT_DIR/bin/tether.js" "$LOCAL_BIN/tether" 700
