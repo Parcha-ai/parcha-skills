@@ -1,7 +1,7 @@
 # Tether Security Model
 
-This document describes the security boundary of Tether `0.2.0-beta.1`,
-binding protocol 2, and database schema 15. The implementation and tests are
+This document describes the security boundary of Tether `0.3.0-beta.1`,
+binding protocol 3, and database schema 17. The implementation and tests are
 authoritative.
 
 ## Scope
@@ -42,15 +42,15 @@ and Tether. Processes under that UID are mutually trusted. Put mutually
 untrusted agents in separate accounts or hosts.
 
 The local SQLite database is the coordination boundary. One-writer routing and
-endpoint uniqueness are not distributed across databases, hosts, or unrelated
-Slack integrations.
+endpoint-wide turn serialization are not distributed across databases, hosts,
+or unrelated Slack integrations.
 
 ## Principals
 
 | Principal | Accepted authority | Not implied |
 | --- | --- | --- |
 | Authorized human | Address an allowed bot and continue an eligible thread | Channel membership alone |
-| Trusted peer bot | Address this bot when explicitly mentioned | Ambient bot messages |
+| Trusted peer bot | Address this bot when explicitly mentioned | Ambient bot messages, unless one exact bot/channel automation route is configured |
 | Hermes gateway | Hold Slack credentials and dispatch admitted Hermes turns | Root or Docker authority |
 | Broker peer | Request operations as the broker's Unix UID | Isolation from other same-UID processes |
 | Bound native process | Receive one generation-bound attempt | Any process with the same command name or pane label |
@@ -76,14 +76,17 @@ Thread-root ownership is deliberately narrow:
 - A root posted through Tether's durable root outbox gives that bridge durable
   ownership of the accepted thread. Ambient replies can use that local proof
   without reading Slack history.
-- `tether attach` binds an existing thread but does not claim that it created
-  the root. Ambient replies fail closed unless another routing rule supplies
-  current, unambiguous ownership evidence.
+- `tether attach` and `tether rebind` are owner-UID local operations that claim
+  one exact existing thread for one binding generation. That claim admits only
+  allowlisted humans; it does not claim authorship of the Slack root and does
+  not weaken peer-bot mention gates.
 
 Human and peer-bot allowlists are explicit. A peer bot must explicitly mention
-this bot. If another bot is mentioned and this bot is not, this instance stays
-silent. Each named bot may independently handle a message that explicitly
-mentions multiple bots.
+this bot unless an administrator separately grants one exact bot identity and
+shared channel through `TETHER_AMBIENT_BOT_CHANNELS`. The same bot remains
+silent everywhere else. If another bot is mentioned and this bot is not, this
+instance stays silent. Each named bot may independently handle a message that
+explicitly mentions multiple bots.
 
 Evidence:
 [`runtime/routing.py`](../runtime/routing.py),
@@ -161,6 +164,11 @@ Zellij identity includes host boot ID, PID and start ticks, executable identity
 and path hash, terminal, session, pane, and adapter. Tether re-resolves the
 foreground process instead of trusting a pane label or stale PID.
 
+Herdr identity includes a private same-user socket, protocol, terminal and pane
+IDs, an occupant-bound agent name, the official native session reference, and
+the same process-incarnation evidence. Tether does not trust Herdr display
+titles or a reusable pane ID as authorization.
+
 ### Verified Zellij delivery
 
 Tether writes the request to a private inbox, stages an instruction, verifies
@@ -173,6 +181,27 @@ The foreground process can change between the last check and Enter, and a
 screen marker cannot prove semantic consumption. An ambiguous submission
 becomes `uncertain` and is not retried automatically.
 
+### Verified Herdr delivery
+
+Tether revalidates the named agent, official native session, terminal, adapter,
+and process before calling Herdr `agent.prompt`, then validates the returned
+agent and process again. A live handoff may rotate only Herdr's internal
+terminal ID; Tether accepts that rotation only when the occupant name, native
+session, and remaining process-incarnation evidence are unchanged. Prompt text
+stays in the private socket request body.
+Cancellation uses `agent.send_keys` only after the same endpoint check.
+
+Herdr has no conditional expected-revision prompt or durable Tether turn ID.
+The occupant-bound name prevents a replacement agent from inheriting the old
+target, while ambiguous acceptance remains durable `uncertain` state requiring
+operator resolution.
+
+Herdr plugin commands run unsandboxed as the current Unix user. Tether treats
+their pane, selection, and clicked-link context only as a hint and revalidates
+the exact endpoint. Selected Slack links cross into the popup through a
+single-use owner-only file; message bodies use stdin and neither appears in
+Herdr's plugin command argv or command log.
+
 ### Detached continuation
 
 Detached Codex and Claude Code continuations use configured binaries, pinned
@@ -184,7 +213,8 @@ Evidence:
 [`tests/test_process_identity_hardening.py`](../tests/test_process_identity_hardening.py),
 [`tests/test_cwd_identity.py`](../tests/test_cwd_identity.py),
 [`tests/test_native_delivery_safety.py`](../tests/test_native_delivery_safety.py),
-and [`tests/test_zellij_cancellation.py`](../tests/test_zellij_cancellation.py).
+[`tests/test_herdr_endpoint.py`](../tests/test_herdr_endpoint.py), and
+[`tests/test_zellij_cancellation.py`](../tests/test_zellij_cancellation.py).
 
 ## Credentials and sensitive data
 
@@ -297,7 +327,7 @@ Evidence:
 - Slack ephemeral notices and native media uploads are best-effort.
 - Same-UID code can access Tether's local authority and owner-only state.
 - SQLite availability and integrity are required for coordination.
-- One-writer and endpoint uniqueness do not span hosts or databases.
+- One-writer and endpoint-wide turn serialization do not span hosts or databases.
 - Polling may recover slowly or not at all under Slack limits and token
   restrictions.
 - State is private by filesystem permissions, not encrypted by Tether.

@@ -2,7 +2,7 @@
 
 ## Supported release boundary
 
-Tether `0.2.0-beta.1` supports:
+Tether `0.3.0-beta.1` supports:
 
 - Linux on x86-64 or arm64;
 - Python 3.11, 3.12, 3.13, or 3.14;
@@ -18,26 +18,37 @@ Hermes must be loaded from the exact tested Git commit in a clean checkout.
 Tracked changes, non-ignored untracked files, and ignored Python overlays in
 Hermes source trees fail closed, even when they are outside the Slack adapter.
 
-The installer refuses non-Linux hosts. Native Zellij continuation also depends
-on Linux `/proc` identity and Unix-domain sockets. Headless runs can publish
+The installer refuses non-Linux hosts. Native Herdr and Zellij continuation
+depend on Linux `/proc` identity and Unix-domain sockets. Herdr protocol 19 is
+supported and tested with Herdr 0.8.0. Headless runs can publish
 with an explicit `--run-id`; stock pi sessions cannot be resumed natively.
 
 ## Binding and database upgrade
 
-This release uses BindingV2 and SQLite schema 15.
+This source tree uses BindingV3 and SQLite schema 17.
 
-A BindingV2 record contains a concrete source, one delivery endpoint, and a
+A BindingV3 record contains a concrete source, one delivery endpoint, and a
 monotonic generation. Rebind and close increment the generation. Legacy or
 incomplete native bindings become `rebind_required`; Tether never guesses a
 replacement process or session.
 
+BindingV3 adds a Herdr live endpoint. It pins the private session socket,
+protocol, terminal and pane IDs, occupant-bound agent name, official native
+session reference, and Linux process incarnation. BindingV1 and BindingV2
+records remain readable and are canonicalized to BindingV3.
+
+Herdr 0.8.0 live handoff can replace its internal terminal ID without replacing
+the terminal process. Tether keeps the binding only when the named occupant,
+native session, and process incarnation still match; process replacement still
+requires an explicit rebind.
+
 At startup, the Store:
 
-1. rejects a database whose `PRAGMA user_version` is newer than 15;
+1. rejects a database whose `PRAGMA user_version` is newer than 17;
 2. opens an immediate migration transaction;
 3. applies additive schema migrations and binding backfills;
-4. closes older duplicate endpoint owners before enforcing uniqueness;
-5. writes schema version 15; and
+4. preserves multiple thread bindings for one endpoint and indexes their shared serialization key;
+5. writes schema version 17; and
 6. recovers attempts that are proven not to have started external I/O.
 
 The installer snapshots managed code and Hermes plugin state, not the
@@ -50,7 +61,7 @@ database. Before upgrading an important host:
 4. Upgrade and start Hermes.
 5. Run `tether doctor`, then test one outbound root and one Socket Mode reply.
 
-Code rollback does not downgrade schema 15. If an older runtime cannot read the
+Code rollback does not downgrade schema 17. If an older runtime cannot read the
 database, restore the backup created for that runtime.
 
 ## Slack compatibility
@@ -63,17 +74,21 @@ channel threads depending on token type, scopes, and channel membership.
 Tether distinguishes two thread types:
 
 - a thread whose root was posted by Tether has durable local root ownership;
-- an existing thread attached with `tether attach` is bound but does not gain
-  root ownership.
+- an existing thread explicitly attached or rebound by a trusted local client
+  has a durable claim fenced to that binding generation.
 
-This distinction can make ambient replies on attached threads fail closed when
-current ownership evidence is unavailable.
+Both permit unmentioned replies from allowlisted humans. Peer bots remain
+mention-gated, and unclaimed existing threads still fail closed.
 
 ## CLI compatibility
 
-The CLI and local broker must both use broker protocol 5. Tether rejects older
+The CLI and local broker must both use broker protocol 6. Tether rejects older
 and unknown newer protocols; upgrade the package and installed runtime
 together.
+
+The `parcha.tether` plugin requires Herdr 0.8.0 or newer within protocol 19.
+The beta supports Herdr-managed Codex and Claude Code agents on Linux. Other
+recognized agents remain visible in Herdr but cannot be bound by Tether.
 
 Use `--text-stdin` or `--text-fd FD` for notification and reply text.
 Deprecated `--text` remains accepted for compatibility but exposes text in
