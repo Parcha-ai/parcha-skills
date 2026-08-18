@@ -126,8 +126,19 @@ class PortablePackagingTest(unittest.TestCase):
 
         for name in SKILLS:
             package_readme = (ROOT / name / "README.md").read_text()
-            self.assertIn(f"https://skills.sh/miguelrios/unc-skills/{name}", package_readme)
-            self.assertIn(f"npx skills add miguelrios/unc-skills --skill {name}", package_readme)
+            repository = (
+                "Parcha-ai/parcha-skills"
+                if name == "recall"
+                else "miguelrios/unc-skills"
+            )
+            self.assertIn(
+                f"https://skills.sh/{repository}/{name}",
+                package_readme,
+            )
+            self.assertIn(
+                f"npx skills add {repository} --skill {name}",
+                package_readme,
+            )
 
     def test_effective_comms_is_a_complete_managed_snippet(self):
         snippet = (ROOT / "snippets/effective-comms/AGENTS.md").read_text()

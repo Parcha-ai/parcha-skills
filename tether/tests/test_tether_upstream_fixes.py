@@ -389,6 +389,61 @@ class PollEmptyTeamIdTest(unittest.TestCase):
             f"expected warning in {log_ctx.output}",
         )
 
+    def test_poll_uses_explicit_configured_team_for_legacy_thread(self):
+        self._make_bridge("")
+        config = self.home / ".config" / "tether" / "config.toml"
+        config.parent.mkdir(parents=True)
+        config.write_text(f'team_id = "{TEAM}"\n')
+        with self.store.connect() as db:
+            db.execute(
+                """
+                UPDATE slack_reconciliation_limits
+                SET next_allowed_at=CURRENT_TIMESTAMP
+                """
+            )
+
+        class Client:
+            calls = []
+
+            async def conversations_replies(self, **kwargs):
+                Client.calls.append(kwargs)
+                return {"messages": [], "response_metadata": {"next_cursor": ""}}
+
+            async def conversations_history(self, **_kwargs):
+                return {"ok": True, "messages": []}
+
+            async def conversations_join(self, **_kwargs):
+                return {"ok": True}
+
+        class Adapter:
+            def __init__(self):
+                self.client = Client()
+
+            def _get_client(self, _channel, team_id=None):
+                self.requested_team_id = team_id
+                return self.client
+
+            async def _handle_slack_message(self, _event):
+                pass
+
+        adapter = Adapter()
+        result = asyncio.run(self.plugin._poll_recent_replies(adapter))
+
+        self.assertEqual(result, 0)
+        self.assertEqual(adapter.requested_team_id, TEAM)
+        self.assertEqual(len(Client.calls), 1)
+
+    def test_hermes_egress_uses_explicit_configured_team(self):
+        config = self.home / ".config" / "tether" / "config.toml"
+        config.parent.mkdir(parents=True)
+        config.write_text(f'team_id = "{TEAM}"\n')
+        adapter = types.SimpleNamespace(_channel_team={})
+
+        self.assertEqual(
+            self.plugin._hermes_workspace_id(adapter, CHANNEL, {}),
+            TEAM,
+        )
+
     def test_poll_includes_hermes_compat_error_detail(self):
         self._make_bridge(TEAM)
         with self.store.connect() as db:

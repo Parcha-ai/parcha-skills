@@ -180,6 +180,9 @@ class RoutingPolicy:
     allowed_human_user_ids: FrozenSet[str] = field(default_factory=frozenset)
     trusted_peer_user_ids: FrozenSet[str] = field(default_factory=frozenset)
     trusted_peer_bot_ids: FrozenSet[str] = field(default_factory=frozenset)
+    ambient_peer_bot_channels: FrozenSet[tuple[str, str]] = field(
+        default_factory=frozenset
+    )
     allowed_channel_ids: FrozenSet[str] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
@@ -230,9 +233,10 @@ def decide_route(
     """Return one deterministic writer decision without performing I/O.
 
     Exact bot mentions have precedence over DMs, bindings, and participation.
-    A trusted peer bot must explicitly mention the local bot. Human ambient
-    replies require either an exact binding, a one-to-one DM, or a unique,
-    unexpired participation lease.
+    A trusted peer bot must explicitly mention the local bot unless its exact
+    Slack identity and channel are configured as an ambient automation source.
+    Human ambient replies require either an exact binding, a one-to-one DM, or
+    a unique, unexpired participation lease.
     """
 
     if message.event_kind is not EventKind.MESSAGE:
@@ -255,19 +259,32 @@ def decide_route(
         )
 
     actor = message.actor
+    ambient_peer_bot = False
     if actor.is_bot:
         if (
             actor.user_id == policy.self_bot_user_id
             or (policy.self_bot_id and actor.bot_id == policy.self_bot_id)
         ):
             return _decision(message, RouteAction.SILENT, "self_message")
-        trusted = (
+        ambient_peer_bot = (
+            bool(
+                actor.user_id
+                and (actor.user_id, message.identity.channel_id)
+                in policy.ambient_peer_bot_channels
+            )
+            or bool(
+                actor.bot_id
+                and (actor.bot_id, message.identity.channel_id)
+                in policy.ambient_peer_bot_channels
+            )
+        )
+        trusted = ambient_peer_bot or (
             bool(actor.user_id and actor.user_id in policy.trusted_peer_user_ids)
             or bool(actor.bot_id and actor.bot_id in policy.trusted_peer_bot_ids)
         )
         if not trusted:
             return _decision(message, RouteAction.SILENT, "untrusted_peer_bot")
-        if not self_targeted:
+        if not self_targeted and not ambient_peer_bot:
             return _decision(message, RouteAction.SILENT, "peer_bot_did_not_target_self")
     elif actor.user_id not in policy.allowed_human_user_ids:
         return _decision(message, RouteAction.SILENT, "human_not_authorized")
@@ -317,6 +334,14 @@ def decide_route(
             message,
             RouteAction.HERMES,
             "self_explicitly_targeted",
+            writer_id=policy.hermes_writer_id,
+        )
+
+    if ambient_peer_bot:
+        return _decision(
+            message,
+            RouteAction.HERMES,
+            "trusted_ambient_peer_bot",
             writer_id=policy.hermes_writer_id,
         )
 
