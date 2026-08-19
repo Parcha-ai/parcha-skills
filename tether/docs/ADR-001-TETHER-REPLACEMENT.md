@@ -256,6 +256,54 @@ readiness contribution, quiesce/stop with deadline, and configuration reload.
 Capabilities are semantically versioned and negotiated; a plugin checks a
 supported range and named capabilities, never repository cleanliness.
 
+## Amendment A2 (2026-08-19) — grounded against Hermes 2026.8 main
+
+The three interface families above were designed against Hermes 0.19.0 (commit `b9ba7c7`,
+2026-07-20). An audit of `NousResearch/hermes-agent` `origin/main` at `6575507` (release
+v2026.8.18, 7,048 commits later) supersedes parts of that design. Placement policy is now
+explicit upstream (CONTRIBUTING.md "Third-Party Product Integrations"): Tether never lands in
+hermes-agent; it ships from this repository into `~/.hermes/plugins/tether`, and upstream PRs
+may only widen the generic plugin surface, led by Tether as the stated consumer.
+
+**Consumed as-is from current main (no upstream ask, retires all 13 private/replaced adapter
+methods and both hook-registry mutations from the L0 baseline):**
+
+- `pre_gateway_dispatch` directive hook (skip/rewrite/allow before auth and dispatch) is the
+  ingress middleware; Tether's `consume` is journal-then-skip.
+- `register_slack_action_handler` replaces patched `SlackAdapter.connect` interactivity.
+- `ctx.dispatch_tool("send_message", ...)` is the plugin egress path;
+  `ctx.platform_actions` covers reactions (capability-gated).
+- `ctx.register_cli_command` provides `hermes tether ...`; `ctx.register_command` provides
+  `/tether`; the Node CLI retires at the deletion gate.
+- `ctx.spawn_task` (supervised, cancelled on unload) + `ctx.on_unload` are the lifecycle;
+  plugin state persists under `plugin-data/tether/` (`plugin_storage.plugin_db`), never the
+  install directory.
+- Compatibility is a behavior contract: manifest v2 fields are advisory, there is no version
+  handshake by design, all hook callbacks declare `**kwargs`.
+
+**Deliberate deviation from "Ingress middleware v1":** Hermes acks Socket Mode before any
+persistence, by design (un-acked events trip Slack's auto-disable of Event Subscriptions), and
+upstream has already rejected a silent outbox (#61790). A pre-ACK ingress ledger is therefore
+not proposable. Tether instead journals the normalized event durably inside
+`pre_gateway_dispatch` before returning a directive; the residual ack-to-hook crash window is
+identical to stock Hermes's own and is documented, bounded exposure — not a regression against
+the deployed baseline, which has the same window plus an in-memory-only dedup.
+
+**Reduced to two upstream proposals (docs/upstream/):**
+
+1. Ledger plugin/tool-path sends in the existing `delivery_obligations` table and return
+   `{obligation_id, external_id}` from `send_message` — the plugin egress path currently
+   reaches `chat_postMessage` with no obligation row, retry, or receipt. This replaces the
+   original "delivery ledger v2 get/watch/reconcile" design: we adopt Hermes's honest
+   at-least-once philosophy instead of proposing our own reconciliation protocol. Until it
+   lands, Tether's schema-18 attempt ledger remains the one receipt authority.
+2. Slack fire-sites for the existing `gateway_platform_event` observer (`message_changed`,
+   `message_deleted`, thread events, reaction parity) — Discord and Telegram already emit
+   these; Slack does not. Pure parity, with Tether as the stated consumer.
+
+The "readiness contribution" requirement is dropped: no plugin readiness API exists, and
+`tether doctor` plus `tether schema status` already carry operator health.
+
 ## Data model and invariants
 
 `Endpoint` stores kind, stable native session reference, pinned working and
