@@ -228,6 +228,8 @@ def _expected_manifest_target_modes(metadata: dict[str, str]) -> dict[Path, int]
         runtime / "schema_orchestrator.py": 0o600,
         runtime / "schema_receipt.py": 0o600,
         runtime / "schema_rehearsal.py": 0o600,
+        runtime / "domain_runtime.py": 0o600,
+        runtime / "native_driver.py": 0o600,
         runtime / "hermes_compat.py": 0o600,
         runtime / "routing.py": 0o600,
         runtime / "security.py": 0o600,

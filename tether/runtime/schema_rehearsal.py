@@ -32,11 +32,13 @@ import stat
 import subprocess  # nosec B404
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 import bridge_runtime
+import domain_runtime as domain_runtime_module
 import domain_schema
 import schema_orchestrator
 import schema_receipt
@@ -266,6 +268,69 @@ class RehearsalCoordinator:
             )
         finally:
             probe.close()
+
+    def _synthetic_domain_cycle(self, database: Path) -> None:
+        """One full domain cycle on a disposable copy; evidence only."""
+        runtime = domain_runtime_module.DomainRuntime(database)
+        owner = self.descriptor.canonical_owner_ids[0]
+        endpoint = runtime.register_endpoint(
+            endpoint_key=f"rehearsal-synthetic-{self._receipt['receipt_id']}",
+            endpoint_kind="detached_native",
+            source_kind="headless_run",
+            source_json='{"run_id":"rehearsal"}',
+            ref_version=1,
+            descriptor=self.descriptor,
+        )
+        binding = runtime.bind_thread(
+            endpoint_id=endpoint["endpoint_id"],
+            team_id=self.descriptor.workspace_id,
+            channel_id="C-rehearsal",
+            thread_ts="1.0",
+            owner_user_id=owner,
+            idempotency_key=f"rehearsal-{self._receipt['receipt_id']}",
+        )
+        runtime.admit_turn(
+            binding_id=binding["binding_id"],
+            event_key=f"rehearsal-turn-{self._receipt['receipt_id']}",
+            ordered_at="1.0",
+            payload_inline="synthetic rehearsal turn",
+        )
+        attempt = runtime.schedule_next(endpoint["endpoint_id"])
+        if attempt is None:
+            raise RehearsalError(
+                "synthetic_cycle_failed",
+                "the migrated store did not schedule the synthetic turn",
+            )
+        for sequence, state in ((1, "accepted"), (2, "no_reply")):
+            runtime.record_driver_receipt(
+                attempt_id=attempt["attempt_id"],
+                receipt_id=f"rehearsal-{attempt['attempt_id']}-{sequence}",
+                lease_fence=attempt["lease_fence"],
+                sequence=sequence,
+                driver_incarnation="rehearsal:synthetic",
+                operation="submit",
+                request_id=attempt["driver_request_id"],
+                watch_cursor=f"rehearsal:{sequence}",
+                state=state,
+                observed_at=time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
+            )
+        status = runtime.attempt_status(attempt["attempt_id"])
+        if status["state"] != "no_reply" or status["lease_open"]:
+            raise RehearsalError(
+                "synthetic_cycle_failed",
+                "the synthetic attempt did not reach a clean terminal state",
+            )
+        connection = sqlite3.connect(database)
+        connection.row_factory = sqlite3.Row
+        try:
+            violations = domain_schema.invariant_violations(connection)
+        finally:
+            connection.close()
+        if violations:
+            raise RehearsalError(
+                "synthetic_cycle_failed",
+                f"domain invariants violated after the synthetic cycle: {violations[:3]}",
+            )
 
     def _validate_with_artifact(
         self,
@@ -504,6 +569,15 @@ class RehearsalCoordinator:
                 scratch_home=scratch_home,
             )
 
+            # Boot the target domain runtime against a copy of the migrated
+            # store and run one full synthetic admit/schedule/receipt/terminal
+            # cycle. The copy keeps the rollback path pristine; the cycle
+            # proves the migrated schema is operable, not merely readable.
+            cycle_db = scratch_dir / "cycle.db"
+            work_digest, _work_bytes = _sha256_file(work_db)
+            _copy_private(work_db, cycle_db, work_digest)
+            self._synthetic_domain_cycle(cycle_db)
+
             connection = sqlite3.connect(work_db)
             try:
                 domain_schema.rollback_v18_to_v17(
@@ -536,6 +610,7 @@ class RehearsalCoordinator:
                 "post_rollback_manifest_sha256": predecessor_attestation.get(
                     "logical_manifest_sha256"
                 ),
+                "synthetic_cycle": "ok",
             },
         )
 
