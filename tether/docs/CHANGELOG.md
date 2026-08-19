@@ -78,6 +78,16 @@
 - Extends the internal schema rehearsal to boot the target `DomainRuntime`
   against a disposable copy of the migrated store and run one synthetic
   admit/schedule/receipt/terminal cycle before rollback validation.
+- Adds the production `default_gateway_controller`: hermes gateway
+  stop/start with supervisor truth observed through systemd independently of
+  CLI exit status, failing closed to "active" when no probe can run.
+- Judges rehearsal round-trip preservation by the migration contract's
+  preserved-manifest key subset (rollback intentionally retains the archived
+  endpoint inventory), attested per artifact via a new
+  `preserved_manifest_sha256` in `validate-store`, and proves the rehearsal
+  over a populated schema-17 store with live synthetic admissions.
+- Adds the L1 exit live trace: one endpoint serving two Slack threads with
+  real detached subprocesses, replies routed by stored binding generation.
 
 - Adds a fail-closed `TETHER_AMBIENT_BOT_CHANNELS` grant for trusted
   automations that intentionally create unmentioned root events. Each grant is

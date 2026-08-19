@@ -277,6 +277,7 @@ def _database_snapshot(
 ) -> tuple[
     int | None,
     str | None,
+    str | None,
     domain_control.BlockingSnapshot | None,
     list[domain_control.BlockingCondition],
 ]:
@@ -299,7 +300,7 @@ def _database_snapshot(
                 next_action="repair_database_path",
             )
         )
-        return None, None, None, conditions
+        return None, None, None, None, conditions
     connection: sqlite3.Connection | None = None
     try:
         uri = f"{path.as_uri()}?mode=ro"
@@ -324,6 +325,11 @@ def _database_snapshot(
                 )
             )
         digest = _sha256_json(manifest) if manifest is not None else None
+        preserved = (
+            domain_schema.preserved_manifest_digest(manifest)
+            if manifest is not None
+            else None
+        )
         domain_snapshot = (
             domain_control.blocking_snapshot(connection)
             if schema_version == TARGET_SCHEMA_VERSION
@@ -332,7 +338,7 @@ def _database_snapshot(
         after_identity = security.owned_file_identity(path, expected_mode=0o600)
         if after_identity != before_identity:
             raise SchemaStatusError("database changed during validation")
-        return schema_version, digest, domain_snapshot, conditions
+        return schema_version, digest, preserved, domain_snapshot, conditions
     except (sqlite3.Error, RuntimeError, SchemaStatusError, ValueError):
         conditions.append(
             _condition(
@@ -342,7 +348,7 @@ def _database_snapshot(
                 next_action="run_tether_doctor",
             )
         )
-        return None, None, None, conditions
+        return None, None, None, None, conditions
     finally:
         if connection is not None:
             connection.close()
@@ -379,7 +385,7 @@ def schema_status(
     runtime_schema_version: int = bridge_runtime.SCHEMA_VERSION,
 ) -> dict[str, Any]:
     conditions: list[domain_control.BlockingCondition] = []
-    schema_version, logical_manifest, domain_snapshot, database_conditions = (
+    schema_version, logical_manifest, _preserved, domain_snapshot, database_conditions = (
         _database_snapshot(paths.database)
     )
     conditions.extend(database_conditions)
@@ -528,10 +534,14 @@ def validate_store(database: Path, *, operation_id: str) -> dict[str, Any]:
         "build_sha256": runtime_build_sha256(),
         "schema_version": None,
         "logical_manifest_sha256": None,
+        "preserved_manifest_sha256": None,
     }
-    schema_version, logical_manifest, _snapshot, conditions = _database_snapshot(database)
+    schema_version, logical_manifest, preserved_manifest, _snapshot, conditions = (
+        _database_snapshot(database)
+    )
     result["schema_version"] = schema_version
     result["logical_manifest_sha256"] = logical_manifest
+    result["preserved_manifest_sha256"] = preserved_manifest
     if conditions:
         result["code"] = conditions[0].reason_code
         return result

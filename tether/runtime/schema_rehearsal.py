@@ -67,6 +67,92 @@ class GatewayController:
     is_active: Callable[[], bool]
 
 
+def _find_hermes() -> str | None:
+    candidates = (
+        os.environ.get("HERMES_BIN") or "",
+        shutil.which("hermes") or "",
+        str(Path.home() / ".local" / "bin" / "hermes"),
+    )
+    for candidate in candidates:
+        if candidate and Path(candidate).exists() and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def default_gateway_controller(
+    *,
+    hermes_bin: str | None = None,
+    system_systemctl: str = "/usr/bin/systemctl",
+    user_systemctl: tuple[str, ...] = ("systemctl", "--user"),
+    unit: str = "hermes-gateway.service",
+    timeout_seconds: float = 120,
+) -> GatewayController:
+    """Production stop/start/probe wiring for the installed Hermes gateway.
+
+    `is_active` observes supervisor truth through systemd, independently of
+    what the hermes CLI returned, and fails closed: when no probe can run,
+    the gateway is reported active so the coordinator refuses to proceed.
+    """
+    binary = hermes_bin or _find_hermes()
+    if binary is None or not (
+        Path(binary).exists() and os.access(binary, os.X_OK)
+    ):
+        raise RehearsalError(
+            "hermes_unavailable",
+            "no executable hermes binary was found for gateway control",
+        )
+
+    def _gateway(command: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(  # nosec B603
+            [binary, "gateway", command],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+
+    def stop() -> None:
+        # Exit status is deliberately ignored: quiescence is attested by
+        # is_active plus the coordinator's socket and singleton probes,
+        # never by "stop returned 0".
+        with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+            _gateway("stop")
+
+    def start() -> None:
+        try:
+            completed = _gateway("start")
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            raise RehearsalError("gateway_start_failed", str(exc)[:200]) from exc
+        if completed.returncode != 0:
+            raise RehearsalError(
+                "gateway_start_failed",
+                f"hermes gateway start exited {completed.returncode}",
+            )
+
+    def is_active() -> bool:
+        observations: list[bool] = []
+        if Path(system_systemctl).exists():
+            with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                completed = subprocess.run(  # nosec B603
+                    [system_systemctl, "is-active", "--quiet", unit],
+                    capture_output=True,
+                    timeout=timeout_seconds,
+                )
+                observations.append(completed.returncode == 0)
+        with contextlib.suppress(FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            completed = subprocess.run(  # nosec B603
+                [*user_systemctl, "is-active", "--quiet", unit],
+                capture_output=True,
+                timeout=timeout_seconds,
+            )
+            observations.append(completed.returncode == 0)
+        if not observations:
+            # No supervisor probe available: fail closed.
+            return True
+        return any(observations)
+
+    return GatewayController(stop=stop, start=start, is_active=is_active)
+
+
 def default_descriptor(
     config: bridge_runtime.Config,
 ) -> domain_schema.SecurityDomainDescriptor:
@@ -156,8 +242,8 @@ def _sha256_file(path: Path) -> tuple[str, int]:
     return digest.hexdigest(), total
 
 
-def _readonly_snapshot(database: Path) -> tuple[int, str]:
-    """Schema version and logical-manifest digest without any write path."""
+def _readonly_snapshot(database: Path) -> tuple[int, str, str]:
+    """Schema version plus whole and preserved manifest digests, read-only."""
     connection = sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
     try:
@@ -174,7 +260,7 @@ def _readonly_snapshot(database: Path) -> tuple[int, str]:
         digest = hashlib.sha256(
             json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
-        return version, digest
+        return version, digest, domain_schema.preserved_manifest_digest(manifest)
     finally:
         connection.close()
 
@@ -483,7 +569,7 @@ class RehearsalCoordinator:
                     "database_identity_changed",
                     "the live database changed identity after planning",
                 )
-            live_schema, live_manifest = _readonly_snapshot(self.database)
+            live_schema, live_manifest, live_preserved = _readonly_snapshot(self.database)
             if live_schema != self._receipt["from_schema"]:
                 raise RehearsalError("database_schema_unsupported")
 
@@ -506,7 +592,7 @@ class RehearsalCoordinator:
                 expected_mode=0o600,
             )
             backup_sha256, backup_bytes = _sha256_file(backup_path)
-            backup_schema, backup_manifest = _readonly_snapshot(backup_path)
+            backup_schema, backup_manifest, backup_preserved = _readonly_snapshot(backup_path)
             reverified = security.owned_file_identity(backup_path, expected_mode=0o600)
             if reverified != backup_identity:
                 raise RehearsalError("backup_identity_changed")
@@ -522,6 +608,7 @@ class RehearsalCoordinator:
                     "backup_bytes": backup_bytes,
                     "schema_version": backup_schema,
                     "logical_manifest_sha256": backup_manifest,
+                    "preserved_manifest_sha256": backup_preserved,
                 },
             )
         finally:
@@ -593,9 +680,13 @@ class RehearsalCoordinator:
                 expected_schema=self._receipt["from_schema"],
                 scratch_home=scratch_home,
             )
+            # Preservation is judged by the migration contract's key subset:
+            # rollback intentionally retains the archived endpoint inventory,
+            # so whole-manifest digests legitimately differ on populated
+            # stores while every preserved record must round-trip exactly.
             if (
-                predecessor_attestation.get("logical_manifest_sha256")
-                != backup_manifest
+                predecessor_attestation.get("preserved_manifest_sha256")
+                != backup_preserved
             ):
                 raise RehearsalError(
                     "rollback_manifest_mismatch",
@@ -609,6 +700,9 @@ class RehearsalCoordinator:
                 ),
                 "post_rollback_manifest_sha256": predecessor_attestation.get(
                     "logical_manifest_sha256"
+                ),
+                "post_rollback_preserved_sha256": predecessor_attestation.get(
+                    "preserved_manifest_sha256"
                 ),
                 "synthetic_cycle": "ok",
             },
