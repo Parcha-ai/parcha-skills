@@ -134,6 +134,20 @@ quiescence, the installer lifecycle lock, the database singleton, a verified
 receipt-bound backup, expected-manifest comparison, exact target-runtime boot,
 and predecessor rollback before exposing migration.
 
+Every schema operation is driven by one receipt at
+`$XDG_STATE_HOME/tether-installer/schema/active.json`. Runtime startup fails
+closed on any invalid or incomplete receipt before SQLite is opened; only an
+absent receipt, a `complete` receipt for a supported schema, or a `resumed`
+receipt (live database verified untouched, predecessor validated) boots. The
+sibling `maintenance` flag file blocks installer install/upgrade/rollback/
+uninstall (exit 75) while a schema operation is in flight. `failed_safe` and
+`needs_operator` receipts keep both gates closed until an operator inspects
+the receipt with `tether schema status`; never delete a receipt or the
+maintenance flag to force a boot. The internal rehearsal coordinator proves
+quiesce, backup, disposable 17→18→17 transforms, and exact pinned-artifact
+validation without mutating the live database; its result is evidence only
+and grants no live-migration authority.
+
 If the process is killed during commit, the next lifecycle command reads the
 transaction journal and completes recovery before starting new work.
 

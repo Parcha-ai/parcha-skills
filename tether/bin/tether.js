@@ -276,6 +276,8 @@ function expectedManagedTargetModes(metadata) {
     [path.join(runtimeRoot, "domain_control.py"), 0o600],
     [path.join(runtimeRoot, "domain_schema.py"), 0o600],
     [path.join(runtimeRoot, "schema_orchestrator.py"), 0o600],
+    [path.join(runtimeRoot, "schema_receipt.py"), 0o600],
+    [path.join(runtimeRoot, "schema_rehearsal.py"), 0o600],
     [path.join(runtimeRoot, "hermes_compat.py"), 0o600],
     [path.join(runtimeRoot, "routing.py"), 0o600],
     [path.join(runtimeRoot, "security.py"), 0o600],

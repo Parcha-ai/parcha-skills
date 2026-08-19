@@ -61,6 +61,33 @@ def _load_security_module() -> Any:
 security = _load_security_module()
 
 
+def _load_schema_receipt_module() -> Any:
+    path = Path(__file__).resolve().with_name("schema_receipt.py")
+    injected = sys.modules.get("schema_receipt")
+    if injected is not None:
+        injected_path = getattr(injected, "__file__", "")
+        with contextlib.suppress(OSError, TypeError, ValueError):
+            if Path(injected_path).resolve() == path:
+                return injected
+    module_name = (
+        "_tether_runtime_schema_receipt_"
+        + hashlib.sha256(str(path).encode()).hexdigest()[:16]
+    )
+    existing = sys.modules.get(module_name)
+    if existing is not None:
+        return existing
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Tether schema receipt module could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+schema_receipt = _load_schema_receipt_module()
+
+
 def _load_hermes_compat_module() -> Any:
     path = Path(__file__).resolve().with_name("hermes_compat.py")
     module_name = (
@@ -9792,8 +9819,23 @@ def _acquire_broker_lock(path: Path) -> int:
         raise
 
 
+def acquire_database_singleton(path: Path = DB_PATH) -> int:
+    """The one database singleton lock; schema orchestration reuses it."""
+    candidate = Path(path).expanduser()
+    security.secure_state_directory(candidate.parent, create=True)
+    return _acquire_broker_lock(candidate)
+
+
 def open_locked_store(path: Path = DB_PATH) -> tuple[Store, int]:
     """Acquire the singleton lock before opening, migrating, or recovering SQLite."""
+    gate_error = schema_receipt.runtime_gate_error(
+        runtime_schema_version=SCHEMA_VERSION,
+    )
+    if gate_error is not None:
+        raise RuntimeError(
+            "Tether refuses to open the database during an unresolved schema "
+            f"operation: {gate_error}"
+        )
     candidate = Path(path).expanduser()
     security.secure_state_directory(candidate.parent, create=True)
     lock_fd = _acquire_broker_lock(candidate)

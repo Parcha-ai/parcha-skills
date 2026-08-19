@@ -140,6 +140,10 @@ class HermesCompatibilityTest(unittest.TestCase):
             installed_runtime / "security.py",
         )
         shutil.copy2(
+            ROOT / "runtime" / "schema_receipt.py",
+            installed_runtime / "schema_receipt.py",
+        )
+        shutil.copy2(
             ROOT / "runtime" / "hermes_compat.py",
             installed_runtime / "hermes_compat.py",
         )

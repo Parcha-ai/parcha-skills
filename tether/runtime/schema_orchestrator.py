@@ -14,25 +14,12 @@ from typing import Any
 import bridge_runtime
 import domain_control
 import domain_schema
+import schema_receipt
 import security
 
 
 ORCHESTRATOR_VERSION = 1
 TARGET_SCHEMA_VERSION = domain_schema.SCHEMA_VERSION
-RECEIPT_VERSION = 1
-INCOMPLETE_RECEIPT_PHASES = frozenset(
-    {
-        "planned",
-        "quiesced",
-        "singleton_acquired",
-        "backup_verified",
-        "db_committed",
-        "runtime_verified",
-        "resumed",
-        "failed_safe",
-        "needs_operator",
-    }
-)
 MANIFEST_HEADER = "# tether-manifest-v2"
 MANIFEST_METADATA_KEYS = frozenset(
     {
@@ -144,35 +131,6 @@ def _read_owned(
         return None, "unsafe"
 
 
-def _read_receipt(path: Path) -> tuple[dict[str, Any] | None, str | None]:
-    raw, error = _read_owned(path, max_bytes=256 * 1024, expected_mode=0o600)
-    if raw is None:
-        return (None, None) if error == "missing" else (None, error)
-    try:
-        value = json.loads(raw.decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError):
-        return None, "invalid"
-    required = {"version", "receipt_id", "operation", "phase", "from_schema", "to_schema"}
-    if not isinstance(value, dict) or not required.issubset(value):
-        return None, "invalid"
-    if value["version"] != RECEIPT_VERSION:
-        return None, "unsupported_version"
-    if value["operation"] not in {"migrate", "rollback"}:
-        return None, "invalid"
-    if value["phase"] not in INCOMPLETE_RECEIPT_PHASES | {"complete"}:
-        return None, "invalid"
-    public = {
-        "version": value["version"],
-        "receipt_id": str(value["receipt_id"]),
-        "operation": value["operation"],
-        "phase": value["phase"],
-        "from_schema": value["from_schema"],
-        "to_schema": value["to_schema"],
-        "error_code": str(value.get("error_code") or ""),
-    }
-    return public, None
-
-
 def _manifest_digest(path: Path) -> tuple[str | None, str | None]:
     raw, error = _read_owned(path, max_bytes=4 * 1024 * 1024, expected_mode=0o600)
     if raw is None:
@@ -268,6 +226,8 @@ def _expected_manifest_target_modes(metadata: dict[str, str]) -> dict[Path, int]
         runtime / "domain_control.py": 0o600,
         runtime / "domain_schema.py": 0o600,
         runtime / "schema_orchestrator.py": 0o600,
+        runtime / "schema_receipt.py": 0o600,
+        runtime / "schema_rehearsal.py": 0o600,
         runtime / "hermes_compat.py": 0o600,
         runtime / "routing.py": 0o600,
         runtime / "security.py": 0o600,
@@ -436,7 +396,8 @@ def schema_status(
             )
         )
 
-    receipt, receipt_error = _read_receipt(paths.receipt)
+    raw_receipt, receipt_error = schema_receipt.load(paths.receipt)
+    receipt = schema_receipt.public_view(raw_receipt) if raw_receipt is not None else None
     if receipt_error is not None:
         conditions.append(
             _condition(
@@ -451,7 +412,29 @@ def schema_status(
         conditions.append(
             _condition(
                 "schema_operation_incomplete",
+                runtime=receipt["phase"] not in schema_receipt.BOOTABLE_PHASES,
+                migration=True,
+                actions=("inspect",),
+                next_action="inspect_schema_receipt",
+            )
+        )
+    elif (
+        receipt is not None
+        and receipt["to_schema"] > runtime_schema_version
+    ):
+        conditions.append(
+            _condition(
+                "schema_receipt_runtime_conflict",
                 runtime=True,
+                migration=True,
+                next_action="install_compatible_runtime",
+            )
+        )
+    if schema_receipt.maintenance_armed(paths.receipt.parent / "maintenance"):
+        conditions.append(
+            _condition(
+                "schema_maintenance_armed",
+                runtime=False,
                 migration=True,
                 actions=("inspect",),
                 next_action="inspect_schema_receipt",
@@ -514,16 +497,77 @@ def schema_status(
     }
 
 
+def runtime_build_sha256(runtime_root: Path | None = None) -> str:
+    """Exact-code identity of this installed runtime artifact."""
+    root = Path(__file__).resolve().parent if runtime_root is None else runtime_root
+    entries = []
+    for candidate in sorted(root.glob("*.py")):
+        content, _identity = security.read_owned_file_bytes(
+            candidate,
+            max_bytes=16 * 1024 * 1024,
+        )
+        entries.append((candidate.name, _sha256_bytes(content)))
+    if not entries:
+        raise SchemaStatusError("runtime artifact contains no Python sources")
+    return _sha256_json(entries)
+
+
+def validate_store(database: Path, *, operation_id: str) -> dict[str, Any]:
+    """Side-effect-free attestation of one database against this artifact.
+
+    Opens SQLite strictly read-only and never instantiates `Store`, which
+    migrates and recovers on open. Emits only hashes and versions.
+    """
+    result: dict[str, Any] = {
+        "ok": False,
+        "implementation": "tether-schema",
+        "operation_id": str(operation_id)[:64],
+        "runtime_schema_version": bridge_runtime.SCHEMA_VERSION,
+        "build_sha256": runtime_build_sha256(),
+        "schema_version": None,
+        "logical_manifest_sha256": None,
+    }
+    schema_version, logical_manifest, _snapshot, conditions = _database_snapshot(database)
+    result["schema_version"] = schema_version
+    result["logical_manifest_sha256"] = logical_manifest
+    if conditions:
+        result["code"] = conditions[0].reason_code
+        return result
+    if schema_version not in {17, TARGET_SCHEMA_VERSION} or logical_manifest is None:
+        result["code"] = "database_schema_unsupported"
+        return result
+    result["ok"] = True
+    return result
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tether schema")
     subparsers = parser.add_subparsers(dest="command", required=True)
     status = subparsers.add_parser("status")
     status.add_argument("--json", action="store_true")
+    validate = subparsers.add_parser("validate-store")
+    validate.add_argument("--database", required=True)
+    validate.add_argument("--operation-id", required=True)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
+    if arguments.command == "validate-store":
+        database = Path(arguments.database)
+        if not database.is_absolute():
+            print(json.dumps({"ok": False, "code": "database_path_not_absolute"}))
+            return 1
+        try:
+            attestation = validate_store(database, operation_id=arguments.operation_id)
+        except (OSError, ValueError, security.SecurityError, SchemaStatusError) as error:
+            attestation = {
+                "ok": False,
+                "code": "validate_store_failed",
+                "message": str(error)[:500],
+            }
+        print(json.dumps(attestation, sort_keys=True, separators=(",", ":")))
+        return 0 if attestation.get("ok") else 1
     if arguments.command != "status":
         raise SchemaStatusError("unsupported schema operation")
     try:

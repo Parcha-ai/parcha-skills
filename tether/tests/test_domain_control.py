@@ -7,7 +7,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from test_bridge import load_runtime
 
@@ -144,7 +144,7 @@ class DomainControlTest(unittest.TestCase):
         try:
             snapshot = self.control.blocking_snapshot(
                 connection,
-                now=datetime(2026, 8, 18, 13, 0, tzinfo=UTC),
+                now=datetime.now(tz=UTC) + timedelta(hours=1),
             )
         finally:
             connection.close()
@@ -168,7 +168,7 @@ class DomainControlTest(unittest.TestCase):
         try:
             second_snapshot = self.control.blocking_snapshot(
                 second_connection,
-                now=datetime(2026, 8, 18, 14, 0, tzinfo=UTC),
+                now=datetime.now(tz=UTC) + timedelta(hours=2),
             )
         finally:
             second_connection.close()
