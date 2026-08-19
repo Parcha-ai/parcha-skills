@@ -208,6 +208,10 @@ class SchemaRehearsalTest(unittest.TestCase):
         receipt, error = self.receipts.load(paths["state"] / "schema" / "active.json")
         self.assertIsNone(error)
         self.assertEqual(receipt["phase"], "complete")
+        self.assertEqual(
+            receipt["phases"]["runtime_verified"]["synthetic_cycle"],
+            "ok",
+        )
         self.assertEqual(receipt["operation"], "rehearse")
         self.assertFalse(
             self.receipts.maintenance_armed(paths["state"] / "schema" / "maintenance")

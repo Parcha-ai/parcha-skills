@@ -59,6 +59,25 @@
   exists and `migration_ready` stays false.
 - Makes the installer refuse install/upgrade/rollback/uninstall while the
   schema maintenance flag is armed.
+- Adds the sole schema-18 `DomainRuntime`: single-transaction admission, fair
+  oldest-ready scheduling across sibling bindings, fenced single-lease
+  allocation, and a driver-receipt-owned attempt lifecycle in which stale
+  fences, replayed request ids, and out-of-order sequences are dead, and
+  terminalization, turn outcomes, and lease release commit atomically. Herdr
+  and Zellij endpoints stay ineligible for automatic scheduling. The shipped
+  schema-17 broker does not use it.
+- Adds the detached-native exact-turn driver: durable spawn intent before
+  `Popen`, process identity (pid + starttime) captured, durable `accepted`
+  receipt before any wait; a crash before acceptance recovers `uncertain` and
+  is never re-executed; exactly stripped `NO_REPLY` is the only silence,
+  empty output fails, responses become owner-private content-addressed
+  blobs; unobservable kill outcomes stay `uncertain`, never `cancelled`.
+- Proves the August 14 accepted-without-terminal journey end to end on
+  schema 18: one typed blocker with age and blocked-turn count, retry never
+  advertised, and capability-gated operator resolution freeing the endpoint.
+- Extends the internal schema rehearsal to boot the target `DomainRuntime`
+  against a disposable copy of the migrated store and run one synthetic
+  admit/schedule/receipt/terminal cycle before rollback validation.
 
 - Adds a fail-closed `TETHER_AMBIENT_BOT_CHANNELS` grant for trusted
   automations that intentionally create unmentioned root events. Each grant is
