@@ -37,6 +37,22 @@ PRESERVED_MANIFEST_KEYS = (
 )
 
 
+def preserved_manifest_digest(manifest: Mapping[str, Any]) -> str:
+    """Digest over exactly the keys the migration contract preserves.
+
+    Whole-manifest digests differ across a lossless 17->18->17 round trip
+    because rollback intentionally retains the archived endpoint inventory;
+    this subset is the preservation contract itself.
+    """
+    return _sha256_text(
+        json.dumps(
+            {key: manifest[key] for key in PRESERVED_MANIFEST_KEYS},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+
+
 @dataclass(frozen=True)
 class SecurityDomainDescriptor:
     instance_uid: int

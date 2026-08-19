@@ -464,6 +464,43 @@ schema_rehearsal.RehearsalCoordinator(
         self.assertNotIn("phases", public)
         self.assertNotIn("backup_sha256", rendered)
 
+    def test_rehearsal_over_populated_store_preserves_live_content(self):
+        paths = self.build_environment(name="populated")
+        store = self.runtime.Store(paths["database"])
+        for index in range(2):
+            bridge = store.create({
+                "source_kind": "headless_run",
+                "source": {"run_id": f"run-{index}", "cwd": "/tmp/project"},
+                "owner_user_id": "U12345678",
+                "team_id": "T12345678",
+                "channel_id": "C12345678",
+                "idempotency_key": f"populated-{index}",
+            })
+            store.bind(bridge.bridge_id, f"1786000000.00000{index}")
+        live_before = self.sha256(paths["database"])
+        result = self.coordinator(paths, FakeController()).run()
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.sha256(paths["database"]), live_before)
+        receipt, error = self.receipts.load(paths["state"] / "schema" / "active.json")
+        self.assertIsNone(error)
+        self.assertEqual(receipt["phase"], "complete")
+        self.assertEqual(
+            receipt["phases"]["runtime_verified"]["synthetic_cycle"],
+            "ok",
+        )
+        # Preservation is judged over the migration contract's key subset:
+        # rollback retains the archived endpoint inventory by design, so the
+        # whole-manifest digests differ while every preserved record must
+        # round-trip exactly.
+        self.assertEqual(
+            receipt["phases"]["runtime_verified"]["post_rollback_preserved_sha256"],
+            receipt["phases"]["backup_verified"]["preserved_manifest_sha256"],
+        )
+        self.assertNotEqual(
+            receipt["phases"]["runtime_verified"]["post_rollback_manifest_sha256"],
+            receipt["phases"]["backup_verified"]["logical_manifest_sha256"],
+        )
+
     def test_installer_refuses_actions_while_maintenance_is_armed(self):
         paths = self.build_environment()
         self.receipts.arm_maintenance(paths["state"] / "schema" / "maintenance")
