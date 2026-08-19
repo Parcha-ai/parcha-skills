@@ -173,6 +173,8 @@ class TetherCliTest(unittest.TestCase):
             runtime / "domain_control.py": 0o600,
             runtime / "domain_schema.py": 0o600,
             runtime / "schema_orchestrator.py": 0o600,
+            runtime / "schema_receipt.py": 0o600,
+            runtime / "schema_rehearsal.py": 0o600,
             runtime / "hermes_compat.py": 0o600,
             runtime / "routing.py": 0o600,
             runtime / "security.py": 0o600,
@@ -805,7 +807,7 @@ class TetherCliTest(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertIn("ok broker socket is private", payload["checks"])
         self.assertIn(
-            "ok managed install integrity verified (22 files; harness=codex)",
+            "ok managed install integrity verified (24 files; harness=codex)",
             payload["checks"],
         )
         self.assertEqual(payload["status"]["protocol_version"], 6)
@@ -943,7 +945,7 @@ class TetherCliTest(unittest.TestCase):
             result = self.run_cli("doctor", socket_path=broker.path)
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn(
-            "ok managed install integrity verified (29 files; harness=both)",
+            "ok managed install integrity verified (31 files; harness=both)",
             result.stdout,
         )
 

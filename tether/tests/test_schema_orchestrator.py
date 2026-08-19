@@ -290,13 +290,23 @@ class SchemaOrchestratorStatusTest(unittest.TestCase):
     def test_incomplete_receipt_and_descriptor_are_typed_blockers(self):
         self.schema17_database()
         self.paths.receipt.parent.mkdir(parents=True, mode=0o700)
-        self.paths.receipt.write_text(
-            "{\"version\":1,\"receipt_id\":\"schema-op-1\","
-            "\"operation\":\"migrate\",\"phase\":\"db_committed\","
-            "\"from_schema\":17,\"to_schema\":18}\n",
-            encoding="utf-8",
+        receipt = self.module.schema_receipt.create(
+            self.paths.receipt,
+            operation="migrate",
+            from_schema=17,
+            to_schema=18,
+            database_device=0,
+            database_inode=0,
+            security_domain_id="sec_000000000000000000000000",
+            predecessor_build_sha256="0" * 64,
+            target_build_sha256="1" * 64,
+            installed_manifest_sha256="2" * 64,
         )
-        self.paths.receipt.chmod(0o600)
+        self.module.schema_receipt.advance(
+            self.paths.receipt,
+            expect=receipt,
+            to_phase="db_committed",
+        )
         incomplete_config = self.module.bridge_runtime.Config()
 
         status = self.module.schema_status(self.paths, config=incomplete_config)

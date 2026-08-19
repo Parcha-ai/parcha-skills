@@ -42,6 +42,23 @@
   logical-manifest digest, explicit security-domain readiness, incomplete
   receipt detection, and schema-18 blocker reporting. Schema migration remains
   disabled until the coupled lifecycle/runtime cutover is implemented.
+- Extracts one authoritative schema-operation receipt module with monotonic
+  compare-and-swap phases, fsync-bound writes, and a redacted public view.
+  Broker and plugin startup now fail closed on any invalid or incomplete
+  receipt before opening the database.
+- Adds a side-effect-free `validate-store` runtime attestation (read-only
+  SQLite, exact-artifact build digest, logical-manifest digest) that never
+  instantiates the migrating `Store`. It is internal; the public CLI remains
+  `tether schema status`.
+- Adds the internal kill-safe schema rehearsal coordinator: installer
+  lifecycle lock, maintenance gate, independent quiesce attestation, database
+  singleton, receipt-bound verified backup, disposable 17→18→17 transforms
+  validated by pinned target and predecessor artifacts in a sanitized
+  environment, and single-classified crash recovery at every durable phase.
+  Rehearsal results are evidence only; no public migrate or rollback command
+  exists and `migration_ready` stays false.
+- Makes the installer refuse install/upgrade/rollback/uninstall while the
+  schema maintenance flag is armed.
 
 - Adds a fail-closed `TETHER_AMBIENT_BOT_CHANNELS` grant for trusted
   automations that intentionally create unmentioned root events. Each grant is
