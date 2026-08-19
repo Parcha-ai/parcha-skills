@@ -88,6 +88,13 @@
   over a populated schema-17 store with live synthetic admissions.
 - Adds the L1 exit live trace: one endpoint serving two Slack threads with
   real detached subprocesses, replies routed by stored binding generation.
+- Re-grounds the Hermes integration against hermes-agent main 2026-08-19
+  (ADR-001 Amendment A2): the plugin consumes the public pre_gateway_dispatch,
+  Slack action handler, dispatch_tool, CLI-command, and supervised-task seams
+  as-is, retiring all thirteen private adapter patches and both hook-registry
+  mutations; only two generic upstream widenings remain, drafted under
+  docs/upstream/ (plugin-path sends in the delivery ledger with receipts;
+  Slack fire-sites for gateway_platform_event).
 
 - Adds a fail-closed `TETHER_AMBIENT_BOT_CHANNELS` grant for trusted
   automations that intentionally create unmentioned root events. Each grant is
