@@ -95,6 +95,15 @@
   mutations; only two generic upstream widenings remain, drafted under
   docs/upstream/ (plugin-path sends in the delivery ledger with receipts;
   Slack fire-sites for gateway_platform_event).
+- Adds the next-generation gateway plugin (runtime/plugin_next/, shadow mode
+  only): a pre_gateway_dispatch observer that evaluates Tether's strict
+  fail-closed admission (exact workspace, authorized owner, bound thread,
+  no bots, event identity required), journals every decision durably and
+  idempotently under plugin-data/tether/, never influences dispatch, never
+  raises into the gateway, and feature-detects newer context surfaces so
+  one package loads unchanged from Hermes v2026.7.20 through current main.
+  Includes an hermes-side `tether` CLI status command. Not yet wired into
+  the installer; deployment arrives with the audited cutover slice.
 
 - Adds a fail-closed `TETHER_AMBIENT_BOT_CHANNELS` grant for trusted
   automations that intentionally create unmentioned root events. Each grant is
