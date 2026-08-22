@@ -1,0 +1,241 @@
+// RECOVERY: partial — first 240 lines (json.tool 4-space render) of the 2026-08-18T02:18Z predecessor version; the remainder of the file and the final 03:10Z version (sha256 c014c5afabb5..., target_commit e37126b0a9ad) were not captured in any transcript. Truncated mid-array; not valid JSON.
+{
+    "manifest_sha256": "6b6477a8209dff0238f40a3c1d2f795cc7c397cc98379b4751fc64ad32d57e09",
+    "python": "3.11.9",
+    "results": [
+        {
+            "classification": "baseline_defect",
+            "control": {
+                "exit_code": 0,
+                "output_tail": [
+                    "test_acknowledgment_unblocks_queued_followup (test_attempt_recovery.AttemptRecoveryTest.test_acknowledgment_unblocks_queued_followup) ... ok",
+                    "",
+                    "----------------------------------------------------------------------",
+                    "Ran 1 test in 0.063s",
+                    "",
+                    "OK"
+                ],
+                "passed": true,
+                "selector": "test_attempt_recovery.AttemptRecoveryTest.test_acknowledgment_unblocks_queued_followup"
+            },
+            "falsifier": "Either selector fails, is missing, or executes against a different target digest.",
+            "id": "INC-AWAITING-ACK-IMMORTAL",
+            "probe": {
+                "exit_code": 0,
+                "output_tail": [
+                    "test_stale_awaiting_ack_remains_blocked_until_reconciled (test_attempt_recovery.AttemptRecoveryTest.test_stale_awaiting_ack_remains_blocked_until_reconciled) ... ok",
+                    "",
+                    "----------------------------------------------------------------------",
+                    "Ran 1 test in 0.064s",
+                    "",
+                    "OK"
+                ],
+                "passed": true,
+                "selector": "test_attempt_recovery.AttemptRecoveryTest.test_stale_awaiting_ack_remains_blocked_until_reconciled"
+            },
+            "verdict": "reproduced"
+        },
+        {
+            "classification": "baseline_defect",
+            "control": {
+                "exit_code": 0,
+                "output_tail": [
+                    "test_valid_reply_key_posts_once_and_acknowledges_exact_attempt (test_attempt_recovery.AttemptRecoveryTest.test_valid_reply_key_posts_once_and_acknowledges_exact_attempt) ... ok",
+                    "",
+                    "----------------------------------------------------------------------",
+                    "Ran 1 test in 0.072s",
+                    "",
+                    "OK"
+                ],
+                "passed": true,
+                "selector": "test_attempt_recovery.AttemptRecoveryTest.test_valid_reply_key_posts_once_and_acknowledges_exact_attempt"
+            },
+            "falsifier": "Either selector fails, is missing, or executes against a different target digest.",
+            "id": "INC-GENERIC-POST-BYPASS",
+            "probe": {
+                "exit_code": 0,
+                "output_tail": [
+                    "test_generic_post_succeeds_but_does_not_close_active_attempt (test_l0_incident_corpus.AwaitingAckIncidentTest.test_generic_post_succeeds_but_does_not_close_active_attempt)",
+                    "Baseline defect: generic egress bypasses attempt completion. ... ok",
+                    "",
+                    "----------------------------------------------------------------------",
+                    "Ran 1 test in 0.072s",
+                    "",
+                    "OK"
+                ],
+                "passed": true,
+                "selector": "test_l0_incident_corpus.AwaitingAckIncidentTest.test_generic_post_succeeds_but_does_not_close_active_attempt"
+            },
+            "verdict": "reproduced"
+        },
+        {
+            "classification": "baseline_defect",
+            "control": {
+                "exit_code": 0,
+                "output_tail": [
+                    "test_uncertain_native_attempt_can_be_explicitly_requeued (test_operator_recovery.OperatorRecoveryTest.test_uncertain_native_attempt_can_be_explicitly_requeued) ... ok",
+                    "",
+                    "----------------------------------------------------------------------",
+                    "Ran 1 test in 0.066s",
+                    "",
+                    "OK"
+                ],
+                "passed": true,
+                "selector": "test_operator_recovery.OperatorRecoveryTest.test_uncertain_native_attempt_can_be_explicitly_requeued"
+            },
+            "falsifier": "Either selector fails, is missing, or executes against a different target digest.",
+            "id": "INC-OPERATOR-SURFACE-DISAGREEMENT",
+            "probe": {
+                "exit_code": 0,
+                "output_tail": [
+                    "test_health_and_unresolved_disagree_about_awaiting_ack_blocker (test_l0_incident_corpus.AwaitingAckIncidentTest.test_health_and_unresolved_disagree_about_awaiting_ack_blocker)",
+                    "Baseline defect: doctor sees a blocker its recovery API omits. ... ok",
+                    "",
+                    "----------------------------------------------------------------------",
+                    "Ran 1 test in 0.061s",
+                    "",
+                    "OK"
+                ],
+                "passed": true,
+                "selector": "test_l0_incident_corpus.AwaitingAckIncidentTest.test_health_and_unresolved_disagree_about_awaiting_ack_blocker"
+            },
+            "verdict": "reproduced"
+        },
+        {
+            "classification": "baseline_defect",
+            "control": {
+                "exit_code": 0,
+                "output_tail": [
+                    "test_upload_uses_private_detached_snapshot_and_survives_source_mutation (test_security_integration.SlackUploadSecurityIntegrationTest.test_upload_uses_private_detached_snapshot_and_survives_source_mutation) ... ok",
+                    "",
+                    "----------------------------------------------------------------------",
+                    "Ran 1 test in 0.040s",
+                    "",
+                    "OK"
+                ],
+                "passed": true,
+                "selector": "test_security_integration.SlackUploadSecurityIntegrationTest.test_upload_uses_private_detached_snapshot_and_survives_source_mutation"
+            },
+            "falsifier": "Either selector fails, is missing, or executes against a different target digest.",
+            "id": "INC-EPHEMERAL-PAYLOAD-PATH",
+            "probe": {
+                "exit_code": 0,
+                "output_tail": [
+                    "test_path_only_handoff_loses_payload_when_writer_removes_file (test_l0_incident_corpus.EphemeralPayloadIncidentTest.test_path_only_handoff_loses_payload_when_writer_removes_file)",
+                    "Baseline defect: a path is not a durable payload reference. ... ok",
+                    "",
+                    "----------------------------------------------------------------------",
+                    "Ran 1 test in 0.001s",
+                    "",
+                    "OK"
+                ],
+                "passed": true,
+                "selector": "test_l0_incident_corpus.EphemeralPayloadIncidentTest.test_path_only_handoff_loses_payload_when_writer_removes_file"
+            },
+            "verdict": "reproduced"
+        },
+        {
+            "classification": "cross_repo_contract_defect",
+            "control": {
+                "exit_code": 0,
+                "output_tail": [
+                    "test_reply_reads_message_from_stdin (test_cli.TetherCliTest.test_reply_reads_message_from_stdin) ... ok",
+                    "",
+                    "----------------------------------------------------------------------",
+                    "Ran 1 test in 0.048s",
+                    "",
+                    "OK"
+                ],
+                "passed": true,
+                "selector": "test_cli.TetherCliTest.test_reply_reads_message_from_stdin"
+            },
+            "falsifier": "Either selector fails, is missing, or executes against a different target digest.",
+            "id": "INC-WRAPPER-REPLY-KEY-DRIFT",
+            "probe": {
+                "exit_code": 0,
+                "output_tail": [
+                    "test_raw_broker_rejects_reply_without_attempt_key (test_generic_outbox.GenericOutboxTest.test_raw_broker_rejects_reply_without_attempt_key) ... ok",
+                    "",
+                    "----------------------------------------------------------------------",
+                    "Ran 1 test in 0.051s",
+                    "",
+                    "OK"
+                ],
+                "passed": true,
+                "selector": "test_generic_outbox.GenericOutboxTest.test_raw_broker_rejects_reply_without_attempt_key"
+            },
+            "verdict": "reproduced"
+        },
+        {
+            "classification": "cross_repo_contract_defect",
+            "control": {
+                "exit_code": 0,
+                "output_tail": [
+                    "test_post_reads_message_from_private_fd (test_cli.TetherCliTest.test_post_reads_message_from_private_fd) ... ok",
+                    "",
+                    "----------------------------------------------------------------------",
+                    "Ran 1 test in 0.032s",
+                    "",
+                    "OK"
+                ],
+                "passed": true,
+                "selector": "test_cli.TetherCliTest.test_post_reads_message_from_private_fd"
+            },
+            "falsifier": "Either selector fails, is missing, or executes against a different target digest.",
+            "id": "INC-WRAPPER-IDEMPOTENCY-DRIFT",
+            "probe": {
+                "exit_code": 0,
+                "output_tail": [
+                    "test_raw_broker_rejects_missing_idempotency_keys (test_generic_outbox.GenericOutboxTest.test_raw_broker_rejects_missing_idempotency_keys) ... ok",
+                    "",
+                    "----------------------------------------------------------------------",
+                    "Ran 1 test in 0.046s",
+                    "",
+                    "OK"
+                ],
+                "passed": true,
+                "selector": "test_generic_outbox.GenericOutboxTest.test_raw_broker_rejects_missing_idempotency_keys"
+            },
+            "verdict": "reproduced"
+        },
+        {
+            "classification": "covered_control",
+            "control": {
+                "exit_code": 0,
+                "output_tail": [
+                    "test_doctor_executes_the_native_credential_helper (test_bridge.CredentialBoundaryTest.test_doctor_executes_the_native_credential_helper) ... ok",
+                    "",
+                    "----------------------------------------------------------------------",
+                    "Ran 1 test in 0.048s",
+                    "",
+                    "OK"
+                ],
+                "passed": true,
+                "selector": "test_bridge.CredentialBoundaryTest.test_doctor_executes_the_native_credential_helper"
+            },
+            "falsifier": "Either selector fails, is missing, or executes against a different target digest.",
+            "id": "INC-CREDENTIAL-HELPER-PREFLIGHT",
+            "probe": {
+                "exit_code": 0,
+                "output_tail": [
+                    "test_credential_helper_misconfiguration (test_tether_upstream_fixes.FailureReasonTest.test_credential_helper_misconfiguration) ... ok",
+                    "",
+                    "----------------------------------------------------------------------",
+                    "Ran 1 test in 0.061s",
+                    "",
+                    "OK"
+                ],
+                "passed": true,
+                "selector": "test_tether_upstream_fixes.FailureReasonTest.test_credential_helper_misconfiguration"
+            },
+            "verdict": "reproduced"
+        },
+        {
+            "classification": "covered_control",
+            "control": {
+                "exit_code": 0,
+                "output_tail": [
+                    "test_concurrent_shared_endpoint_prepares_exactly_one_turn (test_attempt_recovery.AttemptRecoveryTest.test_concurrent_shared_endpoint_prepares_exactly_one_turn) ... ok",
+                    "",
+                    "----------------------------------------------------------------------",
+                    "Ran 1 test in 0.067s",

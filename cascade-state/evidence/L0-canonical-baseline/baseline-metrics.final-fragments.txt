@@ -1,0 +1,190 @@
+# Verbatim transcript fragments of the FINAL baseline-metrics.json (sha256 704ca8bafb8e...), read 2026-08-19 from the live file by Claude session 7f97ffb2.
+
+## First 1500 bytes (head -c 1500, exact file bytes)
+
+{
+  "attempt_terminal_coverage": {
+    "open_states": [
+      "prepared",
+      "submitting",
+      "uncertain",
+      "awaiting_ack",
+      "replying"
+    ],
+    "operator_listed_open_states": [
+      "uncertain"
+    ],
+    "terminal_states": [
+      "delivered",
+      "acknowledged",
+      "cancelled",
+      "failed"
+    ],
+    "unbounded_state": "awaiting_ack"
+  },
+  "candidate_clean": true,
+  "candidate_status": [],
+  "components": {
+    "docs": {
+      "file_count": 10,
+      "nonblank_noncomment_physical_lines": 1736
+    },
+    "herdr_plugin": {
+      "file_count": 1,
+      "nonblank_noncomment_physical_lines": 375
+    },
+    "hermes_plugin": {
+      "file_count": 1,
+      "nonblank_noncomment_physical_lines": 3552
+    },
+    "installer": {
+      "file_count": 1,
+      "nonblank_noncomment_physical_lines": 992
+    },
+    "node_cli": {
+      "file_count": 1,
+      "nonblank_noncomment_physical_lines": 1547
+    },
+    "runtime_core": {
+      "file_count": 5,
+      "nonblank_noncomment_physical_lines": 13270
+    },
+    "skills": {
+      "file_count": 1,
+      "nonblank_noncomment_physical_lines": 904
+    },
+    "tests": {
+      "file_count": 35,
+      "nonblank_noncomment_physical_lines": 20165
+    }
+  },
+  "delivery_health_query_latency": {
+    "max_ms": 1.261,
+    "median_ms": 1.006,
+    "oldest_blocked_created_at": "2026-08-18 03:10:10",
+    "operator_visibility": {
+      "automatic_notice_emitted": false,
+      "on_demand_health_detects": true,
+      "unresolved_lists_
+
+## Top-level keys (python sorted list)
+
+attempt_terminal_coverage
+candidate_clean
+candidate_status
+components
+delivery_health_query_latency
+environment
+hermes_private_coupling
+install_surfaces
+measurement_definition
+observed_versions
+production_incident_observation
+schema_version
+source_sha256
+state_model
+target_commit
+target_content_sha256
+target_tree
+valid
+## data["state_model"] (json.dumps indent=1, first 1200 chars)
+
+{
+ "distinct_explicit_state_literals": [
+  "abandoned",
+  "acknowledged",
+  "awaiting_ack",
+  "cancelled",
+  "complete",
+  "completed",
+  "delivered",
+  "delivering",
+  "dispatched",
+  "failed",
+  "found",
+  "not_found",
+  "pending",
+  "prepared",
+  "processing",
+  "queued",
+  "rebind_required",
+  "replying",
+  "requeued",
+  "reserved",
+  "routing",
+  "sent",
+  "submitting",
+  "transferred",
+  "uncertain",
+  "uploading",
+  "verified"
+ ],
+ "duplicate_endpoint_snapshot_field": "bridges.source_json",
+ "endpoint_identity_form": "derived bridges.endpoint_key",
+ "platform_outbox_or_reconciliation_tables": [
+  "bridge_replies",
+  "bridge_roots",
+  "slack_messages",
+  "slack_reconciliations"
+ ],
+ "schema_version": 17,
+ "table_count": 13,
+ "tables": [
+  "bridge_attempts",
+  "bridge_events",
+  "bridge_replies",
+  "bridge_roots",
+  "bridges",
+  "slack_messages",
+  "slack_reconciliation_limits",
+  "slack_reconciliations",
+  "slack_reply_poll_rotation",
+  "slack_reply_poll_scheduler",
+  "slack_reply_poll_state",
+  "thread_ingress",
+  "thread_participation"
+ ]
+}
+## data["hermes_private_coupling"] and data["install_surfaces"] (json.dumps indent=1)
+
+{
+ "audited_source_paths": 5,
+ "exact_hermes_commit": "b9ba7c78e41b5d187e2c8fb446655c4b71c42aa5",
+ "exact_hermes_version": "0.19.0",
+ "private_hook_registry_mutations": 2,
+ "private_or_replaced_methods": [
+  "_ensure_dm_conversation",
+  "_get_client",
+  "_handle_slack_message",
+  "_is_ignored_channel",
+  "_maybe_blocks",
+  "_pop_slash_context",
+  "_remove_reaction",
+  "_resolve_thread_ts",
+  "_send_slash_ephemeral",
+  "_upload_file",
+  "connect",
+  "edit_message",
+  "send"
+ ],
+ "validated_adapter_methods": 23
+}
+---install_surfaces---
+{
+ "command_surfaces": [
+  "Node tether CLI",
+  "Python notifier",
+  "local broker socket",
+  "Hermes plugin",
+  "Herdr plugin"
+ ],
+ "npm_manifest_entries": 39,
+ "runtime_distribution_roots": [
+  "XDG_DATA_HOME/tether",
+  "HERMES_HOME/plugins/tether",
+  "HOME/.local/bin",
+  "Codex skills",
+  "Claude Code skills",
+  "Herdr plugin"
+ ]
+}

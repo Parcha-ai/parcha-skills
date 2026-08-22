@@ -1,0 +1,168 @@
+// RECOVERY: partial — this is the complete 2026-08-18T02:21Z predecessor version (json.tool 4-space render, target_commit 5aaa3774); the final version (sha256 704ca8bafb8e..., target_commit e37126b0a9ad, 2-space indent) was regenerated at 03:10Z and only fragments of it survive — see baseline-metrics.final-fragments.txt. Drop this line to parse the JSON.
+{
+    "attempt_terminal_coverage": {
+        "open_states": [
+            "prepared",
+            "submitting",
+            "uncertain",
+            "awaiting_ack",
+            "replying"
+        ],
+        "operator_listed_open_states": [
+            "uncertain"
+        ],
+        "terminal_states": [
+            "delivered",
+            "acknowledged",
+            "cancelled",
+            "failed"
+        ],
+        "unbounded_state": "awaiting_ack"
+    },
+    "components": {
+        "docs": {
+            "executable_lines": 1580,
+            "file_count": 10
+        },
+        "herdr_plugin": {
+            "executable_lines": 375,
+            "file_count": 1
+        },
+        "hermes_plugin": {
+            "executable_lines": 3552,
+            "file_count": 1
+        },
+        "installer": {
+            "executable_lines": 992,
+            "file_count": 1
+        },
+        "node_cli": {
+            "executable_lines": 1547,
+            "file_count": 1
+        },
+        "runtime_core": {
+            "executable_lines": 13270,
+            "file_count": 5
+        },
+        "skills": {
+            "executable_lines": 904,
+            "file_count": 1
+        },
+        "tests": {
+            "executable_lines": 20120,
+            "file_count": 35
+        }
+    },
+    "hermes_private_coupling": {
+        "audited_source_paths": 5,
+        "exact_hermes_commit": "b9ba7c78e41b5d187e2c8fb446655c4b71c42aa5",
+        "exact_hermes_version": "0.19.0",
+        "private_hook_registry_mutations": 2,
+        "private_or_replaced_methods": [
+            "_ensure_dm_conversation",
+            "_get_client",
+            "_handle_slack_message",
+            "_is_ignored_channel",
+            "_maybe_blocks",
+            "_pop_slash_context",
+            "_remove_reaction",
+            "_resolve_thread_ts",
+            "_send_slash_ephemeral",
+            "_upload_file",
+            "connect",
+            "edit_message",
+            "send"
+        ],
+        "validated_adapter_methods": 23
+    },
+    "install_surfaces": {
+        "command_surfaces": [
+            "Node tether CLI",
+            "Python notifier",
+            "local broker socket",
+            "Hermes plugin",
+            "Herdr plugin"
+        ],
+        "npm_manifest_entries": 36,
+        "runtime_distribution_roots": [
+            "XDG_DATA_HOME/tether",
+            "HERMES_HOME/plugins/tether",
+            "HOME/.local/bin",
+            "Codex skills",
+            "Claude Code skills",
+            "Herdr plugin"
+        ]
+    },
+    "measurement_definition": "Physical nonblank, non-comment lines; static AST/SQL inventory; 25 local SQLite health queries.",
+    "observed_canary_recovery": {
+        "basis": "Sanitized production timeline: the missed-callback attempt remained blocked from August 14 through August 17 before explicit reconciliation.",
+        "exact_duration_available": false,
+        "lower_bound_hours": 72,
+        "target": "Alert and expose the blocker within 60 seconds; resolution remains evidence-based and manual when execution is ambiguous."
+    },
+    "oldest_blocked_detection": {
+        "max_ms": 1.012,
+        "median_ms": 0.977,
+        "p95_ms": 1.01,
+        "sample_count": 25,
+        "semantic_limit": "Detection is query-time only; there is no automatic age transition or notice for awaiting_ack."
+    },
+    "schema_version": 1,
+    "state_model": {
+        "distinct_explicit_state_literals": [
+            "abandoned",
+            "acknowledged",
+            "awaiting_ack",
+            "cancelled",
+            "complete",
+            "completed",
+            "delivered",
+            "delivering",
+            "dispatched",
+            "failed",
+            "found",
+            "not_found",
+            "pending",
+            "prepared",
+            "processing",
+            "queued",
+            "rebind_required",
+            "replying",
+            "requeued",
+            "reserved",
+            "routing",
+            "sent",
+            "submitting",
+            "transferred",
+            "uncertain",
+            "uploading",
+            "verified"
+        ],
+        "duplicate_endpoint_snapshot_field": "bridges.source_json",
+        "endpoint_identity_form": "derived bridges.endpoint_key",
+        "platform_outbox_or_reconciliation_tables": [
+            "bridge_replies",
+            "bridge_roots",
+            "slack_messages",
+            "slack_reconciliations"
+        ],
+        "schema_version": 17,
+        "table_count": 13,
+        "tables": [
+            "bridge_attempts",
+            "bridge_events",
+            "bridge_replies",
+            "bridge_roots",
+            "bridges",
+            "slack_messages",
+            "slack_reconciliation_limits",
+            "slack_reconciliations",
+            "slack_reply_poll_rotation",
+            "slack_reply_poll_scheduler",
+            "slack_reply_poll_state",
+            "thread_ingress",
+            "thread_participation"
+        ]
+    },
+    "target_commit": "5aaa3774a1cbf324ba1a8b421f75eae0f31b6efd"
+}

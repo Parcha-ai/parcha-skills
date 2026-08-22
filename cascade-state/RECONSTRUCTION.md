@@ -21,10 +21,16 @@ Fidelity per file:
   EXIT.md` and `evidence/L2-stock-hermes-plugin/PLAN-L2.md` — authored by the acting session;
   rewritten verbatim from context (PLAN-L2 additionally carries the L2c status update of
   2026-08-22).
-- `evidence/L0-canonical-baseline/*` and `CHECKPOINT-L1A.md`, `CHECKPOINT-L1B-CONTROL.md` —
-  authored by Codex sessions; recovered from indexed session transcripts where possible (see
-  RECOVERY-NOTES.md alongside them for per-file status). Where recovery is partial, the file says
-  so in a header; nothing partial is presented as verbatim.
+- Transcript recovery (2026-08-22, see `evidence/RECOVERY-NOTES.md` for hashes and sources):
+  **verbatim with independent in-transcript hash verification** — `L0 EXIT.md`,
+  `CHECKPOINT-L1A.md`, `CHECKPOINT-L1B-CONTROL.md`, `PLAN-L1C.md` (the recovered original,
+  `status: READY`, replaces this session's reconstruction), `review-findings.md`.
+  **Partial, marked with `// RECOVERY:` headers** — `baseline-metrics.json` (complete predecessor
+  version plus final-version fragments in the sidecar), `failure-corpus.json` (truncated
+  predecessor), `cross-repo-contracts.json` (first 1800 chars of the final file).
+  **Not recovered** — `provenance.json` (final sha `6794dd43…` recorded; regenerable from the
+  committed `evals/capture_provenance.py`, though not byte-identically), `github-pr.json`,
+  `blueprint-validation.json`, and the full local test log (shas recorded in RECOVERY-NOTES).
 
 Original content-address digests (e.g. blueprint.sha256) are lost with the originals; digests of
 the reconstructed files are NOT substitutes for them. The published blueprint at

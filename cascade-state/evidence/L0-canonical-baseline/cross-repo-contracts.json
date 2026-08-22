@@ -1,0 +1,61 @@
+// RECOVERY: partial — first 1800 characters of the FINAL file (sha256 b752a5e62e3d...) as re-serialized with json.dumps(indent=1) by a 2026-08-19 read; original file formatting and the remainder (results tail, schema_version/source fields cut mid-key) were not captured. Truncated; not valid JSON.
+{
+ "clean": true,
+ "command": [
+  "run_cross_repo_contracts.py",
+  "--fleet-repo",
+  "<clean-detached-worktree>",
+  "--expected-commit",
+  "9b3acf4c39553ce0af3fb7b0ce03361f538e861b",
+  "--output",
+  "<report>"
+ ],
+ "detached_head": true,
+ "expected_commit": "9b3acf4c39553ce0af3fb7b0ce03361f538e861b",
+ "python": "3.11.9",
+ "repository": "Parcha-ai/parcha",
+ "results": [
+  {
+   "classification": "cross_repo_defect_observed",
+   "falsifier": "The real wrapper parses/passes reply_key or no longer hides reply failure.",
+   "id": "wrapper_reply_key",
+   "observed": {
+    "attach_parser_fields": [
+     "bridge_id"
+    ],
+    "has_reply_key": false,
+    "reply_call_found": true,
+    "suppresses_failure": true
+   },
+   "passed": true
+  },
+  {
+   "classification": "cross_repo_defect_observed",
+   "falsifier": "The real hook supplies --idempotency-key or propagates the rejected write.",
+   "id": "hook_idempotency_key",
+   "observed": {
+    "failure_logged": true,
+    "has_idempotency_key": false,
+    "hook_exit_code": 0,
+    "invoked_tether": true,
+    "tether_subcommand": "post"
+   },
+   "passed": true
+  },
+  {
+   "classification": "historical_defect_and_current_control_observed",
+   "falsifier": "Historical source lacks the /run path or current source lacks durable private intake/readability preflight.",
+   "id": "signup_intake_path",
+   "observed": {
+    "current_preflights_reader_access": true,
+    "current_source_sha256": "20a5970fcf34fc4f0779164ebb10165142475ea73fb54ef32fe13f5978419bb3",
+    "current_uses_private_state_intake": true,
+    "historical_commit": "52b7173d23",
+    "historical_source_sha256": "3ae10ec5a6e2283eb4de6efbe054d7e68b8d9a8115002716fa5d70d69f4a3e70",
+    "historical_used_ephemeral_run_path": true
+   },
+   "passed": true
+  }
+ ],
+ "schema_version": 1,
+ "sou

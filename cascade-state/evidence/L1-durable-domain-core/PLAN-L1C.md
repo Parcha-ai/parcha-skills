@@ -3,7 +3,7 @@ cascade_version: 2
 episode_id: tether-rewrite-2026-08-17
 loop: L1
 slice: L1c-rehearsal-coordinator
-status: CONSUMED (built at c248e08, PR 395)
+status: READY
 target_head: 43d12219536dfeab93571c6b300e4a4e0280f60d
 worktree: /home/ubuntu/worktrees/tether-rewrite-l1c-20260818
 branch: codex/tether-rewrite-l1c-20260818
