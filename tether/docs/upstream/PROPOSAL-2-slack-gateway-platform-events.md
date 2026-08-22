@@ -20,8 +20,10 @@ to plugins.
 
 In `plugins/platforms/slack/adapter.py`, at the points where `message_changed` /
 `message_deleted` subtypes and thread-broadcast events are already classified, emit the same
-normalized envelopes Discord emits: `message_edited`, `message_deleted`, `thread_created`
-(first threaded reply), plus `reaction` parity with Telegram. Same post-auth gating and
+normalized envelopes Discord emits: `message_edited`, `message_deleted`, plus `reaction`
+parity with Telegram. (`thread_created` is dropped from scope: Slack has no native thread
+lifecycle event and deriving "first threaded reply" needs adapter state — scope creep for a
+parity PR.) Same post-auth gating and
 `has_hook()` short-circuit as the existing fire-sites; payload fields mirror Discord's envelope
 shape (platform, channel, thread, message id/ts, actor, edited text where applicable). No new
 hook, no schema change, no raw Bolt objects across the boundary.
@@ -38,3 +40,14 @@ hook, no schema change, no raw Bolt objects across the boundary.
 Additive observer emissions only; zero behavior change for installations with no registered
 hook (existing `has_hook()` short-circuit). Conventional commit:
 `feat(slack): emit normalized gateway_platform_event for edits, deletions, threads, reactions`.
+
+## Status (2026-08-22)
+
+**Implemented and tested** on `feat/slack-gateway-platform-events` from hermes-agent main
+`657550716`. Patch: `0001-slack-gateway-platform-events.patch` (this directory). Local
+evidence: 11 new tests mirroring upstream's Discord fire-site suite (normalized envelopes,
+edits visible even when dispatch drops them as already processed, fail-closed on missing
+identities, has_hook fast-path skips normalization, raising observers never break the
+listener), plus the full Slack + platform-event gateway selection green: 563 passed
+(pre-existing environmental collection error in test_teams.py excluded, reproduced on pristine
+main). Filing blocked on credentials, same as proposal 1.
