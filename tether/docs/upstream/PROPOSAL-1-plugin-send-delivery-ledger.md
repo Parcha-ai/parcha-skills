@@ -27,9 +27,9 @@ the duplication `delivery_obligations` exists to prevent.
    ledgered platform adapter and `ledger_enabled()`: `record_obligation()` before I/O,
    `mark_attempting()`, then `mark_delivered()`/`mark_failed()` around the existing send —
    the same three calls `base.py:6573-6632` already makes, no new states, no new table.
-2. Extend the send_message success result payload with `external_id` (the platform message
-   id/ts the adapter already receives from `chat_postMessage` et al.) and, when ledgered,
-   `obligation_id`. Additive, keyword-only, absent fields for adapters that cannot supply them.
+2. Add `obligation_id` to the send_message success result when ledgered (additive; the
+   platform message id is already returned as `message_id`, so no external-id change is
+   needed — verified against current main).
 3. Restart sweep behavior is inherited unchanged, including the visible RECOVERED_MARKER —
    this deliberately does NOT reintroduce a silent outbox (#61790); plugin sends get the same
    honest at-least-once contract final responses already have.
@@ -51,3 +51,16 @@ read-state — nothing beyond parity between the two egress paths.
 Additive only: no signature changes, result dict gains optional keys, ledger participation is
 behind the existing `gateway.delivery_ledger` gate (default on). Conventional commit:
 `feat(gateway,tools): record plugin-path sends in the delivery ledger and return receipts`.
+
+## Status (2026-08-22)
+
+**Implemented and tested** on `feat/plugin-send-delivery-ledger` from hermes-agent main
+`261a4efb9`. Patch: `0001-plugin-send-delivery-ledger.patch` (this directory). Local evidence:
+6 new tests (obligation durably `attempting` before adapter I/O, `delivered`/`failed`
+transitions with error text, config gate honored, ledger trouble never blocks the send,
+identical-resend idempotency by obligation id) plus 68 send_message tests and 24 delivery-ledger
+tests green (pre-existing environmental collection error in test_clipboard.py excluded,
+reproduced on pristine main). Filing blocked on credentials: the claudio-michel GitHub App
+cannot fork or PR outside its installations — apply the patch on a fork from any user account,
+push branch `feat/plugin-send-delivery-ledger`, and open the PR with this document's Problem /
+Proposal / Tests sections as the body.

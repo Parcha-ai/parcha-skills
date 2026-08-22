@@ -1,0 +1,300 @@
+From d8de9c773a57d69ff6f3dba40e70888b11dd7f3c Mon Sep 17 00:00:00 2001
+From: "claudio-michel[bot]" <claudio-michel[bot]@users.noreply.github.com>
+Date: Sat, 22 Aug 2026 15:03:17 +0000
+Subject: [PATCH] feat(gateway,tools): record plugin-path sends in the delivery
+ ledger and return receipts
+
+The gateway's final agent responses get honest at-least-once delivery
+through the delivery-obligation ledger (#58818): obligation row before
+I/O, attempting/delivered/failed transitions, restart sweep with a
+visible recovered marker. Sends made through the send_message tool -
+the path plugins and cron use - reached the platform with none of
+that: no obligation row, no retry on restart, no receipt, so a crash
+between the adapter call and the platform ACK silently lost the
+message.
+
+This records the same pending -> attempting -> delivered/failed
+transitions around the live-adapter send in _send_via_adapter, behind
+the existing gateway.delivery_ledger gate (default on), best-effort at
+every step so ledger trouble never blocks or delays a send. The
+synthetic session_key carries platform, chat, and thread; the restart
+sweep redelivers straight from the row's own fields with the recovered
+marker, and its session-resume matching never matches a synthetic key.
+Successful sends now additionally return the obligation_id receipt
+alongside the existing message_id (additive; absent when the ledger is
+gated off).
+
+Consumer: Tether (Parcha-ai/parcha-skills), a Slack-continuation
+plugin that must prove to an operator that a reply was durably handed
+to the platform.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../test_send_message_delivery_ledger.py      | 161 ++++++++++++++++++
+ tools/send_message_tool.py                    |  66 ++++++-
+ 2 files changed, 226 insertions(+), 1 deletion(-)
+ create mode 100644 tests/tools/test_send_message_delivery_ledger.py
+
+diff --git a/tests/tools/test_send_message_delivery_ledger.py b/tests/tools/test_send_message_delivery_ledger.py
+new file mode 100644
+index 000000000..69f059be4
+--- /dev/null
++++ b/tests/tools/test_send_message_delivery_ledger.py
+@@ -0,0 +1,161 @@
++"""Plugin/tool-path sends join the delivery-obligation ledger (#58818 parity).
++
++The gateway's own final responses are durably recorded before I/O and swept
++on restart; sends made through ``send_message`` / ``_send_via_adapter``
++previously reached the platform with no obligation row. These tests pin the
++new contract on the live-adapter path:
++
++- an obligation row exists in state ``attempting`` BEFORE the adapter send
++  runs (crash between record and ACK is recoverable);
++- ``delivered`` after a successful send, and the result carries the
++  ``obligation_id`` receipt alongside the existing ``message_id``;
++- ``failed`` with the error after an unsuccessful or raising send;
++- ledger trouble never blocks the send (best-effort contract);
++- the ``gateway.delivery_ledger`` config gate is honored.
++"""
++
++from __future__ import annotations
++
++import asyncio
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++
++from gateway import delivery_ledger as dl
++from gateway.config import Platform
++from tools.send_message_tool import _send_via_adapter
++
++
++@pytest.fixture(autouse=True)
++def _fresh_db(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setattr(dl, "_db_path", lambda: home / "state.db")
++    yield
++
++
++def _rows():
++    with dl._connect() as conn:
++        return [
++            {
++                "obligation_id": row[0],
++                "session_key": row[1],
++                "platform": row[2],
++                "chat_id": row[3],
++                "thread_id": row[4],
++                "content": row[5],
++                "state": row[6],
++                "last_error": row[7],
++            }
++            for row in conn.execute(
++                """SELECT obligation_id, session_key, platform, chat_id,
++                          thread_id, content, state, last_error
++                   FROM delivery_obligations"""
++            )
++        ]
++
++
++class _Adapter:
++    def __init__(self, *, success=True, message_id="171.500", error=None,
++                 raises=None):
++        self.success = success
++        self.message_id = message_id
++        self.error = error
++        self.raises = raises
++        self.states_seen_at_send: list[str] = []
++
++    async def send(self, *, chat_id, content, metadata=None):
++        # Witness the ledger state at the moment I/O runs.
++        self.states_seen_at_send = [row["state"] for row in _rows()]
++        if self.raises is not None:
++            raise self.raises
++        return SimpleNamespace(
++            success=self.success,
++            message_id=self.message_id,
++            error=self.error,
++        )
++
++
++def _send(adapter, *, thread_id="100.1", ledger_on=True):
++    runner = SimpleNamespace(adapters={Platform.SLACK: adapter})
++    pconfig = SimpleNamespace(enabled=True, token=None, extra={})
++    with patch("gateway.run._gateway_runner_ref", lambda: runner), \
++         patch.object(dl, "ledger_enabled", lambda config=None: ledger_on):
++        return asyncio.run(
++            _send_via_adapter(
++                Platform.SLACK,
++                pconfig,
++                "C1",
++                "the plugin's message",
++                thread_id=thread_id,
++            )
++        )
++
++
++def test_obligation_recorded_before_io_and_delivered_after_success():
++    adapter = _Adapter()
++    result = _send(adapter)
++
++    assert result["success"] is True
++    assert result["message_id"] == "171.500"
++    rows = _rows()
++    assert len(rows) == 1
++    row = rows[0]
++    assert result["obligation_id"] == row["obligation_id"]
++    # The row was durably 'attempting' when the adapter's I/O ran.
++    assert adapter.states_seen_at_send == ["attempting"]
++    assert row["state"] == "delivered"
++    assert row["platform"] == "slack"
++    assert row["chat_id"] == "C1"
++    assert row["thread_id"] == "100.1"
++    assert row["content"] == "the plugin's message"
++    assert row["session_key"] == "send_message:slack:C1:100.1"
++
++
++def test_failed_send_marks_failed_with_error():
++    result = _send(_Adapter(success=False, error="channel_not_found"))
++
++    assert "error" in result
++    row = _rows()[0]
++    assert row["state"] == "failed"
++    assert "channel_not_found" in (row["last_error"] or "")
++
++
++def test_raising_send_marks_failed():
++    result = _send(_Adapter(raises=RuntimeError("socket exploded")))
++
++    assert "error" in result
++    row = _rows()[0]
++    assert row["state"] == "failed"
++    assert "socket exploded" in (row["last_error"] or "")
++
++
++def test_config_gate_off_means_no_rows_and_no_receipt():
++    result = _send(_Adapter(), ledger_on=False)
++
++    assert result["success"] is True
++    assert "obligation_id" not in result
++    assert _rows() == []
++
++
++def test_ledger_trouble_never_blocks_the_send():
++    adapter = _Adapter()
++    with patch.object(
++        dl, "record_obligation",
++        side_effect=RuntimeError("disk full"),
++    ):
++        result = _send(adapter)
++
++    assert result["success"] is True
++    assert "obligation_id" not in result
++
++
++def test_identical_resend_is_idempotent_by_obligation_id():
++    first = _send(_Adapter())
++    second = _send(_Adapter())
++
++    assert first["obligation_id"] == second["obligation_id"]
++    rows = _rows()
++    assert len(rows) == 1
++    assert rows[0]["state"] == "delivered"
+diff --git a/tools/send_message_tool.py b/tools/send_message_tool.py
+index 403d49fdc..a35942144 100644
+--- a/tools/send_message_tool.py
++++ b/tools/send_message_tool.py
+@@ -827,6 +827,21 @@ def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id:
+     }
+ 
+ 
++def _ledger_mark(obligation_id, *, delivered: bool, error: str = "") -> None:
++    """Best-effort terminal ledger transition; never raises into the send."""
++    if obligation_id is None:
++        return
++    try:
++        from gateway.delivery_ledger import mark_delivered, mark_failed
++
++        if delivered:
++            mark_delivered(obligation_id)
++        else:
++            mark_failed(obligation_id, error)
++    except Exception:
++        logger.debug("delivery ledger update failed", exc_info=True)
++
++
+ async def _send_via_adapter(
+     platform,
+     pconfig,
+@@ -862,6 +877,47 @@ async def _send_via_adapter(
+         except Exception:
+             adapter = None
+         if adapter is not None:
++            # Delivery-obligation ledger parity (#58818 follow-up): the
++            # gateway's own final responses are durably recorded before I/O
++            # and swept on restart; tool/plugin-path sends previously reached
++            # the platform with no obligation row, so a crash between this
++            # call and the platform ACK silently lost the message. Record the
++            # same pending -> attempting -> delivered/failed transitions here.
++            # Best-effort at every step — ledger trouble must never block or
++            # delay the actual send. The synthetic session_key carries
++            # platform, chat, and thread; the restart sweep redelivers
++            # straight from those row fields (with the visible recovered
++            # marker), and its session-resume matching simply never matches a
++            # synthetic key.
++            _obligation_id = None
++            try:
++                from gateway.delivery_ledger import (
++                    compute_obligation_id,
++                    ledger_enabled,
++                    mark_attempting,
++                    record_obligation,
++                )
++
++                if await asyncio.to_thread(ledger_enabled):
++                    _send_session_key = (
++                        f"send_message:{platform_name}:{chat_id}:{thread_id or '-'}"
++                    )
++                    _obligation_id = compute_obligation_id(
++                        _send_session_key, "", chunk
++                    )
++                    await asyncio.to_thread(
++                        record_obligation,
++                        obligation_id=_obligation_id,
++                        session_key=_send_session_key,
++                        platform=platform_name,
++                        chat_id=chat_id,
++                        thread_id=thread_id,
++                        content=chunk,
++                    )
++                    await asyncio.to_thread(mark_attempting, _obligation_id)
++            except Exception:
++                logger.debug("delivery ledger record failed", exc_info=True)
++                _obligation_id = None
+             try:
+                 metadata = {}
+                 if thread_id:
+@@ -874,9 +930,17 @@ async def _send_via_adapter(
+             except asyncio.CancelledError:
+                 raise
+             except Exception as e:
++                _ledger_mark(_obligation_id, delivered=False, error=str(e))
+                 return {"error": f"Plugin platform send failed: {e}"}
+             if result.success:
+-                return {"success": True, "message_id": result.message_id}
++                _ledger_mark(_obligation_id, delivered=True)
++                success_result = {"success": True, "message_id": result.message_id}
++                if _obligation_id is not None:
++                    success_result["obligation_id"] = _obligation_id
++                return success_result
++            _ledger_mark(
++                _obligation_id, delivered=False, error=str(result.error or "")
++            )
+             return {"error": f"Adapter send failed: {result.error}"}
+ 
+     entry = None
+-- 
+2.43.0
+
