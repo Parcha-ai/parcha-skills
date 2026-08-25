@@ -1570,8 +1570,8 @@ class BrainStore:
                           health.coverage_percent,
                           health.archive_coverage_percent,
                           health.archive_backlog,health.last_error_code,
-                          activity.total_records,activity.records_24h,
-                          activity.last_transfer_at,
+                          activity.records_24h,
+                          latest_activity.last_transfer_at,
                           transfer.bytes_24h
                    FROM canonical_sources source
                    LEFT JOIN source_profiles profile
@@ -1603,15 +1603,20 @@ class BrainStore:
                         LIMIT 1
                    ) actor ON true
                    LEFT JOIN LATERAL (
-                       SELECT count(*)::bigint AS total_records,
-                              count(*) FILTER (
-                                  WHERE event.created_at>=now()-interval '24 hours'
-                              )::bigint AS records_24h,
-                              max(event.created_at) AS last_transfer_at
+                       SELECT count(*)::bigint AS records_24h
                          FROM canonical_events event
                         WHERE event.tenant_id=source.tenant_id
                           AND event.source_id=source.source_id
+                          AND event.created_at>=now()-interval '24 hours'
                    ) activity ON true
+                   LEFT JOIN LATERAL (
+                       SELECT event.created_at AS last_transfer_at
+                         FROM canonical_events event
+                        WHERE event.tenant_id=source.tenant_id
+                          AND event.source_id=source.source_id
+                        ORDER BY event.created_at DESC
+                        LIMIT 1
+                   ) latest_activity ON true
                    LEFT JOIN LATERAL (
                        SELECT COALESCE(sum(artifact.size_bytes),0)::bigint
                                 AS bytes_24h
