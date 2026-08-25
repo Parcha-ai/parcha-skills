@@ -11,6 +11,7 @@ import time
 import unittest
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
+from http.client import RemoteDisconnected
 from pathlib import Path
 from unittest import mock
 
@@ -632,6 +633,36 @@ class SemanticRuntimeContractTest(unittest.TestCase):
             )
         self.assertEqual(post.call_count, 2)
         sleep.assert_called_once_with(2.0)
+
+    def test_managed_document_embedding_retries_a_disconnected_provider(self) -> None:
+        runtime = SemanticRuntime(
+            embedding_protocol="openai",
+            embedding_url="https://openai.example",
+            embedding_approved_url="https://openai.example",
+            embedding_key_env="OPENAI_API_KEY",
+            model="text-embedding-synthetic",
+            revision="text-embedding-synthetic-v1",
+            dimensions=64,
+        )
+        response = {
+            "data": [{"index": 0, "embedding": [0.0] * 64}],
+        }
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"OPENAI_API_KEY": "synthetic-scoped-key"},
+                clear=True,
+            ),
+            mock.patch.object(
+                runtime,
+                "_post",
+                side_effect=[RemoteDisconnected("synthetic"), response],
+            ) as post,
+            mock.patch("recall_server.semantic.time.sleep") as sleep,
+        ):
+            self.assertEqual(runtime.embed_documents(["retry me"]), [[0.0] * 64])
+        self.assertEqual(post.call_count, 2)
+        sleep.assert_called_once_with(1.0)
 
     def test_managed_key_may_come_from_a_named_secret_environment_variable(
         self,

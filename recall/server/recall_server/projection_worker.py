@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import time
+import urllib.error
 from collections.abc import Callable
+from http.client import RemoteDisconnected
 from typing import Any
 
 from .logical_evidence_projection import CanonicalLogicalEvidenceProjector
@@ -40,11 +42,28 @@ def run_projection_worker(
         # document batch. New upstream output becomes eligible next cycle;
         # dependency correctness stays in each projector while searchable
         # freshness no longer waits behind an unbounded backfill.
-        embedded = passages.embed_pending(
-            tenant_id=tenant_id,
-            batch_size=embedding_batch_size,
-            max_batches=max_batches_per_cycle,
-        )
+        embedding_error = 0
+        try:
+            embedded = passages.embed_pending(
+                tenant_id=tenant_id,
+                batch_size=embedding_batch_size,
+                max_batches=max_batches_per_cycle,
+            )
+        except (
+            ConnectionError,
+            RemoteDisconnected,
+            TimeoutError,
+            urllib.error.URLError,
+        ) as error:
+            # The embedding provider is an external dependency. Preserve the
+            # durable worker and retry next cycle instead of restarting every
+            # projection stage because one request was disconnected.
+            embedding_error = 1
+            embedded = {"status": "unavailable", "processed": 0}
+            LOG.warning(
+                "projection embedding unavailable type=%s",
+                type(error).__name__,
+            )
         projected = passages.project_pending(
             tenant_id=tenant_id,
             batch_size=passage_batch_size,
@@ -102,6 +121,7 @@ def run_projection_worker(
             "passage_requeued": int(projected.get("requeued", 0)),
             "passages": int(projected["passages"]),
             "embedded": int(embedded["processed"]),
+            "embedding_error": embedding_error,
             "parquet_shards": int(scanned["shards"]),
             "parquet_rows": int(scanned["rows"]),
             "parquet_stale": int(scanned["stale"]),
@@ -113,6 +133,7 @@ def run_projection_worker(
         LOG.info(
             "projection cycle status=%s documents=%s logical_pending=%s records=%s "
             "passage_documents=%s passage_requeued=%s passages=%s embedded=%s "
+            "embedding_error=%s "
             "parquet_shards=%s "
             "parquet_rows=%s parquet_stale=%s parquet_contended=%s "
             "stale=%s pruned=%s "
@@ -128,6 +149,7 @@ def run_projection_worker(
                     "passage_requeued",
                     "passages",
                     "embedded",
+                    "embedding_error",
                     "parquet_shards",
                     "parquet_rows",
                     "parquet_stale",

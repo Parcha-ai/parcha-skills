@@ -16,6 +16,7 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from contextlib import nullcontext
 from dataclasses import dataclass
+from http.client import RemoteDisconnected
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -628,6 +629,16 @@ class SemanticRuntime:
                 headers=headers,
                 retry=retry,
             )
+        except (RemoteDisconnected, TimeoutError, urllib.error.URLError):
+            if input_type == "document" and retry < 4:
+                time.sleep(min(8.0, float(2**retry)))
+                return self._embed_managed_batch(
+                    batch,
+                    input_type=input_type,
+                    headers=headers,
+                    retry=retry + 1,
+                )
+            raise
         return self._openai_vectors(response, len(batch))
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:

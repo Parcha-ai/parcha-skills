@@ -27,7 +27,7 @@ body {
   margin: 0;
   background: var(--paper);
   color: var(--ink);
-  font-family: "Avenir Next", "Gill Sans Nova", "Trebuchet MS", sans-serif;
+  font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
   min-height: 100vh;
 }
 
@@ -126,10 +126,40 @@ h1 em { color: var(--blue); font-weight: 400; }
   letter-spacing: .08em;
 }
 
-.brain-strip, .access-deck, .switchboard, .live-routes {
+.brain-strip, .fleet-status, .access-deck, .switchboard, .live-routes {
   padding: 74px clamp(22px, 5vw, 82px);
   border-bottom: 1px solid var(--ink);
 }
+.fleet-status { background: #101611; color: var(--paper-bright); }
+.fleet-heading { grid-template-columns: 1fr minmax(240px, 420px); }
+.fleet-heading > div > p { color: var(--acid); }
+.fleet-note { margin: 0; color: #9da89e; line-height: 1.6; }
+.fleet-summary { display: grid; grid-template-columns: repeat(4, 1fr); border: 1px solid #556057; }
+.fleet-summary article { min-height: 118px; padding: 22px; border-right: 1px solid #556057; display: flex; flex-direction: column; justify-content: space-between; }
+.fleet-summary article:last-child { border-right: 0; }
+.fleet-summary span, .fleet-machine-metrics span { color: #8f9b91; font-size: 9px; letter-spacing: .12em; text-transform: uppercase; }
+.fleet-summary strong { font-size: clamp(24px, 3vw, 42px); font-weight: 500; }
+.fleet-list { margin-top: 24px; border-top: 1px solid #556057; }
+.fleet-machine { padding: 26px 0; border-bottom: 1px solid #556057; }
+.fleet-machine-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; }
+.fleet-owner { color: #9da89e; font-size: 10px; }
+.fleet-machine h3 { margin: 7px 0 0; font: 600 clamp(22px, 3vw, 34px)/1.1 "JetBrains Mono", monospace; letter-spacing: -.04em; }
+.fleet-health { border: 1px solid currentColor; padding: 7px 10px; font-size: 9px; text-transform: uppercase; }
+.health-ready .fleet-health { color: var(--acid); }
+.health-running .fleet-health, .health-backfilling .fleet-health { color: #76a3ff; }
+.health-stale .fleet-health, .health-unknown .fleet-health { color: #ffc252; }
+.health-degraded .fleet-health { color: var(--orange); }
+.fleet-machine-metrics { display: grid; grid-template-columns: 1fr 1.4fr .8fr .8fr; gap: 22px; margin: 24px 0; }
+.fleet-machine-metrics div { display: flex; flex-direction: column; gap: 8px; }
+.fleet-machine-metrics strong { font-size: 12px; font-weight: 500; }
+.fleet-sources { list-style: none; padding: 0; margin: 0; border-top: 1px solid #303a32; }
+.fleet-sources li { display: grid; grid-template-columns: 10px minmax(90px, .5fr) 1fr; gap: 12px; align-items: center; min-height: 42px; border-bottom: 1px solid #303a32; font-size: 10px; }
+.fleet-sources li > span:last-child { color: #9da89e; }
+.source-health { width: 7px; height: 7px; background: #778078; }
+.source-health.health-ready { background: var(--acid); }
+.source-health.health-running, .source-health.health-backfilling { background: #76a3ff; }
+.source-health.health-stale, .source-health.health-unknown { background: #ffc252; }
+.source-health.health-degraded { background: var(--orange); }
 .section-heading {
   display: grid;
   grid-template-columns: minmax(160px, 1fr) 3fr;
@@ -305,9 +335,22 @@ footer { min-height: 100px; display: flex; justify-content: space-between; align
   .route-matrix { grid-column: 1 / -1; border-top: 1px solid; }
   .integration-grid { grid-template-columns: 1fr; }
   .access-layout { grid-template-columns: 1fr; }
+  .fleet-summary { grid-template-columns: 1fr 1fr; }
+  .fleet-summary article:nth-child(2) { border-right: 0; }
+  .fleet-summary article:nth-child(-n+2) { border-bottom: 1px solid #556057; }
+  .fleet-machine-metrics { grid-template-columns: 1fr 1fr; }
   .ledger-head { display: none; }
   .access-row { grid-template-columns: 1fr auto; padding: 18px; }
   .installation { grid-template-columns: 1fr 1fr; padding: 18px 0; }
+}
+
+@media (max-width: 560px) {
+  .fleet-summary { grid-template-columns: 1fr; }
+  .fleet-summary article { border-right: 0; border-bottom: 1px solid #556057; }
+  .fleet-summary article:last-child { border-bottom: 0; }
+  .fleet-machine-metrics { grid-template-columns: 1fr; }
+  .fleet-sources li { grid-template-columns: 10px 1fr; padding: 9px 0; }
+  .fleet-sources li > span:last-child { grid-column: 2; }
 }
 
 @media (prefers-reduced-motion: reduce) {

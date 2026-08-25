@@ -207,6 +207,124 @@ function renderCatalog() {
     });
 }
 
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let amount = bytes;
+  let unit = -1;
+  do {
+    amount /= 1024;
+    unit += 1;
+  } while (amount >= 1024 && unit < units.length - 1);
+  return `${amount >= 10 ? amount.toFixed(0) : amount.toFixed(1)} ${units[unit]}`;
+}
+
+function relativeTime(value) {
+  if (!value) return "never";
+  const seconds = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1000));
+  if (seconds < 60) return `${seconds}s ago`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+  return `${Math.floor(seconds / 86400)}d ago`;
+}
+
+function sourceDevice(item) {
+  if (item.device_id) return item.device_id;
+  const parts = String(item.source_id).split(":");
+  if (["claude", "codex"].includes(parts[0]) && parts.length > 2) {
+    return parts.slice(2).join(":");
+  }
+  return item.execution === "remote_worker" ? "Hosted connector" : item.source_id;
+}
+
+function fleetRank(value) {
+  return ({ degraded: 5, stale: 4, unknown: 3, backfilling: 2, running: 1, ready: 0 })[value] ?? 3;
+}
+
+function renderFleet() {
+  const rows = state.data.fleet || [];
+  const summary = $("#fleet-summary");
+  const target = $("#fleet-list");
+  summary.replaceChildren();
+  target.replaceChildren();
+  if (!rows.length) {
+    summary.innerHTML = '<p class="empty">No administered sources yet.</p>';
+    return;
+  }
+  const brains = new Map(state.data.brains.map((brain) => [brain.tenant_id, brain.display_name]));
+  const groups = new Map();
+  rows.forEach((item) => {
+    const device = sourceDevice(item);
+    const key = `${item.tenant_id}\u0000${item.owner_principal_id}\u0000${device}`;
+    const group = groups.get(key) || {
+      tenantId: item.tenant_id,
+      owner: item.owner_display_name,
+      device,
+      sources: [],
+      records: 0,
+      bytes: 0,
+      health: "ready",
+      lastTransfer: null,
+      lastReport: null,
+    };
+    group.sources.push(item);
+    group.records += Number(item.records_24h || 0);
+    group.bytes += Number(item.bytes_24h || 0);
+    if (fleetRank(item.health) > fleetRank(group.health)) group.health = item.health;
+    if (item.last_transfer_at && (!group.lastTransfer || item.last_transfer_at > group.lastTransfer)) {
+      group.lastTransfer = item.last_transfer_at;
+    }
+    if (item.reported_at && (!group.lastReport || item.reported_at > group.lastReport)) {
+      group.lastReport = item.reported_at;
+    }
+    groups.set(key, group);
+  });
+  const machines = [...groups.values()].sort((left, right) =>
+    left.owner.localeCompare(right.owner) || left.device.localeCompare(right.device)
+  );
+  const records24h = machines.reduce((sum, item) => sum + item.records, 0);
+  const bytes24h = machines.reduce((sum, item) => sum + item.bytes, 0);
+  const attention = machines.filter((item) => fleetRank(item.health) >= fleetRank("unknown")).length;
+  [
+    ["Machines", machines.length],
+    ["Records / 24h", records24h.toLocaleString()],
+    ["Raw / 24h", formatBytes(bytes24h)],
+    ["Needs attention", attention],
+  ].forEach(([label, value]) => {
+    const card = document.createElement("article");
+    card.innerHTML = `<span>${escapeText(label)}</span><strong>${escapeText(value)}</strong>`;
+    summary.append(card);
+  });
+  machines.forEach((machine) => {
+    const row = document.createElement("article");
+    row.className = `fleet-machine health-${machine.health}`;
+    const sourceRows = machine.sources.map((item) => {
+      const coverage = item.coverage_percent == null
+        ? ""
+        : ` · ${Number(item.coverage_percent).toFixed(0)}% covered`;
+      const queue = Number(item.pending_records || 0) || Number(item.dead_records || 0)
+        ? ` · ${Number(item.pending_records || 0)} pending / ${Number(item.dead_records || 0)} dead`
+        : "";
+      const label = item.collector_kind || item.connector_id || item.source_family || item.source_id;
+      return `<li><span class="source-health health-${escapeText(item.health)}"></span><strong>${escapeText(label)}</strong><span>${escapeText(item.health)}${escapeText(coverage)}${escapeText(queue)}</span></li>`;
+    }).join("");
+    row.innerHTML = `
+      <div class="fleet-machine-head">
+        <div><span class="fleet-owner">${escapeText(machine.owner)}</span><h3>${escapeText(machine.device)}</h3></div>
+        <span class="fleet-health">${escapeText(machine.health)}</span>
+      </div>
+      <div class="fleet-machine-metrics">
+        <div><span>Brain</span><strong>${escapeText(brains.get(machine.tenantId) || machine.tenantId)}</strong></div>
+        <div><span>Transferred / 24h</span><strong>${machine.records.toLocaleString()} records · ${formatBytes(machine.bytes)}</strong></div>
+        <div><span>Last transfer</span><strong>${relativeTime(machine.lastTransfer)}</strong></div>
+        <div><span>Last heartbeat</span><strong>${relativeTime(machine.lastReport)}</strong></div>
+      </div>
+      <ul class="fleet-sources">${sourceRows}</ul>`;
+    target.append(row);
+  });
+}
+
 function renderInstallations() {
   const target = $("#installation-list");
   target.replaceChildren();
@@ -264,6 +382,7 @@ function render() {
   renderGoogle();
   renderSlack();
   renderCatalog();
+  renderFleet();
   renderInstallations();
   $(".pulse").classList.add("ready");
   $("#system-label").textContent = "CONTROL PLANE / READY";
