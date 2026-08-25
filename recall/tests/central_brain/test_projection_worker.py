@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from http.client import RemoteDisconnected
 
 from recall_server.projection_worker import run_projection_worker
 
@@ -79,6 +80,32 @@ class _Scan:
 
 
 class ProjectionWorkerTest(unittest.TestCase):
+    def test_embedding_disconnect_does_not_terminate_the_projection_worker(self):
+        calls: list[str] = []
+
+        class DisconnectedPassages(_Passages):
+            def embed_pending(self, **_kwargs):
+                self.calls.append("embeddings")
+                raise RemoteDisconnected("synthetic")
+
+        result = run_projection_worker(
+            _Logical(calls, work=0),  # type: ignore[arg-type]
+            DisconnectedPassages(calls, work=0),  # type: ignore[arg-type]
+            tenant_id="tenant:company:test",
+            logical_batch_size=25,
+            passage_batch_size=100,
+            embedding_batch_size=128,
+            max_batches_per_cycle=10,
+            upload_concurrency=2,
+            passage_concurrency=4,
+            interval_seconds=5,
+            once=True,
+        )
+
+        self.assertEqual(calls, ["embeddings", "passages", "logical"])
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(result["embedding_error"], 1)
+
     def test_services_downstream_then_coalesces_scan_after_upstream_work(self):
         calls: list[str] = []
         result = run_projection_worker(

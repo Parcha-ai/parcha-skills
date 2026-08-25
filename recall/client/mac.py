@@ -556,6 +556,20 @@ class CanonicalBrainWriter(_CanonicalClient):
             timeout=300,
         )
 
+    def report_health(self, report: dict[str, Any]) -> dict[str, Any]:
+        """Publish a closed, content-free collector heartbeat."""
+
+        return self._request(
+            "/v2/collector/health",
+            body={
+                "tenant_id": self.tenant_id,
+                "principal_id": self.principal_id,
+                "source_id": self.source_id,
+                "report": report,
+            },
+            timeout=30,
+        )
+
     def ingest(self, events: list[dict[str, Any]]) -> dict[str, Any]:
         if not events or len(events) > MAX_CANONICAL_INGEST_EVENTS:
             raise ValueError("canonical ingest batch is invalid")

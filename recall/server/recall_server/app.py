@@ -383,6 +383,7 @@ class Handler(BaseHTTPRequestHandler):
                 "name": credential["name"],
                 "tenant_id": credential.get("tenant_id"),
                 "source_id": credential["source_id"],
+                "installation_id": credential.get("installation_id"),
                 "principal_id": credential.get("principal_id"),
                 "principal_kind": credential.get("principal_kind"),
                 "role": credential.get("role"),
@@ -692,6 +693,7 @@ class Handler(BaseHTTPRequestHandler):
                     "/v2/archive/objects",
                     "/v2/ingest/canonical",
                     "/v2/ingest/status",
+                    "/v2/collector/health",
                 }
             )
         if allowed:
@@ -1298,6 +1300,41 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 LOG.error("canonical ingest failed type=%s", type(exc).__name__)
                 self.send_json(500, {"error": "canonical ingest failed"})
+            return
+        if path == "/v2/collector/health":
+            principal = self.require("write")
+            if not principal:
+                return
+            length = self.body_length(64 * 1024)
+            if length is None:
+                return
+            try:
+                body = json.loads(self.rfile.read(length))
+                if not isinstance(body, dict) or set(body) != {
+                    "tenant_id",
+                    "principal_id",
+                    "source_id",
+                    "report",
+                }:
+                    raise ValueError("collector health request invalid")
+                authority = self.canonical_authority(principal, body)
+                if authority is None:
+                    return
+                tenant_id, _principal_id, source_id = authority
+                self.send_json(
+                    202,
+                    self.store.record_collector_health(
+                        tenant_id=tenant_id,
+                        source_id=source_id,
+                        installation_id=principal.get("installation_id"),
+                        report=body["report"],
+                    ),
+                )
+            except (json.JSONDecodeError, TypeError, ValueError):
+                self.send_json(400, {"error": "collector health request invalid"})
+            except Exception as exc:
+                LOG.error("collector health failed type=%s", type(exc).__name__)
+                self.send_json(503, {"error": "collector health unavailable"})
             return
         if path == "/v2/ingest/status":
             principal = self.require("write")

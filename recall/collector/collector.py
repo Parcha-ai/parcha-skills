@@ -1767,6 +1767,7 @@ class Collector:
         ))
         result = {
             "harness": self.harness,
+            "collector_version": COLLECTOR_VERSION,
             "source_id": self.source_id,
             "disk_files": len(disk),
             "ledger_files": len(ledger),

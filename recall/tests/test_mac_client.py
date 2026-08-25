@@ -282,6 +282,45 @@ class CanonicalV2ClientTest(unittest.TestCase):
             timeout=300,
         )
 
+    def test_collector_health_uses_the_source_scoped_endpoint(self) -> None:
+        writer = CanonicalBrainWriter(
+            endpoint="https://brain.example.invalid",
+            token="synthetic",
+            source_id="codex:linux:synthetic",
+            tenant_id="tenant:company",
+            principal_id="principal:owner",
+        )
+        report = {
+            "schema_version": 1,
+            "collector_kind": "codex",
+            "collector_version": 9,
+            "status": "ready",
+            "scan_complete": True,
+            "pending_records": 0,
+            "dead_records": 0,
+            "coverage_percent": 100.0,
+            "archive_coverage_percent": 100.0,
+            "archive_backlog": 0,
+            "last_success_epoch": 1_800_000_000,
+            "last_error_code": None,
+        }
+        with mock.patch.object(
+            writer,
+            "_request",
+            return_value={"schema_version": 1, "status": "accepted"},
+        ) as request:
+            self.assertEqual(writer.report_health(report)["status"], "accepted")
+        request.assert_called_once_with(
+            "/v2/collector/health",
+            body={
+                "tenant_id": "tenant:company",
+                "principal_id": "principal:owner",
+                "source_id": "codex:linux:synthetic",
+                "report": report,
+            },
+            timeout=30,
+        )
+
     def test_writer_sends_exactly_one_thousand_events(self) -> None:
         writer = CanonicalBrainWriter(
             endpoint="https://brain.example.invalid",

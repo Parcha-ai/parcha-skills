@@ -167,7 +167,9 @@ class FakeIdentityOAuth:
         return self.identity
 
 
-def request(server, method, path, *, body=None, cookie=None, csrf=None):
+def request(
+    server, method, path, *, body=None, cookie=None, csrf=None, authorization=None
+):
     payload = None if body is None else json.dumps(body).encode()
     headers = {"Accept": "application/json"}
     if payload is not None:
@@ -177,6 +179,8 @@ def request(server, method, path, *, body=None, cookie=None, csrf=None):
         headers["Cookie"] = cookie
     if csrf:
         headers["X-Recall-CSRF"] = csrf
+    if authorization:
+        headers["Authorization"] = "Bearer " + authorization
     connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=10)
     connection.request(method, path, body=payload, headers=headers)
     response = connection.getresponse()
@@ -287,6 +291,7 @@ def main():
             "RECALL_ADMIN_WEB_ENABLED",
             "RECALL_AUTH_REQUIRED",
             "RECALL_HTTP_PROFILE",
+            "RECALL_CANONICAL_INGEST_PUBLIC",
         )
     }
     os.environ.update(
@@ -294,6 +299,7 @@ def main():
             "RECALL_ADMIN_WEB_ENABLED": "1",
             "RECALL_AUTH_REQUIRED": "1",
             "RECALL_HTTP_PROFILE": "public-mcp",
+            "RECALL_CANONICAL_INGEST_PUBLIC": "1",
         }
     )
     Handler.store = store
@@ -320,6 +326,7 @@ def main():
         assert b"navigator.clipboard.writeText" in script
         assert b'left.brain_kind === "personal" ? 0 : 1' in script
         assert b"Company brains are shared." in script
+        assert b"Transferred / 24h" in script
         status, _, denied = request(server, "GET", "/admin/api/v1/state")
         assert status == 401 and denied["error"] == "admin_session_invalid"
         status, _, denied = request(
@@ -349,6 +356,10 @@ def main():
         assert SECRET_CANARY not in rendered
         assert "token_sha256" not in rendered
         assert initial["invitations"] == []
+        assert initial["fleet"] == []
+        assert request(
+            server, "GET", "/admin/api/v1/state", cookie=outsider_cookie
+        )[2]["fleet"] == []
 
         invitation_body = {
             "tenant_id": COMPANY,
@@ -803,6 +814,77 @@ def main():
         )
         assert status == 201 and device_route["state"] == "enabled"
         assert store.authenticate_bearer(device_route["token"], "write")
+        health = {
+            "schema_version": 1,
+            "collector_kind": "codex",
+            "collector_version": 9,
+            "status": "ready",
+            "scan_complete": True,
+            "pending_records": 0,
+            "dead_records": 0,
+            "coverage_percent": 100.0,
+            "archive_coverage_percent": 100.0,
+            "archive_backlog": 0,
+            "last_success_epoch": int(datetime.now(timezone.utc).timestamp()),
+            "last_error_code": None,
+        }
+        status, _, accepted_health = request(
+            server,
+            "POST",
+            "/v2/collector/health",
+            body={
+                "tenant_id": PERSONAL,
+                "principal_id": OWNER,
+                "source_id": device_body["source_id"],
+                "report": health,
+            },
+            authorization=device_route["token"],
+        )
+        assert status == 202 and accepted_health["status"] == "accepted"
+        digest = "a" * 64
+        with store.connect() as connection:
+            connection.execute(
+                """INSERT INTO raw_artifacts(
+                       tenant_id,source_id,artifact_id,storage_backend,object_key,
+                       content_sha256,size_bytes,media_type,encryption,version_id
+                   ) VALUES (%s,%s,'artifact:fleet-e2e','s3',%s,%s,123,
+                             'application/json','sse-s3','fleet-e2e-v1')""",
+                (
+                    PERSONAL,
+                    device_body["source_id"],
+                    f"objects/aa/{digest}",
+                    digest,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO canonical_ingest_jobs(
+                       tenant_id,source_id,job_id,connector_id,mode,status,attempt
+                   ) VALUES (%s,%s,'job:fleet-e2e','local.codex','incremental',
+                             'committed',1)""",
+                (PERSONAL, device_body["source_id"]),
+            )
+            connection.execute(
+                """INSERT INTO canonical_events(
+                       tenant_id,source_id,event_id,native_id,artifact_id,job_id,
+                       kind,content_sha256,revision,occurred_at,observed_at,
+                       canonical_redacted
+                   ) VALUES (%s,%s,'event:fleet-e2e','native:fleet-e2e',
+                             'artifact:fleet-e2e','job:fleet-e2e','message',%s,1,
+                             now(),now(),'{}'::jsonb)""",
+                (PERSONAL, device_body["source_id"], digest),
+            )
+        owner_fleet = request(
+            server, "GET", "/admin/api/v1/state", cookie=owner_cookie
+        )[2]["fleet"]
+        device_health = next(
+            item for item in owner_fleet
+            if item["source_id"] == device_body["source_id"]
+        )
+        assert device_health["device_id"] == device_body["device_id"]
+        assert device_health["health"] == "ready"
+        assert device_health["records_24h"] == 1
+        assert device_health["bytes_24h"] == 123
+        assert device_health["last_transfer_at"] is not None
         device_action = (
             "/admin/api/v1/installations/"
             + device_route["installation_id"]

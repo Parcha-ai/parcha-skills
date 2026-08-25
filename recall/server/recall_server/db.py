@@ -882,6 +882,7 @@ class BrainStore:
             row = conn.execute(
                 """SELECT credential.id,credential.name,credential.tenant_id,
                           credential.source_id,credential.principal_id,
+                          credential.installation_id,
                           credential.capture_origin,
                           credential.webhook_privacy_mode,credential.scopes
                    FROM collector_credentials credential
@@ -1381,6 +1382,251 @@ class BrainStore:
         if not row:
             raise RuntimeError("database operational health probe failed")
         return {"status": "ok", "projection_lag": row["projection_lag"]}
+
+    def record_collector_health(
+        self,
+        *,
+        tenant_id: str,
+        source_id: str,
+        installation_id: uuid.UUID | None,
+        report: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Commit one closed, content-free heartbeat for a source collector."""
+
+        expected = {
+            "schema_version",
+            "collector_kind",
+            "collector_version",
+            "status",
+            "scan_complete",
+            "pending_records",
+            "dead_records",
+            "coverage_percent",
+            "archive_coverage_percent",
+            "archive_backlog",
+            "last_success_epoch",
+            "last_error_code",
+        }
+        if not isinstance(report, dict) or set(report) != expected:
+            raise ValueError("collector health report is invalid")
+        collector_kind = report["collector_kind"]
+        collector_version = report["collector_version"]
+        status = report["status"]
+        scan_complete = report["scan_complete"]
+        pending = report["pending_records"]
+        dead = report["dead_records"]
+        coverage = report["coverage_percent"]
+        archive_coverage = report["archive_coverage_percent"]
+        archive_backlog = report["archive_backlog"]
+        last_success_epoch = report["last_success_epoch"]
+        last_error = report["last_error_code"]
+        if (
+            report["schema_version"] != 1
+            or collector_kind not in {"claude", "codex", "connector"}
+            or type(collector_version) is not int
+            or collector_version < 1
+            or status not in {"ready", "running", "backfilling", "degraded"}
+            or type(scan_complete) is not bool
+            or type(pending) is not int
+            or not 0 <= pending <= 1_000_000_000
+            or type(dead) is not int
+            or not 0 <= dead <= 1_000_000_000
+            or isinstance(coverage, bool)
+            or not isinstance(coverage, (int, float))
+            or not 0 <= float(coverage) <= 100
+            or (
+                archive_coverage is not None
+                and (
+                    isinstance(archive_coverage, bool)
+                    or not isinstance(archive_coverage, (int, float))
+                    or not 0 <= float(archive_coverage) <= 100
+                )
+            )
+            or (
+                archive_backlog is not None
+                and (
+                    type(archive_backlog) is not int
+                    or not 0 <= archive_backlog <= 1_000_000_000
+                )
+            )
+            or (
+                last_success_epoch is not None
+                and (
+                    type(last_success_epoch) is not int
+                    or not 0 < last_success_epoch <= int(time.time()) + 300
+                )
+            )
+            or (
+                last_error is not None
+                and (
+                    not isinstance(last_error, str)
+                    or not re.fullmatch(r"[a-z][a-z0-9_]{2,127}", last_error)
+                )
+            )
+        ):
+            raise ValueError("collector health report is invalid")
+        last_success = (
+            datetime.fromtimestamp(last_success_epoch, timezone.utc)
+            if last_success_epoch is not None
+            else None
+        )
+        with self.connect() as conn:
+            row = conn.execute(
+                """INSERT INTO collector_health_reports(
+                       tenant_id,source_id,installation_id,collector_kind,
+                       collector_version,status,scan_complete,pending_records,
+                       dead_records,coverage_percent,archive_coverage_percent,
+                       archive_backlog,last_success_at,last_error_code,reported_at
+                   ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now())
+                   ON CONFLICT(tenant_id,source_id) DO UPDATE SET
+                     installation_id=excluded.installation_id,
+                     collector_kind=excluded.collector_kind,
+                     collector_version=excluded.collector_version,
+                     status=excluded.status,
+                     scan_complete=excluded.scan_complete,
+                     pending_records=excluded.pending_records,
+                     dead_records=excluded.dead_records,
+                     coverage_percent=excluded.coverage_percent,
+                     archive_coverage_percent=excluded.archive_coverage_percent,
+                     archive_backlog=excluded.archive_backlog,
+                     last_success_at=excluded.last_success_at,
+                     last_error_code=excluded.last_error_code,
+                     reported_at=now()
+                   RETURNING reported_at""",
+                (
+                    tenant_id,
+                    source_id,
+                    installation_id,
+                    collector_kind,
+                    collector_version,
+                    status,
+                    scan_complete,
+                    pending,
+                    dead,
+                    float(coverage),
+                    None if archive_coverage is None else float(archive_coverage),
+                    archive_backlog,
+                    last_success,
+                    last_error,
+                ),
+            ).fetchone()
+            if installation_id is not None:
+                conn.execute(
+                    """UPDATE connector_installations
+                          SET last_success_at=COALESCE(%s,last_success_at),
+                              last_error_code=%s,updated_at=now()
+                        WHERE id=%s AND tenant_id=%s AND source_id=%s""",
+                    (
+                        last_success,
+                        last_error,
+                        installation_id,
+                        tenant_id,
+                        source_id,
+                    ),
+                )
+        return {
+            "schema_version": 1,
+            "status": "accepted",
+            "reported_at": row["reported_at"],
+        }
+
+    def fleet_status(self, tenant_ids: list[str]) -> list[dict[str, Any]]:
+        """Return source-level operational facts for administered brains."""
+
+        if not tenant_ids:
+            return []
+        if any(
+            not isinstance(value, str) or not V2_AUTHORITY_RE.fullmatch(value)
+            for value in tenant_ids
+        ):
+            raise ValueError("fleet tenant scope is invalid")
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT source.tenant_id,source.source_id,
+                          source.owner_principal_id,
+                          COALESCE(actor.display_name,source.owner_principal_id)
+                            AS owner_display_name,
+                          profile.family AS source_family,
+                          installation.connector_id,installation.execution,
+                          installation.device_id,installation.state,
+                          installation.last_error_code AS installation_error,
+                          installation.last_success_at AS installation_success_at,
+                          health.collector_kind,health.collector_version,
+                          CASE
+                            WHEN health.reported_at IS NULL THEN
+                              CASE
+                                WHEN installation.last_error_code IS NOT NULL
+                                  THEN 'degraded'
+                                WHEN installation.last_success_at IS NOT NULL
+                                  THEN 'ready'
+                                ELSE 'unknown'
+                              END
+                            WHEN health.reported_at < now()-interval '2 minutes'
+                              THEN 'stale'
+                            ELSE health.status
+                          END AS health,
+                          health.reported_at,health.scan_complete,
+                          health.pending_records,health.dead_records,
+                          health.coverage_percent,
+                          health.archive_coverage_percent,
+                          health.archive_backlog,health.last_error_code,
+                          activity.total_records,activity.records_24h,
+                          activity.last_transfer_at,
+                          transfer.bytes_24h
+                   FROM canonical_sources source
+                   LEFT JOIN source_profiles profile
+                     ON profile.source_id=source.source_id
+                   LEFT JOIN collector_health_reports health
+                     ON health.tenant_id=source.tenant_id
+                    AND health.source_id=source.source_id
+                   LEFT JOIN LATERAL (
+                       SELECT item.connector_id,item.execution,item.device_id,
+                              item.state,item.last_error_code,item.last_success_at
+                         FROM connector_installations item
+                        WHERE item.tenant_id=source.tenant_id
+                          AND item.source_id=source.source_id
+                          AND item.state NOT IN ('revoked','uninstalled')
+                        ORDER BY item.updated_at DESC LIMIT 1
+                   ) installation ON true
+                   LEFT JOIN LATERAL (
+                       SELECT person.display_name
+                         FROM canonical_source_actor_bindings binding
+                         JOIN brain_actors person
+                           ON person.tenant_id=binding.tenant_id
+                          AND person.actor_id=binding.actor_id
+                        WHERE binding.tenant_id=source.tenant_id
+                          AND binding.source_id=source.source_id
+                          AND person.active
+                        ORDER BY
+                          CASE binding.relation WHEN 'owner' THEN 0 ELSE 1 END,
+                          lower(person.display_name)
+                        LIMIT 1
+                   ) actor ON true
+                   LEFT JOIN LATERAL (
+                       SELECT count(*)::bigint AS total_records,
+                              count(*) FILTER (
+                                  WHERE event.created_at>=now()-interval '24 hours'
+                              )::bigint AS records_24h,
+                              max(event.created_at) AS last_transfer_at
+                         FROM canonical_events event
+                        WHERE event.tenant_id=source.tenant_id
+                          AND event.source_id=source.source_id
+                   ) activity ON true
+                   LEFT JOIN LATERAL (
+                       SELECT COALESCE(sum(artifact.size_bytes),0)::bigint
+                                AS bytes_24h
+                         FROM raw_artifacts artifact
+                        WHERE artifact.tenant_id=source.tenant_id
+                          AND artifact.source_id=source.source_id
+                          AND artifact.created_at>=now()-interval '24 hours'
+                   ) transfer ON true
+                  WHERE source.tenant_id=ANY(%s)
+                  ORDER BY lower(COALESCE(actor.display_name,source.owner_principal_id)),
+                           COALESCE(installation.device_id,source.source_id),
+                           source.source_id""",
+                (tenant_ids,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def service_metrics(self) -> dict:
         with self.connect() as conn:
