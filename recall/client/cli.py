@@ -19,6 +19,7 @@ from client.mac import (
     store_keychain_token,
 )
 from collector.collector import Collector
+from collector.health import build_health_report
 from client.capture import CaptureClient, ORIGIN
 from client.mcp import McpServer, serve as serve_mcp
 from client.macos_utility import (
@@ -1043,37 +1044,7 @@ def main() -> None:
             doctor = collector.doctor(include_dead_letters=False)
             health_report = None
             if canonical:
-                health = (
-                    "degraded"
-                    if doctor.get("last_error_code") or doctor.get("dead", 0)
-                    else "running"
-                    if doctor.get("running", False)
-                    else "backfilling"
-                    if not doctor.get("scan_complete", False)
-                    else "ready"
-                )
-                report = {
-                    "schema_version": 1,
-                    "collector_kind": args.harness,
-                    "collector_version": doctor.get("collector_version", 1),
-                    "status": health,
-                    "scan_complete": doctor.get("scan_complete", False),
-                    "pending_records": doctor.get("pending", 0),
-                    "dead_records": doctor.get("dead", 0),
-                    "coverage_percent": doctor.get("coverage_percent", 0.0),
-                    "archive_coverage_percent": (
-                        doctor.get("archive_coverage_percent")
-                        if args.harness == "codex"
-                        else None
-                    ),
-                    "archive_backlog": (
-                        doctor.get("archive_backlog")
-                        if args.harness == "codex"
-                        else None
-                    ),
-                    "last_success_epoch": doctor.get("last_success_epoch") or None,
-                    "last_error_code": doctor.get("last_error_code"),
-                }
+                report = build_health_report(args.harness, doctor)
                 try:
                     health_report = canonical[0].report_health(report)
                 except Exception:

@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 from .collector import Collector
+from .health import build_health_report
 from client.mac import (
     CanonicalArchiveClient,
     CanonicalBrainWriter,
@@ -17,6 +18,26 @@ from privacy.policy import AgenticJudge, PrivacyPolicy, load_scoped_virtual_key
 
 def token_from_file(path: str) -> str:
     return load_file_token(Path(path))
+
+
+def _run_once(collector: Collector, canonical_writer, harness: str) -> dict:
+    scan = collector.scan()
+    flush = collector.flush()
+    doctor = collector.doctor(include_dead_letters=False)
+    health_report = None
+    if canonical_writer is not None:
+        try:
+            health_report = canonical_writer.report_health(
+                build_health_report(harness, doctor)
+            )
+        except Exception:
+            health_report = {"schema_version": 1, "status": "unavailable"}
+    return {
+        "scan": scan,
+        "flush": flush,
+        "doctor": doctor,
+        "health_report": health_report,
+    }
 
 
 def main() -> None:
@@ -152,16 +173,23 @@ def main() -> None:
         parser.error("shard index must be within shard count")
     collector.shard_count = args.shard_count
     collector.shard_index = args.shard_index
+
     try:
         if args.command == "scan":
             print(json.dumps(collector.scan(), sort_keys=True))
         elif args.command == "flush":
             print(json.dumps(collector.flush(), sort_keys=True))
         elif args.command == "run":
-            print(json.dumps({
-                "scan": collector.scan(), "flush": collector.flush(),
-                "doctor": collector.doctor(include_dead_letters=False),
-            }, sort_keys=True))
+            print(
+                json.dumps(
+                    _run_once(
+                        collector,
+                        canonical[0] if canonical else None,
+                        args.harness,
+                    ),
+                    sort_keys=True,
+                )
+            )
         elif args.command == "doctor":
             print(json.dumps(collector.doctor(), sort_keys=True))
         elif args.command == "status":
@@ -176,7 +204,17 @@ def main() -> None:
             print(json.dumps(collector.locate_receipt(args.receipt), sort_keys=True))
         else:
             while True:
-                print(json.dumps({"scan": collector.scan(), "flush": collector.flush(), "doctor": collector.doctor(include_dead_letters=False)}, sort_keys=True), flush=True)
+                print(
+                    json.dumps(
+                        _run_once(
+                            collector,
+                            canonical[0] if canonical else None,
+                            args.harness,
+                        ),
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
                 time.sleep(args.interval)
     except KeyboardInterrupt:
         pass
