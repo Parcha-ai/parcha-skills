@@ -157,6 +157,17 @@ deltas are the bridge-integrity carve-outs above. The parity check itself belong
 matrix: run the same probe script in a user-launched session and a Tether-launched session and
 diff the results to empty (modulo the named carve-outs).
 
+## Amendment A3 — 2026-08-26 — Tether agent model policy
+
+Product-owner directive (Miguel): **Tether-spawned Claude agents run `claude-opus-5`, not
+Fable.** Enforced today via `claude_resume_args = ["--model", "claude-opus-5"]` in the machine
+Tether config (per-attempt read, no restart). The rewrite must carry this as configuration, not
+code: the detached-native driver's launch command composes from operator config, and the L3
+canary matrix includes one resume proving the configured model is honored. Background: the
+machine LiteLLM (llm-dev-eng) routes `claude-fable-5` to a Vertex publisher that 403s
+(data-sharing opt-in missing) — discovered 2026-08-22 when every resume of a bound Claude
+session failed before its first turn; the route stays broken and needs no fix for Tether.
+
 ## Chain (loops L0–L3 and repair loops)
 
 The full loop prompts and acceptance tables for L0/R0/L1/R1/L2/R2/L3/R3 are preserved in the
