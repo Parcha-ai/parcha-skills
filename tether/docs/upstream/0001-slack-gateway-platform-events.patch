@@ -1,4 +1,4 @@
-From 7b6abe2bd3768ed7358baced551e4f60410b566e Mon Sep 17 00:00:00 2001
+From 6d2102763764747dbf0bb13fab0968724ae33fd2 Mon Sep 17 00:00:00 2001
 From: "claudio-michel[bot]" <claudio-michel[bot]@users.noreply.github.com>
 Date: Sat, 22 Aug 2026 15:00:02 +0000
 Subject: [PATCH] feat(slack): emit normalized gateway_platform_event for
@@ -33,10 +33,10 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  create mode 100644 tests/gateway/test_slack_platform_events.py
 
 diff --git a/plugins/platforms/slack/adapter.py b/plugins/platforms/slack/adapter.py
-index e017838fc..ffc46ef86 100644
+index a4193a85b..92fb4c141 100644
 --- a/plugins/platforms/slack/adapter.py
 +++ b/plugins/platforms/slack/adapter.py
-@@ -5332,6 +5332,22 @@ class SlackAdapter(BasePlatformAdapter):
+@@ -5511,6 +5511,22 @@ class SlackAdapter(BasePlatformAdapter):
  
          action = "removed" if removed else "added"
  
@@ -59,7 +59,7 @@ index e017838fc..ffc46ef86 100644
          # Fire the gateway hook surface first (reaction:added/removed) so
          # hook consumers observe every human reaction even when agent
          # routing below is disabled. getattr-guard: tests build adapters
-@@ -5744,6 +5760,109 @@ class SlackAdapter(BasePlatformAdapter):
+@@ -5923,6 +5939,109 @@ class SlackAdapter(BasePlatformAdapter):
                      return True
          return False
  
@@ -169,7 +169,7 @@ index e017838fc..ffc46ef86 100644
      async def _handle_slack_message(
          self, event: dict, payload: Optional[dict] = None
      ) -> None:
-@@ -5775,6 +5894,30 @@ class SlackAdapter(BasePlatformAdapter):
+@@ -5954,6 +6073,30 @@ class SlackAdapter(BasePlatformAdapter):
              if not isinstance(updated_message, dict):
                  return
  
@@ -200,7 +200,7 @@ index e017838fc..ffc46ef86 100644
              original_message_ts = str(updated_message.get("ts") or "")
              if (
                  original_message_ts
-@@ -5865,6 +6008,26 @@ class SlackAdapter(BasePlatformAdapter):
+@@ -6044,6 +6187,26 @@ class SlackAdapter(BasePlatformAdapter):
          # added by edit can still wake the bot once.
          subtype = event.get("subtype")
          if subtype == "message_deleted":

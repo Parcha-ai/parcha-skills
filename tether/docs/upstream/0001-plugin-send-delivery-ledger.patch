@@ -1,4 +1,4 @@
-From d8de9c773a57d69ff6f3dba40e70888b11dd7f3c Mon Sep 17 00:00:00 2001
+From 2f269ac10d097e566c2902d0cf367b541d7479b1 Mon Sep 17 00:00:00 2001
 From: "claudio-michel[bot]" <claudio-michel[bot]@users.noreply.github.com>
 Date: Sat, 22 Aug 2026 15:03:17 +0000
 Subject: [PATCH] feat(gateway,tools): record plugin-path sends in the delivery
@@ -31,8 +31,9 @@ to the platform.
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 ---
  .../test_send_message_delivery_ledger.py      | 161 ++++++++++++++++++
+ tests/tools/test_send_message_tool.py         |   3 +-
  tools/send_message_tool.py                    |  66 ++++++-
- 2 files changed, 226 insertions(+), 1 deletion(-)
+ 3 files changed, 228 insertions(+), 2 deletions(-)
  create mode 100644 tests/tools/test_send_message_delivery_ledger.py
 
 diff --git a/tests/tools/test_send_message_delivery_ledger.py b/tests/tools/test_send_message_delivery_ledger.py
@@ -202,8 +203,22 @@ index 000000000..69f059be4
 +    rows = _rows()
 +    assert len(rows) == 1
 +    assert rows[0]["state"] == "delivered"
+diff --git a/tests/tools/test_send_message_tool.py b/tests/tools/test_send_message_tool.py
+index 5aaffdd59..8e2d224d6 100644
+--- a/tests/tools/test_send_message_tool.py
++++ b/tests/tools/test_send_message_tool.py
+@@ -1711,7 +1711,8 @@ class TestSendViaAdapterStandaloneFallback:
+             "done",
+         )
+ 
+-        assert result == {"success": True, "message_id": "ntfy-id"}
++        assert result["success"] is True
++        assert result["message_id"] == "ntfy-id"
+         assert recorded["chat_id"] == "alerts-channel"
+         assert recorded["content"] == "done"
+         assert recorded["metadata"] == {"publish_topic": "alerts-channel"}
 diff --git a/tools/send_message_tool.py b/tools/send_message_tool.py
-index 403d49fdc..a35942144 100644
+index 08f72d950..cd5999241 100644
 --- a/tools/send_message_tool.py
 +++ b/tools/send_message_tool.py
 @@ -827,6 +827,21 @@ def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id:

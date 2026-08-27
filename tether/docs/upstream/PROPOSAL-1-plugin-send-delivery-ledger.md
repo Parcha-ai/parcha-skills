@@ -64,3 +64,20 @@ reproduced on pristine main). Filing blocked on credentials: the claudio-michel 
 cannot fork or PR outside its installations — apply the patch on a fork from any user account,
 push branch `feat/plugin-send-delivery-ledger`, and open the PR with this document's Problem /
 Proposal / Tests sections as the body.
+
+## Prior art (updated 2026-08-26, rebased on main d9e4b234a)
+
+Searched open and merged PRs/issues per CONTRIBUTING. Related, none resolving this gap:
+
+- **#81554** (open, P3, needs-decision, stalled since 08-12) proposes a full durable-execution
+  runtime and its problem statement names this exact gap ("the `send_message` tool… zero delivery
+  durability"). This PR is the minimal, decision-free subset: it reuses the EXISTING
+  `delivery_obligations` ledger with zero new subsystems, and composes with (or is subsumed by)
+  #81554 if that direction is chosen. Cite it in the PR body.
+- **#73923** (open) adds forensic fields to the same ledger — orthogonal, no conflict.
+- **#70694** (open issue) discusses delivery identity at the adapter boundary — adjacent concept,
+  different layer.
+
+Rebase note: upstream added an ntfy test asserting the exact success-dict shape; the patch relaxes
+that one assertion to per-key checks so the additive `obligation_id` passes (their additive-compat
+policy). Verified on main d9e4b234a: 91/91 across send_message + ledger suites.

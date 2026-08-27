@@ -51,3 +51,14 @@ identities, has_hook fast-path skips normalization, raising observers never brea
 listener), plus the full Slack + platform-event gateway selection green: 563 passed
 (pre-existing environmental collection error in test_teams.py excluded, reproduced on pristine
 main). Filing blocked on credentials, same as proposal 1.
+
+## Prior art (updated 2026-08-26, rebased on main d9e4b234a)
+
+Searched open and merged PRs/issues per CONTRIBUTING. No PR adds Slack fire-sites; related:
+
+- **#89908** (open) suppresses Slack's phantom `message_changed` re-emits (unfurl metadata).
+  Composes cleanly: that PR reduces noise into the branch where our observer fires; whichever
+  lands second rebases trivially. Cite it in the PR body.
+- **#73450 / #83501** (open) fix edit-replay dispatch bugs in the same branch — same relationship.
+
+Verified on main d9e4b234a: 62/62 across slack/discord/hook platform-event suites.
