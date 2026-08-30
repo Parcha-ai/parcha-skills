@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from . import admission
-from .journal import DurableJournal, JournalError
+from .journal import DurableJournal
 
 logger = logging.getLogger("tether.plugin")
 

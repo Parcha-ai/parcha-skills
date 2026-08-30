@@ -855,7 +855,6 @@ class DomainRuntime:
         response_bytes: int | None,
         error_code: str | None,
     ) -> str:
-        attempt_id = attempt["attempt_id"]
         current = attempt["state"]
         if receipt_state == "running":
             if current == "prepared":
