@@ -146,8 +146,6 @@ class ShadowParityTest(unittest.TestCase):
         settings = self.admission.AdmissionSettings(
             workspace_id=WORKSPACE,
             allowed_users=frozenset({OWNER}),
-            persona_id="primary",
-            policy_generation=1,
         )
         if case.get("event_kind", "message") != "message":
             # These subtypes never reach pre_gateway_dispatch today.

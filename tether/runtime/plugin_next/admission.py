@@ -26,19 +26,20 @@ VERDICT_UNCONFIGURED = "unconfigured"  # no valid security domain configured
 
 @dataclass(frozen=True)
 class AdmissionSettings:
+    """What admission actually needs: a workspace and an owner set.
+
+    Persona and policy generation belong to the schema-18 security-domain
+    descriptor, not to this decision — nothing below reads them. Requiring
+    them here would force config keys the deployed schema-17 broker rejects
+    outright, so the shadow would demand breaking production to observe it.
+    """
+
     workspace_id: str
     allowed_users: frozenset[str]
-    persona_id: str
-    policy_generation: int
 
     @property
     def configured(self) -> bool:
-        return bool(
-            self.workspace_id
-            and self.allowed_users
-            and self.persona_id
-            and self.policy_generation >= 1
-        )
+        return bool(self.workspace_id and self.allowed_users)
 
 
 def event_fingerprint(fields: dict[str, Any]) -> str:

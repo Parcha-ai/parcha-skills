@@ -105,8 +105,6 @@ class PluginEnvironment(unittest.TestCase):
         values = {
             "team_id": "T12345678",
             "allowed_users": ["U12345678"],
-            "persona_id": "primary",
-            "policy_generation": 1,
         }
         values.update(overrides)
         lines = []
@@ -371,3 +369,36 @@ class InvalidatedBindingTest(PluginEnvironment):
     def test_active_binding_is_still_claimed(self):
         self.seed_v18_binding("active")
         self.assertEqual(self.dispatch_verdict(), "admit")
+
+
+class AllowlistResolutionTest(PluginEnvironment):
+    """Owners resolve the way the broker resolves them, not config-only."""
+
+    def test_hermes_allowlist_env_authorizes_an_owner(self):
+        self.write_config(allowed_users=[])
+        with mock.patch.dict(
+            os.environ, {"SLACK_ALLOWED_USERS": "U12345678,UOTHER01"}, clear=False
+        ):
+            settings = self.module.load_settings()
+        self.assertIn("U12345678", settings.allowed_users)
+        self.assertIn("UOTHER01", settings.allowed_users)
+        self.assertTrue(settings.configured)
+
+    def test_config_and_env_owners_merge(self):
+        with mock.patch.dict(
+            os.environ, {"GATEWAY_ALLOWED_USERS": "UENVONLY"}, clear=False
+        ):
+            settings = self.module.load_settings()
+        self.assertEqual(
+            {"U12345678", "UENVONLY"}, set(settings.allowed_users)
+        )
+
+    def test_wildcard_and_malformed_entries_are_refused(self):
+        self.write_config(allowed_users=[])
+        with mock.patch.dict(
+            os.environ,
+            {"SLACK_ALLOWED_USERS": "*, ,not a user id,U12345678"},
+            clear=False,
+        ):
+            settings = self.module.load_settings()
+        self.assertEqual({"U12345678"}, set(settings.allowed_users))
