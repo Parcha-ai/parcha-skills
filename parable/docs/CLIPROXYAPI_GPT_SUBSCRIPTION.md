@@ -1,8 +1,8 @@
 # GPT, Claude, Grok, and Kimi subscriptions in one Claude Code session
 
-Parable can run stock Claude Code with exact Fable or `gpt-5.6-sol` as the parent and
-exact GPT, Claude, Grok, and Kimi named agents through one user-owned, loopback-only
-CLIProxyAPI process.
+Parable can run stock Claude Code with exact Fable, `gpt-5.6-sol`, or `grok-4.6` as the
+parent and exact GPT, Claude, Grok, and Kimi named agents through one user-owned,
+loopback-only CLIProxyAPI process.
 
 You can also run in **solo mode** (`parable --solo <model>`) to launch with a single exact model from the loopback proxy — no multi-model casting, no agent delegation. Solo requires `[claude]` configured and only works with exact models exposed through the loopback proxy (not external providers like codex, pi, or cursor). It disables all Agent tool calls and agent synchronization.
 
@@ -93,10 +93,12 @@ parable
 ```
 
 That is the whole ordinary path. Bare `parable` selects `auto` and high effort. `auto` prefers Fable when it is configured and
-its Claude usage is below 80%. When that pool is tight it selects Sol if the
-ChatGPT pool has more or unknown headroom; if both are tight, it takes the less
-used pool. Unknown Claude usage keeps the preferred Fable parent. Use
-`parable --brain fable` or `parable --brain sol` to pin one explicitly.
+its Claude usage is below 80%. When that pool is tight it selects Sol while the
+ChatGPT pool has unknown or available headroom. It uses configured Grok 4.6 when
+Sol is unavailable or both measured pools are tight; xAI does not expose a usage
+probe, so Parable treats Grok only as an ordered fallback. Unknown Claude usage
+keeps the preferred Fable parent. Use `parable --brain fable`,
+`parable --brain sol`, or `parable --brain grok` to pin one explicitly.
 
 To run a single model with no cast and no delegation, use solo mode:
 
@@ -195,7 +197,7 @@ Supported selections are:
 |---|---|
 | `claude` | Fable parent plus exact Fable 5, Sonnet 5, Opus 4.8, and Haiku 4.5 agents |
 | `claude,chatgpt` | Claude cast plus exact Sol, Terra, and Luna; Sol becomes an eligible fallback parent |
-| `claude,xai` | Claude cast plus exact Grok 4.5 |
+| `claude,xai` | Claude cast plus exact Grok 4.6; Grok becomes an eligible fallback parent |
 | `claude,kimi` | Claude cast plus exact Kimi Code through native Kimi OAuth |
 | `claude,chatgpt,xai` | Claude, GPT, and Grok casts (eight models) |
 | `claude,chatgpt,kimi` | Claude and GPT casts, plus Kimi (eight models) |
@@ -255,10 +257,10 @@ an existing checkout. The build stops before
 
 | Item | Pin |
 |---|---|
-| CLIProxyAPI base | `v7.2.103` / `cade44b9cdee6b9328ea2648fd119129fdf11e2d` |
-| Vendored patch SHA-256 | `c0b4c52d4b35040427e1aee0067c99da7068598803604c435ad591d577b2dc5d` |
-| Verified toolchain | Go `1.26.0` |
-| Verified harness | Claude Code `2.1.220` |
+| CLIProxyAPI base | `v7.2.131` / `323b7276bc5bd251e5497699e42c556d6316b30c` |
+| Vendored patch SHA-256 | `89f1cbe8b274c114b94bd1f5146658046e1124f1510a402359f26e2a87f38b4a` |
+| Verified toolchain | Go `1.24.3` |
+| Verified harness | Claude Code `2.1.251` |
 
 The builder applies the vendored effort-translation patch, runs the focused Go
 test slices, and emits a mode-`0700` `parable-cliproxy-api` executable. An
@@ -273,11 +275,19 @@ Prerequisites are Node 18+, Python 3.11+, Git, Go, and stock Claude Code.
 
 ## Exact proved cast and effort behavior
 
-The existing live proof covered 30 parent/child cells: five Sol parent effort values
+On 2026-08-30, the managed `v7.2.131` build exposed exact `grok-4.6` through
+the authenticated xAI OAuth catalog. Stock Claude Code `2.1.251` completed a
+Grok parent text turn, real Bash write, JSON-schema structured output, explicit
+`xhigh` turn, and a Grok-parent invocation of exact `claude-sonnet-5`. The
+parent and child both appeared under their exact model ids with one completed
+`parable-sonnet-exact` subagent.
+
+The earlier live proof covered 30 parent/child cells: five Sol parent effort values
 times six exact named children. Every child used Bash and the parent consumed
-its result. Kimi Code now uses the same exact-model route through `kimi-k3`, but
-it is not part of that earlier proof set; complete the authenticated Kimi sentinel
-before claiming live effort fidelity.
+its result. The Grok rows are historical Grok 4.5 results and do not prove the
+current Grok 4.6 route. Kimi Code now uses the same exact-model route through
+`kimi-k3`, but it is not part of that earlier proof set; complete the authenticated
+Kimi sentinel before claiming live effort fidelity.
 
 | Exact child | Subscription | `low` | `medium` | `high` | `xhigh` | `max` |
 |---|---|---|---|---|---|---|

@@ -174,7 +174,7 @@ function rootLaunchArgs(raw) {
 }
 
 function printUsage() {
-  log("usage: parable [--brain auto|fable|sol|config] [--] [CLAUDE_ARGS...]");
+  log("usage: parable [--brain auto|fable|sol|grok|config] [--] [CLAUDE_ARGS...]");
   log("       parable --solo <alias|exact-model> [--] [CLAUDE_ARGS...]");
   log("       parable <install|setup|doctor|auth|proxy|claude|agents sync> [options]");
   log("  (no command)       start the normal auto-brain Claude Code session; flags pass to Claude");

@@ -26,14 +26,14 @@ const PARABLE_PY = path.join(
   PACKAGE_ROOT, "skills", "parable", "scripts", "parable.py",
 );
 const PATCH_PATH = path.join(
-  path.resolve(__dirname, ".."), "patches", "cliproxyapi-v7.2.103-claude-effort.patch",
+  path.resolve(__dirname, ".."), "patches", "cliproxyapi-v7.2.131-claude-effort.patch",
 );
 
 const SETUP_SCHEMA_VERSION = 1;
 const DEFAULT_PORT = 8317;
 const PROXY_REPOSITORY = "https://github.com/router-for-me/CLIProxyAPI.git";
-const PROXY_COMMIT = "cade44b9cdee6b9328ea2648fd119129fdf11e2d";
-const PROXY_PATCH_SHA256 = "c0b4c52d4b35040427e1aee0067c99da7068598803604c435ad591d577b2dc5d";
+const PROXY_COMMIT = "323b7276bc5bd251e5497699e42c556d6316b30c";
+const PROXY_PATCH_SHA256 = "89f1cbe8b274c114b94bd1f5146658046e1124f1510a402359f26e2a87f38b4a";
 const PROXY_BINARY_NAME = "parable-cliproxy-api";
 const DEFAULT_PROXY_READY_TIMEOUT_MS = 15_000;
 const PROXY_PROBE_TIMEOUT_MS = 750;
@@ -70,8 +70,20 @@ const VENDORS = Object.freeze({
       "claude-haiku-4-5-20251001",
     ]),
   }),
-  xai: Object.freeze({ models: Object.freeze(["grok-4.5"]) }),
+  xai: Object.freeze({ models: Object.freeze(["grok-4.6"]) }),
   kimi: Object.freeze({ models: Object.freeze(["kimi-k3"]) }),
+});
+const GROK_EXECUTOR = Object.freeze({
+  model: "grok-4.6",
+  tags: Object.freeze(["architect", "implementer", "systems", "third-family", "subscription"]),
+  useFor: "Coding, agentic implementation, systems work, architectural second opinions, parent orchestration, and cross-family smoke testing.",
+  avoidFor: "Delegation from a Grok parent, routine mechanical work, or reviewing its own diff.",
+});
+const PREVIOUS_GROK_EXECUTOR = Object.freeze({
+  model: "grok-4.5",
+  tags: Object.freeze(["implementer", "systems", "third-family", "subscription"]),
+  useFor: "Bounded terminal-heavy or systems implementation, especially Rust or C++, plus cross-family smoke testing.",
+  avoidFor: "Sole final factual review, orchestration, ambiguous product architecture, or reviewing its own diff.",
 });
 
 class OnboardingError extends Error {
@@ -591,8 +603,10 @@ function executorBlock(id, model, effort, tags, useFor, avoidFor = "Reviewing it
   ];
 }
 
-function renderParableToml(port, vendors) {
+function renderParableToml(port, vendors, options = {}) {
   const selected = new Set(vendors);
+  const grokExecutor = options.grokExecutor || GROK_EXECUTOR;
+  const grokOrchestrator = options.grokOrchestrator !== false;
   const hasChatGPT = selected.has("chatgpt");
   const reviewer = "opus_exact";
   const defaultExecutor = hasChatGPT ? "terra" : "sonnet_exact";
@@ -665,9 +679,9 @@ function renderParableToml(port, vendors) {
   if (selected.has("xai")) {
     lines.push(
       ...executorBlock(
-        "grok", "grok-4.5", "high", ["implementer", "systems", "third-family", "subscription"],
-        "Bounded terminal-heavy or systems implementation, especially Rust or C++, plus cross-family smoke testing.",
-        "Sole final factual review, orchestration, ambiguous product architecture, or reviewing its own diff.",
+        "grok", grokExecutor.model, "high", grokExecutor.tags,
+        grokExecutor.useFor,
+        grokExecutor.avoidFor,
       ),
     );
   }
@@ -708,6 +722,7 @@ function renderParableToml(port, vendors) {
   if (selected.has("kimi")) smoke.unshift("kimi");
   const architecture = hasChatGPT
     ? ["fable_exact", "opus_exact", "sol_exact"] : ["fable_exact", "opus_exact"];
+  if (selected.has("xai") && grokOrchestrator) architecture.push("grok");
   lines.push(
     "[routing]",
     `mechanical = ${JSON.stringify(mechanical)}`,
@@ -723,6 +738,13 @@ function renderParableToml(port, vendors) {
     "",
   );
   return lines.join("\n");
+}
+
+function renderPreviousParableToml(port, vendors) {
+  return renderParableToml(port, vendors, {
+    grokExecutor: PREVIOUS_GROK_EXECUTOR,
+    grokOrchestrator: false,
+  });
 }
 
 function manifestFor(configDir, authDir, paths, vendors, proxyBinary, port) {
@@ -795,7 +817,12 @@ function validateExistingSetup(configDir, authDir, paths, desired, options = {})
         renderLegacyProxyYaml(desired.port, authDir, token),
       ].includes(actual)
     );
-    if (actual !== content && !legacyProxyConfig) {
+    const previousParableConfig = (
+      options.acceptPreviousParableConfig === true
+      && target === paths.parableConfig
+      && actual === renderPreviousParableToml(desired.port, desired.vendors)
+    );
+    if (actual !== content && !legacyProxyConfig && !previousParableConfig) {
       throw new OnboardingError(`generated setup file has changed; refusing to overwrite: ${target}`);
     }
   }
@@ -821,20 +848,42 @@ function migrateLegacyProxyConfig(paths, desired, authDir) {
   return true;
 }
 
-function activateGeneratedProxyConfig(context, log) {
-  const migrated = migrateLegacyProxyConfig(
+function migratePreviousParableConfig(paths, desired) {
+  const current = renderParableToml(desired.port, desired.vendors);
+  const actual = fs.readFileSync(paths.parableConfig, "utf8");
+  if (actual === current) return false;
+  if (actual !== renderPreviousParableToml(desired.port, desired.vendors)) {
+    throw new OnboardingError(
+      `generated setup file has changed; refusing to overwrite: ${paths.parableConfig}`,
+    );
+  }
+  replacePrivateFileSet([[paths.parableConfig, current]]);
+  return true;
+}
+
+function activateGeneratedSetupMigrations(context, log) {
+  const migratedParableConfig = migratePreviousParableConfig(
+    context.paths,
+    context.manifest,
+  );
+  const migratedProxyConfig = migrateLegacyProxyConfig(
     context.paths,
     context.manifest,
     context.authDir,
   );
-  if (!migrated) return false;
+  if (!migratedParableConfig && !migratedProxyConfig) return false;
   validateExistingSetup(
     context.configDir,
     context.authDir,
     context.paths,
     context.manifest,
   );
-  log(`proxy: updated generated retry policy -> ${context.paths.proxyConfig}`);
+  if (migratedParableConfig) {
+    log(`setup: upgraded generated Grok model -> ${context.paths.parableConfig}`);
+  }
+  if (migratedProxyConfig) {
+    log(`proxy: updated generated retry policy -> ${context.paths.proxyConfig}`);
+  }
   return true;
 }
 
@@ -1149,25 +1198,11 @@ async function runProxyUpgrade(argv, log) {
   }
 
   const context = loadSetupContext();
+  const migrated = activateGeneratedSetupMigrations(context, log);
   const destination = defaultBuildDirectory();
   const nextBinary = path.join(destination, PROXY_BINARY_NAME);
   if (context.manifest.proxyBinary === nextBinary) {
-    const migrated = migrateLegacyProxyConfig(
-      context.paths,
-      context.manifest,
-      context.authDir,
-    );
-    validateExistingSetup(
-      context.configDir,
-      context.authDir,
-      context.paths,
-      context.manifest,
-    );
-    log(
-      migrated
-        ? `proxy is current; updated generated compatibility -> ${context.paths.proxyConfig}`
-        : `proxy is current -> ${nextBinary}`,
-    );
+    log(migrated ? `proxy is current; setup migrations applied` : `proxy is current -> ${nextBinary}`);
     return;
   }
   if (lstatOrNull(destination)) {
@@ -1275,7 +1310,11 @@ function loadSetupContext(options = {}) {
     authDir,
     paths,
     desired,
-    { ...options, acceptLegacyProxyConfig: true },
+    {
+      ...options,
+      acceptLegacyProxyConfig: true,
+      acceptPreviousParableConfig: true,
+    },
   );
   return { configDir, authDir, paths, manifest: desired, vendors };
 }
@@ -1622,7 +1661,7 @@ async function runProxyStart(argv, log) {
     return 0;
   }
   const context = loadSetupContext();
-  activateGeneratedProxyConfig(context, log);
+  activateGeneratedSetupMigrations(context, log);
   const child = spawn(
     context.manifest.proxyBinary,
     ["--config", context.paths.proxyConfig, "--local-model"],
@@ -1849,7 +1888,7 @@ function spawnFinalize(argv, env) {
 async function runManagedClient(
   context, token, spawnClient, clientLabel, log, recovery = null,
 ) {
-  activateGeneratedProxyConfig(context, log);
+  activateGeneratedSetupMigrations(context, log);
   const initialProbe = await probeModels(context.manifest.port, token);
   if (initialProbe.kind === "occupied") {
     throw new OnboardingError(
@@ -2087,8 +2126,12 @@ async function runSetupAddVendors(options, log) {
       authDir,
       paths,
       currentDesired,
-      { acceptLegacyProxyConfig: true },
+      {
+        acceptLegacyProxyConfig: true,
+        acceptPreviousParableConfig: true,
+      },
     );
+    migratePreviousParableConfig(paths, currentDesired);
     migrateLegacyProxyConfig(paths, currentDesired, authDir);
     validateExistingSetup(configDir, authDir, paths, currentDesired);
   } catch (error) {
@@ -2256,16 +2299,24 @@ async function runSetup(argv, log) {
         authDir,
         paths,
         desired,
-        { acceptLegacyProxyConfig: true },
+        {
+          acceptLegacyProxyConfig: true,
+          acceptPreviousParableConfig: true,
+        },
       );
+      const migratedParableConfig = migratePreviousParableConfig(paths, desired);
       const migratedProxyConfig = migrateLegacyProxyConfig(paths, desired, authDir);
       validateExistingSetup(configDir, authDir, paths, desired);
       validateParableConfig(paths.parableConfig, configDir);
-      log(
-        migratedProxyConfig
-          ? `updated generated proxy compatibility -> ${paths.proxyConfig}`
-          : `setup is valid and unchanged -> ${configDir}`,
-      );
+      if (migratedParableConfig) {
+        log(`upgraded generated Grok model -> ${paths.parableConfig}`);
+      }
+      if (migratedProxyConfig) {
+        log(`updated generated proxy compatibility -> ${paths.proxyConfig}`);
+      }
+      if (!migratedParableConfig && !migratedProxyConfig) {
+        log(`setup is valid and unchanged -> ${configDir}`);
+      }
     } else {
       const configCreated = createPrivateDirectory(configDir, "configuration directory");
       const authCreated = createPrivateDirectory(authDir, "CLIProxyAPI auth directory");

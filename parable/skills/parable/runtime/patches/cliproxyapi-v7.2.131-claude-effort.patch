@@ -1,4 +1,4 @@
-From a7b2659ef395ac71a22c60c6405f0113cffcefe9 Mon Sep 17 00:00:00 2001
+From f2ce26dbeae76ce1a4e1c5c26305169cb3a6055c Mon Sep 17 00:00:00 2001
 From: "claudio-michel[bot]"
  <1592301+claudio-michel[bot]@users.noreply.github.com>
 Date: Mon, 20 Jul 2026 04:13:26 +0000
@@ -10,7 +10,7 @@ Subject: [PATCH 1/2] test: reproduce Claude top-level effort loss
  2 files changed, 23 insertions(+)
 
 diff --git a/internal/translator/codex/claude/codex_claude_request_test.go b/internal/translator/codex/claude/codex_claude_request_test.go
-index 446e1376..8357a64a 100644
+index 9db9c069..029a2824 100644
 --- a/internal/translator/codex/claude/codex_claude_request_test.go
 +++ b/internal/translator/codex/claude/codex_claude_request_test.go
 @@ -262,6 +262,19 @@ func TestConvertClaudeRequestToCodex_ServiceTier(t *testing.T) {
@@ -34,10 +34,10 @@ index 446e1376..8357a64a 100644
  	longID := "toolu_" + strings.Repeat("a", 62)
  	if len(longID) <= 64 {
 diff --git a/test/thinking_conversion_test.go b/test/thinking_conversion_test.go
-index 2a95d107..f434fde1 100644
+index 72299d85..7263e071 100644
 --- a/test/thinking_conversion_test.go
 +++ b/test/thinking_conversion_test.go
-@@ -2858,6 +2858,16 @@ func TestThinkingE2EClaudeAdaptive_Body(t *testing.T) {
+@@ -3153,6 +3153,16 @@ func TestThinkingE2EClaudeAdaptive_Body(t *testing.T) {
  			expectValue: "minimal",
  			expectErr:   false,
  		},
@@ -57,7 +57,8 @@ index 2a95d107..f434fde1 100644
 -- 
 2.43.0
 
-From 767ee1358432e6dc424f9912dff9743f99f8dae8 Mon Sep 17 00:00:00 2001
+
+From dafb75cec191db8207fe28e162c586e991a368d5 Mon Sep 17 00:00:00 2001
 From: "claudio-michel[bot]"
  <1592301+claudio-michel[bot]@users.noreply.github.com>
 Date: Mon, 20 Jul 2026 04:21:30 +0000
@@ -73,10 +74,10 @@ Subject: [PATCH 2/2] fix(thinking): preserve Claude effort without thinking
  create mode 100644 internal/thinking/apply_test.go
 
 diff --git a/internal/thinking/apply.go b/internal/thinking/apply.go
-index 8a6f873e..877475a0 100644
+index 92e6161c..1c6cf16d 100644
 --- a/internal/thinking/apply.go
 +++ b/internal/thinking/apply.go
-@@ -498,16 +498,50 @@ func reasoningEffortFromConfig(config ThinkingConfig) string {
+@@ -623,16 +623,50 @@ func reasoningEffortFromConfig(config ThinkingConfig) string {
  	}
  }
  
@@ -127,7 +128,7 @@ index 8a6f873e..877475a0 100644
  	thinkingType := gjson.GetBytes(body, "thinking.type").String()
  	if thinkingType == "disabled" {
  		return ThinkingConfig{Mode: ModeNone, Budget: 0}
-@@ -516,19 +550,8 @@ func extractClaudeConfig(body []byte) ThinkingConfig {
+@@ -641,19 +675,8 @@ func extractClaudeConfig(body []byte) ThinkingConfig {
  		// Claude adaptive thinking uses output_config.effort (low/medium/high/max).
  		// We only treat it as a thinking config when effort is explicitly present;
  		// otherwise we passthrough and let upstream defaults apply.
@@ -149,7 +150,7 @@ index 8a6f873e..877475a0 100644
  		}
  		return ThinkingConfig{}
  	}
-@@ -551,6 +574,14 @@ func extractClaudeConfig(body []byte) ThinkingConfig {
+@@ -676,6 +699,14 @@ func extractClaudeConfig(body []byte) ThinkingConfig {
  		return ThinkingConfig{Mode: ModeAuto, Budget: -1}
  	}
  
@@ -264,10 +265,10 @@ index 00000000..a04832a0
 +	}
 +}
 diff --git a/internal/translator/codex/claude/codex_claude_request.go b/internal/translator/codex/claude/codex_claude_request.go
-index 3a27e850..c8feb5bf 100644
+index 906ae668..9d8caa72 100644
 --- a/internal/translator/codex/claude/codex_claude_request.go
 +++ b/internal/translator/codex/claude/codex_claude_request.go
-@@ -313,7 +313,12 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool)
+@@ -349,7 +349,12 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool,
  
  	// Convert thinking.budget_tokens to reasoning.effort.
  	reasoningEffort := "medium"
@@ -281,7 +282,7 @@ index 3a27e850..c8feb5bf 100644
  		switch thinkingConfig.Get("type").String() {
  		case "enabled":
  			if budgetTokens := thinkingConfig.Get("budget_tokens"); budgetTokens.Exists() {
-@@ -325,11 +330,7 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool)
+@@ -361,11 +366,7 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool,
  		case "adaptive", "auto":
  			// Adaptive thinking can carry an explicit effort in output_config.effort (Claude 4.6).
  			// Pass through directly; ApplyThinking handles clamping to target model's levels.
@@ -295,7 +296,7 @@ index 3a27e850..c8feb5bf 100644
  			} else {
  				reasoningEffort = string(thinking.LevelXHigh)
 diff --git a/internal/translator/codex/claude/codex_claude_request_test.go b/internal/translator/codex/claude/codex_claude_request_test.go
-index 8357a64a..5902e4a2 100644
+index 029a2824..21d3f68f 100644
 --- a/internal/translator/codex/claude/codex_claude_request_test.go
 +++ b/internal/translator/codex/claude/codex_claude_request_test.go
 @@ -262,16 +262,83 @@ func TestConvertClaudeRequestToCodex_ServiceTier(t *testing.T) {

@@ -113,9 +113,26 @@ extra service.
 type = "codex-native"
 ```
 
-Uses codex's own auth (ChatGPT login or `OPENAI_API_KEY`) and model catalog — no overrides
-injected beyond `model` and effort. This is the zero-risk path: codex's home models run its
-harness exactly as designed.
+Uses codex's own auth (ChatGPT login or `OPENAI_API_KEY`) and model catalog. By default Parable
+injects only `model` and effort, so Codex's home models run their native harness. Executor-level
+`extra_config` adds explicit raw `-c` values when needed. For a Parable-only large-context Sol
+lane:
+
+```toml
+[executors.sol]
+provider = "openai"
+model = "gpt-5.6-sol"
+effort = "xhigh"
+context_ktok = 1050
+extra_config = [
+  "model_context_window=1000000",
+  "model_auto_compact_token_limit=900000",
+]
+```
+
+The overrides are replayed on resume and do not edit `~/.codex/config.toml`. The 900K limit is
+90% of the configured 1M budget. Use Codex `/status` to verify the live window granted by the
+server and account.
 
 ## Cursor (cursor-agent)
 
@@ -174,9 +191,10 @@ parable
 
 Claude is the baseline pool for the Claude Code harness; interactive setup asks whether
 to add ChatGPT, xAI, and Kimi subscriptions, and offers the pinned build when no proxy is installed.
-Bare `parable` stays on Fable without ChatGPT. When ChatGPT is selected, it
-prefers Fable while its pool has room and can move to Sol when it is tight. The launcher owns
-proxy start, authenticated readiness, exact catalog sync,
+Bare `parable` prefers Fable while its pool has room. ChatGPT adds Sol as the first fallback; xAI
+adds exact Grok 4.6 as an explicit parent and the ordered fallback when Sol is unavailable or both
+measured pools are tight. No xAI usage endpoint is available, so this policy never claims measured
+Grok headroom. The launcher owns proxy start, authenticated readiness, exact catalog sync,
 stock-Claude launch, signal forwarding, and cleanup. It reuses but never stops
 a healthy existing endpoint. `parable proxy start` and
 `parable setup finalize` remain explicit troubleshooting commands. Headless
@@ -211,8 +229,8 @@ use_for = "Implementation through Claude subscription OAuth."
 
 [executors.grok]
 provider = "claude"
-model = "grok-4.5"
-use_for = "Third-family implementation or review through xAI subscription OAuth."
+model = "grok-4.6"
+use_for = "Coding, systems work, architectural second opinions, and parent orchestration through xAI subscription OAuth."
 
 [executors.kimi]
 provider = "claude"
@@ -245,43 +263,52 @@ and [mechanism diagnosis](../../../docs/evidence/g1-gpt-model-effort-live/mechan
 record the 3/15 exact baseline. Setting
 `CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1` does not change the wire shape.
 
-A source patch rebased onto CLIProxyAPI `v7.2.103`, commit
-`cade44b9cdee6b9328ea2648fd119129fdf11e2d`, fixes the general
-Claude-to-Codex translation boundary. Its independently built binary preserved
-`low|medium|high|xhigh|max` exactly for all three models: 15/15 text cells and
-3/3 medium tool canaries passed through ChatGPT OAuth. See the
+A source patch originally proved against `v7.2.103` and now rebased onto
+CLIProxyAPI `v7.2.131`, commit
+`323b7276bc5bd251e5497699e42c556d6316b30c`, fixes the general
+Claude-to-Codex translation boundary while adding the upstream exact Grok 4.6
+registry entry. The earlier independently built binary preserved
+`low|medium|high|xhigh|max` exactly for all three GPT models: 15/15 text cells
+and 3/3 medium tool canaries passed through ChatGPT OAuth. See the
 [patched live receipt](../../../docs/evidence/e2-cliproxy-effort-live/receipt.json).
 
-The patch is not an upstream release. Until CLIProxyAPI merges and releases
-the change, stock `v7.2.103` users must treat non-medium effort as
-accepted-but-not-effective. Follow the
+The effort fix is still not an upstream release. Stock `v7.2.131` users must
+treat non-medium Claude-to-Codex effort as accepted-but-not-effective. Follow the
 [pinned managed setup path](../../../docs/CLIPROXYAPI_GPT_SUBSCRIPTION.md)
 for the exact build, OAuth, proxy, and Parable commands.
 
-### Verified Grok 4.5 subscription support
+### Current Grok 4.6 route and historical Grok 4.5 proof
 
-The same patched localhost build exposes exact `grok-4.5` through per-user
-xAI OAuth; no `XAI_API_KEY`, broker, or shared deployment is involved. With
-stock Claude Code `2.1.215`, Grok completed 5/5 main-model text cells and 3/3
-real Bash canaries. `low|medium|high` are exact. Claude's `xhigh|max` reach
-CLIProxyAPI intact and clamp to Grok's supported `high`.
-
-A generated custom executor routes exact named agent `parable-grok`:
+Current generated setups require exact `grok-4.6` through per-user xAI OAuth;
+no `XAI_API_KEY`, broker, or shared deployment is involved. The authenticated
+`/v1/models` catalog is the gate: do not substitute a display alias, different
+case, or `-latest` suffix. A generated custom executor routes exact named agent
+`parable-grok`, and `parable --brain grok` can select the same exact model as
+the parent:
 
 ```toml
 [executors.grok]
 provider = "claude"
-model = "grok-4.5"
-use_for = "Third-family implementation or adversarial review."
+model = "grok-4.6"
+use_for = "Coding, systems work, architectural second opinions, and parent orchestration."
 ```
 
-Sol invoked that agent successfully at all five parent effort values. Claude
-Code inherited the parent effort into every child request; Grok preserved the
-three supported values and clamped `xhigh|max` to `high`. The
+On 2026-08-30, the managed `v7.2.131` build and stock Claude Code `2.1.251`
+exposed exact `grok-4.6` in the authenticated catalog and completed parent text,
+real Bash, JSON-schema structured output, explicit `xhigh`, and a Grok-parent
+invocation of exact `claude-sonnet-5`. Model usage attributed both exact ids and
+reported one completed `parable-sonnet-exact` child.
+
+The retained receipts below are historical Grok 4.5 evidence. With stock Claude
+Code `2.1.215`, Grok 4.5 completed 5/5
+main-model text cells and 3/3 real Bash canaries. `low|medium|high` were exact;
+Claude's `xhigh|max` reached CLIProxyAPI intact and clamped to Grok 4.5's
+supported `high`. Sol invoked the named Grok 4.5 agent successfully at all five
+parent effort values. The
 [main-model receipt](../../../docs/evidence/x2-grok45-main-permutations/receipt.json)
 and [named-child receipt](../../../docs/evidence/x3-sol-grok-named-subagent/receipt.json)
-record exact model attribution, real tool use, deterministic artifacts, and
-separate ChatGPT/xAI OAuth routes.
+record that historical exact model attribution, real tool use, deterministic
+artifacts, and separate ChatGPT/xAI OAuth routes.
 
 This xAI OAuth route is distinct from Parable's Cursor executor. Cursor uses a
 Cursor plan and `cursor-agent`; it is not the Grok child route inside Claude

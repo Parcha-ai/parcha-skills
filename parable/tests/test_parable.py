@@ -2,10 +2,29 @@
 
 import importlib.util
 import json
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 from types import SimpleNamespace
+
+# A test run launched from inside Parable must not inherit the active session's
+# routing state or its shared live-usage cache.
+for key in (
+    "PARABLE_AGENT_STATE_JSON",
+    "PARABLE_CONTEXT_RECOVERY_FILE",
+    "PARABLE_WELCOME_MESSAGE",
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+):
+    os.environ.pop(key, None)
+_TEST_USAGE_CACHE_DIR = tempfile.TemporaryDirectory(prefix="parable-unit-usage-")
+os.environ["PARABLE_USAGE_CACHE"] = str(
+    Path(_TEST_USAGE_CACHE_DIR.name) / "usage-cache.json"
+)
 
 SCRIPT = Path(__file__).resolve().parent.parent / "skills" / "parable" / "scripts" / "parable.py"
 spec = importlib.util.spec_from_file_location("parable", SCRIPT)
@@ -557,6 +576,10 @@ class TestClaudeLaunch(unittest.TestCase):
             parable.parse_claude_brain_args(["--", "--print", "hello"]),
             ("config", ["--print", "hello"]),
         )
+        self.assertEqual(
+            parable.parse_claude_brain_args(["--brain", "grok", "--print", "hello"]),
+            ("grok", ["--print", "hello"]),
+        )
         with self.assertRaisesRegex(ValueError, "before the `--`"):
             parable.parse_claude_brain_args(
                 ["--", "--print", "hello", "--brain", "fable"]
@@ -863,7 +886,12 @@ class TestClaudeLaunch(unittest.TestCase):
 
     def test_auto_brain_is_fable_first_then_falls_back_on_usage(self):
         cfg = self.auto_cfg()
-        available = {"gpt-5.6-sol", "claude-fable-5", "kimi-k3"}
+        cfg["executors"]["grok"] = {
+            "provider": "claude",
+            "model": "grok-4.6",
+            "effort": "high",
+        }
+        available = {"gpt-5.6-sol", "claude-fable-5", "grok-4.6", "kimi-k3"}
 
         def reports(claude, codex):
             def item(pool, used):
@@ -884,20 +912,74 @@ class TestClaudeLaunch(unittest.TestCase):
         self.assertEqual(model, "gpt-5.6-sol")
         model, _ = parable.resolve_claude_brain(cfg, "auto", available, reports(90, 30))
         self.assertEqual(model, "gpt-5.6-sol")
-        model, _ = parable.resolve_claude_brain(cfg, "auto", available, reports(90, 95))
+        model, reason = parable.resolve_claude_brain(cfg, "auto", available, reports(90, 95))
+        self.assertEqual(model, "grok-4.6")
+        self.assertIn("xAI usage telemetry is unavailable", reason)
+
+        del cfg["executors"]["grok"]
+        model, reason = parable.resolve_claude_brain(
+            cfg, "auto", available - {"grok-4.6"}, reports(90, 95)
+        )
         self.assertEqual(model, "claude-fable-5")
+        self.assertIn("Grok is not configured", reason)
+
+    def test_auto_brain_never_invents_an_xai_usage_probe(self):
+        cfg = self.auto_cfg()
+        cfg["executors"]["grok"] = {
+            "provider": "claude",
+            "model": "grok-4.6",
+            "effort": "high",
+        }
+        calls = []
+
+        def probe_all(pools):
+            calls.append(pools)
+            used = 90 if pools == ["claude"] else 95
+            return [{
+                "pool": pools[0],
+                "status": "ok",
+                "windows": [{"window": "7d", "used_pct": used}],
+            }]
+
+        fake_usage = SimpleNamespace(
+            probe_all=probe_all,
+            worst_used_pct=lambda report: report["windows"][0]["used_pct"],
+        )
+        with mock.patch.dict(sys.modules, {"parable_usage": fake_usage}):
+            model, reason = parable.resolve_claude_brain(
+                cfg,
+                "auto",
+                {"gpt-5.6-sol", "claude-fable-5", "grok-4.6", "kimi-k3"},
+            )
+        self.assertEqual(model, "grok-4.6")
+        self.assertEqual(calls, [["claude"], ["codex"]])
+        self.assertIn("xAI usage telemetry is unavailable", reason)
 
     def test_explicit_and_unconfigured_brains_fail_or_fall_back_cleanly(self):
         cfg = self.auto_cfg()
-        available = {"gpt-5.6-sol", "claude-fable-5", "kimi-k3"}
+        cfg["executors"]["grok"] = {
+            "provider": "claude",
+            "model": "grok-4.6",
+            "effort": "high",
+        }
+        available = {"gpt-5.6-sol", "claude-fable-5", "grok-4.6", "kimi-k3"}
         self.assertEqual(
             parable.resolve_claude_brain(cfg, "fable", available)[0],
             "claude-fable-5",
+        )
+        self.assertEqual(
+            parable.resolve_claude_brain(cfg, "grok", available),
+            ("grok-4.6", "explicit grok parent"),
         )
         del cfg["executors"]["fable_exact"]
         self.assertEqual(
             parable.resolve_claude_brain(cfg, "auto", available, [])[0],
             "gpt-5.6-sol",
+        )
+        cfg["claude"]["brain_model"] = "grok-4.6"
+        self.assertEqual(
+            parable.resolve_claude_brain(cfg, "auto", available, [])[0],
+            "grok-4.6",
         )
         with self.assertRaisesRegex(ValueError, "rerun setup"):
             parable.resolve_claude_brain(cfg, "fable", available)
@@ -1004,6 +1086,36 @@ class TestArgv(unittest.TestCase):
         joined = " ".join(argv)
         self.assertNotIn("model_providers", joined)
         self.assertIn('model="gpt-5.5"', joined)
+
+    def test_codex_native_sol_replays_one_million_context_overrides(self):
+        cfg = self.make_cfg()
+        cfg["providers"]["openai"] = {"type": "codex-native"}
+        cfg["executors"]["sol"] = {
+            "provider": "openai",
+            "model": "gpt-5.6-sol",
+            "effort": "xhigh",
+            "context_ktok": 1050,
+            "extra_config": [
+                "model_context_window=1000000",
+                "model_auto_compact_token_limit=900000",
+            ],
+        }
+        argv, overrides = parable.build_run_argv(
+            cfg, "sol", Path("/w"), Path("/l.txt")
+        )
+        self.assertNotIn("model_providers", " ".join(argv))
+        for value in (
+            "model_context_window=1000000",
+            "model_auto_compact_token_limit=900000",
+        ):
+            self.assertIn(value, overrides)
+            self.assertIn(value, argv)
+        resume = ["codex", "exec", "resume", "thread-1", "--yolo", "--json"] + overrides
+        for value in (
+            "model_context_window=1000000",
+            "model_auto_compact_token_limit=900000",
+        ):
+            self.assertIn(value, resume)
 
 
 class TestEventParsing(unittest.TestCase):
