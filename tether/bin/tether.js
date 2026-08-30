@@ -1212,6 +1212,13 @@ function statusLines(status) {
   } else {
     lines.push("FAIL Slack Socket Mode ingress has not connected yet");
   }
+  if (status.default_channel_membership === "not_member") {
+    lines.push(
+      "FAIL Slack bot is not a member of its configured channel; mentions there are dropped before Tether sees them (invite it, or run tether setup)",
+    );
+  } else if (status.default_channel_membership === "member") {
+    lines.push("ok Slack bot is a member of its configured channel");
+  }
   if (status.reply_poll_healthy === true) {
     lines.push("ok best-effort Slack polling worker active");
   } else if (status.reply_poll_healthy === false) {

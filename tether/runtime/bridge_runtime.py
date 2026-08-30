@@ -251,6 +251,7 @@ SLACK_METHOD_PATHS = {
     "chat.postMessage": "/api/chat.postMessage",
     "chat.update": "/api/chat.update",
     "conversations.history": "/api/conversations.history",
+    "conversations.info": "/api/conversations.info",
     "conversations.join": "/api/conversations.join",
     "conversations.replies": "/api/conversations.replies",
     "files.completeUploadExternal": "/api/files.completeUploadExternal",
@@ -4603,6 +4604,24 @@ class Store:
                 (team_id, remaining),
             ).fetchall()
             remaining = max(0, remaining - len(attempts))
+            # Roots are the fourth place work strands, and the only one that
+            # was invisible here: an uncertain root retries forever without
+            # ever appearing in `tether unresolved`, so an operator watching
+            # the surface built to show stuck work sees nothing while it
+            # burns a retry every few minutes. Observed at 21,753 retries.
+            roots = db.execute(
+                """
+                SELECT roots.bridge_id,roots.upload_phase,roots.retry_count,
+                       roots.updated_at
+                FROM bridge_roots AS roots
+                JOIN bridges ON bridges.bridge_id=roots.bridge_id
+                WHERE bridges.team_id=? AND roots.state='uncertain'
+                ORDER BY roots.updated_at,roots.bridge_id
+                LIMIT ?
+                """,
+                (team_id, remaining),
+            ).fetchall()
+            remaining = max(0, remaining - len(roots))
             reconciliations = db.execute(
                 """
                 SELECT reconciliation_key,target_kind,target_id,error,updated_at
@@ -4643,6 +4662,18 @@ class Store:
         )
         result.extend(
             {
+                "kind": "root",
+                "id": str(row["bridge_id"]),
+                "bridge_id": str(row["bridge_id"]),
+                "binding_generation": None,
+                "operation": str(row["upload_phase"] or "post"),
+                "error_code": f"root_uncertain_retries_{int(row['retry_count'] or 0)}",
+                "updated_at": str(row["updated_at"] or ""),
+            }
+            for row in roots
+        )
+        result.extend(
+            {
                 "kind": "reconciliation",
                 "id": str(row["reconciliation_key"]),
                 "bridge_id": "",
@@ -4665,7 +4696,7 @@ class Store:
     ) -> dict[str, Any]:
         if (
             not ID_PATTERN.fullmatch(team_id)
-            or kind not in {"ingress", "attempt", "reconciliation"}
+            or kind not in {"ingress", "attempt", "reconciliation", "root"}
             or action not in {"retry", "complete", "abandon"}
             or not operation_id
             or len(operation_id) > 256
@@ -4674,6 +4705,51 @@ class Store:
             raise ValueError("invalid uncertain operation resolution")
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if kind == "root":
+                row = db.execute(
+                    """
+                    SELECT roots.state,bridges.team_id
+                    FROM bridge_roots AS roots
+                    JOIN bridges ON bridges.bridge_id=roots.bridge_id
+                    WHERE roots.bridge_id=?
+                    """,
+                    (operation_id,),
+                ).fetchone()
+                if row is None or str(row["team_id"]) != team_id:
+                    raise ValueError("uncertain root not found")
+                current = str(row["state"])
+                desired = {
+                    "retry": "pending",
+                    "complete": "complete",
+                    "abandon": "cancelled",
+                }[action]
+                if current == desired:
+                    return {
+                        "kind": kind,
+                        "id": operation_id,
+                        "action": action,
+                        "state": desired,
+                        "bridge_id": operation_id,
+                        "deduplicated": True,
+                    }
+                if current != "uncertain":
+                    raise ValueError("root is not awaiting operator resolution")
+                db.execute(
+                    """
+                    UPDATE bridge_roots
+                    SET state=?,updated_at=CURRENT_TIMESTAMP
+                    WHERE bridge_id=? AND state='uncertain'
+                    """,
+                    (desired, operation_id),
+                )
+                return {
+                    "kind": kind,
+                    "id": operation_id,
+                    "action": action,
+                    "state": desired,
+                    "bridge_id": operation_id,
+                    "deduplicated": False,
+                }
             if kind == "ingress":
                 row = db.execute(
                     """
@@ -5295,6 +5371,25 @@ class Store:
     def queued_bridge_ids(self) -> list[str]:
         with self.connect() as db:
             return [str(row[0]) for row in db.execute("SELECT DISTINCT bridge_id FROM bridge_events WHERE state='queued'")]
+
+    def mark_bridge_thread_missing(self, channel_id: str, thread_ts: str) -> int:
+        """Flag bindings whose Slack thread has vanished as needing a rebind.
+
+        Leaving them 'verified' is what let the bridge keep insisting a
+        deleted thread was live while every reply silently became a new root.
+        """
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE bridges
+                SET binding_state='rebind_required',
+                    binding_error_code='thread_not_found',
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE channel_id=? AND thread_ts=? AND binding_state!='rebind_required'
+                """,
+                (channel_id, thread_ts),
+            )
+            return int(cursor.rowcount)
 
     def cancel_queued(self, bridge_id: str) -> int:
         with self.connect() as db:
@@ -8100,6 +8195,31 @@ class Broker:
                 ) from join_exc
         self._joined_channels.add(channel)
 
+    def _default_channel_membership(self, config: Config) -> str | None:
+        """Whether this bot can actually see its configured channel.
+
+        A bot that is not a member of a channel never receives its mentions:
+        Slack drops them before any agent logic runs, so the agent looks hung
+        while nothing anywhere reports a problem. Surfacing membership turns
+        that silence into a diagnosable line. Returns None when unknown, which
+        doctor renders as an advisory rather than a failure.
+        """
+        channel = effective_channel(config)
+        if not channel.startswith("C"):
+            return None
+        try:
+            result = _slack_call(
+                self.token,
+                "conversations.info",
+                {"channel": channel},
+            )
+        except Exception:
+            return None
+        info = result.get("channel")
+        if not isinstance(info, dict) or "is_member" not in info:
+            return None
+        return "member" if info.get("is_member") else "not_member"
+
     def _status(self, config: Config, allowed_users: tuple[str, ...]) -> dict[str, Any]:
         status = {
             "ok": True,
@@ -8114,6 +8234,7 @@ class Broker:
             "broker_uid": os.geteuid(),
             "peer_uid_enforced": True,
             "root_refused": True,
+            "default_channel_membership": self._default_channel_membership(config),
             **self.store.delivery_health(),
         }
         if self.health_provider is not None:
@@ -9115,6 +9236,51 @@ class Broker:
             "acknowledged_events": acknowledged,
         }
 
+    def _detect_thread_fork(
+        self,
+        channel_id: str,
+        thread_ts: str,
+        message_ts: str,
+    ) -> None:
+        """Catch Slack silently promoting a threaded reply to a new root.
+
+        Slack does not reject a chat.postMessage whose thread_ts is unknown
+        to the channel: it posts the message as a NEW TOP-LEVEL ROOT and
+        returns success. The sender believes it replied in-thread, the
+        operator sees stray channel messages, and the binding keeps claiming
+        the thread is live. That is the "my updates landed as new messages
+        instead of in the thread" failure.
+
+        A real threaded reply always gets a ts distinct from its parent; a
+        forked root comes back as its own thread. Detect it from the response
+        we already have — no extra Slack call on the happy path — and flip
+        the binding to rebind_required so the next reply fails loudly rather
+        than scattering more roots.
+        """
+        if not thread_ts or not message_ts or message_ts == thread_ts:
+            return
+        try:
+            result = _slack_call(
+                self.token,
+                "conversations.replies",
+                {"channel": channel_id, "ts": thread_ts, "limit": 1},
+            )
+        except SlackAPIError as exc:
+            if exc.code not in {"thread_not_found", "message_not_found"}:
+                return
+            result = {}
+        except Exception:
+            return
+        messages = result.get("messages") if isinstance(result, dict) else None
+        if messages:
+            return
+        self.store.mark_bridge_thread_missing(channel_id, thread_ts)
+        log_line = (
+            "Tether posted into a Slack thread that no longer exists; the "
+            "message became a new root and the binding now requires a rebind"
+        )
+        print(f"{log_line} (channel={channel_id})", file=sys.stderr, flush=True)
+
     def _deliver_staged_message(
         self,
         idempotency_key: str,
@@ -9283,6 +9449,14 @@ class Broker:
                 ),
             )
         if thread_ts:
+            _after_durable_delivery(
+                "thread fork detection",
+                lambda: self._detect_thread_fork(
+                    channel_id,
+                    thread_ts,
+                    message_ts,
+                ),
+            )
             _after_durable_delivery(
                 "thread participation",
                 lambda: self.store.mark_participation(

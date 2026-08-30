@@ -400,15 +400,11 @@ class PollStateRecoveryTest(unittest.TestCase):
         client = PollClient(respond)
         plugin = self.load_plugin()
 
-        self.poll(plugin, client)
-        with self.assertRaisesRegex(RuntimeError, "every Slack thread poll failed"):
+        # A cycle in which every thread fails is reported, not raised: the
+        # caller still has to drain queued turns, and aborting stranded every
+        # bridge behind one unreachable thread. Fairness is what matters here.
+        for _ in range(6):
             self.poll(plugin, client)
-        self.poll(plugin, client)
-        with self.assertRaisesRegex(RuntimeError, "every Slack thread poll failed"):
-            self.poll(plugin, client)
-        with self.assertRaisesRegex(RuntimeError, "every Slack thread poll failed"):
-            self.poll(plugin, client)
-        self.poll(plugin, client)
 
         self.assertEqual(
             [request["ts"] for request in client.requests],

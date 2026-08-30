@@ -12,9 +12,11 @@ register(ctx) wires exactly four things, every one a documented public API:
   optional context surfaces are feature-detected with hasattr so the plugin
   loads unchanged on Hermes 0.19.0 (v2026.7.20) through current main.
 
-The security domain (workspace, authorized owners, persona, policy
-generation) comes from Tether's own config file — one authority shared with
-the broker and CLI — never duplicated into Hermes config.
+Admission needs exactly two things: the workspace and the authorized owner
+set. Both resolve the way the deployed broker resolves them — Tether's own
+config merged with Hermes's explicit SLACK_ALLOWED_USERS /
+GATEWAY_ALLOWED_USERS allowlists — so observing the shadow never requires
+changing config the running broker would reject.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
 import tomllib
@@ -35,6 +38,7 @@ from .journal import DurableJournal
 logger = logging.getLogger("tether.plugin")
 
 _BINDING_CACHE_TTL_SECONDS = 5.0
+_USER_ID = re.compile(r"[A-Z0-9]{2,32}")
 
 
 def _hermes_home() -> Path:
@@ -58,13 +62,22 @@ def load_settings(path: Path | None = None) -> admission.AdmissionSettings:
     allowed = raw.get("allowed_users") or []
     if not isinstance(allowed, list):
         allowed = []
+    candidates = [str(user) for user in allowed if isinstance(user, str) and user]
+    # The deployed broker merges config overrides with Hermes's own explicit
+    # allowlists (effective_allowed_users in bridge_runtime); an operator who
+    # authorized someone through Hermes has authorized them for Tether too.
+    # Resolving only the config file here would make the shadow under-claim
+    # exactly the traffic it exists to compare against.
+    for name in ("SLACK_ALLOWED_USERS", "GATEWAY_ALLOWED_USERS"):
+        candidates.extend(
+            value.strip() for value in os.environ.get(name, "").split(",")
+        )
     return admission.AdmissionSettings(
         workspace_id=str(raw.get("team_id") or ""),
         allowed_users=frozenset(
-            str(user) for user in allowed if isinstance(user, str) and user
+            user for user in candidates
+            if user and user != "*" and _USER_ID.fullmatch(user)
         ),
-        persona_id=str(raw.get("persona_id") or ""),
-        policy_generation=int(raw.get("policy_generation") or 0),
     )
 
 
