@@ -471,11 +471,10 @@ class PollEmptyTeamIdTest(unittest.TestCase):
             async def _handle_slack_message(self, _event):
                 pass
 
+        # The detail must reach the log; a total-failure cycle no longer
+        # raises, because the caller's queue drain must still run.
         with self.assertLogs(self.plugin.log.name, level="WARNING") as log_ctx:
-            with self.assertRaises(RuntimeError):
-                asyncio.run(
-                    self.plugin._poll_recent_replies(Adapter())
-                )
+            asyncio.run(self.plugin._poll_recent_replies(Adapter()))
 
         self.assertTrue(
             any(

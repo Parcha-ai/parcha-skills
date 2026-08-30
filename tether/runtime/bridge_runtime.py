@@ -251,6 +251,7 @@ SLACK_METHOD_PATHS = {
     "chat.postMessage": "/api/chat.postMessage",
     "chat.update": "/api/chat.update",
     "conversations.history": "/api/conversations.history",
+    "conversations.info": "/api/conversations.info",
     "conversations.join": "/api/conversations.join",
     "conversations.replies": "/api/conversations.replies",
     "files.completeUploadExternal": "/api/files.completeUploadExternal",
@@ -8100,6 +8101,31 @@ class Broker:
                 ) from join_exc
         self._joined_channels.add(channel)
 
+    def _default_channel_membership(self, config: Config) -> str | None:
+        """Whether this bot can actually see its configured channel.
+
+        A bot that is not a member of a channel never receives its mentions:
+        Slack drops them before any agent logic runs, so the agent looks hung
+        while nothing anywhere reports a problem. Surfacing membership turns
+        that silence into a diagnosable line. Returns None when unknown, which
+        doctor renders as an advisory rather than a failure.
+        """
+        channel = effective_channel(config)
+        if not channel.startswith("C"):
+            return None
+        try:
+            result = _slack_call(
+                self.token,
+                "conversations.info",
+                {"channel": channel},
+            )
+        except Exception:
+            return None
+        info = result.get("channel")
+        if not isinstance(info, dict) or "is_member" not in info:
+            return None
+        return "member" if info.get("is_member") else "not_member"
+
     def _status(self, config: Config, allowed_users: tuple[str, ...]) -> dict[str, Any]:
         status = {
             "ok": True,
@@ -8114,6 +8140,7 @@ class Broker:
             "broker_uid": os.geteuid(),
             "peer_uid_enforced": True,
             "root_refused": True,
+            "default_channel_membership": self._default_channel_membership(config),
             **self.store.delivery_health(),
         }
         if self.health_provider is not None:

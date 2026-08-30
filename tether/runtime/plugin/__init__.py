@@ -2418,6 +2418,27 @@ def _install_slack_bridge_prefilter():
     SlackAdapter._tether_prefilter = True
 
 
+def _slack_error_detail(exc: BaseException) -> str:
+    """Surface the platform's own error code, which is what diagnosis needs.
+
+    Logging only ``type(exc).__name__`` renders every Slack failure as a bare
+    "SlackApiError": thread_not_found, not_in_channel, ratelimited, and
+    missing_scope all look identical, and each has a completely different
+    remedy. The code is a fixed Slack identifier, never message content or a
+    credential, so it is safe to log.
+    """
+    for attribute in ("response", "data"):
+        payload = getattr(exc, attribute, None)
+        data = getattr(payload, "data", payload)
+        if isinstance(data, dict):
+            code = data.get("error")
+            if isinstance(code, str) and code:
+                needed = data.get("needed")
+                return f": {code}" + (f" (needed {needed})" if needed else "")
+    text = str(exc)
+    return f": {text[:120]}" if text and text != exc.__class__.__name__ else ""
+
+
 async def _poll_recent_replies(adapter) -> int:
     hours = _bounded_env_int("TETHER_REPLY_RECOVERY_HOURS", 24, 1, 168)
     workspace_limit = _bounded_env_int("TETHER_REPLY_POLL_BATCH", 10, 1, 25)
@@ -2623,7 +2644,7 @@ async def _poll_recent_replies(adapter) -> int:
             detail = (
                 f": {exc}"
                 if isinstance(exc, hermes_compat.HermesCompatibilityError)
-                else ""
+                else _slack_error_detail(exc)
             )
             log.warning(
                 "Could not poll Tether thread %s: %s%s",
@@ -2661,7 +2682,15 @@ async def _poll_recent_replies(adapter) -> int:
                 recovered += 1
         store.clear_reply_poll_page_state(*thread_key)
     if failures and not succeeded:
-        raise RuntimeError("every Slack thread poll failed")
+        # Report the outage without aborting the caller: the poll loop's
+        # remaining work — draining queued turns for every bridge — is
+        # independent of whether Slack reads succeeded, and skipping it
+        # strands live conversations behind one unreachable thread.
+        log.error(
+            "Tether polled %d Slack thread(s), all failed; queue drain continues",
+            failures,
+        )
+        state.last_poll_error_at = time.monotonic()
     return recovered
 
 
