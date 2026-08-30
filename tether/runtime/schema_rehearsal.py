@@ -318,7 +318,13 @@ class RehearsalCoordinator:
             self.fault_inject(phase)
 
     def _advance(self, to_phase: str, evidence: dict[str, Any] | None = None) -> None:
-        assert self._receipt is not None
+        # Not an assert: python -O strips those, and advancing a phase with no
+        # receipt in hand would corrupt the operation ledger silently.
+        if self._receipt is None:
+            raise RehearsalError(
+                "receipt_missing",
+                "cannot advance a schema phase without an active receipt",
+            )
         self._receipt = schema_receipt.advance(
             self.receipt_file,
             expect=self._receipt,

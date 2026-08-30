@@ -39,7 +39,8 @@ DRIVER_KIND_BY_ENDPOINT_KIND = {
     "hermes_continuation": "detached_native",
 }
 # The one silence token. Anything else — including empty output — is not silence.
-NO_REPLY_TOKEN = "NO_REPLY"
+# nosec B105: a protocol sentinel a driver echoes back, never a credential.
+NO_REPLY_TOKEN = "NO_REPLY"  # nosec B105
 TERMINAL_ATTEMPT_STATES = frozenset({
     "completed_with_response",
     "no_reply",
@@ -804,6 +805,8 @@ class DomainRuntime:
         if response:
             parameters.extend(response)
         parameters.extend((error_code, attempt_id))
+        # nosec B608: every interpolated fragment is a fixed literal chosen by
+        # a boolean above; all values are bound parameters.
         db.execute(
             f"""
             UPDATE native_attempts
@@ -815,7 +818,7 @@ class DomainRuntime:
                 error_code=?,
                 updated_at=CURRENT_TIMESTAMP
             WHERE attempt_id=?
-            """,
+            """,  # nosec B608 - interpolations are fixed literals, values bound
             tuple(parameters),
         )
 
