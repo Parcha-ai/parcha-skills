@@ -292,3 +292,46 @@ state change; never keep cascade state only in an uncommitted worktree** (see RE
 - ZEN applies during BUILD. Every architecture-changing EXIT applies POST-ZEN, deletes superseded
   paths after proof, names temporary-scaffold owners/removal gates, and verifies rollback at the
   actual candidate or deployed revision.
+
+## Amendment A4 — Adversarial verification of the schema-18 runtime (2026-08-30)
+
+The chaos work on 2026-08-29 found 13 defects in the **deployed schema-17 system** under
+multi-agent load. That said nothing about the replacement, so before L2d I drove the
+schema-18 runtime adversarially through its public API. It had four defects of its own.
+
+All four were the same structural failure: **terminal and recovery transitions in
+`_apply_receipt_state` / `mark_uncertain` did not agree with the schema's own projection
+invariants.** The schema encodes the correct state machine; the runtime had drifted from it.
+Every one left `invariant_violations()` non-empty, and the terminal-monotonic triggers make
+those rows immutable — no repair short of rebuilding the database, and `require_valid()`
+fails closed for the whole store thereafter.
+
+1. **A driver-reported failure marked its turns `completed`.** Data loss. Any agent exiting
+   nonzero or writing an empty response recorded the user's Slack turns as answered when
+   nothing was delivered, permanently and unretryably. Three of five real `NativeDriver`
+   outcome shapes hit it.
+2. **`mark_uncertain` wrote state without a receipt**, corrupting the store through the
+   shipped driver's own crash-recovery path — precisely when an operator needs to trust it.
+3. **A `running` receipt before `accepted`** left the newest receipt disagreeing with the
+   attempt. The bundled driver never emits it first, so the suite stayed green; any other
+   driver implementing the public protocol hits it immediately.
+4. **A liveness receipt on an uncertain attempt** silently kept `uncertain` while becoming
+   the newest receipt. Found by the randomized sweep *after* fixing #2 — the recovery receipt
+   consumes a sequence the driver does not know about.
+
+Fixed in PR #410 with seven regressions, including the passing counterparts so a fix in one
+direction cannot silently break the other.
+
+**Evidence:** each defect reproduced against the public API before the fix and verified clean
+after; randomized sweep over the public API went from **56 of 60 trials corrupt to 0 of 60**,
+widened to **400 seeds x 200 steps (80,000 operations) with zero violations**; full suite
+**799 passed, 221 subtests**, ruff and bandit clean.
+
+**What this changes about L2d.** The cutover target is now adversarially verified rather than
+merely test-passing, which is the evidence the cutover decision needed. It also updates the
+methodology: a green suite proves the paths someone thought to write, and every one of these
+four defects lived outside them. Randomized invariant checking over the public API belongs in
+the exit criteria for any component owning durable state, not in a one-off hunt.
+
+**Still open:** the deployed system remains patched schema-17. Everything merged on 2026-08-29
+and 2026-08-30 sits on main unrun, and cutover needs an explicit gateway-restart grant.
