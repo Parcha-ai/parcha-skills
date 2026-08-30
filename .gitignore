@@ -7,3 +7,6 @@ __pycache__/
 *.py[cod]
 .ruff_cache/
 .desloppify/
+
+# Machine-local agent checkpoint state (never shared)
+.parcha/
