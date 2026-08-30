@@ -2350,7 +2350,15 @@ async function runSetup(argv, log) {
     if (prompt) prompt.close();
   }
   if (!options.no_auth) {
-    for (const vendor of context.vendors) runNativeAuth(context, vendor, false, log);
+    let status = scanAuthStatus(context.authDir);
+    for (const vendor of context.vendors) {
+      if (status.providers[vendor].present) {
+        log(`${vendor}: already authorized`);
+        continue;
+      }
+      runNativeAuth(context, vendor, false, log);
+      status = scanAuthStatus(context.authDir);
+    }
     log("authorization complete; next: parable");
   } else {
     log("next: authorize each selected subscription, then run parable");
