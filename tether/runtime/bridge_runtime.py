@@ -5297,6 +5297,25 @@ class Store:
         with self.connect() as db:
             return [str(row[0]) for row in db.execute("SELECT DISTINCT bridge_id FROM bridge_events WHERE state='queued'")]
 
+    def mark_bridge_thread_missing(self, channel_id: str, thread_ts: str) -> int:
+        """Flag bindings whose Slack thread has vanished as needing a rebind.
+
+        Leaving them 'verified' is what let the bridge keep insisting a
+        deleted thread was live while every reply silently became a new root.
+        """
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE bridges
+                SET binding_state='rebind_required',
+                    binding_error_code='thread_not_found',
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE channel_id=? AND thread_ts=? AND binding_state!='rebind_required'
+                """,
+                (channel_id, thread_ts),
+            )
+            return int(cursor.rowcount)
+
     def cancel_queued(self, bridge_id: str) -> int:
         with self.connect() as db:
             cursor = db.execute(
@@ -9142,6 +9161,51 @@ class Broker:
             "acknowledged_events": acknowledged,
         }
 
+    def _detect_thread_fork(
+        self,
+        channel_id: str,
+        thread_ts: str,
+        message_ts: str,
+    ) -> None:
+        """Catch Slack silently promoting a threaded reply to a new root.
+
+        Slack does not reject a chat.postMessage whose thread_ts is unknown
+        to the channel: it posts the message as a NEW TOP-LEVEL ROOT and
+        returns success. The sender believes it replied in-thread, the
+        operator sees stray channel messages, and the binding keeps claiming
+        the thread is live. That is the "my updates landed as new messages
+        instead of in the thread" failure.
+
+        A real threaded reply always gets a ts distinct from its parent; a
+        forked root comes back as its own thread. Detect it from the response
+        we already have — no extra Slack call on the happy path — and flip
+        the binding to rebind_required so the next reply fails loudly rather
+        than scattering more roots.
+        """
+        if not thread_ts or not message_ts or message_ts == thread_ts:
+            return
+        try:
+            result = _slack_call(
+                self.token,
+                "conversations.replies",
+                {"channel": channel_id, "ts": thread_ts, "limit": 1},
+            )
+        except SlackAPIError as exc:
+            if exc.code not in {"thread_not_found", "message_not_found"}:
+                return
+            result = {}
+        except Exception:
+            return
+        messages = result.get("messages") if isinstance(result, dict) else None
+        if messages:
+            return
+        self.store.mark_bridge_thread_missing(channel_id, thread_ts)
+        log_line = (
+            "Tether posted into a Slack thread that no longer exists; the "
+            "message became a new root and the binding now requires a rebind"
+        )
+        print(f"{log_line} (channel={channel_id})", file=sys.stderr, flush=True)
+
     def _deliver_staged_message(
         self,
         idempotency_key: str,
@@ -9310,6 +9374,14 @@ class Broker:
                 ),
             )
         if thread_ts:
+            _after_durable_delivery(
+                "thread fork detection",
+                lambda: self._detect_thread_fork(
+                    channel_id,
+                    thread_ts,
+                    message_ts,
+                ),
+            )
             _after_durable_delivery(
                 "thread participation",
                 lambda: self.store.mark_participation(

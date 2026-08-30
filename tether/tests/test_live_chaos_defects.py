@@ -104,3 +104,43 @@ class ChannelMembershipVisibilityTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VanishedThreadTest(unittest.TestCase):
+    """A reply into a thread Slack no longer has must fail, not fork.
+
+    Slack does not reject an unknown thread_ts on chat.postMessage — it
+    silently promotes the message to a new top-level root. The sender
+    believes it replied in-thread; the operator sees stray messages in the
+    channel. This is the "my updates landed as new messages instead of in
+    the thread" failure reported in production on 2026-08-28.
+    """
+
+    def test_fork_detection_runs_after_delivery_without_a_preflight_call(self):
+        source = (RUNTIME / "bridge_runtime.py").read_text()
+        # Detected from the response we already have: no extra Slack round
+        # trip on the happy path (a preflight probe cost one call per reply
+        # and added a fresh failure mode to every delivery).
+        self.assertIn("def _detect_thread_fork", source)
+        self.assertIn('"thread fork detection"', source)
+        self.assertNotIn("_require_live_thread", source)
+        # It is best-effort post-delivery work, never a delivery blocker.
+        detect_at = source.index('"thread fork detection"')
+        complete_at = source.index("self.store.complete_message(")
+        self.assertLess(complete_at, detect_at)
+
+    def test_missing_thread_flips_the_binding_out_of_verified(self):
+        source = (RUNTIME / "bridge_runtime.py").read_text()
+        self.assertIn("def mark_bridge_thread_missing", source)
+        self.assertIn("binding_state='rebind_required'", source)
+        self.assertIn("binding_error_code='thread_not_found'", source)
+
+    def test_only_a_definitively_missing_thread_marks_a_rebind(self):
+        """A transient Slack failure must not condemn a healthy binding."""
+        source = (RUNTIME / "bridge_runtime.py").read_text()
+        guard = source[source.index("def _detect_thread_fork"):]
+        guard = guard[: guard.index("def _deliver_staged_message")]
+        self.assertIn('{"thread_not_found", "message_not_found"}', guard)
+        # Any other error, and any unexpected exception, leaves it alone.
+        self.assertIn("return", guard)
+        self.assertIn("except Exception:", guard)

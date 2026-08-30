@@ -1093,6 +1093,15 @@ def _prepare_authoritative_hermes_gate(adapter) -> bool:
 
 
 def _allowed_peer_bot_users() -> set[str]:
+    """Bot identities this instance will accept turns from.
+
+    Empty by default, and deliberately so: an unlisted bot cannot drive this
+    agent. The cost is that agent-to-agent conversation is impossible until
+    an operator pairs them, and the refusal is otherwise invisible — the
+    mention is simply dropped and the agent looks unresponsive. Tether logs
+    the rejection with the exact id to add, so the remedy is discoverable
+    from the logs rather than from reading this function.
+    """
     return {
         value.strip()
         for value in os.getenv("TETHER_ALLOWED_BOT_USERS", "").split(",")
