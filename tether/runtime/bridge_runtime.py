@@ -4604,6 +4604,24 @@ class Store:
                 (team_id, remaining),
             ).fetchall()
             remaining = max(0, remaining - len(attempts))
+            # Roots are the fourth place work strands, and the only one that
+            # was invisible here: an uncertain root retries forever without
+            # ever appearing in `tether unresolved`, so an operator watching
+            # the surface built to show stuck work sees nothing while it
+            # burns a retry every few minutes. Observed at 21,753 retries.
+            roots = db.execute(
+                """
+                SELECT roots.bridge_id,roots.upload_phase,roots.retry_count,
+                       roots.updated_at
+                FROM bridge_roots AS roots
+                JOIN bridges ON bridges.bridge_id=roots.bridge_id
+                WHERE bridges.team_id=? AND roots.state='uncertain'
+                ORDER BY roots.updated_at,roots.bridge_id
+                LIMIT ?
+                """,
+                (team_id, remaining),
+            ).fetchall()
+            remaining = max(0, remaining - len(roots))
             reconciliations = db.execute(
                 """
                 SELECT reconciliation_key,target_kind,target_id,error,updated_at
@@ -4644,6 +4662,18 @@ class Store:
         )
         result.extend(
             {
+                "kind": "root",
+                "id": str(row["bridge_id"]),
+                "bridge_id": str(row["bridge_id"]),
+                "binding_generation": None,
+                "operation": str(row["upload_phase"] or "post"),
+                "error_code": f"root_uncertain_retries_{int(row['retry_count'] or 0)}",
+                "updated_at": str(row["updated_at"] or ""),
+            }
+            for row in roots
+        )
+        result.extend(
+            {
                 "kind": "reconciliation",
                 "id": str(row["reconciliation_key"]),
                 "bridge_id": "",
@@ -4666,7 +4696,7 @@ class Store:
     ) -> dict[str, Any]:
         if (
             not ID_PATTERN.fullmatch(team_id)
-            or kind not in {"ingress", "attempt", "reconciliation"}
+            or kind not in {"ingress", "attempt", "reconciliation", "root"}
             or action not in {"retry", "complete", "abandon"}
             or not operation_id
             or len(operation_id) > 256
@@ -4675,6 +4705,51 @@ class Store:
             raise ValueError("invalid uncertain operation resolution")
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if kind == "root":
+                row = db.execute(
+                    """
+                    SELECT roots.state,bridges.team_id
+                    FROM bridge_roots AS roots
+                    JOIN bridges ON bridges.bridge_id=roots.bridge_id
+                    WHERE roots.bridge_id=?
+                    """,
+                    (operation_id,),
+                ).fetchone()
+                if row is None or str(row["team_id"]) != team_id:
+                    raise ValueError("uncertain root not found")
+                current = str(row["state"])
+                desired = {
+                    "retry": "pending",
+                    "complete": "complete",
+                    "abandon": "cancelled",
+                }[action]
+                if current == desired:
+                    return {
+                        "kind": kind,
+                        "id": operation_id,
+                        "action": action,
+                        "state": desired,
+                        "bridge_id": operation_id,
+                        "deduplicated": True,
+                    }
+                if current != "uncertain":
+                    raise ValueError("root is not awaiting operator resolution")
+                db.execute(
+                    """
+                    UPDATE bridge_roots
+                    SET state=?,updated_at=CURRENT_TIMESTAMP
+                    WHERE bridge_id=? AND state='uncertain'
+                    """,
+                    (desired, operation_id),
+                )
+                return {
+                    "kind": kind,
+                    "id": operation_id,
+                    "action": action,
+                    "state": desired,
+                    "bridge_id": operation_id,
+                    "deduplicated": False,
+                }
             if kind == "ingress":
                 row = db.execute(
                     """

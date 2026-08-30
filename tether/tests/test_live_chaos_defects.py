@@ -178,3 +178,42 @@ class SilentAuthorizationGateTest(unittest.TestCase):
         # what it costs, because the failure is otherwise invisible.
         self.assertIn("TETHER_ALLOWED_BOT_USERS", block)
         self.assertIn("invisible", block)
+
+
+class UnresolvedRootVisibilityTest(unittest.TestCase):
+    """An uncertain root must be visible to, and fixable by, an operator.
+
+    Found live: a root stuck in `uncertain` had accumulated 21,753 retries
+    over three days, firing a failure every few minutes, while
+    `tether unresolved` — the surface built to show exactly this — listed
+    nothing. Roots were the one stranding point the query never covered, so
+    the only way to see it was to open the database by hand.
+    """
+
+    def test_unresolved_query_covers_roots(self):
+        source = (RUNTIME / "bridge_runtime.py").read_text()
+        block = source[source.index("def unresolved_operations"):]
+        block = block[: block.index("def resolve_uncertain")] if "def resolve_uncertain" in block else block[:8000]
+        self.assertIn("FROM bridge_roots", block)
+        self.assertIn("roots.state='uncertain'", block)
+
+    def test_root_rows_are_rendered_with_their_retry_count(self):
+        source = (RUNTIME / "bridge_runtime.py").read_text()
+        self.assertIn('"kind": "root"', source)
+        # The retry count is the signal that distinguishes a transient
+        # uncertainty from one that has been burning for days.
+        self.assertIn("root_uncertain_retries_", source)
+
+    def test_root_is_an_accepted_resolution_kind(self):
+        source = (RUNTIME / "bridge_runtime.py").read_text()
+        self.assertIn(
+            '{"ingress", "attempt", "reconciliation", "root"}', source
+        )
+
+    def test_root_resolution_refuses_a_root_that_is_not_uncertain(self):
+        source = (RUNTIME / "bridge_runtime.py").read_text()
+        block = source[source.index('if kind == "root":'):]
+        block = block[: block.index('if kind == "ingress":')]
+        self.assertIn("root is not awaiting operator resolution", block)
+        # Idempotent: re-resolving an already-resolved root is a no-op.
+        self.assertIn('"deduplicated": True', block)
