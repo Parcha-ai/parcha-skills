@@ -1,0 +1,106 @@
+From 748d00f0bd0303223adc1822baad544c0238c648 Mon Sep 17 00:00:00 2001
+From: "claudio-michel[bot]" <claudio-michel[bot]@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 03:30:16 +0000
+Subject: [PATCH] fix(slack): carry the sender bot flag into the early-reject
+ auth check
+
+The Slack adapter rejects unauthorized senders before thread lookups and
+media downloads, calling the runner's _is_user_authorized with a source
+it builds itself. That source omitted is_bot, so the authorizer always
+took its human branch and never reached the SLACK_ALLOW_BOTS check that
+exists precisely for this traffic.
+
+The effect is an operator-visible dead end: with SLACK_ALLOW_BOTS=all (or
+=mentions) set, every bot-authored message is still rejected here, and
+the only trace is a generic 'Early reject of unauthorized user' warning
+that names the sender but not the reason. Nothing distinguishes it from
+a genuinely unlisted human, so the setting looks broken and the remedy
+is unguessable.
+
+sender_is_bot is already resolved earlier in the same function, so the
+fix is to pass it through. Found while debugging why one agent could not
+answer another in Slack: the answer was that no configuration could make
+it work.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ plugins/platforms/slack/adapter.py            |  6 +++
+ .../test_slack_early_reject_bot_flag.py       | 49 +++++++++++++++++++
+ 2 files changed, 55 insertions(+)
+ create mode 100644 tests/gateway/test_slack_early_reject_bot_flag.py
+
+diff --git a/plugins/platforms/slack/adapter.py b/plugins/platforms/slack/adapter.py
+index cd8e237d3..0ccf821af 100644
+--- a/plugins/platforms/slack/adapter.py
++++ b/plugins/platforms/slack/adapter.py
+@@ -6333,6 +6333,12 @@ class SlackAdapter(BasePlatformAdapter):
+                 chat_type="dm" if is_dm else "group",
+                 user_id=user_id,
+                 user_name="",
++                # Without this the source always looks human here, so
++                # _is_user_authorized never reaches its bot branch and
++                # SLACK_ALLOW_BOTS is unreachable on this path: an operator
++                # who enabled bot traffic still sees every bot-authored
++                # message rejected, with no indication why.
++                is_bot=sender_is_bot,
+             )
+             if not _auth_fn(_source):
+                 logger.warning(
+diff --git a/tests/gateway/test_slack_early_reject_bot_flag.py b/tests/gateway/test_slack_early_reject_bot_flag.py
+new file mode 100644
+index 000000000..c1c5f6205
+--- /dev/null
++++ b/tests/gateway/test_slack_early_reject_bot_flag.py
+@@ -0,0 +1,49 @@
++"""SLACK_ALLOW_BOTS must be reachable from the Slack early-reject guard.
++
++The adapter rejects unauthorized senders before thread lookups and media
++downloads, calling the runner's ``_is_user_authorized`` with a source it
++builds itself. That source omitted ``is_bot``, so the authorizer always took
++its human branch: an operator who set ``SLACK_ALLOW_BOTS=all`` still had
++every bot-authored message rejected here, with only a generic
++"Early reject of unauthorized user" line to go on.
++"""
++
++from __future__ import annotations
++
++import sys
++from pathlib import Path
++
++_repo = str(Path(__file__).resolve().parents[2])
++if _repo not in sys.path:
++    sys.path.insert(0, _repo)
++
++
++def _adapter_source() -> str:
++    return (
++        Path(_repo) / "plugins" / "platforms" / "slack" / "adapter.py"
++    ).read_text()
++
++
++def _early_reject_block(source: str) -> str:
++    start = source.index("Reject unauthorized users before thread lookups")
++    end = source.index("Early reject of unauthorized user", start)
++    return source[start:end]
++
++
++def test_early_reject_source_carries_the_sender_bot_flag():
++    block = _early_reject_block(_adapter_source())
++    assert "is_bot=sender_is_bot" in block
++
++
++def test_sender_bot_flag_is_resolved_before_the_guard_runs():
++    source = _adapter_source()
++    resolved_at = source.index("sender_is_bot = self._event_declares_bot_sender")
++    guard_at = source.index("Reject unauthorized users before thread lookups")
++    assert resolved_at < guard_at
++
++
++def test_authorizer_bot_branch_depends_on_that_flag():
++    """The field the guard omitted is exactly what the authorizer reads."""
++    authz = (Path(_repo) / "gateway" / "authz_mixin.py").read_text()
++    assert 'getattr(source, "is_bot", False)' in authz
++    assert "SLACK_ALLOW_BOTS" in authz
+-- 
+2.43.0
+

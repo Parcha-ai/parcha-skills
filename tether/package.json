@@ -17,6 +17,8 @@
     "docs/HERDR_UPSTREAM_API.md",
     "docs/upstream/0001-plugin-send-delivery-ledger.patch",
     "docs/upstream/0001-slack-gateway-platform-events.patch",
+    "docs/upstream/PROPOSAL-3-slack-early-reject-bot-flag.md",
+    "docs/upstream/0001-slack-early-reject-bot-flag.patch",
     "docs/upstream/PROPOSAL-1-plugin-send-delivery-ledger.md",
     "docs/upstream/PROPOSAL-2-slack-gateway-platform-events.md",
     "docs/OPERATIONS.md",

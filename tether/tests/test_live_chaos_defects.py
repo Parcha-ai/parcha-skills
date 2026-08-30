@@ -144,3 +144,37 @@ class VanishedThreadTest(unittest.TestCase):
         # Any other error, and any unexpected exception, leaves it alone.
         self.assertIn("return", guard)
         self.assertIn("except Exception:", guard)
+
+
+class SilentAuthorizationGateTest(unittest.TestCase):
+    """Four independent gates can each silently drop an inbound mention.
+
+    Reproduced live on 2026-08-30: making one agent answer another required
+    clearing all four, and each rejection was invisible from the outside —
+    the agent simply looked unresponsive.
+
+      1. Slack channel membership     (Slack drops it; nothing logs)
+      2. Hermes SLACK_TRUSTED_BOT_IDS (adapter "early reject", warn only)
+      3. Tether router peer trust     (cancelled: untrusted_peer_bot)
+      4. The installed plugin build   (old build ignores 2 and 3 entirely)
+
+    Each is defensible alone. Together, with no single place that reports
+    "your message was dropped and here is which gate did it", they make a
+    silent agent indistinguishable from a broken one.
+    """
+
+    def test_router_rejection_carries_a_diagnosable_reason(self):
+        source = (RUNTIME / "routing.py").read_text()
+        # The reason string must name the gate, so an operator reading the
+        # ingress ledger learns which allowlist to edit.
+        self.assertIn('"untrusted_peer_bot"', source)
+        self.assertIn("ambient_peer_bot_channels", source)
+
+    def test_peer_trust_is_opt_in_and_documented_where_it_is_read(self):
+        source = (RUNTIME / "plugin" / "__init__.py").read_text()
+        block = source[source.index("def _allowed_peer_bot_users"):]
+        block = block[: block.index("def _resolve_slack_adapter")]
+        # Empty default is deliberate; the docstring must say so and say
+        # what it costs, because the failure is otherwise invisible.
+        self.assertIn("TETHER_ALLOWED_BOT_USERS", block)
+        self.assertIn("invisible", block)
