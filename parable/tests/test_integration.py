@@ -2531,6 +2531,19 @@ raise SystemExit(int(os.environ.get("FAKE_PROXY_EXIT", "0")))
             ])
             self.assertIn("authorization complete", proc.stdout)
 
+            capture.write_text("")
+            rerun = self.run_cli(
+                home,
+                proxy,
+                capture,
+                "setup", "--non-interactive", "--vendors", "chatgpt,claude,xai",
+                "--proxy-bin", str(proxy),
+            )
+            self.assertEqual(rerun.returncode, 0, rerun.stdout + rerun.stderr)
+            self.assertEqual(self.calls(capture), [])
+            for vendor in ("claude", "chatgpt", "xai"):
+                self.assertIn(f"{vendor}: already authorized", rerun.stdout)
+
     def test_auth_add_uses_private_umask_and_secures_proxy_record(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
