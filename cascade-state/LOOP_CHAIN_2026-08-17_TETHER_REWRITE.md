@@ -45,7 +45,18 @@ CREDENTIALS — the claudio-michel App cannot fork or PR outside its installatio
 user account applies each patch to a fork and opens the PR with its proposal document as the body.
 After filing: external gate, `BLOCKED_EXTERNAL` honest while waiting. Next: L2d shadow deploy on
 the greppy3 gateway, live parity, single-writer cutover, deletion gate.
-PR stack 392←393←395←396←397←398←399 awaits human review; work keeps stacking.
+**MERGED 2026-08-30**: the entire stack landed on main as PR 403 (squash of 392/393/395/396/397/
+398/399 onto post-381 main), after an adversarial review pass found and fixed six defects — two of
+which would have corrupted production silently: recovery reporting a crashed agent as a successful
+completion (unobserved exit status assumed 0), and a read-only rehearsal able to permanently block
+the broker from starting. Also fixed: racing driver receipts swallowed as replays, the migration's
+preservation check blind to binding liveness, rebind_required bindings treated as live, unbounded
+backups, and leaked SQLite connections. Evidence at merge: 747/747 tests (92 new, one regression
+per defect), all 8 CI checks green, release-install + tarball lifecycles. PR 381 merged separately
+as its base. Twelve stale tether PRs triaged to two: 391/364/337/284/41 closed as subsumed with
+per-PR evidence (364 verified by cherry-pick showing comment-only conflicts); 227/210 left open as
+group-DM product decisions. Root cause of two CI round trips fixed at source: npm test now runs
+ruff and bandit exactly as CI does.
 
 Canary, credential/host-policy changes, Slack sends, deployment, fleet rollout, and destructive
 actions remain separate gates.
