@@ -1,10 +1,10 @@
 # Tether
 
-Tether binds a Slack thread to the Codex, Claude Code, Zellij, Hermes, or
+Tether binds a Slack thread to the Codex, Claude Code, Herdr, Zellij, Hermes, or
 headless run that created it. Hermes owns the Slack credential. Local clients
 use an owner-only Unix socket and do not receive that credential.
 
-`0.2.0-beta.1` is a pre-release. It uses BindingV2 and database schema 15.
+`0.3.0-beta.1` is a pre-release. This source tree uses BindingV3 and database schema 16.
 Read [Compatibility](docs/COMPATIBILITY.md) before upgrading an existing host.
 
 ## Supported boundary
@@ -16,7 +16,7 @@ Read [Compatibility](docs/COMPATIBILITY.md) before upgrading an existing host.
 | Node.js | Maintained LTS 22 or 24 |
 | Hermes Agent | Exactly 0.19.0; tested commit `b9ba7c78e41b5d187e2c8fb446655c4b71c42aa5` |
 | Native continuation | Codex and Claude Code |
-| Terminal continuation | Zellij on Linux with `/proc` process identity |
+| Terminal continuation | Herdr protocol 19 (tested with 0.8.0), or Zellij on Linux; both require `/proc` process identity |
 | Slack ingress | Slack Events API through Hermes Socket Mode |
 | Headless publication | Explicit `--run-id`; no native-session resume |
 
@@ -40,10 +40,15 @@ Each bridge stores one source, one continuation endpoint, one Slack thread, an
 operator policy, and a monotonic binding generation. Rebind and close increment
 the generation, which fences stale ingress and delivery attempts.
 
+One continuation endpoint may own multiple bridges and therefore multiple
+independent Slack threads. Tether routes ingress by exact workspace, channel,
+and thread, and serializes agent turns across every bridge sharing the endpoint.
+
 A Tether-created thread root is durable local proof that the bridge owns that
-thread for ambient replies. `tether attach` binds an existing thread but does
-not claim its root; unmentioned replies there fail closed unless ownership can
-be established by the routing rules.
+thread for ambient replies. An explicit local `tether attach` or `tether
+rebind` durably claims an existing thread for its exact binding generation.
+Allowlisted humans can then reply without a mention; peer bots remain
+mention-gated, and replacing the writer still requires an explicit rebind.
 
 Slack Events API delivery is authoritative ingress. The
 `conversations.replies` poller is bounded, best-effort recovery for events
@@ -59,13 +64,14 @@ See [Architecture](docs/ARCHITECTURE.md) and
 Install an immutable published version:
 
 ```bash
-npx --yes --package=@parcha/tether@0.2.0-beta.1 \
-  tether setup --harness=both
+npx --yes --package=@parcha/tether@0.3.0-beta.1 \
+  tether setup --harness=both --herdr
 ```
 
 Use `--harness=codex` or `--harness=claude-code` for one harness. Setup requires
 Hermes 0.19.0, an explicit Slack operator allowlist, and a Slack app configured
-for Socket Mode.
+for Socket Mode. Omit `--herdr` on a host that uses only Zellij or detached
+native sessions.
 
 For a source install, use the full 40-character commit from the matching
 release:
@@ -74,10 +80,18 @@ release:
 TETHER_COMMIT="<verified-release-commit-sha>"
 npx --yes \
   --package="github:Parcha-ai/parcha-skills#$TETHER_COMMIT" \
-  tether setup --harness=both
+  tether setup --harness=both --herdr
 ```
 
 Do not install from a moving branch.
+
+When Tether core is already installed, install the Herdr-native package from
+the same reviewed commit:
+
+```bash
+herdr plugin install Parcha-ai/parcha-skills/tether/herdr-plugin \
+  --ref "$TETHER_COMMIT"
+```
 
 To install only the portable instruction skill:
 
@@ -106,6 +120,12 @@ Hermes, an explicit operator allowlist, and connected Socket Mode ingress.
 From Codex or Claude Code:
 
 > Let me know in Slack when this is done.
+
+Inside Herdr, invoke `Tether: Open cockpit` from the plugin action menu. It can
+create a thread for the focused Codex or Claude agent, attach a selected or
+Ctrl-clicked Slack thread URL, rebind a stale agent, detach, run doctor, and
+inspect unresolved work. Create, attach, and rebind disclose and then assign a
+visible occupant-bound `tether_…` name when the agent is unnamed.
 
 For a process that may exit, provide a durable run identity and pass text over
 standard input:
@@ -181,14 +201,18 @@ whether the original operation ran.
 Upgrade:
 
 ```bash
-npx --yes --package=@parcha/tether@0.2.0-beta.1 \
-  tether upgrade --harness=both --restart
+npx --yes --package=@parcha/tether@0.3.0-beta.1 \
+  tether upgrade --harness=both --restart --herdr
 ```
+
+On Linux, `--restart` detects an active system-level Hermes gateway and uses
+Hermes's documented non-interactive system restart path. A restart failure
+restores the previous managed state and returns nonzero.
 
 Restore the immediately previous managed payload:
 
 ```bash
-tether rollback --restart
+tether rollback --restart --herdr
 ```
 
 Install and upgrade take a lifecycle lock, stage a complete payload, snapshot
@@ -199,8 +223,12 @@ Rollback does not downgrade `bridges.db` or undo Slack settings. Uninstall
 retains config, bridge state, snapshots, and locally modified managed files:
 
 ```bash
-tether uninstall
+tether uninstall --herdr
 ```
+
+Use `--herdr` only when the companion plugin is linked. Rollback reconciles the
+link with the restored payload; uninstall removes the link before deleting
+unchanged managed plugin files.
 
 See [Operations](docs/OPERATIONS.md) for backup, rollback, diagnostics,
 retention, and irreversible state removal.
@@ -236,7 +264,7 @@ tether maintenance
 | Broker unavailable | Restart Hermes, then run `tether doctor`. |
 | Socket Mode disconnected | Restore Socket Mode; do not rely on polling alone. |
 | Native binding stale | Rebind from the intended live session. |
-| Zellij delivery uncertain | Inspect that exact pane, then use `tether resolve`. |
+| Live terminal delivery uncertain | Inspect that exact Herdr agent or Zellij pane, then use `tether resolve`. |
 | Upgrade failed | Review automatic rollback; run `tether rollback --restart` if needed. |
 
 ## Development

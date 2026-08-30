@@ -186,11 +186,77 @@ class FileUploadProtocolTest(unittest.TestCase):
         self.assertIn("slack_file_id", columns)
         self.assertIn("upload_phase", columns)
         self.assertNotIn("upload_url", columns)
-        self.assertEqual(version, 15)
+        self.assertEqual(version, self.runtime.SCHEMA_VERSION)
         self.assertEqual(
             self.store.root_record(bridge.bridge_id)["upload_phase"],
             "reserved",
         )
+
+    def test_new_root_attachment_is_one_top_level_file_message(self):
+        source = self.approved / "top-level.txt"
+        source.write_bytes(b"top-level evidence")
+        source.chmod(0o600)
+        bridge = self.store.create(
+            {
+                "source_kind": "headless_run",
+                "source": {"run_id": "top-level", "cwd": "/tmp/project"},
+                "owner_user_id": "U12345678",
+                "team_id": "T12345678",
+                "channel_id": "C12345678",
+                "idempotency_key": "top-level",
+            }
+        )
+        staged = self.runtime.stage_safe_upload(str(source))
+        self.store.reserve_root(
+            bridge.bridge_id,
+            "comment attached to the file",
+            "",
+            staged_upload=staged,
+            upload_filename="demo.txt",
+        )
+        root_ts = "1789000000.777777"
+
+        with mock.patch.object(
+            self.broker,
+            "_ensure_channel_membership",
+        ), mock.patch.object(
+            self.runtime,
+            "slack_post",
+        ) as text_post, mock.patch.object(
+            self.runtime,
+            "_allocate_slack_upload",
+            return_value=(
+                "F12345678",
+                "https://files.slack.com/upload/v1/signed-value",
+            ),
+        ), mock.patch.object(
+            self.runtime,
+            "_upload_slack_bytes",
+        ), mock.patch.object(
+            self.runtime,
+            "_complete_slack_upload",
+            return_value={"ok": True, "files": [{"id": "F12345678"}]},
+        ) as complete, mock.patch.object(
+            self.broker,
+            "_find_staged_root_file",
+            return_value=root_ts,
+        ):
+            result = self.broker._deliver_staged_root(bridge)
+
+        text_post.assert_not_called()
+        self.assertEqual(
+            complete.call_args.kwargs,
+            {
+                "filename": "demo.txt",
+                "text": "comment attached to the file",
+                "thread_ts": None,
+            },
+        )
+        self.assertEqual(result["thread_ts"], root_ts)
+        self.assertEqual(self.store.get(bridge.bridge_id).thread_ts, root_ts)
+        record = self.store.root_record(bridge.bridge_id)
+        self.assertEqual(record["state"], "complete")
+        self.assertEqual(record["file_message_ts"], root_ts)
 
     def test_v9_schema_migrates_and_backfills_pending_attachment(self):
         legacy_path = self.home / "legacy-v9.db"
@@ -219,7 +285,7 @@ class FileUploadProtocolTest(unittest.TestCase):
         with migrated.connect() as database:
             self.assertEqual(
                 int(database.execute("PRAGMA user_version").fetchone()[0]),
-                15,
+                self.runtime.SCHEMA_VERSION,
             )
 
     def test_allocation_failure_is_durable_and_retry_allocates_once(self):

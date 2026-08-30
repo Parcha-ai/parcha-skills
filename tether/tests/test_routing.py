@@ -46,6 +46,7 @@ class RoutingDecisionTest(unittest.TestCase):
         bot_id: str = BOT_A_APP,
         trusted_users=frozenset({BOT_B, BOT_C}),
         trusted_bot_ids=frozenset({PEER_APP}),
+        ambient_bot_channels=frozenset(),
         allowed_channels=frozenset(),
     ) -> RoutingPolicy:
         return RoutingPolicy(
@@ -55,6 +56,7 @@ class RoutingDecisionTest(unittest.TestCase):
             allowed_human_user_ids=frozenset({HUMAN}),
             trusted_peer_user_ids=frozenset(trusted_users),
             trusted_peer_bot_ids=frozenset(trusted_bot_ids),
+            ambient_peer_bot_channels=frozenset(ambient_bot_channels),
             allowed_channel_ids=frozenset(allowed_channels),
         )
 
@@ -285,6 +287,51 @@ class RoutingDecisionTest(unittest.TestCase):
         self.assertEqual(mentioned.action, RouteAction.HERMES)
         self.assertEqual(chatter.action, RouteAction.SILENT)
         self.assertEqual(chatter.reason, "peer_bot_did_not_target_self")
+
+    def test_exact_ambient_bot_channel_routes_without_a_mention(self):
+        peer = ActorIdentity("", is_bot=True, bot_id=PEER_APP)
+        decision = decide_route(
+            self.message(actor=peer, thread_ts=None),
+            None,
+            self.policy(ambient_bot_channels={(PEER_APP, CHANNEL)}),
+        )
+
+        self.assertEqual(decision.action, RouteAction.HERMES)
+        self.assertEqual(decision.reason, "trusted_ambient_peer_bot")
+
+    def test_ambient_bot_route_is_bound_to_exact_identity_and_channel(self):
+        policy = self.policy(ambient_bot_channels={(PEER_APP, CHANNEL)})
+        cases = (
+            self.message(
+                channel="COTHER001",
+                actor=ActorIdentity("", is_bot=True, bot_id=PEER_APP),
+                thread_ts=None,
+            ),
+            self.message(
+                actor=ActorIdentity("", is_bot=True, bot_id="BOTHER001"),
+                thread_ts=None,
+            ),
+        )
+
+        for message in cases:
+            with self.subTest(message=message.identity):
+                decision = decide_route(message, None, policy)
+                self.assertEqual(decision.action, RouteAction.SILENT)
+
+    def test_ambient_bot_cannot_redirect_to_another_mentioned_participant(self):
+        peer = ActorIdentity("", is_bot=True, bot_id=PEER_APP)
+        decision = decide_route(
+            self.message(
+                actor=peer,
+                human_mentions={HUMAN},
+                thread_ts=None,
+            ),
+            None,
+            self.policy(ambient_bot_channels={(PEER_APP, CHANNEL)}),
+        )
+
+        self.assertEqual(decision.action, RouteAction.SILENT)
+        self.assertEqual(decision.reason, "another_participant_explicitly_targeted")
 
     def test_trusted_bot_id_without_user_id_can_route_when_mentioned(self):
         message = self.message(

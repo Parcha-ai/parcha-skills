@@ -20,7 +20,7 @@ const MIN_TIMEOUT_MS = 50;
 const MAX_TIMEOUT_MS = 60_000;
 const CHILD_TIMEOUT_MS = 60_000;
 const LIFECYCLE_TIMEOUT_MS = 900_000;
-const BROKER_PROTOCOL_VERSION = 5;
+const BROKER_PROTOCOL_VERSION = 6;
 
 const packageRoot = path.resolve(__dirname, "..");
 const packageInstaller = path.join(packageRoot, "install.sh");
@@ -71,6 +71,103 @@ class BrokerError extends CliError {
 
 function stringValue(value) {
   return typeof value === "string" ? value : "";
+}
+
+function discoverHerdrBinary() {
+  const candidates = [stringValue(process.env.HERDR_BIN_PATH)];
+  for (const directory of stringValue(process.env.PATH).split(path.delimiter)) {
+    if (directory) candidates.push(path.join(directory, "herdr"));
+  }
+  const localVersions = path.join(home, ".local", "opt", "herdr");
+  try {
+    for (const version of fs.readdirSync(localVersions).sort().reverse()) {
+      candidates.push(path.join(localVersions, version, "herdr"));
+    }
+  } catch {
+    // Herdr is optional for detached and Zellij bindings.
+  }
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      if (fs.statSync(candidate).isFile()) return fs.realpathSync.native(candidate);
+    } catch {
+      // Continue to the next explicit or conventional location.
+    }
+  }
+  return "";
+}
+
+function herdrDoctorChecks() {
+  const checks = [];
+  let healthy = true;
+  const executable = discoverHerdrBinary();
+  if (!executable) {
+    return { healthy, checks: ["WARN Herdr client unavailable; Herdr live bindings are disabled"] };
+  }
+  const schemaResult = spawnSync(executable, ["api", "schema", "--json"], {
+    encoding: "utf8",
+    env: process.env,
+    timeout: 10_000,
+  });
+  try {
+    if (schemaResult.error || schemaResult.status !== 0) throw new Error("schema unavailable");
+    const schema = JSON.parse(schemaResult.stdout);
+    if (schema.protocol !== 19) {
+      healthy = false;
+      checks.push(`FAIL Herdr protocol=${stringValue(schema.protocol) || "unknown"}; expected 19`);
+    } else {
+      checks.push("ok Herdr client protocol=19 available");
+    }
+  } catch {
+    healthy = false;
+    checks.push("FAIL Herdr client compatibility check");
+  }
+
+  const socketPath = stringValue(process.env.HERDR_SOCKET_PATH);
+  if (socketPath) {
+    try {
+      const info = fs.lstatSync(socketPath);
+      const mode = info.mode & 0o777;
+      if (
+        info.isSymbolicLink() ||
+        !info.isSocket() ||
+        mode !== 0o600 ||
+        (typeof process.getuid === "function" && info.uid !== process.getuid())
+      ) {
+        throw new Error("unsafe socket");
+      }
+      const snapshotResult = spawnSync(executable, ["api", "snapshot"], {
+        encoding: "utf8",
+        env: process.env,
+        timeout: 10_000,
+      });
+      if (snapshotResult.error || snapshotResult.status !== 0) throw new Error("snapshot unavailable");
+      const response = JSON.parse(snapshotResult.stdout);
+      if (response?.result?.snapshot?.protocol !== 19) throw new Error("protocol mismatch");
+      checks.push("ok current Herdr session socket is private and compatible");
+    } catch {
+      healthy = false;
+      checks.push("FAIL current Herdr session socket is unavailable or unsafe");
+    }
+  }
+  return { healthy, checks };
+}
+
+function manageHerdrPlugin(action) {
+  const executable = discoverHerdrBinary();
+  if (!executable) {
+    throw new CliError(
+      "Herdr is unavailable; install Herdr before using --herdr.",
+      EXIT_USAGE,
+      "herdr_unavailable",
+    );
+  }
+  const pluginRoot = path.join(runtimeHome, "herdr-plugin");
+  const commandArgs = action === "unlink"
+    ? ["plugin", "unlink", "parcha.tether"]
+    : ["plugin", "link", pluginRoot];
+  return runChild(executable, commandArgs, CHILD_TIMEOUT_MS);
 }
 
 function packagePayloadAvailable() {
@@ -182,6 +279,9 @@ function expectedManagedTargets(metadata) {
     path.join(runtimeRoot, "tether_notify.py"),
     path.join(runtimeRoot, "install.sh"),
     path.join(runtimeRoot, "package.json"),
+    path.join(runtimeRoot, "herdr-plugin", "herdr-plugin.toml"),
+    path.join(runtimeRoot, "herdr-plugin", "tether_plugin.py"),
+    path.join(runtimeRoot, "herdr-plugin", "README.md"),
     path.join(pluginRoot, "__init__.py"),
     path.join(pluginRoot, "plugin.yaml"),
     path.join(localBin, "tether"),
@@ -385,6 +485,7 @@ function printHelp(command = "") {
     resolve: "tether resolve --kind ingress|attempt|reconciliation --id ID --action retry|complete|abandon [--team ID]",
     history: "tether history [--channel ID] [--limit N] [--team ID]",
     thread: "tether thread --channel ID --thread-ts TS [--limit N] [--team ID]",
+    herdr: "tether herdr status|create|attach|rebind|detach [options]",
   };
   if (command && commandHelp[command]) {
     process.stdout.write(`${commandHelp[command]}\n`);
@@ -393,11 +494,12 @@ function printHelp(command = "") {
   process.stdout.write(`Tether ${readVersion()}
 
 Usage:
-  tether setup [--harness=codex|claude-code|both]
-  tether install|upgrade [installer options]
-  tether rollback|uninstall [--dry-run] [--restart]
+  tether setup [--harness=codex|claude-code|both] [--herdr]
+  tether install|upgrade [installer options] [--herdr]
+  tether rollback|uninstall [--dry-run] [--restart] [--herdr]
   tether doctor|status|identity|maintenance [--json]
   tether notify|reply|attach|rebind|close|unbind|post|history|thread [options]
+  tether herdr status|create|attach|rebind|detach [options]
   tether unresolved|resolve [options]
   tether version
 
@@ -770,7 +872,7 @@ function brokerCall(request, options) {
 function assertNonRoot(command) {
   const mutating = new Set([
     "setup", "install", "upgrade", "rollback", "uninstall", "maintenance",
-    "notify", "reply", "attach", "rebind", "close", "unbind", "post", "resolve",
+    "notify", "reply", "attach", "rebind", "close", "unbind", "post", "resolve", "herdr",
   ]);
   if (
     mutating.has(command) &&
@@ -865,7 +967,7 @@ function runNotifier(
   const socketPath = resolveSocketPath(options);
   if (path.basename(socketPath) !== "bridge.sock") {
     throw new CliError(
-      "Zellij source capture requires a broker socket named bridge.sock.",
+      "Live terminal source capture requires a broker socket named bridge.sock.",
       EXIT_USAGE,
       "unsupported_socket_override",
     );
@@ -926,6 +1028,12 @@ function workingDirectoryIdentity(cwd) {
 
 function detectSource(options) {
   const cwd = path.resolve(stringValue(options.cwd) || process.cwd());
+  const hasHerdrEnvironment = Boolean(
+    process.env.HERDR_ENV ||
+    process.env.HERDR_SESSION ||
+    process.env.HERDR_SOCKET_PATH ||
+    process.env.HERDR_PANE_ID
+  );
   const hasZellijOption = Boolean(options["zellij-session"] || options["zellij-pane-id"]);
   if (Boolean(options["zellij-session"]) !== Boolean(options["zellij-pane-id"])) {
     throw new CliError("--zellij-session and --zellij-pane-id must be provided together.");
@@ -950,15 +1058,17 @@ function detectSource(options) {
       stringValue(process.env.CLAUDE_CODE_SESSION_ID) ||
       stringValue(process.env.CODEX_THREAD_ID) ||
       stringValue(process.env.ZELLIJ_SESSION_NAME) ||
-      stringValue(process.env.ZELLIJ_PANE_ID)
+      stringValue(process.env.ZELLIJ_PANE_ID) ||
+      hasHerdrEnvironment
     )
   ) {
     throw new CliError(
-      "An explicit headless or Hermes source cannot replace an active Codex, Claude Code, or Zellij binding; repair or rebind the exact native session.",
+      "An explicit headless or Hermes source cannot replace an active Codex, Claude Code, Herdr, or Zellij binding; repair or rebind the exact native session.",
       EXIT_USAGE,
       "native_binding_required",
     );
   }
+  if (hasHerdrEnvironment) return null;
   if (hasZellijOption) return null;
   if (explicit.length === 1) {
     const [kind, identifier] = explicit[0];
@@ -1053,15 +1163,29 @@ function statusLines(status) {
   } else {
     lines.push("WARN best-effort Slack polling health has not been observed");
   }
+  const uncertain = Number(status.uncertain_delivery_count || 0);
+  const blocked = Number(status.blocked_bridge_count || 0);
+  const queued = Number(status.queued_delivery_count || 0);
+  if (uncertain > 0 || blocked > 0) {
+    lines.push(
+      `FAIL durable delivery blocked: unresolved=${uncertain} blocked_threads=${blocked}; run tether unresolved`,
+    );
+  } else {
+    lines.push("ok durable delivery queue has no unresolved blockers");
+  }
+  if (queued > 0) {
+    lines.push(`WARN queued Slack follow-ups=${queued}`);
+  }
   return lines;
 }
 
 async function runStatus(options) {
   const status = await brokerCall({ op: "status" }, options);
+  const checks = statusLines(status);
   if (options.json) {
     writeJson(process.stdout, status);
   } else {
-    process.stdout.write(`${statusLines(status).join("\n")}\n`);
+    process.stdout.write(`${checks.join("\n")}\n`);
   }
   const failed = status.implementation !== "tether" ||
     !Number.isInteger(status.protocol_version) ||
@@ -1070,7 +1194,8 @@ async function runStatus(options) {
     status.root_refused !== true ||
     !status.owner_configured ||
     !(status.allowed_user_count > 0) ||
-    status.slack_transport_connected !== true;
+    status.slack_transport_connected !== true ||
+    checks.some((line) => line.startsWith("FAIL"));
   return failed ? 1 : 0;
 }
 
@@ -1117,6 +1242,9 @@ async function runDoctor(options) {
   const installIntegrity = verifyManagedInstall();
   checks.push(installIntegrity.line);
   if (!installIntegrity.ok) healthy = false;
+  const herdr = herdrDoctorChecks();
+  checks.push(...herdr.checks);
+  if (!herdr.healthy) healthy = false;
 
   let status = null;
   try {
@@ -1415,13 +1543,25 @@ async function main() {
 
   assertNonRoot(command);
 
+  if (command === "herdr") {
+    return runNotifier("herdr", argv, {}, CHILD_TIMEOUT_MS);
+  }
+
   if (command === "install" || command === "upgrade") {
     if (!packagePayloadAvailable()) {
       throw new CliError(
         "Install and upgrade require a complete tagged Tether package. Run the documented npx command.",
       );
     }
-    return runChild(packageInstaller, [command, ...argv], LIFECYCLE_TIMEOUT_MS);
+    const withHerdr = argv.includes("--herdr");
+    const installerArgs = argv.filter((argument) => argument !== "--herdr");
+    const installed = runChild(
+      packageInstaller,
+      [command, ...installerArgs],
+      LIFECYCLE_TIMEOUT_MS,
+    );
+    if (installed !== 0 || !withHerdr) return installed;
+    return manageHerdrPlugin("link");
   }
 
   if (command === "rollback" || command === "uninstall") {
@@ -1431,15 +1571,36 @@ async function main() {
     if (!fs.existsSync(installer)) {
       throw new CliError("The Tether lifecycle installer is unavailable.");
     }
-    return runChild(installer, [command, ...argv], LIFECYCLE_TIMEOUT_MS);
+    const withHerdr = argv.includes("--herdr");
+    const installerArgs = argv.filter((argument) => argument !== "--herdr");
+    if (command === "uninstall" && withHerdr) {
+      const unlinked = manageHerdrPlugin("unlink");
+      if (unlinked !== 0) return unlinked;
+    }
+    const completed = runChild(
+      installer,
+      [command, ...installerArgs],
+      LIFECYCLE_TIMEOUT_MS,
+    );
+    if (completed === 0 && command === "rollback" && withHerdr) {
+      const manifest = path.join(runtimeHome, "herdr-plugin", "herdr-plugin.toml");
+      return manageHerdrPlugin(fs.existsSync(manifest) ? "link" : "unlink");
+    }
+    if (completed !== 0 && command === "uninstall" && withHerdr) {
+      manageHerdrPlugin("link");
+    }
+    return completed;
   }
 
   if (command === "setup") {
+    const withHerdr = argv.includes("--herdr");
     const installArgs = argv.filter((argument) =>
       argument.startsWith("--harness=") ||
       ["--both", "--codex", "--claude-code"].includes(argument)
     );
-    const setupArgs = argv.filter((argument) => !installArgs.includes(argument));
+    const setupArgs = argv.filter((argument) =>
+      argument !== "--herdr" && !installArgs.includes(argument)
+    );
     if (packagePayloadAvailable()) {
       const installed = runChild(
         packageInstaller,
@@ -1448,7 +1609,9 @@ async function main() {
       );
       if (installed !== 0) return installed;
     }
-    return runNotifier("setup", setupArgs, {}, LIFECYCLE_TIMEOUT_MS);
+    const configured = runNotifier("setup", setupArgs, {}, LIFECYCLE_TIMEOUT_MS);
+    if (configured !== 0 || !withHerdr) return configured;
+    return manageHerdrPlugin("link");
   }
 
   return runBrokerCommand(command, argv);

@@ -1,6 +1,8 @@
 import asyncio
 import concurrent.futures
+import hashlib
 import importlib.util
+import json
 import pathlib
 import sys
 import tempfile
@@ -139,6 +141,176 @@ class AttemptRecoveryTest(unittest.TestCase):
                     reply_key="att_000000000000000000000001",
                     text=text,
                 )
+
+    def test_delivery_health_reports_head_of_line_blocking(self):
+        bridge = self._bound_bridge("delivery-health")
+        attempt_id = self._attempt(
+            bridge,
+            event_id="1785000000.000901",
+            awaiting_ack=False,
+        )
+        self.assertTrue(
+            self.store.mark_attempt_submitting(
+                attempt_id,
+                bridge.bridge_id,
+                bridge.binding_generation,
+            )
+        )
+        self.assertTrue(
+            self.store.mark_attempt_uncertain(
+                attempt_id,
+                bridge.bridge_id,
+                "terminal_submit_uncertain",
+            )
+        )
+        # Schema 16 preserves older active records whose endpoint identity
+        # cannot be reconstructed. Their own blocked queue must remain visible.
+        with self.store.connect() as database:
+            database.execute(
+                "UPDATE bridges SET endpoint_key='' WHERE bridge_id=?",
+                (bridge.bridge_id,),
+            )
+        self.assertTrue(
+            self.store.enqueue_event(
+                "1785000000.000902",
+                bridge.bridge_id,
+                "later follow-up",
+            )
+        )
+
+        self.assertEqual(
+            self.store.delivery_health(),
+            {
+                "queued_delivery_count": 1,
+                "uncertain_delivery_count": 1,
+                "blocked_bridge_count": 1,
+            },
+        )
+
+    def test_shared_endpoint_serializes_threads_and_wakes_next(self):
+        shared_source = {"run_id": "shared-native-session", "cwd": "/tmp/project"}
+        first = self._bound_bridge(
+            "shared-thread-first",
+            source=shared_source,
+        )
+        second = self._bound_bridge(
+            "shared-thread-second",
+            source=shared_source,
+            channel_id="C87654321",
+        )
+        first_attempt = self._attempt(
+            first,
+            event_id="1785000000.000911",
+            awaiting_ack=True,
+        )
+        self.assertTrue(
+            self.store.enqueue_event(
+                "1785000000.000912",
+                second.bridge_id,
+                "independent thread follow-up",
+            )
+        )
+        second_items = self.store.claim_event_batch(second.bridge_id)
+        second_attempt = self.runtime.delivery_attempt_id(
+            second.bridge_id,
+            [item["event_id"] for item in second_items],
+            second.binding_generation,
+        )
+
+        with self.assertRaises(self.runtime.NativeContinuationError) as raised:
+            self.store.prepare_delivery_attempt(
+                [item["event_id"] for item in second_items],
+                second.bridge_id,
+                second.binding_generation,
+                second_attempt,
+                delivery_kind="detached_native",
+            )
+
+        self.assertEqual(raised.exception.code, "endpoint_busy")
+        self.assertEqual(
+            self.store.endpoint_queued_bridge_ids(first.bridge_id),
+            [second.bridge_id],
+        )
+        self.assertEqual(
+            self.store.delivery_health()["blocked_bridge_count"],
+            1,
+        )
+        self.assertEqual(
+            self.store.acknowledge_attempt(
+                first_attempt,
+                first.bridge_id,
+                ack_kind="no_reply",
+            ),
+            1,
+        )
+        retried_items = self.store.claim_event_batch(second.bridge_id)
+        self.assertEqual(
+            [item["event_id"] for item in retried_items],
+            ["1785000000.000912"],
+        )
+        self.assertTrue(
+            self.store.prepare_delivery_attempt(
+                ["1785000000.000912"],
+                second.bridge_id,
+                second.binding_generation,
+                second_attempt,
+                delivery_kind="detached_native",
+            )
+        )
+
+    def test_concurrent_shared_endpoint_prepares_exactly_one_turn(self):
+        shared_source = {"run_id": "concurrent-native-session", "cwd": "/tmp/project"}
+        bridges = [
+            self._bound_bridge(
+                f"concurrent-thread-{index}",
+                source=shared_source,
+                channel_id=("C12345678" if index == 1 else "C87654321"),
+            )
+            for index in (1, 2)
+        ]
+        batches = []
+        for index, bridge in enumerate(bridges, start=1):
+            event_id = f"1785000000.00092{index}"
+            self.assertTrue(
+                self.store.enqueue_event(event_id, bridge.bridge_id, "follow-up")
+            )
+            self.store.claim_event_batch(bridge.bridge_id)
+            attempt_id = self.runtime.delivery_attempt_id(
+                bridge.bridge_id,
+                [event_id],
+                bridge.binding_generation,
+            )
+            batches.append((bridge, event_id, attempt_id))
+        barrier = threading.Barrier(2)
+
+        def prepare(batch):
+            bridge, event_id, attempt_id = batch
+            barrier.wait()
+            try:
+                prepared = self.store.prepare_delivery_attempt(
+                    [event_id],
+                    bridge.bridge_id,
+                    bridge.binding_generation,
+                    attempt_id,
+                    delivery_kind="detached_native",
+                )
+                return "prepared" if prepared else "rejected"
+            except self.runtime.NativeContinuationError as exc:
+                return exc.code
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(prepare, batches))
+
+        self.assertEqual(sorted(outcomes), ["endpoint_busy", "prepared"])
+        with self.store.connect() as database:
+            states = dict(
+                database.execute(
+                    "SELECT state,count(*) FROM bridge_events "
+                    "WHERE bridge_id IN (?,?) GROUP BY state",
+                    (bridges[0].bridge_id, bridges[1].bridge_id),
+                ).fetchall()
+            )
+        self.assertEqual(states, {"prepared": 1, "queued": 1})
 
     def test_wrong_bridge_reply_key_cannot_post_or_suppress(self):
         for index, text in enumerate(("completed", "NO_REPLY"), start=1):
@@ -652,6 +824,45 @@ class PluginAttemptRecoveryTest(unittest.TestCase):
             },
         )
 
+    def _herdr_bridge(self, key: str):
+        terminal_id = "term_6583153c2a1b81"
+        identity = "herdr-proc-v1:" + json.dumps(
+            {
+                "agent": "codex",
+                "boot": "00000000-0000-4000-8000-000000000001",
+                "exe": "1:2",
+                "exe_path": hashlib.sha256(
+                    b"/opt/codex/bin/codex"
+                ).hexdigest()[:16],
+                "pid": 200,
+                "start": "20000",
+                "terminal": terminal_id,
+                "tty": "34823",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        session_id = f"{key}-session"
+        return self._bridge(
+            key,
+            "codex_session",
+            {
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "pane_agent": "codex",
+                "process_identity": identity,
+                "herdr_session": "pilot",
+                "herdr_socket_path": "/tmp/herdr-pilot.sock",
+                "herdr_terminal_id": terminal_id,
+                "herdr_pane_id": "w1:p1",
+                "herdr_agent_name": "tether_0123456789abcdef",
+                "herdr_agent_session_source": "codex_notify",
+                "herdr_agent_session_kind": "thread_id",
+                "herdr_agent_session_value": session_id,
+                "herdr_protocol": "19",
+            },
+        )
+
     def _claimed_item(self, bridge, event_id: str):
         self.assertTrue(
             self.plugin.store.enqueue_event(
@@ -663,6 +874,27 @@ class PluginAttemptRecoveryTest(unittest.TestCase):
         items = self.plugin.store.claim_event_batch(bridge.bridge_id)
         self.assertEqual([item["event_id"] for item in items], [event_id])
         return items
+
+    def test_attempt_close_schedules_queued_sibling_thread(self):
+        source = {"run_id": "shared-plugin-session", "cwd": "/tmp/project"}
+        first = self._bridge("shared-plugin-first", "headless_run", source)
+        second = self._bridge("shared-plugin-second", "headless_run", source)
+        self.assertTrue(
+            self.plugin.store.enqueue_event(
+                "1785000100.000050",
+                second.bridge_id,
+                "second thread",
+            )
+        )
+
+        with mock.patch.object(
+            self.plugin,
+            "_schedule_one_bridge_drain",
+            return_value=True,
+        ) as schedule:
+            self.plugin._schedule_bridge_drain(first.bridge_id)
+
+        schedule.assert_called_once_with(second.bridge_id)
 
     def test_bound_zellij_cancel_interrupts_and_closes_exact_attempt(self):
         bridge = self._zellij_bridge("operator-cancel")
@@ -708,6 +940,120 @@ class PluginAttemptRecoveryTest(unittest.TestCase):
                 (event_id,),
             ).fetchone()[0]
         self.assertEqual(state, "failed")
+
+    def test_bound_herdr_submission_uses_herdr_attempt_ledger(self):
+        bridge = self._herdr_bridge("herdr-submit")
+        event_id = "1785000100.000199"
+        items = self._claimed_item(bridge, event_id)
+        with mock.patch.object(
+            self.plugin,
+            "deliver_herdr",
+            return_value="att_marker",
+        ) as deliver, mock.patch.object(
+            self.plugin,
+            "deliver_zellij",
+        ) as zellij:
+            attempt_id = self.plugin._submit_live_attempt(
+                bridge,
+                items,
+                "continue",
+            )
+        deliver.assert_called_once_with(bridge, "continue", attempt_id)
+        zellij.assert_not_called()
+        active = self.plugin.store.active_live_attempt(
+            bridge.bridge_id,
+            "herdr",
+        )
+        self.assertEqual(active["attempt_id"], attempt_id)
+        self.assertEqual(active["delivery_kind"], "herdr")
+        with self.plugin.store.connect() as database:
+            delivery_kind = database.execute(
+                "SELECT delivery_kind FROM bridge_attempts WHERE attempt_id=?",
+                (attempt_id,),
+            ).fetchone()[0]
+        self.assertEqual(delivery_kind, "herdr")
+
+    def test_restart_requeues_legacy_safe_herdr_preflight_failure(self):
+        bridge = self._herdr_bridge("herdr-safe-preflight")
+        event_id = "1785000100.000249"
+        items = self._claimed_item(bridge, event_id)
+        attempt_id = self.runtime.delivery_attempt_id(
+            bridge.bridge_id,
+            [item["event_id"] for item in items],
+            bridge.binding_generation,
+        )
+        self.assertTrue(
+            self.plugin.store.prepare_delivery_attempt(
+                [event_id],
+                bridge.bridge_id,
+                bridge.binding_generation,
+                attempt_id,
+                delivery_kind="herdr",
+            )
+        )
+        self.assertTrue(
+            self.plugin.store.mark_attempt_submitting(
+                attempt_id,
+                bridge.bridge_id,
+                bridge.binding_generation,
+            )
+        )
+        self.assertTrue(
+            self.plugin.store.mark_attempt_uncertain(
+                attempt_id,
+                bridge.bridge_id,
+                "native_continuation_failed",
+            )
+        )
+
+        restarted = self.runtime.Store(self.plugin.store.path)
+        claimed = restarted.claim_event_batch(bridge.bridge_id)
+
+        self.assertEqual([item["event_id"] for item in claimed], [event_id])
+        self.assertEqual(
+            restarted.attempt_state(attempt_id, bridge.bridge_id),
+            "requeued",
+        )
+
+    def test_bound_herdr_cancel_interrupts_and_closes_exact_attempt(self):
+        bridge = self._herdr_bridge("herdr-cancel")
+        event_id = "1785000100.000299"
+        items = self._claimed_item(bridge, event_id)
+        attempt_id = self.runtime.delivery_attempt_id(
+            bridge.bridge_id,
+            [item["event_id"] for item in items],
+            bridge.binding_generation,
+        )
+        self.assertTrue(
+            self.plugin.store.prepare_delivery_attempt(
+                [event_id],
+                bridge.bridge_id,
+                bridge.binding_generation,
+                attempt_id,
+                delivery_kind="herdr",
+            )
+        )
+        self.assertTrue(
+            self.plugin.store.mark_attempt_awaiting_ack(
+                attempt_id,
+                bridge.bridge_id,
+                bridge.binding_generation,
+            )
+        )
+        with mock.patch.object(
+            self.plugin,
+            "interrupt_herdr",
+        ) as interrupt:
+            cancelled = self.plugin._interrupt_active_live_attempt(bridge)
+        interrupt.assert_called_once_with(bridge)
+        self.assertEqual(cancelled, 1)
+        self.assertIsNone(
+            self.plugin.store.active_live_attempt(bridge.bridge_id, "herdr")
+        )
+        self.assertEqual(
+            self.plugin.store.attempt_state(attempt_id, bridge.bridge_id),
+            "cancelled",
+        )
 
     def test_crash_before_zellij_injection_is_recoverable(self):
         bridge = self._zellij_bridge("pre-injection")
