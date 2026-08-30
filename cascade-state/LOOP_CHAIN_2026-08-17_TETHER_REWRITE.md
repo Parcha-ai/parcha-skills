@@ -168,6 +168,41 @@ deltas are the bridge-integrity carve-outs above. The parity check itself belong
 matrix: run the same probe script in a user-launched session and a Tether-launched session and
 diff the results to empty (modulo the named carve-outs).
 
+## Chaos-test findings — 2026-08-30 — twelve defects from one live conversation
+
+Running three agents through one Slack thread (a debate in #agent-hub) surfaced twelve
+defects in the DEPLOYED system in a single session. None was reachable from the test
+suite; each needed a real gateway, a real workspace, or both. Six are fixed and merged
+(PR 406), one is an upstream Hermes bug with a filing-ready patch, four were config or
+version problems corrected live, one is documented.
+
+The two that had been embarrassing us publicly:
+
+- **Slack silently forks a threaded reply into a new root.** Slack does not reject a
+  chat.postMessage whose thread_ts it does not know — it posts a new top-level message
+  and returns success. A binding marked active/verified pointed at a thread Slack
+  answered thread_not_found for, and every reply became a stray root while the sender
+  believed it replied in-thread. This is exactly Manuel's "my updates landed as new
+  messages instead of in the thread" report of 2026-08-28. Now detected from the
+  delivery response (no extra call on the happy path) and the binding flips to
+  rebind_required.
+- **Stuck work was invisible to the surface built to show it.** A root in `uncertain`
+  retried 21,786 times over three days, logging a failure every few minutes, while
+  `tether unresolved` reported nothing: roots were the one stranding point the query
+  never covered. Now listed with their retry count and resolvable via `--kind root`.
+
+The systemic finding: **six independent silent gates** stand between one agent and
+another (channel membership, Tether router peer-trust, plugin build version,
+HERMES_TRUSTED_BOT_IDS, SLACK_ALLOW_BOTS, and an upstream bug making the fifth
+unreachable). Each drops the message with no report of which one fired, so a blocked
+agent is indistinguishable from a hung one. Runbook: memory `tether-agent-to-agent-gates`.
+Also observed: **four different Tether plugin builds running on one machine**, one old
+enough that a correct config grant had no code to read it — the drift the rewrite's
+single install path exists to end.
+
+Operational note: agent-to-agent conversation now works on greppy3 and was verified by
+two agents sustaining an unmoderated argument.
+
 ## Amendment A3 — 2026-08-26 — Tether agent model policy
 
 Product-owner directive (Miguel): **Tether-spawned Claude agents run `claude-opus-5`, not
