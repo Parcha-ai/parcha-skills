@@ -1,7 +1,7 @@
 {
   "name": "parable",
   "description": "Multi-model orchestration or explicit solo execution: route work across capable models, or run one exact proxy model with delegation disabled.",
-  "version": "0.1.30",
+  "version": "0.1.31",
   "author": {
     "name": "Parcha Labs",
     "url": "https://parcha.com"

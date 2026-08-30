@@ -57,6 +57,11 @@ avoid_for = "Design judgment; high-blast-radius review."
 provider = "openai"
 model = "gpt-5.6-sol"
 effort = "xhigh"
+context_ktok = 1050
+extra_config = [
+  "model_context_window=1000000",
+  "model_auto_compact_token_limit=900000",
+]
 cost = { in = 0.0, out = 0.0 }
 tags = ["frontier", "gnarly", "adversarial"]
 use_for = "Gnarly debugging, cross-cutting design tension; adversarial reviewer of Claude diffs."

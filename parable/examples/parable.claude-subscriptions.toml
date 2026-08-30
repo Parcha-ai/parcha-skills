@@ -19,11 +19,11 @@ type = "subagent"
 
 [executors.grok]
 provider = "claude"
-model = "grok-4.5"
+model = "grok-4.6"
 effort = "high"
-tags = ["implementer", "systems", "third-family", "subscription"]
-use_for = "Bounded terminal-heavy or systems implementation, especially Rust or C++, plus cross-family smoke testing."
-avoid_for = "Sole final factual review, orchestration, ambiguous product architecture, or reviewing its own diff."
+tags = ["architect", "implementer", "systems", "third-family", "subscription"]
+use_for = "Coding, agentic implementation, systems work, architectural second opinions, parent orchestration, and cross-family smoke testing."
+avoid_for = "Delegation from a Grok parent, routine mechanical work, or reviewing its own diff."
 
 [executors.kimi]
 provider = "claude"
@@ -98,5 +98,5 @@ refactor_wide  = ["sol_exact", "sonnet_exact", "opus_exact", "fable_exact", "gro
 gnarly         = ["sol_exact", "opus_exact", "fable_exact", "grok", "kimi"]
 review         = ["opus_exact", "sol_exact", "terra", "sonnet_exact", "grok"]
 smoke_test     = ["kimi", "grok", "sol_exact", "luna", "sonnet_exact"]
-architecture   = ["fable_exact", "opus_exact", "sol_exact"]
+architecture   = ["fable_exact", "opus_exact", "sol_exact", "grok"]
 escalation     = ["fable_exact", "opus_exact", "sol_exact", "grok", "kimi", "terra", "sonnet_exact"]

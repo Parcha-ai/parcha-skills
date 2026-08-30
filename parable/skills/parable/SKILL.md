@@ -271,10 +271,12 @@ this tool exists to prevent. The per-pool selection detail lives in `references/
   `parable-config.sh`; for a bare Claude alias, use a general-purpose agent with the executor's
   model. If there is no native agent-spawn tool, that executor is unavailable; choose a
   CLI-backed executor. In solo mode, the selected proxy model runs directly as the parent.
-- `parable [--brain auto|fable|sol|config] [--] [CLAUDE_ARGS...]` or `parable --solo <alias|exact-model> [--] [CLAUDE_ARGS...]` — safely reuse a healthy configured loopback proxy or own its
+- `parable [--brain auto|fable|sol|grok|config] [--] [CLAUDE_ARGS...]` or `parable --solo <alias|exact-model> [--] [CLAUDE_ARGS...]` — safely reuse a healthy configured loopback proxy or own its
   start/readiness/cleanup lifecycle. Multi-model mode requires its selected parent and tolerates unavailable optional cast members; solo requires only its selected exact model. Multi-model mode: `auto` prefers Fable while
-  its pool is below the tight threshold, then falls back to Sol by live usage; `fable` and `sol`
-  pin either parent, and `config` uses `brain_model`. Idempotently synchronizes Parable-owned project agents and displays the multi-model cast card. Solo mode: `--solo <model>` launches with the single selected model only; `--brain` is rejected. With no arguments, Parable uses `auto` (multi-model) and
+  its pool is below the tight threshold, moves to Sol while that pool has unknown or available
+  headroom, and uses configured Grok when Sol is unavailable or both measured pools are tight.
+  Parable has no xAI usage probe and never claims Grok has measured headroom. `fable`, `sol`, and
+  `grok` pin an eligible exact parent, and `config` uses `brain_model`. Idempotently synchronizes Parable-owned project agents and displays the multi-model cast card. Solo mode: `--solo <model>` launches with the single selected model only; `--brain` is rejected. With no arguments, Parable uses `auto` (multi-model) and
   forwards `--effort high`. Claude flags pass through directly, so for example
   `parable --dangerously-skip-permissions` works; the `--` separator is optional. Never enable
   permission bypass implicitly.
