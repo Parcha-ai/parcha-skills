@@ -99,38 +99,38 @@ Code's native `[1m]` selector while retaining the bare exact id for catalog vali
 routing.
 
 Non-Claude models still need an explicit ceiling. Parable sets
-`CLAUDE_CODE_MAX_CONTEXT_TOKENS` to their real window. When the **parent itself is non-Claude**, it
-also sets `CLAUDE_CODE_AUTO_COMPACT_WINDOW` to that ceiling and
-`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=75` to leave room for tool results and the compaction request.
-Those last two controls are process-wide, so Parable deliberately does not derive them from a
-mixed cast when the parent is Fable or another Claude-family model; doing so would shrink a 1M
-Fable session to the cast's smaller window.
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the active non-Claude parent's window. It also sets
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW` to that ceiling and a model-specific compaction percentage:
+Sol uses `90`, giving it a 1,000,000-token budget with compaction at 900,000; other non-Claude
+parents default to `75` for extra tool-result headroom. These controls are process-wide, so a
+smaller child must not silently shrink the active parent.
 
 - **Solo mode** uses `[1m]` for a known 1M Claude-family model. A non-Claude solo model receives
-  its exact ceiling and the 75% safety threshold.
-- **Multi-model mode** gives a Claude-family parent its native marked window, while
-  `CLAUDE_CODE_MAX_CONTEXT_TOKENS` remains the minimum across enabled non-Claude proxy models in
-  the cast. An unknown non-Claude model counts as Claude Code's own 200k fallback rather than
-  raising the assumed ceiling blindly.
-- Built-in windows come from the pinned proxy's own model registry (gpt-5.6-sol/terra/luna
-  372k, grok-4.6 500k, kimi-k3 1M via upstream `k3` normalization, Claude 5-class 1M). Override
-  or extend per executor with `context_ktok`.
-- User-provided values always win independently. For a non-Claude parent, when you provide only
-  `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, Parable uses that value for the auto-compact window too. An
-  explicit `CLAUDE_CODE_AUTO_COMPACT_WINDOW` or `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` is never
-  overwritten. An unknown solo model leaves all three variables unset unless you explicitly
-  provide a context ceiling.
+  its own ceiling and model-specific compaction percentage.
+- **Multi-model mode** gives a non-Claude parent its own window. A Claude-family parent keeps its
+  native marked window, while `CLAUDE_CODE_MAX_CONTEXT_TOKENS` remains the minimum across
+  available non-Claude proxy children. An unknown child counts as Claude Code's own 200k fallback
+  rather than raising the assumed ceiling blindly.
+- Sol uses the provider-documented 1M operating budget from its 1.05M maximum, even though the
+  pinned proxy registry still describes the separately tuned 372k default. Terra and Luna remain
+  372k; Grok 4.6 is 500k; Kimi K3 and Claude 5-class models are 1M. Override or extend per executor
+  with `context_ktok`.
+- User-provided values from an ordinary shell win independently. For a non-Claude parent, when you
+  provide only `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, Parable uses that value for the auto-compact
+  window too. An explicit `CLAUDE_CODE_AUTO_COMPACT_WINDOW` or
+  `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` is never overwritten. When Parable is started from inside an
+  existing Parable session, those inherited process controls are stale launch state and are
+  recomputed for the new brain. An unknown solo model leaves all three variables unset unless you
+  explicitly provide a context ceiling.
 
-The launch line reports the parent window and any separate non-Claude cast ceiling; the startup
-card shows each model's real window (`· 372k ctx`). For a Sol parent, 75% starts compaction near
-279k instead of waiting until roughly 353k; this leaves about 74k of headroom below the currently
-observed Claude-loopback Codex route's 353.4k effective input window. A Fable parent retains its
-1M window and Claude Code's native auto-compaction policy.
+The launch line reports the parent window and any separate non-Claude cast ceiling. The startup
+card shows Sol as `· 1M ctx`, and Claude Code receives a 90% auto-compact point. A Fable parent
+retains its own 1M window and Claude Code's native auto-compaction policy.
 
 ### Codex-native Sol context
 
-The Claude-loopback parent window above is separate from a Codex-native executor. To opt only a
-Parable Codex-native Sol lane into the documented large context, configure the executor directly:
+The Claude-loopback Sol parent now receives the 1M/900K defaults automatically. A Codex-native
+executor uses separate Codex CLI settings, configured directly on that executor:
 
 ```toml
 [executors.sol]
@@ -147,8 +147,8 @@ Parable passes each `extra_config` entry as a raw Codex `-c` argument on the ini
 those arguments for `codex exec resume`. The 900,000-token limit is the 90% compaction point for
 the configured 1,000,000-token budget. This changes only that executor invocation; Parable never
 edits `~/.codex/config.toml`. Run Codex `/status` in the launched session to verify the context
-window actually granted by the server and account. Do not raise the Claude-loopback Sol ceiling
-from 372k without separate authenticated proxy and long-context evidence.
+window actually granted by the server and account. The Claude-loopback route uses the same 1M
+operating budget through Claude Code's process-scoped context controls.
 
 Those environment controls protect future turns, but they cannot repair a saved conversation
 that is already larger than a newly selected model's window. On explicit CLI resumes

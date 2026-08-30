@@ -350,9 +350,10 @@ runtime difference.
   exact selected session before accepting the first prompt. Long compactions print a flushed
   status line before Sonnet starts, followed by verification and completion messages.
 - Live non-Claude parents use Claude Code's explicit auto-compact window as well as the model
-  ceiling. Known 1M Claude-family parents use Claude Code's `[1m]` selector and native
-  auto-compaction so a smaller mixed-cast model cannot cap the parent process. Separately, the
-  Codex-native Sol example passes `model_context_window=1000000` and
+  ceiling. A Sol brain defaults to a 1M budget and 90% compaction point, so its launch card shows
+  `1M ctx` and compaction starts around 900K. Known 1M Claude-family parents use Claude Code's
+  `[1m]` selector and native auto-compaction so a smaller mixed-cast model cannot cap the parent
+  process. Separately, the Codex-native Sol example passes `model_context_window=1000000` and
   `model_auto_compact_token_limit=900000` only for that executor; Parable never edits
   `~/.codex/config.toml`, and Codex `/status` is the authority for the granted live window. If
   Claude Code still returns a context-window API error, the managed supervisor stops the

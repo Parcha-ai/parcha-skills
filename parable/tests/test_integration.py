@@ -448,7 +448,7 @@ class TestClaudeSubscriptionLauncher(unittest.TestCase):
             self.assertNotIn(token, agent.read_text())
             self.assertNotIn(token, (repo / "parable.toml").read_text())
 
-    def test_launcher_compacts_large_resume_with_sonnet_before_sol(self):
+    def test_launcher_keeps_resume_on_one_million_sol_window(self):
         with tempfile.TemporaryDirectory() as tmp, model_server(
             ["gpt-5.6-sol", "claude-sonnet-5", "kimi-k3"]
         ) as (_server, base_url, token):
@@ -470,36 +470,16 @@ class TestClaudeSubscriptionLauncher(unittest.TestCase):
             )
 
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            self.assertIn(
-                "resume: compacted 321,400 to 42,000 tokens with Sonnet 5", proc.stdout
-            )
+            self.assertNotIn("resume: compacted", proc.stdout)
             recorded = [json.loads(line) for line in calls.read_text().splitlines()]
-            self.assertEqual(len(recorded), 4)
-            self.assertIn("claude-sonnet-5[1m]", recorded[0]["argv"])
-            self.assertEqual(recorded[0]["argv"][-2:], ["--continue", "/context"])
-            self.assertIsNone(recorded[0]["max_context_tokens"])
-            self.assertIsNone(recorded[0]["auto_compact_window"])
+            self.assertEqual(len(recorded), 1)
             self.assertEqual(
-                recorded[1]["argv"][-3:],
-                [
-                    "--resume", "resolved-resume-session",
-                    "/compact preserve the active task, user requirements, decisions, "
-                    "changed files, remaining work, and verification evidence",
-                ],
+                recorded[0]["argv"][-4:],
+                ["gpt-5.6-sol", "--continue", "--print", "finish"],
             )
-            self.assertEqual(
-                recorded[2]["argv"][-3:],
-                ["--resume", "resolved-resume-session", "/context"],
-            )
-            self.assertEqual(
-                recorded[3]["argv"][-5:],
-                [
-                    "gpt-5.6-sol", "--resume", "resolved-resume-session",
-                    "--print", "finish",
-                ],
-            )
-            self.assertEqual(recorded[3]["max_context_tokens"], "372000")
-            self.assertEqual(recorded[3]["auto_compact_window"], "372000")
+            self.assertEqual(recorded[0]["max_context_tokens"], "1000000")
+            self.assertEqual(recorded[0]["auto_compact_window"], "1000000")
+            self.assertEqual(recorded[0]["auto_compact_pct"], "90")
 
     def test_launcher_degrades_when_an_optional_routed_model_is_absent(self):
         with tempfile.TemporaryDirectory() as tmp, model_server(
@@ -786,7 +766,7 @@ exit 0
             self.assertEqual(first.stdout.count(handoff), 1)
             self.assertIn(launch, first.stdout)
 
-            installed = home / ".local" / "share" / "parable" / "0.1.31"
+            installed = home / ".local" / "share" / "parable" / "0.1.33"
             durable = home / ".local" / "bin" / "parable"
             self.assertTrue((installed / "bin" / "parable.js").is_file())
             self.assertTrue((installed / "lib" / "onboarding.js").is_file())

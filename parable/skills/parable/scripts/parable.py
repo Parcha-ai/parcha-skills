@@ -78,16 +78,18 @@ AUTO_BRAIN_TIGHT_PCT = 80.0
 # assumes 200k (or 1M via the [1m]/beta paths) for models it does not recognize,
 # so without this table auto-compact fires far too late for proxied non-Anthropic
 # models and sessions die with upstream "input exceeds the context window" 400s.
-# Sources: the pinned CLIProxyAPI registry (internal/registry/models/*.json) and
-# upstream issue reports; kimi-k3 is ~1M because the pinned proxy normalizes the
-# upstream id to bare "k3" (router-for-me/CLIProxyAPI#4418). A `context_ktok`
+# Sources: provider documentation plus the pinned CLIProxyAPI registry
+# (internal/registry/models/*.json). Sol supports a 1.05M provider window; Parable
+# uses the documented 1M operating budget with 900k compaction rather than the
+# registry's tuned 372k default. kimi-k3 is ~1M because the pinned proxy normalizes
+# the upstream id to bare "k3" (router-for-me/CLIProxyAPI#4418). A `context_ktok`
 # on the executor in parable.toml overrides this table.
 MODEL_CONTEXT_WINDOWS = {
     "claude-fable-5": 1_000_000,
     "claude-sonnet-5": 1_000_000,
     "claude-opus-4-8": 1_000_000,
     "claude-haiku-4-5-20251001": 200_000,
-    "gpt-5.6-sol": 372_000,
+    "gpt-5.6-sol": 1_000_000,
     "gpt-5.6-terra": 372_000,
     "gpt-5.6-luna": 372_000,
     "gpt-5.5": 272_000,
@@ -102,10 +104,12 @@ CLAUDE_AUTO_COMPACT_WINDOW_ENV = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
 CLAUDE_AUTO_COMPACT_PCT_ENV = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
 # Claude Code's default auto-compact point is about 95%. That leaves too little
 # room for a tool result between turns when a proxied model has a smaller input
-# ceiling than Claude expects. The pinned Sol registry window is 372k and live
-# sessions have been rejected as early as ~321k, so 75% triggers near 279k and
-# leaves roughly 74k before the Codex effective window (353.4k).
+# ceiling than Claude expects. Use a conservative default, while Sol follows the
+# documented 1M operating budget and 900k compaction point.
 CLAUDE_AUTO_COMPACT_PCT = 75
+MODEL_AUTO_COMPACT_PCT = {
+    "gpt-5.6-sol": 90,
+}
 CLAUDE_LONG_CONTEXT_MARKER = "[1m]"
 CLAUDE_RESUME_COMPACT_MODEL = "claude-sonnet-5[1m]"
 CLAUDE_RESUME_COMPACT_BASE_MODEL = "claude-sonnet-5"
@@ -591,6 +595,10 @@ def build_claude_launch(cfg: dict, forwarded: list[str], environ: dict[str, str]
     launch_env["ANTHROPIC_AUTH_TOKEN"] = token
     if token_name != "ANTHROPIC_AUTH_TOKEN":
         launch_env.pop(token_name, None)
+    nested_parable = bool(
+        source_env.get(PARABLE_AGENT_STATE_ENV)
+        or source_env.get(PARABLE_WELCOME_ENV)
+    )
     for inherited in (
         "ANTHROPIC_API_KEY",
         "CLAUDE_CODE_OAUTH_TOKEN",
@@ -599,6 +607,16 @@ def build_claude_launch(cfg: dict, forwarded: list[str], environ: dict[str, str]
         PARABLE_AGENT_STATE_ENV,
     ):
         launch_env.pop(inherited, None)
+    if nested_parable:
+        # A new Parable launched from an existing Parable/Claude shell inherits
+        # the old session's process-scoped context controls. They are launch
+        # state, not a fresh user override; recompute them for the new brain.
+        for inherited in (
+            CLAUDE_CONTEXT_ENV,
+            CLAUDE_AUTO_COMPACT_WINDOW_ENV,
+            CLAUDE_AUTO_COMPACT_PCT_ENV,
+        ):
+            launch_env.pop(inherited, None)
     if solo:
         launch_env.pop("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", None)
     # MAX_CONTEXT teaches Claude Code the real ceiling of proxied non-Claude
@@ -608,7 +626,7 @@ def build_claude_launch(cfg: dict, forwarded: list[str], environ: dict[str, str]
     ceiling = claude_context_ceiling(
         cfg, claude["brain_model"], solo=solo, available=available
     )
-    if not source_env.get(CLAUDE_CONTEXT_ENV):
+    if nested_parable or not source_env.get(CLAUDE_CONTEXT_ENV):
         if ceiling is not None:
             launch_env[CLAUDE_CONTEXT_ENV] = str(ceiling)
     effective_ceiling = launch_env.get(CLAUDE_CONTEXT_ENV)
@@ -616,15 +634,19 @@ def build_claude_launch(cfg: dict, forwarded: list[str], environ: dict[str, str]
     if (
         effective_ceiling
         and not parent_is_claude
-        and not source_env.get(CLAUDE_AUTO_COMPACT_WINDOW_ENV)
+        and (nested_parable or not source_env.get(CLAUDE_AUTO_COMPACT_WINDOW_ENV))
     ):
         launch_env[CLAUDE_AUTO_COMPACT_WINDOW_ENV] = effective_ceiling
     if (
         effective_ceiling
         and not parent_is_claude
-        and not source_env.get(CLAUDE_AUTO_COMPACT_PCT_ENV)
+        and (nested_parable or not source_env.get(CLAUDE_AUTO_COMPACT_PCT_ENV))
     ):
-        launch_env[CLAUDE_AUTO_COMPACT_PCT_ENV] = str(CLAUDE_AUTO_COMPACT_PCT)
+        launch_env[CLAUDE_AUTO_COMPACT_PCT_ENV] = str(
+            MODEL_AUTO_COMPACT_PCT.get(
+                claude["brain_model"], CLAUDE_AUTO_COMPACT_PCT
+            )
+        )
     isolation = ["--disallowedTools", "Agent"] if solo else []
     argv = [
         claude.get("binary", "claude"),
@@ -1091,28 +1113,28 @@ def claude_context_ceiling(cfg: dict, brain_model: str, *, solo: bool = False,
 
     Claude Code honors this env var only for models whose id does not start
     with "claude-", and it is process-wide — one value covers the parent and
-    every subagent. A non-Claude solo launch gets that model's window; a
-    Claude-family solo launch uses Claude Code's native long-context marker
-    instead. A multi-model launch takes the minimum window across the brain and
-    every available non-Claude cast model in the launch snapshot, treating
-    unknown windows as Claude Code's own 200k fallback so an unknown model never
-    raises the assumed ceiling. Claude-family models ignore this env var.
+    every subagent. A non-Claude parent therefore gets its own window; taking
+    the minimum across smaller cast models would silently shrink the active
+    brain. A Claude-family parent uses its native window rules, while this env
+    remains the minimum across available non-Claude cast models. Unknown windows
+    use Claude Code's own 200k fallback so they never raise the assumed ceiling.
     """
     if solo:
         if is_claude_family_model(brain_model):
             return None
         return model_context_window(cfg, brain_model)
-    models = {brain_model}
-    models.update(
+    if not is_claude_family_model(brain_model):
+        return model_context_window(cfg, brain_model) or CLAUDE_DEFAULT_CONTEXT_WINDOW
+    non_claude = [
         ex["model"] for ex in custom_claude_executors(cfg).values()
-        if available is None or ex["model"] in available
-    )
-    non_claude = [m for m in models if not m.lower().startswith("claude-")]
+        if not is_claude_family_model(ex["model"])
+        and (available is None or ex["model"] in available)
+    ]
     if not non_claude:
         return None
     return min(
-        model_context_window(cfg, m) or CLAUDE_DEFAULT_CONTEXT_WINDOW
-        for m in non_claude
+        model_context_window(cfg, model) or CLAUDE_DEFAULT_CONTEXT_WINDOW
+        for model in non_claude
     )
 
 

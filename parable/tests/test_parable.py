@@ -271,6 +271,7 @@ class TestClaudeLaunch(unittest.TestCase):
             cfg, "gpt-5.6-sol", "explicit sol parent",
             {"gpt-5.6-sol"}, columns=96,
         )
+        self.assertIn("gpt-5.6-sol · 1M ctx", degraded)
         self.assertIn("DEGRADED FABLE, KIMI unavailable for this session", degraded)
 
     def test_resume_selector_handles_explicit_forms_and_not_prompt_text(self):
@@ -750,34 +751,37 @@ class TestClaudeLaunch(unittest.TestCase):
             parable.claude_context_ceiling(cfg, "kimi-k3", solo=True), 1_000_000
         )
         self.assertEqual(
-            parable.claude_context_ceiling(cfg, "gpt-5.6-sol", solo=True), 372_000
+            parable.claude_context_ceiling(cfg, "gpt-5.6-sol", solo=True), 1_000_000
         )
         # Solo on an unknown model: no override rather than a guess.
         self.assertIsNone(
             parable.claude_context_ceiling(cfg, "mystery-model", solo=True)
         )
-        # Multi-model: minimum across brain + non-Claude cast models.
-        self.assertEqual(parable.claude_context_ceiling(cfg, "gpt-5.6-sol"), 372_000)
+        # A non-Claude parent keeps its own window even when the cast differs.
+        self.assertEqual(parable.claude_context_ceiling(cfg, "gpt-5.6-sol"), 1_000_000)
         # Anthropic-only cast (kimi disabled): env should not be set at all.
         cfg_claude_only = self.cfg()
         cfg_claude_only["executors"]["kimi"]["enabled"] = False
         self.assertIsNone(
             parable.claude_context_ceiling(cfg_claude_only, "claude-fable-5")
         )
-        # An unknown cast model clamps to Claude Code's own 200k fallback.
+        # A smaller or unknown child cannot silently shrink a non-Claude parent.
         cfg_unknown = self.cfg()
         cfg_unknown["executors"]["mystery"] = {
             "provider": "claude", "model": "mystery-model",
         }
         self.assertEqual(
-            parable.claude_context_ceiling(cfg_unknown, "gpt-5.6-sol"), 200_000
+            parable.claude_context_ceiling(cfg_unknown, "gpt-5.6-sol"), 1_000_000
         )
-        # An unavailable exact-model lane does not constrain this session.
+        self.assertEqual(
+            parable.claude_context_ceiling(cfg_unknown, "claude-fable-5"), 200_000
+        )
+        # Catalog availability does not change the active parent's own window.
         self.assertEqual(
             parable.claude_context_ceiling(
                 cfg_unknown, "gpt-5.6-sol", available={"gpt-5.6-sol"}
             ),
-            372_000,
+            1_000_000,
         )
         # parable.toml context_ktok override beats the built-in table.
         cfg_override = self.cfg()
@@ -793,12 +797,26 @@ class TestClaudeLaunch(unittest.TestCase):
         self.assertEqual(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "1000000")
         self.assertEqual(env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "1000000")
         self.assertEqual(env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], "75")
-        # Multi-model launch takes the min across the non-Claude cast.
+        # Sol keeps its documented 1M parent budget and compacts at 900k.
         multi = parable.config_with_claude_brain(self.cfg(), "gpt-5.6-sol")
         _argv, env = parable.build_claude_launch(multi, [], source)
-        self.assertEqual(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "372000")
-        self.assertEqual(env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "372000")
-        self.assertEqual(env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], "75")
+        self.assertEqual(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "1000000")
+        self.assertEqual(env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "1000000")
+        self.assertEqual(env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], "90")
+        # Stale process controls from an older Parable session are launch state,
+        # not fresh user overrides; a restarted Sol brain gets current defaults.
+        nested = {
+            "CLIPROXY_API_KEY": "x",
+            parable.PARABLE_AGENT_STATE_ENV: "{}",
+            "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "372000",
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "372000",
+            "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "75",
+        }
+        _argv, env = parable.build_claude_launch(multi, [], nested)
+        self.assertEqual(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "1000000")
+        self.assertEqual(env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "1000000")
+        self.assertEqual(env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], "90")
+        self.assertNotIn(parable.PARABLE_AGENT_STATE_ENV, env)
         # A user's own values are never clobbered.
         user = {
             "CLIPROXY_API_KEY": "x",
@@ -842,10 +860,10 @@ class TestClaudeLaunch(unittest.TestCase):
 
         # Claude Code otherwise treats the proxied Fable id as a 200k model.
         self.assertEqual(argv[1:3], ["--model", "claude-fable-5[1m]"])
-        # MAX_CONTEXT applies to the non-Claude cast without shrinking Fable.
-        self.assertEqual(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "372000")
-        # These controls are process-wide. Setting either from the cast's 372k
-        # ceiling caps the Fable parent and caused compaction around 135k.
+        # The available non-Claude cast is also 1M, so MAX_CONTEXT stays at 1M.
+        self.assertEqual(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "1000000")
+        # These controls are process-wide. Setting either from a smaller cast
+        # ceiling would cap the Fable parent and trigger compaction too early.
         self.assertNotIn("CLAUDE_CODE_AUTO_COMPACT_WINDOW", env)
         self.assertNotIn("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", env)
 
