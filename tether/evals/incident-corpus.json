@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "purpose": "Sanitized executable contract for witnessed Tether failures and critical controls",
+  "baseline_semantics": "A baseline_defect probe passes only when it reproduces the named defect. L1 must replace it with a desired-contract test before deleting the probe.",
+  "incidents": [
+    {
+      "id": "INC-AWAITING-ACK-IMMORTAL",
+      "classification": "baseline_defect",
+      "probe": "test_attempt_recovery.AttemptRecoveryTest.test_stale_awaiting_ack_remains_blocked_until_reconciled",
+      "control": "test_attempt_recovery.AttemptRecoveryTest.test_acknowledgment_unblocks_queued_followup",
+      "mechanism": "An accepted native turn with no reply callback remains awaiting_ack without an age or driver-terminal transition and blocks later work.",
+      "desired_contract": "Every admitted native turn reaches a typed terminal or operator-visible uncertain state through driver evidence, never model obedience."
+    },
+    {
+      "id": "INC-GENERIC-POST-BYPASS",
+      "classification": "baseline_defect",
+      "probe": "test_l0_incident_corpus.AwaitingAckIncidentTest.test_generic_post_succeeds_but_does_not_close_active_attempt",
+      "control": "test_attempt_recovery.AttemptRecoveryTest.test_valid_reply_key_posts_once_and_acknowledges_exact_attempt",
+      "mechanism": "Generic thread egress can succeed while the exact native attempt remains open.",
+      "desired_contract": "Generic egress cannot close an execution attempt. Driver evidence alone closes execution; any explicit progress post is a separate idempotent operation."
+    },
+    {
+      "id": "INC-OPERATOR-SURFACE-DISAGREEMENT",
+      "classification": "baseline_defect",
+      "probe": "test_l0_incident_corpus.AwaitingAckIncidentTest.test_real_cli_and_broker_expose_the_same_operator_mismatch",
+      "control": "test_operator_recovery.OperatorRecoveryTest.test_uncertain_native_attempt_can_be_explicitly_requeued",
+      "mechanism": "Health counts awaiting_ack as blocked while unresolved only returns uncertain attempts.",
+      "desired_contract": "Health, list, and resolve operate on the same blocker set and advertise only valid actions."
+    },
+    {
+      "id": "INC-EPHEMERAL-PAYLOAD-PATH",
+      "classification": "baseline_defect",
+      "external_probe": "signup_intake_path",
+      "control": "test_security_integration.SlackUploadSecurityIntegrationTest.test_upload_uses_private_detached_snapshot_and_survives_source_mutation",
+      "mechanism": "Passing only a temporary intake path loses the payload when the writer disappears or cleans up.",
+      "desired_contract": "Handoff accepts inline content or an owner-private content-addressed durable blob with explicit retention."
+    },
+    {
+      "id": "INC-WRAPPER-REPLY-KEY-DRIFT",
+      "classification": "cross_repo_contract_defect",
+      "external_probe": "wrapper_reply_key",
+      "control": "test_cli.TetherCliTest.test_reply_reads_message_from_stdin",
+      "mechanism": "Fleet wrapper calls reply without the now-required attempt reply key and suppresses the nonzero result.",
+      "desired_contract": "One generated client owns the typed broker contract; required fields cannot drift across repositories."
+    },
+    {
+      "id": "INC-WRAPPER-IDEMPOTENCY-DRIFT",
+      "classification": "cross_repo_contract_defect",
+      "external_probe": "hook_idempotency_key",
+      "control": "test_cli.TetherCliTest.test_post_reads_message_from_private_fd",
+      "mechanism": "Fleet hook calls generic post without the required idempotency key and converts failure into success.",
+      "desired_contract": "One generated client owns the typed broker contract and never hides a rejected write."
+    },
+    {
+      "id": "INC-CREDENTIAL-HELPER-PREFLIGHT",
+      "classification": "legacy_behavior_control",
+      "probe": "test_bridge.CredentialBoundaryTest.test_broker_refuses_invalid_credentials_before_opening_traffic",
+      "control": "test_bridge.CredentialBoundaryTest.test_doctor_executes_the_native_credential_helper",
+      "mechanism": "Credential helper validation must fail before native traffic with a typed, correlated reason.",
+      "desired_contract": "Capability and credential providers expose readiness before admission; failure never wedges an accepted turn."
+    },
+    {
+      "id": "INC-ENDPOINT-MULTI-THREAD",
+      "classification": "legacy_behavior_control",
+      "probe": "test_bridge_lifecycle.BridgeLifecycleTest.test_exact_native_endpoint_can_own_multiple_active_threads",
+      "control": "test_attempt_recovery.AttemptRecoveryTest.test_concurrent_shared_endpoint_prepares_exactly_one_turn",
+      "mechanism": "One endpoint may own many thread bindings while permitting only one active turn.",
+      "desired_contract": "Endpoint is first-class; N bindings share one fair scheduler and one lease."
+    },
+    {
+      "id": "INC-RESTART-STATE-MATRIX",
+      "classification": "legacy_behavior_control",
+      "probe": "test_attempt_recovery.AttemptRecoveryTest.test_restart_recovers_pre_io_and_preserves_ambiguous_attempts",
+      "control": "test_outbox_process_safety.OutboxProcessSafetyTest.test_uncertain_reconciliation_never_reposts_after_acceptance_crash",
+      "mechanism": "Restart safely requeues only proven pre-I/O work and preserves ambiguous outcomes.",
+      "desired_contract": "Every transition has a crash test and typed recovery action with no blind replay."
+    },
+    {
+      "id": "INC-ROUTING-MUTATION-OWNERSHIP",
+      "classification": "legacy_behavior_control",
+      "probe": "test_routing_plugin.RoutingPluginIntegrationTest.test_native_edit_revises_queued_turn_without_duplicate_delivery",
+      "control": "test_routing_plugin.RoutingPluginIntegrationTest.test_native_delete_cancels_queued_turn",
+      "mechanism": "Edit/delete routing keeps the exact workspace, thread, event, writer, and generation.",
+      "desired_contract": "Normalized ingress mutation semantics remain deterministic under the public Hermes contract."
+    },
+    {
+      "id": "INC-PEER-BOT-WORKSPACE-OWNERSHIP",
+      "classification": "legacy_behavior_control",
+      "probe": "test_routing_plugin.RoutingPluginIntegrationTest.test_trusted_peer_requires_exact_self_mention",
+      "control": "test_hermes_compat.HermesCompatibilityTest.test_reply_poller_uses_bound_bridge_workspace",
+      "mechanism": "Peer bots and workspace identity must never inherit authority from thread participation alone.",
+      "desired_contract": "Slack principal and workspace are explicit inputs to one fail-closed admission decision."
+    },
+    {
+      "id": "INC-SLACK-UNCERTAIN-DELIVERY",
+      "classification": "legacy_behavior_control",
+      "probe": "test_outbox_recovery.OutboxRecoveryTest.test_accepted_reply_is_reconciled_after_local_complete_crash",
+      "control": "test_attempt_recovery.AttemptRecoveryTest.test_uncertain_slack_post_retries_immutable_payload_with_same_client_id",
+      "mechanism": "Remote acceptance before local commit remains uncertain until exact receipt reconciliation.",
+      "desired_contract": "One Hermes-owned ledger covers every durable egress operation with rejected, failed-before-I/O, accepted, delivered, retryable, or uncertain receipts and exact reconciliation."
+    },
+    {
+      "id": "INC-CANCEL-FILE-BOUNDARIES",
+      "classification": "legacy_behavior_control",
+      "probe": "test_zellij_cancellation.ZellijCancellationTest.test_verified_interrupt_cancels_exact_attempt",
+      "control": "test_file_upload_protocol.FileUploadProtocolTest.test_uncertain_completion_reconciles_exact_id_without_retry",
+      "mechanism": "Cancellation and files remain attempt/destination bound across ambiguous I/O.",
+      "desired_contract": "Cancellation and file operations use the same typed lifecycle and canonical egress receipt boundary."
+    }
+  ]
+}

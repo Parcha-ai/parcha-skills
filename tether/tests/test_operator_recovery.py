@@ -492,7 +492,7 @@ class OperatorRecoveryTest(unittest.TestCase):
                 "complete",
             )
 
-    def test_broker_resolution_is_workspace_bound_and_wakes_bridge(self):
+    def test_broker_resolution_is_disabled_without_operator_isolation(self):
         event_id = self.uncertain_hermes_ingress("3")
         woken: list[str] = []
         broker = self.runtime.Broker(
@@ -503,17 +503,20 @@ class OperatorRecoveryTest(unittest.TestCase):
         )
         listed = broker.handle({"op": "unresolved", "team_id": TEAM})
         self.assertEqual(listed["operations"][0]["id"], event_id)
-        resolved = broker.handle(
-            {
-                "op": "resolve",
-                "team_id": TEAM,
-                "kind": "ingress",
-                "id": event_id,
-                "action": "retry",
-            }
-        )
-        self.assertEqual(resolved["state"], "pending")
-        self.assertEqual(woken, [self.bridge.bridge_id])
+        with self.assertRaisesRegex(
+            self.runtime.NativeContinuationError,
+            "OS-isolated operator authority",
+        ):
+            broker.handle(
+                {
+                    "op": "resolve",
+                    "team_id": TEAM,
+                    "kind": "ingress",
+                    "id": event_id,
+                    "action": "retry",
+                }
+            )
+        self.assertEqual(woken, [])
         with self.assertRaises(self.runtime.NativeContinuationError):
             broker.handle({"op": "unresolved", "team_id": "T87654321"})
 

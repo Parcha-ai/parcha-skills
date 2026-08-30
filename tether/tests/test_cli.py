@@ -170,6 +170,13 @@ class TetherCliTest(unittest.TestCase):
         claude = self.home / ".claude"
         candidates: dict[pathlib.Path, int] = {
             runtime / "bridge_runtime.py": 0o600,
+            runtime / "domain_control.py": 0o600,
+            runtime / "domain_schema.py": 0o600,
+            runtime / "schema_orchestrator.py": 0o600,
+            runtime / "schema_receipt.py": 0o600,
+            runtime / "schema_rehearsal.py": 0o600,
+            runtime / "domain_runtime.py": 0o600,
+            runtime / "native_driver.py": 0o600,
             runtime / "hermes_compat.py": 0o600,
             runtime / "routing.py": 0o600,
             runtime / "security.py": 0o600,
@@ -416,6 +423,73 @@ class TetherCliTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("exactly one", result.stderr)
 
+    def test_schema_status_delegates_to_installed_read_only_orchestrator(self) -> None:
+        manifest, _candidates = self.write_managed_install(harness="codex")
+        orchestrator = self.root / "data" / "tether" / "schema_orchestrator.py"
+        orchestrator.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "assert sys.argv[1:] == ['status', '--json']\n"
+            "print(json.dumps({'ok': True, 'runtime_ready': True}))\n",
+            encoding="utf-8",
+        )
+        orchestrator.chmod(0o600)
+        lines = manifest.read_text(encoding="utf-8").splitlines()
+        replacement = (
+            f"{orchestrator}\t600\t"
+            f"{hashlib.sha256(orchestrator.read_bytes()).hexdigest()}"
+        )
+        manifest.write_text(
+            "\n".join(
+                replacement if line.startswith(f"{orchestrator}\t") else line
+                for line in lines
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_cli("schema", "status", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {"ok": True, "runtime_ready": True},
+        )
+
+        orchestrator.chmod(0o666)
+        manifest.write_text(
+            manifest.read_text(encoding="utf-8").replace(
+                f"{orchestrator}\t600\t",
+                f"{orchestrator}\t666\t",
+            ),
+            encoding="utf-8",
+        )
+        unsafe_mode = self.run_cli("schema", "status", "--json")
+        self.assertEqual(unsafe_mode.returncode, 2)
+        self.assertIn("managed_install_drift", unsafe_mode.stderr)
+
+        orchestrator.chmod(0o600)
+        manifest.write_text(
+            manifest.read_text(encoding="utf-8").replace(
+                f"{orchestrator}\t666\t",
+                f"{orchestrator}\t600\t",
+            ),
+            encoding="utf-8",
+        )
+        orchestrator.write_text("raise SystemExit(0)\n", encoding="utf-8")
+        tampered = self.run_cli("schema", "status", "--json")
+        self.assertEqual(tampered.returncode, 2)
+        self.assertIn("managed_install_drift", tampered.stderr)
+
+    def test_schema_command_rejects_missing_or_unknown_orchestrator(self) -> None:
+        missing = self.run_cli("schema", "status", "--json")
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("schema_orchestrator_missing", missing.stderr)
+
+        self.write_managed_install(harness="codex")
+        unknown = self.run_cli("schema", "migrate")
+        self.assertEqual(unknown.returncode, 2)
+        self.assertIn("Unknown schema operation", unknown.stderr)
+
     @unittest.skipIf(os.geteuid() == 0, "mutating CLI commands intentionally refuse root")
     def test_js_forwards_message_to_python_only_through_stdin(self) -> None:
         runtime = self.root / "data" / "tether"
@@ -552,81 +626,20 @@ class TetherCliTest(unittest.TestCase):
             "evt-1",
         )
 
-    @unittest.skipIf(os.geteuid() == 0, "mutating CLI commands intentionally refuse root")
-    def test_resolve_requires_explicit_fields_and_confirms_action(self) -> None:
-        with FakeBroker(
-            self.root,
-            lambda _request: self.response(
-                {"ok": True, "status": "resolved"}
-            ),
-        ) as broker:
-            result = self.run_cli(
-                "resolve",
-                "--kind",
-                "attempt",
-                "--id",
-                "attempt-1",
-                "--action",
-                "abandon",
-                "--team",
-                "T12345678",
-                socket_path=broker.path,
-            )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            broker.requests,
-            [{
-                "op": "resolve",
-                "kind": "attempt",
-                "id": "attempt-1",
-                "action": "abandon",
-                "team_id": "T12345678",
-            }],
-        )
-        self.assertEqual(
-            result.stdout,
-            'resolved attempt "attempt-1" with action=abandon\n',
-        )
-
-    @unittest.skipIf(os.geteuid() == 0, "mutating CLI commands intentionally refuse root")
-    def test_resolve_rejects_unknown_actions_before_broker_call(self) -> None:
+    def test_resolve_is_disabled_before_operator_isolation(self) -> None:
         result = self.run_cli(
             "resolve",
             "--kind",
-            "ingress",
+            "attempt",
             "--id",
-            "evt-1",
+            "attempt-1",
             "--action",
-            "force",
+            "abandon",
+            "--team",
+            "T12345678",
         )
         self.assertEqual(result.returncode, 2)
-        self.assertIn("--action must be one of", result.stderr)
-
-    @unittest.skipIf(os.geteuid() == 0, "mutating CLI commands intentionally refuse root")
-    def test_resolve_accepts_reconciliation_kind(self) -> None:
-        with FakeBroker(
-            self.root,
-            lambda _request: self.response(
-                {"ok": True, "status": "resolved"}
-            ),
-        ) as broker:
-            result = self.run_cli(
-                "resolve",
-                "--kind",
-                "reconciliation",
-                "--id",
-                "rec_0123456789abcdef0123456789abcdef",
-                "--action",
-                "retry",
-                "--team",
-                "T12345678",
-                socket_path=broker.path,
-            )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            broker.requests[0]["kind"],
-            "reconciliation",
-        )
+        self.assertIn("operator_boundary_unavailable", result.stderr)
 
     @unittest.skipIf(os.geteuid() == 0, "mutating CLI commands intentionally refuse root")
     def test_rebind_sends_explicit_headless_source(self) -> None:
@@ -796,7 +809,7 @@ class TetherCliTest(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertIn("ok broker socket is private", payload["checks"])
         self.assertIn(
-            "ok managed install integrity verified (19 files; harness=codex)",
+            "ok managed install integrity verified (26 files; harness=codex)",
             payload["checks"],
         )
         self.assertEqual(payload["status"]["protocol_version"], 6)
@@ -934,7 +947,7 @@ class TetherCliTest(unittest.TestCase):
             result = self.run_cli("doctor", socket_path=broker.path)
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn(
-            "ok managed install integrity verified (26 files; harness=both)",
+            "ok managed install integrity verified (33 files; harness=both)",
             result.stdout,
         )
 

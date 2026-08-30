@@ -120,6 +120,39 @@ class ReleaseWorkflowTest(unittest.TestCase):
             'python -m py_compile "$installed/runtime/slack_protocol.py"',
             release,
         )
+        self.assertIn("runtime/domain_schema.py", package["files"])
+        self.assertIn(
+            '"$ROOT_DIR/runtime/domain_schema.py" "$RUNTIME_HOME/domain_schema.py"',
+            installer,
+        )
+        self.assertIn("runtime/domain_schema.py", package["scripts"]["test"])
+        self.assertIn("python -m py_compile tether/runtime/domain_schema.py", ci)
+        self.assertIn(
+            'python -m py_compile "$installed/runtime/domain_schema.py"',
+            release,
+        )
+        self.assertIn("runtime/domain_control.py", package["files"])
+        self.assertIn(
+            '"$ROOT_DIR/runtime/domain_control.py" "$RUNTIME_HOME/domain_control.py"',
+            installer,
+        )
+        self.assertIn("runtime/domain_control.py", package["scripts"]["test"])
+        self.assertIn("python -m py_compile tether/runtime/domain_control.py", ci)
+        self.assertIn(
+            'python -m py_compile "$installed/runtime/domain_control.py"',
+            release,
+        )
+        self.assertIn("runtime/schema_orchestrator.py", package["files"])
+        self.assertIn(
+            '"$ROOT_DIR/runtime/schema_orchestrator.py" "$RUNTIME_HOME/schema_orchestrator.py"',
+            installer,
+        )
+        self.assertIn("runtime/schema_orchestrator.py", package["scripts"]["test"])
+        self.assertIn("python -m py_compile tether/runtime/schema_orchestrator.py", ci)
+        self.assertIn(
+            'python -m py_compile "$installed/runtime/schema_orchestrator.py"',
+            release,
+        )
 
 
 if __name__ == "__main__":

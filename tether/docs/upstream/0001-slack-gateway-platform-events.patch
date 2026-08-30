@@ -1,0 +1,549 @@
+From 6d2102763764747dbf0bb13fab0968724ae33fd2 Mon Sep 17 00:00:00 2001
+From: "claudio-michel[bot]" <claudio-michel[bot]@users.noreply.github.com>
+Date: Sat, 22 Aug 2026 15:00:02 +0000
+Subject: [PATCH] feat(slack): emit normalized gateway_platform_event for
+ edits, deletions, reactions
+
+Discord and Telegram already emit normalized gateway_platform_event
+envelopes; Slack fired none, so message_changed and message_deleted
+subtypes and reactions were invisible to plugins. Adds the missing
+fire-sites with the same contract as the existing ones: plain-dict
+envelopes only (no raw Bolt objects), dispatch through the
+gateway-owned post-auth boundary (set_platform_event_handler ->
+_handle_gateway_platform_event, which enforces _is_user_authorized),
+has_hook fast-path before any normalization, fail-closed on missing
+actor or chat identity, and observer errors never propagate into the
+Socket Mode listener.
+
+Edits fire before the already-processed drop so observers see what
+routing suppresses; deletions authorize the deleted message's author
+(the only identity Slack supplies, mirroring Discord); reactions fire
+regardless of the reaction_triggers opt-in, matching Telegram, and
+independent of the standalone reaction:* gateway hooks.
+
+Consumer: Tether (Parcha-ai/parcha-skills), a Slack-continuation
+plugin that must observe edits and deletions of the messages driving
+long-running agent turns.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ plugins/platforms/slack/adapter.py          | 163 ++++++++++
+ tests/gateway/test_slack_platform_events.py | 311 ++++++++++++++++++++
+ 2 files changed, 474 insertions(+)
+ create mode 100644 tests/gateway/test_slack_platform_events.py
+
+diff --git a/plugins/platforms/slack/adapter.py b/plugins/platforms/slack/adapter.py
+index a4193a85b..92fb4c141 100644
+--- a/plugins/platforms/slack/adapter.py
++++ b/plugins/platforms/slack/adapter.py
+@@ -5511,6 +5511,22 @@ class SlackAdapter(BasePlatformAdapter):
+ 
+         action = "removed" if removed else "added"
+ 
++        # Observer parity (#64176): normalized reaction envelope, matching
++        # Telegram's fire-site. Independent of the reaction_triggers opt-in
++        # and of the standalone reaction:* gateway hooks.
++        await self._fire_slack_platform_event(
++            "reaction",
++            channel_id=channel_id,
++            team_id=team_id or None,
++            user_id=user_id,
++            thread_ts=None,
++            message_id=msg_ts,
++            payload_extra={
++                "reaction": str(reaction_name)[:64],
++                "action": action,
++            },
++        )
++
+         # Fire the gateway hook surface first (reaction:added/removed) so
+         # hook consumers observe every human reaction even when agent
+         # routing below is disabled. getattr-guard: tests build adapters
+@@ -5923,6 +5939,109 @@ class SlackAdapter(BasePlatformAdapter):
+                     return True
+         return False
+ 
++    # ------------------------------------------------------------------
++    # gateway_platform_event fire-sites (#64176 — Discord/Telegram parity)
++    # ------------------------------------------------------------------
++
++    @staticmethod
++    def _platform_events_subscribed() -> bool:
++        """has_hook fast-path shared by every Slack fire-site."""
++        try:
++            from hermes_cli.lifecycle import has_hook
++
++            return has_hook("gateway_platform_event")
++        except Exception:
++            return False
++
++    async def _fire_platform_event(self, event: dict, source) -> None:
++        """Forward one normalized envelope to the gateway-owned boundary.
++
++        No installed callback means no trusted auth boundary — fail closed.
++        Dispatch errors never propagate into the Socket Mode listener.
++        """
++        handler = getattr(self, "_platform_event_handler", None)
++        if handler is None:
++            return
++        try:
++            await handler(event, source)
++        except Exception:
++            logger.debug(
++                "[%s] gateway_platform_event dispatch error", self.name, exc_info=True,
++            )
++
++    def _slack_platform_event_source(
++        self,
++        *,
++        channel_id: str,
++        team_id: Optional[str],
++        user_id: Optional[str],
++        thread_ts: Optional[str],
++        message_id: Optional[str],
++    ):
++        """Build the SessionSource the gateway authorizes against.
++
++        Raises ``ValueError`` when the actor or chat identity is missing so
++        the post-auth boundary fails closed instead of authorizing an
++        incomplete source (mirrors the Discord and Telegram extractors).
++        """
++        if not user_id or not channel_id:
++            raise ValueError(
++                "gateway_platform_event requires actor and chat identities"
++            )
++        return self.build_source(
++            chat_id=str(channel_id),
++            chat_type="thread" if thread_ts else "group",
++            user_id=str(user_id),
++            thread_id=str(thread_ts) if thread_ts else None,
++            scope_id=str(team_id) if team_id else None,
++            parent_chat_id=str(channel_id) if thread_ts else None,
++            message_id=str(message_id) if message_id else None,
++        )
++
++    async def _fire_slack_platform_event(
++        self,
++        event_type: str,
++        *,
++        channel_id: Optional[str],
++        team_id: Optional[str],
++        user_id: Optional[str],
++        thread_ts: Optional[str],
++        message_id: Optional[str],
++        payload_extra: Optional[dict] = None,
++    ) -> None:
++        """Normalize and emit one Slack platform event; never raises."""
++        if not self._platform_events_subscribed():
++            return
++        try:
++            if not channel_id or not message_id:
++                return
++            payload = {
++                "chat_id": str(channel_id)[:128],
++                "message_id": str(message_id)[:128],
++                "thread_id": str(thread_ts)[:128] if thread_ts else None,
++                "workspace_id": str(team_id)[:128] if team_id else None,
++            }
++            if payload_extra:
++                payload.update(payload_extra)
++            event = {
++                "platform": "slack",
++                "event_type": event_type,
++                "payload": payload,
++            }
++            source = self._slack_platform_event_source(
++                channel_id=str(channel_id),
++                team_id=team_id,
++                user_id=user_id,
++                thread_ts=thread_ts,
++                message_id=str(message_id),
++            )
++        except Exception:
++            logger.debug(
++                "[%s] %s normalize error", self.name, event_type, exc_info=True,
++            )
++            return
++        await self._fire_platform_event(event, source)
++
+     async def _handle_slack_message(
+         self, event: dict, payload: Optional[dict] = None
+     ) -> None:
+@@ -5954,6 +6073,30 @@ class SlackAdapter(BasePlatformAdapter):
+             if not isinstance(updated_message, dict):
+                 return
+ 
++            # Observer parity (#64176): edits are visible to plugins even
++            # when normal dispatch later drops them as already-processed.
++            _edited_meta = updated_message.get("edited")
++            await self._fire_slack_platform_event(
++                "message_edited",
++                channel_id=event.get("channel"),
++                team_id=self._event_team_id(event, payload),
++                user_id=updated_message.get("user"),
++                thread_ts=updated_message.get("thread_ts"),
++                message_id=updated_message.get("ts"),
++                payload_extra={
++                    "text": (
++                        str(updated_message.get("text"))[:8192]
++                        if isinstance(updated_message.get("text"), str)
++                        else None
++                    ),
++                    "edited_ts": (
++                        str(_edited_meta.get("ts") or "")[:64] or None
++                        if isinstance(_edited_meta, dict)
++                        else None
++                    ),
++                },
++            )
++
+             original_message_ts = str(updated_message.get("ts") or "")
+             if (
+                 original_message_ts
+@@ -6044,6 +6187,26 @@ class SlackAdapter(BasePlatformAdapter):
+         # added by edit can still wake the bot once.
+         subtype = event.get("subtype")
+         if subtype == "message_deleted":
++            # Observer parity (#64176): the deleter is not identified by
++            # Slack; the source authorized is the deleted message's author,
++            # the only identity the event carries (mirrors Discord).
++            _previous = event.get("previous_message")
++            _previous = _previous if isinstance(_previous, dict) else {}
++            await self._fire_slack_platform_event(
++                "message_deleted",
++                channel_id=event.get("channel"),
++                team_id=self._event_team_id(event, payload),
++                user_id=_previous.get("user"),
++                thread_ts=_previous.get("thread_ts"),
++                message_id=event.get("deleted_ts") or _previous.get("ts"),
++                payload_extra={
++                    "author_id": (
++                        str(_previous.get("user"))[:128]
++                        if _previous.get("user")
++                        else None
++                    ),
++                },
++            )
+             return
+ 
+         original_text = event.get("text", "")
+diff --git a/tests/gateway/test_slack_platform_events.py b/tests/gateway/test_slack_platform_events.py
+new file mode 100644
+index 000000000..ebf1be8cc
+--- /dev/null
++++ b/tests/gateway/test_slack_platform_events.py
+@@ -0,0 +1,311 @@
++"""Slack ``gateway_platform_event`` fire-sites (#64176 Discord/Telegram parity).
++
++Covers the Slack half of the normalized-envelope pipeline:
++* ``message_changed`` / ``message_deleted`` subtypes and reactions normalize
++  to stable plain-dict envelopes (no raw Bolt objects) and dispatch through
++  the gateway-owned post-auth boundary
++* edits fire even when normal dispatch later drops the message as already
++  processed (observers see what routing suppresses)
++* malformed events (missing actor / chat identities) drop, fail closed
++* no installed gateway callback means no fire (no trusted auth boundary)
++* the has_hook no-subscriber fast-path skips all normalization work
++"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import sys
++import time
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from gateway.config import Platform
++
++_repo = str(Path(__file__).resolve().parents[2])
++if _repo not in sys.path:
++    sys.path.insert(0, _repo)
++
++from plugins.platforms.slack.adapter import SlackAdapter  # noqa: E402
++
++
++def _adapter() -> SlackAdapter:
++    """Build a SlackAdapter without the heavy __init__ (fire-sites only
++    need platform/config, the handler slot, and the tiny state the two
++    message subtype paths read)."""
++    a = object.__new__(SlackAdapter)
++    a.platform = Platform.SLACK
++    a.config = SimpleNamespace(extra={})
++    a.gateway_runner = None
++    a._processed_message_ts = {}
++    a._channel_team = {}
++    a._team_clients = {}
++    a._bot_user_id = "UBOT"
++    return a
++
++
++@pytest.fixture(autouse=True)
++def _observer_available(monkeypatch):
++    monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda _name: True)
++
++
++def _capture(a):
++    seen: list = []
++
++    async def observe(event, source):
++        seen.append((event, source))
++
++    a.set_platform_event_handler(observe)
++    return seen
++
++
++def _changed_event(**overrides):
++    message = {
++        "ts": "170.100",
++        "text": "edited body",
++        "user": "U777",
++        "thread_ts": "100.1",
++        "edited": {"ts": "171.000", "user": "U777"},
++    }
++    message.update(overrides.pop("message_overrides", {}))
++    event = {
++        "type": "message",
++        "subtype": "message_changed",
++        "channel": "C555",
++        "team": "T999",
++        "ts": "171.000",
++        "event_ts": "171.000",
++        "message": message,
++    }
++    event.update(overrides)
++    return event
++
++
++class TestMessageEdited:
++    def test_edit_normalized_and_fired_even_when_dispatch_drops_it(self):
++        a = _adapter()
++        seen = _capture(a)
++        # Already processed: normal dispatch drops the edit, the observer
++        # must still see it.
++        a._processed_message_ts["170.100"] = time.time()
++
++        asyncio.run(a._handle_slack_message(_changed_event()))
++
++        assert len(seen) == 1
++        event, source = seen[0]
++        assert event == {
++            "platform": "slack",
++            "event_type": "message_edited",
++            "payload": {
++                "chat_id": "C555",
++                "message_id": "170.100",
++                "thread_id": "100.1",
++                "workspace_id": "T999",
++                "text": "edited body",
++                "edited_ts": "171.000",
++            },
++        }
++        json.dumps(event)
++        assert source.user_id == "U777"
++        assert source.chat_id == "C555"
++        assert source.thread_id == "100.1"
++        assert source.scope_id == "T999"
++
++    def test_edit_without_author_identity_fails_closed(self):
++        a = _adapter()
++        seen = _capture(a)
++        a._processed_message_ts["170.100"] = time.time()
++
++        asyncio.run(a._handle_slack_message(
++            _changed_event(message_overrides={"user": None})
++        ))
++
++        assert seen == []
++
++    def test_malformed_changed_payload_drops(self):
++        a = _adapter()
++        seen = _capture(a)
++
++        asyncio.run(a._handle_slack_message(
++            _changed_event(message="not-a-dict")
++        ))
++
++        assert seen == []
++
++
++class TestMessageDeleted:
++    def _deleted_event(self, **overrides):
++        event = {
++            "type": "message",
++            "subtype": "message_deleted",
++            "channel": "C555",
++            "team": "T999",
++            "ts": "172.000",
++            "deleted_ts": "170.100",
++            "previous_message": {
++                "ts": "170.100",
++                "user": "U777",
++                "thread_ts": "100.1",
++            },
++        }
++        event.update(overrides)
++        return event
++
++    @staticmethod
++    def _prepare(a, monkeypatch):
++        # The deleted subtype crosses dedup, the ignored-channel gate, and
++        # the (marker-based, pure) bot filter before reaching its drop.
++        a._dedup = SimpleNamespace(is_duplicate=lambda _key: False)
++        monkeypatch.setattr(
++            SlackAdapter, "_is_ignored_channel", lambda _self, _cid: False,
++            raising=True,
++        )
++
++    def test_delete_normalized_fired_and_dropped_from_dispatch(self, monkeypatch):
++        a = _adapter()
++        seen = _capture(a)
++        self._prepare(a, monkeypatch)
++        # Guard: reaching normal message dispatch would raise, proving the
++        # deleted subtype still never dispatches.
++        monkeypatch.setattr(
++            SlackAdapter,
++            "handle_message",
++            lambda _self, _event: (_ for _ in ()).throw(AssertionError()),
++            raising=True,
++        )
++
++        asyncio.run(a._handle_slack_message(self._deleted_event()))
++
++        assert len(seen) == 1
++        event, source = seen[0]
++        assert event["event_type"] == "message_deleted"
++        assert event["payload"] == {
++            "chat_id": "C555",
++            "message_id": "170.100",
++            "thread_id": "100.1",
++            "workspace_id": "T999",
++            "author_id": "U777",
++        }
++        json.dumps(event)
++        assert source.user_id == "U777"
++
++    def test_delete_without_author_fails_closed(self, monkeypatch):
++        a = _adapter()
++        seen = _capture(a)
++        self._prepare(a, monkeypatch)
++
++        asyncio.run(a._handle_slack_message(
++            self._deleted_event(previous_message={})
++        ))
++
++        assert seen == []
++
++
++class TestReaction:
++    def _reaction_event(self, **overrides):
++        event = {
++            "type": "reaction_added",
++            "user": "U777",
++            "reaction": "thumbsup",
++            "item": {"type": "message", "channel": "C555", "ts": "170.100"},
++            "event_ts": "173.000",
++        }
++        event.update(overrides)
++        return event
++
++    def _reaction_adapter(self, monkeypatch):
++        a = _adapter()
++        a._channel_team = {"C555": "T999"}
++        monkeypatch.setattr(
++            SlackAdapter,
++            "_slack_reaction_triggers",
++            lambda _self: None,
++            raising=True,
++        )
++        return a
++
++    def test_reaction_normalized_and_fired(self, monkeypatch):
++        a = self._reaction_adapter(monkeypatch)
++        seen = _capture(a)
++
++        asyncio.run(a._handle_slack_reaction(self._reaction_event()))
++
++        assert len(seen) == 1
++        event, source = seen[0]
++        assert event == {
++            "platform": "slack",
++            "event_type": "reaction",
++            "payload": {
++                "chat_id": "C555",
++                "message_id": "170.100",
++                "thread_id": None,
++                "workspace_id": "T999",
++                "reaction": "thumbsup",
++                "action": "added",
++            },
++        }
++        json.dumps(event)
++        assert source.user_id == "U777"
++
++    def test_removed_reaction_carries_action(self, monkeypatch):
++        a = self._reaction_adapter(monkeypatch)
++        seen = _capture(a)
++
++        asyncio.run(
++            a._handle_slack_reaction(self._reaction_event(), removed=True)
++        )
++
++        assert seen[0][0]["payload"]["action"] == "removed"
++
++    def test_self_reaction_never_fires(self, monkeypatch):
++        a = self._reaction_adapter(monkeypatch)
++        seen = _capture(a)
++
++        asyncio.run(
++            a._handle_slack_reaction(self._reaction_event(user="UBOT"))
++        )
++
++        assert seen == []
++
++
++class TestBoundary:
++    def test_no_installed_handler_means_no_fire(self):
++        a = _adapter()  # set_platform_event_handler never called
++        a._processed_message_ts["170.100"] = time.time()
++        asyncio.run(a._handle_slack_message(_changed_event()))
++        # Nothing to assert beyond "no crash": with no handler there is no
++        # trusted auth boundary and the fire-site must be inert.
++
++    def test_no_subscriber_fast_path_skips_normalization(self, monkeypatch):
++        monkeypatch.setattr(
++            "hermes_cli.lifecycle.has_hook", lambda _name: False
++        )
++        a = _adapter()
++        seen = _capture(a)
++        a._processed_message_ts["170.100"] = time.time()
++
++        def _boom(**_kwargs):
++            raise AssertionError("normalization ran without a subscriber")
++
++        monkeypatch.setattr(
++            SlackAdapter,
++            "_slack_platform_event_source",
++            _boom,
++            raising=True,
++        )
++
++        asyncio.run(a._handle_slack_message(_changed_event()))
++
++        assert seen == []
++
++    def test_raising_observer_never_breaks_the_listener(self):
++        a = _adapter()
++        a._processed_message_ts["170.100"] = time.time()
++
++        async def boom(_event, _source):
++            raise RuntimeError("observer bug")
++
++        a.set_platform_event_handler(boom)
++        asyncio.run(a._handle_slack_message(_changed_event()))
+-- 
+2.43.0
+

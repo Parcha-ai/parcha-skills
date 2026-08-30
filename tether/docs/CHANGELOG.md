@@ -27,6 +27,84 @@
 
 ## Unreleased
 
+- Adds one schema-18 `BlockingCondition` projection for native uncertainty and
+  endpoint/binding rebind blockers. The August 14 accepted-without-ack shape is
+  visible with its age and blocked-turn count. Operator actions remain hidden
+  until the isolated authority capability is attested; blind retry is never
+  advertised.
+- Adds a fenced, idempotent operator-resolution domain transaction that
+  requires an external authority verifier, terminalizes exact attempt members,
+  and releases the endpoint lease atomically. It is not exposed on the
+  same-UID agent socket.
+- Disables the legacy same-UID broker and CLI recovery mutation until an
+  OS-distinguishable operator authority channel exists.
+- Adds read-only `tether schema status` with database/runtime compatibility,
+  logical-manifest digest, explicit security-domain readiness, incomplete
+  receipt detection, and schema-18 blocker reporting. Schema migration remains
+  disabled until the coupled lifecycle/runtime cutover is implemented.
+- Extracts one authoritative schema-operation receipt module with monotonic
+  compare-and-swap phases, fsync-bound writes, and a redacted public view.
+  Broker and plugin startup now fail closed on any invalid or incomplete
+  receipt before opening the database.
+- Adds a side-effect-free `validate-store` runtime attestation (read-only
+  SQLite, exact-artifact build digest, logical-manifest digest) that never
+  instantiates the migrating `Store`. It is internal; the public CLI remains
+  `tether schema status`.
+- Adds the internal kill-safe schema rehearsal coordinator: installer
+  lifecycle lock, maintenance gate, independent quiesce attestation, database
+  singleton, receipt-bound verified backup, disposable 17→18→17 transforms
+  validated by pinned target and predecessor artifacts in a sanitized
+  environment, and single-classified crash recovery at every durable phase.
+  Rehearsal results are evidence only; no public migrate or rollback command
+  exists and `migration_ready` stays false.
+- Makes the installer refuse install/upgrade/rollback/uninstall while the
+  schema maintenance flag is armed.
+- Adds the sole schema-18 `DomainRuntime`: single-transaction admission, fair
+  oldest-ready scheduling across sibling bindings, fenced single-lease
+  allocation, and a driver-receipt-owned attempt lifecycle in which stale
+  fences, replayed request ids, and out-of-order sequences are dead, and
+  terminalization, turn outcomes, and lease release commit atomically. Herdr
+  and Zellij endpoints stay ineligible for automatic scheduling. The shipped
+  schema-17 broker does not use it.
+- Adds the detached-native exact-turn driver: durable spawn intent before
+  `Popen`, process identity (pid + starttime) captured, durable `accepted`
+  receipt before any wait; a crash before acceptance recovers `uncertain` and
+  is never re-executed; exactly stripped `NO_REPLY` is the only silence,
+  empty output fails, responses become owner-private content-addressed
+  blobs; unobservable kill outcomes stay `uncertain`, never `cancelled`.
+- Proves the August 14 accepted-without-terminal journey end to end on
+  schema 18: one typed blocker with age and blocked-turn count, retry never
+  advertised, and capability-gated operator resolution freeing the endpoint.
+- Extends the internal schema rehearsal to boot the target `DomainRuntime`
+  against a disposable copy of the migrated store and run one synthetic
+  admit/schedule/receipt/terminal cycle before rollback validation.
+- Adds the production `default_gateway_controller`: hermes gateway
+  stop/start with supervisor truth observed through systemd independently of
+  CLI exit status, failing closed to "active" when no probe can run.
+- Judges rehearsal round-trip preservation by the migration contract's
+  preserved-manifest key subset (rollback intentionally retains the archived
+  endpoint inventory), attested per artifact via a new
+  `preserved_manifest_sha256` in `validate-store`, and proves the rehearsal
+  over a populated schema-17 store with live synthetic admissions.
+- Adds the L1 exit live trace: one endpoint serving two Slack threads with
+  real detached subprocesses, replies routed by stored binding generation.
+- Re-grounds the Hermes integration against hermes-agent main 2026-08-19
+  (ADR-001 Amendment A2): the plugin consumes the public pre_gateway_dispatch,
+  Slack action handler, dispatch_tool, CLI-command, and supervised-task seams
+  as-is, retiring all thirteen private adapter patches and both hook-registry
+  mutations; only two generic upstream widenings remain, drafted under
+  docs/upstream/ (plugin-path sends in the delivery ledger with receipts;
+  Slack fire-sites for gateway_platform_event).
+- Adds the next-generation gateway plugin (runtime/plugin_next/, shadow mode
+  only): a pre_gateway_dispatch observer that evaluates Tether's strict
+  fail-closed admission (exact workspace, authorized owner, bound thread,
+  no bots, event identity required), journals every decision durably and
+  idempotently under plugin-data/tether/, never influences dispatch, never
+  raises into the gateway, and feature-detects newer context surfaces so
+  one package loads unchanged from Hermes v2026.7.20 through current main.
+  Includes an hermes-side `tether` CLI status command. Not yet wired into
+  the installer; deployment arrives with the audited cutover slice.
+
 - Adds a fail-closed `TETHER_AMBIENT_BOT_CHANNELS` grant for trusted
   automations that intentionally create unmentioned root events. Each grant is
   bound to one exact Slack bot/app identity and one exact shared channel.

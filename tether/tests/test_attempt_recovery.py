@@ -163,7 +163,7 @@ class AttemptRecoveryTest(unittest.TestCase):
                 "terminal_submit_uncertain",
             )
         )
-        # Schema 16 preserves older active records whose endpoint identity
+        # Schema 17 preserves older active records whose endpoint identity
         # cannot be reconstructed. Their own blocked queue must remain visible.
         with self.store.connect() as database:
             database.execute(
