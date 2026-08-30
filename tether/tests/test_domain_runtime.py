@@ -474,3 +474,189 @@ class ReceiptCollisionTest(DomainRuntimeTest):
                 attempt, sequence=1, state="accepted", watch_cursor="other"
             )
         self.assertEqual(caught.exception.code, "receipt_identity_conflict")
+
+
+class ProjectionConsistencyTest(DomainRuntimeTest):
+    """Every terminal and recovery transition must satisfy the schema's own
+    invariants. Each test here corresponds to a defect found by driving the
+    public API adversarially; before the fixes, all four left
+    ``invariant_violations`` non-empty and the corrupted rows immutable.
+    """
+
+    def live_attempt(self, *, event_key="e1"):
+        endpoint = self.endpoint()
+        binding = self.binding(endpoint["endpoint_id"])
+        self.admit(binding["binding_id"], event_key, "2026-08-30 00:00:00")
+        return self.runtime.schedule_next(endpoint["endpoint_id"])
+
+    def assert_clean(self):
+        connection = self.connect()
+        try:
+            self.assertEqual(self.schema.invariant_violations(connection), [])
+        finally:
+            connection.close()
+
+    def turn_state(self, event_key="e1"):
+        connection = self.connect()
+        try:
+            return connection.execute(
+                "SELECT state FROM queued_turns WHERE event_key=?", (event_key,)
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+    def test_failed_attempt_cancels_its_turns(self):
+        # A failed attempt delivered nothing. Recording its turns 'completed'
+        # told the operator the message was answered when the driver crashed,
+        # and the terminal-monotonic trigger made that permanent.
+        attempt = self.live_attempt()
+        self.receipt(attempt, sequence=1, state="accepted")
+        self.receipt(attempt, sequence=2, state="failed", error_code="exit_7")
+        self.assertEqual(self.turn_state(), "cancelled")
+        self.assert_clean()
+
+    def test_completed_attempt_still_completes_its_turns(self):
+        attempt = self.live_attempt()
+        self.receipt(attempt, sequence=1, state="accepted")
+        self.receipt(
+            attempt,
+            sequence=2,
+            state="completed_with_response",
+            response_ref="blob:sha256:aa",
+            response_sha256="a" * 64,
+            response_bytes=3,
+        )
+        self.assertEqual(self.turn_state(), "completed")
+        self.assert_clean()
+
+    def test_mark_uncertain_projects_a_matching_receipt(self):
+        # mark_uncertain wrote state without a receipt, so the newest receipt
+        # still said 'accepted' while the attempt said 'uncertain'.
+        attempt = self.live_attempt()
+        self.receipt(attempt, sequence=1, state="accepted")
+        self.runtime.mark_uncertain(attempt["attempt_id"], "exit_status_unobserved")
+        status = self.runtime.attempt_status(attempt["attempt_id"])
+        self.assertEqual(status["state"], "uncertain")
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                "SELECT state,driver_incarnation FROM driver_receipts "
+                "WHERE attempt_id=? ORDER BY sequence DESC LIMIT 1",
+                (attempt["attempt_id"],),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(row[0], "uncertain")
+        # Tagged so an operator can tell a recovered uncertainty from a
+        # witnessed one.
+        self.assertEqual(row[1], "recovery")
+        self.assert_clean()
+
+    def test_mark_uncertain_after_running_receipt_stays_consistent(self):
+        # The recovery projection has to hold from 'running' too, not just
+        # 'accepted'; both are receipt states the invariant treats as live.
+        attempt = self.live_attempt()
+        self.receipt(attempt, sequence=1, state="running")
+        self.runtime.mark_uncertain(attempt["attempt_id"], "spawn_proof_lost")
+        self.assertEqual(
+            self.runtime.attempt_status(attempt["attempt_id"])["state"], "uncertain"
+        )
+        self.assert_clean()
+
+    def test_running_receipt_before_accepted_reaches_accepted(self):
+        # 'running' is a public receipt state and the projection invariant
+        # treats it exactly like 'accepted'; stopping at 'submitting' left the
+        # newest receipt disagreeing with the attempt.
+        attempt = self.live_attempt()
+        self.receipt(attempt, sequence=1, state="running")
+        self.assertEqual(
+            self.runtime.attempt_status(attempt["attempt_id"])["state"], "accepted"
+        )
+        self.assert_clean()
+
+    def test_running_receipt_after_accepted_is_still_accepted(self):
+        attempt = self.live_attempt()
+        self.receipt(attempt, sequence=1, state="accepted")
+        self.receipt(attempt, sequence=2, state="running")
+        self.assertEqual(
+            self.runtime.attempt_status(attempt["attempt_id"])["state"], "accepted"
+        )
+        self.assert_clean()
+
+    def test_uncertain_attempt_refuses_a_liveness_receipt(self):
+        # An uncertain attempt is frozen until reconciliation or an operator
+        # resolves it; a bare liveness ping is not that proof.
+        attempt = self.live_attempt()
+        self.receipt(attempt, sequence=1, state="accepted")
+        self.runtime.mark_uncertain(attempt["attempt_id"], "chaos")
+        with self.assertRaises(self.module.DomainRuntimeError) as caught:
+            self.receipt(attempt, sequence=3, state="running")
+        self.assertEqual(caught.exception.code, "attempt_uncertain")
+        self.assertEqual(
+            self.runtime.attempt_status(attempt["attempt_id"])["state"], "uncertain"
+        )
+        self.assert_clean()
+
+
+class EndpointRepointTest(DomainRuntimeTest):
+    """Re-registering an endpoint used to silently discard the new coordinates,
+    so a restarted agent kept the dead session's target and attempts were
+    driven at a process that no longer existed. No invariant caught it.
+    """
+
+    def register(self, source_json, ref_version):
+        return self.runtime.register_endpoint(
+            endpoint_key="ep-repoint",
+            endpoint_kind="detached_native",
+            source_kind="claude_session",
+            source_json=source_json,
+            ref_version=ref_version,
+            descriptor=self.descriptor,
+        )
+
+    def endpoint_row(self):
+        connection = self.connect()
+        try:
+            return connection.execute(
+                "SELECT source_json,ref_version,incarnation FROM endpoints "
+                "WHERE endpoint_key='ep-repoint'"
+            ).fetchone()
+        finally:
+            connection.close()
+
+    def test_identical_registration_is_idempotent(self):
+        self.register('{"session_id":"A"}', 1)
+        self.register('{"session_id":"A"}', 1)
+        row = self.endpoint_row()
+        self.assertEqual(row[2], 1, "an unchanged re-registration must not bump")
+
+    def test_new_coordinates_repoint_and_invalidate_bindings(self):
+        endpoint = self.register('{"session_id":"A","pid":111}', 1)
+        binding = self.binding(endpoint["endpoint_id"])
+        self.register('{"session_id":"B","pid":222}', 2)
+        row = self.endpoint_row()
+        self.assertEqual(row[0], '{"session_id":"B","pid":222}')
+        self.assertEqual(row[1], 2)
+        self.assertEqual(row[2], 2, "repointing must bump the incarnation")
+        connection = self.connect()
+        try:
+            state, code = connection.execute(
+                "SELECT state,error_code FROM thread_bindings WHERE binding_id=?",
+                (binding["binding_id"],),
+            ).fetchone()
+            self.assertEqual(state, "rebind_required")
+            self.assertEqual(code, "endpoint_incarnation_changed")
+            self.assertEqual(self.schema.invariant_violations(connection), [])
+        finally:
+            connection.close()
+
+    def test_repoint_refused_while_a_lease_is_open(self):
+        endpoint = self.register('{"session_id":"A","pid":111}', 1)
+        binding = self.binding(endpoint["endpoint_id"])
+        self.admit(binding["binding_id"], "e1", "2026-08-30 00:00:00")
+        self.assertIsNotNone(self.runtime.schedule_next(endpoint["endpoint_id"]))
+        with self.assertRaises(self.module.DomainRuntimeError) as caught:
+            self.register('{"session_id":"B","pid":222}', 2)
+        self.assertEqual(caught.exception.code, "endpoint_busy")
+        # The live attempt keeps its target; nothing was yanked mid-flight.
+        self.assertEqual(self.endpoint_row()[0], '{"session_id":"A","pid":111}')

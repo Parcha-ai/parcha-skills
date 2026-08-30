@@ -23,6 +23,7 @@ import json
 import os
 import sqlite3
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -156,6 +157,39 @@ class DomainRuntime:
                     or existing["endpoint_kind"] != endpoint_kind
                 ):
                     raise DomainRuntimeError("endpoint_identity_conflict")
+                if (
+                    existing["source_json"] != source_json
+                    or existing["source_kind"] != source_kind
+                    or int(existing["ref_version"]) != int(ref_version)
+                ):
+                    # The agent restarted and now lives somewhere else. Keeping
+                    # the old coordinates would drive attempts at a process that
+                    # no longer exists, silently and with no invariant to catch
+                    # it. The schema already models this transition: bumping the
+                    # incarnation is what marks existing bindings
+                    # 'rebind_required', and its guard refuses the bump while a
+                    # lease is open, so a live attempt is never yanked out from
+                    # under its driver.
+                    try:
+                        db.execute(
+                            """
+                            UPDATE endpoints
+                            SET source_kind=?,source_json=?,ref_version=?,
+                                incarnation=incarnation+1,
+                                updated_at=CURRENT_TIMESTAMP
+                            WHERE endpoint_id=?
+                            """,
+                            (source_kind, source_json, int(ref_version), endpoint_id),
+                        )
+                    except sqlite3.IntegrityError as error:
+                        raise DomainRuntimeError(
+                            "endpoint_busy",
+                            "the endpoint has an open lease; resolve the live "
+                            "attempt before repointing it",
+                        ) from error
+                    existing = db.execute(
+                        "SELECT * FROM endpoints WHERE endpoint_id=?", (endpoint_id,)
+                    ).fetchone()
                 return self._endpoint_view(existing)
             db.execute(
                 """
@@ -860,9 +894,24 @@ class DomainRuntime:
     ) -> str:
         current = attempt["state"]
         if receipt_state == "running":
-            if current == "prepared":
-                self._advance_attempt(db, attempt, "submitting", error_code=None)
-                return "submitting"
+            # 'running' is proof the driver holds live work, which the
+            # projection invariant treats exactly like 'accepted'. Stopping at
+            # 'submitting' left the newest receipt disagreeing with the attempt
+            # whenever a driver reported 'running' first -- legal in the public
+            # receipt protocol, even though the bundled driver never does it.
+            if current in {"prepared", "submitting"}:
+                self._advance_attempt(db, attempt, "accepted", error_code=None)
+                return "accepted"
+            if current == "uncertain":
+                # An uncertain attempt is frozen until a driver reconciles it
+                # or an operator resolves it. A bare liveness ping is not that
+                # proof, and silently keeping 'uncertain' would leave this
+                # receipt as the newest one while disagreeing with the state.
+                raise DomainRuntimeError(
+                    "attempt_uncertain",
+                    "an uncertain attempt needs reconciliation or operator "
+                    "resolution, not a liveness receipt",
+                )
             return current
         if receipt_state == "accepted":
             self._advance_attempt(db, attempt, "accepted", error_code=None)
@@ -919,11 +968,18 @@ class DomainRuntime:
                 error_code=None,
             )
         if receipt_state == "failed":
+            # A failed attempt delivered nothing, so its turns are cancelled,
+            # not completed. Recording them 'completed' would tell the operator
+            # the user's message was answered when the driver crashed, and the
+            # terminal-monotonic trigger makes that lie permanent -- the turn
+            # can never be retried. attempt_turn_state_mismatch encodes the
+            # rule: state IN ('cancelled','failed','operator_abandoned')
+            # requires turn.state='cancelled'.
             return self._terminalize(
                 db,
                 attempt,
                 "failed",
-                turn_outcome="completed",
+                turn_outcome="cancelled",
                 error_code=error_code or "driver_failed",
             )
         if receipt_state == "cancelled":
@@ -989,10 +1045,15 @@ class DomainRuntime:
 
     # -- recovery -------------------------------------------------------------
 
-    def mark_uncertain(self, attempt_id: str, error_code: str) -> None:
+    def mark_uncertain(
+        self, attempt_id: str, error_code: str, observed_at: str | None = None
+    ) -> None:
         """Driver recovery: proof of outcome was lost after possible execution."""
         if not error_code:
             raise DomainRuntimeError("error_code_required")
+        observed_at = observed_at or datetime.now(timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
         with self._transaction() as db:
             attempt = self._load_attempt(db, attempt_id)
             if attempt["state"] in TERMINAL_ATTEMPT_STATES:
@@ -1002,12 +1063,82 @@ class DomainRuntime:
                     "attempt_not_submitted",
                     "a prepared attempt cannot be uncertain; nothing was spawned",
                 )
+            # Writing 'uncertain' as bare state leaves last_driver_receipt_id
+            # pointing at the previous receipt ('accepted'/'running'), which
+            # driver_receipt_projection_mismatch forbids: the last receipt must
+            # agree with the attempt state. Recovery is exactly when the store
+            # has to stay trustworthy, so synthesize the receipt that records
+            # what we actually observed -- nothing -- the same way the driver
+            # emits an uncertain receipt for an unobservable cancel.
             self._advance_attempt(db, attempt, "uncertain", error_code=error_code)
+            self._project_recovery_uncertainty(db, attempt, error_code, observed_at)
 
     # A prepared attempt that provably never spawned is terminalized by the
     # driver's recovery pass through record_driver_receipt(state='not_started'):
     # the schema's terminal-proof guard demands a fenced driver receipt for
     # every terminal transition, so no receipt-free recovery path exists.
+
+    def _project_recovery_uncertainty(
+        self,
+        db: sqlite3.Connection,
+        attempt: sqlite3.Row,
+        error_code: str,
+        observed_at: str,
+    ) -> None:
+        """Record a synthetic receipt so the projection matches 'uncertain'.
+
+        A recovery pass has no driver observation to report -- that absence is
+        what makes the attempt uncertain -- but the schema requires the newest
+        receipt to agree with the attempt state. This writes that agreement
+        explicitly, with driver_incarnation='recovery' so an operator reading
+        the receipt chain can tell a recovered uncertainty from one the driver
+        actually witnessed.
+        """
+        attempt_id = str(attempt["attempt_id"])
+        lease = db.execute(
+            "SELECT fence FROM endpoint_leases WHERE attempt_id=?", (attempt_id,)
+        ).fetchone()
+        if lease is None:
+            # No lease means no fence to anchor a receipt to. The attempt is
+            # already unschedulable; leave the chain untouched rather than
+            # invent a fence.
+            return
+        sequence = int(attempt["last_driver_sequence"] or 0) + 1
+        receipt_id = f"recovery:{attempt_id}:{sequence}"
+        db.execute(
+            """
+            INSERT INTO driver_receipts(
+              receipt_id,attempt_id,endpoint_id,lease_fence,sequence,
+              driver_kind,driver_incarnation,operation,request_id,request_hash,
+              watch_cursor,state,error_code,observed_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                receipt_id,
+                attempt_id,
+                str(attempt["endpoint_id"]),
+                int(lease["fence"]),
+                sequence,
+                attempt["driver_kind"],
+                "recovery",
+                "submit",
+                str(attempt["driver_request_id"]),
+                self._receipt_request_hash(attempt, "submit"),
+                f"recovery:{sequence}",
+                "uncertain",
+                error_code,
+                observed_at,
+            ),
+        )
+        db.execute(
+            """
+            UPDATE native_attempts
+            SET receipt_cursor=?,last_driver_receipt_id=?,
+                last_driver_sequence=?,updated_at=CURRENT_TIMESTAMP
+            WHERE attempt_id=?
+            """,
+            (f"recovery:{sequence}", receipt_id, sequence, attempt_id),
+        )
 
     def attempt_status(self, attempt_id: str) -> dict[str, Any]:
         with self._transaction() as db:
