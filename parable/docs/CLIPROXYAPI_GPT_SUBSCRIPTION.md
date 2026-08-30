@@ -98,7 +98,9 @@ ChatGPT pool has unknown or available headroom. It uses configured Grok 4.6 when
 Sol is unavailable or both measured pools are tight; xAI does not expose a usage
 probe, so Parable treats Grok only as an ordered fallback. Unknown Claude usage
 keeps the preferred Fable parent. Use `parable --brain fable`,
-`parable --brain sol`, or `parable --brain grok` to pin one explicitly.
+`parable --brain sol`, or `parable --brain grok` to pin one explicitly. A Sol brain defaults to a
+1,000,000-token operating budget with Claude Code auto-compaction at 900,000 tokens; its startup
+card therefore reports `SOL · gpt-5.6-sol · 1M ctx`.
 
 To run a single model with no cast and no delegation, use solo mode:
 

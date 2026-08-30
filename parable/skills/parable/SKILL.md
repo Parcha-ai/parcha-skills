@@ -126,10 +126,10 @@ Solo refusals are **hard fails** — a solo session does not silently degrade to
 
 Known 1M Claude-family parents launch with Claude Code's native `[1m]` selector. Non-Claude
 parents pin both `CLAUDE_CODE_MAX_CONTEXT_TOKENS` and the separate
-`CLAUDE_CODE_AUTO_COMPACT_WINDOW` to their real window, then set
-`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=75`. In a mixed cast under a Claude-family parent, only the
-non-Claude `MAX_CONTEXT` ceiling is set: the auto-compact controls are process-wide and would
-otherwise shrink Fable's 1M parent window to the smallest cast model. Details and override knobs:
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW` to the active parent's real window. Sol defaults to a 1M budget
+with `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=90`, so compaction starts at 900K; other non-Claude parents
+default to 75%. In a mixed cast under a Claude-family parent, only the non-Claude `MAX_CONTEXT`
+ceiling is set because auto-compact controls are process-wide. Details and override knobs:
 `references/config.md`.
 
 An explicit CLI resume into a smaller window (`--continue`, `--resume <name-or-id>`, or
