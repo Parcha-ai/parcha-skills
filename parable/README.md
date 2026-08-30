@@ -156,7 +156,7 @@ provider sends the same `plan.md` through [Cursor CLI](https://cursor.com/docs/c
 [Cursor example](examples/parable.cursor.toml), and the other configs in `examples/`.
 
 There is also a single-harness, subscription-only path. `parable setup` builds or discovers a
-loopback CLIProxyAPI, delegates each selected user's native ChatGPT/Claude/xAI/Kimi OAuth, and writes
+loopback CLIProxyAPI pinned to an exact Grok-4.6-capable source revision, delegates each selected user's native ChatGPT/Claude/xAI/Kimi OAuth, and writes
 an exact Sol/Terra/Luna/Fable/Sonnet/Opus/Haiku/Grok/Kimi cast. Bare `parable` starts or safely reuses the
 configured loopback proxy, waits for its authenticated catalog, requires the selected parent,
 creates the project-local agents, and launches stock Claude Code. Optional cast models missing
@@ -170,9 +170,11 @@ No broker, shared deployment, provider API key, or copied OAuth credential is in
 [end-to-end setup guide](docs/CLIPROXYAPI_GPT_SUBSCRIPTION.md) and the generated-config
 [reference](examples/parable.claude-subscriptions.toml).
 
-Bare `parable` uses the automatic brain policy: it prefers Fable while the Claude pool has room
-and moves the parent to Sol when that pool becomes tight. `parable --brain fable` and
-`parable --brain sol` pin either parent. All other flags pass directly to Claude Code, including
+Bare `parable` uses the automatic brain policy: it prefers Fable while the Claude pool has room,
+then moves to Sol while the ChatGPT pool has unknown or available headroom. Grok 4.6 is the
+ordered fallback when Sol is unavailable or both measured pools are tight; Parable does not invent
+xAI usage telemetry. `parable --brain fable`, `parable --brain sol`, and `parable --brain grok`
+pin an eligible exact parent. All other flags pass directly to Claude Code, including
 `parable --dangerously-skip-permissions`; `--` remains an optional separator. `parable claude`
 remains a compatibility alias. Permission bypass is never enabled implicitly.
 
@@ -193,9 +195,10 @@ The generated cast gives the parent evidence-informed stage directions: Fable fo
 planning and architecture; Sol for long implementation, difficult debugging, and high-recall
 review; Terra for React and frontend work; Luna for data transforms and mechanical work; Sonnet
 for brownfield implementation and test repair; Opus for high-blast-radius review; Haiku for fast
-exploration; and Grok for bounded terminal-heavy or systems work. These are starting hypotheses,
-not a universal leaderboard. Task-class arrays are capable-model menus; the parent excludes its
-own model and the diff author, then chooses by task fit and live subscription headroom.
+exploration; and Grok 4.6 for coding, systems work, architectural second opinions, and parent
+orchestration. These are starting hypotheses, not a universal leaderboard. Task-class arrays are
+capable-model menus; the parent excludes its own model and the diff author, then chooses by task
+fit and measured subscription headroom where a usage probe exists.
 
 Minimal Cursor configuration:
 
@@ -267,8 +270,10 @@ The skill uses Claude Code's `AskUserQuestion`, Codex's `request_user_input` whe
 permits it, or the current harness's equivalent structured UI to choose optional ChatGPT, xAI, and
 Kimi subscriptions; it falls back to one concise question when structured input is unavailable.
 Claude is the baseline pool because the harness is Claude Code. ChatGPT adds Sol/Terra/Luna and
-enables Sol as an automatic fallback; without ChatGPT, `auto` stays on Fable. After those choices,
-the skill runs its bundled installer once and delegates each selected provider's native OAuth flow.
+enables Sol as the first automatic fallback. xAI adds Grok 4.6 as an explicit parent and ordered
+automatic fallback when Sol is unavailable or both measured pools are tight. Without either
+optional parent, `auto` stays on Fable. After those choices, the skill runs its bundled installer
+once and delegates each selected provider's native OAuth flow.
 
 ```bash
 # Claude Code plugin marketplace
@@ -345,9 +350,13 @@ runtime difference.
   exact selected session before accepting the first prompt. Long compactions print a flushed
   status line before Sonnet starts, followed by verification and completion messages.
 - Live non-Claude parents use Claude Code's explicit auto-compact window as well as the model
-  ceiling. Known 1M Claude-family parents use Claude Code's `[1m]` selector and native
-  auto-compaction so a smaller mixed-cast model cannot cap the parent process. If Claude Code
-  still returns a context-window API error, the managed supervisor stops the
+  ceiling. A Sol brain defaults to a 1M budget and 90% compaction point, so its launch card shows
+  `1M ctx` and compaction starts around 900K. Known 1M Claude-family parents use Claude Code's
+  `[1m]` selector and native auto-compaction so a smaller mixed-cast model cannot cap the parent
+  process. Separately, the Codex-native Sol example passes `model_context_window=1000000` and
+  `model_auto_compact_token_limit=900000` only for that executor; Parable never edits
+  `~/.codex/config.toml`, and Codex `/status` is the authority for the granted live window. If
+  Claude Code still returns a context-window API error, the managed supervisor stops the
   stranded child, compacts that exact session with low-effort Sonnet 5, and resumes the
   original Parable launch once. Other API failures and subagent failures are untouched.
 - If an automatically delivered agent-team message interrupts the lead request and leaves it

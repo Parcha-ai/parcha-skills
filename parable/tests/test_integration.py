@@ -18,11 +18,27 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+# Subprocess fixtures inherit this process environment. Isolate them from an
+# enclosing Parable session and from the user's shared live-usage cache.
+for key in (
+    "PARABLE_AGENT_STATE_JSON",
+    "PARABLE_CONTEXT_RECOVERY_FILE",
+    "PARABLE_WELCOME_MESSAGE",
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+):
+    os.environ.pop(key, None)
+_TEST_USAGE_CACHE_DIR = tempfile.TemporaryDirectory(prefix="parable-integration-usage-")
+os.environ["PARABLE_USAGE_CACHE"] = str(
+    Path(_TEST_USAGE_CACHE_DIR.name) / "usage-cache.json"
+)
+
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "skills" / "parable" / "scripts" / "parable.py"
 NODE = shutil.which("node") or "node"
-PROXY_COMMIT = "cade44b9cdee6b9328ea2648fd119129fdf11e2d"
-PROXY_PATCH_SHA256 = "c0b4c52d4b35040427e1aee0067c99da7068598803604c435ad591d577b2dc5d"
+PROXY_COMMIT = "323b7276bc5bd251e5497699e42c556d6316b30c"
+PROXY_PATCH_SHA256 = "89f1cbe8b274c114b94bd1f5146658046e1124f1510a402359f26e2a87f38b4a"
 
 FAKE_CODEX = """#!/usr/bin/env bash
 cat > /dev/null   # drain the plan from stdin like the real binary
@@ -432,7 +448,7 @@ class TestClaudeSubscriptionLauncher(unittest.TestCase):
             self.assertNotIn(token, agent.read_text())
             self.assertNotIn(token, (repo / "parable.toml").read_text())
 
-    def test_launcher_compacts_large_resume_with_sonnet_before_sol(self):
+    def test_launcher_keeps_resume_on_one_million_sol_window(self):
         with tempfile.TemporaryDirectory() as tmp, model_server(
             ["gpt-5.6-sol", "claude-sonnet-5", "kimi-k3"]
         ) as (_server, base_url, token):
@@ -454,36 +470,16 @@ class TestClaudeSubscriptionLauncher(unittest.TestCase):
             )
 
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            self.assertIn(
-                "resume: compacted 321,400 to 42,000 tokens with Sonnet 5", proc.stdout
-            )
+            self.assertNotIn("resume: compacted", proc.stdout)
             recorded = [json.loads(line) for line in calls.read_text().splitlines()]
-            self.assertEqual(len(recorded), 4)
-            self.assertIn("claude-sonnet-5[1m]", recorded[0]["argv"])
-            self.assertEqual(recorded[0]["argv"][-2:], ["--continue", "/context"])
-            self.assertIsNone(recorded[0]["max_context_tokens"])
-            self.assertIsNone(recorded[0]["auto_compact_window"])
+            self.assertEqual(len(recorded), 1)
             self.assertEqual(
-                recorded[1]["argv"][-3:],
-                [
-                    "--resume", "resolved-resume-session",
-                    "/compact preserve the active task, user requirements, decisions, "
-                    "changed files, remaining work, and verification evidence",
-                ],
+                recorded[0]["argv"][-4:],
+                ["gpt-5.6-sol", "--continue", "--print", "finish"],
             )
-            self.assertEqual(
-                recorded[2]["argv"][-3:],
-                ["--resume", "resolved-resume-session", "/context"],
-            )
-            self.assertEqual(
-                recorded[3]["argv"][-5:],
-                [
-                    "gpt-5.6-sol", "--resume", "resolved-resume-session",
-                    "--print", "finish",
-                ],
-            )
-            self.assertEqual(recorded[3]["max_context_tokens"], "372000")
-            self.assertEqual(recorded[3]["auto_compact_window"], "372000")
+            self.assertEqual(recorded[0]["max_context_tokens"], "1000000")
+            self.assertEqual(recorded[0]["auto_compact_window"], "1000000")
+            self.assertEqual(recorded[0]["auto_compact_pct"], "90")
 
     def test_launcher_degrades_when_an_optional_routed_model_is_absent(self):
         with tempfile.TemporaryDirectory() as tmp, model_server(
@@ -702,6 +698,12 @@ exit 0
         self.assertIn("should never be handed separate per-provider commands", readme)
         self.assertIn("inside Claude Code", readme)
         self.assertIn("user-only", skill)
+        self.assertIn("--brain auto|fable|sol|grok|config", skill)
+        self.assertIn("Grok 4.6", readme)
+        self.assertIn("`parable --brain grok`", guide)
+        self.assertIn('model = "grok-4.6"', providers)
+        self.assertIn('"model_context_window=1000000"', providers)
+        self.assertIn('"model_auto_compact_token_limit=900000"', providers)
 
         self.assertIn('chmod +x "$DEST"/parable.sh', installer)
         self.assertIn('exec "$DEST/parable.sh" "$@"', installer)
@@ -713,6 +715,7 @@ exit 0
             timeout=60,
         )
         self.assertEqual(help_proc.returncode, 0, help_proc.stdout + help_proc.stderr)
+        self.assertIn("--brain auto|fable|sol|grok|config", help_proc.stdout)
         self.assertIn("auto-brain Claude Code session", help_proc.stdout)
         self.assertIn("backward-compatible explicit launcher alias", help_proc.stdout)
         self.assertIn("diagnostic foreground", help_proc.stdout)
@@ -763,7 +766,7 @@ exit 0
             self.assertEqual(first.stdout.count(handoff), 1)
             self.assertIn(launch, first.stdout)
 
-            installed = home / ".local" / "share" / "parable" / "0.1.30"
+            installed = home / ".local" / "share" / "parable" / "0.1.33"
             durable = home / ".local" / "bin" / "parable"
             self.assertTrue((installed / "bin" / "parable.js").is_file())
             self.assertTrue((installed / "lib" / "onboarding.js").is_file())
@@ -922,7 +925,7 @@ exit 0
         self.assertEqual(welcome_manifest["version"], package["version"])
         patch = (
             REPO / "skills" / "parable" / "runtime" / "patches"
-            / "cliproxyapi-v7.2.103-claude-effort.patch"
+            / "cliproxyapi-v7.2.131-claude-effort.patch"
         )
         self.assertEqual(hashlib.sha256(patch.read_bytes()).hexdigest(), PROXY_PATCH_SHA256)
 
@@ -1080,22 +1083,24 @@ class TestClaudeAgentModelGuard(unittest.TestCase):
         self.assertEqual(decision["permissionDecision"], "deny")
 
     def test_parent_model_agent_is_blocked_with_accurate_reason(self):
-        payload = {
-            "hook_event_name": "PreToolUse",
-            "tool_name": "Agent",
-            "tool_input": {
-                "subagent_type": "parable-sol-exact",
-                "prompt": "delegate back",
-            },
-        }
-        result = self.run_guard(payload, state={
-            "active": [],
-            "unavailable": [],
-            "parent": ["parable-sol-exact"],
-        })
-        decision = json.loads(result.stdout)["hookSpecificOutput"]
-        self.assertEqual(decision["permissionDecision"], "deny")
-        self.assertIn("current parent model", decision["permissionDecisionReason"])
+        for agent in ("parable-sol-exact", "parable-grok"):
+            with self.subTest(agent=agent):
+                payload = {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Agent",
+                    "tool_input": {
+                        "subagent_type": agent,
+                        "prompt": "delegate back",
+                    },
+                }
+                result = self.run_guard(payload, state={
+                    "active": [],
+                    "unavailable": [],
+                    "parent": [agent],
+                })
+                decision = json.loads(result.stdout)["hookSpecificOutput"]
+                self.assertEqual(decision["permissionDecision"], "deny")
+                self.assertIn("current parent model", decision["permissionDecisionReason"])
 
 
 class TestClaudeContextRecoveryHook(unittest.TestCase):
@@ -1460,7 +1465,7 @@ class TestFirstRunSetup(unittest.TestCase):
             ):
                 self.assertIn(present, config)
             for absent in (
-                "grok-4.5",
+                "grok-4.6",
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",
                 "gpt-5.6-luna",
@@ -1533,6 +1538,74 @@ class TestFirstRunSetup(unittest.TestCase):
                     config.read_text(),
                 )
 
+    def test_setup_migrates_only_the_previous_generated_grok_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            proxy = self.make_proxy(home / "tools")
+            first = self.run_cli(
+                home,
+                "setup", "--non-interactive", "--vendors", "claude,xai",
+                "--proxy-bin", str(proxy), "--no-auth",
+            )
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            config_dir = home / ".config" / "parable"
+            config = config_dir / "parable.toml"
+            previous = config.read_text()
+            replacements = (
+                ('model = "grok-4.6"', 'model = "grok-4.5"'),
+                (
+                    'tags = ["architect", "implementer", "systems", "third-family", "subscription"]',
+                    'tags = ["implementer", "systems", "third-family", "subscription"]',
+                ),
+                (
+                    'use_for = "Coding, agentic implementation, systems work, architectural second opinions, parent orchestration, and cross-family smoke testing."',
+                    'use_for = "Bounded terminal-heavy or systems implementation, especially Rust or C++, plus cross-family smoke testing."',
+                ),
+                (
+                    'avoid_for = "Delegation from a Grok parent, routine mechanical work, or reviewing its own diff."',
+                    'avoid_for = "Sole final factual review, orchestration, ambiguous product architecture, or reviewing its own diff."',
+                ),
+                (
+                    'architecture = ["fable_exact","opus_exact","grok"]',
+                    'architecture = ["fable_exact","opus_exact"]',
+                ),
+            )
+            for current, old in replacements:
+                self.assertIn(current, previous)
+                previous = previous.replace(current, old)
+            config.write_text(previous)
+            config.chmod(0o600)
+            untouched = {
+                target: (target.read_bytes(), target.stat().st_mtime_ns)
+                for target in (
+                    config_dir / "cliproxy.yaml",
+                    config_dir / "cliproxy.env",
+                    config_dir / "setup.json",
+                )
+            }
+
+            migrated = self.run_cli(
+                home,
+                "setup", "--non-interactive", "--vendors", "claude,xai", "--no-auth",
+            )
+            self.assertEqual(migrated.returncode, 0, migrated.stdout + migrated.stderr)
+            self.assertIn("upgraded generated Grok model", migrated.stdout)
+            self.assertIn('model = "grok-4.6"', config.read_text())
+            self.assertNotIn('model = "grok-4.5"', config.read_text())
+            self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+            for target, snapshot in untouched.items():
+                self.assertEqual((target.read_bytes(), target.stat().st_mtime_ns), snapshot)
+
+            config.write_text(previous + "# user edit\n")
+            config.chmod(0o600)
+            refused = self.run_cli(
+                home,
+                "setup", "--non-interactive", "--vendors", "claude,xai", "--no-auth",
+            )
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("refusing to overwrite", refused.stderr)
+            self.assertEqual(config.read_text(), previous + "# user edit\n")
+
     def test_interactive_and_all_vendor_configs_use_exact_models(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1582,7 +1655,7 @@ class TestFirstRunSetup(unittest.TestCase):
                 claude_xai_home / ".config" / "parable" / "parable.toml"
             ).read_text()
             self.assertIn('brain_model = "claude-fable-5"', claude_xai_config)
-            self.assertIn('model = "grok-4.5"', claude_xai_config)
+            self.assertIn('model = "grok-4.6"', claude_xai_config)
             self.assertNotIn("gpt-5.6-", claude_xai_config)
 
             all_home = root / "all"
@@ -1607,7 +1680,7 @@ class TestFirstRunSetup(unittest.TestCase):
                 "claude-sonnet-5",
                 "claude-opus-4-8",
                 "claude-haiku-4-5-20251001",
-                "grok-4.5",
+                "grok-4.6",
                 "kimi-k3",
             ):
                 self.assertIn(model, config)
@@ -1619,7 +1692,7 @@ class TestFirstRunSetup(unittest.TestCase):
                 config.replace(" ", ""),
             )
             self.assertIn(
-                'architecture=["fable_exact","opus_exact","sol_exact"]',
+                'architecture=["fable_exact","opus_exact","sol_exact","grok"]',
                 config.replace(" ", ""),
             )
             self.assertNotIn("kimi", config.replace(" ", "").split("architecture=")[1].split("]")[0])
@@ -2262,7 +2335,7 @@ if args and args[0] == "build":
             shutil.copytree(REPO / "skills", package / "skills")
             patch = (
                 package / "skills" / "parable" / "runtime" / "patches"
-                / "cliproxyapi-v7.2.103-claude-effort.patch"
+                / "cliproxyapi-v7.2.131-claude-effort.patch"
             )
             patch.write_text(patch.read_text() + "\n# checksum mutation\n")
             destination = root / "checksum"
@@ -2437,6 +2510,19 @@ raise SystemExit(int(os.environ.get("FAKE_PROXY_EXIT", "0")))
                 ["--config", str(config), "--xai-login", "--no-browser"],
             ])
             self.assertIn("authorization complete", proc.stdout)
+
+            capture.write_text("")
+            rerun = self.run_cli(
+                home,
+                proxy,
+                capture,
+                "setup", "--non-interactive", "--vendors", "chatgpt,claude,xai",
+                "--proxy-bin", str(proxy),
+            )
+            self.assertEqual(rerun.returncode, 0, rerun.stdout + rerun.stderr)
+            self.assertEqual(self.calls(capture), [])
+            for vendor in ("claude", "chatgpt", "xai"):
+                self.assertIn(f"{vendor}: already authorized", rerun.stdout)
 
     def test_auth_add_uses_private_umask_and_secures_proxy_record(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2793,7 +2879,7 @@ for flag, (vendor, record_type) in mapping.items():
             "claude-sonnet-5",
             "claude-opus-4-8",
             "claude-haiku-4-5-20251001",
-            "grok-4.5",
+            "grok-4.6",
             "kimi-k3",
         ]
         expected_agents = {
@@ -2804,7 +2890,7 @@ for flag, (vendor, record_type) in mapping.items():
             "parable-sonnet-exact": "claude-sonnet-5",
             "parable-opus-exact": "claude-opus-4-8",
             "parable-haiku-exact": "claude-haiku-4-5-20251001",
-            "parable-grok": "grok-4.5",
+            "parable-grok": "grok-4.6",
             "parable-kimi": "kimi-k3",
         }
         with tempfile.TemporaryDirectory() as tmp, model_server(
@@ -3044,6 +3130,24 @@ for flag, (vendor, record_type) in mapping.items():
                 ],
             )
 
+            grok = self.run_cli(
+                repo, env, "claude", "--brain", "grok", "--", "--print", "grok-parent"
+            )
+            self.assertEqual(grok.returncode, 0, grok.stdout + grok.stderr)
+            self.assertIn("brain: grok-4.6 (explicit grok parent)", grok.stdout)
+            captured = json.loads(claude_capture.read_text())
+            self.assertEqual(
+                captured["argv"],
+                [
+                    "--plugin-dir", str(welcome_plugin),
+                    "--model", "grok-4.6", "--print", "grok-parent",
+                ],
+            )
+            self.assertEqual(
+                json.loads(captured["agent_state"])["parent"],
+                ["parable-grok"],
+            )
+
     def test_finalize_subset_and_missing_optional_exact_id_degrades_without_aliases(self):
         with tempfile.TemporaryDirectory() as tmp, model_server([
             "claude-fable-5", "claude-sonnet-5", "claude-opus-4-8",
@@ -3084,7 +3188,10 @@ for flag, (vendor, record_type) in mapping.items():
                 repo, env, "claude", "--brain", "auto", "--", "--print", "claude-only"
             )
             self.assertEqual(auto.returncode, 0, auto.stdout + auto.stderr)
-            self.assertIn("brain: claude-fable-5 (Sol is not configured; using Fable)", auto.stdout)
+            self.assertIn(
+                "brain: claude-fable-5 (Sol is not configured; Grok is not configured; using Fable)",
+                auto.stdout,
+            )
             captured = json.loads(claude_capture.read_text())
             welcome_plugin = (
                 REPO / "skills" / "parable" / "runtime" / "welcome-plugin"
@@ -3108,8 +3215,8 @@ for flag, (vendor, record_type) in mapping.items():
             "claude-sonnet-5",
             "claude-opus-4-8",
             "claude-haiku-4-5-20251001",
-            "grok-4.5-latest",
-            "GROK-4.5",
+            "grok-4.6-latest",
+            "GROK-4.6",
         ]
         with tempfile.TemporaryDirectory() as tmp, model_server(
             misleading
@@ -3139,7 +3246,7 @@ for flag, (vendor, record_type) in mapping.items():
             self.assertTrue(report["degraded"])
             self.assertEqual(
                 report["unavailableAgents"],
-                [{"name": "parable-grok", "model": "grok-4.5"}],
+                [{"name": "parable-grok", "model": "grok-4.6"}],
             )
             agents = repo / ".claude" / "agents"
             self.assertTrue((agents / "parable-grok.md").is_file())
@@ -3157,7 +3264,7 @@ class TestMagicalClaudeSupervisor(unittest.TestCase):
         "claude-sonnet-5",
         "claude-opus-4-8",
         "claude-haiku-4-5-20251001",
-        "grok-4.5",
+        "grok-4.6",
     ]
 
     PROXY = r'''#!/usr/bin/env python3

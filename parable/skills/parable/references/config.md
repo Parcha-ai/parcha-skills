@@ -73,15 +73,18 @@ The source token variable, `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, and
 `CLAUDE_CODE_SUBAGENT_MODEL` are removed from the child environment. A forwarded `--model`
 is rejected so parent selection stays inside Parable's declared policy.
 
-The launcher-level `--brain` policy can be `config`, `fable`, `sol`, or `auto`. `config` requires
-the configured `brain_model` to be available. `auto` prefers configured Fable while its live Claude usage is below
-80%, probes ChatGPT only when that pool is tight, and then selects Sol when it has more or
-unknown headroom. Explicit `fable` or `sol` fails unless that exact model is configured and
-present in the authenticated catalog. Bare `parable` means `--brain auto` with high effort.
-Claude flags pass through directly; use `parable --dangerously-skip-permissions` or pin the
-brain with `parable --brain fable --effort high`. An optional `--` can separate Parable's brain
-option from Claude arguments. Interactive sessions show this selection and the usable executor
-cast in Claude Code via a user-only startup system message; the model does not receive the card.
+The launcher-level `--brain` policy can be `config`, `fable`, `sol`, `grok`, or `auto`.
+`config` requires the configured `brain_model` to be available. `auto` prefers configured Fable
+while its live Claude usage is unknown or below 80%. When Claude is tight, it selects eligible
+Sol while ChatGPT usage is unknown or below 80%, then uses eligible Grok when Sol is unavailable
+or both measured pools are tight. If Fable is unavailable, fallback order is Sol then Grok.
+Parable has no xAI usage endpoint and never reports inferred Grok headroom. Explicit `fable`,
+`sol`, or `grok` fails unless that exact model is configured and present in the authenticated
+catalog. Bare `parable` means `--brain auto` with high effort. Claude flags pass through
+directly; use `parable --dangerously-skip-permissions` or pin the brain with
+`parable --brain grok --effort high`. An optional `--` can separate Parable's brain option from
+Claude arguments. Interactive sessions show this selection and the usable executor cast in
+Claude Code via a user-only startup system message; the model does not receive the card.
 
 `parable --solo <alias|exact-model>` instead requires only the selected exact catalog id, skips
 agent synchronization, launches that model as the parent, removes agent-team enablement, and passes
@@ -96,33 +99,56 @@ Code's native `[1m]` selector while retaining the bare exact id for catalog vali
 routing.
 
 Non-Claude models still need an explicit ceiling. Parable sets
-`CLAUDE_CODE_MAX_CONTEXT_TOKENS` to their real window. When the **parent itself is non-Claude**, it
-also sets `CLAUDE_CODE_AUTO_COMPACT_WINDOW` to that ceiling and
-`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=75` to leave room for tool results and the compaction request.
-Those last two controls are process-wide, so Parable deliberately does not derive them from a
-mixed cast when the parent is Fable or another Claude-family model; doing so would shrink a 1M
-Fable session to the cast's smaller window.
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the active non-Claude parent's window. It also sets
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW` to that ceiling and a model-specific compaction percentage:
+Sol uses `90`, giving it a 1,000,000-token budget with compaction at 900,000; other non-Claude
+parents default to `75` for extra tool-result headroom. These controls are process-wide, so a
+smaller child must not silently shrink the active parent.
 
 - **Solo mode** uses `[1m]` for a known 1M Claude-family model. A non-Claude solo model receives
-  its exact ceiling and the 75% safety threshold.
-- **Multi-model mode** gives a Claude-family parent its native marked window, while
-  `CLAUDE_CODE_MAX_CONTEXT_TOKENS` remains the minimum across enabled non-Claude proxy models in
-  the cast. An unknown non-Claude model counts as Claude Code's own 200k fallback rather than
-  raising the assumed ceiling blindly.
-- Built-in windows come from the pinned proxy's own model registry (gpt-5.6-sol/terra/luna
-  372k, grok-4.5 500k, kimi-k3 1M via upstream `k3` normalization, Claude 5-class 1M). Override
-  or extend per executor with `context_ktok`.
-- User-provided values always win independently. For a non-Claude parent, when you provide only
-  `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, Parable uses that value for the auto-compact window too. An
-  explicit `CLAUDE_CODE_AUTO_COMPACT_WINDOW` or `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` is never
-  overwritten. An unknown solo model leaves all three variables unset unless you explicitly
-  provide a context ceiling.
+  its own ceiling and model-specific compaction percentage.
+- **Multi-model mode** gives a non-Claude parent its own window. A Claude-family parent keeps its
+  native marked window, while `CLAUDE_CODE_MAX_CONTEXT_TOKENS` remains the minimum across
+  available non-Claude proxy children. An unknown child counts as Claude Code's own 200k fallback
+  rather than raising the assumed ceiling blindly.
+- Sol uses the provider-documented 1M operating budget from its 1.05M maximum, even though the
+  pinned proxy registry still describes the separately tuned 372k default. Terra and Luna remain
+  372k; Grok 4.6 is 500k; Kimi K3 and Claude 5-class models are 1M. Override or extend per executor
+  with `context_ktok`.
+- User-provided values from an ordinary shell win independently. For a non-Claude parent, when you
+  provide only `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, Parable uses that value for the auto-compact
+  window too. An explicit `CLAUDE_CODE_AUTO_COMPACT_WINDOW` or
+  `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` is never overwritten. When Parable is started from inside an
+  existing Parable session, those inherited process controls are stale launch state and are
+  recomputed for the new brain. An unknown solo model leaves all three variables unset unless you
+  explicitly provide a context ceiling.
 
-The launch line reports the parent window and any separate non-Claude cast ceiling; the startup
-card shows each model's real window (`· 372k ctx`). For a Sol parent, 75% starts compaction near
-279k instead of waiting until roughly 353k; this leaves about 74k of headroom below the Codex
-route's 353.4k effective input window. A Fable parent retains its 1M window and Claude Code's
-native auto-compaction policy.
+The launch line reports the parent window and any separate non-Claude cast ceiling. The startup
+card shows Sol as `· 1M ctx`, and Claude Code receives a 90% auto-compact point. A Fable parent
+retains its own 1M window and Claude Code's native auto-compaction policy.
+
+### Codex-native Sol context
+
+The Claude-loopback Sol parent now receives the 1M/900K defaults automatically. A Codex-native
+executor uses separate Codex CLI settings, configured directly on that executor:
+
+```toml
+[executors.sol]
+provider = "openai"
+model = "gpt-5.6-sol"
+context_ktok = 1050
+extra_config = [
+  "model_context_window=1000000",
+  "model_auto_compact_token_limit=900000",
+]
+```
+
+Parable passes each `extra_config` entry as a raw Codex `-c` argument on the initial run and saves
+those arguments for `codex exec resume`. The 900,000-token limit is the 90% compaction point for
+the configured 1,000,000-token budget. This changes only that executor invocation; Parable never
+edits `~/.codex/config.toml`. Run Codex `/status` in the launched session to verify the context
+window actually granted by the server and account. The Claude-loopback route uses the same 1M
+operating budget through Claude Code's process-scoped context controls.
 
 Those environment controls protect future turns, but they cannot repair a saved conversation
 that is already larger than a newly selected model's window. On explicit CLI resumes

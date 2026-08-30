@@ -1,6 +1,6 @@
 {
   "name": "parable",
-  "version": "0.1.30",
+  "version": "0.1.33",
   "description": "Multi-model orchestration or explicit solo execution for coding sessions.",
   "author": {
     "name": "Parcha Labs",
