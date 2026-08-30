@@ -1,7 +1,7 @@
 # Tether Security Model
 
 This document describes the security boundary of Tether `0.3.0-beta.1`,
-binding protocol 3, and database schema 16. The implementation and tests are
+binding protocol 3, and database schema 17. The implementation and tests are
 authoritative.
 
 ## Scope
@@ -273,28 +273,14 @@ List uncertain Hermes ingress and native attempts:
 tether unresolved --team T12345678
 ```
 
-Inspect the exact Slack thread and bound native session. Then record one
-workspace-bound decision:
-
-```bash
-tether resolve \
-  --team T12345678 \
-  --kind attempt \
-  --id att_example \
-  --action complete
-```
-
-Actions are:
-
-| Action | Ingress | Attempt |
-| --- | --- | --- |
-| `retry` | Requeues uncertain Hermes ingress; native ingress must be resolved through its attempt | Requeues its events |
-| `complete` | Records dispatch as completed | Acknowledges the attempt and records its events delivered |
-| `abandon` | Cancels ingress | Cancels the attempt and fails its events |
-
-Use `retry` only after proving the original operation did not run. Use
-`complete` only after proving it did. Otherwise use `abandon` and start a new
-explicit operation. Repeating the same terminal resolution is idempotent;
+Inspect the exact Slack thread and bound native session, then keep the endpoint
+blocked. The legacy same-UID mutation is disabled because an endpoint/model
+process can share that UID. The schema-18 domain accepts fenced `complete` or
+`abandon` decisions only when an attested, OS-distinguishable operator
+authority channel is enabled; that transport is not exposed in this release.
+Blind retry is never a native-attempt action. Once the authority channel
+exists, `complete` requires proof of completion; otherwise `abandon` starts a
+new explicit operation. Repeating the same terminal resolution is idempotent;
 conflicting resolution fails closed.
 
 Evidence:
@@ -308,7 +294,7 @@ complete staging, checksums, snapshots, atomic renames, and a durable
 transaction journal. A failed requested gateway restart restores the prior
 managed files and plugin state.
 
-The current database schema is 15. Startup rejects a newer schema and upgrades
+The active runtime database schema is 17. Startup rejects a newer schema and upgrades
 older supported state in one immediate transaction. Legacy or incomplete
 native bindings become `rebind_required`; Tether does not guess a replacement
 endpoint.

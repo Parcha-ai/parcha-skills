@@ -61,6 +61,33 @@ def _load_security_module() -> Any:
 security = _load_security_module()
 
 
+def _load_schema_receipt_module() -> Any:
+    path = Path(__file__).resolve().with_name("schema_receipt.py")
+    injected = sys.modules.get("schema_receipt")
+    if injected is not None:
+        injected_path = getattr(injected, "__file__", "")
+        with contextlib.suppress(OSError, TypeError, ValueError):
+            if Path(injected_path).resolve() == path:
+                return injected
+    module_name = (
+        "_tether_runtime_schema_receipt_"
+        + hashlib.sha256(str(path).encode()).hexdigest()[:16]
+    )
+    existing = sys.modules.get(module_name)
+    if existing is not None:
+        return existing
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Tether schema receipt module could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+schema_receipt = _load_schema_receipt_module()
+
+
 def _load_hermes_compat_module() -> Any:
     path = Path(__file__).resolve().with_name("hermes_compat.py")
     module_name = (
@@ -274,6 +301,8 @@ class Config:
     allow_channel_owner_restrictions: bool = False
     team_id: str = ""
     allowed_users: tuple[str, ...] = ()
+    persona_id: str = ""
+    policy_generation: int = 0
     native_timeout_seconds: int = 1800
     max_reply_words: int = 50
     max_reply_chars: int = 500
@@ -295,6 +324,8 @@ CONFIG_KEYS = frozenset({
     "allow_channel_owner_restrictions",
     "team_id",
     "allowed_users",
+    "persona_id",
+    "policy_generation",
     "native_timeout_seconds",
     "max_reply_words",
     "max_reply_chars",
@@ -438,6 +469,8 @@ def load_config(path: Path = CONFIG_PATH) -> Config:
     default_owner = _config_string(raw, "default_owner")
     allow_channel_owner_restrictions = raw.get("allow_channel_owner_restrictions", False)
     team_id = _config_string(raw, "team_id")
+    persona_id = _config_string(raw, "persona_id")
+    policy_generation = _config_integer(raw, "policy_generation", 0)
     if not isinstance(allow_channel_owner_restrictions, bool):
         raise ValueError("allow_channel_owner_restrictions must be a boolean")
     if default_channel and not CHANNEL_ID_PATTERN.fullmatch(default_channel):
@@ -446,12 +479,18 @@ def load_config(path: Path = CONFIG_PATH) -> Config:
         raise ValueError("default_owner is not a valid Slack member ID")
     if team_id and not ID_PATTERN.fullmatch(team_id):
         raise ValueError("team_id is not a valid Slack workspace ID")
+    if persona_id and len(persona_id) > 128:
+        raise ValueError("persona_id must be at most 128 characters")
+    if not 0 <= policy_generation <= 2_147_483_647:
+        raise ValueError("policy_generation must be between 0 and 2147483647")
     return Config(
         default_channel=default_channel,
         default_owner=default_owner,
         allow_channel_owner_restrictions=allow_channel_owner_restrictions,
         team_id=team_id,
         allowed_users=tuple(users),
+        persona_id=persona_id,
+        policy_generation=policy_generation,
         native_timeout_seconds=timeout,
         max_reply_words=max_reply_words,
         max_reply_chars=max_reply_chars,
@@ -9579,26 +9618,6 @@ class Broker:
             ),
         }
 
-    def _resolve(
-        self,
-        request: BridgeRequest,
-        config: Config,
-    ) -> dict[str, Any]:
-        team_id = self.require_workspace(
-            str(request.get("team_id") or config.team_id)
-        )
-        resolution = self.store.resolve_uncertain_operation(
-            team_id,
-            str(request.get("kind") or ""),
-            str(request.get("id") or ""),
-            str(request.get("action") or ""),
-        )
-        if resolution["action"] == "retry":
-            bridge_id = str(resolution.get("bridge_id") or "")
-            if bridge_id:
-                self._wake_bridge(bridge_id)
-        return {"ok": True, **resolution}
-
     def handle(self, request: BridgeRequest) -> dict[str, Any]:
         operation = str(request.get("op", "notify"))
         config = load_config()
@@ -9618,7 +9637,11 @@ class Broker:
         if operation == "unresolved":
             return self._unresolved(request, config)
         if operation == "resolve":
-            return self._resolve(request, config)
+            raise NativeContinuationError(
+                "Tether recovery mutation is disabled until an OS-isolated operator "
+                "authority channel is active",
+                code="operator_boundary_unavailable",
+            )
         if operation == "notify":
             with self._notify_lock:
                 return self._notify(request, config, allowed_users)
@@ -9796,8 +9819,23 @@ def _acquire_broker_lock(path: Path) -> int:
         raise
 
 
+def acquire_database_singleton(path: Path = DB_PATH) -> int:
+    """The one database singleton lock; schema orchestration reuses it."""
+    candidate = Path(path).expanduser()
+    security.secure_state_directory(candidate.parent, create=True)
+    return _acquire_broker_lock(candidate)
+
+
 def open_locked_store(path: Path = DB_PATH) -> tuple[Store, int]:
     """Acquire the singleton lock before opening, migrating, or recovering SQLite."""
+    gate_error = schema_receipt.runtime_gate_error(
+        runtime_schema_version=SCHEMA_VERSION,
+    )
+    if gate_error is not None:
+        raise RuntimeError(
+            "Tether refuses to open the database during an unresolved schema "
+            f"operation: {gate_error}"
+        )
     candidate = Path(path).expanduser()
     security.secure_state_directory(candidate.parent, create=True)
     lock_fd = _acquire_broker_lock(candidate)

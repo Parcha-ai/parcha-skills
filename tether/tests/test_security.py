@@ -122,6 +122,44 @@ class PrivateStatePathTest(unittest.TestCase):
         self.assertTrue(raced)
         self.assertEqual(target.read_text(encoding="utf-8"), "target")
 
+    def test_owned_file_reader_rejects_symlink_ancestors_and_leaf_swap(self):
+        real = self.root / "real-owned"
+        real.mkdir(mode=0o700)
+        owned = real / "manifest.tsv"
+        owned.write_bytes(b"trusted")
+        owned.chmod(0o600)
+        linked = self.root / "linked-owned"
+        linked.symlink_to(real, target_is_directory=True)
+        with self.assertRaises(security.StatePathError):
+            security.read_owned_file_bytes(
+                linked / owned.name,
+                expected_mode=0o600,
+            )
+
+        replacement = real / "replacement"
+        replacement.write_bytes(b"replacement")
+        replacement.chmod(0o600)
+        original_lstat = security._lstat_at
+        raced = False
+
+        def replace_after_lstat(parent_fd, name):
+            nonlocal raced
+            result = original_lstat(parent_fd, name)
+            if name == owned.name and not raced:
+                owned.unlink()
+                owned.symlink_to(replacement)
+                raced = True
+            return result
+
+        with mock.patch.object(
+            security,
+            "_lstat_at",
+            side_effect=replace_after_lstat,
+        ):
+            with self.assertRaises(security.StatePathError):
+                security.read_owned_file_bytes(owned, expected_mode=0o600)
+        self.assertTrue(raced)
+
     def test_relative_and_traversal_paths_are_rejected(self):
         with self.assertRaises(security.StatePathError):
             security.secure_state_directory("relative/state")

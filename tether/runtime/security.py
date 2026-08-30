@@ -48,6 +48,14 @@ class UploadSecurityError(SecurityError):
     """An upload source or staged snapshot failed validation."""
 
 
+@dataclass(frozen=True)
+class OwnedFileIdentity:
+    device: int
+    inode: int
+    size: int
+    mode: int
+
+
 def _absolute_path(path: str | os.PathLike[str], *, label: str) -> Path:
     candidate = Path(path)
     if not candidate.is_absolute():
@@ -109,9 +117,11 @@ def secure_state_directory(
     """
     target = _absolute_path(path, label="state directory")
     expected_uid = os.geteuid() if owner_uid is None else owner_uid
-    parent_fd, name = _open_parent(target)
+    parent_fd = -1
+    name = target.name
     descriptor = -1
     try:
+        parent_fd, name = _open_parent(target)
         try:
             before = _lstat_at(parent_fd, name)
         except FileNotFoundError:
@@ -139,7 +149,8 @@ def secure_state_directory(
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-        os.close(parent_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
 
 
 def secure_state_file(
@@ -151,9 +162,11 @@ def secure_state_file(
     """Validate one private regular state file and enforce mode 0600."""
     target = _absolute_path(path, label="state file")
     expected_uid = os.geteuid() if owner_uid is None else owner_uid
-    parent_fd, name = _open_parent(target)
+    parent_fd = -1
+    name = target.name
     descriptor = -1
     try:
+        parent_fd, name = _open_parent(target)
         try:
             before = _lstat_at(parent_fd, name)
         except FileNotFoundError:
@@ -187,7 +200,8 @@ def secure_state_file(
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-        os.close(parent_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
 
 
 def read_private_text(
@@ -202,9 +216,11 @@ def read_private_text(
     if not 1 <= max_bytes <= 16 * 1024 * 1024:
         raise StatePathError("private file size limit is invalid")
     expected_uid = os.geteuid() if owner_uid is None else owner_uid
-    parent_fd, name = _open_parent(target)
+    parent_fd = -1
+    name = target.name
     descriptor = -1
     try:
+        parent_fd, name = _open_parent(target)
         before = _lstat_at(parent_fd, name)
         if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
             raise StatePathError("private file is not a real regular file")
@@ -238,7 +254,118 @@ def read_private_text(
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-        os.close(parent_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
+
+
+def read_owned_file_bytes(
+    path: str | os.PathLike[str],
+    *,
+    owner_uid: int | None = None,
+    max_bytes: int = 1_048_576,
+    expected_mode: int | None = None,
+) -> tuple[bytes, OwnedFileIdentity]:
+    """Read an owned regular file through one pinned no-follow descriptor.
+
+    Unlike ``read_private_text``, this helper does not change the file mode. It
+    is intended for integrity verification of installed, mixed-mode artifacts.
+    """
+
+    target = _absolute_path(path, label="owned file")
+    if not 1 <= max_bytes <= 16 * 1024 * 1024:
+        raise StatePathError("owned file size limit is invalid")
+    expected_uid = os.geteuid() if owner_uid is None else owner_uid
+    parent_fd = -1
+    name = target.name
+    descriptor = -1
+    try:
+        parent_fd, name = _open_parent(target)
+        before = _lstat_at(parent_fd, name)
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+            raise StatePathError("owned file is not a real regular file")
+        descriptor = os.open(name, _READ_FLAGS, dir_fd=parent_fd)
+        opened = os.fstat(descriptor)
+        if not _same_inode(before, opened):
+            raise StatePathError("owned file changed during validation")
+        _validate_owner(opened, expected_uid, label="owned file")
+        if opened.st_nlink != 1:
+            raise StatePathError("owned file has multiple hard links")
+        mode = stat.S_IMODE(opened.st_mode)
+        if expected_mode is not None and mode != expected_mode:
+            raise StatePathError("owned file mode is invalid")
+        if opened.st_size > max_bytes:
+            raise StatePathError("owned file is too large")
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(65_536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > max_bytes:
+            raise StatePathError("owned file is too large")
+        return raw, OwnedFileIdentity(
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            mode,
+        )
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise StatePathError("owned file could not be read safely") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if parent_fd >= 0:
+            os.close(parent_fd)
+
+
+def owned_file_identity(
+    path: str | os.PathLike[str],
+    *,
+    owner_uid: int | None = None,
+    expected_mode: int | None = None,
+) -> OwnedFileIdentity:
+    """Return a no-follow identity for an owned regular file without reading it."""
+
+    target = _absolute_path(path, label="owned file")
+    expected_uid = os.geteuid() if owner_uid is None else owner_uid
+    parent_fd = -1
+    name = target.name
+    descriptor = -1
+    try:
+        parent_fd, name = _open_parent(target)
+        before = _lstat_at(parent_fd, name)
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+            raise StatePathError("owned file is not a real regular file")
+        descriptor = os.open(name, _READ_FLAGS, dir_fd=parent_fd)
+        opened = os.fstat(descriptor)
+        if not _same_inode(before, opened):
+            raise StatePathError("owned file changed during validation")
+        _validate_owner(opened, expected_uid, label="owned file")
+        if opened.st_nlink != 1:
+            raise StatePathError("owned file has multiple hard links")
+        mode = stat.S_IMODE(opened.st_mode)
+        if expected_mode is not None and mode != expected_mode:
+            raise StatePathError("owned file mode is invalid")
+        return OwnedFileIdentity(
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            mode,
+        )
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise StatePathError("owned file could not be validated safely") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if parent_fd >= 0:
+            os.close(parent_fd)
 
 
 def validate_private_executable(

@@ -2248,6 +2248,7 @@ class NotifierTest(unittest.TestCase):
         data.mkdir(parents=True)
         shutil.copy2(RUNTIME_PATH, data / "bridge_runtime.py")
         shutil.copy2(SECURITY_PATH, data / "security.py")
+        shutil.copy2(ROOT / "runtime" / "schema_receipt.py", data / "schema_receipt.py")
         shutil.copy2(HERMES_COMPAT_PATH, data / "hermes_compat.py")
         shutil.copy2(ROUTING_PATH, data / "routing.py")
         shutil.copy2(SLACK_PROTOCOL_PATH, data / "slack_protocol.py")

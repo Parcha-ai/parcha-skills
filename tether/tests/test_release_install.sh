@@ -324,6 +324,9 @@ STATE="$XDG_STATE_HOME/tether-installer"
 CONFIG="$XDG_CONFIG_HOME/tether/config.toml"
 LAUNCHER="$HOME/.local/bin/tether"
 BRIDGE="$RUNTIME/bridge_runtime.py"
+DOMAIN_CONTROL="$RUNTIME/domain_control.py"
+DOMAIN_SCHEMA="$RUNTIME/domain_schema.py"
+SCHEMA_ORCHESTRATOR="$RUNTIME/schema_orchestrator.py"
 HERMES_COMPAT="$RUNTIME/hermes_compat.py"
 ROUTING="$RUNTIME/routing.py"
 SECURITY="$RUNTIME/security.py"
@@ -334,7 +337,7 @@ HERDR_README="$RUNTIME/herdr-plugin/README.md"
 CODEX_SKILL="$CODEX_HOME/skills/tether/SKILL.md"
 CLAUDE_SKILL="$CLAUDE_HOME/skills/tether/SKILL.md"
 
-for path in "$BRIDGE" "$HERMES_COMPAT" "$ROUTING" "$SECURITY" "$SLACK_PROTOCOL" \
+for path in "$BRIDGE" "$DOMAIN_CONTROL" "$DOMAIN_SCHEMA" "$SCHEMA_ORCHESTRATOR" "$HERMES_COMPAT" "$ROUTING" "$SECURITY" "$SLACK_PROTOCOL" \
   "$RUNTIME/install.sh" "$RUNTIME/package.json" "$LAUNCHER" "$CODEX_SKILL" \
   "$CLAUDE_SKILL" "$HERDR_MANIFEST" "$HERDR_PLUGIN" "$HERDR_README" \
   "$STATE/current.tsv" "$CONFIG"

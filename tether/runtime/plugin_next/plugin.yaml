@@ -1,0 +1,29 @@
+name: tether
+version: 0.4.0-alpha.1
+manifest_version: 2
+api_version: 1
+description: >
+  Slack-thread continuation for long-running local agent sessions. Shadow
+  mode only in this release: observes pre_gateway_dispatch, records the
+  admission and routing decision Tether would make into a durable journal
+  under plugin-data/tether/, and never influences dispatch. The security
+  domain (workspace, authorized owners, persona, policy generation) is read
+  from Tether's own config file, which the broker and CLI share; only
+  plugin-behavior toggles live under plugins.entries.tether.settings.
+author: Parcha
+license: MIT
+homepage: https://github.com/Parcha-ai/parcha-skills
+tags: [slack, continuation, tether]
+kind: standalone
+provides_hooks:
+  - pre_gateway_dispatch
+capabilities: []
+config_schema:
+  shadow_mode:
+    type: bool
+    default: true
+    description: >
+      Record decisions without influencing dispatch. This release ignores a
+      false value and stays in shadow (active mode arrives with the audited
+      cutover); the setting exists so enabling active mode later is a config
+      change, not a schema change.
