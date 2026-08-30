@@ -7637,7 +7637,29 @@ def validate_reply_text(text: str, config: Config | None = None) -> str:
         raise ValueError(
             f"Slack reply exceeds Tether's {MAX_TEXT}-character transport limit"
         )
-    return cleaned
+    return _repair_bare_user_mentions(cleaned)
+
+
+_BARE_MENTION = re.compile(r"(?<![<\w`])@([UW][A-Z0-9]{6,})\b(?!>)")
+
+
+def _repair_bare_user_mentions(text: str) -> str:
+    """Turn a bare ``@U123ABC`` into the ``<@U123ABC>`` Slack actually renders.
+
+    Inbound text reaches the agent with mentions already humanized to
+    ``@DisplayName``, so an agent that wants to address someone by ID — which
+    is what it has when the display name is empty, as it is for every bot in
+    this workspace — writes the bare form back. Slack renders that as literal
+    text: the mention silently does not happen, the addressee is never
+    notified, and the reply looks like it is talking to nobody.
+
+    Only the exact Slack ID shape is rewritten, and only when it is not
+    already inside angle brackets, part of a larger word, or in a code span,
+    so ordinary prose and quoted identifiers are untouched.
+    """
+    if "@" not in text:
+        return text
+    return _BARE_MENTION.sub(lambda match: "<@" + match.group(1) + ">", text)
 
 
 def stage_reply_payload(

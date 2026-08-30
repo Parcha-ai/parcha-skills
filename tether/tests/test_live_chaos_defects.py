@@ -217,3 +217,66 @@ class UnresolvedRootVisibilityTest(unittest.TestCase):
         self.assertIn("root is not awaiting operator resolution", block)
         # Idempotent: re-resolving an already-resolved root is a no-op.
         self.assertIn('"deduplicated": True', block)
+
+
+class BareMentionRepairTest(unittest.TestCase):
+    """An agent writing @U123 must still produce a real Slack mention.
+
+    Inbound text is humanized to @DisplayName before the agent sees it, so
+    when a display name is empty — true for every bot in this workspace —
+    the agent sees the raw ID and writes it back bare. Slack renders that as
+    plain text: the mention never happens and the addressee is not notified.
+    Observed live on 2026-08-30, where two agents addressed each other for
+    an entire debate without either being pinged.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        previous = list(sys.path)
+        try:
+            sys.path.insert(0, str(RUNTIME))
+            for name in ("bridge_runtime", "security", "routing", "slack_protocol",
+                         "hermes_compat", "schema_receipt"):
+                sys.modules.pop(name, None)
+            import bridge_runtime
+            cls.runtime = bridge_runtime
+        finally:
+            sys.path[:] = previous
+
+    def repair(self, text):
+        return self.runtime._repair_bare_user_mentions(text)
+
+    def test_bare_id_becomes_a_real_mention(self):
+        self.assertEqual(
+            self.repair("@U0BJATRKZ6V Fair hit"), "<@U0BJATRKZ6V> Fair hit"
+        )
+
+    def test_punctuation_immediately_after_the_id_is_preserved(self):
+        self.assertEqual(
+            self.repair("@U095AHX1QQL, you conceded"),
+            "<@U095AHX1QQL>, you conceded",
+        )
+
+    def test_already_correct_mentions_are_untouched(self):
+        text = "<@U095AHX1QQL> and <@U0BJATRKZ6V> are fine"
+        self.assertEqual(self.repair(text), text)
+
+    def test_emails_and_handles_are_not_rewritten(self):
+        for text in ("write to me@Ucorp.example", "plain @alice untouched",
+                     "ask @UX for help"):
+            self.assertEqual(self.repair(text), text)
+
+    def test_ids_inside_code_spans_are_left_alone(self):
+        text = "the var `@U12345678` in code"
+        self.assertEqual(self.repair(text), text)
+
+    def test_repair_runs_on_every_outbound_reply(self):
+        # The chokepoint matters: fixing only one call site would leave the
+        # other delivery paths emitting dead mentions.
+        source = (RUNTIME / "bridge_runtime.py").read_text()
+        block = source[source.index("def validate_reply_text"):]
+        block = block[: block.index("def _repair_bare_user_mentions")]
+        self.assertIn("return _repair_bare_user_mentions(cleaned)", block)
+
+    def test_silence_control_output_is_not_mangled(self):
+        self.assertEqual(self.runtime.validate_reply_text("NO_REPLY"), "NO_REPLY")
