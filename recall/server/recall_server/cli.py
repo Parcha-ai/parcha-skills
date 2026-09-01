@@ -310,7 +310,7 @@ def _discard_empty_legacy_storage(store: BrainStore) -> dict[str, object]:
                 """SELECT relname
                      FROM pg_stat_user_tables
                     WHERE schemaname='public' AND relname=ANY(%s)""",
-                (_EMPTY_LEGACY_RELATIONS,),
+                (list(_EMPTY_LEGACY_RELATIONS),),
             ).fetchall()
         }
         if existing != set(_EMPTY_LEGACY_RELATIONS):
@@ -329,7 +329,7 @@ def _discard_empty_legacy_storage(store: BrainStore) -> dict[str, object]:
                       pg_total_relation_size(relid) AS total_bytes
                  FROM pg_stat_user_tables
                 WHERE schemaname='public' AND relname=ANY(%s)""",
-            (_EMPTY_LEGACY_RELATIONS,),
+            (list(_EMPTY_LEGACY_RELATIONS),),
         ).fetchall()
         before = {
             row["relname"]: int(row["total_bytes"])
@@ -346,7 +346,7 @@ def _discard_empty_legacy_storage(store: BrainStore) -> dict[str, object]:
                       pg_total_relation_size(relid) AS total_bytes
                  FROM pg_stat_user_tables
                 WHERE schemaname='public' AND relname=ANY(%s)""",
-            (_EMPTY_LEGACY_RELATIONS,),
+            (list(_EMPTY_LEGACY_RELATIONS),),
         ).fetchall()
         after = {
             row["relname"]: int(row["total_bytes"])
