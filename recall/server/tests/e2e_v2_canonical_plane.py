@@ -11,7 +11,9 @@ from pathlib import Path
 import psycopg
 
 SERVER = Path(__file__).resolve().parents[1]
+RECALL = SERVER.parent
 sys.path.insert(0, str(SERVER))
+sys.path.insert(0, str(RECALL))
 
 from recall_server.db import BrainStore
 from recall_server.cli import _storage_authority_audit
