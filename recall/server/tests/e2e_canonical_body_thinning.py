@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PostgreSQL E2E for fail-closed canonical body thinning."""
+"""PostgreSQL E2E for object-authoritative canonical body thinning."""
 
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ def insert_document(
     source: str,
     suffix: str,
     text: str,
-    corrupt_chunks: bool = False,
+    omit_chunks: bool = False,
 ) -> tuple[str, str]:
     native = f"native:{suffix}"
     parent = f"session:{suffix}"
@@ -132,9 +132,9 @@ def insert_document(
             digest(text),
         ),
     )
-    for ordinal, chunk_text in enumerate(canonical_text_chunks(text)):
-        if corrupt_chunks and ordinal == 0:
-            chunk_text += " corrupt"
+    for ordinal, chunk_text in enumerate(
+        () if omit_chunks else canonical_text_chunks(text)
+    ):
         chunk_hash = digest(f"{document}:{ordinal}")
         connection.execute(
             """INSERT INTO canonical_chunks(
@@ -211,9 +211,9 @@ def main() -> None:
                 tenant=tenant,
                 principal=principal,
                 source=source,
-                suffix="bad",
+                suffix="no-chunks",
                 text=text,
-                corrupt_chunks=True,
+                omit_chunks=True,
             )
 
         report = thin_canonical_bodies(
@@ -322,7 +322,7 @@ def main() -> None:
             "status": "pass",
             "lossless_body_rebuilt": True,
             "logical_reprojection_after_thinning": True,
-            "corrupt_chunks_refused": True,
+            "missing_chunks_refused": True,
             "object_backed_metadata_preserved": True,
             "event_id": good_event,
         }, sort_keys=True))

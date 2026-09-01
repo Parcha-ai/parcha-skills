@@ -43,12 +43,13 @@ def thin_canonical_bodies(
     batch_size: int = 1_000,
     max_batches: int = 1,
 ) -> dict[str, Any]:
-    """Remove duplicate bodies only after lossless chunks and S3 authority agree.
+    """Remove duplicate bodies only after searchable chunks and S3 authority exist.
 
     The canonical chunk plane remains the single database-resident text copy. The
     raw and logical evidence objects remain the immutable full-document authority.
-    Each batch fails closed for a document unless its ordered chunks concatenate
-    byte-for-byte to the inline document body.
+    Each batch fails closed for a document unless it has at least one live chunk.
+    We deliberately do not reread and concatenate the retained chunk corpus here:
+    object storage, not a second SQL body copy, is the recovery authority.
     """
 
     if (
@@ -83,18 +84,29 @@ def thin_canonical_bodies(
                              ON artifact.tenant_id=event.tenant_id
                             AND artifact.source_id=event.source_id
                             AND artifact.artifact_id=event.artifact_id
-                           JOIN canonical_evidence_documents evidence
-                             ON evidence.tenant_id=event.tenant_id
-                            AND evidence.source_id=event.source_id
-                            AND evidence.native_parent_id=COALESCE(
-                                event.native_parent_id,event.native_id
-                            )
                           WHERE document.tenant_id=%s
                             AND document.body_location='inline'
                             AND document.deleted_at IS NULL
                             AND artifact.storage_backend='s3'
                             AND artifact.state='live'
-                            AND evidence.manifest_storage_backend='s3'
+                            AND EXISTS (
+                                SELECT 1
+                                  FROM canonical_evidence_documents evidence
+                                 WHERE evidence.tenant_id=event.tenant_id
+                                   AND evidence.source_id=event.source_id
+                                   AND evidence.native_parent_id=COALESCE(
+                                       event.native_parent_id,event.native_id
+                                   )
+                                   AND evidence.manifest_storage_backend='s3'
+                            )
+                            AND EXISTS (
+                                SELECT 1
+                                  FROM canonical_chunks chunk
+                                 WHERE chunk.tenant_id=document.tenant_id
+                                   AND chunk.source_id=document.source_id
+                                   AND chunk.document_id=document.document_id
+                                   AND chunk.deleted_at IS NULL
+                            )
                             AND NOT EXISTS (
                                 SELECT 1
                                   FROM canonical_evidence_document_queue queued
@@ -107,32 +119,16 @@ def thin_canonical_bodies(
                           ORDER BY document.source_id,document.document_id
                           LIMIT %s
                           FOR UPDATE OF document,event SKIP LOCKED
-                     ), verified AS MATERIALIZED (
-                         SELECT candidate.*
-                           FROM candidates candidate
-                           JOIN LATERAL (
-                                SELECT string_agg(
-                                           chunk.text_redacted,''
-                                           ORDER BY chunk.ordinal
-                                       ) AS full_text,
-                                       count(*)::integer AS chunk_count
-                                  FROM canonical_chunks chunk
-                                 WHERE chunk.tenant_id=candidate.tenant_id
-                                   AND chunk.source_id=candidate.source_id
-                                   AND chunk.document_id=candidate.document_id
-                                   AND chunk.deleted_at IS NULL
-                           ) chunks ON chunks.chunk_count>0
-                          WHERE chunks.full_text=candidate.text_redacted
                      ), updated_documents AS (
                          UPDATE canonical_documents document
                             SET text_redacted='',body_location='chunks'
-                           FROM verified
-                          WHERE document.tenant_id=verified.tenant_id
-                            AND document.source_id=verified.source_id
-                            AND document.document_id=verified.document_id
-                      RETURNING verified.event_id,
-                                verified.tenant_id,verified.source_id,
-                                verified.document_bytes,verified.event_bytes
+                           FROM candidates candidate
+                          WHERE document.tenant_id=candidate.tenant_id
+                            AND document.source_id=candidate.source_id
+                            AND document.document_id=candidate.document_id
+                      RETURNING candidate.event_id,
+                                candidate.tenant_id,candidate.source_id,
+                                candidate.document_bytes,candidate.event_bytes
                      ), updated_events AS (
                          UPDATE canonical_events event
                             SET canonical_redacted={compact_event},
