@@ -11,9 +11,12 @@ from pathlib import Path
 import psycopg
 
 SERVER = Path(__file__).resolve().parents[1]
+RECALL = SERVER.parent
 sys.path.insert(0, str(SERVER))
+sys.path.insert(0, str(RECALL))
 
 from recall_server.db import BrainStore
+from recall_server.cli import _storage_authority_audit
 
 
 def expect_sqlstate(connection, sql: str, parameters: tuple, expected: str) -> None:
@@ -45,7 +48,14 @@ def insert_source(connection, tenant: str, principal: str, source: str) -> None:
 
 def main() -> None:
     dsn = os.environ["RECALL_DATABASE_URL"]
-    BrainStore(dsn).migrate()
+    store = BrainStore(dsn)
+    store.migrate()
+    empty_audit = _storage_authority_audit(
+        store,
+        "tenant:e2e:authority-audit-empty",
+    )
+    assert empty_audit["status"] == "ok"
+    assert empty_audit["canonical_documents"]["total"] == 0
     nonce = uuid.uuid4().hex
     tenant_a = f"tenant:e2e:{nonce}:a"
     tenant_b = f"tenant:e2e:{nonce}:b"
