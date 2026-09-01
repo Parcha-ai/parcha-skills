@@ -1114,6 +1114,59 @@ class CanonicalLogicalEvidenceProjector:
                     connection,
                     candidate,
                 )
+                current_artifacts = (
+                    None
+                    if old_manifest is None
+                    else (
+                        old_manifest["artifact_id"],
+                        tuple(
+                            reference["artifact_id"]
+                            for reference in old_parts
+                        ),
+                    )
+                )
+                uploaded_artifacts = (
+                    manifest_reference["artifact_id"],
+                    tuple(
+                        reference["artifact_id"]
+                        for reference in upload.part_references
+                    ),
+                )
+                if current_artifacts == uploaded_artifacts:
+                    # Repairing an absent immutable object must not replace an
+                    # identical database document. The old path cascaded
+                    # through every passage, actor, context, and embedding even
+                    # though their source bytes had not changed.
+                    connection.execute(
+                        """UPDATE canonical_evidence_documents
+                              SET source_updated_at=%s
+                            WHERE tenant_id=%s AND source_id=%s
+                              AND native_parent_id=%s
+                              AND source_updated_at IS DISTINCT FROM %s""",
+                        (
+                            candidate.source_updated_at,
+                            candidate.tenant_id,
+                            candidate.source_id,
+                            candidate.native_parent_id,
+                            candidate.source_updated_at,
+                        ),
+                    )
+                    deleted = connection.execute(
+                        """DELETE FROM canonical_evidence_document_queue
+                            WHERE tenant_id=%s AND source_id=%s
+                              AND native_parent_id=%s AND generation=%s""",
+                        (
+                            candidate.tenant_id,
+                            candidate.source_id,
+                            candidate.native_parent_id,
+                            candidate.generation,
+                        ),
+                    )
+                    if deleted.rowcount != 1:
+                        raise LogicalEvidenceError(
+                            "logical_evidence_queue_conflict"
+                        )
+                    return "repaired"
                 retained_artifacts = {
                     reference["artifact_id"]
                     for reference in upload.all_references
@@ -1455,6 +1508,7 @@ class CanonicalLogicalEvidenceProjector:
             prepare_pool(min(upload_concurrency, batch_size))
         tenant_id = self._tenant(tenant_id)
         documents = records = receipts = objects = bytes_uploaded = batches = 0
+        repaired = 0
         old_objects_deleted = cleanup_failures = source_races = pruned = 0
         cleanup_completed = cleanup_pending = 0
         cleanup = self.drain_cleanup(
@@ -1584,6 +1638,9 @@ class CanonicalLogicalEvidenceProjector:
                     continue
                 if status == "adopted":
                     continue
+                if status == "repaired":
+                    repaired += 1
+                    continue
                 if status == "pruned":
                     pruned += 1
                     continue
@@ -1616,6 +1673,7 @@ class CanonicalLogicalEvidenceProjector:
         return {
             "status": "complete" if int(pending) == 0 else "pending",
             "documents": documents,
+            "repaired": repaired,
             "records": records,
             "receipts": receipts,
             "objects": objects,

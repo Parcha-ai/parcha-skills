@@ -115,6 +115,7 @@ def run_projection_worker(
                 else "pending"
             ),
             "documents": int(documents["documents"]),
+            "logical_repaired": int(documents.get("repaired", 0)),
             "logical_pending": int(documents.get("pending", 0)),
             "records": int(documents["records"]),
             "passage_documents": int(projected["documents"]),
@@ -133,7 +134,8 @@ def run_projection_worker(
             "cleanup_failures": int(documents["cleanup_failures"]),
         }
         LOG.info(
-            "projection cycle status=%s documents=%s logical_pending=%s records=%s "
+            "projection cycle status=%s documents=%s logical_repaired=%s "
+            "logical_pending=%s records=%s "
             "passage_documents=%s passage_pending=%s "
             "passage_requeued=%s passage_unavailable=%s "
             "passages=%s embedded=%s "
@@ -147,6 +149,7 @@ def run_projection_worker(
                 for key in (
                     "status",
                     "documents",
+                    "logical_repaired",
                     "logical_pending",
                     "records",
                     "passage_documents",
