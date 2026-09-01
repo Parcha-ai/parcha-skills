@@ -1155,6 +1155,22 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
         self.assertNotIn("SELECT query", sql)
         self.assertIn("pg_stat_activity", sql)
 
+    def test_event_compaction_index_is_disposable_and_concurrent(self) -> None:
+        store = mock.MagicMock()
+        connection = store.connect.return_value.__enter__.return_value
+
+        prepared = server_cli._set_event_compaction_index(store, present=True)
+        create_sql = connection.execute.call_args.args[0]
+        self.assertIn("CREATE INDEX CONCURRENTLY", create_sql)
+        self.assertIn("WHERE body_location='inline'", create_sql)
+        self.assertTrue(prepared["present"])
+
+        finished = server_cli._set_event_compaction_index(store, present=False)
+        drop_sql = connection.execute.call_args.args[0]
+        self.assertIn("DROP INDEX CONCURRENTLY", drop_sql)
+        self.assertFalse(finished["present"])
+        self.assertFalse(connection.autocommit)
+
     def test_s3_event_body_repair_is_batched_and_authority_gated(self) -> None:
         store = mock.MagicMock()
         connection = store.connect.return_value.__enter__.return_value

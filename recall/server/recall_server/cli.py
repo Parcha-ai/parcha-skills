@@ -179,6 +179,35 @@ def _active_database_work(store: BrainStore) -> dict[str, object]:
     }
 
 
+def _set_event_compaction_index(
+    store: BrainStore,
+    *,
+    present: bool,
+) -> dict[str, object]:
+    """Create or remove the disposable index used by event-body maintenance."""
+
+    operation = (
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+        "recall_event_body_compaction_idx "
+        "ON public.canonical_events(tenant_id,source_id,event_id) "
+        "WHERE body_location='inline'"
+        if present
+        else "DROP INDEX CONCURRENTLY IF EXISTS "
+        "public.recall_event_body_compaction_idx"
+    )
+    with store.connect() as connection:
+        connection.autocommit = True
+        try:
+            connection.execute(operation)
+        finally:
+            connection.autocommit = False
+    return {
+        "status": "ok",
+        "index": "recall_event_body_compaction_idx",
+        "present": present,
+    }
+
+
 def _compact_storage(
     store: BrainStore,
     relations: list[str],
@@ -1195,6 +1224,8 @@ def main() -> None:
     sub.add_parser("storage-footprint")
     sub.add_parser("storage-event-shape")
     sub.add_parser("storage-active-work")
+    sub.add_parser("storage-prepare-event-compaction")
+    sub.add_parser("storage-finish-event-compaction")
     sub.add_parser("storage-recompact-oversized-events")
     recompact_s3_events = sub.add_parser("storage-recompact-s3-event-bodies")
     recompact_s3_events.add_argument("--batch-size", type=int, default=10_000)
@@ -1648,6 +1679,14 @@ def main() -> None:
         print(json.dumps(_canonical_event_shape(store), sort_keys=True))
     elif args.command == "storage-active-work":
         print(json.dumps(_active_database_work(store), sort_keys=True))
+    elif args.command == "storage-prepare-event-compaction":
+        print(json.dumps(
+            _set_event_compaction_index(store, present=True), sort_keys=True,
+        ))
+    elif args.command == "storage-finish-event-compaction":
+        print(json.dumps(
+            _set_event_compaction_index(store, present=False), sort_keys=True,
+        ))
     elif args.command == "storage-recompact-oversized-events":
         print(json.dumps(_recompact_oversized_event_pointers(store), sort_keys=True))
     elif args.command == "storage-recompact-s3-event-bodies":
