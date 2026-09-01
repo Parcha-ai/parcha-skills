@@ -371,6 +371,105 @@ def _discard_empty_legacy_storage(store: BrainStore) -> dict[str, object]:
     }
 
 
+def _legacy_storage_coverage(connection: object) -> dict[str, int]:
+    """Count legacy events durably represented by an S3-backed canonical event."""
+
+    row = connection.execute(
+        """SELECT count(*)::bigint AS total,
+                  count(*) FILTER (
+                      WHERE EXISTS (
+                          SELECT 1
+                            FROM canonical_events event
+                            JOIN raw_artifacts artifact
+                              ON artifact.tenant_id=event.tenant_id
+                             AND artifact.source_id=event.source_id
+                             AND artifact.artifact_id=event.artifact_id
+                           WHERE event.source_id=source_events.source_id
+                             AND event.native_id=source_events.native_id
+                             AND event.content_sha256=source_events.content_sha256
+                             AND artifact.storage_backend='s3'
+                             AND artifact.state='live'
+                      )
+                  )::bigint AS canonical_covered
+             FROM source_events"""
+    ).fetchone()
+    return {key: int(row[key]) for key in ("total", "canonical_covered")}
+
+
+def _discard_covered_legacy_storage(store: BrainStore) -> dict[str, object]:
+    """Reclaim the legacy plane only after an atomic S3-backed coverage proof."""
+
+    with store.connect() as connection:
+        existing = {
+            row["relname"]
+            for row in connection.execute(
+                """SELECT relname
+                     FROM pg_stat_user_tables
+                    WHERE schemaname='public' AND relname=ANY(%s)""",
+                (list(_EMPTY_LEGACY_RELATIONS),),
+            ).fetchall()
+        }
+        if existing != set(_EMPTY_LEGACY_RELATIONS):
+            raise ValueError("covered legacy storage relation is unavailable")
+
+        # Freeze legacy writers and the canonical proof rows for the short final
+        # gate. This prevents a covered row from changing between proof and cut.
+        connection.execute("LOCK TABLE public.source_events IN ACCESS EXCLUSIVE MODE")
+        connection.execute(
+            "LOCK TABLE public.canonical_events,public.raw_artifacts IN SHARE MODE"
+        )
+        coverage = _legacy_storage_coverage(connection)
+        if coverage["canonical_covered"] != coverage["total"]:
+            raise ValueError("legacy source events are not fully S3-canonical-covered")
+
+        before_rows = connection.execute(
+            """SELECT relname,
+                      pg_total_relation_size(relid) AS total_bytes
+                 FROM pg_stat_user_tables
+                WHERE schemaname='public' AND relname=ANY(%s)""",
+            (list(_EMPTY_LEGACY_RELATIONS),),
+        ).fetchall()
+        before = {
+            row["relname"]: int(row["total_bytes"])
+            for row in before_rows
+        }
+
+        identifiers = ",".join(
+            f'public."{name}"' for name in _EMPTY_LEGACY_RELATIONS
+        )
+        connection.execute(f"TRUNCATE TABLE {identifiers}")
+
+        after_rows = connection.execute(
+            """SELECT relname,
+                      pg_total_relation_size(relid) AS total_bytes
+                 FROM pg_stat_user_tables
+                WHERE schemaname='public' AND relname=ANY(%s)""",
+            (list(_EMPTY_LEGACY_RELATIONS),),
+        ).fetchall()
+        after = {
+            row["relname"]: int(row["total_bytes"])
+            for row in after_rows
+        }
+
+    results = [
+        {
+            "relation": relation,
+            "before_bytes": before[relation],
+            "after_bytes": after[relation],
+            "reclaimed_bytes": max(0, before[relation] - after[relation]),
+        }
+        for relation in _EMPTY_LEGACY_RELATIONS
+    ]
+    return {
+        "status": "ok",
+        "coverage": coverage,
+        "before_bytes": sum(row["before_bytes"] for row in results),
+        "after_bytes": sum(row["after_bytes"] for row in results),
+        "reclaimed_bytes": sum(row["reclaimed_bytes"] for row in results),
+        "relations": results,
+    }
+
+
 def _storage_authority_audit(
     store: BrainStore,
     tenant_id: str,
@@ -378,18 +477,7 @@ def _storage_authority_audit(
     """Prove database-side coverage before bodies move to object storage only."""
 
     with store.connect() as connection:
-        legacy = connection.execute(
-            """SELECT count(*)::bigint AS total,
-                      count(*) FILTER (
-                          WHERE EXISTS (
-                              SELECT 1 FROM canonical_events event
-                               WHERE event.source_id=source_events.source_id
-                                 AND event.native_id=source_events.native_id
-                                 AND event.content_sha256=source_events.content_sha256
-                          )
-                      )::bigint AS canonical_covered
-                 FROM source_events"""
-        ).fetchone()
+        legacy_report = _legacy_storage_coverage(connection)
         documents = connection.execute(
             """SELECT count(*)::bigint AS total,
                       count(*) FILTER (
@@ -474,7 +562,6 @@ def _storage_authority_audit(
             (tenant_id, tenant_id, tenant_id),
         ).fetchone()
 
-    legacy_report = {key: int(legacy[key]) for key in legacy}
     document_report = {key: int(documents[key]) for key in documents}
     logical_report = {key: int(logical[key]) for key in logical}
     evidence_report = {key: int(evidence[key]) for key in evidence}
@@ -528,6 +615,7 @@ def main() -> None:
         help="exact rebuildable projection to discard; repeat for more than one",
     )
     sub.add_parser("storage-discard-empty-legacy")
+    sub.add_parser("storage-discard-covered-legacy")
     authority_audit = sub.add_parser("storage-authority-audit")
     authority_audit.add_argument("--tenant", required=True)
     sub.add_parser("archive-check")
@@ -968,6 +1056,8 @@ def main() -> None:
         )
     elif args.command == "storage-discard-empty-legacy":
         print(json.dumps(_discard_empty_legacy_storage(store), sort_keys=True))
+    elif args.command == "storage-discard-covered-legacy":
+        print(json.dumps(_discard_covered_legacy_storage(store), sort_keys=True))
     elif args.command == "storage-authority-audit":
         print(json.dumps(_storage_authority_audit(store, args.tenant), sort_keys=True))
     elif args.command == "rebuild":

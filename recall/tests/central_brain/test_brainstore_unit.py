@@ -1356,6 +1356,97 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
         )
         self.assertNotIn("content", json.dumps(report))
 
+    def test_covered_legacy_storage_discard_refuses_incomplete_s3_coverage(
+        self,
+    ) -> None:
+        store = mock.MagicMock()
+        connection = store.connect.return_value.__enter__.return_value
+        existing = mock.MagicMock()
+        existing.fetchall.return_value = [
+            {"relname": relation}
+            for relation in server_cli._EMPTY_LEGACY_RELATIONS
+        ]
+        coverage = mock.MagicMock()
+        coverage.fetchone.return_value = {
+            "total": 10,
+            "canonical_covered": 9,
+        }
+        connection.execute.side_effect = [
+            existing,
+            mock.MagicMock(),
+            mock.MagicMock(),
+            coverage,
+        ]
+
+        with self.assertRaisesRegex(ValueError, "not fully S3-canonical-covered"):
+            server_cli._discard_covered_legacy_storage(store)
+
+        self.assertFalse(
+            any(
+                str(call.args[0]).startswith("TRUNCATE")
+                for call in connection.execute.call_args_list
+            )
+        )
+
+    def test_covered_legacy_storage_discard_rechecks_under_locks(self) -> None:
+        store = mock.MagicMock()
+        connection = store.connect.return_value.__enter__.return_value
+        relations = server_cli._EMPTY_LEGACY_RELATIONS
+        existing = mock.MagicMock()
+        existing.fetchall.return_value = [
+            {"relname": relation} for relation in relations
+        ]
+        coverage = mock.MagicMock()
+        coverage.fetchone.return_value = {
+            "total": 10,
+            "canonical_covered": 10,
+        }
+        before = mock.MagicMock()
+        before.fetchall.return_value = [
+            {"relname": relation, "total_bytes": 100}
+            for relation in relations
+        ]
+        after = mock.MagicMock()
+        after.fetchall.return_value = [
+            {"relname": relation, "total_bytes": 10}
+            for relation in relations
+        ]
+        connection.execute.side_effect = [
+            existing,
+            mock.MagicMock(),
+            mock.MagicMock(),
+            coverage,
+            before,
+            mock.MagicMock(),
+            after,
+        ]
+
+        report = server_cli._discard_covered_legacy_storage(store)
+
+        self.assertEqual(report["coverage"], {
+            "total": 10,
+            "canonical_covered": 10,
+        })
+        self.assertEqual(report["reclaimed_bytes"], 630)
+        calls = [str(call.args[0]) for call in connection.execute.call_args_list]
+        self.assertIn(
+            "LOCK TABLE public.source_events IN ACCESS EXCLUSIVE MODE",
+            calls,
+        )
+        self.assertIn(
+            "LOCK TABLE public.canonical_events,public.raw_artifacts IN SHARE MODE",
+            calls,
+        )
+        self.assertIn(
+            "TRUNCATE TABLE "
+            + ",".join(f'public."{name}"' for name in relations),
+            calls,
+        )
+        coverage_sql = calls[3]
+        self.assertIn("JOIN raw_artifacts artifact", coverage_sql)
+        self.assertNotIn("event.tenant_id=%s", coverage_sql)
+        self.assertNotIn("content", json.dumps(report))
+
     def test_storage_authority_audit_requires_complete_database_coverage(
         self,
     ) -> None:
@@ -1382,7 +1473,7 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
 
         legacy_call = connection.execute.call_args_list[0]
         self.assertEqual(len(legacy_call.args), 1)
-        self.assertNotIn("event.tenant_id", legacy_call.args[0])
+        self.assertNotIn("event.tenant_id=%s", legacy_call.args[0])
         self.assertTrue(report["database_coverage_complete"])
         self.assertTrue(report["object_verification_required"])
         self.assertEqual(report["queues"]["cleanup"], 2)
