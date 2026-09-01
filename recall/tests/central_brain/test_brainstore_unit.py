@@ -1119,9 +1119,16 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
         before = mock.MagicMock()
         before.fetchone.return_value = {"bytes": 1_000}
         vacuum = mock.MagicMock()
+        reindex = mock.MagicMock()
         after = mock.MagicMock()
         after.fetchone.return_value = {"bytes": 200}
-        connection.execute.side_effect = [existing, before, vacuum, after]
+        connection.execute.side_effect = [
+            existing,
+            before,
+            vacuum,
+            reindex,
+            after,
+        ]
 
         report = server_cli._compact_storage(store, ["canonical_chunks"])
 
@@ -1139,6 +1146,9 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
         )
         connection.execute.assert_any_call(
             'VACUUM (FULL, ANALYZE) public."canonical_chunks"'
+        )
+        connection.execute.assert_any_call(
+            'REINDEX TABLE CONCURRENTLY public."canonical_chunks"'
         )
         self.assertFalse(connection.autocommit)
         self.assertNotIn("content", json.dumps(report))
