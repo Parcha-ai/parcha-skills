@@ -21,7 +21,7 @@ from .archive_runtime import (
     probe_archive,
 )
 from .canonical_retrieval import CanonicalRetrieval
-from .canonical_thinning import thin_canonical_bodies
+from .canonical_thinning import _compact_event_expression, thin_canonical_bodies
 from .capabilities import CapabilityError, probe_database
 from .control import ControlPlane, SecretBox
 from .db import BrainStore
@@ -160,16 +160,6 @@ def _compact_storage(
                 connection.execute(
                     f'VACUUM (FULL, ANALYZE) public."{relation}"'
                 )
-                logging.getLogger(__name__).info(
-                    "storage compaction relation=%s phase=reindexing",
-                    relation,
-                )
-                # PlanetScale recommends concurrent reindexing separately from
-                # table compaction because index bloat is not reclaimed by its
-                # supported table-maintenance path.
-                connection.execute(
-                    f'REINDEX TABLE CONCURRENTLY public."{relation}"'
-                )
                 after = int(
                     connection.execute(
                         "SELECT pg_total_relation_size(to_regclass(%s)) AS bytes",
@@ -200,6 +190,50 @@ def _compact_storage(
             int(row["reclaimed_bytes"]) for row in results
         ),
         "relations": results,
+    }
+
+
+def _recompact_oversized_event_pointers(store: BrainStore) -> dict[str, object]:
+    """Remove obsolete head/tail previews after S3-backed body thinning."""
+
+    expression = _compact_event_expression()
+    with store.connect() as connection:
+        row = connection.execute(
+            f"""WITH candidates AS MATERIALIZED (
+                     SELECT tenant_id,source_id,event_id,
+                            octet_length(canonical_redacted::text)::bigint
+                                AS before_bytes
+                       FROM canonical_events
+                      WHERE body_location='raw'
+                        AND canonical_redacted #>> '{{content,contract}}'=
+                            'recall.oversized-projection.v1'
+                        AND (canonical_redacted->'content') ?| ARRAY[
+                            'head','tail','archive_size_bytes'
+                        ]
+                 ), updated AS (
+                     UPDATE canonical_events AS event
+                        SET canonical_redacted={expression}
+                       FROM candidates AS candidate
+                      WHERE event.tenant_id=candidate.tenant_id
+                        AND event.source_id=candidate.source_id
+                        AND event.event_id=candidate.event_id
+                  RETURNING candidate.before_bytes,
+                            octet_length(event.canonical_redacted::text)::bigint
+                                AS after_bytes
+                 )
+                 SELECT count(*)::bigint AS events,
+                        coalesce(sum(before_bytes),0)::bigint AS before_bytes,
+                        coalesce(sum(after_bytes),0)::bigint AS after_bytes
+                   FROM updated"""
+        ).fetchone()
+    before = int(row["before_bytes"])
+    after = int(row["after_bytes"])
+    return {
+        "status": "complete",
+        "events": int(row["events"]),
+        "before_bytes": before,
+        "after_bytes": after,
+        "replaced_bytes": before - after,
     }
 
 
@@ -974,6 +1008,7 @@ def main() -> None:
     sub = ap.add_subparsers(dest="command", required=True)
     sub.add_parser("migrate")
     sub.add_parser("storage-footprint")
+    sub.add_parser("storage-recompact-oversized-events")
     compact_storage = sub.add_parser("storage-compact")
     compact_storage.add_argument(
         "--relation",
@@ -1420,6 +1455,8 @@ def main() -> None:
         print(json.dumps({"status": "ok", "schema_version": SCHEMA_VERSION}))
     elif args.command == "storage-footprint":
         print(json.dumps(_storage_footprint(store), sort_keys=True))
+    elif args.command == "storage-recompact-oversized-events":
+        print(json.dumps(_recompact_oversized_event_pointers(store), sort_keys=True))
     elif args.command == "storage-compact":
         print(
             json.dumps(
