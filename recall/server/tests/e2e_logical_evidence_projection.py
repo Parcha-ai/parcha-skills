@@ -196,6 +196,9 @@ class FlakyDeleteArchive:
     def read_raw(self, value):
         return self.delegate.read_raw(value)
 
+    def verify_raw(self, value):
+        return self.delegate.verify_raw(value)
+
     def delete_raw(self, value):
         if self.failures_remaining:
             self.failures_remaining -= 1
@@ -349,7 +352,9 @@ def main() -> None:
         assert first["receipts"] == 7
         assert first["objects"] == 4
         assert first["cleanup_failures"] == 0
-        assert archive_object_count(archive_root) == 5
+        assert archive_object_count(archive_root) == 5, archive_object_count(
+            archive_root
+        )
         assert projector.project_pending(
             tenant_id=tenant,
             batch_size=10,
@@ -496,6 +501,23 @@ def main() -> None:
                     (tenant,),
                 ).fetchall()
             }
+            document_versions_before = {
+                (row["source_id"], row["logical_document_id"]): row["xmin"]
+                for row in connection.execute(
+                    """SELECT source_id,logical_document_id,xmin::text AS xmin
+                         FROM canonical_evidence_documents
+                        WHERE tenant_id=%s""",
+                    (tenant,),
+                ).fetchall()
+            }
+        repair_target = projector.targets_for_receipts(
+            tenant_id=tenant,
+            source_ids=(claude,),
+            receipts=(receipts["claude-0"],),
+            limit=1,
+        )[0]
+        assert projection.delete_reference(repair_target["reference"])
+        assert archive_object_count(archive_root) == 4
         assert (
             projector.seed_backfill(
                 tenant_id=tenant,
@@ -509,11 +531,14 @@ def main() -> None:
             max_batches=1,
             upload_concurrency=2,
         )
-        assert reprojected["documents"] == 2
-        assert reprojected["records"] == 6
-        assert reprojected["receipts"] == 7
+        assert reprojected["documents"] == 0, reprojected
+        assert reprojected["repaired"] == 2
+        assert reprojected["records"] == 0
+        assert reprojected["receipts"] == 0
         assert reprojected["cleanup_failures"] == 0
-        assert archive_object_count(archive_root) == 5
+        assert archive_object_count(archive_root) == 5, archive_object_count(
+            archive_root
+        )
         with store.connect() as connection:
             part_artifacts_after = {
                 row["artifact_id"]
@@ -524,7 +549,17 @@ def main() -> None:
                     (tenant,),
                 ).fetchall()
             }
+            document_versions_after = {
+                (row["source_id"], row["logical_document_id"]): row["xmin"]
+                for row in connection.execute(
+                    """SELECT source_id,logical_document_id,xmin::text AS xmin
+                         FROM canonical_evidence_documents
+                        WHERE tenant_id=%s""",
+                    (tenant,),
+                ).fetchall()
+            }
             assert part_artifacts_after == part_artifacts_before
+            assert document_versions_after == document_versions_before
             connection.execute(
                 """INSERT INTO canonical_evidence_cleanup_queue(
                        tenant_id,source_id,artifact_id,storage_backend,

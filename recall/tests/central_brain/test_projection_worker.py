@@ -27,6 +27,7 @@ class _Logical:
         return {
             "status": "complete" if self.pending == 0 else "pending",
             "documents": self.work,
+            "repaired": 0,
             "records": self.work * 3,
             "batches": 1,
             "cleanup_failures": self.cleanup_failures,
@@ -36,9 +37,16 @@ class _Logical:
 
 
 class _Passages:
-    def __init__(self, calls: list[str], *, work: int = 2):
+    def __init__(
+        self,
+        calls: list[str],
+        *,
+        work: int = 2,
+        pending: int = 0,
+    ):
         self.calls = calls
         self.work = work
+        self.pending = pending
 
     def project_pending(self, **_kwargs):
         self.calls.append("passages")
@@ -47,6 +55,7 @@ class _Passages:
             "documents": self.work,
             "passages": self.work * 4,
             "stale": 0,
+            "pending": self.pending,
         }
 
     def embed_pending(self, **_kwargs):
@@ -170,6 +179,56 @@ class ProjectionWorkerTest(unittest.TestCase):
         self.assertEqual(result["status"], "pending")
         self.assertEqual(result["logical_pending"], 8_547)
         self.assertEqual(result["parquet_shards"], 0)
+
+    def test_reports_passage_backlog_for_operational_exit_gates(self):
+        calls: list[str] = []
+        result = run_projection_worker(
+            _Logical(calls, work=0),  # type: ignore[arg-type]
+            _Passages(calls, work=0, pending=321),  # type: ignore[arg-type]
+            tenant_id="tenant:company:test",
+            logical_batch_size=1,
+            passage_batch_size=2,
+            embedding_batch_size=2,
+            max_batches_per_cycle=1,
+            upload_concurrency=1,
+            passage_concurrency=1,
+            interval_seconds=30,
+            once=True,
+        )
+        self.assertEqual(result["passage_pending"], 321)
+
+    def test_reports_object_only_logical_repairs(self):
+        calls: list[str] = []
+        logical = _Logical(calls, work=0)
+
+        def repaired(**_kwargs):
+            logical.calls.append("logical")
+            return {
+                "status": "complete",
+                "documents": 0,
+                "repaired": 17,
+                "records": 0,
+                "batches": 1,
+                "cleanup_failures": 0,
+                "pruned": 0,
+                "pending": 0,
+            }
+
+        logical.project_pending = repaired  # type: ignore[method-assign]
+        result = run_projection_worker(
+            logical,  # type: ignore[arg-type]
+            _Passages(calls, work=0),  # type: ignore[arg-type]
+            tenant_id="tenant:company:test",
+            logical_batch_size=20,
+            passage_batch_size=20,
+            embedding_batch_size=20,
+            max_batches_per_cycle=1,
+            upload_concurrency=2,
+            passage_concurrency=2,
+            interval_seconds=30,
+            once=True,
+        )
+        self.assertEqual(result["logical_repaired"], 17)
 
     def test_stale_scan_keeps_the_worker_pending_for_retry(self):
         calls: list[str] = []

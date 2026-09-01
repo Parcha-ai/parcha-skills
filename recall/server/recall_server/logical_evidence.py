@@ -6,7 +6,7 @@ import json
 import re
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, Iterable, Protocol
 from urllib.parse import urlsplit
@@ -1024,6 +1024,45 @@ class LogicalEvidenceProjectionStore:
         ):
             raise LogicalEvidenceError("logical_evidence_manifest_invalid")
         return value
+
+    def restore_manifest_revision(
+        self,
+        upload: LogicalEvidenceUpload,
+        *,
+        revision: int,
+    ) -> dict[str, Any]:
+        """Restore the exact manifest referenced by an unchanged catalog row."""
+
+        if (
+            isinstance(revision, bool)
+            or not isinstance(revision, int)
+            or revision < 1
+        ):
+            raise LogicalEvidenceError("logical_evidence_document_invalid")
+        manifest = replace(
+            upload.manifest,
+            revision=revision,
+            evidence_id=_opaque(
+                "evd_",
+                upload.prepared.tenant_id,
+                upload.prepared.source_id,
+                upload.prepared.logical_document_id,
+                str(revision),
+                upload.prepared.document_content_sha256,
+            ),
+        )
+        return self.archive.put_raw(
+            tenant_id=upload.prepared.tenant_id,
+            source_id=upload.prepared.source_id,
+            native_id=(
+                "logical-manifest:"
+                f"{upload.prepared.logical_document_id}:"
+                f"{upload.prepared.document_content_sha256[:16]}"
+            ),
+            payload=manifest.encode(),
+            media_type=MANIFEST_MEDIA_TYPE,
+            created_at=upload.prepared.first_occurred_at,
+        )
 
     def read_part(
         self,

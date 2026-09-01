@@ -1087,6 +1087,7 @@ class CanonicalLogicalEvidenceProjector:
                 ).fetchone()
                 current = connection.execute(
                     """SELECT revision,source_updated_at,receipt_count,
+                              document_content_sha256,
                               manifest_artifact_id,first_occurred_at,
                               last_occurred_at
                          FROM canonical_evidence_documents
@@ -1114,6 +1115,60 @@ class CanonicalLogicalEvidenceProjector:
                     connection,
                     candidate,
                 )
+                same_parts = tuple(
+                    reference["artifact_id"] for reference in old_parts
+                ) == tuple(
+                    reference["artifact_id"]
+                    for reference in upload.part_references
+                )
+                if (
+                    current is not None
+                    and old_manifest is not None
+                    and current["document_content_sha256"]
+                        == prepared.document_content_sha256
+                    and same_parts
+                ):
+                    # Repairing an absent immutable object must not replace an
+                    # identical database document. The old path cascaded
+                    # through every passage, actor, context, and embedding even
+                    # though their source bytes had not changed.
+                    restored_manifest = (
+                        self.projection.restore_manifest_revision(
+                            upload,
+                            revision=int(current["revision"]),
+                        )
+                    )
+                    if (
+                        restored_manifest["artifact_id"]
+                        != old_manifest["artifact_id"]
+                    ):
+                        raise LogicalEvidenceError(
+                            "logical_evidence_state_invalid"
+                        )
+                    if (
+                        manifest_reference["artifact_id"]
+                        != restored_manifest["artifact_id"]
+                    ):
+                        self._enqueue_cleanup(
+                            connection,
+                            (manifest_reference,),
+                        )
+                    deleted = connection.execute(
+                        """DELETE FROM canonical_evidence_document_queue
+                            WHERE tenant_id=%s AND source_id=%s
+                              AND native_parent_id=%s AND generation=%s""",
+                        (
+                            candidate.tenant_id,
+                            candidate.source_id,
+                            candidate.native_parent_id,
+                            candidate.generation,
+                        ),
+                    )
+                    if deleted.rowcount != 1:
+                        raise LogicalEvidenceError(
+                            "logical_evidence_queue_conflict"
+                        )
+                    return "repaired"
                 retained_artifacts = {
                     reference["artifact_id"]
                     for reference in upload.all_references
@@ -1455,6 +1510,7 @@ class CanonicalLogicalEvidenceProjector:
             prepare_pool(min(upload_concurrency, batch_size))
         tenant_id = self._tenant(tenant_id)
         documents = records = receipts = objects = bytes_uploaded = batches = 0
+        repaired = 0
         old_objects_deleted = cleanup_failures = source_races = pruned = 0
         cleanup_completed = cleanup_pending = 0
         cleanup = self.drain_cleanup(
@@ -1584,6 +1640,9 @@ class CanonicalLogicalEvidenceProjector:
                     continue
                 if status == "adopted":
                     continue
+                if status == "repaired":
+                    repaired += 1
+                    continue
                 if status == "pruned":
                     pruned += 1
                     continue
@@ -1616,6 +1675,7 @@ class CanonicalLogicalEvidenceProjector:
         return {
             "status": "complete" if int(pending) == 0 else "pending",
             "documents": documents,
+            "repaired": repaired,
             "records": records,
             "receipts": receipts,
             "objects": objects,
