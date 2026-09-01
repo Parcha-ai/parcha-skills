@@ -57,6 +57,12 @@ def _opaque(prefix: str, *values: str) -> str:
     return f"{prefix}_{digest[:32]}"
 
 
+def _source_ordinal(event: dict[str, Any]) -> int | None:
+    provenance = event.get("provenance")
+    value = provenance.get("byte_start") if isinstance(provenance, dict) else None
+    return value if type(value) is int and -(2**63) <= value < 2**63 else None
+
+
 def _linked_native_ids(
     conn: Any,
     *,
@@ -505,8 +511,9 @@ class CanonicalPlane:
                     """INSERT INTO canonical_events(
                            tenant_id,source_id,event_id,native_id,native_parent_id,
                            artifact_id,job_id,kind,content_sha256,revision,
-                           occurred_at,observed_at,is_tombstone,canonical_redacted
-                       ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                           occurred_at,observed_at,is_tombstone,canonical_redacted,
+                           source_ordinal
+                       ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                     (
                         tenant_id,
                         source_id,
@@ -522,6 +529,7 @@ class CanonicalPlane:
                         event["observed_at"],
                         is_tombstone,
                         json.dumps(event),
+                        _source_ordinal(event),
                     ),
                 )
                 attribute_canonical_events(
@@ -1220,6 +1228,7 @@ class CanonicalPlane:
                             "observed_at": item["event"]["observed_at"],
                             "is_tombstone": item["is_tombstone"],
                             "canonical_redacted": item["event"],
+                            "source_ordinal": _source_ordinal(item["event"]),
                         }
                         for item in new_rows
                     ]
@@ -1227,20 +1236,21 @@ class CanonicalPlane:
                         """INSERT INTO canonical_events(
                                tenant_id,source_id,event_id,native_id,native_parent_id,
                                artifact_id,job_id,kind,content_sha256,revision,
-                               occurred_at,observed_at,is_tombstone,canonical_redacted
+                               occurred_at,observed_at,is_tombstone,canonical_redacted,
+                               source_ordinal
                            )
                            SELECT %s,%s,row.event_id,row.native_id,
                                   row.native_parent_id,row.artifact_id,row.job_id,
                                   row.kind,row.content_sha256,row.revision,
                                   row.occurred_at,row.observed_at,row.is_tombstone,
-                                  row.canonical_redacted
+                                  row.canonical_redacted,row.source_ordinal
                            FROM jsonb_to_recordset(%s::jsonb) AS row(
                                event_id text,native_id text,native_parent_id text,
                                artifact_id text,job_id text,kind text,
                                content_sha256 char(64),revision integer,
                                occurred_at timestamptz,observed_at timestamptz,
                                is_tombstone boolean,
-                               canonical_redacted jsonb
+                               canonical_redacted jsonb,source_ordinal bigint
                            )""",
                         (
                             tenant_id,
