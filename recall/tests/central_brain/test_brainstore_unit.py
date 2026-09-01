@@ -1155,6 +1155,93 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
         self.assertNotIn("SELECT query", sql)
         self.assertIn("pg_stat_activity", sql)
 
+    def test_event_compaction_index_is_disposable_and_concurrent(self) -> None:
+        store = mock.MagicMock()
+        connection = store.connect.return_value.__enter__.return_value
+
+        prepared = server_cli._set_event_compaction_index(store, present=True)
+        create_sql = connection.execute.call_args.args[0]
+        self.assertIn("CREATE INDEX CONCURRENTLY", create_sql)
+        self.assertIn("WHERE body_location='inline'", create_sql)
+        self.assertTrue(prepared["present"])
+
+        finished = server_cli._set_event_compaction_index(store, present=False)
+        drop_sql = connection.execute.call_args.args[0]
+        self.assertIn("DROP INDEX CONCURRENTLY", drop_sql)
+        self.assertFalse(finished["present"])
+        self.assertFalse(connection.autocommit)
+
+    def test_event_compaction_queue_is_authority_gated_and_disposable(self) -> None:
+        store = mock.MagicMock()
+        connection = store.connect.return_value.__enter__.return_value
+        created = mock.MagicMock()
+        inserted = mock.MagicMock()
+        count = mock.MagicMock()
+        count.fetchone.return_value = {"value": 8}
+        connection.execute.side_effect = [created, inserted, count]
+        with mock.patch.object(server_cli, "_set_event_compaction_index") as index:
+            prepared = server_cli._prepare_event_compaction_queue(store)
+        self.assertEqual(prepared["candidates"], 8)
+        index.assert_called_once_with(store, present=True)
+        insert_sql = connection.execute.call_args_list[1].args[0]
+        self.assertIn("CREATE UNLOGGED TABLE", connection.execute.call_args_list[0].args[0])
+        self.assertIn("artifact.storage_backend='s3'", insert_sql)
+        self.assertIn("evidence.manifest_storage_backend='s3'", insert_sql)
+        self.assertIn("document.body_location='chunks'", insert_sql)
+
+        relation = mock.MagicMock()
+        relation.fetchone.return_value = {"value": "recall_event_body_compaction_queue"}
+        empty = mock.MagicMock()
+        empty.fetchone.return_value = {"value": 0}
+        connection.execute.reset_mock()
+        connection.execute.side_effect = [relation, empty, mock.MagicMock()]
+        with mock.patch.object(server_cli, "_set_event_compaction_index") as index:
+            finished = server_cli._finish_event_compaction_queue(store)
+        self.assertEqual(finished["remaining"], 0)
+        self.assertIn("DROP TABLE", connection.execute.call_args_list[2].args[0])
+        index.assert_called_once_with(store, present=False)
+
+    def test_prepared_event_compaction_drains_shared_claims(self) -> None:
+        store = mock.MagicMock()
+        connection = store.connect.return_value.__enter__.return_value
+        relation = mock.MagicMock()
+        relation.fetchone.return_value = {"value": "recall_event_body_compaction_queue"}
+        batch = mock.MagicMock()
+        batch.fetchone.return_value = {"events": 2, "after_bytes": 300}
+        connection.execute.side_effect = [relation, batch]
+
+        report = server_cli._drain_prepared_event_compaction_queue(
+            store, batch_size=10,
+        )
+
+        self.assertEqual(report["events"], 2)
+        batch_sql = connection.execute.call_args_list[1].args[0]
+        self.assertIn("FOR UPDATE SKIP LOCKED", batch_sql)
+        self.assertIn("DELETE FROM public.recall_event_body_compaction_queue", batch_sql)
+
+    def test_stale_event_compaction_cancel_is_signature_scoped(self) -> None:
+        store = mock.MagicMock()
+        connection = store.connect.return_value.__enter__.return_value
+        connection.execute.return_value.fetchone.return_value = {
+            "candidates": 4,
+            "terminated": 4,
+        }
+
+        report = server_cli._cancel_stale_event_compaction(store)
+
+        self.assertEqual(report, {
+            "status": "ok",
+            "candidates": 4,
+            "terminated": 4,
+        })
+        sql = connection.execute.call_args.args[0]
+        self.assertIn("pg_terminate_backend", sql)
+        self.assertIn("clock_timestamp()-query_start>interval '5 minutes'", sql)
+        self.assertIn("WITH batch AS MATERIALIZED (", sql)
+        self.assertIn("FROM canonical_events AS event", sql)
+        self.assertIn("artifact.storage_backend=''s3''", sql)
+        self.assertNotIn("SELECT query", sql)
+
     def test_s3_event_body_repair_is_batched_and_authority_gated(self) -> None:
         store = mock.MagicMock()
         connection = store.connect.return_value.__enter__.return_value
@@ -1177,6 +1264,7 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
         self.assertIn("canonical_evidence_document_queue", batch_sql)
         self.assertIn("FOR UPDATE OF event SKIP LOCKED", batch_sql)
         self.assertNotIn("CREATE TEMP TABLE", batch_sql)
+        self.assertNotIn("ORDER BY", batch_sql)
         self.assertNotIn("text_redacted", batch_sql)
 
     def test_storage_compaction_preserves_relation_scope_and_reports_bytes(
