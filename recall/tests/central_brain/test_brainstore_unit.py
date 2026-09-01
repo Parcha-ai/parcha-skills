@@ -1134,6 +1134,27 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
         self.assertIn("pg_column_size", sql)
         self.assertNotIn("GROUP BY", sql)
 
+    def test_active_database_work_excludes_query_text(self) -> None:
+        store = mock.MagicMock()
+        connection = store.connect.return_value.__enter__.return_value
+        connection.execute.return_value.fetchall.return_value = [
+            {
+                "state": "active",
+                "wait_event_type": None,
+                "wait_event": None,
+                "age_seconds": 180,
+            }
+        ]
+
+        report = server_cli._active_database_work(store)
+
+        self.assertEqual(report["active"], 1)
+        self.assertEqual(report["work"][0]["age_seconds"], 180)
+        self.assertNotIn("query", json.dumps(report))
+        sql = connection.execute.call_args.args[0]
+        self.assertNotIn("SELECT query", sql)
+        self.assertIn("pg_stat_activity", sql)
+
     def test_s3_event_body_repair_is_batched_and_authority_gated(self) -> None:
         store = mock.MagicMock()
         connection = store.connect.return_value.__enter__.return_value

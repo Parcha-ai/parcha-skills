@@ -147,6 +147,38 @@ def _canonical_event_shape(store: BrainStore) -> dict[str, object]:
     return {"status": "ok", **{key: int(value) for key, value in row.items()}}
 
 
+def _active_database_work(store: BrainStore) -> dict[str, object]:
+    """Report content-free PostgreSQL activity and wait metadata."""
+
+    with store.connect() as connection:
+        rows = connection.execute(
+            """SELECT state,wait_event_type,wait_event,
+                      greatest(
+                          0,extract(epoch FROM (
+                              clock_timestamp()-query_start
+                          ))::bigint
+                      ) AS age_seconds
+                 FROM pg_stat_activity
+                WHERE datname=current_database()
+                  AND pid<>pg_backend_pid()
+                  AND state<>'idle'
+                ORDER BY query_start"""
+        ).fetchall()
+    return {
+        "status": "ok",
+        "active": len(rows),
+        "work": [
+            {
+                "state": row["state"],
+                "wait_event_type": row["wait_event_type"],
+                "wait_event": row["wait_event"],
+                "age_seconds": int(row["age_seconds"]),
+            }
+            for row in rows
+        ],
+    }
+
+
 def _compact_storage(
     store: BrainStore,
     relations: list[str],
@@ -1208,6 +1240,7 @@ def main() -> None:
     sub.add_parser("migrate")
     sub.add_parser("storage-footprint")
     sub.add_parser("storage-event-shape")
+    sub.add_parser("storage-active-work")
     sub.add_parser("storage-recompact-oversized-events")
     recompact_s3_events = sub.add_parser("storage-recompact-s3-event-bodies")
     recompact_s3_events.add_argument("--batch-size", type=int, default=10_000)
@@ -1659,6 +1692,8 @@ def main() -> None:
         print(json.dumps(_storage_footprint(store), sort_keys=True))
     elif args.command == "storage-event-shape":
         print(json.dumps(_canonical_event_shape(store), sort_keys=True))
+    elif args.command == "storage-active-work":
+        print(json.dumps(_active_database_work(store), sort_keys=True))
     elif args.command == "storage-recompact-oversized-events":
         print(json.dumps(_recompact_oversized_event_pointers(store), sort_keys=True))
     elif args.command == "storage-recompact-s3-event-bodies":
