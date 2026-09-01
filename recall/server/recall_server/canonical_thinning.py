@@ -20,10 +20,23 @@ def _compact_event_expression(alias: str = "event") -> str:
         f"'message',{structural('content,message')},"
         f"'payload',{structural('content,payload')}))"
     )
+    oversized_pointer = (
+        "jsonb_strip_nulls(jsonb_build_object("
+        f"'contract',{alias}.canonical_redacted #> '{{content,contract}}',"
+        f"'schema_version',{alias}.canonical_redacted #> '{{content,schema_version}}',"
+        f"'full_record_available',{alias}.canonical_redacted #> "
+        "'{content,full_record_available}',"
+        f"'full_content_sha256',{alias}.canonical_redacted #> "
+        "'{content,full_content_sha256}',"
+        f"'full_size_bytes',{alias}.canonical_redacted #> "
+        "'{content,full_size_bytes}',"
+        f"'archive_encoding',{alias}.canonical_redacted #> "
+        "'{content,archive_encoding}'))"
+    )
     content = (
         f"CASE WHEN {alias}.canonical_redacted #>> '{{content,contract}}'="
         "'recall.oversized-projection.v1' "
-        f"THEN {alias}.canonical_redacted->'content' ELSE {content_metadata} END"
+        f"THEN {oversized_pointer} ELSE {content_metadata} END"
     )
     provenance = (
         "jsonb_strip_nulls(jsonb_build_object("
