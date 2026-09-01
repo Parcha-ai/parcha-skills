@@ -433,7 +433,6 @@ def _recompact_s3_event_bodies(
                                    event.native_parent_id,event.native_id
                                )
                         )
-                      ORDER BY event.tenant_id,event.source_id,event.event_id
                       LIMIT %s
                       FOR UPDATE OF event SKIP LOCKED
                  ), updated AS (

@@ -1216,6 +1216,7 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
         self.assertIn("canonical_evidence_document_queue", batch_sql)
         self.assertIn("FOR UPDATE OF event SKIP LOCKED", batch_sql)
         self.assertNotIn("CREATE TEMP TABLE", batch_sql)
+        self.assertNotIn("ORDER BY", batch_sql)
         self.assertNotIn("text_redacted", batch_sql)
 
     def test_storage_compaction_preserves_relation_scope_and_reports_bytes(
