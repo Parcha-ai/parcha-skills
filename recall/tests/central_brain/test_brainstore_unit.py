@@ -1369,16 +1369,22 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
         coverage = mock.MagicMock()
         coverage.fetchone.return_value = {
             "total": 10,
-            "canonical_covered": 9,
+            "canonical_identity_covered": 9,
         }
+        highwater = mock.MagicMock()
+        highwater.fetchone.return_value = {"value": 10}
+        uncovered = mock.MagicMock()
+        uncovered.__iter__.return_value = iter([])
         connection.execute.side_effect = [
             existing,
             mock.MagicMock(),
             mock.MagicMock(),
             coverage,
+            highwater,
+            uncovered,
         ]
 
-        with self.assertRaisesRegex(ValueError, "not fully S3-canonical-covered"):
+        with self.assertRaisesRegex(ValueError, "identity coverage is inconsistent"):
             server_cli._discard_covered_legacy_storage(store)
 
         self.assertFalse(
@@ -1399,8 +1405,12 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
         coverage = mock.MagicMock()
         coverage.fetchone.return_value = {
             "total": 10,
-            "canonical_covered": 10,
+            "canonical_identity_covered": 10,
         }
+        highwater = mock.MagicMock()
+        highwater.fetchone.return_value = {"value": 10}
+        uncovered = mock.MagicMock()
+        uncovered.__iter__.return_value = iter([])
         before = mock.MagicMock()
         before.fetchall.return_value = [
             {"relname": relation, "total_bytes": 100}
@@ -1416,6 +1426,8 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
             mock.MagicMock(),
             mock.MagicMock(),
             coverage,
+            highwater,
+            uncovered,
             before,
             mock.MagicMock(),
             after,
@@ -1425,7 +1437,8 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
 
         self.assertEqual(report["coverage"], {
             "total": 10,
-            "canonical_covered": 10,
+            "canonical_identity_covered": 10,
+            "archived_uncovered": 0,
         })
         self.assertEqual(report["reclaimed_bytes"], 630)
         calls = [str(call.args[0]) for call in connection.execute.call_args_list]

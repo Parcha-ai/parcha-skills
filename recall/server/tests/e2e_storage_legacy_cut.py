@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -18,8 +19,10 @@ sys.path.insert(0, str(RECALL))
 
 from recall_server.cli import (  # noqa: E402
     _EMPTY_LEGACY_RELATIONS,
+    _archive_uncovered_legacy_storage,
     _discard_covered_legacy_storage_indexed,
 )
+from recall_server.archive import FilesystemArchiveStore  # noqa: E402
 from recall_server.db import BrainStore  # noqa: E402
 
 
@@ -70,9 +73,32 @@ def main() -> None:
         try:
             _discard_covered_legacy_storage_indexed(store)
         except ValueError as error:
-            assert str(error) == "legacy source events are not fully S3-canonical-covered"
+            assert str(error) == "legacy source events are not fully S3-identity-covered"
         else:
             raise RuntimeError("uncovered legacy row was discarded")
+
+        with tempfile.TemporaryDirectory() as archive_root:
+            archive = FilesystemArchiveStore(
+                root=Path(archive_root), namespace_key=b"l" * 32,
+            )
+            archive_report = _archive_uncovered_legacy_storage(store, archive)
+            assert archive_report["row_count"] == 1
+            archived_report = _discard_covered_legacy_storage_indexed(store, archive)
+            assert archived_report["coverage"] == {
+                "total": 1,
+                "canonical_identity_covered": 0,
+                "archived_uncovered": 1,
+            }
+
+        with store.connect() as connection:
+            connection.execute(
+                """INSERT INTO source_events(
+                       source_id,native_id,kind,occurred_at,observed_at,principal_id,
+                       visibility,content_type,content_sha256,revision,envelope,batch_id
+                   ) VALUES (%s,%s,'document',now(),now(),%s,'private',
+                             'application/json',%s,1,'{}'::jsonb,%s)""",
+                (source, native, principal, content_hash, batch),
+            )
 
         with store.connect() as connection:
             connection.execute(
@@ -114,7 +140,11 @@ def main() -> None:
             )
 
         report = _discard_covered_legacy_storage_indexed(store)
-        assert report["coverage"] == {"total": 1, "canonical_covered": 1}
+        assert report["coverage"] == {
+            "total": 1,
+            "canonical_identity_covered": 1,
+            "archived_uncovered": 0,
+        }
         with store.connect() as connection:
             counts = {
                 relation: int(
@@ -139,6 +169,7 @@ def main() -> None:
         print(json.dumps({
             "status": "pass",
             "uncovered_refused": True,
+            "uncovered_archived": True,
             "covered_discarded": True,
             "canonical_preserved": True,
         }, sort_keys=True))
