@@ -1118,6 +1118,8 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
             "max_json_bytes": 300,
             "toasted_events": 2,
             "inline_events": 7,
+            "inline_s3_live_events": 6,
+            "inline_without_s3_live_events": 1,
             "raw_events": 3,
             "content_bytes": 400,
             "provenance_bytes": 200,
@@ -1129,6 +1131,7 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
 
         self.assertEqual(report["json_bytes"], 1_000)
         self.assertEqual(report["content_bytes"], 400)
+        self.assertEqual(report["inline_s3_live_events"], 6)
         self.assertNotIn("content_text", report)
         sql = connection.execute.call_args.args[0]
         self.assertIn("pg_column_size", sql)

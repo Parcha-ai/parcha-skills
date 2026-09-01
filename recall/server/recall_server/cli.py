@@ -128,6 +128,18 @@ def _canonical_event_shape(store: BrainStore) -> dict[str, object]:
                       )::bigint AS toasted_events,
                       count(*) FILTER (WHERE body_location='inline')::bigint
                           AS inline_events,
+                      count(*) FILTER (
+                          WHERE body_location='inline'
+                            AND artifact.storage_backend='s3'
+                            AND artifact.state='live'
+                      )::bigint AS inline_s3_live_events,
+                      count(*) FILTER (
+                          WHERE body_location='inline'
+                            AND NOT (
+                                artifact.storage_backend='s3'
+                                AND artifact.state='live'
+                            )
+                      )::bigint AS inline_without_s3_live_events,
                       count(*) FILTER (WHERE body_location='raw')::bigint
                           AS raw_events,
                       coalesce(sum(CASE WHEN canonical_redacted ? 'content'
@@ -142,7 +154,11 @@ def _canonical_event_shape(store: BrainStore) -> dict[str, object]:
                       coalesce(sum(CASE WHEN canonical_redacted ? 'payload'
                           THEN pg_column_size(canonical_redacted->'payload')
                           ELSE 0 END),0)::bigint AS payload_bytes
-                 FROM canonical_events"""
+                 FROM canonical_events AS event
+                 JOIN raw_artifacts AS artifact
+                   ON artifact.tenant_id=event.tenant_id
+                  AND artifact.source_id=event.source_id
+                  AND artifact.artifact_id=event.artifact_id"""
         ).fetchone()
     return {"status": "ok", **{key: int(value) for key, value in row.items()}}
 
