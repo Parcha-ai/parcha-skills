@@ -1119,14 +1119,12 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
         before = mock.MagicMock()
         before.fetchone.return_value = {"bytes": 1_000}
         vacuum = mock.MagicMock()
-        reindex = mock.MagicMock()
         after = mock.MagicMock()
         after.fetchone.return_value = {"bytes": 200}
         connection.execute.side_effect = [
             existing,
             before,
             vacuum,
-            reindex,
             after,
         ]
 
@@ -1147,11 +1145,30 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
         connection.execute.assert_any_call(
             'VACUUM (FULL, ANALYZE) public."canonical_chunks"'
         )
-        connection.execute.assert_any_call(
-            'REINDEX TABLE CONCURRENTLY public."canonical_chunks"'
-        )
         self.assertFalse(connection.autocommit)
         self.assertNotIn("content", json.dumps(report))
+
+    def test_oversized_event_recompaction_reports_only_aggregate_bytes(
+        self,
+    ) -> None:
+        store = mock.MagicMock()
+        connection = store.connect.return_value.__enter__.return_value
+        result = mock.MagicMock()
+        result.fetchone.return_value = {
+            "events": 7,
+            "before_bytes": 10_000,
+            "after_bytes": 700,
+        }
+        connection.execute.return_value = result
+
+        report = server_cli._recompact_oversized_event_pointers(store)
+
+        self.assertEqual(report["events"], 7)
+        self.assertEqual(report["replaced_bytes"], 9_300)
+        sql = connection.execute.call_args.args[0]
+        self.assertIn("recall.oversized-projection.v1", sql)
+        self.assertIn("archive_size_bytes", sql)
+        self.assertNotIn("10_000", sql)
 
     def test_storage_compaction_rejects_untrusted_or_duplicate_relations(
         self,
