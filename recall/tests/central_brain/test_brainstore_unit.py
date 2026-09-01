@@ -1338,6 +1338,18 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
         self.assertEqual(report["before_bytes"], 700)
         self.assertEqual(report["after_bytes"], 70)
         self.assertEqual(report["reclaimed_bytes"], 630)
+        relation_queries = [
+            call
+            for call in connection.execute.call_args_list
+            if "relname=ANY" in str(call.args[0])
+        ]
+        self.assertEqual(len(relation_queries), 3)
+        self.assertTrue(
+            all(
+                call.args[1] == (list(relations),)
+                for call in relation_queries
+            )
+        )
         connection.execute.assert_any_call(
             "TRUNCATE TABLE "
             + ",".join(f'public."{name}"' for name in relations)
