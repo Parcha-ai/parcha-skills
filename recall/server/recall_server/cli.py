@@ -375,26 +375,56 @@ def _legacy_storage_coverage(connection: object) -> dict[str, int]:
     """Count legacy events durably represented by an S3-backed canonical event."""
 
     row = connection.execute(
-        """WITH covered AS MATERIALIZED (
-                   SELECT DISTINCT event.source_id,event.native_id,
-                          event.content_sha256
-                     FROM canonical_events event
-                     JOIN raw_artifacts artifact
-                       ON artifact.tenant_id=event.tenant_id
-                      AND artifact.source_id=event.source_id
-                      AND artifact.artifact_id=event.artifact_id
-                    WHERE artifact.storage_backend='s3'
-                      AND artifact.state='live'
-               )
-               SELECT count(*)::bigint AS total,
-                      count(covered.source_id)::bigint AS canonical_covered
-                 FROM source_events
-                 LEFT JOIN covered
-                   ON covered.source_id=source_events.source_id
-                  AND covered.native_id=source_events.native_id
-                  AND covered.content_sha256=source_events.content_sha256"""
+        """SELECT count(*)::bigint AS total,
+                  count(*) FILTER (
+                      WHERE EXISTS (
+                          SELECT 1
+                            FROM canonical_events event
+                            JOIN raw_artifacts artifact
+                              ON artifact.tenant_id=event.tenant_id
+                             AND artifact.source_id=event.source_id
+                             AND artifact.artifact_id=event.artifact_id
+                           WHERE event.source_id=source_events.source_id
+                             AND event.native_id=source_events.native_id
+                             AND event.content_sha256=source_events.content_sha256
+                             AND artifact.storage_backend='s3'
+                             AND artifact.state='live'
+                      )
+                  )::bigint AS canonical_covered
+             FROM source_events"""
     ).fetchone()
     return {key: int(row[key]) for key in ("total", "canonical_covered")}
+
+
+def _create_legacy_coverage_index(store: BrainStore) -> None:
+    """Build the one-time cross-tenant lookup without blocking canonical writes."""
+
+    with store.connect() as connection:
+        connection.autocommit = True
+        try:
+            connection.execute(
+                """CREATE INDEX CONCURRENTLY IF NOT EXISTS
+                          recall_legacy_coverage_tmp_idx
+                       ON public.canonical_events(
+                          source_id,native_id,content_sha256
+                       ) INCLUDE (tenant_id,artifact_id)"""
+            )
+        finally:
+            connection.autocommit = False
+
+
+def _drop_legacy_coverage_index(store: BrainStore) -> None:
+    """Remove the one-time lookup after the legacy plane is cut or refused."""
+
+    with store.connect() as connection:
+        connection.autocommit = True
+        try:
+            connection.execute(
+                """DROP INDEX CONCURRENTLY IF EXISTS
+                          public.recall_legacy_coverage_tmp_idx"""
+            )
+        finally:
+            connection.autocommit = False
 
 
 def _discard_covered_legacy_storage(store: BrainStore) -> dict[str, object]:
@@ -469,6 +499,18 @@ def _discard_covered_legacy_storage(store: BrainStore) -> dict[str, object]:
         "reclaimed_bytes": sum(row["reclaimed_bytes"] for row in results),
         "relations": results,
     }
+
+
+def _discard_covered_legacy_storage_indexed(
+    store: BrainStore,
+) -> dict[str, object]:
+    """Use a disposable lookup index for the one-time global coverage cut."""
+
+    _create_legacy_coverage_index(store)
+    try:
+        return _discard_covered_legacy_storage(store)
+    finally:
+        _drop_legacy_coverage_index(store)
 
 
 def _storage_authority_audit(
@@ -1058,7 +1100,12 @@ def main() -> None:
     elif args.command == "storage-discard-empty-legacy":
         print(json.dumps(_discard_empty_legacy_storage(store), sort_keys=True))
     elif args.command == "storage-discard-covered-legacy":
-        print(json.dumps(_discard_covered_legacy_storage(store), sort_keys=True))
+        print(
+            json.dumps(
+                _discard_covered_legacy_storage_indexed(store),
+                sort_keys=True,
+            )
+        )
     elif args.command == "storage-authority-audit":
         print(json.dumps(_storage_authority_audit(store, args.tenant), sort_keys=True))
     elif args.command == "rebuild":
