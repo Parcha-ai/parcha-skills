@@ -1171,6 +1171,54 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
         self.assertFalse(finished["present"])
         self.assertFalse(connection.autocommit)
 
+    def test_event_compaction_queue_is_authority_gated_and_disposable(self) -> None:
+        store = mock.MagicMock()
+        connection = store.connect.return_value.__enter__.return_value
+        created = mock.MagicMock()
+        inserted = mock.MagicMock()
+        count = mock.MagicMock()
+        count.fetchone.return_value = {"value": 8}
+        connection.execute.side_effect = [created, inserted, count]
+        with mock.patch.object(server_cli, "_set_event_compaction_index") as index:
+            prepared = server_cli._prepare_event_compaction_queue(store)
+        self.assertEqual(prepared["candidates"], 8)
+        index.assert_called_once_with(store, present=True)
+        insert_sql = connection.execute.call_args_list[1].args[0]
+        self.assertIn("CREATE UNLOGGED TABLE", connection.execute.call_args_list[0].args[0])
+        self.assertIn("artifact.storage_backend='s3'", insert_sql)
+        self.assertIn("evidence.manifest_storage_backend='s3'", insert_sql)
+        self.assertIn("document.body_location='chunks'", insert_sql)
+
+        relation = mock.MagicMock()
+        relation.fetchone.return_value = {"value": "recall_event_body_compaction_queue"}
+        empty = mock.MagicMock()
+        empty.fetchone.return_value = {"value": 0}
+        connection.execute.reset_mock()
+        connection.execute.side_effect = [relation, empty, mock.MagicMock()]
+        with mock.patch.object(server_cli, "_set_event_compaction_index") as index:
+            finished = server_cli._finish_event_compaction_queue(store)
+        self.assertEqual(finished["remaining"], 0)
+        self.assertIn("DROP TABLE", connection.execute.call_args_list[2].args[0])
+        index.assert_called_once_with(store, present=False)
+
+    def test_prepared_event_compaction_drains_shared_claims(self) -> None:
+        store = mock.MagicMock()
+        connection = store.connect.return_value.__enter__.return_value
+        relation = mock.MagicMock()
+        relation.fetchone.return_value = {"value": "recall_event_body_compaction_queue"}
+        batch = mock.MagicMock()
+        batch.fetchone.return_value = {"events": 2, "after_bytes": 300}
+        connection.execute.side_effect = [relation, batch]
+
+        report = server_cli._drain_prepared_event_compaction_queue(
+            store, batch_size=10,
+        )
+
+        self.assertEqual(report["events"], 2)
+        batch_sql = connection.execute.call_args_list[1].args[0]
+        self.assertIn("FOR UPDATE SKIP LOCKED", batch_sql)
+        self.assertIn("DELETE FROM public.recall_event_body_compaction_queue", batch_sql)
+
     def test_stale_event_compaction_cancel_is_signature_scoped(self) -> None:
         store = mock.MagicMock()
         connection = store.connect.return_value.__enter__.return_value
