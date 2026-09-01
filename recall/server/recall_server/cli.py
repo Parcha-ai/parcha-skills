@@ -371,6 +371,138 @@ def _discard_empty_legacy_storage(store: BrainStore) -> dict[str, object]:
     }
 
 
+def _storage_authority_audit(
+    store: BrainStore,
+    tenant_id: str,
+) -> dict[str, object]:
+    """Prove database-side coverage before bodies move to object storage only."""
+
+    with store.connect() as connection:
+        legacy = connection.execute(
+            """SELECT count(*)::bigint AS total,
+                      count(*) FILTER (
+                          WHERE EXISTS (
+                              SELECT 1 FROM canonical_events event
+                               WHERE event.tenant_id=%s
+                                 AND event.source_id=source_events.source_id
+                                 AND event.native_id=source_events.native_id
+                                 AND event.content_sha256=source_events.content_sha256
+                          )
+                      )::bigint AS canonical_covered
+                 FROM source_events""",
+            (tenant_id,),
+        ).fetchone()
+        documents = connection.execute(
+            """SELECT count(*)::bigint AS total,
+                      count(*) FILTER (
+                          WHERE artifact.storage_backend='s3'
+                            AND artifact.state='live'
+                      )::bigint AS s3_raw_covered
+                 FROM canonical_documents document
+                 JOIN canonical_events event
+                   USING(tenant_id,source_id,event_id)
+                 JOIN raw_artifacts artifact
+                   USING(tenant_id,source_id,artifact_id)
+                WHERE document.tenant_id=%s
+                  AND document.is_current
+                  AND document.deleted_at IS NULL""",
+            (tenant_id,),
+        ).fetchone()
+        logical = connection.execute(
+            """WITH source_groups AS (
+                       SELECT DISTINCT event.source_id,
+                              COALESCE(event.native_parent_id,event.native_id)
+                                  AS native_parent_id
+                         FROM canonical_documents document
+                         JOIN canonical_events event
+                           USING(tenant_id,source_id,event_id)
+                        WHERE document.tenant_id=%s
+                          AND document.is_current
+                          AND document.deleted_at IS NULL
+                   )
+                   SELECT count(*)::bigint AS total,
+                          count(evidence.logical_document_id)::bigint
+                              AS projected
+                     FROM source_groups source_group
+                     LEFT JOIN canonical_evidence_documents evidence
+                       ON evidence.tenant_id=%s
+                      AND evidence.source_id=source_group.source_id
+                      AND evidence.native_parent_id=source_group.native_parent_id""",
+            (tenant_id, tenant_id),
+        ).fetchone()
+        evidence = connection.execute(
+            """WITH part_coverage AS (
+                       SELECT document.logical_document_id,document.source_id,
+                              count(part.part_ordinal)::bigint AS actual_parts,
+                              count(*) FILTER (
+                                  WHERE part.storage_backend<>'s3'
+                              )::bigint AS non_s3_parts
+                         FROM canonical_evidence_documents document
+                         LEFT JOIN canonical_evidence_document_parts part
+                           USING(tenant_id,source_id,logical_document_id,revision)
+                        WHERE document.tenant_id=%s
+                        GROUP BY document.logical_document_id,document.source_id
+                   )
+                   SELECT count(*)::bigint AS total,
+                          count(*) FILTER (
+                              WHERE document.manifest_storage_backend='s3'
+                                AND coverage.actual_parts=document.part_count
+                                AND coverage.actual_parts>0
+                                AND coverage.non_s3_parts=0
+                          )::bigint AS s3_pointer_complete,
+                          count(passage.logical_document_id)::bigint
+                              AS passage_projected
+                     FROM canonical_evidence_documents document
+                     JOIN part_coverage coverage
+                       USING(logical_document_id,source_id)
+                     LEFT JOIN canonical_passage_documents passage
+                       ON passage.tenant_id=document.tenant_id
+                      AND passage.source_id=document.source_id
+                      AND passage.logical_document_id=document.logical_document_id
+                      AND passage.revision=document.revision
+                    WHERE document.tenant_id=%s""",
+            (tenant_id, tenant_id),
+        ).fetchone()
+        queues = connection.execute(
+            """SELECT
+                   (SELECT count(*) FROM canonical_evidence_document_queue
+                     WHERE tenant_id=%s)::bigint AS logical,
+                   (SELECT count(*) FROM canonical_passage_projection_queue
+                     WHERE tenant_id=%s)::bigint AS passage,
+                   (SELECT count(*) FROM canonical_evidence_cleanup_queue
+                     WHERE tenant_id=%s)::bigint AS cleanup""",
+            (tenant_id, tenant_id, tenant_id),
+        ).fetchone()
+
+    legacy_report = {key: int(legacy[key]) for key in legacy}
+    document_report = {key: int(documents[key]) for key in documents}
+    logical_report = {key: int(logical[key]) for key in logical}
+    evidence_report = {key: int(evidence[key]) for key in evidence}
+    queue_report = {key: int(queues[key]) for key in queues}
+    database_coverage_complete = all(
+        (
+            legacy_report["canonical_covered"] == legacy_report["total"],
+            document_report["s3_raw_covered"] == document_report["total"],
+            logical_report["projected"] == logical_report["total"],
+            evidence_report["s3_pointer_complete"] == evidence_report["total"],
+            evidence_report["passage_projected"] == evidence_report["total"],
+            queue_report["logical"] == 0,
+            queue_report["passage"] == 0,
+        )
+    )
+    return {
+        "status": "ok",
+        "tenant_id": tenant_id,
+        "database_coverage_complete": database_coverage_complete,
+        "object_verification_required": database_coverage_complete,
+        "legacy": legacy_report,
+        "canonical_documents": document_report,
+        "logical_groups": logical_report,
+        "logical_evidence": evidence_report,
+        "queues": queue_report,
+    }
+
+
 def main() -> None:
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"), format="%(levelname)s %(message)s"
@@ -396,6 +528,8 @@ def main() -> None:
         help="exact rebuildable projection to discard; repeat for more than one",
     )
     sub.add_parser("storage-discard-empty-legacy")
+    authority_audit = sub.add_parser("storage-authority-audit")
+    authority_audit.add_argument("--tenant", required=True)
     sub.add_parser("archive-check")
     sub.add_parser("evidence-archive-check")
     publish_duckdb = sub.add_parser("publish-archil-duckdb")
@@ -834,6 +968,8 @@ def main() -> None:
         )
     elif args.command == "storage-discard-empty-legacy":
         print(json.dumps(_discard_empty_legacy_storage(store), sort_keys=True))
+    elif args.command == "storage-authority-audit":
+        print(json.dumps(_storage_authority_audit(store, args.tenant), sort_keys=True))
     elif args.command == "rebuild":
         print(json.dumps(store.rebuild(), sort_keys=True))
     elif args.command == "managed-worker":
