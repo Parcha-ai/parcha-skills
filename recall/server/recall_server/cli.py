@@ -200,6 +200,96 @@ def _compact_storage(
     }
 
 
+_DISCARDABLE_DERIVED_RELATIONS = frozenset(
+    {
+        "canonical_chunk_embeddings",
+        "canonical_passage_contexts",
+        "canonical_passage_embedding_representations",
+        "item_embeddings",
+        "turn_embeddings",
+    }
+)
+
+
+def _discard_derived_storage(
+    store: BrainStore,
+    relations: list[str],
+) -> dict[str, object]:
+    """Discard only rebuildable retrieval projections and reclaim their pages."""
+
+    if (
+        not relations
+        or len(relations) > len(_DISCARDABLE_DERIVED_RELATIONS)
+        or len(set(relations)) != len(relations)
+        or not set(relations) <= _DISCARDABLE_DERIVED_RELATIONS
+    ):
+        raise ValueError("derived storage discard relation list is invalid")
+
+    expanded = set(relations)
+    if "turn_embeddings" in expanded:
+        expanded.add("turn_embedding_items")
+    if "canonical_passage_contexts" in expanded:
+        expanded.add("canonical_passage_embedding_representations")
+    ordered = sorted(expanded)
+
+    with store.connect() as connection:
+        existing = {
+            row["relname"]
+            for row in connection.execute(
+                """SELECT relname
+                     FROM pg_stat_user_tables
+                    WHERE schemaname='public' AND relname=ANY(%s)""",
+                (ordered,),
+            ).fetchall()
+        }
+        if existing != set(ordered):
+            raise ValueError("derived storage discard relation is unavailable")
+        before_rows = connection.execute(
+            """SELECT relname,
+                      pg_total_relation_size(relid) AS total_bytes
+                 FROM pg_stat_user_tables
+                WHERE schemaname='public' AND relname=ANY(%s)""",
+            (ordered,),
+        ).fetchall()
+        before = {
+            row["relname"]: int(row["total_bytes"])
+            for row in before_rows
+        }
+
+        # The fixed allowlist above is the identifier injection boundary.
+        identifiers = ",".join(f'public."{name}"' for name in ordered)
+        connection.execute(f"TRUNCATE TABLE {identifiers}")
+
+        after_rows = connection.execute(
+            """SELECT relname,
+                      pg_total_relation_size(relid) AS total_bytes
+                 FROM pg_stat_user_tables
+                WHERE schemaname='public' AND relname=ANY(%s)""",
+            (ordered,),
+        ).fetchall()
+        after = {
+            row["relname"]: int(row["total_bytes"])
+            for row in after_rows
+        }
+
+    results = [
+        {
+            "relation": relation,
+            "before_bytes": before[relation],
+            "after_bytes": after[relation],
+            "reclaimed_bytes": max(0, before[relation] - after[relation]),
+        }
+        for relation in ordered
+    ]
+    return {
+        "status": "ok",
+        "before_bytes": sum(row["before_bytes"] for row in results),
+        "after_bytes": sum(row["after_bytes"] for row in results),
+        "reclaimed_bytes": sum(row["reclaimed_bytes"] for row in results),
+        "relations": results,
+    }
+
+
 def main() -> None:
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"), format="%(levelname)s %(message)s"
@@ -215,6 +305,14 @@ def main() -> None:
         action="append",
         required=True,
         help="exact public user relation to rewrite; repeat for more than one",
+    )
+    discard_derived = sub.add_parser("storage-discard-derived")
+    discard_derived.add_argument(
+        "--relation",
+        action="append",
+        required=True,
+        choices=sorted(_DISCARDABLE_DERIVED_RELATIONS),
+        help="exact rebuildable projection to discard; repeat for more than one",
     )
     sub.add_parser("archive-check")
     sub.add_parser("evidence-archive-check")
@@ -642,6 +740,13 @@ def main() -> None:
         print(
             json.dumps(
                 _compact_storage(store, args.relation),
+                sort_keys=True,
+            )
+        )
+    elif args.command == "storage-discard-derived":
+        print(
+            json.dumps(
+                _discard_derived_storage(store, args.relation),
                 sort_keys=True,
             )
         )
