@@ -1109,6 +1109,31 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
         )
         self.assertNotIn("text", json.dumps(report))
 
+    def test_canonical_event_shape_is_aggregate_only(self) -> None:
+        store = mock.MagicMock()
+        connection = store.connect.return_value.__enter__.return_value
+        connection.execute.return_value.fetchone.return_value = {
+            "events": 10,
+            "json_bytes": 1_000,
+            "max_json_bytes": 300,
+            "toasted_events": 2,
+            "inline_events": 7,
+            "raw_events": 3,
+            "content_bytes": 400,
+            "provenance_bytes": 200,
+            "message_bytes": 100,
+            "payload_bytes": 50,
+        }
+
+        report = server_cli._canonical_event_shape(store)
+
+        self.assertEqual(report["json_bytes"], 1_000)
+        self.assertEqual(report["content_bytes"], 400)
+        self.assertNotIn("content_text", report)
+        sql = connection.execute.call_args.args[0]
+        self.assertIn("pg_column_size", sql)
+        self.assertNotIn("GROUP BY", sql)
+
     def test_storage_compaction_preserves_relation_scope_and_reports_bytes(
         self,
     ) -> None:
