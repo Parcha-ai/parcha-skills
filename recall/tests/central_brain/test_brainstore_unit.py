@@ -1278,6 +1278,72 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
                     server_cli._discard_derived_storage(store, relations)
         store.connect.assert_not_called()
 
+    def test_empty_legacy_storage_discard_requires_exact_empty_source(
+        self,
+    ) -> None:
+        store = mock.MagicMock()
+        connection = store.connect.return_value.__enter__.return_value
+        existing = mock.MagicMock()
+        existing.fetchall.return_value = [
+            {"relname": relation}
+            for relation in server_cli._EMPTY_LEGACY_RELATIONS
+        ]
+        present = mock.MagicMock()
+        present.fetchone.return_value = {"present": True}
+        connection.execute.side_effect = [existing, present]
+
+        with self.assertRaisesRegex(ValueError, "source events are not empty"):
+            server_cli._discard_empty_legacy_storage(store)
+
+        self.assertFalse(
+            any(
+                str(call.args[0]).startswith("TRUNCATE")
+                for call in connection.execute.call_args_list
+            )
+        )
+
+    def test_empty_legacy_storage_discard_reclaims_closed_dependency_set(
+        self,
+    ) -> None:
+        store = mock.MagicMock()
+        connection = store.connect.return_value.__enter__.return_value
+        relations = server_cli._EMPTY_LEGACY_RELATIONS
+        existing = mock.MagicMock()
+        existing.fetchall.return_value = [
+            {"relname": relation} for relation in relations
+        ]
+        absent = mock.MagicMock()
+        absent.fetchone.return_value = {"present": False}
+        before = mock.MagicMock()
+        before.fetchall.return_value = [
+            {"relname": relation, "total_bytes": 100}
+            for relation in relations
+        ]
+        truncate = mock.MagicMock()
+        after = mock.MagicMock()
+        after.fetchall.return_value = [
+            {"relname": relation, "total_bytes": 10}
+            for relation in relations
+        ]
+        connection.execute.side_effect = [
+            existing,
+            absent,
+            before,
+            truncate,
+            after,
+        ]
+
+        report = server_cli._discard_empty_legacy_storage(store)
+
+        self.assertEqual(report["before_bytes"], 700)
+        self.assertEqual(report["after_bytes"], 70)
+        self.assertEqual(report["reclaimed_bytes"], 630)
+        connection.execute.assert_any_call(
+            "TRUNCATE TABLE "
+            + ",".join(f'public."{name}"' for name in relations)
+        )
+        self.assertNotIn("content", json.dumps(report))
+
     def test_worker_pool_matches_actual_concurrency_floor(self) -> None:
         self.assertEqual(
             server_cli._worker_pool_max_size(argparse.Namespace(
