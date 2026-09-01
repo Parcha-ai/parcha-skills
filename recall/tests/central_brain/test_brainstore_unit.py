@@ -1189,9 +1189,9 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
         sql = connection.execute.call_args.args[0]
         self.assertIn("pg_terminate_backend", sql)
         self.assertIn("clock_timestamp()-query_start>interval '5 minutes'", sql)
-        self.assertIn("UPDATE canonical_events AS event", sql)
-        self.assertIn("SET canonical_redacted=", sql)
-        self.assertIn("body_location=''raw''", sql)
+        self.assertIn("WITH batch AS MATERIALIZED (", sql)
+        self.assertIn("FROM canonical_events AS event", sql)
+        self.assertIn("artifact.storage_backend=''s3''", sql)
         self.assertNotIn("SELECT query", sql)
 
     def test_s3_event_body_repair_is_batched_and_authority_gated(self) -> None:

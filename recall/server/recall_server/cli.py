@@ -220,9 +220,9 @@ def _cancel_stale_event_compaction(store: BrainStore) -> dict[str, object]:
                         AND pid<>pg_backend_pid()
                         AND state<>'idle'
                         AND clock_timestamp()-query_start>interval '5 minutes'
-                        AND query LIKE '%%UPDATE canonical_events AS event%%'
-                        AND query LIKE '%%SET canonical_redacted=%%'
-                        AND query LIKE '%%body_location=''raw''%%'
+                        AND query LIKE 'WITH batch AS MATERIALIZED (%%'
+                        AND query LIKE '%%FROM canonical_events AS event%%'
+                        AND query LIKE '%%artifact.storage_backend=''s3''%%'
                  )
                  SELECT count(*)::integer AS candidates,
                         count(*) FILTER (
