@@ -76,6 +76,40 @@ def _worker_pool_max_size(args: argparse.Namespace) -> int | None:
     return None
 
 
+def _storage_footprint(store: BrainStore) -> dict[str, object]:
+    """Return aggregate relation sizes without reading user content."""
+
+    with store.connect() as connection:
+        rows = connection.execute(
+            """SELECT schemaname,relname,
+                      pg_total_relation_size(relid) AS total_bytes,
+                      pg_relation_size(relid) AS heap_bytes,
+                      pg_indexes_size(relid) AS index_bytes,
+                      n_live_tup,n_dead_tup
+                 FROM pg_stat_user_tables
+                ORDER BY total_bytes DESC,schemaname,relname"""
+        ).fetchall()
+    relations = [
+        {
+            "schema": row["schemaname"],
+            "relation": row["relname"],
+            "total_bytes": int(row["total_bytes"]),
+            "heap_bytes": int(row["heap_bytes"]),
+            "index_bytes": int(row["index_bytes"]),
+            "live_rows_estimate": int(row["n_live_tup"]),
+            "dead_rows_estimate": int(row["n_dead_tup"]),
+        }
+        for row in rows
+    ]
+    return {
+        "status": "ok",
+        "total_relation_bytes": sum(
+            int(relation["total_bytes"]) for relation in relations
+        ),
+        "relations": relations,
+    }
+
+
 def main() -> None:
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"), format="%(levelname)s %(message)s"
@@ -84,6 +118,7 @@ def main() -> None:
     ap.add_argument("--dsn", default=os.environ.get("RECALL_DATABASE_URL"))
     sub = ap.add_subparsers(dest="command", required=True)
     sub.add_parser("migrate")
+    sub.add_parser("storage-footprint")
     sub.add_parser("archive-check")
     sub.add_parser("evidence-archive-check")
     publish_duckdb = sub.add_parser("publish-archil-duckdb")
@@ -504,6 +539,8 @@ def main() -> None:
     if args.command == "migrate":
         store.migrate()
         print(json.dumps({"status": "ok", "schema_version": SCHEMA_VERSION}))
+    elif args.command == "storage-footprint":
+        print(json.dumps(_storage_footprint(store), sort_keys=True))
     elif args.command == "rebuild":
         print(json.dumps(store.rebuild(), sort_keys=True))
     elif args.command == "managed-worker":

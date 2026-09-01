@@ -1076,6 +1076,39 @@ class DeliberateCaptureContractTest(unittest.TestCase):
 
 
 class SemanticRetrievalConfigurationTest(unittest.TestCase):
+    def test_storage_footprint_is_aggregate_only(self) -> None:
+        store = mock.MagicMock()
+        connection = store.connect.return_value.__enter__.return_value
+        connection.execute.return_value.fetchall.return_value = [
+            {
+                "schemaname": "public",
+                "relname": "canonical_passages",
+                "total_bytes": 120,
+                "heap_bytes": 80,
+                "index_bytes": 40,
+                "n_live_tup": 7,
+                "n_dead_tup": 2,
+            },
+            {
+                "schemaname": "public",
+                "relname": "canonical_passage_embeddings",
+                "total_bytes": 300,
+                "heap_bytes": 200,
+                "index_bytes": 100,
+                "n_live_tup": 7,
+                "n_dead_tup": 0,
+            },
+        ]
+
+        report = server_cli._storage_footprint(store)
+
+        self.assertEqual(report["total_relation_bytes"], 420)
+        self.assertEqual(
+            [row["relation"] for row in report["relations"]],
+            ["canonical_passages", "canonical_passage_embeddings"],
+        )
+        self.assertNotIn("text", json.dumps(report))
+
     def test_worker_pool_matches_actual_concurrency_floor(self) -> None:
         self.assertEqual(
             server_cli._worker_pool_max_size(argparse.Namespace(
