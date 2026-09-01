@@ -1969,9 +1969,12 @@ def _install_slack_bridge_prefilter():
                         routing_event_id,
                         "routing_internal_error",
                     )
+            # Fail closed, but never silently: the type name alone hid a real
+            # production drop for hours (only a traceback names the line).
             log.error(
                 "Tether routing failed closed before the Hermes Slack gate (%s)",
                 type(exc).__name__,
+                exc_info=True,
             )
             return None
         heartbeat = (
