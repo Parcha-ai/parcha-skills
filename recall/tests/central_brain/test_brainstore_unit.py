@@ -1171,6 +1171,29 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
         self.assertFalse(finished["present"])
         self.assertFalse(connection.autocommit)
 
+    def test_stale_event_compaction_cancel_is_signature_scoped(self) -> None:
+        store = mock.MagicMock()
+        connection = store.connect.return_value.__enter__.return_value
+        connection.execute.return_value.fetchone.return_value = {
+            "candidates": 4,
+            "terminated": 4,
+        }
+
+        report = server_cli._cancel_stale_event_compaction(store)
+
+        self.assertEqual(report, {
+            "status": "ok",
+            "candidates": 4,
+            "terminated": 4,
+        })
+        sql = connection.execute.call_args.args[0]
+        self.assertIn("pg_terminate_backend", sql)
+        self.assertIn("clock_timestamp()-query_start>interval '5 minutes'", sql)
+        self.assertIn("UPDATE canonical_events AS event", sql)
+        self.assertIn("SET canonical_redacted=", sql)
+        self.assertIn("body_location=''raw''", sql)
+        self.assertNotIn("SELECT query", sql)
+
     def test_s3_event_body_repair_is_batched_and_authority_gated(self) -> None:
         store = mock.MagicMock()
         connection = store.connect.return_value.__enter__.return_value

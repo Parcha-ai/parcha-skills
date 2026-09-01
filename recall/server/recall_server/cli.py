@@ -208,6 +208,35 @@ def _set_event_compaction_index(
     }
 
 
+def _cancel_stale_event_compaction(store: BrainStore) -> dict[str, object]:
+    """Terminate only orphaned historical event-body maintenance statements."""
+
+    with store.connect() as connection:
+        row = connection.execute(
+            """WITH stale AS MATERIALIZED (
+                     SELECT pid
+                       FROM pg_stat_activity
+                      WHERE datname=current_database()
+                        AND pid<>pg_backend_pid()
+                        AND state<>'idle'
+                        AND clock_timestamp()-query_start>interval '5 minutes'
+                        AND query LIKE '%%UPDATE canonical_events AS event%%'
+                        AND query LIKE '%%SET canonical_redacted=%%'
+                        AND query LIKE '%%body_location=''raw''%%'
+                 )
+                 SELECT count(*)::integer AS candidates,
+                        count(*) FILTER (
+                            WHERE pg_terminate_backend(pid)
+                        )::integer AS terminated
+                   FROM stale"""
+        ).fetchone()
+    return {
+        "status": "ok",
+        "candidates": int(row["candidates"]),
+        "terminated": int(row["terminated"]),
+    }
+
+
 def _compact_storage(
     store: BrainStore,
     relations: list[str],
@@ -1226,6 +1255,7 @@ def main() -> None:
     sub.add_parser("storage-active-work")
     sub.add_parser("storage-prepare-event-compaction")
     sub.add_parser("storage-finish-event-compaction")
+    sub.add_parser("storage-cancel-stale-event-compaction")
     sub.add_parser("storage-recompact-oversized-events")
     recompact_s3_events = sub.add_parser("storage-recompact-s3-event-bodies")
     recompact_s3_events.add_argument("--batch-size", type=int, default=10_000)
@@ -1687,6 +1717,8 @@ def main() -> None:
         print(json.dumps(
             _set_event_compaction_index(store, present=False), sort_keys=True,
         ))
+    elif args.command == "storage-cancel-stale-event-compaction":
+        print(json.dumps(_cancel_stale_event_compaction(store), sort_keys=True))
     elif args.command == "storage-recompact-oversized-events":
         print(json.dumps(_recompact_oversized_event_pointers(store), sort_keys=True))
     elif args.command == "storage-recompact-s3-event-bodies":
