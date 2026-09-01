@@ -1447,6 +1447,39 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
         self.assertNotIn("event.tenant_id=%s", coverage_sql)
         self.assertNotIn("content", json.dumps(report))
 
+    def test_covered_legacy_storage_discard_drops_temporary_index(self) -> None:
+        store = mock.MagicMock()
+        report = {"status": "ok"}
+        with (
+            mock.patch.object(server_cli, "_create_legacy_coverage_index") as create,
+            mock.patch.object(server_cli, "_drop_legacy_coverage_index") as drop,
+            mock.patch.object(
+                server_cli,
+                "_discard_covered_legacy_storage",
+                return_value=report,
+            ) as discard,
+        ):
+            self.assertIs(
+                server_cli._discard_covered_legacy_storage_indexed(store),
+                report,
+            )
+        create.assert_called_once_with(store)
+        discard.assert_called_once_with(store)
+        drop.assert_called_once_with(store)
+
+        with (
+            mock.patch.object(server_cli, "_create_legacy_coverage_index"),
+            mock.patch.object(server_cli, "_drop_legacy_coverage_index") as drop,
+            mock.patch.object(
+                server_cli,
+                "_discard_covered_legacy_storage",
+                side_effect=ValueError("refused"),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "refused"):
+                server_cli._discard_covered_legacy_storage_indexed(store)
+        drop.assert_called_once_with(store)
+
     def test_storage_authority_audit_requires_complete_database_coverage(
         self,
     ) -> None:

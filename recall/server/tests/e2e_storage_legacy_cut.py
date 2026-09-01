@@ -18,7 +18,7 @@ sys.path.insert(0, str(RECALL))
 
 from recall_server.cli import (  # noqa: E402
     _EMPTY_LEGACY_RELATIONS,
-    _discard_covered_legacy_storage,
+    _discard_covered_legacy_storage_indexed,
 )
 from recall_server.db import BrainStore  # noqa: E402
 
@@ -68,7 +68,7 @@ def main() -> None:
             )
 
         try:
-            _discard_covered_legacy_storage(store)
+            _discard_covered_legacy_storage_indexed(store)
         except ValueError as error:
             assert str(error) == "legacy source events are not fully S3-canonical-covered"
         else:
@@ -113,7 +113,7 @@ def main() -> None:
                 (tenant, source, event, native, artifact, job, content_hash),
             )
 
-        report = _discard_covered_legacy_storage(store)
+        report = _discard_covered_legacy_storage_indexed(store)
         assert report["coverage"] == {"total": 1, "canonical_covered": 1}
         with store.connect() as connection:
             counts = {
@@ -129,8 +129,12 @@ def main() -> None:
                     "SELECT count(*) AS count FROM canonical_events"
                 ).fetchone()["count"]
             )
+            temporary_index = connection.execute(
+                "SELECT to_regclass('public.recall_legacy_coverage_tmp_idx') AS value"
+            ).fetchone()["value"]
         assert set(counts.values()) == {0}
         assert canonical_count == 1
+        assert temporary_index is None
         assert "content" not in json.dumps(report)
         print(json.dumps({
             "status": "pass",
