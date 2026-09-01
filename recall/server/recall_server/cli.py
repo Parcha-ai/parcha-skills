@@ -113,6 +113,40 @@ def _storage_footprint(store: BrainStore) -> dict[str, object]:
     }
 
 
+def _canonical_event_shape(store: BrainStore) -> dict[str, object]:
+    """Return aggregate canonical-event JSON sizes without reading content."""
+
+    with store.connect() as connection:
+        row = connection.execute(
+            """SELECT count(*)::bigint AS events,
+                      coalesce(sum(pg_column_size(canonical_redacted)),0)::bigint
+                          AS json_bytes,
+                      coalesce(max(pg_column_size(canonical_redacted)),0)::bigint
+                          AS max_json_bytes,
+                      count(*) FILTER (
+                          WHERE pg_column_size(canonical_redacted)>2048
+                      )::bigint AS toasted_events,
+                      count(*) FILTER (WHERE body_location='inline')::bigint
+                          AS inline_events,
+                      count(*) FILTER (WHERE body_location='raw')::bigint
+                          AS raw_events,
+                      coalesce(sum(CASE WHEN canonical_redacted ? 'content'
+                          THEN pg_column_size(canonical_redacted->'content')
+                          ELSE 0 END),0)::bigint AS content_bytes,
+                      coalesce(sum(CASE WHEN canonical_redacted ? 'provenance'
+                          THEN pg_column_size(canonical_redacted->'provenance')
+                          ELSE 0 END),0)::bigint AS provenance_bytes,
+                      coalesce(sum(CASE WHEN canonical_redacted ? 'message'
+                          THEN pg_column_size(canonical_redacted->'message')
+                          ELSE 0 END),0)::bigint AS message_bytes,
+                      coalesce(sum(CASE WHEN canonical_redacted ? 'payload'
+                          THEN pg_column_size(canonical_redacted->'payload')
+                          ELSE 0 END),0)::bigint AS payload_bytes
+                 FROM canonical_events"""
+        ).fetchone()
+    return {"status": "ok", **{key: int(value) for key, value in row.items()}}
+
+
 def _compact_storage(
     store: BrainStore,
     relations: list[str],
@@ -1015,6 +1049,7 @@ def main() -> None:
     sub = ap.add_subparsers(dest="command", required=True)
     sub.add_parser("migrate")
     sub.add_parser("storage-footprint")
+    sub.add_parser("storage-event-shape")
     sub.add_parser("storage-recompact-oversized-events")
     compact_storage = sub.add_parser("storage-compact")
     compact_storage.add_argument(
@@ -1462,6 +1497,8 @@ def main() -> None:
         print(json.dumps({"status": "ok", "schema_version": SCHEMA_VERSION}))
     elif args.command == "storage-footprint":
         print(json.dumps(_storage_footprint(store), sort_keys=True))
+    elif args.command == "storage-event-shape":
+        print(json.dumps(_canonical_event_shape(store), sort_keys=True))
     elif args.command == "storage-recompact-oversized-events":
         print(json.dumps(_recompact_oversized_event_pointers(store), sort_keys=True))
     elif args.command == "storage-compact":
