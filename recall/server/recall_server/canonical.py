@@ -731,7 +731,7 @@ class CanonicalPlane:
                    ), current_documents AS (
                        SELECT document.native_id,document.revision,
                               document.document_id,event.native_parent_id,
-                              document.text_redacted
+                              document.text_redacted,document.body_location
                        FROM canonical_documents document
                        JOIN canonical_events event
                          ON event.tenant_id=document.tenant_id
@@ -768,7 +768,10 @@ class CanonicalPlane:
                        WHERE item.native_id IS NULL)
                        AS stale_current_documents,
                      (SELECT count(*) FROM current_documents
-                       WHERE text_redacted='') AS empty_current_documents,
+                       WHERE text_redacted=''
+                         AND body_location='inline') AS empty_current_documents,
+                     (SELECT count(*) FROM current_documents
+                       WHERE body_location='chunks') AS chunk_backed_documents,
                      (SELECT count(*) FROM expected_parents)
                        AS logical_documents_expected,
                      (SELECT count(*) FROM canonical_evidence_documents

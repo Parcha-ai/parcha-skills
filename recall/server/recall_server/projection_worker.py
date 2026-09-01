@@ -32,6 +32,7 @@ def run_projection_worker(
     interval_seconds: float,
     once: bool = False,
     sleep: Callable[[float], Any] = time.sleep,
+    body_thinner: Callable[[], dict[str, Any]] | None = None,
 ) -> dict[str, int | str]:
     """Service every projection stage without upstream backfill starvation."""
 
@@ -100,6 +101,26 @@ def run_projection_worker(
                 "contended": 0,
             }
         )
+        thinned = (
+            body_thinner()
+            if (
+                body_thinner is not None
+                and int(documents.get("pending", 0)) == 0
+                and projected["status"] == "complete"
+                and int(projected["documents"]) == 0
+                and scanned["status"] == "complete"
+                and int(scanned["shards"]) == 0
+                and int(scanned["stale"]) == 0
+                and int(scanned["contended"]) == 0
+            )
+            else {
+                "status": "deferred" if body_thinner is not None else "complete",
+                "documents": 0,
+                "refused": 0,
+                "document_bytes_removed": 0,
+                "event_bytes_replaced": 0,
+            }
+        )
         result: dict[str, int | str] = {
             "status": (
                 "complete"
@@ -112,6 +133,7 @@ def run_projection_worker(
                 and int(scanned["shards"]) == 0
                 and int(scanned["stale"]) == 0
                 and int(scanned["contended"]) == 0
+                and thinned["status"] == "complete"
                 else "pending"
             ),
             "documents": int(documents["documents"]),
@@ -129,6 +151,14 @@ def run_projection_worker(
             "parquet_rows": int(scanned["rows"]),
             "parquet_stale": int(scanned["stale"]),
             "parquet_contended": int(scanned["contended"]),
+            "canonical_bodies_thinned": int(thinned["documents"]),
+            "canonical_bodies_refused": int(thinned["refused"]),
+            "canonical_document_bytes_removed": int(
+                thinned["document_bytes_removed"]
+            ),
+            "canonical_event_bytes_replaced": int(
+                thinned["event_bytes_replaced"]
+            ),
             "stale": int(projected["stale"]),
             "pruned": int(documents["pruned"]),
             "cleanup_failures": int(documents["cleanup_failures"]),
@@ -142,6 +172,9 @@ def run_projection_worker(
             "embedding_error=%s "
             "parquet_shards=%s "
             "parquet_rows=%s parquet_stale=%s parquet_contended=%s "
+            "canonical_bodies_thinned=%s canonical_bodies_refused=%s "
+            "canonical_document_bytes_removed=%s "
+            "canonical_event_bytes_replaced=%s "
             "stale=%s pruned=%s "
             "cleanup_failures=%s",
             *(
@@ -163,6 +196,10 @@ def run_projection_worker(
                     "parquet_rows",
                     "parquet_stale",
                     "parquet_contended",
+                    "canonical_bodies_thinned",
+                    "canonical_bodies_refused",
+                    "canonical_document_bytes_removed",
+                    "canonical_event_bytes_replaced",
                     "stale",
                     "pruned",
                     "cleanup_failures",
@@ -180,6 +217,7 @@ def run_projection_worker(
                 "embedded",
                 "parquet_shards",
                 "parquet_stale",
+                "canonical_bodies_thinned",
                 "stale",
                 "pruned",
             )
