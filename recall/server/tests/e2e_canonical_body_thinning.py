@@ -262,6 +262,7 @@ def main() -> None:
         )
         assert report["documents"] == 2
         assert report["events"] == 2
+        assert report["oversized_events"] == 0
         assert report["document_bytes_removed"] == 2 * len(text.encode())
         assert report["event_bytes_replaced"] > 2 * len(text.encode())
 
