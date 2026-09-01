@@ -200,19 +200,26 @@ def _recompact_oversized_event_pointers(store: BrainStore) -> dict[str, object]:
     with store.connect() as connection:
         row = connection.execute(
             f"""WITH candidates AS MATERIALIZED (
-                     SELECT tenant_id,source_id,event_id,
-                            octet_length(canonical_redacted::text)::bigint
+                     SELECT event.tenant_id,event.source_id,event.event_id,
+                            octet_length(event.canonical_redacted::text)::bigint
                                 AS before_bytes
-                       FROM canonical_events
-                      WHERE body_location='raw'
-                        AND canonical_redacted #>> '{{content,contract}}'=
+                       FROM canonical_events AS event
+                       JOIN raw_artifacts AS artifact
+                         ON artifact.tenant_id=event.tenant_id
+                        AND artifact.source_id=event.source_id
+                        AND artifact.artifact_id=event.artifact_id
+                      WHERE artifact.storage_backend='s3'
+                        AND artifact.state='live'
+                        AND event.canonical_redacted #>> '{{content,contract}}'=
                             'recall.oversized-projection.v1'
-                        AND (canonical_redacted->'content') ?| ARRAY[
+                        AND event.canonical_redacted #>>
+                            '{{content,full_record_available}}'='true'
+                        AND (event.canonical_redacted->'content') ?| ARRAY[
                             'head','tail','archive_size_bytes'
                         ]
                  ), updated AS (
                      UPDATE canonical_events AS event
-                        SET canonical_redacted={expression}
+                        SET canonical_redacted={expression},body_location='raw'
                        FROM candidates AS candidate
                       WHERE event.tenant_id=candidate.tenant_id
                         AND event.source_id=candidate.source_id
