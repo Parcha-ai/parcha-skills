@@ -36,9 +36,16 @@ class _Logical:
 
 
 class _Passages:
-    def __init__(self, calls: list[str], *, work: int = 2):
+    def __init__(
+        self,
+        calls: list[str],
+        *,
+        work: int = 2,
+        pending: int = 0,
+    ):
         self.calls = calls
         self.work = work
+        self.pending = pending
 
     def project_pending(self, **_kwargs):
         self.calls.append("passages")
@@ -47,6 +54,7 @@ class _Passages:
             "documents": self.work,
             "passages": self.work * 4,
             "stale": 0,
+            "pending": self.pending,
         }
 
     def embed_pending(self, **_kwargs):
@@ -170,6 +178,23 @@ class ProjectionWorkerTest(unittest.TestCase):
         self.assertEqual(result["status"], "pending")
         self.assertEqual(result["logical_pending"], 8_547)
         self.assertEqual(result["parquet_shards"], 0)
+
+    def test_reports_passage_backlog_for_operational_exit_gates(self):
+        calls: list[str] = []
+        result = run_projection_worker(
+            _Logical(calls, work=0),  # type: ignore[arg-type]
+            _Passages(calls, work=0, pending=321),  # type: ignore[arg-type]
+            tenant_id="tenant:company:test",
+            logical_batch_size=1,
+            passage_batch_size=2,
+            embedding_batch_size=2,
+            max_batches_per_cycle=1,
+            upload_concurrency=1,
+            passage_concurrency=1,
+            interval_seconds=30,
+            once=True,
+        )
+        self.assertEqual(result["passage_pending"], 321)
 
     def test_stale_scan_keeps_the_worker_pending_for_retry(self):
         calls: list[str] = []
