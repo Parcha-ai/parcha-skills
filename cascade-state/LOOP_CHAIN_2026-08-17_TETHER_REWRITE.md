@@ -249,7 +249,7 @@ host control, service changes, synthetic traffic, rollback, and deletion.
 |---|---|---|---|---|
 | Canonicalize source and freeze executable contract | clean commit + local/matrix/GitHub evidence | L0 | `evidence/L0-canonical-baseline/EXIT.md` | complete |
 | Replace domain core and completion protocol | PRs 392/393/395/396/397 (stacked, human review pending) | L1 | CHECKPOINT-L1A/L1B-CONTROL/L1C/L1D + `EXIT.md` under `evidence/L1-durable-domain-core/` | complete |
-| Land stock Hermes contract and self-contained plugin | L1 COMPLETE + GitHub/upstream authority; upstream FILING blocked on credentials | L2 | `evidence/L2-stock-hermes-plugin/EXIT.md` | active |
+| Land stock Hermes contract and self-contained plugin | L1 COMPLETE + GitHub/upstream authority; upstream FILING blocked on credentials | L2 | `evidence/L2-stock-hermes-plugin/EXIT.md` | BLOCKED_EXTERNAL (5/6 PASS; L2.1 needs upstream PR URLs) |
 | Prove privileged one-Greppy canary | L2 COMPLETE + named canary/security/deploy authority | L3 | `evidence/L3-authority-canary/EXIT.md` | blocked |
 | Cut evidence-based fleet rollout successor | L3 COMPLETE | successor PLAN | successor chain path determined at L3 EXIT | blocked |
 
