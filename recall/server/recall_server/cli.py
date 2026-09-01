@@ -375,23 +375,24 @@ def _legacy_storage_coverage(connection: object) -> dict[str, int]:
     """Count legacy events durably represented by an S3-backed canonical event."""
 
     row = connection.execute(
-        """SELECT count(*)::bigint AS total,
-                  count(*) FILTER (
-                      WHERE EXISTS (
-                          SELECT 1
-                            FROM canonical_events event
-                            JOIN raw_artifacts artifact
-                              ON artifact.tenant_id=event.tenant_id
-                             AND artifact.source_id=event.source_id
-                             AND artifact.artifact_id=event.artifact_id
-                           WHERE event.source_id=source_events.source_id
-                             AND event.native_id=source_events.native_id
-                             AND event.content_sha256=source_events.content_sha256
-                             AND artifact.storage_backend='s3'
-                             AND artifact.state='live'
-                      )
-                  )::bigint AS canonical_covered
-             FROM source_events"""
+        """WITH covered AS MATERIALIZED (
+                   SELECT DISTINCT event.source_id,event.native_id,
+                          event.content_sha256
+                     FROM canonical_events event
+                     JOIN raw_artifacts artifact
+                       ON artifact.tenant_id=event.tenant_id
+                      AND artifact.source_id=event.source_id
+                      AND artifact.artifact_id=event.artifact_id
+                    WHERE artifact.storage_backend='s3'
+                      AND artifact.state='live'
+               )
+               SELECT count(*)::bigint AS total,
+                      count(covered.source_id)::bigint AS canonical_covered
+                 FROM source_events
+                 LEFT JOIN covered
+                   ON covered.source_id=source_events.source_id
+                  AND covered.native_id=source_events.native_id
+                  AND covered.content_sha256=source_events.content_sha256"""
     ).fetchone()
     return {key: int(row[key]) for key in ("total", "canonical_covered")}
 
