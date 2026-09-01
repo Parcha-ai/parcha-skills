@@ -101,18 +101,14 @@ def run_projection_worker(
                 "contended": 0,
             }
         )
+        # The thinner has its own row-level authority gates: live S3 raw data,
+        # an S3 logical manifest, retained searchable chunks, and no queued
+        # reprojection for that source group. Run one bounded batch every cycle
+        # so steady ingestion cannot permanently prevent safe rows from being
+        # thinned merely because an unrelated global queue is non-empty.
         thinned = (
             body_thinner()
-            if (
-                body_thinner is not None
-                and int(documents.get("pending", 0)) == 0
-                and projected["status"] == "complete"
-                and int(projected["documents"]) == 0
-                and scanned["status"] == "complete"
-                and int(scanned["shards"]) == 0
-                and int(scanned["stale"]) == 0
-                and int(scanned["contended"]) == 0
-            )
+            if body_thinner is not None
             else {
                 "status": "deferred" if body_thinner is not None else "complete",
                 "documents": 0,

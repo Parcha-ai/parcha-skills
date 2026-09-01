@@ -285,7 +285,7 @@ class ProjectionWorkerTest(unittest.TestCase):
         )
         self.assertEqual(result["status"], "complete")
 
-    def test_thins_only_after_every_object_projection_is_drained(self):
+    def test_thins_authoritative_rows_after_each_projection_cycle(self):
         calls: list[str] = []
 
         def thin():
@@ -321,6 +321,39 @@ class ProjectionWorkerTest(unittest.TestCase):
         self.assertEqual(result["canonical_document_bytes_removed"], 120)
         self.assertEqual(result["canonical_event_bytes_replaced"], 240)
         self.assertEqual(result["status"], "complete")
+
+    def test_unrelated_projection_backlog_does_not_starve_safe_thinning(self):
+        calls: list[str] = []
+
+        def thin():
+            calls.append("thin")
+            return {
+                "status": "pending",
+                "documents": 3,
+                "refused": 0,
+                "document_bytes_removed": 120,
+                "event_bytes_replaced": 240,
+            }
+
+        result = run_projection_worker(
+            _Logical(calls, work=100, pending=8_547),  # type: ignore[arg-type]
+            _Passages(calls, work=2),  # type: ignore[arg-type]
+            _Scan(calls, work=4),  # type: ignore[arg-type]
+            tenant_id="tenant:company:test",
+            logical_batch_size=100,
+            passage_batch_size=100,
+            embedding_batch_size=128,
+            max_batches_per_cycle=10,
+            upload_concurrency=2,
+            passage_concurrency=4,
+            interval_seconds=5,
+            once=True,
+            body_thinner=thin,
+        )
+
+        self.assertEqual(calls, ["embeddings", "passages", "logical", "thin"])
+        self.assertEqual(result["canonical_bodies_thinned"], 3)
+        self.assertEqual(result["status"], "pending")
 
     def test_cleanup_failure_does_not_create_a_hot_loop(self):
         calls: list[str] = []

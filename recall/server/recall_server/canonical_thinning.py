@@ -188,44 +188,12 @@ def thin_canonical_bodies(
         batches += 1
         if current_candidates < batch_size or current < current_candidates:
             break
-    with store.connect() as connection:
-        oversized_events = int(
-            connection.execute(
-                f"""WITH candidates AS MATERIALIZED (
-                         SELECT event.tenant_id,event.source_id,event.event_id
-                           FROM canonical_events AS event
-                           JOIN raw_artifacts AS artifact
-                             ON artifact.tenant_id=event.tenant_id
-                            AND artifact.source_id=event.source_id
-                            AND artifact.artifact_id=event.artifact_id
-                          WHERE event.tenant_id=%s
-                            AND artifact.storage_backend='s3'
-                            AND artifact.state='live'
-                            AND event.canonical_redacted #>>
-                                '{{content,contract}}'=
-                                'recall.oversized-projection.v1'
-                            AND event.canonical_redacted #>>
-                                '{{content,full_record_available}}'='true'
-                            AND (event.canonical_redacted->'content') ?| ARRAY[
-                                'head','tail','archive_size_bytes'
-                            ]
-                          ORDER BY event.source_id,event.event_id
-                          LIMIT %s
-                          FOR UPDATE OF event SKIP LOCKED
-                     ), updated AS (
-                         UPDATE canonical_events AS event
-                            SET canonical_redacted={compact_event},
-                                body_location='raw'
-                           FROM candidates AS candidate
-                          WHERE event.tenant_id=candidate.tenant_id
-                            AND event.source_id=candidate.source_id
-                            AND event.event_id=candidate.event_id
-                      RETURNING 1
-                     )
-                     SELECT count(*)::integer AS events FROM updated""",
-                (tenant_id, batch_size * max_batches),
-            ).fetchone()["events"]
-        )
+    # Non-document oversized records are a historical repair concern, not part
+    # of this hot path. Scanning every event's JSON after each small document
+    # batch made a bounded update pay for a full-table TOAST walk. The explicit
+    # storage-recompact-oversized-events operation owns that one-time repair;
+    # document-backed oversized records are already compacted above.
+    oversized_events = 0
     refused = candidates - documents
     return {
         "status": (
