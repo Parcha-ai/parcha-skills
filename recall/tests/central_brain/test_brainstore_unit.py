@@ -1356,6 +1356,50 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
         )
         self.assertNotIn("content", json.dumps(report))
 
+    def test_storage_authority_audit_requires_complete_database_coverage(
+        self,
+    ) -> None:
+        store = mock.MagicMock()
+        connection = store.connect.return_value.__enter__.return_value
+
+        def result(row: dict[str, int]) -> mock.MagicMock:
+            query = mock.MagicMock()
+            query.fetchone.return_value = row
+            return query
+
+        connection.execute.side_effect = [
+            result({"total": 7, "canonical_covered": 7}),
+            result({"total": 5, "s3_raw_covered": 5}),
+            result({"total": 3, "projected": 3}),
+            result({"total": 3, "s3_pointer_complete": 3, "passage_projected": 3}),
+            result({"logical": 0, "passage": 0, "cleanup": 2}),
+        ]
+
+        report = server_cli._storage_authority_audit(
+            store,
+            "tenant:company:parcha",
+        )
+
+        self.assertTrue(report["database_coverage_complete"])
+        self.assertTrue(report["object_verification_required"])
+        self.assertEqual(report["queues"]["cleanup"], 2)
+        self.assertNotIn("content", json.dumps(report))
+
+        connection.execute.side_effect = [
+            result({"total": 7, "canonical_covered": 6}),
+            result({"total": 5, "s3_raw_covered": 5}),
+            result({"total": 3, "projected": 2}),
+            result({"total": 2, "s3_pointer_complete": 2, "passage_projected": 2}),
+            result({"logical": 1, "passage": 0, "cleanup": 0}),
+        ]
+
+        incomplete = server_cli._storage_authority_audit(
+            store,
+            "tenant:company:parcha",
+        )
+        self.assertFalse(incomplete["database_coverage_complete"])
+        self.assertFalse(incomplete["object_verification_required"])
+
     def test_worker_pool_matches_actual_concurrency_floor(self) -> None:
         self.assertEqual(
             server_cli._worker_pool_max_size(argparse.Namespace(
