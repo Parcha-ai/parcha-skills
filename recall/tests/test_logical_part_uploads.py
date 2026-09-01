@@ -6,6 +6,11 @@ import time
 import unittest
 from typing import Any
 
+from server.recall_server.archive import (
+    ArchiveCorruption,
+    ArchiveError,
+    ArchiveNotFound,
+)
 from server.recall_server.logical_evidence import (
     LogicalEvidenceError,
     DEFAULT_PART_BYTES,
@@ -82,6 +87,11 @@ class _ConcurrentArchive:
         with self.lock:
             return self.objects.pop(value["artifact_id"], None) is not None
 
+    def verify_raw(self, value: dict[str, Any]) -> None:
+        with self.lock:
+            if value["artifact_id"] not in self.objects:
+                raise ArchiveNotFound("archive object not found")
+
     def read_raw(self, value: dict[str, Any]) -> bytes:
         with self.lock:
             return self.objects[value["artifact_id"]]
@@ -109,6 +119,43 @@ def _records(count: int) -> tuple[LogicalEvidenceRecord, ...]:
 
 
 class LogicalPartUploadTests(unittest.TestCase):
+    def test_archive_read_failures_preserve_missing_corrupt_and_unavailable(
+        self,
+    ) -> None:
+        reference = {
+            "tenant_id": "tenant:company:test",
+            "source_id": "source:test",
+            "media_type": "application/vnd.recall.logical-document-part+jsonl",
+            "content_sha256": "0" * 64,
+        }
+
+        for archive_error, expected in (
+            (
+                ArchiveNotFound("archive object not found"),
+                "logical_evidence_not_found",
+            ),
+            (
+                ArchiveCorruption("archive object corrupt"),
+                "logical_evidence_corrupt",
+            ),
+            (
+                ArchiveError("archive provider request failed"),
+                "logical_evidence_unavailable",
+            ),
+        ):
+            class FailingArchive:
+                @staticmethod
+                def read_raw(_reference):
+                    raise archive_error
+
+            projection = LogicalEvidenceProjectionStore(FailingArchive())
+            with self.assertRaisesRegex(LogicalEvidenceError, expected):
+                projection.read_part(
+                    reference,
+                    tenant_id="tenant:company:test",
+                    source_id="source:test",
+                )
+
     def test_backfill_rejects_an_invalid_exact_source_before_database_access(
         self,
     ) -> None:
@@ -276,6 +323,65 @@ class LogicalPartUploadTests(unittest.TestCase):
             second.manifest_reference["artifact_id"],
         )
         self.assertEqual(archive.put_calls, calls_after_first + 1)
+
+    def test_missing_reusable_part_is_reuploaded_instead_of_reused(self) -> None:
+        archive = _ConcurrentArchive()
+        projection = LogicalEvidenceProjectionStore(archive)
+        first = projection.put_records(
+            tenant_id="tenant:parallel",
+            source_id="source:parallel",
+            native_parent_id="session:missing-part",
+            revision=1,
+            records=iter(_records(8)),
+            part_bytes=1_024,
+        )
+        missing = first.part_references[0]
+        archive.objects.pop(missing["artifact_id"])
+        calls_before_repair = archive.put_calls
+
+        repaired = projection.put_records(
+            tenant_id="tenant:parallel",
+            source_id="source:parallel",
+            native_parent_id="session:missing-part",
+            revision=2,
+            records=iter(_records(8)),
+            part_bytes=1_024,
+            existing_part_references=first.part_references,
+        )
+
+        self.assertIn(missing["artifact_id"], archive.objects)
+        self.assertEqual(repaired.part_references, first.part_references)
+        self.assertEqual(archive.put_calls, calls_before_repair + 2)
+
+    def test_transient_reuse_verification_fails_without_uploading(self) -> None:
+        class UnavailableArchive(_ConcurrentArchive):
+            def verify_raw(self, _value: dict[str, Any]) -> None:
+                raise ArchiveError("archive provider request failed")
+
+        archive = UnavailableArchive()
+        projection = LogicalEvidenceProjectionStore(archive)
+        first = projection.put_records(
+            tenant_id="tenant:parallel",
+            source_id="source:parallel",
+            native_parent_id="session:unavailable-part",
+            revision=1,
+            records=iter(_records(8)),
+            part_bytes=1_024,
+        )
+        calls_before_retry = archive.put_calls
+
+        with self.assertRaisesRegex(ArchiveError, "archive provider request failed"):
+            projection.put_records(
+                tenant_id="tenant:parallel",
+                source_id="source:parallel",
+                native_parent_id="session:unavailable-part",
+                revision=2,
+                records=iter(_records(8)),
+                part_bytes=1_024,
+                existing_part_references=first.part_references,
+            )
+
+        self.assertEqual(archive.put_calls, calls_before_retry)
 
     def test_mixed_changed_and_reused_parts_keep_manifest_order(self) -> None:
         archive = _ConcurrentArchive()

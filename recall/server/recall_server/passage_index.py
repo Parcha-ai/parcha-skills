@@ -599,7 +599,7 @@ class CanonicalPassageProjector:
         if callable(prepare_pool):
             prepare_pool(min(PASSAGE_POOL_WARM_SIZE, concurrency))
         started = time.monotonic()
-        documents = passages = stale = requeued = batches = 0
+        documents = passages = stale = requeued = unavailable = batches = 0
         while batches < max_batches:
             candidates = self._pending(
                 tenant_id=tenant_id,
@@ -617,13 +617,17 @@ class CanonicalPassageProjector:
                 ]
                 prepared_documents = []
                 requeued_in_batch = 0
+                unavailable_in_batch = 0
                 for candidate, future in futures:
                     try:
                         prepared_documents.append(future.result())
                     except LogicalEvidenceError as error:
-                        if str(error) != "logical_evidence_not_found":
+                        if str(error) == "logical_evidence_not_found":
+                            requeued_in_batch += self._requeue_missing(candidate)
+                        elif str(error) == "logical_evidence_unavailable":
+                            unavailable_in_batch += 1
+                        else:
                             raise
-                        requeued_in_batch += self._requeue_missing(candidate)
             statuses: list[str] = []
             if prepared_documents:
                 with ThreadPoolExecutor(
@@ -649,10 +653,13 @@ class CanonicalPassageProjector:
                 documents += 1
                 passages += len(prepared.passages)
             requeued += requeued_in_batch
+            unavailable += unavailable_in_batch
             batches += 1
-            if requeued_in_batch:
+            if requeued_in_batch or unavailable_in_batch:
                 # Yield to the logical projector in the unified worker. The
                 # passage queue remains authoritative and retries next cycle.
+                # A transient archive failure must never become a destructive
+                # logical-document rebuild.
                 break
         with self.store.connect() as connection:
             pending = connection.execute(
@@ -668,6 +675,7 @@ class CanonicalPassageProjector:
             "passages": passages,
             "stale": stale,
             "requeued": requeued,
+            "unavailable": unavailable,
             "batches": batches,
             "pending": int(pending),
             "elapsed_seconds": round(elapsed_seconds, 3),
