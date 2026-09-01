@@ -21,6 +21,7 @@ from .archive_runtime import (
     probe_archive,
 )
 from .canonical_retrieval import CanonicalRetrieval
+from .canonical_thinning import thin_canonical_bodies
 from .capabilities import CapabilityError, probe_database
 from .control import ControlPlane, SecretBox
 from .db import BrainStore
@@ -993,6 +994,10 @@ def main() -> None:
     sub.add_parser("storage-discard-covered-legacy")
     authority_audit = sub.add_parser("storage-authority-audit")
     authority_audit.add_argument("--tenant", required=True)
+    thin_bodies = sub.add_parser("storage-thin-canonical-bodies")
+    thin_bodies.add_argument("--tenant", required=True)
+    thin_bodies.add_argument("--batch-size", type=int, default=1_000)
+    thin_bodies.add_argument("--max-batches", type=int, default=1)
     sub.add_parser("archive-check")
     sub.add_parser("evidence-archive-check")
     publish_duckdb = sub.add_parser("publish-archil-duckdb")
@@ -1449,6 +1454,18 @@ def main() -> None:
         )
     elif args.command == "storage-authority-audit":
         print(json.dumps(_storage_authority_audit(store, args.tenant), sort_keys=True))
+    elif args.command == "storage-thin-canonical-bodies":
+        print(
+            json.dumps(
+                thin_canonical_bodies(
+                    store,
+                    tenant_id=args.tenant,
+                    batch_size=args.batch_size,
+                    max_batches=args.max_batches,
+                ),
+                sort_keys=True,
+            )
+        )
     elif args.command == "rebuild":
         print(json.dumps(store.rebuild(), sort_keys=True))
     elif args.command == "managed-worker":
@@ -1700,6 +1717,12 @@ def main() -> None:
                     passage_concurrency=args.passage_concurrency,
                     interval_seconds=args.interval_seconds,
                     once=args.once,
+                    body_thinner=lambda: thin_canonical_bodies(
+                        store,
+                        tenant_id=args.tenant,
+                        batch_size=1_000,
+                        max_batches=1,
+                    ),
                 ),
                 sort_keys=True,
             )

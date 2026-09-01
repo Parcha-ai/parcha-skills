@@ -591,7 +591,7 @@ class CanonicalLogicalEvidenceProjector:
                               event.occurred_at,
                               CASE
                                   WHEN left(
-                                      ltrim(document.text_redacted),1
+                                      ltrim(source_record.event_text),1
                                   ) IN ('{','[') THEN '[]'::jsonb
                                   ELSE jsonb_build_array(
                                       event.canonical_redacted->>'role',
@@ -612,7 +612,7 @@ class CanonicalLogicalEvidenceProjector:
                               END AS fallback_role_values,
                               CASE
                                   WHEN left(
-                                      ltrim(document.text_redacted),1
+                                      ltrim(source_record.event_text),1
                                   ) IN ('{','[') THEN '[]'::jsonb
                                   ELSE jsonb_build_array(
                                       event.canonical_redacted->>'type',
@@ -629,7 +629,7 @@ class CanonicalLogicalEvidenceProjector:
                                    ELSE NULL
                               END AS oversized_content,
                               event.source_ordinal AS byte_start,
-                              document.text_redacted AS event_text,
+                              source_record.event_text,
                               document.revision AS document_revision,
                               source_record.chunk_count,
                               source_record.chunk_receipts,
@@ -667,7 +667,11 @@ class CanonicalLogicalEvidenceProjector:
                               SELECT count(*)::integer AS chunk_count,
                                      array_agg(
                                          chunk.receipt ORDER BY chunk.ordinal
-                                     ) AS chunk_receipts
+                                     ) AS chunk_receipts,
+                                     string_agg(
+                                         chunk.text_redacted,''
+                                         ORDER BY chunk.ordinal
+                                     ) AS event_text
                                 FROM canonical_chunks chunk
                                WHERE chunk.tenant_id=document.tenant_id
                                  AND chunk.source_id=document.source_id
