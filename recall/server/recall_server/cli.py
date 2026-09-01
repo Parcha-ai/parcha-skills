@@ -278,6 +278,164 @@ def _recompact_oversized_event_pointers(store: BrainStore) -> dict[str, object]:
     }
 
 
+def _recompact_s3_event_bodies(
+    store: BrainStore,
+    *,
+    batch_size: int = 10_000,
+) -> dict[str, object]:
+    """Repair event bodies left inline after their documents became S3-backed."""
+
+    if (
+        isinstance(batch_size, bool)
+        or not isinstance(batch_size, int)
+        or not 1 <= batch_size <= 100_000
+    ):
+        raise ValueError("S3 event body compaction batch size is invalid")
+
+    expression = _compact_event_expression()
+    candidate_table = "recall_s3_event_body_candidates"
+    events = after_bytes = batches = 0
+    with store.connect() as connection:
+        try:
+            connection.execute(
+                f"""CREATE TEMP TABLE {candidate_table}
+                         ON COMMIT PRESERVE ROWS AS
+                     SELECT event.tenant_id,event.source_id,event.event_id
+                       FROM canonical_events AS event
+                       JOIN raw_artifacts AS artifact
+                         ON artifact.tenant_id=event.tenant_id
+                        AND artifact.source_id=event.source_id
+                        AND artifact.artifact_id=event.artifact_id
+                      WHERE event.body_location='inline'
+                        AND artifact.storage_backend='s3'
+                        AND artifact.state='live'
+                        AND EXISTS (
+                            SELECT 1
+                              FROM canonical_documents AS document
+                             WHERE document.tenant_id=event.tenant_id
+                               AND document.source_id=event.source_id
+                               AND document.event_id=event.event_id
+                               AND document.body_location='chunks'
+                               AND document.deleted_at IS NULL
+                               AND EXISTS (
+                                   SELECT 1
+                                     FROM canonical_chunks AS chunk
+                                    WHERE chunk.tenant_id=document.tenant_id
+                                      AND chunk.source_id=document.source_id
+                                      AND chunk.document_id=document.document_id
+                                      AND chunk.deleted_at IS NULL
+                               )
+                        )
+                        AND EXISTS (
+                            SELECT 1
+                              FROM canonical_evidence_documents AS evidence
+                             WHERE evidence.tenant_id=event.tenant_id
+                               AND evidence.source_id=event.source_id
+                               AND evidence.native_parent_id=COALESCE(
+                                   event.native_parent_id,event.native_id
+                               )
+                               AND evidence.manifest_storage_backend='s3'
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1
+                              FROM canonical_evidence_document_queue AS queued
+                             WHERE queued.tenant_id=event.tenant_id
+                               AND queued.source_id=event.source_id
+                               AND queued.native_parent_id=COALESCE(
+                                   event.native_parent_id,event.native_id
+                               )
+                        )"""
+            )
+            connection.execute(
+                f"""CREATE UNIQUE INDEX ON {candidate_table}(
+                         tenant_id,source_id,event_id
+                     )"""
+            )
+            total = int(
+                connection.execute(
+                    f"SELECT count(*)::bigint AS events FROM {candidate_table}"
+                ).fetchone()["events"]
+            )
+            connection.commit()
+            logging.getLogger(__name__).info(
+                "S3 event body compaction phase=snapshot candidates=%s", total
+            )
+
+            while True:
+                row = connection.execute(
+                    f"""WITH batch AS MATERIALIZED (
+                             SELECT candidate.tenant_id,candidate.source_id,
+                                    candidate.event_id
+                               FROM {candidate_table} AS candidate
+                              ORDER BY candidate.tenant_id,candidate.source_id,
+                                       candidate.event_id
+                              LIMIT %s
+                              FOR UPDATE SKIP LOCKED
+                         ), updated AS (
+                             UPDATE canonical_events AS event
+                                SET canonical_redacted={expression},
+                                    body_location='raw'
+                               FROM batch
+                              WHERE event.tenant_id=batch.tenant_id
+                                AND event.source_id=batch.source_id
+                                AND event.event_id=batch.event_id
+                          RETURNING event.tenant_id,event.source_id,event.event_id,
+                                    octet_length(
+                                        event.canonical_redacted::text
+                                    )::bigint AS after_bytes
+                         ), deleted AS (
+                             DELETE FROM {candidate_table} AS candidate
+                              USING updated
+                              WHERE candidate.tenant_id=updated.tenant_id
+                                AND candidate.source_id=updated.source_id
+                                AND candidate.event_id=updated.event_id
+                          RETURNING updated.after_bytes
+                         )
+                         SELECT count(*)::bigint AS events,
+                                coalesce(sum(after_bytes),0)::bigint AS after_bytes
+                           FROM deleted""",
+                    (batch_size,),
+                ).fetchone()
+                current = int(row["events"])
+                current_after = int(row["after_bytes"])
+                connection.commit()
+                if current == 0:
+                    break
+                events += current
+                after_bytes += current_after
+                batches += 1
+                logging.getLogger(__name__).info(
+                    "S3 event body compaction phase=batch batch=%s events=%s "
+                    "remaining=%s",
+                    batches,
+                    current,
+                    max(0, total - events),
+                )
+                if current < batch_size:
+                    break
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            try:
+                connection.execute(f"DROP TABLE IF EXISTS {candidate_table}")
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+
+    # The full pre-rewrite byte total is already available from the aggregate
+    # storage-event-shape diagnostic. Avoid a second decompression pass here;
+    # this operation reports the exact compacted bytes it wrote.
+    return {
+        "status": "complete",
+        "candidates": total,
+        "events": events,
+        "batches": batches,
+        "after_bytes": after_bytes,
+    }
+
+
 _DISCARDABLE_DERIVED_RELATIONS = frozenset(
     {
         "canonical_chunk_embeddings",
@@ -1051,6 +1209,8 @@ def main() -> None:
     sub.add_parser("storage-footprint")
     sub.add_parser("storage-event-shape")
     sub.add_parser("storage-recompact-oversized-events")
+    recompact_s3_events = sub.add_parser("storage-recompact-s3-event-bodies")
+    recompact_s3_events.add_argument("--batch-size", type=int, default=10_000)
     compact_storage = sub.add_parser("storage-compact")
     compact_storage.add_argument(
         "--relation",
@@ -1501,6 +1661,13 @@ def main() -> None:
         print(json.dumps(_canonical_event_shape(store), sort_keys=True))
     elif args.command == "storage-recompact-oversized-events":
         print(json.dumps(_recompact_oversized_event_pointers(store), sort_keys=True))
+    elif args.command == "storage-recompact-s3-event-bodies":
+        print(
+            json.dumps(
+                _recompact_s3_event_bodies(store, batch_size=args.batch_size),
+                sort_keys=True,
+            )
+        )
     elif args.command == "storage-compact":
         print(
             json.dumps(
