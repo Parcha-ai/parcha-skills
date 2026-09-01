@@ -2,17 +2,19 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import gzip
 import hashlib
 import json
 import logging
 import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 from . import SCHEMA_VERSION
 from .app import serve, serve_unix
-from .archive import ArchiveError
+from .archive import ArchiveError, ArchiveRequest, S3ArchiveStore
 from .archive_runtime import (
     build_archive_store,
     build_evidence_archive_store,
@@ -219,6 +221,251 @@ _EMPTY_LEGACY_RELATIONS = (
     "turn_embedding_items",
     "turn_embeddings",
 )
+
+_LEGACY_GAP_ARCHIVE_OPERATION = "storage.legacy-gap-archive"
+_LEGACY_GAP_ARCHIVE_TENANT = "tenant:system:legacy"
+_LEGACY_GAP_ARCHIVE_SOURCE = "system:legacy-gap"
+_LEGACY_GAP_SHARD_BYTES = 40 * 1024 * 1024
+
+
+def _legacy_identity_coverage(connection: object) -> dict[str, int]:
+    """Count legacy identities represented by any live S3 canonical revision."""
+
+    row = connection.execute(
+        """SELECT count(*)::bigint AS total,
+                  count(*) FILTER (
+                      WHERE EXISTS (
+                          SELECT 1
+                            FROM canonical_events event
+                            JOIN raw_artifacts artifact
+                              ON artifact.tenant_id=event.tenant_id
+                             AND artifact.source_id=event.source_id
+                             AND artifact.artifact_id=event.artifact_id
+                           WHERE event.source_id=source_events.source_id
+                             AND event.native_id=source_events.native_id
+                             AND artifact.storage_backend='s3'
+                             AND artifact.state='live'
+                      )
+                  )::bigint AS canonical_identity_covered
+             FROM source_events"""
+    ).fetchone()
+    return {
+        key: int(row[key])
+        for key in ("total", "canonical_identity_covered")
+    }
+
+
+def _legacy_uncovered_identity_query() -> str:
+    return """SELECT legacy.id,legacy.source_id,legacy.native_id,
+                     legacy.native_parent_id,legacy.kind,legacy.occurred_at,
+                     legacy.observed_at,legacy.principal_id,legacy.visibility,
+                     legacy.content_type,legacy.content_sha256,legacy.revision,
+                     legacy.envelope,legacy.is_tombstone,legacy.batch_id,
+                     legacy.created_at
+                FROM source_events legacy
+               WHERE legacy.id<=%s
+                 AND NOT EXISTS (
+                     SELECT 1
+                       FROM canonical_events event
+                       JOIN raw_artifacts artifact
+                         ON artifact.tenant_id=event.tenant_id
+                        AND artifact.source_id=event.source_id
+                        AND artifact.artifact_id=event.artifact_id
+                      WHERE event.source_id=legacy.source_id
+                        AND event.native_id=legacy.native_id
+                        AND artifact.storage_backend='s3'
+                        AND artifact.state='live'
+                 )
+               ORDER BY legacy.id"""
+
+
+def _legacy_gap_digest(rows: object) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    count = 0
+    for row in rows:
+        digest.update(str(row["id"]).encode())
+        digest.update(b"\0")
+        digest.update(row["source_id"].encode())
+        digest.update(b"\0")
+        digest.update(row["native_id"].encode())
+        digest.update(b"\0")
+        digest.update(row["content_sha256"].encode())
+        digest.update(b"\n")
+        count += 1
+    return digest.hexdigest(), count
+
+
+def _legacy_event_json(row: object) -> bytes:
+    value = {
+        key: row[key]
+        for key in (
+            "id", "source_id", "native_id", "native_parent_id", "kind",
+            "occurred_at", "observed_at", "principal_id", "visibility",
+            "content_type", "content_sha256", "revision", "envelope",
+            "is_tombstone", "batch_id", "created_at",
+        )
+    }
+    return (
+        json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=str,
+        ).encode()
+        + b"\n"
+    )
+
+
+def _archive_uncovered_legacy_storage(
+    store: BrainStore,
+    archive: S3ArchiveStore,
+) -> dict[str, object]:
+    """Move only legacy identities absent from canonical S3 into a private archive."""
+
+    created_at = datetime.now(timezone.utc).isoformat()
+    with tempfile.TemporaryDirectory(prefix="recall-legacy-gap-") as directory:
+        root = Path(directory)
+        shard_paths: list[tuple[Path, int]] = []
+        identity_digest = hashlib.sha256()
+        row_count = 0
+        shard_count = 0
+        uncompressed_bytes = 0
+        current_rows = 0
+        raw_file = None
+        compressed = None
+
+        def close_shard() -> None:
+            nonlocal raw_file, compressed, current_rows, uncompressed_bytes
+            if compressed is None or raw_file is None:
+                return
+            compressed.close()
+            raw_file.close()
+            path = root / f"legacy-gap-{len(shard_paths):06d}.jsonl.gz"
+            shard_paths.append((path, current_rows))
+            raw_file = None
+            compressed = None
+            current_rows = 0
+            uncompressed_bytes = 0
+
+        with store.connect() as connection:
+            highwater = int(
+                connection.execute(
+                    "SELECT coalesce(max(id),0)::bigint AS value FROM source_events"
+                ).fetchone()["value"]
+            )
+            cursor = connection.cursor(name="recall_legacy_gap_archive")
+            cursor.itersize = 1000
+            cursor.execute(_legacy_uncovered_identity_query(), (highwater,))
+            for row in cursor:
+                line = _legacy_event_json(row)
+                if compressed is None:
+                    path = root / f"legacy-gap-{len(shard_paths):06d}.jsonl.gz"
+                    raw_file = path.open("wb")
+                    compressed = gzip.GzipFile(
+                        filename="", mode="wb", fileobj=raw_file, mtime=0,
+                    )
+                if current_rows and uncompressed_bytes + len(line) > _LEGACY_GAP_SHARD_BYTES:
+                    close_shard()
+                    path = root / f"legacy-gap-{len(shard_paths):06d}.jsonl.gz"
+                    raw_file = path.open("wb")
+                    compressed = gzip.GzipFile(
+                        filename="", mode="wb", fileobj=raw_file, mtime=0,
+                    )
+                compressed.write(line)
+                identity_digest.update(str(row["id"]).encode())
+                identity_digest.update(b"\0")
+                identity_digest.update(row["source_id"].encode())
+                identity_digest.update(b"\0")
+                identity_digest.update(row["native_id"].encode())
+                identity_digest.update(b"\0")
+                identity_digest.update(row["content_sha256"].encode())
+                identity_digest.update(b"\n")
+                current_rows += 1
+                row_count += 1
+                uncompressed_bytes += len(line)
+            close_shard()
+
+        digest = identity_digest.hexdigest()
+        shard_contracts = []
+        for index, (path, rows) in enumerate(shard_paths):
+            payload = path.read_bytes()
+            reference = archive.put(ArchiveRequest(
+                tenant_id=_LEGACY_GAP_ARCHIVE_TENANT,
+                source_id=_LEGACY_GAP_ARCHIVE_SOURCE,
+                native_id=f"legacy-gap:{digest[:24]}:{index:06d}",
+                media_type="application/gzip",
+                payload=payload,
+            ))
+            archive.verify(
+                reference,
+                tenant_id=_LEGACY_GAP_ARCHIVE_TENANT,
+                source_id=_LEGACY_GAP_ARCHIVE_SOURCE,
+            )
+            shard_contracts.append({
+                "rows": rows,
+                "artifact": reference.to_contract(
+                    tenant_id=_LEGACY_GAP_ARCHIVE_TENANT,
+                    source_id=_LEGACY_GAP_ARCHIVE_SOURCE,
+                    created_at=created_at,
+                ),
+            })
+            shard_count += 1
+
+        manifest = {
+            "schema_version": 1,
+            "kind": "recall.legacy-gap-archive",
+            "created_at": created_at,
+            "highwater_id": highwater,
+            "row_count": row_count,
+            "identity_sha256": digest,
+            "shards": shard_contracts,
+        }
+        manifest_payload = json.dumps(
+            manifest, sort_keys=True, separators=(",", ":"),
+        ).encode()
+        manifest_reference = archive.put(ArchiveRequest(
+            tenant_id=_LEGACY_GAP_ARCHIVE_TENANT,
+            source_id=_LEGACY_GAP_ARCHIVE_SOURCE,
+            native_id=f"legacy-gap-manifest:{digest[:32]}",
+            media_type="application/json",
+            payload=manifest_payload,
+        ))
+        if archive.read(
+            manifest_reference,
+            tenant_id=_LEGACY_GAP_ARCHIVE_TENANT,
+            source_id=_LEGACY_GAP_ARCHIVE_SOURCE,
+        ) != manifest_payload:
+            raise ArchiveError("legacy gap manifest verification failed")
+        manifest_contract = manifest_reference.to_contract(
+            tenant_id=_LEGACY_GAP_ARCHIVE_TENANT,
+            source_id=_LEGACY_GAP_ARCHIVE_SOURCE,
+            created_at=created_at,
+        )
+
+        with store.connect() as connection:
+            connection.execute(
+                """INSERT INTO audit_events(operation,status,metadata)
+                   VALUES (%s,'success',%s)""",
+                (
+                    _LEGACY_GAP_ARCHIVE_OPERATION,
+                    json.dumps({
+                        "schema_version": 1,
+                        "highwater_id": highwater,
+                        "row_count": row_count,
+                        "identity_sha256": digest,
+                        "manifest": manifest_contract,
+                    }),
+                ),
+            )
+    return {
+        "status": "ok",
+        "highwater_id": highwater,
+        "row_count": row_count,
+        "identity_sha256": digest,
+        "shards": shard_count,
+        "manifest": manifest_contract,
+    }
 
 
 def _discard_derived_storage(
@@ -427,8 +674,65 @@ def _drop_legacy_coverage_index(store: BrainStore) -> None:
             connection.autocommit = False
 
 
-def _discard_covered_legacy_storage(store: BrainStore) -> dict[str, object]:
-    """Reclaim the legacy plane only after an atomic S3-backed coverage proof."""
+def _verified_legacy_gap_archive(
+    store: BrainStore,
+    archive: S3ArchiveStore,
+) -> dict[str, object] | None:
+    with store.connect() as connection:
+        row = connection.execute(
+            """SELECT metadata
+                 FROM audit_events
+                WHERE operation=%s AND status='success'
+                ORDER BY id DESC
+                LIMIT 1""",
+            (_LEGACY_GAP_ARCHIVE_OPERATION,),
+        ).fetchone()
+    if row is None:
+        return None
+    metadata = row["metadata"]
+    if not isinstance(metadata, dict):
+        raise ValueError("legacy gap archive metadata is invalid")
+    manifest_reference = metadata.get("manifest")
+    if not isinstance(manifest_reference, dict):
+        raise ValueError("legacy gap archive metadata is invalid")
+    manifest_payload = archive.read_raw(manifest_reference)
+    try:
+        manifest = json.loads(manifest_payload)
+    except json.JSONDecodeError:
+        raise ValueError("legacy gap archive manifest is invalid") from None
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema_version") != 1
+        or manifest.get("kind") != "recall.legacy-gap-archive"
+        or manifest.get("row_count") != metadata.get("row_count")
+        or manifest.get("identity_sha256") != metadata.get("identity_sha256")
+        or manifest.get("highwater_id") != metadata.get("highwater_id")
+        or not isinstance(manifest.get("shards"), list)
+        or sum(
+            shard.get("rows", -1)
+            for shard in manifest["shards"]
+            if isinstance(shard, dict)
+        ) != manifest["row_count"]
+    ):
+        raise ValueError("legacy gap archive manifest is invalid")
+    for shard in manifest["shards"]:
+        if not isinstance(shard, dict) or not isinstance(shard.get("artifact"), dict):
+            raise ValueError("legacy gap archive manifest is invalid")
+        archive.verify_raw(shard["artifact"])
+    return manifest
+
+
+def _discard_covered_legacy_storage(
+    store: BrainStore,
+    archive: S3ArchiveStore | None = None,
+) -> dict[str, object]:
+    """Reclaim legacy rows superseded by S3 identity or a verified gap archive."""
+
+    verified_archive = (
+        _verified_legacy_gap_archive(store, archive)
+        if archive is not None
+        else None
+    )
 
     with store.connect() as connection:
         existing = {
@@ -449,9 +753,30 @@ def _discard_covered_legacy_storage(store: BrainStore) -> dict[str, object]:
         connection.execute(
             "LOCK TABLE public.canonical_events,public.raw_artifacts IN SHARE MODE"
         )
-        coverage = _legacy_storage_coverage(connection)
-        if coverage["canonical_covered"] != coverage["total"]:
-            raise ValueError("legacy source events are not fully S3-canonical-covered")
+        coverage = _legacy_identity_coverage(connection)
+        highwater = int(
+            connection.execute(
+                "SELECT coalesce(max(id),0)::bigint AS value FROM source_events"
+            ).fetchone()["value"]
+        )
+        uncovered_cursor = connection.execute(
+            _legacy_uncovered_identity_query(), (highwater,),
+        )
+        uncovered_digest, uncovered_count = _legacy_gap_digest(uncovered_cursor)
+        if (
+            coverage["canonical_identity_covered"] + uncovered_count
+            != coverage["total"]
+        ):
+            raise ValueError("legacy identity coverage is inconsistent")
+        expected_archive = verified_archive or {}
+        archived = (
+            uncovered_count == 0
+            or expected_archive.get("row_count") == uncovered_count
+            and expected_archive.get("identity_sha256") == uncovered_digest
+            and int(expected_archive.get("highwater_id", -1)) <= highwater
+        )
+        if not archived:
+            raise ValueError("legacy source events are not fully S3-identity-covered")
 
         before_rows = connection.execute(
             """SELECT relname,
@@ -493,7 +818,10 @@ def _discard_covered_legacy_storage(store: BrainStore) -> dict[str, object]:
     ]
     return {
         "status": "ok",
-        "coverage": coverage,
+        "coverage": {
+            **coverage,
+            "archived_uncovered": uncovered_count,
+        },
         "before_bytes": sum(row["before_bytes"] for row in results),
         "after_bytes": sum(row["after_bytes"] for row in results),
         "reclaimed_bytes": sum(row["reclaimed_bytes"] for row in results),
@@ -503,12 +831,15 @@ def _discard_covered_legacy_storage(store: BrainStore) -> dict[str, object]:
 
 def _discard_covered_legacy_storage_indexed(
     store: BrainStore,
+    archive: S3ArchiveStore | None = None,
 ) -> dict[str, object]:
     """Use a disposable lookup index for the one-time global coverage cut."""
 
     _create_legacy_coverage_index(store)
     try:
-        return _discard_covered_legacy_storage(store)
+        if archive is None:
+            return _discard_covered_legacy_storage(store)
+        return _discard_covered_legacy_storage(store, archive)
     finally:
         _drop_legacy_coverage_index(store)
 
@@ -658,6 +989,7 @@ def main() -> None:
         help="exact rebuildable projection to discard; repeat for more than one",
     )
     sub.add_parser("storage-discard-empty-legacy")
+    sub.add_parser("storage-archive-legacy-gap")
     sub.add_parser("storage-discard-covered-legacy")
     authority_audit = sub.add_parser("storage-authority-audit")
     authority_audit.add_argument("--tenant", required=True)
@@ -1099,10 +1431,19 @@ def main() -> None:
         )
     elif args.command == "storage-discard-empty-legacy":
         print(json.dumps(_discard_empty_legacy_storage(store), sort_keys=True))
+    elif args.command == "storage-archive-legacy-gap":
+        print(
+            json.dumps(
+                _archive_uncovered_legacy_storage(store, build_archive_store()),
+                sort_keys=True,
+            )
+        )
     elif args.command == "storage-discard-covered-legacy":
         print(
             json.dumps(
-                _discard_covered_legacy_storage_indexed(store),
+                _discard_covered_legacy_storage_indexed(
+                    store, build_archive_store(),
+                ),
                 sort_keys=True,
             )
         )
