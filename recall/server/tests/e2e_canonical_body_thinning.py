@@ -89,7 +89,13 @@ def insert_document(
     envelope = {
         "role": "assistant",
         "type": "message",
-        "provenance": {"cwd": "/workspace/project", "branch": "main"},
+        "provenance": {
+            "cwd": "/workspace/project",
+            "branch": "main",
+            "artifact_ref": "s3://private/raw-object",
+            "artifact_member": "large/member/path",
+            "original_path": "/private/source/transcript.jsonl",
+        },
         "content": {
             "type": "assistant",
             "message": {"role": "assistant", "text": text},

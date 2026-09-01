@@ -25,11 +25,27 @@ def _compact_event_expression(alias: str = "event") -> str:
         "'recall.oversized-projection.v1' "
         f"THEN {alias}.canonical_redacted->'content' ELSE {content_metadata} END"
     )
+    provenance = (
+        "jsonb_strip_nulls(jsonb_build_object("
+        f"'connector_id',{alias}.canonical_redacted #> '{{provenance,connector_id}}',"
+        f"'connector_schema_version',{alias}.canonical_redacted #> "
+        "'{provenance,connector_schema_version}',"
+        f"'collector_version',{alias}.canonical_redacted #> "
+        "'{provenance,collector_version}',"
+        f"'privacy_policy_version',{alias}.canonical_redacted #> "
+        "'{provenance,privacy_policy_version}',"
+        f"'harness',{alias}.canonical_redacted #> '{{provenance,harness}}',"
+        f"'cwd',{alias}.canonical_redacted #> '{{provenance,cwd}}',"
+        f"'branch',{alias}.canonical_redacted #> '{{provenance,branch}}',"
+        f"'slot',{alias}.canonical_redacted #> '{{provenance,slot}}',"
+        f"'byte_start',{alias}.canonical_redacted #> '{{provenance,byte_start}}',"
+        f"'byte_end',{alias}.canonical_redacted #> '{{provenance,byte_end}}'))"
+    )
     return (
         "jsonb_strip_nulls(jsonb_build_object("
         f"'role',{alias}.canonical_redacted->'role',"
         f"'type',{alias}.canonical_redacted->'type',"
-        f"'provenance',{alias}.canonical_redacted->'provenance',"
+        f"'provenance',{provenance},"
         f"'content',{content},"
         f"'message',{structural('message')},"
         f"'payload',{structural('payload')}))"
