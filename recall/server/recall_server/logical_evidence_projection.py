@@ -1087,6 +1087,7 @@ class CanonicalLogicalEvidenceProjector:
                 ).fetchone()
                 current = connection.execute(
                     """SELECT revision,source_updated_at,receipt_count,
+                              document_content_sha256,
                               manifest_artifact_id,first_occurred_at,
                               last_occurred_at
                          FROM canonical_evidence_documents
@@ -1114,43 +1115,44 @@ class CanonicalLogicalEvidenceProjector:
                     connection,
                     candidate,
                 )
-                current_artifacts = (
-                    None
-                    if old_manifest is None
-                    else (
-                        old_manifest["artifact_id"],
-                        tuple(
-                            reference["artifact_id"]
-                            for reference in old_parts
-                        ),
-                    )
+                same_parts = tuple(
+                    reference["artifact_id"] for reference in old_parts
+                ) == tuple(
+                    reference["artifact_id"]
+                    for reference in upload.part_references
                 )
-                uploaded_artifacts = (
-                    manifest_reference["artifact_id"],
-                    tuple(
-                        reference["artifact_id"]
-                        for reference in upload.part_references
-                    ),
-                )
-                if current_artifacts == uploaded_artifacts:
+                if (
+                    current is not None
+                    and old_manifest is not None
+                    and current["document_content_sha256"]
+                        == prepared.document_content_sha256
+                    and same_parts
+                ):
                     # Repairing an absent immutable object must not replace an
                     # identical database document. The old path cascaded
                     # through every passage, actor, context, and embedding even
                     # though their source bytes had not changed.
-                    connection.execute(
-                        """UPDATE canonical_evidence_documents
-                              SET source_updated_at=%s
-                            WHERE tenant_id=%s AND source_id=%s
-                              AND native_parent_id=%s
-                              AND source_updated_at IS DISTINCT FROM %s""",
-                        (
-                            candidate.source_updated_at,
-                            candidate.tenant_id,
-                            candidate.source_id,
-                            candidate.native_parent_id,
-                            candidate.source_updated_at,
-                        ),
+                    restored_manifest = (
+                        self.projection.restore_manifest_revision(
+                            upload,
+                            revision=int(current["revision"]),
+                        )
                     )
+                    if (
+                        restored_manifest["artifact_id"]
+                        != old_manifest["artifact_id"]
+                    ):
+                        raise LogicalEvidenceError(
+                            "logical_evidence_state_invalid"
+                        )
+                    if (
+                        manifest_reference["artifact_id"]
+                        != restored_manifest["artifact_id"]
+                    ):
+                        self._enqueue_cleanup(
+                            connection,
+                            (manifest_reference,),
+                        )
                     deleted = connection.execute(
                         """DELETE FROM canonical_evidence_document_queue
                             WHERE tenant_id=%s AND source_id=%s

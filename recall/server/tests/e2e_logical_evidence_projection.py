@@ -196,6 +196,9 @@ class FlakyDeleteArchive:
     def read_raw(self, value):
         return self.delegate.read_raw(value)
 
+    def verify_raw(self, value):
+        return self.delegate.verify_raw(value)
+
     def delete_raw(self, value):
         if self.failures_remaining:
             self.failures_remaining -= 1
@@ -349,7 +352,9 @@ def main() -> None:
         assert first["receipts"] == 7
         assert first["objects"] == 4
         assert first["cleanup_failures"] == 0
-        assert archive_object_count(archive_root) == 5
+        assert archive_object_count(archive_root) == 5, archive_object_count(
+            archive_root
+        )
         assert projector.project_pending(
             tenant_id=tenant,
             batch_size=10,
@@ -526,12 +531,14 @@ def main() -> None:
             max_batches=1,
             upload_concurrency=2,
         )
-        assert reprojected["documents"] == 0
+        assert reprojected["documents"] == 0, reprojected
         assert reprojected["repaired"] == 2
         assert reprojected["records"] == 0
         assert reprojected["receipts"] == 0
         assert reprojected["cleanup_failures"] == 0
-        assert archive_object_count(archive_root) == 5
+        assert archive_object_count(archive_root) == 5, archive_object_count(
+            archive_root
+        )
         with store.connect() as connection:
             part_artifacts_after = {
                 row["artifact_id"]
