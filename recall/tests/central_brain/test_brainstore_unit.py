@@ -1109,6 +1109,71 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
         )
         self.assertNotIn("text", json.dumps(report))
 
+    def test_storage_compaction_preserves_relation_scope_and_reports_bytes(
+        self,
+    ) -> None:
+        store = mock.MagicMock()
+        connection = store.connect.return_value.__enter__.return_value
+        existing = mock.MagicMock()
+        existing.fetchall.return_value = [{"relname": "canonical_chunks"}]
+        before = mock.MagicMock()
+        before.fetchone.return_value = {"bytes": 1_000}
+        vacuum = mock.MagicMock()
+        after = mock.MagicMock()
+        after.fetchone.return_value = {"bytes": 200}
+        connection.execute.side_effect = [existing, before, vacuum, after]
+
+        report = server_cli._compact_storage(store, ["canonical_chunks"])
+
+        self.assertEqual(report["before_bytes"], 1_000)
+        self.assertEqual(report["after_bytes"], 200)
+        self.assertEqual(report["reclaimed_bytes"], 800)
+        self.assertEqual(
+            report["relations"],
+            [{
+                "relation": "canonical_chunks",
+                "before_bytes": 1_000,
+                "after_bytes": 200,
+                "reclaimed_bytes": 800,
+            }],
+        )
+        connection.execute.assert_any_call(
+            'VACUUM (FULL, ANALYZE) public."canonical_chunks"'
+        )
+        self.assertFalse(connection.autocommit)
+        self.assertNotIn("content", json.dumps(report))
+
+    def test_storage_compaction_rejects_untrusted_or_duplicate_relations(
+        self,
+    ) -> None:
+        store = mock.MagicMock()
+
+        for relations in (
+            [],
+            ["canonical_chunks", "canonical_chunks"],
+            ["canonical_chunks;drop table canonical_documents"],
+            ["CanonicalChunks"],
+        ):
+            with self.subTest(relations=relations):
+                with self.assertRaisesRegex(ValueError, "relation list"):
+                    server_cli._compact_storage(store, relations)
+        store.connect.assert_not_called()
+
+    def test_storage_compaction_rejects_unknown_relation(self) -> None:
+        store = mock.MagicMock()
+        connection = store.connect.return_value.__enter__.return_value
+        connection.execute.return_value.fetchall.return_value = []
+
+        with self.assertRaisesRegex(ValueError, "unavailable"):
+            server_cli._compact_storage(store, ["canonical_chunks"])
+
+        self.assertFalse(
+            any(
+                "VACUUM" in str(call.args[0])
+                for call in connection.execute.call_args_list
+            )
+        )
+
     def test_worker_pool_matches_actual_concurrency_floor(self) -> None:
         self.assertEqual(
             server_cli._worker_pool_max_size(argparse.Namespace(

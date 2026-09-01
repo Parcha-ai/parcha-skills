@@ -110,6 +110,86 @@ def _storage_footprint(store: BrainStore) -> dict[str, object]:
     }
 
 
+def _compact_storage(
+    store: BrainStore,
+    relations: list[str],
+) -> dict[str, object]:
+    """Rewrite named user relations to reclaim bloat without deleting rows."""
+
+    if (
+        not relations
+        or len(relations) > 100
+        or len(set(relations)) != len(relations)
+        or any(re.fullmatch(r"[a-z][a-z0-9_]{0,62}", name) is None for name in relations)
+    ):
+        raise ValueError("storage compaction relation list is invalid")
+    with store.connect() as connection:
+        existing = {
+            row["relname"]
+            for row in connection.execute(
+                """SELECT relname
+                     FROM pg_stat_user_tables
+                    WHERE schemaname='public' AND relname=ANY(%s)""",
+                (relations,),
+            ).fetchall()
+        }
+    if existing != set(relations):
+        raise ValueError("storage compaction relation is unavailable")
+
+    results = []
+    for relation in relations:
+        with store.connect() as connection:
+            connection.autocommit = True
+            try:
+                before = int(
+                    connection.execute(
+                        "SELECT pg_total_relation_size(to_regclass(%s)) AS bytes",
+                        (f"public.{relation}",),
+                    ).fetchone()["bytes"]
+                )
+                logging.getLogger(__name__).info(
+                    "storage compaction relation=%s phase=started before_bytes=%s",
+                    relation,
+                    before,
+                )
+                # The closed identifier grammar above is the injection boundary;
+                # VACUUM cannot accept an identifier as a query parameter.
+                connection.execute(
+                    f'VACUUM (FULL, ANALYZE) public."{relation}"'
+                )
+                after = int(
+                    connection.execute(
+                        "SELECT pg_total_relation_size(to_regclass(%s)) AS bytes",
+                        (f"public.{relation}",),
+                    ).fetchone()["bytes"]
+                )
+            finally:
+                connection.autocommit = False
+        logging.getLogger(__name__).info(
+            "storage compaction relation=%s phase=complete before_bytes=%s after_bytes=%s",
+            relation,
+            before,
+            after,
+        )
+        results.append(
+            {
+                "relation": relation,
+                "before_bytes": before,
+                "after_bytes": after,
+                "reclaimed_bytes": max(0, before - after),
+            }
+        )
+    return {
+        "status": "ok",
+        "before_bytes": sum(int(row["before_bytes"]) for row in results),
+        "after_bytes": sum(int(row["after_bytes"]) for row in results),
+        "reclaimed_bytes": sum(
+            int(row["reclaimed_bytes"]) for row in results
+        ),
+        "relations": results,
+    }
+
+
 def main() -> None:
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"), format="%(levelname)s %(message)s"
@@ -119,6 +199,13 @@ def main() -> None:
     sub = ap.add_subparsers(dest="command", required=True)
     sub.add_parser("migrate")
     sub.add_parser("storage-footprint")
+    compact_storage = sub.add_parser("storage-compact")
+    compact_storage.add_argument(
+        "--relation",
+        action="append",
+        required=True,
+        help="exact public user relation to rewrite; repeat for more than one",
+    )
     sub.add_parser("archive-check")
     sub.add_parser("evidence-archive-check")
     publish_duckdb = sub.add_parser("publish-archil-duckdb")
@@ -541,6 +628,13 @@ def main() -> None:
         print(json.dumps({"status": "ok", "schema_version": SCHEMA_VERSION}))
     elif args.command == "storage-footprint":
         print(json.dumps(_storage_footprint(store), sort_keys=True))
+    elif args.command == "storage-compact":
+        print(
+            json.dumps(
+                _compact_storage(store, args.relation),
+                sort_keys=True,
+            )
+        )
     elif args.command == "rebuild":
         print(json.dumps(store.rebuild(), sort_keys=True))
     elif args.command == "managed-worker":
