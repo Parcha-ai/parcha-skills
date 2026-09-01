@@ -212,6 +212,38 @@ def main() -> None:
                 suffix="good",
                 text=text,
             )
+            oversized_event, oversized_document = insert_document(
+                connection,
+                tenant=tenant,
+                principal=principal,
+                source=source,
+                suffix="oversized",
+                text=text,
+            )
+            oversized_projection = {
+                "contract": "recall.oversized-projection.v1",
+                "schema_version": 1,
+                "full_record_available": True,
+                "full_content_sha256": "a" * 64,
+                "full_size_bytes": 100_000,
+                "archive_encoding": "gzip",
+                "archive_size_bytes": 25_000,
+                "head": "duplicate head " * 10_000,
+                "tail": "duplicate tail " * 10_000,
+            }
+            connection.execute(
+                """UPDATE canonical_events
+                      SET canonical_redacted=jsonb_set(
+                          canonical_redacted,'{content}',%s::jsonb
+                      )
+                    WHERE tenant_id=%s AND source_id=%s AND event_id=%s""",
+                (
+                    json.dumps(oversized_projection),
+                    tenant,
+                    source,
+                    oversized_event,
+                ),
+            )
             _bad_event, bad_document = insert_document(
                 connection,
                 tenant=tenant,
@@ -228,10 +260,10 @@ def main() -> None:
             batch_size=10,
             max_batches=1,
         )
-        assert report["documents"] == 1
-        assert report["events"] == 1
-        assert report["document_bytes_removed"] == len(text.encode())
-        assert report["event_bytes_replaced"] > len(text.encode())
+        assert report["documents"] == 2
+        assert report["events"] == 2
+        assert report["document_bytes_removed"] == 2 * len(text.encode())
+        assert report["event_bytes_replaced"] > 2 * len(text.encode())
 
         with store.connect() as connection:
             good = connection.execute(
@@ -251,6 +283,14 @@ def main() -> None:
                     WHERE tenant_id=%s AND source_id=%s AND document_id=%s""",
                 (tenant, source, bad_document),
             ).fetchone()
+            oversized = connection.execute(
+                """SELECT event.canonical_redacted
+                     FROM canonical_documents document
+                     JOIN canonical_events event USING(tenant_id,source_id,event_id)
+                    WHERE document.tenant_id=%s AND document.source_id=%s
+                      AND document.document_id=%s""",
+                (tenant, source, oversized_document),
+            ).fetchone()["canonical_redacted"]
             rebuilt = connection.execute(
                 """SELECT string_agg(text_redacted,'' ORDER BY ordinal) AS text
                      FROM canonical_chunks
@@ -271,6 +311,14 @@ def main() -> None:
             == "assistant"
         )
         assert "large_duplicate" not in good["canonical_redacted"]["content"]
+        assert oversized["content"] == {
+            "contract": "recall.oversized-projection.v1",
+            "schema_version": 1,
+            "full_record_available": True,
+            "full_content_sha256": "a" * 64,
+            "full_size_bytes": 100_000,
+            "archive_encoding": "gzip",
+        }
         assert rebuilt == text
         assert bad["text_redacted"] == text
         assert bad["body_location"] == "inline"
