@@ -1184,6 +1184,100 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
             )
         )
 
+    def test_derived_storage_discard_is_fixed_scope_and_reports_bytes(
+        self,
+    ) -> None:
+        store = mock.MagicMock()
+        connection = store.connect.return_value.__enter__.return_value
+        existing = mock.MagicMock()
+        existing.fetchall.return_value = [
+            {"relname": "canonical_passage_contexts"},
+            {"relname": "canonical_passage_embedding_representations"},
+        ]
+        before = mock.MagicMock()
+        before.fetchall.return_value = [
+            {
+                "relname": "canonical_passage_contexts",
+                "total_bytes": 1_000,
+            },
+            {
+                "relname": "canonical_passage_embedding_representations",
+                "total_bytes": 2_000,
+            },
+        ]
+        truncate = mock.MagicMock()
+        after = mock.MagicMock()
+        after.fetchall.return_value = [
+            {
+                "relname": "canonical_passage_contexts",
+                "total_bytes": 100,
+            },
+            {
+                "relname": "canonical_passage_embedding_representations",
+                "total_bytes": 200,
+            },
+        ]
+        connection.execute.side_effect = [existing, before, truncate, after]
+
+        report = server_cli._discard_derived_storage(
+            store,
+            ["canonical_passage_contexts"],
+        )
+
+        self.assertEqual(report["before_bytes"], 3_000)
+        self.assertEqual(report["after_bytes"], 300)
+        self.assertEqual(report["reclaimed_bytes"], 2_700)
+        connection.execute.assert_any_call(
+            'TRUNCATE TABLE '
+            'public."canonical_passage_contexts",'
+            'public."canonical_passage_embedding_representations"'
+        )
+        self.assertNotIn("content", json.dumps(report))
+
+    def test_derived_storage_discard_expands_turn_dependency(self) -> None:
+        store = mock.MagicMock()
+        connection = store.connect.return_value.__enter__.return_value
+        existing = mock.MagicMock()
+        existing.fetchall.return_value = [
+            {"relname": "turn_embedding_items"},
+            {"relname": "turn_embeddings"},
+        ]
+        before = mock.MagicMock()
+        before.fetchall.return_value = [
+            {"relname": "turn_embedding_items", "total_bytes": 10},
+            {"relname": "turn_embeddings", "total_bytes": 20},
+        ]
+        truncate = mock.MagicMock()
+        after = mock.MagicMock()
+        after.fetchall.return_value = [
+            {"relname": "turn_embedding_items", "total_bytes": 1},
+            {"relname": "turn_embeddings", "total_bytes": 2},
+        ]
+        connection.execute.side_effect = [existing, before, truncate, after]
+
+        server_cli._discard_derived_storage(store, ["turn_embeddings"])
+
+        connection.execute.assert_any_call(
+            'TRUNCATE TABLE public."turn_embedding_items",'
+            'public."turn_embeddings"'
+        )
+
+    def test_derived_storage_discard_rejects_authoritative_relations(
+        self,
+    ) -> None:
+        store = mock.MagicMock()
+
+        for relations in (
+            [],
+            ["item_embeddings", "item_embeddings"],
+            ["canonical_documents"],
+            ["source_events"],
+        ):
+            with self.subTest(relations=relations):
+                with self.assertRaisesRegex(ValueError, "relation list"):
+                    server_cli._discard_derived_storage(store, relations)
+        store.connect.assert_not_called()
+
     def test_worker_pool_matches_actual_concurrency_floor(self) -> None:
         self.assertEqual(
             server_cli._worker_pool_max_size(argparse.Namespace(
