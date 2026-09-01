@@ -790,6 +790,54 @@ class PassageProjectionTests(unittest.TestCase):
         ):
             projector.project_pending(max_batches=1)
 
+    def test_transient_archive_failure_never_requeues_logical_document(
+        self,
+    ) -> None:
+        class Connection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            @staticmethod
+            def execute(_query, _values):
+                return SimpleNamespace(fetchone=lambda: {"count": 1})
+
+        projector = CanonicalPassageProjector(
+            SimpleNamespace(
+                pool_max_size=4,
+                connect=lambda: Connection(),
+            ),
+            object(),  # type: ignore[arg-type]
+            policy=PassagePolicy(target_tokens=8, overlap_tokens=2),
+        )
+        candidate = PassageCandidate(
+            tenant_id="tenant:company:test",
+            source_id="source:test",
+            logical_document_id="ldoc_" + "a" * 32,
+            revision=4,
+            generation=2,
+            changed_at=datetime.now(timezone.utc),
+            source_document_sha256="b" * 64,
+            manifest_reference={},
+            part_references=(),
+        )
+        projector._pending = mock.Mock(return_value=(candidate,))
+        projector._prepare = mock.Mock(
+            side_effect=LogicalEvidenceError("logical_evidence_unavailable")
+        )
+        projector._requeue_missing = mock.Mock(return_value=1)
+
+        result = projector.project_pending(max_batches=10)
+
+        self.assertEqual(result["documents"], 0)
+        self.assertEqual(result["requeued"], 0)
+        self.assertEqual(result["unavailable"], 1)
+        self.assertEqual(result["batches"], 1)
+        projector._requeue_missing.assert_not_called()
+        projector._pending.assert_called_once()
+
     def test_revision_projection_reuses_unchanged_content_embeddings(
         self,
     ) -> None:

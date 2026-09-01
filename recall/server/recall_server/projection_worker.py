@@ -119,6 +119,7 @@ def run_projection_worker(
             "records": int(documents["records"]),
             "passage_documents": int(projected["documents"]),
             "passage_requeued": int(projected.get("requeued", 0)),
+            "passage_unavailable": int(projected.get("unavailable", 0)),
             "passages": int(projected["passages"]),
             "embedded": int(embedded["processed"]),
             "embedding_error": embedding_error,
@@ -132,7 +133,8 @@ def run_projection_worker(
         }
         LOG.info(
             "projection cycle status=%s documents=%s logical_pending=%s records=%s "
-            "passage_documents=%s passage_requeued=%s passages=%s embedded=%s "
+            "passage_documents=%s passage_requeued=%s passage_unavailable=%s "
+            "passages=%s embedded=%s "
             "embedding_error=%s "
             "parquet_shards=%s "
             "parquet_rows=%s parquet_stale=%s parquet_contended=%s "
@@ -147,6 +149,7 @@ def run_projection_worker(
                     "records",
                     "passage_documents",
                     "passage_requeued",
+                    "passage_unavailable",
                     "passages",
                     "embedded",
                     "embedding_error",

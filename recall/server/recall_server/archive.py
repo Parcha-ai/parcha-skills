@@ -269,6 +269,16 @@ class _ArchiveStore:
             source_id=value["source_id"],
         )
 
+    def verify_raw(self, value: dict[str, Any]) -> None:
+        """Verify a persisted reference without downloading its payload."""
+
+        reference = self._from_contract(value)
+        self.verify(
+            reference,
+            tenant_id=value["tenant_id"],
+            source_id=value["source_id"],
+        )
+
     def delete_internal_raw(self, value: dict[str, Any]) -> bool:
         """Delete a trusted persisted reference without downloading its payload.
 
@@ -495,6 +505,29 @@ class FilesystemArchiveStore(_ArchiveStore):
         ):
             raise ArchiveCorruption("archive content digest mismatch")
         return payload
+
+    def verify(
+        self,
+        reference: ArtifactReference,
+        *,
+        tenant_id: str,
+        source_id: str,
+    ) -> None:
+        self._validate_reference(reference)
+        self._authorize(reference, tenant_id=tenant_id, source_id=source_id)
+        directory = self.root / reference.object_key
+        data_path = directory / "data"
+        metadata_path = directory / "metadata.json"
+        if data_path.is_symlink() or metadata_path.is_symlink():
+            raise ArchiveCorruption("archive object path is unsafe")
+        try:
+            metadata = json.loads(metadata_path.read_bytes())
+            details = data_path.stat()
+        except (FileNotFoundError, json.JSONDecodeError) as error:
+            raise ArchiveNotFound("archive object not found") from error
+        _verify_metadata(reference, metadata)
+        if not stat.S_ISREG(details.st_mode) or details.st_size != reference.size_bytes:
+            raise ArchiveCorruption("archive metadata mismatch")
 
     def delete(
         self,
@@ -734,6 +767,29 @@ class S3ArchiveStore(_ArchiveStore):
             maximum_bytes=self.maximum_bytes,
         )
         return payload
+
+    def verify(
+        self,
+        reference: ArtifactReference,
+        *,
+        tenant_id: str,
+        source_id: str,
+    ) -> None:
+        self._validate_reference(reference)
+        self._authorize(reference, tenant_id=tenant_id, source_id=source_id)
+        try:
+            response = self.client.head_object(
+                Bucket=self.bucket,
+                Key=reference.object_key,
+                **self._version_kwargs(reference),
+            )
+        except ArchiveNotFound:
+            raise
+        except Exception as error:
+            raise ArchiveError("archive provider request failed") from error
+        _verify_metadata(reference, response.get("Metadata"))
+        if response.get("ContentLength") != reference.size_bytes:
+            raise ArchiveCorruption("archive metadata mismatch")
 
     def _read_parallel(
         self,

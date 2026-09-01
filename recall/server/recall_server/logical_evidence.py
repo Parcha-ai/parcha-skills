@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 import orjson
 
 from .actor_attribution import ActorLink, actor_links, canonical_actor_links
+from .archive import ArchiveCorruption, ArchiveError, ArchiveNotFound
 
 LOGICAL_DOCUMENT_ID_RE = re.compile(r"ldoc_[0-9a-f]{32}\Z")
 EVIDENCE_ID_RE = re.compile(r"evd_[0-9a-f]{32}\Z")
@@ -52,6 +53,7 @@ class EvidenceArchive(Protocol):
         created_at: str,
     ) -> dict[str, Any]: ...
 
+    def verify_raw(self, value: dict[str, Any]) -> None: ...
     def read_raw(self, value: dict[str, Any]) -> bytes: ...
     def delete_raw(self, value: dict[str, Any]) -> bool: ...
 
@@ -790,6 +792,12 @@ class LogicalEvidenceProjectionStore:
                 or reference.get("media_type") != PART_MEDIA_TYPE
             ):
                 return None
+            verify_raw = getattr(self.archive, "verify_raw", None)
+            if callable(verify_raw):
+                try:
+                    verify_raw(reference)
+                except ArchiveNotFound:
+                    return None
             return reference
 
         def close_part(last_record: int) -> None:
@@ -999,10 +1007,12 @@ class LogicalEvidenceProjectionStore:
             raise LogicalEvidenceError("logical_evidence_not_found")
         try:
             value = json.loads(self.archive.read_raw(reference))
-        except Exception as error:
-            if error.__class__.__name__ == "ArchiveCorruption":
-                raise LogicalEvidenceError("logical_evidence_corrupt") from None
+        except ArchiveNotFound as error:
             raise LogicalEvidenceError("logical_evidence_not_found") from error
+        except ArchiveCorruption:
+            raise LogicalEvidenceError("logical_evidence_corrupt") from None
+        except ArchiveError as error:
+            raise LogicalEvidenceError("logical_evidence_unavailable") from error
         if not isinstance(value, dict):
             raise LogicalEvidenceError("logical_evidence_manifest_invalid")
         version = (value.get("contract"), value.get("schema_version"))
@@ -1031,10 +1041,12 @@ class LogicalEvidenceProjectionStore:
             raise LogicalEvidenceError("logical_evidence_not_found")
         try:
             payload = self.archive.read_raw(reference)
-        except Exception as error:
-            if error.__class__.__name__ == "ArchiveCorruption":
-                raise LogicalEvidenceError("logical_evidence_corrupt") from None
+        except ArchiveNotFound as error:
             raise LogicalEvidenceError("logical_evidence_not_found") from error
+        except ArchiveCorruption:
+            raise LogicalEvidenceError("logical_evidence_corrupt") from None
+        except ArchiveError as error:
+            raise LogicalEvidenceError("logical_evidence_unavailable") from error
         if not hmac.compare_digest(
             hashlib.sha256(payload).hexdigest(),
             reference.get("content_sha256", ""),
