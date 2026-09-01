@@ -153,9 +153,19 @@ def _compact_storage(
                     before,
                 )
                 # The closed identifier grammar above is the injection boundary;
-                # VACUUM cannot accept an identifier as a query parameter.
+                # maintenance statements cannot parameterize identifiers.
                 connection.execute(
                     f'VACUUM (FULL, ANALYZE) public."{relation}"'
+                )
+                logging.getLogger(__name__).info(
+                    "storage compaction relation=%s phase=reindexing",
+                    relation,
+                )
+                # PlanetScale recommends concurrent reindexing separately from
+                # table compaction because index bloat is not reclaimed by its
+                # supported table-maintenance path.
+                connection.execute(
+                    f'REINDEX TABLE CONCURRENTLY public."{relation}"'
                 )
                 after = int(
                     connection.execute(
