@@ -1380,6 +1380,9 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
             "tenant:company:parcha",
         )
 
+        legacy_call = connection.execute.call_args_list[0]
+        self.assertEqual(len(legacy_call.args), 1)
+        self.assertNotIn("event.tenant_id", legacy_call.args[0])
         self.assertTrue(report["database_coverage_complete"])
         self.assertTrue(report["object_verification_required"])
         self.assertEqual(report["queues"]["cleanup"], 2)

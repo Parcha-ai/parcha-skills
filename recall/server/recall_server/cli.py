@@ -383,14 +383,12 @@ def _storage_authority_audit(
                       count(*) FILTER (
                           WHERE EXISTS (
                               SELECT 1 FROM canonical_events event
-                               WHERE event.tenant_id=%s
-                                 AND event.source_id=source_events.source_id
+                               WHERE event.source_id=source_events.source_id
                                  AND event.native_id=source_events.native_id
                                  AND event.content_sha256=source_events.content_sha256
                           )
                       )::bigint AS canonical_covered
-                 FROM source_events""",
-            (tenant_id,),
+                 FROM source_events"""
         ).fetchone()
         documents = connection.execute(
             """SELECT count(*)::bigint AS total,
