@@ -325,13 +325,11 @@ def _recompact_s3_event_bodies(
         raise ValueError("S3 event body compaction batch size is invalid")
 
     expression = _compact_event_expression()
-    candidate_table = "recall_s3_event_body_candidates"
     events = after_bytes = batches = 0
-    with store.connect() as connection:
-        try:
-            connection.execute(
-                f"""CREATE TEMP TABLE {candidate_table}
-                         ON COMMIT PRESERVE ROWS AS
+    while True:
+        with store.connect() as connection:
+            row = connection.execute(
+                f"""WITH batch AS MATERIALIZED (
                      SELECT event.tenant_id,event.source_id,event.event_id
                        FROM canonical_events AS event
                        JOIN raw_artifacts AS artifact
@@ -376,34 +374,11 @@ def _recompact_s3_event_bodies(
                                AND queued.native_parent_id=COALESCE(
                                    event.native_parent_id,event.native_id
                                )
-                        )"""
-            )
-            connection.execute(
-                f"""CREATE UNIQUE INDEX ON {candidate_table}(
-                         tenant_id,source_id,event_id
-                     )"""
-            )
-            total = int(
-                connection.execute(
-                    f"SELECT count(*)::bigint AS events FROM {candidate_table}"
-                ).fetchone()["events"]
-            )
-            connection.commit()
-            logging.getLogger(__name__).info(
-                "S3 event body compaction phase=snapshot candidates=%s", total
-            )
-
-            while True:
-                row = connection.execute(
-                    f"""WITH batch AS MATERIALIZED (
-                             SELECT candidate.tenant_id,candidate.source_id,
-                                    candidate.event_id
-                               FROM {candidate_table} AS candidate
-                              ORDER BY candidate.tenant_id,candidate.source_id,
-                                       candidate.event_id
-                              LIMIT %s
-                              FOR UPDATE SKIP LOCKED
-                         ), updated AS (
+                        )
+                      ORDER BY event.tenant_id,event.source_id,event.event_id
+                      LIMIT %s
+                      FOR UPDATE OF event SKIP LOCKED
+                 ), updated AS (
                              UPDATE canonical_events AS event
                                 SET canonical_redacted={expression},
                                     body_location='raw'
@@ -411,57 +386,36 @@ def _recompact_s3_event_bodies(
                               WHERE event.tenant_id=batch.tenant_id
                                 AND event.source_id=batch.source_id
                                 AND event.event_id=batch.event_id
-                          RETURNING event.tenant_id,event.source_id,event.event_id,
-                                    octet_length(
+                          RETURNING octet_length(
                                         event.canonical_redacted::text
                                     )::bigint AS after_bytes
-                         ), deleted AS (
-                             DELETE FROM {candidate_table} AS candidate
-                              USING updated
-                              WHERE candidate.tenant_id=updated.tenant_id
-                                AND candidate.source_id=updated.source_id
-                                AND candidate.event_id=updated.event_id
-                          RETURNING updated.after_bytes
                          )
                          SELECT count(*)::bigint AS events,
                                 coalesce(sum(after_bytes),0)::bigint AS after_bytes
-                           FROM deleted""",
+                           FROM updated""",
                     (batch_size,),
                 ).fetchone()
-                current = int(row["events"])
-                current_after = int(row["after_bytes"])
-                connection.commit()
-                if current == 0:
-                    break
-                events += current
-                after_bytes += current_after
-                batches += 1
-                logging.getLogger(__name__).info(
-                    "S3 event body compaction phase=batch batch=%s events=%s "
-                    "remaining=%s",
-                    batches,
-                    current,
-                    max(0, total - events),
-                )
-                if current < batch_size:
-                    break
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            try:
-                connection.execute(f"DROP TABLE IF EXISTS {candidate_table}")
-                connection.commit()
-            except Exception:
-                connection.rollback()
-                raise
+        current = int(row["events"])
+        if current == 0:
+            break
+        events += current
+        after_bytes += int(row["after_bytes"])
+        batches += 1
+        logging.getLogger(__name__).info(
+            "S3 event body compaction phase=batch batch=%s events=%s total=%s",
+            batches,
+            current,
+            events,
+        )
+        if current < batch_size:
+            break
 
     # The full pre-rewrite byte total is already available from the aggregate
     # storage-event-shape diagnostic. Avoid a second decompression pass here;
     # this operation reports the exact compacted bytes it wrote.
     return {
         "status": "complete",
-        "candidates": total,
+        "candidates": events,
         "events": events,
         "batches": batches,
         "after_bytes": after_bytes,
