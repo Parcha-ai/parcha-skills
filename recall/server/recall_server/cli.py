@@ -402,7 +402,9 @@ def _storage_authority_audit(
                  JOIN canonical_events event
                    USING(tenant_id,source_id,event_id)
                  JOIN raw_artifacts artifact
-                   USING(tenant_id,source_id,artifact_id)
+                   ON artifact.tenant_id=event.tenant_id
+                  AND artifact.source_id=event.source_id
+                  AND artifact.artifact_id=event.artifact_id
                 WHERE document.tenant_id=%s
                   AND document.is_current
                   AND document.deleted_at IS NULL""",
