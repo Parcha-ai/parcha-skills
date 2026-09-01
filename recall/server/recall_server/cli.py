@@ -210,6 +210,16 @@ _DISCARDABLE_DERIVED_RELATIONS = frozenset(
     }
 )
 
+_EMPTY_LEGACY_RELATIONS = (
+    "chunks",
+    "entities",
+    "item_embeddings",
+    "items",
+    "source_events",
+    "turn_embedding_items",
+    "turn_embeddings",
+)
+
 
 def _discard_derived_storage(
     store: BrainStore,
@@ -290,6 +300,77 @@ def _discard_derived_storage(
     }
 
 
+def _discard_empty_legacy_storage(store: BrainStore) -> dict[str, object]:
+    """Reclaim the legacy plane only when its authoritative event table is empty."""
+
+    with store.connect() as connection:
+        existing = {
+            row["relname"]
+            for row in connection.execute(
+                """SELECT relname
+                     FROM pg_stat_user_tables
+                    WHERE schemaname='public' AND relname=ANY(%s)""",
+                (_EMPTY_LEGACY_RELATIONS,),
+            ).fetchall()
+        }
+        if existing != set(_EMPTY_LEGACY_RELATIONS):
+            raise ValueError("empty legacy storage relation is unavailable")
+
+        has_source_events = bool(
+            connection.execute(
+                "SELECT EXISTS(SELECT 1 FROM public.source_events LIMIT 1) AS present"
+            ).fetchone()["present"]
+        )
+        if has_source_events:
+            raise ValueError("legacy source events are not empty")
+
+        before_rows = connection.execute(
+            """SELECT relname,
+                      pg_total_relation_size(relid) AS total_bytes
+                 FROM pg_stat_user_tables
+                WHERE schemaname='public' AND relname=ANY(%s)""",
+            (_EMPTY_LEGACY_RELATIONS,),
+        ).fetchall()
+        before = {
+            row["relname"]: int(row["total_bytes"])
+            for row in before_rows
+        }
+
+        identifiers = ",".join(
+            f'public."{name}"' for name in _EMPTY_LEGACY_RELATIONS
+        )
+        connection.execute(f"TRUNCATE TABLE {identifiers}")
+
+        after_rows = connection.execute(
+            """SELECT relname,
+                      pg_total_relation_size(relid) AS total_bytes
+                 FROM pg_stat_user_tables
+                WHERE schemaname='public' AND relname=ANY(%s)""",
+            (_EMPTY_LEGACY_RELATIONS,),
+        ).fetchall()
+        after = {
+            row["relname"]: int(row["total_bytes"])
+            for row in after_rows
+        }
+
+    results = [
+        {
+            "relation": relation,
+            "before_bytes": before[relation],
+            "after_bytes": after[relation],
+            "reclaimed_bytes": max(0, before[relation] - after[relation]),
+        }
+        for relation in _EMPTY_LEGACY_RELATIONS
+    ]
+    return {
+        "status": "ok",
+        "before_bytes": sum(row["before_bytes"] for row in results),
+        "after_bytes": sum(row["after_bytes"] for row in results),
+        "reclaimed_bytes": sum(row["reclaimed_bytes"] for row in results),
+        "relations": results,
+    }
+
+
 def main() -> None:
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"), format="%(levelname)s %(message)s"
@@ -314,6 +395,7 @@ def main() -> None:
         choices=sorted(_DISCARDABLE_DERIVED_RELATIONS),
         help="exact rebuildable projection to discard; repeat for more than one",
     )
+    sub.add_parser("storage-discard-empty-legacy")
     sub.add_parser("archive-check")
     sub.add_parser("evidence-archive-check")
     publish_duckdb = sub.add_parser("publish-archil-duckdb")
@@ -750,6 +832,8 @@ def main() -> None:
                 sort_keys=True,
             )
         )
+    elif args.command == "storage-discard-empty-legacy":
+        print(json.dumps(_discard_empty_legacy_storage(store), sort_keys=True))
     elif args.command == "rebuild":
         print(json.dumps(store.rebuild(), sort_keys=True))
     elif args.command == "managed-worker":
