@@ -128,6 +128,18 @@ def _canonical_event_shape(store: BrainStore) -> dict[str, object]:
                       )::bigint AS toasted_events,
                       count(*) FILTER (WHERE body_location='inline')::bigint
                           AS inline_events,
+                      count(*) FILTER (
+                          WHERE body_location='inline'
+                            AND artifact.storage_backend='s3'
+                            AND artifact.state='live'
+                      )::bigint AS inline_s3_live_events,
+                      count(*) FILTER (
+                          WHERE body_location='inline'
+                            AND NOT (
+                                artifact.storage_backend='s3'
+                                AND artifact.state='live'
+                            )
+                      )::bigint AS inline_without_s3_live_events,
                       count(*) FILTER (WHERE body_location='raw')::bigint
                           AS raw_events,
                       coalesce(sum(CASE WHEN canonical_redacted ? 'content'
@@ -142,7 +154,11 @@ def _canonical_event_shape(store: BrainStore) -> dict[str, object]:
                       coalesce(sum(CASE WHEN canonical_redacted ? 'payload'
                           THEN pg_column_size(canonical_redacted->'payload')
                           ELSE 0 END),0)::bigint AS payload_bytes
-                 FROM canonical_events"""
+                 FROM canonical_events AS event
+                 JOIN raw_artifacts AS artifact
+                   ON artifact.tenant_id=event.tenant_id
+                  AND artifact.source_id=event.source_id
+                  AND artifact.artifact_id=event.artifact_id"""
         ).fetchone()
     return {"status": "ok", **{key: int(value) for key, value in row.items()}}
 
@@ -457,6 +473,38 @@ def _recompact_oversized_event_pointers(store: BrainStore) -> dict[str, object]:
         "before_bytes": before,
         "after_bytes": after,
         "replaced_bytes": before - after,
+    }
+
+
+def _recompact_raw_s3_event_bodies(store: BrainStore) -> dict[str, object]:
+    """Remove inline bodies when the immutable raw artifact is live in S3."""
+
+    expression = _compact_event_expression()
+    with store.connect() as connection:
+        row = connection.execute(
+            f"""WITH updated AS (
+                     UPDATE canonical_events AS event
+                        SET canonical_redacted={expression},
+                            body_location='raw'
+                       FROM raw_artifacts AS artifact
+                      WHERE event.tenant_id=artifact.tenant_id
+                        AND event.source_id=artifact.source_id
+                        AND event.artifact_id=artifact.artifact_id
+                        AND event.body_location='inline'
+                        AND artifact.storage_backend='s3'
+                        AND artifact.state='live'
+                  RETURNING octet_length(
+                      event.canonical_redacted::text
+                  )::bigint AS after_bytes
+                 )
+                 SELECT count(*)::bigint AS events,
+                        coalesce(sum(after_bytes),0)::bigint AS after_bytes
+                   FROM updated"""
+        ).fetchone()
+    return {
+        "status": "complete",
+        "events": int(row["events"]),
+        "after_bytes": int(row["after_bytes"]),
     }
 
 
@@ -1424,6 +1472,7 @@ def main() -> None:
     sub.add_parser("storage-finish-event-compaction")
     sub.add_parser("storage-cancel-stale-event-compaction")
     sub.add_parser("storage-recompact-oversized-events")
+    sub.add_parser("storage-recompact-raw-s3-event-bodies")
     recompact_s3_events = sub.add_parser("storage-recompact-s3-event-bodies")
     recompact_s3_events.add_argument("--batch-size", type=int, default=10_000)
     recompact_s3_events.add_argument("--prepared-queue", action="store_true")
@@ -1885,6 +1934,8 @@ def main() -> None:
         print(json.dumps(_cancel_stale_event_compaction(store), sort_keys=True))
     elif args.command == "storage-recompact-oversized-events":
         print(json.dumps(_recompact_oversized_event_pointers(store), sort_keys=True))
+    elif args.command == "storage-recompact-raw-s3-event-bodies":
+        print(json.dumps(_recompact_raw_s3_event_bodies(store), sort_keys=True))
     elif args.command == "storage-recompact-s3-event-bodies":
         print(
             json.dumps(

@@ -1118,6 +1118,8 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
             "max_json_bytes": 300,
             "toasted_events": 2,
             "inline_events": 7,
+            "inline_s3_live_events": 6,
+            "inline_without_s3_live_events": 1,
             "raw_events": 3,
             "content_bytes": 400,
             "provenance_bytes": 200,
@@ -1129,6 +1131,7 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
 
         self.assertEqual(report["json_bytes"], 1_000)
         self.assertEqual(report["content_bytes"], 400)
+        self.assertEqual(report["inline_s3_live_events"], 6)
         self.assertNotIn("content_text", report)
         sql = connection.execute.call_args.args[0]
         self.assertIn("pg_column_size", sql)
@@ -1266,6 +1269,24 @@ class SemanticRetrievalConfigurationTest(unittest.TestCase):
         self.assertNotIn("CREATE TEMP TABLE", batch_sql)
         self.assertNotIn("ORDER BY", batch_sql)
         self.assertNotIn("text_redacted", batch_sql)
+
+    def test_raw_s3_event_body_repair_requires_live_immutable_artifact(self) -> None:
+        store = mock.MagicMock()
+        connection = store.connect.return_value.__enter__.return_value
+        connection.execute.return_value.fetchone.return_value = {
+            "events": 7,
+            "after_bytes": 900,
+        }
+
+        report = server_cli._recompact_raw_s3_event_bodies(store)
+
+        self.assertEqual(report["events"], 7)
+        self.assertEqual(report["after_bytes"], 900)
+        sql = connection.execute.call_args.args[0]
+        self.assertIn("event.body_location='inline'", sql)
+        self.assertIn("artifact.storage_backend='s3'", sql)
+        self.assertIn("artifact.state='live'", sql)
+        self.assertNotIn("canonical_documents", sql)
 
     def test_storage_compaction_preserves_relation_scope_and_reports_bytes(
         self,
