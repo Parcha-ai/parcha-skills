@@ -339,6 +339,11 @@ CONFIG_KEYS = frozenset({
     "credential_command",
     "credential_env_allowlist",
     "zellij_agent_commands",
+    # Owned by the schema-18 plugin (plugin_next), which shares this file.
+    # The broker must tolerate them or enabling the active slice silently
+    # kills the legacy broker at load_config.
+    "active",
+    "trusted_bot_users",
 })
 CONFIG_CONTROL_PATTERN = re.compile(r"[\x00-\x1f\x7f]")
 
