@@ -335,3 +335,30 @@ the exit criteria for any component owning durable state, not in a one-off hunt.
 
 **Still open:** the deployed system remains patched schema-17. Everything merged on 2026-08-29
 and 2026-08-30 sits on main unrun, and cutover needs an explicit gateway-restart grant.
+
+## Amendment A5 — Rip and replace (2026-09-02)
+
+Miguel's call: one system, downtime acceptable. L2d/L3's "single-writer cutover per binding
+kind, then delete the compatibility adapter" collapsed into one PR (#441, 0.4.0):
+
+- Deleted: `bridge_runtime.py` (12k lines), `routing.py`, `slack_protocol.py`,
+  `hermes_compat.py`, the schema migration tooling (`schema_orchestrator/receipt/rehearsal`),
+  the legacy plugin, Zellij and Herdr endpoints, and 40 tests that only pinned them.
+- Kept: `domain_runtime` + `domain_schema` (schema 18), `native_driver`, `security`,
+  `domain_control`, and `plugin_next` as the `tether` plugin, now carrying the active
+  scheduler, a local NDJSON broker on the same socket/protocol the CLI already spoke, and a
+  urllib Slack egress. `tether_notify.py` is self-contained.
+- The router change that made peers work: a thread bound in the domain is an ambient-owned,
+  peer-addressable binding; trusted peers reach it without mentioning the local bot.
+
+**Proof (live, 2026-09-02 01:44 UTC):** `tether notify` from a fresh Claude Code session posted
+a root in #agent-hub and bound it; anthro's question in that thread was admitted
+(`trusted_peer_on_bound_thread`), one attempt reached `completed_with_response`, and the bound
+session answered in the thread. Suite 221 passed; ruff, bandit, release-install and
+release-tarball green. Rolled to all five gateways through the installer; `tether doctor`
+green on each (protocol=6, integrity verified, brokers listening).
+
+**Open:** the isolated instance users (hermes-mikael, hermes-irma) have no Claude login, so
+their bound sessions need proxy auth passthrough (tracked as the next fix). Upstream filing
+(L2.1) remains blocked on credentials. L3's canary/authority plane is superseded by this
+amendment: the fleet is the deployment, and the receipts are the invariants.
