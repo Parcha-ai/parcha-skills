@@ -36,6 +36,9 @@ class AdmissionSettings:
 
     workspace_id: str
     allowed_users: frozenset[str]
+    # Peer agents the operator explicitly trusts (the deployed broker's
+    # TETHER_ALLOWED_BOT_USERS). A bot outside this set is still denied.
+    trusted_bot_users: frozenset[str] = frozenset()
 
     @property
     def configured(self) -> bool:
@@ -110,6 +113,9 @@ def evaluate(
         decision.update(verdict=VERDICT_DENY, reason="wrong_workspace")
         return decision
     if actor_is_bot:
+        if actor and actor in settings.trusted_bot_users and message_id:
+            decision.update(verdict=VERDICT_ADMIT, reason="trusted_peer_on_bound_thread")
+            return decision
         decision.update(verdict=VERDICT_DENY, reason="untrusted_bot")
         return decision
     if not actor or actor not in settings.allowed_users:

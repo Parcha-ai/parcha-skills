@@ -192,6 +192,22 @@ class ActiveSliceTest(unittest.TestCase):
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(self.violations(), [])
 
+    def test_trusted_peer_bot_is_admitted_and_stranger_bot_denied(self):
+        admission = importlib.import_module("plugin_next.admission")
+        settings = admission.AdmissionSettings(
+            workspace_id="T12345678",
+            allowed_users=frozenset({"U12345678"}),
+            trusted_bot_users=frozenset({"U0PEER0001"}),
+        )
+        common = dict(
+            platform="slack", workspace="T12345678", channel="C1", thread="100.1",
+            message_id="170.500", settings=settings, bound_threads={("C1", "100.1")},
+        )
+        peer = admission.evaluate(actor="U0PEER0001", actor_is_bot=True, **common)
+        stranger = admission.evaluate(actor="U0STRANGER", actor_is_bot=True, **common)
+        self.assertEqual((peer["verdict"], peer["reason"]), ("admit", "trusted_peer_on_bound_thread"))
+        self.assertEqual((stranger["verdict"], stranger["reason"]), ("deny", "untrusted_bot"))
+
     def test_codex_and_claude_commands(self):
         settings = self.active.ActiveSettings(
             claude_binary="/bin/echo", codex_binary="/bin/echo",

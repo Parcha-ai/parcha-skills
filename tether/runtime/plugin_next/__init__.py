@@ -74,11 +74,18 @@ def load_settings(path: Path | None = None) -> admission.AdmissionSettings:
         candidates.extend(
             value.strip() for value in os.environ.get(name, "").split(",")
         )
+    peers = raw.get("trusted_bot_users") or []
+    peer_candidates = [str(user) for user in peers if isinstance(user, str) and user] if isinstance(peers, list) else []
+    for name in ("TETHER_ALLOWED_BOT_USERS", "HERMES_TRUSTED_BOT_USERS"):
+        peer_candidates.extend(value.strip() for value in os.environ.get(name, "").split(","))
     return admission.AdmissionSettings(
         workspace_id=str(raw.get("team_id") or ""),
         allowed_users=frozenset(
             user for user in candidates
             if user and user != "*" and _USER_ID.fullmatch(user)
+        ),
+        trusted_bot_users=frozenset(
+            user for user in peer_candidates if user and _USER_ID.fullmatch(user)
         ),
     )
 
@@ -303,9 +310,14 @@ def _build_active_slice(
         import domain_schema
         import native_driver
     except ImportError:
-        package_root = Path(__file__).resolve().parents[1]
-        if str(package_root) not in sys.path:
-            sys.path.insert(0, str(package_root))
+        # Installed layout: runtime modules live in $XDG_DATA_HOME/tether; the
+        # source layout keeps them one directory above this package.
+        data_home = Path(
+            os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))
+        ).expanduser()
+        for candidate in (data_home / "tether", Path(__file__).resolve().parents[1]):
+            if str(candidate) not in sys.path and candidate.is_dir():
+                sys.path.insert(0, str(candidate))
         try:
             import domain_runtime
             import domain_schema
