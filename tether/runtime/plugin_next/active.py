@@ -42,9 +42,29 @@ SAFE_CHILD_ENV = frozenset({
 })
 
 
-def child_env(source: dict[str, str] | None = None) -> dict[str, str]:
+def child_env(
+    source: dict[str, str] | None = None,
+    passthrough: tuple[str, ...] = (),
+) -> dict[str, str]:
+    """Login-shell env plus an explicit, per-instance passthrough.
+
+    Isolated gateway users have no claude.ai login; they reach the model through
+    the machine proxy, so the operator lists ANTHROPIC_BASE_URL/ANTHROPIC_API_KEY
+    in ``harness_env``. The Claude CLI appends ``/v1`` itself, so a proxy URL
+    configured with that suffix is normalised or the CLI reports every model as
+    missing.
+    """
     base = os.environ if source is None else source
-    return {key: value for key, value in base.items() if key in SAFE_CHILD_ENV}
+    env = {key: value for key, value in base.items() if key in SAFE_CHILD_ENV}
+    for key in passthrough:
+        if key in base:
+            value = base[key]
+            if key.endswith("_BASE_URL"):
+                value = value.rstrip("/")
+                if value.endswith("/v1"):
+                    value = value[:-3]
+            env[key] = value
+    return env
 
 
 @dataclass(frozen=True)
@@ -59,6 +79,7 @@ class ActiveSettings:
     poll_interval_seconds: float = 2.0
     persona_id: str = "primary"
     policy_generation: int = 1
+    harness_env: tuple[str, ...] = ()
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -86,6 +107,7 @@ def load_active_settings(path: Path) -> ActiveSettings:
         max_reply_sentences=integer("max_reply_sentences", 3),
         persona_id=str(raw.get("persona_id") or "primary"),
         policy_generation=integer("policy_generation", 1),
+        harness_env=strings("harness_env"),
         extra={"default_channel": str(raw.get("default_channel") or "")},
     )
 
@@ -240,7 +262,8 @@ class ActiveSlice:
             if not cwd.is_dir():
                 cwd = Path.home()
             launched = self.driver.launch(
-                attempt, command=command, cwd=cwd, env=child_env()
+                attempt, command=command, cwd=cwd,
+                env=child_env(passthrough=self.settings.harness_env),
             )
             result = self.driver.reap(
                 attempt, launched, timeout_seconds=self.settings.native_timeout_seconds

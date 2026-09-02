@@ -216,6 +216,17 @@ class ActiveSliceTest(unittest.TestCase):
         })
         self.assertEqual(env, {"HOME": "/h", "PATH": "/bin", "LANG": "C.UTF-8"})
 
+    def test_harness_env_passthrough_normalises_proxy_base_url(self):
+        env = self.active.child_env(
+            {"HOME": "/h", "ANTHROPIC_BASE_URL": "http://127.0.0.1:9413/v1",
+             "ANTHROPIC_API_KEY": "k", "SLACK_BOT_TOKEN": "xoxb"},
+            passthrough=("ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY"),
+        )
+        self.assertEqual(env, {"HOME": "/h", "ANTHROPIC_BASE_URL": "http://127.0.0.1:9413",
+                               "ANTHROPIC_API_KEY": "k"})
+        settings = self.active.load_active_settings(pathlib.Path("/nonexistent"))
+        self.assertEqual(settings.harness_env, ())
+
     def test_codex_and_claude_commands(self):
         settings = self.active.ActiveSettings(
             claude_binary="/bin/echo", codex_binary="/bin/echo",
