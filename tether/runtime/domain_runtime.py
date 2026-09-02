@@ -1140,6 +1140,81 @@ class DomainRuntime:
             (f"recovery:{sequence}", receipt_id, sequence, attempt_id),
         )
 
+    # -- read models for the active plugin slice ------------------------------
+
+    def find_active_binding(
+        self, *, team_id: str, channel_id: str, thread_ts: str
+    ) -> dict[str, Any] | None:
+        """Return the live binding for one Slack thread, or None."""
+        with self._transaction() as db:
+            row = db.execute(
+                """
+                SELECT b.binding_id,b.endpoint_id,b.team_id,b.channel_id,
+                       b.thread_ts,b.owner_user_id,b.generation,b.state
+                FROM thread_bindings AS b
+                JOIN endpoints AS e ON e.endpoint_id=b.endpoint_id
+                WHERE b.team_id=? AND b.channel_id=? AND b.thread_ts=?
+                  AND b.state='active' AND e.state='ready'
+                """,
+                (team_id, channel_id, thread_ts),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def endpoints_with_ready_turns(self) -> list[str]:
+        """Endpoint ids that have at least one ready turn and no open lease."""
+        with self._transaction() as db:
+            rows = db.execute(
+                """
+                SELECT DISTINCT e.endpoint_id
+                FROM queued_turns AS t
+                JOIN thread_bindings AS b ON b.binding_id=t.binding_id
+                JOIN endpoints AS e ON e.endpoint_id=b.endpoint_id
+                WHERE t.state='ready' AND b.state='active' AND e.state='ready'
+                  AND NOT EXISTS(
+                    SELECT 1 FROM endpoint_leases AS l
+                    WHERE l.endpoint_id=e.endpoint_id AND l.released_at IS NULL
+                  )
+                ORDER BY e.endpoint_id
+                """
+            ).fetchall()
+            return [str(row["endpoint_id"]) for row in rows]
+
+    def attempt_context(self, attempt_id: str) -> dict[str, Any]:
+        """Everything a driver needs to run one attempt: source, thread, turns."""
+        with self._transaction() as db:
+            attempt = self._load_attempt(db, attempt_id)
+            endpoint = db.execute(
+                "SELECT endpoint_kind,source_kind,source_json FROM endpoints "
+                "WHERE endpoint_id=?",
+                (attempt["endpoint_id"],),
+            ).fetchone()
+            binding = db.execute(
+                "SELECT team_id,channel_id,thread_ts,owner_user_id FROM thread_bindings "
+                "WHERE binding_id=?",
+                (attempt["binding_id"],),
+            ).fetchone()
+            turns = db.execute(
+                """
+                SELECT t.event_key,t.ordered_at,t.payload_inline,t.payload_ref
+                FROM native_attempt_turns AS m
+                JOIN queued_turns AS t ON t.event_key=m.event_key
+                WHERE m.attempt_id=? ORDER BY m.ordinal
+                """,
+                (attempt_id,),
+            ).fetchall()
+            return {
+                "attempt_id": attempt_id,
+                "state": attempt["state"],
+                "response_ref": attempt["response_ref"],
+                "source_kind": endpoint["source_kind"],
+                "source": json.loads(endpoint["source_json"] or "{}"),
+                "team_id": binding["team_id"],
+                "channel_id": binding["channel_id"],
+                "thread_ts": binding["thread_ts"],
+                "owner_user_id": binding["owner_user_id"],
+                "turns": [dict(turn) for turn in turns],
+            }
+
     def attempt_status(self, attempt_id: str) -> dict[str, Any]:
         with self._transaction() as db:
             attempt = self._load_attempt(db, attempt_id)
