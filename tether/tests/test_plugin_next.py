@@ -244,7 +244,7 @@ class ShadowHookTest(PluginEnvironment):
     def test_shadow_mode_false_is_refused_loudly_and_stays_shadow(self):
         self.seed_v17_binding()
         ctx = RichCtx(config={"shadow_mode": False})
-        with self.assertLogs("tether.plugin", level="WARNING") as logs:
+        with self.assertLogs("hermes_plugins.tether_next", level="WARNING") as logs:
             self.register(ctx)
         self.assertTrue(any("staying in shadow" in line for line in logs.output))
         self.assertIsNone(self.dispatch(ctx))

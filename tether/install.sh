@@ -569,7 +569,7 @@ add_file() {
 }
 
 add_skill() {
-  local harness_home="$1" harness_name="$2"
+  local harness_home="$1"
   local destination="$harness_home/skills/tether"
   add_file "$SKILL_SOURCE/SKILL.md" "$destination/SKILL.md" 644
   add_file "$SKILL_SOURCE/agents/openai.yaml" "$destination/agents/openai.yaml" 644
@@ -577,18 +577,6 @@ add_skill() {
   add_file "$SKILL_SOURCE/references/contract.md" "$destination/references/contract.md" 644
   add_file "$SKILL_SOURCE/scripts/tether_notify.py" "$destination/scripts/tether_notify.py" 700
 
-  local legacy="$harness_home/skills/hermes-slack-bridge"
-  if [[ -d "$legacy" ]]; then
-    LEGACY_HARNESSES+=("$harness_name")
-    add_file \
-      "$ROOT_DIR/runtime/compat/hermes-slack-bridge-SKILL.md" \
-      "$legacy/SKILL.md" \
-      644
-    add_file \
-      "$SKILL_SOURCE/scripts/tether_notify.py" \
-      "$legacy/scripts/hermes_notify.py" \
-      700
-  fi
 }
 
 build_install_plan() {
@@ -597,26 +585,18 @@ build_install_plan() {
     exit 2
   }
   resolve_harness
-  add_file "$ROOT_DIR/runtime/bridge_runtime.py" "$RUNTIME_HOME/bridge_runtime.py" 600
   add_file "$ROOT_DIR/runtime/domain_control.py" "$RUNTIME_HOME/domain_control.py" 600
   add_file "$ROOT_DIR/runtime/domain_schema.py" "$RUNTIME_HOME/domain_schema.py" 600
-  add_file "$ROOT_DIR/runtime/schema_orchestrator.py" "$RUNTIME_HOME/schema_orchestrator.py" 600
-  add_file "$ROOT_DIR/runtime/schema_receipt.py" "$RUNTIME_HOME/schema_receipt.py" 600
-  add_file "$ROOT_DIR/runtime/schema_rehearsal.py" "$RUNTIME_HOME/schema_rehearsal.py" 600
   add_file "$ROOT_DIR/runtime/domain_runtime.py" "$RUNTIME_HOME/domain_runtime.py" 600
   add_file "$ROOT_DIR/runtime/native_driver.py" "$RUNTIME_HOME/native_driver.py" 600
-  add_file "$ROOT_DIR/runtime/hermes_compat.py" "$RUNTIME_HOME/hermes_compat.py" 600
-  add_file "$ROOT_DIR/runtime/routing.py" "$RUNTIME_HOME/routing.py" 600
   add_file "$ROOT_DIR/runtime/security.py" "$RUNTIME_HOME/security.py" 600
-  add_file "$ROOT_DIR/runtime/slack_protocol.py" "$RUNTIME_HOME/slack_protocol.py" 600
   add_file "$SKILL_SOURCE/scripts/tether_notify.py" "$RUNTIME_HOME/tether_notify.py" 700
   add_file "$ROOT_DIR/install.sh" "$RUNTIME_HOME/install.sh" 700
   add_file "$ROOT_DIR/package.json" "$RUNTIME_HOME/package.json" 600
-  add_file "$ROOT_DIR/herdr-plugin/herdr-plugin.toml" "$RUNTIME_HOME/herdr-plugin/herdr-plugin.toml" 644
-  add_file "$ROOT_DIR/herdr-plugin/tether_plugin.py" "$RUNTIME_HOME/herdr-plugin/tether_plugin.py" 700
-  add_file "$ROOT_DIR/herdr-plugin/README.md" "$RUNTIME_HOME/herdr-plugin/README.md" 644
-  add_file "$ROOT_DIR/runtime/plugin/__init__.py" "$PLUGIN_HOME/__init__.py" 600
-  add_file "$ROOT_DIR/runtime/plugin/plugin.yaml" "$PLUGIN_HOME/plugin.yaml" 644
+  for module in __init__.py active.py admission.py broker.py journal.py slack_egress.py; do
+    add_file "$ROOT_DIR/runtime/plugin_next/$module" "$PLUGIN_HOME/$module" 600
+  done
+  add_file "$ROOT_DIR/runtime/plugin_next/plugin.yaml" "$PLUGIN_HOME/plugin.yaml" 644
   add_file "$ROOT_DIR/bin/tether.js" "$LOCAL_BIN/tether" 700
   if [[ "$HARNESS" == "codex" || "$HARNESS" == "both" ]]; then
     add_skill "$CODEX_ROOT" codex

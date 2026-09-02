@@ -169,25 +169,20 @@ class TetherCliTest(unittest.TestCase):
         codex = self.home / ".codex"
         claude = self.home / ".claude"
         candidates: dict[pathlib.Path, int] = {
-            runtime / "bridge_runtime.py": 0o600,
             runtime / "domain_control.py": 0o600,
             runtime / "domain_schema.py": 0o600,
-            runtime / "schema_orchestrator.py": 0o600,
-            runtime / "schema_receipt.py": 0o600,
-            runtime / "schema_rehearsal.py": 0o600,
             runtime / "domain_runtime.py": 0o600,
             runtime / "native_driver.py": 0o600,
-            runtime / "hermes_compat.py": 0o600,
-            runtime / "routing.py": 0o600,
             runtime / "security.py": 0o600,
-            runtime / "slack_protocol.py": 0o600,
             runtime / "tether_notify.py": 0o700,
             runtime / "install.sh": 0o700,
             runtime / "package.json": 0o600,
-            runtime / "herdr-plugin" / "herdr-plugin.toml": 0o644,
-            runtime / "herdr-plugin" / "tether_plugin.py": 0o700,
-            runtime / "herdr-plugin" / "README.md": 0o644,
             plugin / "__init__.py": 0o600,
+            plugin / "active.py": 0o600,
+            plugin / "admission.py": 0o600,
+            plugin / "broker.py": 0o600,
+            plugin / "journal.py": 0o600,
+            plugin / "slack_egress.py": 0o600,
             plugin / "plugin.yaml": 0o644,
             local_bin / "tether": 0o700,
         }
@@ -423,151 +418,48 @@ class TetherCliTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("exactly one", result.stderr)
 
-    def test_schema_status_delegates_to_installed_read_only_orchestrator(self) -> None:
-        manifest, _candidates = self.write_managed_install(harness="codex")
-        orchestrator = self.root / "data" / "tether" / "schema_orchestrator.py"
-        orchestrator.write_text(
-            "#!/usr/bin/env python3\n"
-            "import json, sys\n"
-            "assert sys.argv[1:] == ['status', '--json']\n"
-            "print(json.dumps({'ok': True, 'runtime_ready': True}))\n",
-            encoding="utf-8",
-        )
-        orchestrator.chmod(0o600)
-        lines = manifest.read_text(encoding="utf-8").splitlines()
-        replacement = (
-            f"{orchestrator}\t600\t"
-            f"{hashlib.sha256(orchestrator.read_bytes()).hexdigest()}"
-        )
-        manifest.write_text(
-            "\n".join(
-                replacement if line.startswith(f"{orchestrator}\t") else line
-                for line in lines
-            )
-            + "\n",
-            encoding="utf-8",
-        )
 
-        result = self.run_cli("schema", "status", "--json")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            json.loads(result.stdout),
-            {"ok": True, "runtime_ready": True},
-        )
-
-        orchestrator.chmod(0o666)
-        manifest.write_text(
-            manifest.read_text(encoding="utf-8").replace(
-                f"{orchestrator}\t600\t",
-                f"{orchestrator}\t666\t",
-            ),
-            encoding="utf-8",
-        )
-        unsafe_mode = self.run_cli("schema", "status", "--json")
-        self.assertEqual(unsafe_mode.returncode, 2)
-        self.assertIn("managed_install_drift", unsafe_mode.stderr)
-
-        orchestrator.chmod(0o600)
-        manifest.write_text(
-            manifest.read_text(encoding="utf-8").replace(
-                f"{orchestrator}\t666\t",
-                f"{orchestrator}\t600\t",
-            ),
-            encoding="utf-8",
-        )
-        orchestrator.write_text("raise SystemExit(0)\n", encoding="utf-8")
-        tampered = self.run_cli("schema", "status", "--json")
-        self.assertEqual(tampered.returncode, 2)
-        self.assertIn("managed_install_drift", tampered.stderr)
-
-    def test_schema_command_rejects_missing_or_unknown_orchestrator(self) -> None:
-        missing = self.run_cli("schema", "status", "--json")
-        self.assertEqual(missing.returncode, 2)
-        self.assertIn("schema_orchestrator_missing", missing.stderr)
-
-        self.write_managed_install(harness="codex")
-        unknown = self.run_cli("schema", "migrate")
-        self.assertEqual(unknown.returncode, 2)
-        self.assertIn("Unknown schema operation", unknown.stderr)
-
-    @unittest.skipIf(os.geteuid() == 0, "mutating CLI commands intentionally refuse root")
-    def test_js_forwards_message_to_python_only_through_stdin(self) -> None:
-        runtime = self.root / "data" / "tether"
-        runtime.mkdir(parents=True)
-        (runtime / "tether_notify.py").write_text("# notifier placeholder\n")
-        capture = self.root / "child-capture.json"
-        fake_python = self.root / "fake-python"
-        fake_python.write_text(
-            "#!/usr/bin/env python3\n"
-            "import json, os, pathlib, sys\n"
-            "pathlib.Path(os.environ['CAPTURE_PATH']).write_text(json.dumps({\n"
-            "    'argv': sys.argv[1:], 'stdin': sys.stdin.read(),\n"
-            "}))\n"
-            "print('123.456')\n",
-            encoding="utf-8",
-        )
-        fake_python.chmod(0o700)
-        message = "must never appear in Python argv"
-        result = self.run_cli(
-            "notify",
-            "--text",
-            message,
-            "--idempotency-key",
-            "notify-1",
-            extra_env={
-                "PYTHON_BIN": str(fake_python),
-                "CAPTURE_PATH": str(capture),
-                "TETHER_BROKER_SOCKET": str(self.root / "bridge.sock"),
-                "ZELLIJ_SESSION_NAME": "work",
-                "ZELLIJ_PANE_ID": "7",
-            },
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        captured = json.loads(capture.read_text())
-        self.assertNotIn(message, captured["argv"])
-        self.assertIn("--text-stdin", captured["argv"])
-        self.assertEqual(captured["stdin"], message)
-        self.assertIn("DEPRECATED", result.stderr)
 
     def test_python_notifier_reads_message_from_stdin(self) -> None:
-        runtime = self.root / "data" / "tether"
-        runtime.mkdir(parents=True)
+        import socket
+        import threading
+
         capture = self.root / "notifier-request.json"
-        (runtime / "bridge_runtime.py").write_text(
-            "import json, os, pathlib\n"
-            "def broker_call(request):\n"
-            "    pathlib.Path(os.environ['CAPTURE_PATH']).write_text(json.dumps(request))\n"
-            "    return {'thread_ts': '123.456'}\n"
-            "def doctor(): return (True, ['ok'])\n"
-            "def herdr_agent_identity(*args): return {}\n"
-            "def zellij_pane_identity(*args): return {}\n"
-            "def working_directory_identity(cwd): return {'cwd': cwd}\n",
-            encoding="utf-8",
-        )
+        sock = self.root / "broker.sock"
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(sock))
+        server.listen(1)
+
+        def serve() -> None:
+            connection, _ = server.accept()
+            with connection:
+                data = b""
+                while b"\n" not in data:
+                    chunk = connection.recv(65536)
+                    if not chunk:
+                        break
+                    data += chunk
+                capture.write_text(data.split(b"\n", 1)[0].decode("utf-8"))
+                connection.sendall(b'{"ok": true, "thread_ts": "123.456"}\n')
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
         message = "notifier stdin message"
         result = subprocess.run(
-            [
-                "python3",
-                str(NOTIFIER),
-                "reply",
-                "--bridge-id",
-                "brg_example",
-                "--reply-key",
-                "reply-1",
-                "--text-stdin",
-            ],
-            text=True,
-            input=message,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env={**self.base_env, "CAPTURE_PATH": str(capture)},
-            timeout=4,
-            check=False,
+            ["python3", str(NOTIFIER), "reply", "--bridge-id", "brg_example",
+             "--reply-key", "reply-1", "--text-stdin"],
+            text=True, input=message, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env={**self.base_env, "TETHER_BROKER_SOCKET": str(sock)},
+            timeout=8, check=False,
         )
+        thread.join(timeout=5)
+        server.close()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(capture.read_text())["text"], message)
+        captured = json.loads(capture.read_text())
+        self.assertEqual(captured["op"], "reply")
+        self.assertEqual(captured["text"], message)
+        self.assertEqual(result.stdout.strip(), "123.456")
 
-    @unittest.skipIf(os.geteuid() == 0, "mutating CLI commands intentionally refuse root")
     def test_close_and_unbind_send_the_close_contract(self) -> None:
         for command in ("close", "unbind"):
             with self.subTest(command=command):
@@ -809,7 +701,7 @@ class TetherCliTest(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertIn("ok broker socket is private", payload["checks"])
         self.assertIn(
-            "ok managed install integrity verified (26 files; harness=codex)",
+            "ok managed install integrity verified (21 files; harness=codex)",
             payload["checks"],
         )
         self.assertEqual(payload["status"]["protocol_version"], 6)
@@ -847,7 +739,7 @@ class TetherCliTest(unittest.TestCase):
 
     def test_doctor_fails_when_a_managed_file_drifted(self) -> None:
         self.write_managed_install(harness="codex")
-        runtime = self.root / "data" / "tether" / "bridge_runtime.py"
+        runtime = self.root / "data" / "tether" / "domain_runtime.py"
         runtime.write_text("# drifted\n", encoding="utf-8")
 
         with FakeBroker(
@@ -947,7 +839,7 @@ class TetherCliTest(unittest.TestCase):
             result = self.run_cli("doctor", socket_path=broker.path)
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn(
-            "ok managed install integrity verified (33 files; harness=both)",
+            "ok managed install integrity verified (28 files; harness=both)",
             result.stdout,
         )
 
@@ -985,7 +877,7 @@ class TetherCliTest(unittest.TestCase):
         runtime = self.root / "data" / "tether"
         runtime.mkdir(parents=True)
         candidates = (
-            runtime / "bridge_runtime.py",
+            runtime / "domain_runtime.py",
             runtime / "tether_notify.py",
             runtime / "install.sh",
         )

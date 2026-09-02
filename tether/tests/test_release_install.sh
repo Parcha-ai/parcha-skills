@@ -7,7 +7,7 @@ umask 077
 
 PACKAGE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPOSITORY_ROOT="$(cd "$PACKAGE_ROOT/.." && pwd)"
-EXPECTED_VERSION="0.3.0-beta.1"
+EXPECTED_VERSION="0.4.0"
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 
@@ -92,11 +92,11 @@ marketplace = json.loads((root / ".claude-plugin/marketplace.json").read_text())
 versions[".claude-plugin/marketplace.json"] = next(
     plugin["version"] for plugin in marketplace["plugins"] if plugin["name"] == "tether"
 )
-plugin_yaml = (root / "tether/runtime/plugin/plugin.yaml").read_text()
+plugin_yaml = (root / "tether/runtime/plugin_next/plugin.yaml").read_text()
 match = re.search(r"^version:\s*[\"']?([^\"'\s]+)", plugin_yaml, re.MULTILINE)
 if not match:
     raise SystemExit("runtime plugin version is missing")
-versions["tether/runtime/plugin/plugin.yaml"] = match.group(1)
+versions["tether/runtime/plugin_next/plugin.yaml"] = match.group(1)
 wrong = {path: value for path, value in versions.items() if value != expected}
 if wrong:
     raise SystemExit(f"inconsistent Tether versions: {wrong}")
@@ -323,23 +323,20 @@ RUNTIME="$XDG_DATA_HOME/tether"
 STATE="$XDG_STATE_HOME/tether-installer"
 CONFIG="$XDG_CONFIG_HOME/tether/config.toml"
 LAUNCHER="$HOME/.local/bin/tether"
-BRIDGE="$RUNTIME/bridge_runtime.py"
+BRIDGE="$RUNTIME/domain_runtime.py"
 DOMAIN_CONTROL="$RUNTIME/domain_control.py"
 DOMAIN_SCHEMA="$RUNTIME/domain_schema.py"
-SCHEMA_ORCHESTRATOR="$RUNTIME/schema_orchestrator.py"
-HERMES_COMPAT="$RUNTIME/hermes_compat.py"
-ROUTING="$RUNTIME/routing.py"
+SCHEMA_ORCHESTRATOR="$RUNTIME/native_driver.py"
+HERMES_COMPAT="$RUNTIME/domain_schema.py"
+ROUTING="$RUNTIME/domain_control.py"
 SECURITY="$RUNTIME/security.py"
-SLACK_PROTOCOL="$RUNTIME/slack_protocol.py"
-HERDR_MANIFEST="$RUNTIME/herdr-plugin/herdr-plugin.toml"
-HERDR_PLUGIN="$RUNTIME/herdr-plugin/tether_plugin.py"
-HERDR_README="$RUNTIME/herdr-plugin/README.md"
+SLACK_PROTOCOL="$RUNTIME/security.py"
 CODEX_SKILL="$CODEX_HOME/skills/tether/SKILL.md"
 CLAUDE_SKILL="$CLAUDE_HOME/skills/tether/SKILL.md"
 
 for path in "$BRIDGE" "$DOMAIN_CONTROL" "$DOMAIN_SCHEMA" "$SCHEMA_ORCHESTRATOR" "$HERMES_COMPAT" "$ROUTING" "$SECURITY" "$SLACK_PROTOCOL" \
   "$RUNTIME/install.sh" "$RUNTIME/package.json" "$LAUNCHER" "$CODEX_SKILL" \
-  "$CLAUDE_SKILL" "$HERDR_MANIFEST" "$HERDR_PLUGIN" "$HERDR_README" \
+  "$CLAUDE_SKILL" \
   "$STATE/current.tsv" "$CONFIG"
 do
   assert_file "$path"
@@ -358,16 +355,8 @@ assert_mode "$HERMES_COMPAT" 600
 assert_mode "$ROUTING" 600
 assert_mode "$SECURITY" 600
 assert_mode "$SLACK_PROTOCOL" 600
-assert_mode "$HERDR_MANIFEST" 644
-assert_mode "$HERDR_PLUGIN" 700
 assert_mode "$LAUNCHER" 700
 assert_mode "$CONFIG" 600
-node "$PACKAGE_ROOT/bin/tether.js" upgrade --dry-run --harness=both --herdr
-assert_contains "$HERDR_TEST_LOG" "plugin link $RUNTIME/herdr-plugin"
-node "$PACKAGE_ROOT/bin/tether.js" rollback --dry-run --herdr
-assert_contains "$HERDR_TEST_LOG" "plugin link $RUNTIME/herdr-plugin"
-node "$PACKAGE_ROOT/bin/tether.js" uninstall --dry-run --herdr
-assert_contains "$HERDR_TEST_LOG" "plugin unlink parcha.tether"
 chmod 722 "$LAUNCHER"
 set +e
 "$PACKAGE_ROOT/install.sh" upgrade --dry-run --harness=both \

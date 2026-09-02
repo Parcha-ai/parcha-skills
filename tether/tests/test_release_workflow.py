@@ -98,7 +98,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
         package = json.loads((PACKAGE_ROOT / "package.json").read_text())
         self.assertIn("install.sh", package["files"])
 
-    def test_slack_protocol_is_packaged_installed_and_compiled(self) -> None:
+    def test_security_module_is_packaged_installed_and_compiled(self) -> None:
         package = json.loads((PACKAGE_ROOT / "package.json").read_text())
         installer = (PACKAGE_ROOT / "install.sh").read_text()
         ci = (REPOSITORY_ROOT / ".github/workflows/tether-ci.yml").read_text()
@@ -106,53 +106,21 @@ class ReleaseWorkflowTest(unittest.TestCase):
             REPOSITORY_ROOT / ".github/workflows/tether-release.yml"
         ).read_text()
 
-        self.assertIn("runtime/slack_protocol.py", package["files"])
-        self.assertIn(
-            '"$ROOT_DIR/runtime/slack_protocol.py" "$RUNTIME_HOME/slack_protocol.py"',
-            installer,
-        )
-        self.assertIn("runtime/slack_protocol.py", package["scripts"]["test"])
-        self.assertIn(
-            "python -m py_compile tether/runtime/slack_protocol.py",
-            ci,
-        )
-        self.assertIn(
-            'python -m py_compile "$installed/runtime/slack_protocol.py"',
-            release,
-        )
-        self.assertIn("runtime/domain_schema.py", package["files"])
-        self.assertIn(
-            '"$ROOT_DIR/runtime/domain_schema.py" "$RUNTIME_HOME/domain_schema.py"',
-            installer,
-        )
-        self.assertIn("runtime/domain_schema.py", package["scripts"]["test"])
-        self.assertIn("python -m py_compile tether/runtime/domain_schema.py", ci)
-        self.assertIn(
-            'python -m py_compile "$installed/runtime/domain_schema.py"',
-            release,
-        )
-        self.assertIn("runtime/domain_control.py", package["files"])
-        self.assertIn(
-            '"$ROOT_DIR/runtime/domain_control.py" "$RUNTIME_HOME/domain_control.py"',
-            installer,
-        )
-        self.assertIn("runtime/domain_control.py", package["scripts"]["test"])
-        self.assertIn("python -m py_compile tether/runtime/domain_control.py", ci)
-        self.assertIn(
-            'python -m py_compile "$installed/runtime/domain_control.py"',
-            release,
-        )
-        self.assertIn("runtime/schema_orchestrator.py", package["files"])
-        self.assertIn(
-            '"$ROOT_DIR/runtime/schema_orchestrator.py" "$RUNTIME_HOME/schema_orchestrator.py"',
-            installer,
-        )
-        self.assertIn("runtime/schema_orchestrator.py", package["scripts"]["test"])
-        self.assertIn("python -m py_compile tether/runtime/schema_orchestrator.py", ci)
-        self.assertIn(
-            'python -m py_compile "$installed/runtime/schema_orchestrator.py"',
-            release,
-        )
+        for module in ("security", "domain_schema", "domain_control", "domain_runtime", "native_driver"):
+            self.assertIn(f"runtime/{module}.py", package["files"])
+            self.assertIn(
+                f'"$ROOT_DIR/runtime/{module}.py" "$RUNTIME_HOME/{module}.py"',
+                installer,
+            )
+            self.assertIn(f"runtime/{module}.py", package["scripts"]["test"])
+            self.assertIn(f"python -m py_compile tether/runtime/{module}.py", ci)
+            self.assertIn(
+                f'python -m py_compile "$installed/runtime/{module}.py"',
+                release,
+            )
+        for module in ("__init__", "active", "admission", "broker", "journal", "slack_egress"):
+            self.assertIn(f"runtime/plugin_next/{module}.py", package["files"])
+            self.assertIn(f"runtime/plugin_next/{module}.py", package["scripts"]["test"])
 
 
 if __name__ == "__main__":
