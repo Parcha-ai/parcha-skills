@@ -166,3 +166,26 @@ ready. Neither path weakens workspace, channel, user, bot, or binding checks.
 Use the package's `docs/OPERATIONS.md` for upgrade, rollback, backup, retention,
 and uninstall. Never bypass a failed broker or compatibility check with a
 direct Slack token.
+
+
+## Tether 0.4.0 configuration keys
+
+`~/.config/tether/config.toml` (shared by the plugin and the CLI):
+
+- `active = true` — the plugin drives bound threads through the schema-18 domain
+  runtime. Without it the plugin only journals admission decisions.
+- `team_id` — the Slack workspace id; admission refuses events from any other.
+- `trusted_bot_users = ["U…"]` — peer agents allowed to talk in bound threads
+  without mentioning this bot. Merged with `TETHER_ALLOWED_BOT_USERS` /
+  `HERMES_TRUSTED_BOT_USERS` from the gateway environment.
+- `harness_env = ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY"]` — variables the
+  harness may inherit from the gateway. Needed only where the gateway user has no
+  `claude` login and must reach the model through the machine proxy; a trailing
+  `/v1` on `*_BASE_URL` is stripped because the Claude CLI appends it.
+- `claude_binary`, `claude_resume_args`, `codex_binary`, `codex_resume_args`,
+  `native_timeout_seconds`, `max_reply_sentences`, `default_channel` — as before.
+
+Binding rules that bite: `tether notify/attach --cwd` must be the directory the
+Claude session was created in (Claude keys sessions by project directory), and a
+session already registered under another owner set is refused with
+`endpoint_key_conflict`.

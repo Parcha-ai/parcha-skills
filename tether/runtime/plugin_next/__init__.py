@@ -169,7 +169,7 @@ def _event_fields(event: Any) -> dict[str, Any]:
 
 def register(ctx: Any) -> None:
     home = _hermes_home()
-    print("tether_next: register() entered", file=sys.stderr, flush=True)
+    logger.info("tether: register() entered")
     journal = DurableJournal(home / "plugin-data" / "tether")
     bindings = BindingIndex(home / "bridges.db")
     # Threads bound in the schema-18 domain (active mode) count as bound too:
@@ -213,7 +213,7 @@ def register(ctx: Any) -> None:
             if event is None:
                 return None
             fields = _event_fields(event)
-            print(f"tether_next: hook event {fields}", file=sys.stderr, flush=True)
+            logger.debug("tether: hook event %s", fields)
             if fields["platform"] != "slack":
                 return None
             decision = admission.evaluate(
@@ -247,12 +247,14 @@ def register(ctx: Any) -> None:
                 thread=fields["thread"],
                 actor=fields["actor"],
             )
-            print(f"tether_next: decision {decision.get('verdict')}/{decision.get('reason')} claimed={claimed is not None}", file=sys.stderr, flush=True)
+            logger.info(
+                "tether: decision %s/%s claimed=%s",
+                decision.get("verdict"), decision.get("reason"), claimed is not None,
+            )
             if claimed is not None:
                 # Tether owns this turn; Hermes' own agent must not also answer.
                 return {"action": "skip", "reason": "tether-claimed"}
-        except Exception as exc:  # pragma: no cover - the gateway must never break
-            print(f"tether_next: hook exception {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        except Exception:  # pragma: no cover - the gateway must never break
             logger.exception("tether: observation failed; event untouched")
         return None
 
