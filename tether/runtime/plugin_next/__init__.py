@@ -37,7 +37,7 @@ from . import admission
 from . import active as active_module
 from .journal import DurableJournal
 
-logger = logging.getLogger("tether.plugin")
+logger = logging.getLogger("hermes_plugins.tether_next")
 
 _BINDING_CACHE_TTL_SECONDS = 5.0
 _USER_ID = re.compile(r"[A-Z0-9]{2,32}")
@@ -167,6 +167,7 @@ def _event_fields(event: Any) -> dict[str, Any]:
 
 def register(ctx: Any) -> None:
     home = _hermes_home()
+    print("tether_next: register() entered", file=sys.stderr, flush=True)
     journal = DurableJournal(home / "plugin-data" / "tether")
     bindings = BindingIndex(home / "bridges.db")
     # Threads bound in the schema-18 domain (active mode) count as bound too:
@@ -178,6 +179,13 @@ def register(ctx: Any) -> None:
     slice_: active_module.ActiveSlice | None = None
     if active_settings.enabled and settings.configured:
         slice_ = _build_active_slice(ctx, home, settings, active_settings)
+        logger.warning(
+            "tether: active slice %s (workspace=%s owners=%d peers=%d)",
+            "started" if slice_ else "NOT built",
+            settings.workspace_id, len(settings.allowed_users), len(settings.trusted_bot_users),
+        )
+    elif active_settings.enabled:
+        logger.warning("tether: active=true but security domain incomplete; staying shadow")
 
     if not settings.configured:
         logger.warning(
@@ -203,6 +211,7 @@ def register(ctx: Any) -> None:
             if event is None:
                 return None
             fields = _event_fields(event)
+            print(f"tether_next: hook event {fields}", file=sys.stderr, flush=True)
             if fields["platform"] != "slack":
                 return None
             decision = admission.evaluate(
@@ -222,7 +231,10 @@ def register(ctx: Any) -> None:
             )
             claimed = None
             if slice_ is not None and decision.get("verdict") == "admit":
-                claimed = slice_.claim(fields, str(getattr(event, "text", "") or ""))
+                try:
+                    claimed = slice_.claim(fields, str(getattr(event, "text", "") or ""))
+                except Exception:
+                    logger.exception("tether: claim failed for %s; event falls through", event_key)
                 decision = dict(decision, claimed=claimed is not None)
             journal.record(
                 event_key,
@@ -233,10 +245,12 @@ def register(ctx: Any) -> None:
                 thread=fields["thread"],
                 actor=fields["actor"],
             )
+            print(f"tether_next: decision {decision.get('verdict')}/{decision.get('reason')} claimed={claimed is not None}", file=sys.stderr, flush=True)
             if claimed is not None:
                 # Tether owns this turn; Hermes' own agent must not also answer.
                 return {"action": "skip", "reason": "tether-claimed"}
-        except Exception:  # pragma: no cover - the gateway must never break
+        except Exception as exc:  # pragma: no cover - the gateway must never break
+            print(f"tether_next: hook exception {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
             logger.exception("tether: observation failed; event untouched")
         return None
 

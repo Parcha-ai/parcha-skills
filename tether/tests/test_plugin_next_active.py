@@ -208,6 +208,14 @@ class ActiveSliceTest(unittest.TestCase):
         self.assertEqual((peer["verdict"], peer["reason"]), ("admit", "trusted_peer_on_bound_thread"))
         self.assertEqual((stranger["verdict"], stranger["reason"]), ("deny", "untrusted_bot"))
 
+    def test_harness_env_drops_proxy_and_secret_variables(self):
+        env = self.active.child_env({
+            "HOME": "/h", "PATH": "/bin", "ANTHROPIC_API_KEY": "x",
+            "ANTHROPIC_BASE_URL": "http://proxy", "SLACK_BOT_TOKEN": "xoxb",
+            "OP_SERVICE_ACCOUNT_TOKEN": "ops", "LANG": "C.UTF-8",
+        })
+        self.assertEqual(env, {"HOME": "/h", "PATH": "/bin", "LANG": "C.UTF-8"})
+
     def test_codex_and_claude_commands(self):
         settings = self.active.ActiveSettings(
             claude_binary="/bin/echo", codex_binary="/bin/echo",

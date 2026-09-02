@@ -25,9 +25,24 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-logger = logging.getLogger("tether.plugin.active")
+logger = logging.getLogger("hermes_plugins.tether_next.active")
 
 Egress = Callable[[str, str, str], Any]  # (channel_id, thread_ts, text)
+
+# The harness inherits only what a login shell would give it. The gateway's own
+# environment carries the model-proxy variables (ANTHROPIC_*/OPENAI_*), Slack
+# tokens and 1Password material; passing those through made `claude --resume`
+# route to the proxy and exit 1 instead of using the operator's own login.
+SAFE_CHILD_ENV = frozenset({
+    "HOME", "USER", "LOGNAME", "PATH", "SHELL", "LANG", "LC_ALL", "LC_CTYPE",
+    "TERM", "TMPDIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
+    "CODEX_HOME", "CLAUDE_HOME", "SSL_CERT_FILE", "SSL_CERT_DIR",
+})
+
+
+def child_env(source: dict[str, str] | None = None) -> dict[str, str]:
+    base = os.environ if source is None else source
+    return {key: value for key, value in base.items() if key in SAFE_CHILD_ENV}
 
 
 @dataclass(frozen=True)
@@ -220,7 +235,7 @@ class ActiveSlice:
             if not cwd.is_dir():
                 cwd = Path.home()
             launched = self.driver.launch(
-                attempt, command=command, cwd=cwd, env=dict(os.environ)
+                attempt, command=command, cwd=cwd, env=child_env()
             )
             result = self.driver.reap(
                 attempt, launched, timeout_seconds=self.settings.native_timeout_seconds
@@ -270,8 +285,10 @@ class ActiveSlice:
         self._stop.set()
 
     def _loop(self) -> None:
+        heartbeat = Path(self.driver.work_root).parent / "active.heartbeat"
         while not self._stop.is_set():
             try:
+                heartbeat.write_text(str(time.time()), encoding="utf-8")
                 self.run_once()
             except Exception:
                 logger.error("tether: scheduler pass failed", exc_info=True)
