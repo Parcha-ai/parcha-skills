@@ -12,6 +12,7 @@ import inspect
 import json
 import logging
 import os
+import sqlite3
 import re
 import sys
 import threading
@@ -793,6 +794,52 @@ def _binding_for_bridge(bridge, *, ambient_owned: bool = False):
     )
 
 
+def _domain_database_path() -> Path:
+    home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+    return home / "plugin-data" / "tether" / "domain.db"
+
+
+def _domain_thread_binding(team_id: str, channel_id: str, thread_ts: str):
+    """Read-only lookup of a live schema-18 thread binding, or None.
+
+    Fails closed: any error means "not bound here", never an exception into
+    routing.
+    """
+    path = _domain_database_path()
+    if not path.exists():
+        return None
+    try:
+        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=2)
+        try:
+            if int(connection.execute("PRAGMA user_version").fetchone()[0]) < 18:
+                return None
+            row = connection.execute(
+                """
+                SELECT b.binding_id,b.generation FROM thread_bindings AS b
+                JOIN endpoints AS e ON e.endpoint_id=b.endpoint_id
+                WHERE b.team_id=? AND b.channel_id=? AND b.thread_ts=?
+                  AND b.state='active' AND e.state='ready'
+                """,
+                (team_id, channel_id, thread_ts),
+            ).fetchone()
+        finally:
+            connection.close()
+    except (sqlite3.Error, OSError, ValueError):
+        return None
+    if row is None:
+        return None
+    return routing.ActiveBinding(
+        kind=routing.BindingKind.HERMES,
+        bridge_id=f"domain:{row[0]}",
+        writer_id=f"domain:{row[0]}",
+        owner_user_id="*",
+        active=True,
+        binding_generation=int(row[1]),
+        ambient_owned=True,
+        peer_addressable=True,
+    )
+
+
 async def _routing_thread_state(
     adapter,
     message,
@@ -813,6 +860,17 @@ async def _routing_thread_state(
         message.identity.channel_id,
         message.thread_ts,
     )
+    if bridge is None:
+        domain_binding = _domain_thread_binding(
+            message.identity.team_id,
+            message.identity.channel_id,
+            message.thread_ts,
+        )
+        if domain_binding is not None:
+            # Bound in the schema-18 domain (tether-next). Route to Hermes so the
+            # next plugin's gateway hook can claim the turn; ambient_owned means
+            # participants need not mention the local bot in this thread.
+            return routing.ThreadState(identity=identity, binding=domain_binding), ""
     if bridge is not None:
         if bridge.team_id != message.identity.team_id:
             return None, "bridge_workspace_unresolved"

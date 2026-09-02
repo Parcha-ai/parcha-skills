@@ -288,6 +288,32 @@ class RoutingDecisionTest(unittest.TestCase):
         self.assertEqual(chatter.action, RouteAction.SILENT)
         self.assertEqual(chatter.reason, "peer_bot_did_not_target_self")
 
+    def test_trusted_peer_bot_on_ambient_owned_binding_needs_no_mention(self):
+        # A thread bound in the schema-18 domain surfaces as an ambient-owned
+        # Hermes binding; peers working that thread must reach the bound
+        # session without mentioning the local bot.
+        peer = ActorIdentity(BOT_B, is_bot=True, bot_id=PEER_APP)
+        bound = ActiveBinding(
+            kind=BindingKind.HERMES,
+            bridge_id="domain:bnd_1",
+            writer_id="domain:bnd_1",
+            owner_user_id="*",
+            active=True,
+            binding_generation=1,
+            ambient_owned=True,
+            peer_addressable=True,
+        )
+        decision = decide_route(
+            self.message(actor=peer),
+            self.thread(binding=bound),
+            self.policy(),
+        )
+        self.assertEqual(decision.action, RouteAction.HERMES)
+        self.assertEqual(decision.reason, "active_hermes_binding")
+        stranger = ActorIdentity("U0STRANGER", is_bot=True, bot_id="B0STRANGER")
+        denied = decide_route(self.message(actor=stranger), self.thread(binding=bound), self.policy())
+        self.assertEqual((denied.action, denied.reason), (RouteAction.SILENT, "untrusted_peer_bot"))
+
     def test_exact_ambient_bot_channel_routes_without_a_mention(self):
         peer = ActorIdentity("", is_bot=True, bot_id=PEER_APP)
         decision = decide_route(

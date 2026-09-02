@@ -128,6 +128,10 @@ class ActiveBinding:
     active: bool = True
     binding_generation: int = 1
     ambient_owned: bool = False
+    # True only for bindings whose thread is worked by peer agents by design
+    # (schema-18 domain bindings). Legacy ambient claims keep requiring an
+    # explicit mention from peers.
+    peer_addressable: bool = False
 
     def __post_init__(self) -> None:
         if not self.bridge_id or not self.writer_id:
@@ -284,7 +288,17 @@ def decide_route(
         )
         if not trusted:
             return _decision(message, RouteAction.SILENT, "untrusted_peer_bot")
-        if not self_targeted and not ambient_peer_bot:
+        # A thread with an ambient-owned active binding is addressed to the bound
+        # session by construction; a trusted peer talking in it need not mention
+        # the local bot. This is what lets agents work a bound thread together.
+        binding_ambient = bool(
+            thread is not None
+            and thread.binding is not None
+            and thread.binding.active
+            and thread.binding.ambient_owned
+            and thread.binding.peer_addressable
+        )
+        if not self_targeted and not ambient_peer_bot and not binding_ambient:
             return _decision(message, RouteAction.SILENT, "peer_bot_did_not_target_self")
     elif actor.user_id not in policy.allowed_human_user_ids:
         return _decision(message, RouteAction.SILENT, "human_not_authorized")
