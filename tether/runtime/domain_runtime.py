@@ -1215,6 +1215,72 @@ class DomainRuntime:
                 "turns": [dict(turn) for turn in turns],
             }
 
+    def close_binding(self, binding_id: str) -> dict[str, Any]:
+        """Close one binding. The schema refuses while ready turns remain."""
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT * FROM thread_bindings WHERE binding_id=?", (binding_id,)
+            ).fetchone()
+            if row is None:
+                raise DomainRuntimeError("binding_unknown")
+            if row["state"] == "closed":
+                return self._binding_view(row)
+            try:
+                db.execute(
+                    # The schema requires closing to advance the generation, so
+                    # any in-flight attempt on the old generation is recognisably stale.
+                    "UPDATE thread_bindings SET state='closed',generation=generation+1,"
+                    "updated_at=CURRENT_TIMESTAMP WHERE binding_id=?",
+                    (binding_id,),
+                )
+            except sqlite3.IntegrityError as error:
+                raise DomainRuntimeError("binding_has_ready_turns", str(error)) from error
+            row = db.execute(
+                "SELECT * FROM thread_bindings WHERE binding_id=?", (binding_id,)
+            ).fetchone()
+            return self._binding_view(row)
+
+    def live_binding_for_thread(
+        self, *, team_id: str, channel_id: str, thread_ts: str
+    ) -> dict[str, Any] | None:
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT * FROM thread_bindings WHERE team_id=? AND channel_id=? "
+                "AND thread_ts=? AND state!='closed'",
+                (team_id, channel_id, thread_ts),
+            ).fetchone()
+            return self._binding_view(row) if row else None
+
+    def binding_thread(self, binding_id: str) -> dict[str, Any] | None:
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT binding_id,team_id,channel_id,thread_ts,state FROM thread_bindings "
+                "WHERE binding_id=?", (binding_id,),
+            ).fetchone()
+            return dict(row) if row and row["thread_ts"] else None
+
+    def uncertain_attempts(self) -> list[dict[str, Any]]:
+        with self._transaction() as db:
+            rows = db.execute(
+                "SELECT attempt_id,binding_id,state,error_code FROM native_attempts "
+                "WHERE state='uncertain' ORDER BY created_at"
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def counts(self) -> dict[str, int]:
+        with self._transaction() as db:
+            ready = db.execute(
+                "SELECT COUNT(*) FROM queued_turns WHERE state='ready'"
+            ).fetchone()[0]
+            uncertain = db.execute(
+                "SELECT COUNT(*) FROM native_attempts WHERE state='uncertain'"
+            ).fetchone()[0]
+            blocked = db.execute(
+                "SELECT COUNT(*) FROM thread_bindings WHERE state='rebind_required'"
+            ).fetchone()[0]
+            return {"ready_turns": int(ready), "uncertain_attempts": int(uncertain),
+                    "rebind_required": int(blocked)}
+
     def attempt_status(self, attempt_id: str) -> dict[str, Any]:
         with self._transaction() as db:
             attempt = self._load_attempt(db, attempt_id)

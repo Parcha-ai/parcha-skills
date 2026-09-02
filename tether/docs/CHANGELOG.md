@@ -163,3 +163,20 @@
 - Makes explicit Slack mentions authoritative across humans and bots, suppresses
   terminal `NO_REPLY` control output, and keeps continuation failures out of
   conversation threads.
+
+## 0.4.0 — rip and replace
+
+One system. The 12k-line schema-17 broker, its router, the Zellij/Herdr pane
+endpoints and the migration tooling are gone. What remains:
+
+- `runtime/domain_runtime.py` + `domain_schema.py`: the durable domain (endpoints,
+  thread bindings, queued turns, fenced leases, receipt-owned attempts).
+- `runtime/native_driver.py`: the exact-turn driver for `claude --resume` and
+  `codex exec resume`.
+- `runtime/plugin_next/`: the Hermes plugin `tether` — admission gate, active
+  scheduler, local broker (same NDJSON protocol, same `tether` CLI), Slack egress
+  over urllib with the gateway's bot token.
+- `tether` CLI and `tether_notify.py`: unchanged surface for notify/post/reply/
+  attach/rebind/close/history/thread/unresolved/doctor. Herdr, Zellij panes and
+  `tether schema` are removed. Config keys `active` and `trusted_bot_users` are
+  honoured; `active = true` is the only switch.

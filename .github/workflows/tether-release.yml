@@ -420,10 +420,12 @@ jobs:
             --no-fund \
             "$PWD/dist/$tarball"
           installed="$smoke_root/node_modules/@parcha/tether"
-          python -m py_compile "$installed/runtime/slack_protocol.py"
           python -m py_compile "$installed/runtime/domain_control.py"
           python -m py_compile "$installed/runtime/domain_schema.py"
-          python -m py_compile "$installed/runtime/schema_orchestrator.py"
+          python -m py_compile "$installed/runtime/domain_runtime.py"
+          python -m py_compile "$installed/runtime/native_driver.py"
+          python -m py_compile "$installed/runtime/security.py"
+          python -m py_compile "$installed/"
           [[ "$(node "$installed/bin/tether.js" version)" == "tether $RELEASE_VERSION" ]]
 
           sha256="$(sha256sum "dist/$tarball" | awk '{print $1}')"

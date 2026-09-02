@@ -62,12 +62,20 @@ jobs:
           python -m pip install --disable-pip-version-check
           "bandit==1.8.6"
           "ruff==0.15.18"
-      - run: ruff check tether/runtime tether/skills/tether/scripts tether/herdr-plugin tether/tests
+      - run: ruff check tether/runtime tether/skills/tether/scripts tether/tests
       - run: bandit -q -r tether/runtime tether/skills/tether/scripts
-      - run: python -m py_compile tether/runtime/slack_protocol.py
       - run: python -m py_compile tether/runtime/domain_control.py
       - run: python -m py_compile tether/runtime/domain_schema.py
-      - run: python -m py_compile tether/runtime/schema_orchestrator.py
+      - run: python -m py_compile tether/runtime/domain_runtime.py
+      - run: python -m py_compile tether/runtime/native_driver.py
+      - run: python -m py_compile tether/runtime/security.py
+      - run: python -m py_compile tether/runtime/plugin_next/__init__.py
+      - run: python -m py_compile tether/runtime/plugin_next/active.py
+      - run: python -m py_compile tether/runtime/plugin_next/admission.py
+      - run: python -m py_compile tether/runtime/plugin_next/broker.py
+      - run: python -m py_compile tether/runtime/plugin_next/journal.py
+      - run: python -m py_compile tether/runtime/plugin_next/slack_egress.py
+      - run: python -m py_compile tether/skills/tether/scripts/tether_notify.py
       - run: npm ci --ignore-scripts --no-audit --no-fund
         working-directory: tether
       - run: npm test
@@ -117,7 +125,7 @@ jobs:
           python -m pip install --disable-pip-version-check
           "bandit==1.8.6"
           "ruff==0.15.18"
-      - run: ruff check tether/runtime tether/skills/tether/scripts tether/herdr-plugin tether/tests
+      - run: ruff check tether/runtime tether/skills/tether/scripts tether/tests
       - run: bandit -q -r tether/runtime tether/skills/tether/scripts
       - run: npm ci --ignore-scripts --no-audit --no-fund
         working-directory: tether

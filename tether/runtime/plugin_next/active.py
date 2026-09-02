@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from .broker import BrokerRefused
+
 
 logger = logging.getLogger("hermes_plugins.tether_next.active")
 
@@ -84,6 +86,7 @@ def load_active_settings(path: Path) -> ActiveSettings:
         max_reply_sentences=integer("max_reply_sentences", 3),
         persona_id=str(raw.get("persona_id") or "primary"),
         policy_generation=integer("policy_generation", 1),
+        extra={"default_channel": str(raw.get("default_channel") or "")},
     )
 
 
@@ -141,6 +144,7 @@ class ActiveSlice:
         egress: Egress,
         descriptor: Any,
         command_factory: Callable[[dict[str, Any], ActiveSettings, str], list[str]] = harness_command,
+        slack: Any = None,
     ):
         self.runtime = runtime
         self.driver = driver
@@ -148,6 +152,7 @@ class ActiveSlice:
         self.egress = egress
         self.descriptor = descriptor
         self.command_factory = command_factory
+        self.slack: Any = slack
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -272,6 +277,257 @@ class ActiveSlice:
             return candidate.read_text(encoding="utf-8", errors="replace")
         except OSError:
             return ""
+
+    # -- broker ops (the CLI contract) ---------------------------------------------
+
+    def _identity(self) -> dict[str, Any]:
+        slack = getattr(self, "slack", None)
+        if slack is None:
+            raise BrokerRefused("slack_unconfigured", "no Slack bot token in the gateway")
+        try:
+            return slack.identity()
+        except Exception as exc:
+            raise BrokerRefused("slack_unreachable", str(exc), retryable=True) from exc
+
+    def _team(self, request: dict[str, Any]) -> str:
+        return str(request.get("team_id") or self.descriptor.workspace_id)
+
+    def _owner(self, request: dict[str, Any]) -> str:
+        owner = str(request.get("owner_user_id") or "")
+        if owner:
+            return owner
+        owners = tuple(self.descriptor.canonical_owner_ids) if hasattr(self.descriptor, "canonical_owner_ids") else tuple(self.descriptor.authorized_owner_ids)
+        return owners[0] if owners else ""
+
+    def _source(self, request: dict[str, Any]) -> tuple[str, str, str]:
+        kind = str(request.get("source_kind") or "")
+        source = request.get("source") or {}
+        if kind not in {"claude_session", "codex_session"} or not isinstance(source, dict):
+            raise BrokerRefused(
+                "source_unsupported",
+                "Tether v2 binds Claude Code and Codex sessions; run from inside one, or pass "
+                "--claude-session-id/--codex-session-id",
+            )
+        session_id = str(source.get("session_id") or "")
+        if not session_id:
+            raise BrokerRefused("source_unsupported", "session_id missing")
+        return kind, session_id, str(source.get("cwd") or os.getcwd())
+
+    def handle(self, request: dict[str, Any]) -> dict[str, Any]:
+        op = str(request.get("op") or "")
+        handler = getattr(self, f"op_{op}", None)
+        if handler is None:
+            raise BrokerRefused("unsupported_op", f"Tether v2 does not implement op={op!r}")
+        return handler(request)
+
+    def op_status(self, request: dict[str, Any]) -> dict[str, Any]:
+        counts = self.runtime.counts()
+        connected: bool | None = None
+        membership = "unconfigured"
+        slack = getattr(self, "slack", None)
+        if slack is not None and slack.configured:
+            try:
+                slack.identity()
+                connected = True
+            except Exception:
+                connected = False
+            if self.settings.extra.get("default_channel"):
+                membership = slack.membership(str(self.settings.extra["default_channel"]))
+        owners = tuple(self.descriptor.authorized_owner_ids)
+        return {
+            "implementation": "tether",
+            "protocol_version": 6,
+            "peer_uid_enforced": True,
+            "root_refused": True,
+            "owner_configured": bool(owners),
+            "allowed_user_count": len(owners),
+            "slack_transport_connected": connected,
+            "default_channel_membership": membership,
+            "reply_poll_healthy": True,
+            "queued_delivery_count": counts["ready_turns"],
+            "uncertain_delivery_count": counts["uncertain_attempts"],
+            "blocked_bridge_count": counts["rebind_required"],
+            "schema_version": 18,
+        }
+
+    def op_identity(self, request: dict[str, Any]) -> dict[str, Any]:
+        return dict(self._identity())
+
+    def op_maintenance(self, request: dict[str, Any]) -> dict[str, Any]:
+        return {"performed": []}
+
+    def op_notify(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Post a root message and bind the calling session to its thread."""
+        text = str(request.get("text") or "").strip()
+        if not text:
+            raise BrokerRefused("text_required")
+        kind, session_id, cwd = self._source(request)
+        team_id = self._team(request)
+        channel_id = str(request.get("channel_id") or self.settings.extra.get("default_channel") or "")
+        if not channel_id:
+            raise BrokerRefused("channel_required", "no --channel and no default_channel configured")
+        key = str(request.get("idempotency_key") or "")
+        if not key:
+            raise BrokerRefused("idempotency_key_required")
+        source = {"session_id": session_id, "cwd": cwd}
+        endpoint = self.runtime.register_endpoint(
+            endpoint_key=endpoint_key_for(kind, session_id),
+            endpoint_kind="detached_native",
+            source_kind=kind,
+            source_json=json.dumps(source, sort_keys=True, separators=(",", ":")),
+            ref_version=1,
+            descriptor=self.descriptor,
+        )
+        # Idempotent: the binding row is created pending_root under the key
+        # first, so a retried notify never posts twice.
+        binding = self.runtime.bind_thread(
+            endpoint_id=endpoint["endpoint_id"], team_id=team_id, channel_id=channel_id,
+            owner_user_id=self._owner(request), idempotency_key=f"notify:{team_id}:{channel_id}:{key}",
+        )
+        if binding.get("thread_ts"):
+            return {"status": "duplicate", "state": "posted", "team_id": team_id,
+                    "channel_id": channel_id, "thread_ts": binding["thread_ts"],
+                    "message_ts": binding["thread_ts"], "bridge_id": binding["binding_id"]}
+        ts = self._post(channel_id, text, None)
+        binding = self.runtime.activate_binding(binding["binding_id"], ts)
+        return {"status": "posted", "state": "posted", "team_id": team_id, "channel_id": channel_id,
+                "thread_ts": ts, "message_ts": ts, "bridge_id": binding["binding_id"]}
+
+    def op_attach(self, request: dict[str, Any]) -> dict[str, Any]:
+        kind, session_id, cwd = self._source(request)
+        team_id = self._team(request)
+        channel_id = str(request.get("channel_id") or "")
+        thread_ts = str(request.get("thread_ts") or "")
+        if not channel_id or not thread_ts:
+            raise BrokerRefused("thread_required", "--channel and --thread-ts are required")
+        binding = self.bind(
+            source_kind=kind, session_id=session_id, cwd=cwd, team_id=team_id,
+            channel_id=channel_id, thread_ts=thread_ts, owner_user_id=self._owner(request),
+        )
+        return {"status": "attached", "team_id": team_id, "channel_id": channel_id,
+                "thread_ts": thread_ts, "bridge_id": binding["binding_id"]}
+
+    def op_rebind(self, request: dict[str, Any]) -> dict[str, Any]:
+        kind, session_id, cwd = self._source(request)
+        team_id = self._team(request)
+        channel_id = str(request.get("channel_id") or "")
+        thread_ts = str(request.get("thread_ts") or "")
+        if not channel_id or not thread_ts:
+            raise BrokerRefused("thread_required")
+        existing = self.runtime.live_binding_for_thread(
+            team_id=team_id, channel_id=channel_id, thread_ts=thread_ts
+        )
+        if existing is not None:
+            try:
+                self.runtime.close_binding(existing["binding_id"])
+            except Exception as exc:
+                raise BrokerRefused(getattr(exc, "code", "binding_busy"), str(exc), retryable=True) from exc
+        source = {"session_id": session_id, "cwd": cwd}
+        endpoint = self.runtime.register_endpoint(
+            endpoint_key=endpoint_key_for(kind, session_id), endpoint_kind="detached_native",
+            source_kind=kind, source_json=json.dumps(source, sort_keys=True, separators=(",", ":")),
+            ref_version=1, descriptor=self.descriptor,
+        )
+        binding = self.runtime.bind_thread(
+            endpoint_id=endpoint["endpoint_id"], team_id=team_id, channel_id=channel_id,
+            thread_ts=thread_ts, owner_user_id=self._owner(request),
+            idempotency_key=f"rebind:{team_id}:{channel_id}:{thread_ts}:{session_id}:{time.time_ns()}",
+        )
+        return {"status": "rebound", "team_id": team_id, "channel_id": channel_id,
+                "thread_ts": thread_ts, "bridge_id": binding["binding_id"]}
+
+    def op_close(self, request: dict[str, Any]) -> dict[str, Any]:
+        team_id = self._team(request)
+        channel_id = str(request.get("channel_id") or "")
+        thread_ts = str(request.get("thread_ts") or "")
+        binding_id = str(request.get("bridge_id") or "")
+        if not binding_id:
+            found = self.runtime.live_binding_for_thread(team_id=team_id, channel_id=channel_id, thread_ts=thread_ts)
+            if found is None:
+                raise BrokerRefused("binding_unknown")
+            binding_id = found["binding_id"]
+        try:
+            closed = self.runtime.close_binding(binding_id)
+        except Exception as exc:
+            raise BrokerRefused(getattr(exc, "code", "binding_busy"), str(exc), retryable=True) from exc
+        return {"status": "closed", "bridge_id": closed["binding_id"], "team_id": team_id,
+                "channel_id": closed.get("channel_id"), "thread_ts": closed.get("thread_ts")}
+
+    def op_thread_reply(self, request: dict[str, Any]) -> dict[str, Any]:
+        text = str(request.get("text") or "").strip()
+        channel_id = str(request.get("channel_id") or "")
+        thread_ts = str(request.get("thread_ts") or "")
+        if not text or not channel_id or not thread_ts:
+            raise BrokerRefused("thread_required", "channel, thread-ts and text are required")
+        if text.strip() == "NO_REPLY":
+            return {"status": "no_reply", "team_id": self._team(request), "channel_id": channel_id, "thread_ts": thread_ts}
+        ts = self._post(channel_id, text, thread_ts)
+        return {"status": "posted", "team_id": self._team(request), "channel_id": channel_id,
+                "thread_ts": thread_ts, "message_ts": ts}
+
+    def op_reply(self, request: dict[str, Any]) -> dict[str, Any]:
+        """A bound session answering its thread by binding id (legacy `tether reply`)."""
+        binding_id = str(request.get("bridge_id") or "")
+        text = str(request.get("text") or "")
+        context = self.runtime.binding_thread(binding_id) if hasattr(self.runtime, "binding_thread") else None
+        if context is None:
+            raise BrokerRefused("binding_unknown")
+        if text.strip() == "NO_REPLY":
+            return {"status": "no_reply", "bridge_id": binding_id, "team_id": context["team_id"],
+                    "channel_id": context["channel_id"], "thread_ts": context["thread_ts"],
+                    "reply_key": request.get("reply_key")}
+        ts = self._post(context["channel_id"], text.strip(), context["thread_ts"])
+        return {"status": "posted", "bridge_id": binding_id, "team_id": context["team_id"],
+                "channel_id": context["channel_id"], "thread_ts": context["thread_ts"],
+                "message_ts": ts, "reply_key": request.get("reply_key")}
+
+    def op_history(self, request: dict[str, Any]) -> dict[str, Any]:
+        channel_id = str(request.get("channel_id") or self.settings.extra.get("default_channel") or "")
+        if not channel_id:
+            raise BrokerRefused("channel_required")
+        limit = int(request.get("limit") or 20)
+        return {"team_id": self._team(request), "channel_id": channel_id,
+                "messages": self._slack().history(channel_id, limit=max(1, min(limit, 200)))}
+
+    def op_thread_history(self, request: dict[str, Any]) -> dict[str, Any]:
+        channel_id = str(request.get("channel_id") or "")
+        thread_ts = str(request.get("thread_ts") or "")
+        if not channel_id or not thread_ts:
+            raise BrokerRefused("thread_required")
+        return {"team_id": self._team(request), "channel_id": channel_id, "thread_ts": thread_ts,
+                "messages": self._slack().thread_replies(channel_id, thread_ts)}
+
+    def op_unresolved(self, request: dict[str, Any]) -> dict[str, Any]:
+        operations: list[dict[str, Any]] = []
+        for attempt in self.runtime.uncertain_attempts() if hasattr(self.runtime, "uncertain_attempts") else []:
+            operations.append({"kind": "attempt", "id": attempt["attempt_id"], "state": attempt["state"],
+                               "error_code": attempt.get("error_code"), "binding_id": attempt.get("binding_id")})
+        return {"team_id": self._team(request), "operations": operations}
+
+    def op_resolve(self, request: dict[str, Any]) -> dict[str, Any]:
+        raise BrokerRefused(
+            "unsupported_op",
+            "operator resolution of uncertain attempts is not exposed through the broker yet; "
+            "use hermes tether status to inspect",
+        )
+
+    def op_herdr_context(self, request: dict[str, Any]) -> dict[str, Any]:
+        raise BrokerRefused("unsupported_op", "Herdr panes are not supported by Tether v2")
+
+    def _slack(self) -> Any:
+        slack = getattr(self, "slack", None)
+        if slack is None or not slack.configured:
+            raise BrokerRefused("slack_unconfigured", "no Slack bot token in the gateway")
+        return slack
+
+    def _post(self, channel_id: str, text: str, thread_ts: str | None) -> str:
+        try:
+            return self._slack().post(channel_id, text, thread_ts=thread_ts)
+        except BrokerRefused:
+            raise
+        except Exception as exc:
+            code = getattr(exc, "code", "slack_error")
+            raise BrokerRefused(f"slack_{code}", str(exc), retryable=code in {"transport", "ratelimited"}) from exc
 
     # -- lifecycle ------------------------------------------------------------------
 

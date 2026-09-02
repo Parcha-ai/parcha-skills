@@ -35,6 +35,8 @@ from typing import Any
 
 from . import admission
 from . import active as active_module
+from . import broker as broker_module
+from .slack_egress import SlackEgress
 from .journal import DurableJournal
 
 logger = logging.getLogger("hermes_plugins.tether_next")
@@ -257,6 +259,10 @@ def register(ctx: Any) -> None:
     ctx.register_hook("pre_gateway_dispatch", on_pre_gateway_dispatch)
     if slice_ is not None:
         slice_.start()
+        broker = getattr(slice_, "broker", None)
+        if broker is not None:
+            broker.start()
+            logger.warning("tether: broker listening on %s", broker.socket_path)
 
     def _cli_setup(parser: Any) -> None:
         parser.add_argument(
@@ -310,6 +316,10 @@ def register(ctx: Any) -> None:
         if slice_ is not None:
             with contextlib.suppress(Exception):
                 ctx.on_unload(slice_.stop)
+            broker = getattr(slice_, "broker", None)
+            if broker is not None:
+                with contextlib.suppress(Exception):
+                    ctx.on_unload(broker.stop)
 
 
 def _build_active_slice(
@@ -361,13 +371,15 @@ def _build_active_slice(
         policy_generation=active_settings.policy_generation,
     )
 
-    def egress(channel_id: str, thread_ts: str, text: str) -> Any:
-        return ctx.dispatch_tool(
-            "send_message",
-            {"action": "send", "target": f"slack:{channel_id}:{thread_ts}", "message": text},
-        )
+    slack = SlackEgress()
 
-    return active_module.ActiveSlice(
+    def egress(channel_id: str, thread_ts: str, text: str) -> Any:
+        return slack.post(channel_id, text, thread_ts=thread_ts)
+
+    slice_ = active_module.ActiveSlice(
         runtime=runtime, driver=driver, settings=active_settings,
-        egress=egress, descriptor=descriptor,
+        egress=egress, descriptor=descriptor, slack=slack,
     )
+    server = broker_module.BrokerServer(home / "bridge.sock", slice_.handle)
+    slice_.broker = server
+    return slice_

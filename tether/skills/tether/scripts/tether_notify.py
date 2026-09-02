@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import os
 import re
 import shutil
+import socket
+import stat
 # Hermes is invoked with a fixed argv list, never a shell.
 import subprocess  # nosec B404
 import sys
@@ -14,11 +15,9 @@ import time
 import urllib.parse
 from collections.abc import Sequence
 from pathlib import Path
-from types import ModuleType
 
 
 DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
-RUNTIME_PATH = DATA_HOME / "tether" / "bridge_runtime.py"
 SETUP_TIMEOUT_SECONDS = 900
 SERVICE_TIMEOUT_SECONDS = 60
 MAX_MESSAGE_BYTES = 512 * 1024
@@ -30,25 +29,148 @@ SLACK_THREAD_URL = re.compile(
 )
 
 
-def _load_runtime(path: Path = RUNTIME_PATH) -> ModuleType:
-    if not path.is_file():
-        raise SystemExit("Tether runtime is not installed; run the package installer")
-    spec = importlib.util.spec_from_file_location("tether_bridge_runtime", path)
-    if spec is None or spec.loader is None:
-        raise SystemExit("Tether runtime could not be loaded")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+BROKER_PROTOCOL_VERSION = 6
 
 
-_runtime = _load_runtime()
-broker_call = _runtime.broker_call
-doctor = _runtime.doctor
-redact_text = getattr(_runtime, "redact_text", None)
-zellij_pane_identity = _runtime.zellij_pane_identity
-herdr_agent_identity = _runtime.herdr_agent_identity
-working_directory_identity = _runtime.working_directory_identity
+def _broker_socket() -> Path:
+    for name in ("TETHER_BROKER_SOCKET", "TETHER_SOCKET_PATH", "TETHER_SOCKET"):
+        value = os.environ.get(name, "")
+        if value:
+            return Path(value)
+    return Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))) / "bridge.sock"
+
+
+class BrokerError(RuntimeError):
+    def __init__(self, payload: dict[str, object]):
+        super().__init__(str(payload.get("error") or payload.get("code") or "broker error"))
+        self.code = str(payload.get("code") or "broker_error")
+        self.retryable = bool(payload.get("retryable"))
+
+
+def broker_call(request: dict[str, object], *, timeout: float = 60.0) -> dict[str, object]:
+    """One JSON line in, one JSON line out, over the gateway's private socket."""
+    socket_path = _broker_socket()
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(timeout)
+            client.connect(str(socket_path))
+            client.sendall((json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"))
+            chunks = bytearray()
+            while b"\n" not in chunks:
+                piece = client.recv(65536)
+                if not piece:
+                    break
+                chunks.extend(piece)
+                if len(chunks) > 1_000_000:
+                    raise SystemExit("Tether broker response too large")
+    except OSError as error:
+        raise SystemExit(f"Tether could not reach its local broker ({error.strerror or error})") from error
+    line = bytes(chunks).split(b"\n", 1)[0]
+    if not line:
+        raise SystemExit("Tether's local broker closed without a response")
+    payload = json.loads(line.decode("utf-8", errors="replace"))
+    if not isinstance(payload, dict) or not isinstance(payload.get("ok"), bool):
+        raise SystemExit("Tether's local broker returned an invalid response contract")
+    if not payload["ok"]:
+        raise BrokerError(payload)
+    return payload
+
+
+_PROVIDER_KEY = re.compile(
+    r"(?<![A-Za-z0-9_-])(?:"
+    r"xox[baprs]-[A-Za-z0-9-]{10,}|xa" r"pp-[A-Za-z0-9-]{10,}|"
+    r"github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|"
+    r"sk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}|AIza[A-Za-z0-9_-]{35}|"
+    r"(?:AKIA|ASIA)[A-Z0-9]{16}|(?:hf_|gsk_|ops_)[A-Za-z0-9_-]{20,}|"
+    r"(?:sk|rk)_live_[A-Za-z0-9]{16,}"
+    r")(?![A-Za-z0-9_-])"
+)
+_BEARER = re.compile(r"(?P<prefix>\bBearer\s+)[A-Za-z0-9._~+/=-]{8,}", re.IGNORECASE)
+
+
+def redact_text(value: str) -> str:
+    value = _PROVIDER_KEY.sub("[REDACTED_PROVIDER_KEY]", value)
+    return _BEARER.sub(r"\g<prefix>[REDACTED]", value)
+
+
+def doctor() -> tuple[bool, list[str]]:
+    checks: list[str] = []
+    socket_path = _broker_socket()
+    try:
+        mode = socket_path.lstat().st_mode
+        if not stat.S_ISSOCK(mode):
+            checks.append("FAIL broker path is not a Unix socket")
+        elif stat.S_IMODE(mode) != 0o600:
+            checks.append(f"FAIL broker socket mode is {stat.S_IMODE(mode):04o}; expected 0600")
+        else:
+            checks.append("ok broker socket is private")
+    except OSError as error:
+        checks.append(f"FAIL broker socket unavailable ({error.strerror or 'stat error'})")
+    try:
+        status = broker_call({"op": "status"})
+    except (SystemExit, BrokerError) as error:
+        checks.append(f"FAIL broker readiness: {redact_text(str(error))}")
+        return False, checks
+    checks.append(
+        "ok Tether broker implementation active" if status.get("implementation") == "tether"
+        else f"FAIL unexpected broker implementation={status.get('implementation') or 'unknown'}"
+    )
+    checks.append(
+        f"ok broker protocol={status.get('protocol_version')}" if status.get("protocol_version") == BROKER_PROTOCOL_VERSION
+        else f"FAIL unsupported broker protocol={status.get('protocol_version')}"
+    )
+    count = status.get("allowed_user_count") or 0
+    checks.append(f"ok authorized operators={count}" if count else "FAIL no explicit operator allowlist")
+    checks.append("ok bridge owner configured" if status.get("owner_configured") else "FAIL no bridge owner configured")
+    checks.append(
+        "ok local Unix peer boundary enforced"
+        if status.get("peer_uid_enforced") is True and status.get("root_refused") is True
+        else "FAIL local Unix peer boundary is not confirmed"
+    )
+    connected = status.get("slack_transport_connected")
+    checks.append(
+        "ok Slack egress authenticated" if connected is True
+        else "FAIL Slack egress is not authenticated" if connected is False
+        else "WARN Slack egress not yet verified"
+    )
+    membership = status.get("default_channel_membership")
+    if membership == "member":
+        checks.append("ok Slack bot is a member of its configured channel")
+    elif membership == "not_member":
+        checks.append("FAIL Slack bot is not a member of its configured channel")
+    uncertain = int(status.get("uncertain_delivery_count") or 0)
+    checks.append(f"WARN uncertain attempts={uncertain}; run tether unresolved" if uncertain else "ok no uncertain attempts")
+    queued = int(status.get("queued_delivery_count") or 0)
+    if queued:
+        checks.append(f"WARN ready turns waiting={queued}")
+    return not any(line.startswith("FAIL") for line in checks), checks
+
+
+def working_directory_identity(cwd: str) -> dict[str, str]:
+    resolved = os.path.realpath(cwd)
+    try:
+        info = os.stat(resolved)
+    except OSError as error:
+        raise SystemExit("The working directory is unavailable.") from error
+    if not stat.S_ISDIR(info.st_mode):
+        raise SystemExit("The working directory is not a directory.")
+    return {
+        "cwd": os.path.abspath(cwd),
+        "cwd_realpath": resolved,
+        "cwd_device": str(info.st_dev),
+        "cwd_inode": str(info.st_ino),
+        "cwd_owner_uid": str(info.st_uid),
+    }
+
+
+def zellij_pane_identity(*args: object, **kwargs: object) -> dict[str, str] | None:
+    # Zellij panes are not a Tether v2 source; only exact Claude Code / Codex
+    # sessions are bindable. Ambient terminal detection therefore yields nothing.
+    return None
+
+
+def herdr_agent_identity(*args: object, **kwargs: object) -> dict[str, str] | None:
+    return None
 
 
 def _safe_error(error: BaseException) -> str:
