@@ -569,7 +569,7 @@ add_file() {
 }
 
 add_skill() {
-  local harness_home="$1" harness_name="$2"
+  local harness_home="$1"
   local destination="$harness_home/skills/tether"
   add_file "$SKILL_SOURCE/SKILL.md" "$destination/SKILL.md" 644
   add_file "$SKILL_SOURCE/agents/openai.yaml" "$destination/agents/openai.yaml" 644
