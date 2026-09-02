@@ -191,6 +191,18 @@ class DomainRuntime:
                         "SELECT * FROM endpoints WHERE endpoint_id=?", (endpoint_id,)
                     ).fetchone()
                 return self._endpoint_view(existing)
+            owner = db.execute(
+                "SELECT security_domain_id FROM endpoints WHERE endpoint_key=?",
+                (endpoint_key,),
+            ).fetchone()
+            if owner is not None and owner["security_domain_id"] != domain_id:
+                # The same session is already registered under a different
+                # security domain (other owner set / persona). Refusing loudly
+                # beats a raw UNIQUE failure from SQLite.
+                raise DomainRuntimeError(
+                    "endpoint_key_conflict",
+                    "this session is registered under another security domain",
+                )
             db.execute(
                 """
                 INSERT INTO endpoints(

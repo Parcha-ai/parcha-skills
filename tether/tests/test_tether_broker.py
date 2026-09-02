@@ -166,6 +166,20 @@ class BrokerTest(unittest.TestCase):
         finally:
             os.environ.pop("TETHER_BROKER_SOCKET", None)
 
+    def test_same_session_in_another_domain_is_refused_with_a_code(self):
+        other = self.schema.SecurityDomainDescriptor(
+            instance_uid=os.geteuid(), workspace_id="T12345678", persona_id="other",
+            authorized_owner_ids=("U99999999",), policy_generation=1,
+        )
+        self.slice.runtime.register_endpoint(
+            endpoint_key="detached_native:claude_session:sess-x", endpoint_kind="detached_native",
+            source_kind="claude_session", source_json='{"session_id":"sess-x"}', ref_version=1,
+            descriptor=other,
+        )
+        refused = self.call(op="attach", channel_id="C1", thread_ts="100.9", idempotency_key="ax", **self.source("sess-x"))
+        self.assertFalse(refused["ok"])
+        self.assertEqual(refused["code"], "endpoint_key_conflict")
+
     def test_refusals_are_explicit(self):
         bad = self.call(op="herdr_context")
         self.assertFalse(bad["ok"])

@@ -577,18 +577,6 @@ add_skill() {
   add_file "$SKILL_SOURCE/references/contract.md" "$destination/references/contract.md" 644
   add_file "$SKILL_SOURCE/scripts/tether_notify.py" "$destination/scripts/tether_notify.py" 700
 
-  local legacy="$harness_home/skills/hermes-slack-bridge"
-  if [[ -d "$legacy" ]]; then
-    LEGACY_HARNESSES+=("$harness_name")
-    add_file \
-      "$ROOT_DIR/runtime/compat/hermes-slack-bridge-SKILL.md" \
-      "$legacy/SKILL.md" \
-      644
-    add_file \
-      "$SKILL_SOURCE/scripts/tether_notify.py" \
-      "$legacy/scripts/hermes_notify.py" \
-      700
-  fi
 }
 
 build_install_plan() {

@@ -318,7 +318,16 @@ class ActiveSlice:
         handler = getattr(self, f"op_{op}", None)
         if handler is None:
             raise BrokerRefused("unsupported_op", f"Tether v2 does not implement op={op!r}")
-        return handler(request)
+        try:
+            return handler(request)
+        except BrokerRefused:
+            raise
+        except Exception as exc:
+            code = getattr(exc, "code", None)
+            if isinstance(code, str) and code:
+                # Domain refusals carry their own code; hand it to the caller.
+                raise BrokerRefused(code, str(exc)) from exc
+            raise
 
     def op_status(self, request: dict[str, Any]) -> dict[str, Any]:
         counts = self.runtime.counts()
