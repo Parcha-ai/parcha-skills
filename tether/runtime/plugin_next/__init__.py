@@ -27,12 +27,14 @@ import logging
 import os
 import re
 import sqlite3
+import sys
 import time
 import tomllib
 from pathlib import Path
 from typing import Any
 
 from . import admission
+from . import active as active_module
 from .journal import DurableJournal
 
 logger = logging.getLogger("tether.plugin")
@@ -72,11 +74,18 @@ def load_settings(path: Path | None = None) -> admission.AdmissionSettings:
         candidates.extend(
             value.strip() for value in os.environ.get(name, "").split(",")
         )
+    peers = raw.get("trusted_bot_users") or []
+    peer_candidates = [str(user) for user in peers if isinstance(user, str) and user] if isinstance(peers, list) else []
+    for name in ("TETHER_ALLOWED_BOT_USERS", "HERMES_TRUSTED_BOT_USERS"):
+        peer_candidates.extend(value.strip() for value in os.environ.get(name, "").split(","))
     return admission.AdmissionSettings(
         workspace_id=str(raw.get("team_id") or ""),
         allowed_users=frozenset(
             user for user in candidates
             if user and user != "*" and _USER_ID.fullmatch(user)
+        ),
+        trusted_bot_users=frozenset(
+            user for user in peer_candidates if user and _USER_ID.fullmatch(user)
         ),
     )
 
@@ -160,7 +169,15 @@ def register(ctx: Any) -> None:
     home = _hermes_home()
     journal = DurableJournal(home / "plugin-data" / "tether")
     bindings = BindingIndex(home / "bridges.db")
+    # Threads bound in the schema-18 domain (active mode) count as bound too:
+    # admission stays the single gate, it just reads both stores.
+    domain_bindings = BindingIndex(home / "plugin-data" / "tether" / "domain.db", ttl_seconds=0.0)
     settings = load_settings()
+
+    active_settings = active_module.load_active_settings(_config_path())
+    slice_: active_module.ActiveSlice | None = None
+    if active_settings.enabled and settings.configured:
+        slice_ = _build_active_slice(ctx, home, settings, active_settings)
 
     if not settings.configured:
         logger.warning(
@@ -197,12 +214,16 @@ def register(ctx: Any) -> None:
                 actor_is_bot=fields["actor_is_bot"],
                 message_id=fields["message_id"],
                 settings=settings,
-                bound_threads=bindings.bound_threads(),
+                bound_threads=bindings.bound_threads() | domain_bindings.bound_threads(),
             )
             event_key = (
                 f"slack:{fields['workspace'] or '-'}:{fields['channel'] or '-'}:"
                 f"{fields['message_id'] or decision['fingerprint']}"
             )
+            claimed = None
+            if slice_ is not None and decision.get("verdict") == "admit":
+                claimed = slice_.claim(fields, str(getattr(event, "text", "") or ""))
+                decision = dict(decision, claimed=claimed is not None)
             journal.record(
                 event_key,
                 decision,
@@ -212,24 +233,52 @@ def register(ctx: Any) -> None:
                 thread=fields["thread"],
                 actor=fields["actor"],
             )
+            if claimed is not None:
+                # Tether owns this turn; Hermes' own agent must not also answer.
+                return {"action": "skip", "reason": "tether-claimed"}
         except Exception:  # pragma: no cover - the gateway must never break
-            logger.exception("tether: shadow observation failed; event untouched")
+            logger.exception("tether: observation failed; event untouched")
         return None
 
     ctx.register_hook("pre_gateway_dispatch", on_pre_gateway_dispatch)
+    if slice_ is not None:
+        slice_.start()
 
     def _cli_setup(parser: Any) -> None:
         parser.add_argument(
             "subcommand",
             nargs="?",
             default="status",
-            choices=["status"],
+            choices=["status", "bind"],
         )
         parser.add_argument("--json", action="store_true", default=True)
+        parser.add_argument("--channel")
+        parser.add_argument("--thread-ts")
+        parser.add_argument("--owner")
+        parser.add_argument("--claude-session-id")
+        parser.add_argument("--codex-session-id")
+        parser.add_argument("--cwd", default=os.getcwd())
 
     def _cli_handler(args: Any) -> int:
-        del args
-        print(json.dumps(journal.summary(), sort_keys=True))
+        if getattr(args, "subcommand", "status") == "bind":
+            if slice_ is None:
+                print(json.dumps({"ok": False, "error": "active_mode_disabled"}))
+                return 2
+            kind, session = ("codex_session", args.codex_session_id) if args.codex_session_id else ("claude_session", args.claude_session_id)
+            if not (session and args.channel and args.thread_ts):
+                print(json.dumps({"ok": False, "error": "usage: bind --channel C --thread-ts TS (--claude-session-id|--codex-session-id) ID"}))
+                return 2
+            owner = args.owner or next(iter(sorted(settings.allowed_users)), "")
+            binding = slice_.bind(
+                source_kind=kind, session_id=session, cwd=args.cwd,
+                team_id=settings.workspace_id, channel_id=args.channel,
+                thread_ts=args.thread_ts, owner_user_id=owner,
+            )
+            print(json.dumps({"ok": True, "binding_id": binding["binding_id"]}))
+            return 0
+        summary = journal.summary()
+        summary["active"] = slice_ is not None
+        print(json.dumps(summary, sort_keys=True))
         return 0
 
     with contextlib.suppress(Exception):
@@ -244,3 +293,67 @@ def register(ctx: Any) -> None:
     if hasattr(ctx, "on_unload"):
         with contextlib.suppress(Exception):
             ctx.on_unload(journal.close)
+        if slice_ is not None:
+            with contextlib.suppress(Exception):
+                ctx.on_unload(slice_.stop)
+
+
+def _build_active_slice(
+    ctx: Any,
+    home: Path,
+    settings: admission.AdmissionSettings,
+    active_settings: active_module.ActiveSettings,
+) -> active_module.ActiveSlice | None:
+    """Wire the schema-18 domain, the exact-turn driver, and Hermes egress."""
+    try:
+        import domain_runtime
+        import domain_schema
+        import native_driver
+    except ImportError:
+        # Installed layout: runtime modules live in $XDG_DATA_HOME/tether; the
+        # source layout keeps them one directory above this package.
+        data_home = Path(
+            os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))
+        ).expanduser()
+        for candidate in (data_home / "tether", Path(__file__).resolve().parents[1]):
+            if str(candidate) not in sys.path and candidate.is_dir():
+                sys.path.insert(0, str(candidate))
+        try:
+            import domain_runtime
+            import domain_schema
+            import native_driver
+        except ImportError:
+            logger.error("tether: active mode requested but domain runtime is not installed")
+            return None
+    root = home / "plugin-data" / "tether"
+    root.mkdir(parents=True, exist_ok=True)
+    database = root / "domain.db"
+    if not database.exists():
+        connection = sqlite3.connect(database)
+        try:
+            domain_schema.install_schema(connection)
+            connection.execute(f"PRAGMA user_version={domain_schema.SCHEMA_VERSION}")
+            connection.commit()
+        finally:
+            connection.close()
+        os.chmod(database, 0o600)
+    runtime = domain_runtime.DomainRuntime(database)
+    driver = native_driver.NativeDriver(runtime, work_root=root / "driver")
+    descriptor = domain_schema.SecurityDomainDescriptor(
+        instance_uid=os.geteuid(),
+        workspace_id=settings.workspace_id,
+        persona_id=active_settings.persona_id,
+        authorized_owner_ids=tuple(sorted(settings.allowed_users)),
+        policy_generation=active_settings.policy_generation,
+    )
+
+    def egress(channel_id: str, thread_ts: str, text: str) -> Any:
+        return ctx.dispatch_tool(
+            "send_message",
+            {"action": "send", "target": f"slack:{channel_id}:{thread_ts}", "message": text},
+        )
+
+    return active_module.ActiveSlice(
+        runtime=runtime, driver=driver, settings=active_settings,
+        egress=egress, descriptor=descriptor,
+    )
