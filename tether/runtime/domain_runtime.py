@@ -1217,6 +1217,7 @@ class DomainRuntime:
             return {
                 "attempt_id": attempt_id,
                 "state": attempt["state"],
+                "error_code": attempt["error_code"],
                 "response_ref": attempt["response_ref"],
                 "source_kind": endpoint["source_kind"],
                 "source": json.loads(endpoint["source_json"] or "{}"),
