@@ -591,6 +591,8 @@ build_install_plan() {
   add_file "$ROOT_DIR/runtime/native_driver.py" "$RUNTIME_HOME/native_driver.py" 600
   add_file "$ROOT_DIR/runtime/security.py" "$RUNTIME_HOME/security.py" 600
   add_file "$SKILL_SOURCE/scripts/tether_notify.py" "$RUNTIME_HOME/tether_notify.py" 700
+  add_file "$SKILL_SOURCE/scripts/tether_team.py" "$RUNTIME_HOME/tether_team.py" 700
+  add_file "$ROOT_DIR/team/TEAM.md" "$RUNTIME_HOME/team/TEAM.md" 600
   add_file "$ROOT_DIR/install.sh" "$RUNTIME_HOME/install.sh" 700
   add_file "$ROOT_DIR/package.json" "$RUNTIME_HOME/package.json" 600
   for module in __init__.py active.py admission.py broker.py journal.py slack_egress.py; do
