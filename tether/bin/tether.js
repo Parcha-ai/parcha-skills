@@ -1198,6 +1198,13 @@ async function runDoctor(options) {
 }
 
 async function runBrokerCommand(command, argv) {
+  if (command === "team") {
+    const script = path.join(runtimeHome, "tether_team.py");
+    const teamMd = path.join(runtimeHome, "team", "TEAM.md");
+    const sub = argv[1] || "apply";
+    const child = spawnSync("python3", [script, sub, "--team-md", teamMd], { stdio: "inherit" });
+    return child.status ?? 1;
+  }
   const source = sourceDefinitions();
   let definitions;
   switch (command) {
@@ -1295,13 +1302,6 @@ async function runBrokerCommand(command, argv) {
     return 0;
   }
   const options = parseOptions(argv, definitions);
-  if (command === "team") {
-    const script = path.join(runtimeHome, "tether_team.py");
-    const teamMd = path.join(runtimeHome, "team", "TEAM.md");
-    const sub = argv[1] || "apply";
-    const child = spawnSync("python3", [script, sub, "--team-md", teamMd], { stdio: "inherit" });
-    return child.status ?? 1;
-  }
   if (command === "status") return runStatus(options);
   if (command === "doctor") return runDoctor(options);
   const messageText = ["notify", "reply", "post"].includes(command)
