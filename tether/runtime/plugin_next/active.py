@@ -258,6 +258,9 @@ def create_session(
 ) -> str:
     """Start a fresh harness session on this box, seeded with the task; return its id.
 
+    Runs through :func:`launch_plan`, so with the systemd-user launcher the
+    session is created in the operator's own user session.
+
     The session runs its first turn now so the id exists on disk and later
     `--resume` finds it. The task text is the first user turn, so the session
     already knows what it is for when the thread starts talking to it.
@@ -266,6 +269,7 @@ def create_session(
     if source_kind == "codex_session":
         binary = shutil.which(settings.codex_binary) or settings.codex_binary
         command = [binary, "exec", "--json", *settings.codex_resume_args, task]
+        command, env, _ = launch_plan(command, cwd, env, settings)
         completed = runner(command, cwd=str(cwd), env=env, input="", capture_output=True, text=True, timeout=timeout)  # nosec B603
         for line in completed.stdout.splitlines():
             try:
@@ -277,6 +281,9 @@ def create_session(
         raise RuntimeError(f"codex did not report a thread id (exit {completed.returncode})")
     binary = shutil.which(settings.claude_binary) or settings.claude_binary
     command = [binary, "-p", "--output-format", "json", *settings.claude_resume_args, task]
+    # Same launcher as bound turns: a spawned session's first turn must not run
+    # inside the gateway sandbox either, or it starts life believing the host is broken.
+    command, env, _ = launch_plan(command, cwd, env, settings)
     completed = runner(command, cwd=str(cwd), env=env, capture_output=True, text=True, timeout=timeout)  # nosec B603
     try:
         payload = json.loads(completed.stdout.strip().splitlines()[-1]) if completed.stdout.strip() else {}
