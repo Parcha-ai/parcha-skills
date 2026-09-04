@@ -16,8 +16,10 @@ const MAX_REQUEST_FRAME_BYTES = 1_048_576;
 const MAX_RESPONSE_FRAME_BYTES = 8 * 1_048_576;
 const MAX_MESSAGE_BYTES = 512 * 1024;
 const DEFAULT_TIMEOUT_MS = 35_000;
+// spawn seeds a whole harness turn before the broker can answer.
+const SPAWN_TIMEOUT_MS = 900_000;
 const MIN_TIMEOUT_MS = 50;
-const MAX_TIMEOUT_MS = 60_000;
+const MAX_TIMEOUT_MS = 900_000;
 const CHILD_TIMEOUT_MS = 60_000;
 const LIFECYCLE_TIMEOUT_MS = 900_000;
 const BROKER_PROTOCOL_VERSION = 6;
@@ -432,7 +434,7 @@ Usage:
 
 Broker options:
   --socket PATH       Override TETHER_BROKER_SOCKET and HERMES_HOME.
-  --timeout-ms MS     Bound one local broker request (50..60000 ms).
+  --timeout-ms MS     Bound one local broker request (50..900000 ms; spawn defaults to 900000).
   --json              Emit one redacted JSON object where supported.
 
 Run \`tether <operational-command> --help\` for command-specific arguments.
@@ -638,9 +640,11 @@ function requireChoice(options, name, allowed) {
   return value;
 }
 
-function resolveTimeout(options) {
+function resolveTimeout(options, request) {
   const raw = options["timeout-ms"] ?? process.env.TETHER_BROKER_TIMEOUT_MS;
-  if (raw === undefined || raw === "") return DEFAULT_TIMEOUT_MS;
+  if (raw === undefined || raw === "") {
+    return request && request.op === "spawn" ? SPAWN_TIMEOUT_MS : DEFAULT_TIMEOUT_MS;
+  }
   if (!/^[0-9]+$/.test(String(raw))) {
     throw new CliError("Broker timeout must be an integer number of milliseconds.");
   }
@@ -676,7 +680,7 @@ function protocolFailure(message) {
 
 function brokerCall(request, options) {
   const socketPath = resolveSocketPath(options);
-  const timeoutMs = resolveTimeout(options);
+  const timeoutMs = resolveTimeout(options, request);
   let encoded;
   try {
     encoded = JSON.stringify(request);

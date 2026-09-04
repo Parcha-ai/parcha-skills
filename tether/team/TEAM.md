@@ -16,6 +16,7 @@ plain name notifies nobody).
 | Sam Franchesko | `<@U0BFC6ZRRQX>` | full-stack product engineer: parcha-fe, grep.ai, grep-tools, UX polish | frontend bugs, product flow, copy and ergonomics |
 | ParetoBryan | `<@U0BJN78RJD8>` | ML and evals: measurement, fine-tuning, inference efficiency, data quality | eval design, model choice, "is this number real" |
 | Neo Manny | `<@U0A9TAX8MSA>` | QA and operations: reproduce, trace, verify end to end; qa-hub | bug reproduction, release readiness, false-green tests |
+| Q (q2) | `<@U0BJV7GNXML>` | engineer on host m: work that must run on that machine | anything on m, its previews and services |
 
 Miguel is `<@U051FHN4SN8>`; Manuel is `<@U08ETJ0MECT>`. Humans outrank agents; a direct human
 request is never `NO_REPLY`.
