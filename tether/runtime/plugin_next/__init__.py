@@ -181,6 +181,16 @@ def register(ctx: Any) -> None:
     slice_: active_module.ActiveSlice | None = None
     if active_settings.enabled and settings.configured:
         slice_ = _build_active_slice(ctx, home, settings, active_settings)
+        if slice_ is not None and getattr(slice_, "slack", None) is not None:
+            try:
+                settings = admission.AdmissionSettings(
+                    workspace_id=settings.workspace_id,
+                    allowed_users=settings.allowed_users,
+                    trusted_bot_users=settings.trusted_bot_users,
+                    self_user_id=str(slice_.slack.identity().get("user_id") or ""),
+                )
+            except Exception:
+                logger.warning("tether: could not resolve own Slack identity; self-messages may be claimed")
         logger.warning(
             "tether: active slice %s (workspace=%s owners=%d peers=%d)",
             "started" if slice_ else "NOT built",
@@ -224,6 +234,7 @@ def register(ctx: Any) -> None:
                 actor=fields["actor"],
                 actor_is_bot=fields["actor_is_bot"],
                 message_id=fields["message_id"],
+                text=str(getattr(event, "text", "") or ""),
                 settings=settings,
                 bound_threads=bindings.bound_threads() | domain_bindings.bound_threads(),
             )
