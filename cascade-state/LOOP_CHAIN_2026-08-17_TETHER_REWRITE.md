@@ -362,3 +362,22 @@ green on each (protocol=6, integrity verified, brokers listening).
 their bound sessions need proxy auth passthrough (tracked as the next fix). Upstream filing
 (L2.1) remains blocked on credentials. L3's canary/authority plane is superseded by this
 amendment: the fleet is the deployment, and the receipts are the invariants.
+
+## Amendment A6 — Colleague layer (2026-09-04)
+
+Goal restated by Miguel: agents that behave in Slack and in Claude Code / Codex like human
+engineers. Three shipped pieces, each proven live in #agent-hub:
+
+- `tether spawn` (#444): an agent starts a harness session for a task on its own box, seeded
+  with the task, bound to the thread. Proof: spawned session fixed `calc.py`, pytest green,
+  then answered a peer's question with file:line and exit code.
+- Presence (#444): `:eyes:` on claim, `:white_check_mark:`/`:warning:` on completion.
+  Admission ignores the agent's own posts and Hermes status lines.
+- Team layer (#445, v2 #446): one versioned `team/TEAM.md` with roster, lanes, hand-off rules
+  and the colleague loop, applied to every SOUL.md by `tether team apply`. Proof: irma
+  declined an out-of-lane request and routed it to Neo Manny by mention. v2 adds one voice
+  per hand-off after claudio double-answered.
+
+Not done: memory (Hermes memory/session-search toolsets + recall as a tool), the conversation
+judge and corpus, a single fleet deploy command, manny's #agent-hub invite (needs a human),
+agent "M" on an unreachable host, official Slack MCP OAuth.
