@@ -1070,6 +1070,9 @@ function statusLines(status) {
     status.peer_uid_enforced === true && status.root_refused === true
       ? "ok local Unix peer boundary enforced"
       : "FAIL local Unix peer boundary is not confirmed",
+    status.harness_launcher === "systemd-user"
+      ? "ok harness turns run in the operator's systemd user session"
+      : "WARN harness launcher=direct: turns inherit the gateway sandbox (no sudo/docker); enable-linger the gateway user",
   ];
   if (status.slack_transport_connected === true) {
     lines.push("ok Slack Socket Mode ingress connected");
