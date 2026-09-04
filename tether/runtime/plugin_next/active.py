@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess  # nosec B404 - fixed argv, no shell
 import threading
 import time
 import tomllib
@@ -80,6 +81,10 @@ class ActiveSettings:
     persona_id: str = "primary"
     policy_generation: int = 1
     harness_env: tuple[str, ...] = ()
+    presence: bool = True
+    ack_emoji: str = "eyes"
+    done_emoji: str = "white_check_mark"
+    fail_emoji: str = "warning"
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -108,6 +113,7 @@ def load_active_settings(path: Path) -> ActiveSettings:
         persona_id=str(raw.get("persona_id") or "primary"),
         policy_generation=integer("policy_generation", 1),
         harness_env=strings("harness_env"),
+        presence=bool(raw.get("presence", True)),
         extra={"default_channel": str(raw.get("default_channel") or "")},
     )
 
@@ -139,6 +145,47 @@ def compose_prompt(context: dict[str, Any], settings: ActiveSettings) -> str:
         "saying, reply with exactly NO_REPLY.",
     ]
     return "\n".join(lines)
+
+
+def create_session(
+    source_kind: str,
+    cwd: Path,
+    task: str,
+    settings: ActiveSettings,
+    *,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    timeout: int = 600,
+) -> str:
+    """Start a fresh harness session on this box, seeded with the task; return its id.
+
+    The session runs its first turn now so the id exists on disk and later
+    `--resume` finds it. The task text is the first user turn, so the session
+    already knows what it is for when the thread starts talking to it.
+    """
+    env = child_env(passthrough=settings.harness_env)
+    if source_kind == "codex_session":
+        binary = shutil.which(settings.codex_binary) or settings.codex_binary
+        command = [binary, "exec", "--json", *settings.codex_resume_args, task]
+        completed = runner(command, cwd=str(cwd), env=env, input="", capture_output=True, text=True, timeout=timeout)  # nosec B603
+        for line in completed.stdout.splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if event.get("type") == "thread.started" and event.get("thread_id"):
+                return str(event["thread_id"])
+        raise RuntimeError(f"codex did not report a thread id (exit {completed.returncode})")
+    binary = shutil.which(settings.claude_binary) or settings.claude_binary
+    command = [binary, "-p", "--output-format", "json", *settings.claude_resume_args, task]
+    completed = runner(command, cwd=str(cwd), env=env, capture_output=True, text=True, timeout=timeout)  # nosec B603
+    try:
+        payload = json.loads(completed.stdout.strip().splitlines()[-1]) if completed.stdout.strip() else {}
+    except ValueError:
+        payload = {}
+    session_id = str(payload.get("session_id") or "")
+    if not session_id:
+        raise RuntimeError(f"claude did not report a session id (exit {completed.returncode})")
+    return session_id
 
 
 def harness_command(context: dict[str, Any], settings: ActiveSettings, prompt: str) -> list[str]:
@@ -238,7 +285,42 @@ class ActiveSlice:
             if code not in {"turn_exists", "event_exists", "duplicate"}:
                 logger.warning("tether: admit_turn refused %s (%s)", event_key, code)
                 return None
+        else:
+            # Presence: the thread sees "seen" within a second, the way a
+            # colleague reacts before they go and do the thing.
+            self._react(binding["channel_id"], message_id, self.settings.ack_emoji)
         return {"binding_id": binding["binding_id"], "event_key": event_key}
+
+    def _react(self, channel_id: str, message_ts: str, emoji: str) -> None:
+        if not self.settings.presence or not message_ts or not emoji:
+            return
+        slack = getattr(self, "slack", None)
+        if slack is None or not getattr(slack, "configured", False):
+            return
+        try:
+            slack.react(channel_id, message_ts, emoji)
+        except Exception:
+            logger.debug("tether: reaction %s failed", emoji, exc_info=True)
+
+    def _unreact(self, channel_id: str, message_ts: str, emoji: str) -> None:
+        if not self.settings.presence or not message_ts or not emoji:
+            return
+        slack = getattr(self, "slack", None)
+        if slack is None or not getattr(slack, "configured", False):
+            return
+        try:
+            slack.unreact(channel_id, message_ts, emoji)
+        except Exception:
+            logger.debug("tether: un-reaction %s failed", emoji, exc_info=True)
+
+    def _turn_message_ids(self, context: dict[str, Any]) -> list[str]:
+        ids: list[str] = []
+        for turn in context.get("turns", []):
+            try:
+                ids.append(str(json.loads(turn.get("payload_inline") or "{}").get("ts") or ""))
+            except ValueError:
+                pass
+        return [i for i in ids if i]
 
     # -- scheduling -----------------------------------------------------------------
 
@@ -273,8 +355,15 @@ class ActiveSlice:
                 "tether: attempt %s did not reach a receipt (%s)",
                 attempt["attempt_id"], type(exc).__name__, exc_info=True,
             )
+            for ts in self._turn_message_ids(context):
+                self._react(context["channel_id"], ts, self.settings.fail_emoji)
             return
-        if result.get("state") != "completed_with_response":
+        state = result.get("state")
+        marker = self.settings.done_emoji if state in {"completed_with_response", "no_reply"} else self.settings.fail_emoji
+        for ts in self._turn_message_ids(context):
+            self._unreact(context["channel_id"], ts, self.settings.ack_emoji)
+            self._react(context["channel_id"], ts, marker)
+        if state != "completed_with_response":
             return
         final = self.runtime.attempt_context(attempt["attempt_id"])
         text = self._read_response(final.get("response_ref"))
@@ -284,6 +373,8 @@ class ActiveSlice:
             self.egress(final["channel_id"], final["thread_ts"], text.strip())
         except Exception:
             logger.error("tether: egress failed for %s", attempt["attempt_id"], exc_info=True)
+            for ts in self._turn_message_ids(context):
+                self._react(context["channel_id"], ts, self.settings.fail_emoji)
 
     def _read_response(self, response_ref: str | None) -> str:
         if not response_ref:
@@ -424,6 +515,46 @@ class ActiveSlice:
         binding = self.runtime.activate_binding(binding["binding_id"], ts)
         return {"status": "posted", "state": "posted", "team_id": team_id, "channel_id": channel_id,
                 "thread_ts": ts, "message_ts": ts, "bridge_id": binding["binding_id"]}
+
+    def op_spawn(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Start a fresh harness session for a task and bind it to a thread.
+
+        This is what lets an agent say "I'll take it": the session is created
+        on this box, in the requested repo, seeded with the task, then bound so
+        every later message in the thread continues that same session.
+        """
+        kind = str(request.get("harness") or "claude")
+        source_kind = {"claude": "claude_session", "codex": "codex_session"}.get(kind)
+        if source_kind is None:
+            raise BrokerRefused("harness_unsupported", "harness must be claude or codex")
+        task = str(request.get("task") or "").strip()
+        if not task:
+            raise BrokerRefused("task_required")
+        cwd = Path(str(request.get("cwd") or os.getcwd())).expanduser()
+        if not cwd.is_dir():
+            raise BrokerRefused("cwd_missing", f"{cwd} is not a directory")
+        team_id = self._team(request)
+        channel_id = str(request.get("channel_id") or self.settings.extra.get("default_channel") or "")
+        thread_ts = str(request.get("thread_ts") or "")
+        if not channel_id:
+            raise BrokerRefused("channel_required")
+        try:
+            session_id = self._create_session(source_kind, cwd, task)
+        except Exception as exc:
+            raise BrokerRefused("spawn_failed", str(exc)[:300]) from exc
+        if not thread_ts:
+            root = str(request.get("root_text") or "").strip() or f"On it: {task[:200]}"
+            thread_ts = self._post(channel_id, root, None)
+        binding = self.bind(
+            source_kind=source_kind, session_id=session_id, cwd=str(cwd), team_id=team_id,
+            channel_id=channel_id, thread_ts=thread_ts, owner_user_id=self._owner(request),
+        )
+        return {"status": "spawned", "harness": kind, "session_id": session_id, "cwd": str(cwd),
+                "team_id": team_id, "channel_id": channel_id, "thread_ts": thread_ts,
+                "bridge_id": binding["binding_id"]}
+
+    def _create_session(self, source_kind: str, cwd: Path, task: str) -> str:
+        return create_session(source_kind, cwd, task, self.settings)
 
     def op_attach(self, request: dict[str, Any]) -> dict[str, Any]:
         kind, session_id, cwd = self._source(request)

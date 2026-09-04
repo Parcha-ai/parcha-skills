@@ -404,6 +404,7 @@ function printHelp(command = "") {
     close: "tether close --bridge-id ID | --channel ID --thread-ts TS [--team ID] [--expected-generation N]",
     unbind: "tether unbind --bridge-id ID | --channel ID --thread-ts TS [--team ID] [--expected-generation N]",
     post: "tether post --channel ID --thread-ts TS (--text-stdin|--text-fd FD|--text TEXT [deprecated]) --idempotency-key KEY [--team ID]",
+    spawn: "tether spawn --task TEXT [--harness claude|codex] [--cwd DIR] [--channel ID] [--thread-ts TS] [--root-text TEXT] [--team ID]",
     unresolved: "tether unresolved [--team ID] [--json]",
     history: "tether history [--channel ID] [--limit N] [--team ID]",
     thread: "tether thread --channel ID --thread-ts TS [--limit N] [--team ID]",
@@ -420,7 +421,7 @@ Usage:
   tether install|upgrade [installer options]
   tether rollback|uninstall [--dry-run] [--restart]
   tether doctor|status|identity|maintenance [--json]
-  tether notify|reply|attach|rebind|close|unbind|post|history|thread [options]
+  tether notify|reply|attach|rebind|close|unbind|post|spawn|history|thread [options]
   tether schema status [--json]
   tether unresolved [options]
   tether version
@@ -794,7 +795,7 @@ function brokerCall(request, options) {
 function assertNonRoot(command) {
   const mutating = new Set([
     "setup", "install", "upgrade", "rollback", "uninstall", "maintenance",
-    "notify", "reply", "attach", "rebind", "close", "unbind", "post",
+    "notify", "reply", "attach", "rebind", "close", "unbind", "post", "spawn",
   ]);
   if (
     mutating.has(command) &&
@@ -1240,6 +1241,16 @@ async function runBrokerCommand(command, argv) {
         "idempotency-key": { type: "value" },
       }));
       break;
+    case "spawn":
+      definitions = commonRequestOptions({
+        task: { type: "value" },
+        harness: { type: "value" },
+        cwd: { type: "value" },
+        channel: { type: "value" },
+        "thread-ts": { type: "value" },
+        "root-text": { type: "value" },
+      });
+      break;
     case "unresolved":
       definitions = commonRequestOptions();
       break;
@@ -1300,6 +1311,17 @@ async function runBrokerCommand(command, argv) {
       bridge_id: requireOption(options, "bridge-id"),
       reply_key: requireOption(options, "reply-key"),
       text: messageText,
+      team_id: stringValue(options.team),
+    };
+  } else if (command === "spawn") {
+    request = {
+      op: "spawn",
+      task: requireOption(options, "task"),
+      harness: stringValue(options.harness) || "claude",
+      cwd: stringValue(options.cwd) || process.cwd(),
+      channel_id: stringValue(options.channel),
+      thread_ts: stringValue(options["thread-ts"]),
+      root_text: stringValue(options["root-text"]),
       team_id: stringValue(options.team),
     };
   } else if (command === "post") {
