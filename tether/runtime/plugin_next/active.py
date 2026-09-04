@@ -81,7 +81,7 @@ def sandbox_facts() -> dict[str, bool]:
                 facts["no_new_privs"] = line.split()[-1] == "1"
     except OSError:
         pass
-    facts["var_writable"] = os.access("/var/lib", os.W_OK) or os.access("/var/tmp", os.W_OK)
+    facts["var_writable"] = os.access("/var/lib", os.W_OK)
     return facts
 
 
