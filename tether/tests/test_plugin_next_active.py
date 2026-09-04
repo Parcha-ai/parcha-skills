@@ -135,6 +135,9 @@ class ActiveSliceTest(unittest.TestCase):
         self.assertEqual(self.sent, [("C1", "100.1", "claro <@U12345678>, ya quedo.")])
         self.assertIn("<@U12345678>: can you ship it?", self.prompts[0])
         self.assertIn("NO_REPLY", self.prompts[0])
+        self.assertIn("Tether continuation", self.prompts[0])
+        self.assertIn("sess-1", self.prompts[0])
+        self.assertIn("never infer a host or disk fault", self.prompts[0])
         self.assertEqual(self.violations(), [])
         # Nothing left to do, and nothing runs twice.
         self.assertEqual(slice_.run_once(), 0)

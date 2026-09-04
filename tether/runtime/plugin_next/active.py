@@ -123,9 +123,18 @@ def endpoint_key_for(source_kind: str, session_id: str) -> str:
 
 
 def compose_prompt(context: dict[str, Any], settings: ActiveSettings) -> str:
-    """The turn as the harness sees it: who said what, and how to answer."""
+    """The turn as the harness sees it: who said what, where you are, what to do.
+
+    A bound session is the engineer who owns the work, not a chat persona.
+    It continues the work with its tools and reports with evidence; the
+    sentence cap applies to the reply, never to the work.
+    """
+    source = context.get("source") or {}
     lines = [
-        "You are continuing this coding session from a Slack thread. New messages:",
+        "You are a Tether continuation of your own Claude Code / Codex session "
+        f"(session {source.get('session_id', '?')}, cwd {source.get('cwd', '?')}, host "
+        f"{os.uname().nodename}). New messages arrived in the Slack thread bound to this "
+        "session:",
         "",
     ]
     for turn in context["turns"]:
@@ -139,10 +148,15 @@ def compose_prompt(context: dict[str, Any], settings: ActiveSettings) -> str:
         lines.append(f"<@{who}>: {payload.get('text', '').strip()}")
     lines += [
         "",
-        "Answer the thread as a colleague would: at most "
-        f"{settings.max_reply_sentences} short sentences, concrete, no meta-narration, "
-        "no restating the question. Mention people as <@USERID>. If nothing needs "
-        "saying, reply with exactly NO_REPLY.",
+        "You own this work. Do what the message needs with your tools first (reproduce, fix, "
+        "rerun, verify), then reply. Report with evidence: file and line, command and exit "
+        "code, PR link, test count.",
+        "Runtime truth: you have the same user, groups, sudo and docker access as the operator "
+        "who started this session. If a command is denied or a service is down, say exactly "
+        "what failed and ask; never infer a host or disk fault from a permission error.",
+        f"Reply in at most {max(settings.max_reply_sentences, 3)} short sentences, as a colleague: "
+        "no meta-narration, no restating the question. Mention people as <@USERID>. If the "
+        "messages need no reply from you, respond with exactly NO_REPLY.",
     ]
     return "\n".join(lines)
 
@@ -625,8 +639,17 @@ class ActiveSlice:
         if text.strip() == "NO_REPLY":
             return {"status": "no_reply", "team_id": self._team(request), "channel_id": channel_id, "thread_ts": thread_ts}
         ts = self._post(channel_id, text, thread_ts)
-        return {"status": "posted", "team_id": self._team(request), "channel_id": channel_id,
-                "thread_ts": thread_ts, "message_ts": ts}
+        team_id = self._team(request)
+        # An operator posting into a bound thread through the broker is an
+        # instruction to the session that owns it. Slack ingress would drop it
+        # as our own message, so admit it here as a turn.
+        claimed = self.claim(
+            {"workspace": team_id, "channel": channel_id, "thread": thread_ts,
+             "actor": str(request.get("actor") or "operator"), "message_id": ts},
+            text.strip(),
+        )
+        return {"status": "posted", "team_id": team_id, "channel_id": channel_id,
+                "thread_ts": thread_ts, "message_ts": ts, "turn_admitted": claimed is not None}
 
     def op_reply(self, request: dict[str, Any]) -> dict[str, Any]:
         """A bound session answering its thread by binding id (legacy `tether reply`)."""
