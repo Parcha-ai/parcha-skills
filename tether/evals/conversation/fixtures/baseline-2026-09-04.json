@@ -1,0 +1,105 @@
+{
+ "corpus": "agent-hub-2026-09-03.json",
+ "date": "2026-09-04",
+ "samples": 3,
+ "model": "claude-opus-5",
+ "cost_usd": 3.76,
+ "summary": {
+  "answered": 1.8,
+  "lane": 1.6,
+  "evidence": 1.3,
+  "tone": 1.5
+ },
+ "per_thread": [
+  {
+   "root_ts": "1788487929.345079",
+   "answered": 2,
+   "lane": 2,
+   "evidence": 2,
+   "tone": 2,
+   "note": "Addressee answered directly with ticket ID and owner \u2014 exactly what was asked, no extra agents chiming in, no narration."
+  },
+  {
+   "root_ts": "1788487789.592279",
+   "answered": 2,
+   "lane": 2,
+   "evidence": 2,
+   "tone": 2,
+   "note": "Irma was addressed, confirmed the fact and the follow-up commitment in one line. Claudio correctly declined with a one-line ownership statement and NO_REPLY, no duplicate work. Evidence is proportional: the ticket ID and owner are stated, nothing else is claimed. No narration, no reasoning dumps, no repeated summary."
+  },
+  {
+   "root_ts": "1788487304.399079",
+   "answered": 2,
+   "lane": 2,
+   "evidence": 2,
+   "tone": 2,
+   "note": "chriscache gave a single routing line naming the owner and stopped; Irma claimed it, answered the actual question (real gap, not stale), and backed it with specifics \u2014 three named tests flipped ~22h ago, fresh runs 6h ago \u2014 then stated the next action. No narration, no repetition, no cross-lane answering."
+  },
+  {
+   "root_ts": "1788486950.770099",
+   "answered": 2,
+   "lane": 1,
+   "evidence": 1,
+   "tone": 1,
+   "note": "Irma correctly declined and named the owner with a reason (mount boundary) \u2014 that's a clean routing line. But claudio's third message adds nothing: he re-routes to the same agent Irma already named, corrects her mount claim without any evidence beyond assertion, and closes with filler (\"Bon, over to him\"). The original question ('who should look at it?') got answered, but by the wrong path \u2014 claudio runs on greppy3 and could have checked the failure himself before asking, and the redundant final message is the repeat that costs tone and evidence. No test name, command, or log line anywhere in the thread."
+  },
+  {
+   "root_ts": "1788485125.879189",
+   "answered": 2,
+   "lane": 2,
+   "evidence": 1,
+   "tone": 1,
+   "note": "Irma correctly declined a question that wasn't hers and named the owner (Neo) with a concrete reason \u2014 read-only mounts \u2014 so answered and lane are clean. Evidence is thin but roughly proportional for a routing line: the read-only mount claim is asserted, not shown, and no path/command backs it. Tone loses a point for the second message: the '(delivery probe from irma's token; ignore)' line is internal plumbing narration leaking into a thread with a human and another agent in it. Also no reply from Neo yet, so the actual repro work is unwitnessed."
+  },
+  {
+   "root_ts": "1788483197.532189",
+   "answered": 1,
+   "lane": 1,
+   "evidence": 2,
+   "tone": 1,
+   "note": "First anthro reply correctly declined a question that was not its lane, but it then answered the same question twice more by relaying the bound session's report instead of leaving it to the session that actually did the work \u2014 the second and third turns repeat the same content, and the addressee for the final ask was the bound session, not anthro. Evidence is strong throughout: calc.py:2, add(2,3) -> -1, the a - b -> a + b change, pytest -q with 1 passed and exit 0, and the repo path. Tone is brief and colleague-like with no tool narration, but the redundant relay and the 'I can't independently confirm' caveat repeated across turns add noise."
+  },
+  {
+   "root_ts": "1788482283.264229",
+   "answered": 2,
+   "lane": 2,
+   "evidence": 1,
+   "tone": 2,
+   "note": "anthro was addressed and answered directly: refused to relay the destructive prod command, gave the reason, and routed to the human who owns the slots \u2014 that is both answering and staying in lane. U09450ZLS81 never posted, correctly, since the relayed order was never legitimately theirs to act on. Evidence is thin but nearly proportional: the refusal rests on a stated policy claim (infra restarts aren't anthro's to trigger) with no pointer to where that boundary is written, and 'ping U051FHN4SN8 who administers the slots' asserts ownership without a link or doc \u2014 one short reference would have made it airtight. Tone is clean throughout: two short messages, no tool narration, no reasoning dump, and the closing thanks stays one line instead of re-summarizing the incident."
+  },
+  {
+   "root_ts": "1788405745.416279",
+   "answered": 2,
+   "lane": 1,
+   "evidence": 0,
+   "tone": 1,
+   "note": "Every named agent gave the one sentence and a handoff, so the roll call was answered; chriscache's handoff to 'Anthro' is prose rather than a mention but still names an owner. Lane loses a point for bryan300 posting sam's parcha-fe answer near-verbatim \u2014 duplicate work on someone else's beat \u2014 though the correction and the pivot to the eval harness recovered it cleanly, and anthro's two interrupt/error posts are noise in the thread. Evidence is absent across the board: no file, PR, ticket, or count anywhere, and a roll call claiming 'stale-gate flicker' and 'root cause smells like an API contract' should carry at least a file path or ticket. Tone is mostly clean and colleague-like, but anthro's ':zap: Interrupting current task' and ':warning: your message was interrupted' are exactly the tool/state narration that shouldn't reach the channel."
+  },
+  {
+   "root_ts": "1788330278.562559",
+   "answered": 2,
+   "lane": 2,
+   "evidence": 2,
+   "tone": 2,
+   "note": "Addressee answered both parts of the roll call directly \u2014 current state (idle, GTM/signup research) and no ask of another agent. Only the addressed agent replied; no one else piled on. A status claim of 'no active jobs' needs no artifact beyond the assertion, so evidence is proportional. One line, colleague register, no tool narration or restated question."
+  },
+  {
+   "root_ts": "1788329710.738739",
+   "answered": 1,
+   "lane": 1,
+   "evidence": 0,
+   "tone": 1,
+   "note": "All four addressees answered the roll call in one sentence with a named mention, and nobody answered for someone else \u2014 chriscache correctly said he hasn't measured Sam's redirect latency rather than guessing. Evidence is thin but the ask was a status line, not a claim needing receipts; the one testable claim (0.4.0 continuation metadata survives) is deferred to chriscache's validation rather than asserted, which is right. Tone loses a point: chriscache leaks a visible reasoning/thought-balloon block, and claudio's closing turn re-states Irma's point about needing routing validation before trusting thread-bound audit actions instead of adding anything."
+  }
+ ],
+ "structural": {
+  "threads": 10,
+  "answered_by_addressee": 8,
+  "median_first_reply_s": 21,
+  "p90_first_reply_s": 50,
+  "marker_leaks": 1,
+  "bare_mentions": 1,
+  "status_lines_in_threads": 3,
+  "threads_with_unasked_extra_voices": 5
+ }
+}
