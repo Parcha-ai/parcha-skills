@@ -34,9 +34,13 @@ class ConversationEvalTest(unittest.TestCase):
         module = load()
         self.assertEqual(module.redact("mail me@x.io see https://a.b/c now"), "mail <email> see <url> now")
 
-    def test_fixture_carries_no_raw_human_identities(self):
+    def test_fixture_carries_no_raw_identities(self):
+        import re
         text = (ROOT / "evals" / "conversation" / "fixtures" / "agent-hub-2026-09-03.json").read_text()
-        self.assertNotIn("@", text.replace("<email>", "").replace("<@", ""))
+        self.assertEqual(re.findall(r"U0[A-Z0-9]{8,}", text), [])
+        self.assertEqual(re.findall(r"[\w.+-]+@[\w-]+\.[\w.]+", text), [])
+        for mention in re.findall(r"<@([^>]+)>", text):
+            self.assertRegex(mention, r"^(anthro|irma|chriscache|sam|bryan300|manny|claudio|HUMAN_\d+)$")
 
 
 if __name__ == "__main__":
