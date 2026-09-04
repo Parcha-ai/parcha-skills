@@ -285,14 +285,39 @@ def create_session(
     # inside the gateway sandbox either, or it starts life believing the host is broken.
     command, env, _ = launch_plan(command, cwd, env, settings)
     completed = runner(command, cwd=str(cwd), env=env, capture_output=True, text=True, timeout=timeout)  # nosec B603
-    try:
-        payload = json.loads(completed.stdout.strip().splitlines()[-1]) if completed.stdout.strip() else {}
-    except ValueError:
-        payload = {}
-    session_id = str(payload.get("session_id") or "")
+    session_id = claude_session_id(completed.stdout)
     if not session_id:
         raise RuntimeError(f"claude did not report a session id (exit {completed.returncode})")
     return session_id
+
+
+def claude_session_id(stdout: str) -> str:
+    """Session id from `claude -p --output-format json`.
+
+    Older CLIs print one JSON object per line and the last one is the result;
+    newer ones print a single JSON array of events. Accept both, and prefer the
+    result event when several carry a session id.
+    """
+    text = (stdout or "").strip()
+    if not text:
+        return ""
+    events: list[Any] = []
+    try:
+        parsed = json.loads(text)
+        events = parsed if isinstance(parsed, list) else [parsed]
+    except ValueError:
+        for line in text.splitlines():
+            try:
+                events.append(json.loads(line))
+            except ValueError:
+                continue
+    found = ""
+    for event in events:
+        if isinstance(event, dict) and event.get("session_id"):
+            found = str(event["session_id"])
+            if event.get("type") == "result":
+                return found
+    return found
 
 
 def harness_command(context: dict[str, Any], settings: ActiveSettings, prompt: str) -> list[str]:
