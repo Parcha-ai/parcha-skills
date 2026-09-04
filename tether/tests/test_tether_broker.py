@@ -150,6 +150,11 @@ class BrokerTest(unittest.TestCase):
         self.assertEqual(reply["thread_ts"], "100.1")
         self.assertEqual(self.call(op="thread_history", channel_id="C1", thread_ts="100.1")["messages"][0]["text"], "root")
         self.assertEqual(self.call(op="history")["messages"][0]["user"], "U1")
+        # The broker post above admitted a turn; a binding with ready work refuses
+        # to close until it is drained, which is the schema protecting the queue.
+        busy = self.call(op="close", channel_id="C1", thread_ts="100.1")
+        self.assertEqual(busy["code"], "binding_has_ready_turns")
+        self.assertEqual(self.slice.run_once(), 1)
         closed = self.call(op="close", channel_id="C1", thread_ts="100.1")
         self.assertEqual(closed["status"], "closed")
         self.assertIsNone(self.slice.runtime.find_active_binding(team_id="T12345678", channel_id="C1", thread_ts="100.1"))
@@ -262,6 +267,15 @@ class BrokerTest(unittest.TestCase):
         self.assertEqual(self.slice.run_once(), 1)
         self.assertIn(("add", "C1", "1700000000.000031", "warning"), self.slack.reactions)
         self.assertEqual(self.sent, [])
+
+    def test_post_into_a_bound_thread_wakes_the_session(self):
+        self.call(op="attach", channel_id="C1", thread_ts="100.5", idempotency_key="w1", **self.source("sess-w"))
+        posted = self.call(op="thread_reply", channel_id="C1", thread_ts="100.5", text="fix the env and tell Manuel", idempotency_key="w2")
+        self.assertTrue(posted["turn_admitted"], posted)
+        self.assertEqual(self.slice.run_once(), 1)
+        self.assertEqual(self.sent[-1], ("C1", "100.5", "listo"))
+        unbound = self.call(op="thread_reply", channel_id="C1", thread_ts="999.9", text="hello", idempotency_key="w3")
+        self.assertFalse(unbound["turn_admitted"])
 
     def test_refusals_are_explicit(self):
         bad = self.call(op="herdr_context")

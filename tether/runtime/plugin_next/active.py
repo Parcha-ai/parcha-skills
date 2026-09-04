@@ -161,6 +161,47 @@ def compose_prompt(context: dict[str, Any], settings: ActiveSettings) -> str:
     return "\n".join(lines)
 
 
+def create_session(
+    source_kind: str,
+    cwd: Path,
+    task: str,
+    settings: ActiveSettings,
+    *,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    timeout: int = 600,
+) -> str:
+    """Start a fresh harness session on this box, seeded with the task; return its id.
+
+    The session runs its first turn now so the id exists on disk and later
+    `--resume` finds it. The task text is the first user turn, so the session
+    already knows what it is for when the thread starts talking to it.
+    """
+    env = child_env(passthrough=settings.harness_env)
+    if source_kind == "codex_session":
+        binary = shutil.which(settings.codex_binary) or settings.codex_binary
+        command = [binary, "exec", "--json", *settings.codex_resume_args, task]
+        completed = runner(command, cwd=str(cwd), env=env, input="", capture_output=True, text=True, timeout=timeout)  # nosec B603
+        for line in completed.stdout.splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if event.get("type") == "thread.started" and event.get("thread_id"):
+                return str(event["thread_id"])
+        raise RuntimeError(f"codex did not report a thread id (exit {completed.returncode})")
+    binary = shutil.which(settings.claude_binary) or settings.claude_binary
+    command = [binary, "-p", "--output-format", "json", *settings.claude_resume_args, task]
+    completed = runner(command, cwd=str(cwd), env=env, capture_output=True, text=True, timeout=timeout)  # nosec B603
+    try:
+        payload = json.loads(completed.stdout.strip().splitlines()[-1]) if completed.stdout.strip() else {}
+    except ValueError:
+        payload = {}
+    session_id = str(payload.get("session_id") or "")
+    if not session_id:
+        raise RuntimeError(f"claude did not report a session id (exit {completed.returncode})")
+    return session_id
+
+
 def harness_command(context: dict[str, Any], settings: ActiveSettings, prompt: str) -> list[str]:
     source = context["source"]
     session_id = str(source.get("session_id") or "")
@@ -598,8 +639,17 @@ class ActiveSlice:
         if text.strip() == "NO_REPLY":
             return {"status": "no_reply", "team_id": self._team(request), "channel_id": channel_id, "thread_ts": thread_ts}
         ts = self._post(channel_id, text, thread_ts)
-        return {"status": "posted", "team_id": self._team(request), "channel_id": channel_id,
-                "thread_ts": thread_ts, "message_ts": ts}
+        team_id = self._team(request)
+        # An operator posting into a bound thread through the broker is an
+        # instruction to the session that owns it. Slack ingress would drop it
+        # as our own message, so admit it here as a turn.
+        claimed = self.claim(
+            {"workspace": team_id, "channel": channel_id, "thread": thread_ts,
+             "actor": str(request.get("actor") or "operator"), "message_id": ts},
+            text.strip(),
+        )
+        return {"status": "posted", "team_id": team_id, "channel_id": channel_id,
+                "thread_ts": thread_ts, "message_ts": ts, "turn_admitted": claimed is not None}
 
     def op_reply(self, request: dict[str, Any]) -> dict[str, Any]:
         """A bound session answering its thread by binding id (legacy `tether reply`)."""
