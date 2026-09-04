@@ -258,6 +258,15 @@ class BrokerTest(unittest.TestCase):
             active.create_session("claude_session", pathlib.Path(self.temp.name), "t", settings,
                                   runner=lambda cmd, **kw: sp.CompletedProcess(cmd, 1, stdout="", stderr="boom"))
 
+    def test_claude_session_id_accepts_array_and_line_output(self):
+        active = sys.modules["plugin_next.active"]
+        array = '[{"type":"system","session_id":"s-array"},{"type":"result","session_id":"s-array","result":"READY"}]\n'
+        lines = '{"type":"system","session_id":"s-line"}\n{"type":"result","session_id":"s-line"}\n'
+        self.assertEqual(active.claude_session_id(array), "s-array")
+        self.assertEqual(active.claude_session_id(lines), "s-line")
+        self.assertEqual(active.claude_session_id("not json"), "")
+        self.assertEqual(active.claude_session_id(""), "")
+
     def test_create_session_uses_the_same_launcher_as_bound_turns(self):
         import subprocess as sp
         from unittest import mock
