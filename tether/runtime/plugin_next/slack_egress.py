@@ -91,6 +91,21 @@ class SlackEgress:
         body = self._call("conversations.history", {"channel": channel_id, "limit": limit}, get=True)
         return _messages(body)
 
+    def react(self, channel_id: str, message_ts: str, emoji: str) -> bool:
+        """Best effort; a reaction is presence, never delivery. Duplicates are fine."""
+        try:
+            self._call("reactions.add", {"channel": channel_id, "timestamp": message_ts, "name": emoji})
+            return True
+        except SlackError as error:
+            return error.code == "already_reacted"
+
+    def unreact(self, channel_id: str, message_ts: str, emoji: str) -> bool:
+        try:
+            self._call("reactions.remove", {"channel": channel_id, "timestamp": message_ts, "name": emoji})
+            return True
+        except SlackError as error:
+            return error.code == "no_reaction"
+
     def membership(self, channel_id: str) -> str:
         try:
             body = self._call("conversations.info", {"channel": channel_id}, get=True)

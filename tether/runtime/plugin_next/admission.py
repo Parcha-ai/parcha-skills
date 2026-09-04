@@ -39,10 +39,31 @@ class AdmissionSettings:
     # Peer agents the operator explicitly trusts (the deployed broker's
     # TETHER_ALLOWED_BOT_USERS). A bot outside this set is still denied.
     trusted_bot_users: frozenset[str] = frozenset()
+    # This agent's own Slack user id. Its own posts are never turns.
+    self_user_id: str = ""
 
     @property
     def configured(self) -> bool:
         return bool(self.workspace_id and self.allowed_users)
+
+
+# Hermes gateways post transient status lines ("Working - 3 min", "Gateway
+# shutting down", "Interrupting current task") as the bot user. They are UI, not
+# conversation; a peer must never treat them as a turn to answer.
+_STATUS_PREFIXES = (
+    ":hourglass_flowing_sand:", ":zap:", ":warning:", ":arrow_right_hook:", ":stopwatch:",
+)
+_STATUS_PHRASES = (
+    "Working —", "Working -", "Gateway shutting down", "Interrupting current task",
+    "Redirected current run", "was interrupted before processing",
+)
+
+
+def is_status_notice(text: str) -> bool:
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    return stripped.startswith(_STATUS_PREFIXES) or any(p in stripped[:80] for p in _STATUS_PHRASES)
 
 
 def event_fingerprint(fields: dict[str, Any]) -> str:
@@ -70,6 +91,7 @@ def evaluate(
     actor: str | None,
     actor_is_bot: bool,
     message_id: str | None,
+    text: str = "",
     settings: AdmissionSettings,
     bound_threads: Iterable[tuple[str, str]],
 ) -> dict[str, Any]:
@@ -112,7 +134,13 @@ def evaluate(
     if workspace != settings.workspace_id:
         decision.update(verdict=VERDICT_DENY, reason="wrong_workspace")
         return decision
+    if actor and settings.self_user_id and actor == settings.self_user_id:
+        decision.update(verdict=VERDICT_NOT_OURS, reason="self_message")
+        return decision
     if actor_is_bot:
+        if actor and actor in settings.trusted_bot_users and message_id and is_status_notice(text):
+            decision.update(verdict=VERDICT_NOT_OURS, reason="peer_status_notice")
+            return decision
         if actor and actor in settings.trusted_bot_users and message_id:
             decision.update(verdict=VERDICT_ADMIT, reason="trusted_peer_on_bound_thread")
             return decision

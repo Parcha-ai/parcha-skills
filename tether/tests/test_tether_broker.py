@@ -38,6 +38,16 @@ class FakeSlack:
     def membership(self, channel_id):
         return "member"
 
+    reactions: list[tuple[str, str, str, str]] = []
+
+    def react(self, channel_id, message_ts, emoji):
+        self.reactions.append(("add", channel_id, message_ts, emoji))
+        return True
+
+    def unreact(self, channel_id, message_ts, emoji):
+        self.reactions.append(("remove", channel_id, message_ts, emoji))
+        return True
+
 
 class BrokerTest(unittest.TestCase):
     def setUp(self):
@@ -179,6 +189,79 @@ class BrokerTest(unittest.TestCase):
         refused = self.call(op="attach", channel_id="C1", thread_ts="100.9", idempotency_key="ax", **self.source("sess-x"))
         self.assertFalse(refused["ok"])
         self.assertEqual(refused["code"], "endpoint_key_conflict")
+
+    def test_spawn_creates_a_session_binds_it_and_the_thread_drives_it(self):
+        created = []
+
+        def fake_create(source_kind, cwd, task):
+            created.append((source_kind, str(cwd), task))
+            return "sess-spawned"
+
+        self.slice._create_session = fake_create
+        spawned = self.call(op="spawn", harness="claude", task="fix the flaky test", cwd=self.temp.name)
+        self.assertTrue(spawned["ok"], spawned)
+        self.assertEqual(spawned["session_id"], "sess-spawned")
+        self.assertEqual(created, [("claude_session", self.temp.name, "fix the flaky test")])
+        # No thread given: a root was posted and the new thread is bound.
+        self.assertEqual(self.slack.posts[-1][0], "C1")
+        self.assertIn("On it: fix the flaky test", self.slack.posts[-1][1])
+        self.assertEqual(spawned["thread_ts"], "1700000000.000001")
+        bound = self.slice.runtime.find_active_binding(team_id="T12345678", channel_id="C1", thread_ts=spawned["thread_ts"])
+        self.assertIsNotNone(bound)
+        # A follow-up in that thread reaches the spawned session with presence.
+        self.slack.reactions.clear()
+        fields = {"workspace": "T12345678", "channel": "C1", "thread": spawned["thread_ts"],
+                  "actor": "U12345678", "message_id": "1700000000.000009"}
+        self.assertIsNotNone(self.slice.claim(fields, "status?"))
+        self.assertEqual(self.slack.reactions, [("add", "C1", "1700000000.000009", "eyes")])
+        self.assertEqual(self.slice.run_once(), 1)
+        self.assertEqual(self.sent[-1], ("C1", spawned["thread_ts"], "listo"))
+        self.assertIn(("remove", "C1", "1700000000.000009", "eyes"), self.slack.reactions)
+        self.assertIn(("add", "C1", "1700000000.000009", "white_check_mark"), self.slack.reactions)
+
+    def test_spawn_into_an_existing_thread_and_refusals(self):
+        self.slice._create_session = lambda k, c, t: "sess-2"
+        spawned = self.call(op="spawn", harness="codex", task="t", cwd=self.temp.name, channel_id="C1", thread_ts="100.7")
+        self.assertEqual((spawned["ok"], spawned["thread_ts"], spawned["harness"]), (True, "100.7", "codex"))
+        self.assertEqual(self.call(op="spawn", harness="vim", task="t", cwd=self.temp.name)["code"], "harness_unsupported")
+        self.assertEqual(self.call(op="spawn", harness="claude", task="", cwd=self.temp.name)["code"], "task_required")
+        self.assertEqual(self.call(op="spawn", harness="claude", task="t", cwd="/nonexistent-dir-x")["code"], "cwd_missing")
+
+        def boom(k, c, t):
+            raise RuntimeError("claude did not report a session id (exit 1)")
+
+        self.slice._create_session = boom
+        failed = self.call(op="spawn", harness="claude", task="t", cwd=self.temp.name)
+        self.assertEqual(failed["code"], "spawn_failed")
+
+    def test_create_session_parses_both_harnesses(self):
+        import subprocess as sp
+        active = sys.modules["plugin_next.active"]
+        settings = active.ActiveSettings(claude_binary="/bin/echo", codex_binary="/bin/echo")
+
+        def claude_runner(cmd, **kw):
+            self.assertEqual(cmd[:4], ["/bin/echo", "-p", "--output-format", "json"])
+            return sp.CompletedProcess(cmd, 0, stdout='{"type":"result","session_id":"c-123","result":"READY"}\n', stderr="")
+
+        def codex_runner(cmd, **kw):
+            self.assertEqual(cmd[:3], ["/bin/echo", "exec", "--json"])
+            return sp.CompletedProcess(cmd, 0, stdout='{"type":"thread.started","thread_id":"x-9"}\n{"type":"turn.started"}\n', stderr="")
+
+        self.assertEqual(active.create_session("claude_session", pathlib.Path(self.temp.name), "t", settings, runner=claude_runner), "c-123")
+        self.assertEqual(active.create_session("codex_session", pathlib.Path(self.temp.name), "t", settings, runner=codex_runner), "x-9")
+        with self.assertRaises(RuntimeError):
+            active.create_session("claude_session", pathlib.Path(self.temp.name), "t", settings,
+                                  runner=lambda cmd, **kw: sp.CompletedProcess(cmd, 1, stdout="", stderr="boom"))
+
+    def test_failed_turn_marks_the_message_with_a_warning(self):
+        self.slice.command_factory = lambda ctx, st, prompt: ["/bin/sh", "-c", "exit 3"]
+        self.call(op="attach", channel_id="C1", thread_ts="100.3", idempotency_key="f1", **self.source("sess-f"))
+        self.slack.reactions.clear()
+        fields = {"workspace": "T12345678", "channel": "C1", "thread": "100.3", "actor": "U12345678", "message_id": "1700000000.000031"}
+        self.slice.claim(fields, "do it")
+        self.assertEqual(self.slice.run_once(), 1)
+        self.assertIn(("add", "C1", "1700000000.000031", "warning"), self.slack.reactions)
+        self.assertEqual(self.sent, [])
 
     def test_refusals_are_explicit(self):
         bad = self.call(op="herdr_context")

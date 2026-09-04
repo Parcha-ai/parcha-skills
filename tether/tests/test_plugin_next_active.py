@@ -227,6 +227,23 @@ class ActiveSliceTest(unittest.TestCase):
         settings = self.active.load_active_settings(pathlib.Path("/nonexistent"))
         self.assertEqual(settings.harness_env, ())
 
+    def test_self_messages_and_peer_status_notices_are_not_turns(self):
+        admission = importlib.import_module("plugin_next.admission")
+        settings = admission.AdmissionSettings(
+            workspace_id="T12345678", allowed_users=frozenset({"U12345678"}),
+            trusted_bot_users=frozenset({"U0PEER0001"}), self_user_id="UME",
+        )
+        common = dict(platform="slack", workspace="T12345678", channel="C1", thread="100.1",
+                      message_id="170.500", settings=settings, bound_threads={("C1", "100.1")})
+        mine = admission.evaluate(actor="UME", actor_is_bot=True, text="hola", **common)
+        self.assertEqual((mine["verdict"], mine["reason"]), ("not_ours", "self_message"))
+        for notice in (":hourglass_flowing_sand: Working — 3 min — waiting", ":zap: Interrupting current task.",
+                       ":warning: Gateway shutting down — Your current task will be interrupted."):
+            d = admission.evaluate(actor="U0PEER0001", actor_is_bot=True, text=notice, **common)
+            self.assertEqual((d["verdict"], d["reason"]), ("not_ours", "peer_status_notice"), notice)
+        real = admission.evaluate(actor="U0PEER0001", actor_is_bot=True, text="what was the bug?", **common)
+        self.assertEqual(real["verdict"], "admit")
+
     def test_codex_and_claude_commands(self):
         settings = self.active.ActiveSettings(
             claude_binary="/bin/echo", codex_binary="/bin/echo",
