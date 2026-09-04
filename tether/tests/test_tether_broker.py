@@ -242,7 +242,7 @@ class BrokerTest(unittest.TestCase):
     def test_create_session_parses_both_harnesses(self):
         import subprocess as sp
         active = sys.modules["plugin_next.active"]
-        settings = active.ActiveSettings(claude_binary="/bin/echo", codex_binary="/bin/echo")
+        settings = active.ActiveSettings(claude_binary="/bin/echo", codex_binary="/bin/echo", launcher="direct")
 
         def claude_runner(cmd, **kw):
             self.assertEqual(cmd[:4], ["/bin/echo", "-p", "--output-format", "json"])
@@ -257,6 +257,26 @@ class BrokerTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             active.create_session("claude_session", pathlib.Path(self.temp.name), "t", settings,
                                   runner=lambda cmd, **kw: sp.CompletedProcess(cmd, 1, stdout="", stderr="boom"))
+
+    def test_create_session_uses_the_same_launcher_as_bound_turns(self):
+        import subprocess as sp
+        from unittest import mock
+        active = sys.modules["plugin_next.active"]
+        settings = active.ActiveSettings(claude_binary="/bin/echo", launcher="systemd-user")
+        seen = {}
+
+        def runner(cmd, **kw):
+            seen["cmd"], seen["env"] = cmd, kw["env"]
+            return sp.CompletedProcess(cmd, 0, stdout='{"session_id":"c-7"}\n', stderr="")
+
+        bus = pathlib.Path(self.temp.name) / "bus"
+        bus.write_text("")
+        with mock.patch.object(active, "user_bus_path", return_value=bus), \
+             mock.patch.object(active.shutil, "which", side_effect=lambda name: {"systemd-run": "/usr/bin/systemd-run"}.get(name, name)):
+            self.assertEqual(active.create_session("claude_session", pathlib.Path(self.temp.name), "t", settings, runner=runner), "c-7")
+        self.assertEqual(seen["cmd"][:2], ["/usr/bin/systemd-run", "--user"])
+        self.assertIn("/bin/echo", seen["cmd"])
+        self.assertEqual(seen["env"]["DBUS_SESSION_BUS_ADDRESS"], f"unix:path={bus}")
 
     def test_failed_turn_marks_the_message_with_a_warning(self):
         self.slice.command_factory = lambda ctx, st, prompt: ["/bin/sh", "-c", "exit 3"]
