@@ -266,7 +266,9 @@ class BrokerTest(unittest.TestCase):
         self.slice.claim(fields, "do it")
         self.assertEqual(self.slice.run_once(), 1)
         self.assertIn(("add", "C1", "1700000000.000031", "warning"), self.slack.reactions)
-        self.assertEqual(self.sent, [])
+        # ...and says so once, instead of leaving the thread staring at an emoji.
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("I could not take this turn (exit_3)", self.sent[0][2])
 
     def test_post_into_a_bound_thread_wakes_the_session(self):
         self.call(op="attach", channel_id="C1", thread_ts="100.5", idempotency_key="w1", **self.source("sess-w"))

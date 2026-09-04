@@ -12,8 +12,10 @@ import pathlib
 import sqlite3
 import sys
 import tempfile
+from pathlib import Path
 import types
 import unittest
+import unittest.mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 RUNTIME = ROOT / "runtime"
@@ -98,7 +100,7 @@ class ActiveSliceTest(unittest.TestCase):
             self.prompts.append(prompt)
             return ["/bin/sh", "-c", script]
 
-        settings = self.active.ActiveSettings(enabled=True, native_timeout_seconds=30)
+        settings = self.active.ActiveSettings(enabled=True, native_timeout_seconds=30, launcher="direct")
         return self.active.ActiveSlice(
             runtime=self.runtime,
             driver=self.driver,
@@ -138,6 +140,9 @@ class ActiveSliceTest(unittest.TestCase):
         self.assertIn("Tether continuation", self.prompts[0])
         self.assertIn("sess-1", self.prompts[0])
         self.assertIn("never infer a host or disk fault", self.prompts[0])
+        # direct launcher = inside the gateway unit; the prompt must say so.
+        self.assertIn("INSIDE the gateway's hardened systemd unit", self.prompts[0])
+        self.assertIn("whatever you print is posted verbatim", self.prompts[0])
         self.assertEqual(self.violations(), [])
         # Nothing left to do, and nothing runs twice.
         self.assertEqual(slice_.run_once(), 0)
@@ -156,8 +161,8 @@ class ActiveSliceTest(unittest.TestCase):
         self.assertEqual(self.violations(), [])
         self.assertEqual(slice_.run_once(), 0)
 
-    def test_crashed_harness_cancels_turns_and_posts_nothing(self):
-        slice_ = self.make_slice("exit 7")
+    def test_crashed_harness_cancels_turns_and_says_why(self):
+        slice_ = self.make_slice("printf 'You have hit your session limit - resets 6:40am (UTC)'; exit 7")
         slice_.bind(
             source_kind="claude_session", session_id="sess-3", cwd=self.temp.name,
             team_id="T12345678", channel_id="C1", thread_ts="100.1",
@@ -165,7 +170,11 @@ class ActiveSliceTest(unittest.TestCase):
         )
         slice_.claim(self.fields(FakeEvent("go")), "go")
         self.assertEqual(slice_.run_once(), 1)
-        self.assertEqual(self.sent, [])
+        # A failed turn is not silence: one line, the harness's own reason, no invention.
+        self.assertEqual(len(self.sent), 1)
+        channel, thread, text = self.sent[0]
+        self.assertEqual((channel, thread), ("C1", "100.1"))
+        self.assertIn("<@U12345678> I could not take this turn (exit_7: You have hit your session limit", text)
         connection = sqlite3.connect(self.db)
         try:
             state = connection.execute("SELECT state FROM queued_turns").fetchone()[0]
@@ -320,3 +329,43 @@ class ActiveSliceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LauncherTests(unittest.TestCase):
+    def setUp(self):
+        import importlib
+        self.active = importlib.import_module("runtime.plugin_next.active")
+
+    def test_direct_launcher_leaves_the_command_alone(self):
+        settings = self.active.ActiveSettings(launcher="direct")
+        argv, env, launcher = self.active.launch_plan(["claude", "-p", "x"], Path("/tmp"), {"HOME": "/h"}, settings)
+        self.assertEqual((argv, env, launcher), (["claude", "-p", "x"], {"HOME": "/h"}, "direct"))
+
+    def test_systemd_user_launcher_runs_in_the_operators_user_manager(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bus = Path(tmp) / "bus"
+            bus.write_text("")
+            settings = self.active.ActiveSettings(launcher="systemd-user", native_timeout_seconds=100)
+            with unittest.mock.patch.object(self.active, "user_bus_path", return_value=bus), \
+                 unittest.mock.patch.object(self.active.shutil, "which", return_value="/usr/bin/systemd-run"):
+                argv, env, launcher = self.active.launch_plan(
+                    ["claude", "--print", "hi"], Path("/work"), {"HOME": "/h", "PATH": "/bin"}, settings,
+                )
+        self.assertEqual(launcher, "systemd-user")
+        self.assertEqual(argv[:6], ["/usr/bin/systemd-run", "--user", "--quiet", "--pipe", "--wait", "--collect"])
+        self.assertIn("--property=WorkingDirectory=/work", argv)
+        self.assertIn("--property=RuntimeMaxSec=130", argv)
+        self.assertIn("--setenv=HOME=/h", argv)
+        self.assertEqual(argv[-4:], ["--", "claude", "--print", "hi"])
+        # The systemd-run client needs the bus; the harness gets only the allowlisted env.
+        self.assertEqual(env["DBUS_SESSION_BUS_ADDRESS"], f"unix:path={bus}")
+        self.assertEqual(env["XDG_RUNTIME_DIR"], str(bus.parent))
+        self.assertNotIn("--setenv=XDG_RUNTIME_DIR", " ".join(argv))
+
+    def test_systemd_user_falls_back_to_direct_and_the_prompt_tells_the_truth(self):
+        settings = self.active.ActiveSettings(launcher="systemd-user")
+        with unittest.mock.patch.object(self.active, "user_bus_path", return_value=Path("/nonexistent/bus")):
+            self.assertEqual(self.active.resolve_launcher(settings), "direct")
+        self.assertIn("operator's own systemd user session", self.active.runtime_truth("systemd-user"))
+        self.assertIn("INSIDE the gateway's hardened systemd unit", self.active.runtime_truth("direct"))
+        self.assertIn("not to the host", self.active.runtime_truth("direct"))

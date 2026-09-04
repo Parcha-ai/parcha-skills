@@ -122,6 +122,11 @@ def doctor() -> tuple[bool, list[str]]:
     count = status.get("allowed_user_count") or 0
     checks.append(f"ok authorized operators={count}" if count else "FAIL no explicit operator allowlist")
     checks.append("ok bridge owner configured" if status.get("owner_configured") else "FAIL no bridge owner configured")
+    launcher = status.get("harness_launcher")
+    checks.append(
+        "ok harness turns run in the operator's systemd user session" if launcher == "systemd-user"
+        else "WARN harness launcher=direct: turns inherit the gateway sandbox (no sudo/docker); enable-linger the gateway user"
+    )
     checks.append(
         "ok local Unix peer boundary enforced"
         if status.get("peer_uid_enforced") is True and status.get("root_refused") is True

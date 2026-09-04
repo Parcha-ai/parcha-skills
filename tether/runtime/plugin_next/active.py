@@ -68,6 +68,64 @@ def child_env(
     return env
 
 
+def user_bus_path(uid: int | None = None) -> Path:
+    return Path(f"/run/user/{os.getuid() if uid is None else uid}/bus")
+
+
+def sandbox_facts() -> dict[str, bool]:
+    """What this process can do; the harness child inherits exactly this."""
+    facts = {"no_new_privs": False, "var_writable": True}
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("NoNewPrivs:"):
+                facts["no_new_privs"] = line.split()[-1] == "1"
+    except OSError:
+        pass
+    facts["var_writable"] = os.access("/var/lib", os.W_OK) or os.access("/var/tmp", os.W_OK)
+    return facts
+
+
+def resolve_launcher(settings: ActiveSettings) -> str:
+    """'systemd-user' when the operator's user manager is reachable, else 'direct'."""
+    mode = settings.launcher
+    if mode == "direct":
+        return "direct"
+    reachable = user_bus_path().exists() and shutil.which("systemd-run") is not None
+    if mode == "systemd-user" and not reachable:
+        logger.warning("tether: launcher=systemd-user but %s is unreachable; running direct", user_bus_path())
+        return "direct"
+    return "systemd-user" if reachable else "direct"
+
+
+def launch_plan(
+    command: list[str], cwd: Path, env: dict[str, str], settings: ActiveSettings,
+) -> tuple[list[str], dict[str, str], str]:
+    """Wrap ``command`` for the chosen launcher; returns (argv, popen_env, launcher).
+
+    systemd-user: ``systemd-run --user --pipe --wait`` asks the operator's user
+    manager to run the harness in the user's own slice -- full groups, sudo,
+    docker, a writable filesystem -- instead of inside the gateway's hardened
+    unit. Exit status propagates; RuntimeMaxSec bounds the service the way
+    the driver bounds the client.
+    """
+    launcher = resolve_launcher(settings)
+    if launcher != "systemd-user":
+        return command, env, "direct"
+    argv = [
+        shutil.which("systemd-run") or "systemd-run", "--user", "--quiet", "--pipe", "--wait",
+        "--collect", f"--property=WorkingDirectory={cwd}",
+        f"--property=RuntimeMaxSec={settings.native_timeout_seconds + 30}",
+        "--property=KillMode=control-group",
+    ]
+    argv += [f"--setenv={key}={value}" for key, value in sorted(env.items())]
+    argv += ["--", *command]
+    bus = user_bus_path()
+    popen_env = dict(env)
+    popen_env["XDG_RUNTIME_DIR"] = str(bus.parent)
+    popen_env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus}"
+    return argv, popen_env, "systemd-user"
+
+
 @dataclass(frozen=True)
 class ActiveSettings:
     enabled: bool = False
@@ -81,6 +139,12 @@ class ActiveSettings:
     persona_id: str = "primary"
     policy_generation: int = 1
     harness_env: tuple[str, ...] = ()
+    # Where a harness turn runs. "systemd-user": in the operator's own systemd
+    # user manager, outside the gateway's sandbox (the default when the user
+    # bus is reachable). "direct": as a child of the gateway, inheriting its
+    # hardening. "auto" picks systemd-user when possible and says so in the prompt
+    # when it cannot, so the session never mistakes the sandbox for the host.
+    launcher: str = "auto"
     presence: bool = True
     ack_emoji: str = "eyes"
     done_emoji: str = "white_check_mark"
@@ -113,6 +177,7 @@ def load_active_settings(path: Path) -> ActiveSettings:
         persona_id=str(raw.get("persona_id") or "primary"),
         policy_generation=integer("policy_generation", 1),
         harness_env=strings("harness_env"),
+        launcher=str(raw.get("launcher") or "auto"),
         presence=bool(raw.get("presence", True)),
         extra={"default_channel": str(raw.get("default_channel") or "")},
     )
@@ -122,7 +187,27 @@ def endpoint_key_for(source_kind: str, session_id: str) -> str:
     return f"detached_native:{source_kind}:{session_id}"
 
 
-def compose_prompt(context: dict[str, Any], settings: ActiveSettings) -> str:
+def runtime_truth(launcher: str) -> str:
+    if launcher == "systemd-user":
+        return (
+            "Runtime truth: this turn runs in your operator's own systemd user session with "
+            "the same user, groups, sudo and docker access they have. If a command is denied "
+            "or a service is down, quote the exact error and ask; never infer a host or disk "
+            "fault from a permission error."
+        )
+    facts = sandbox_facts()
+    return (
+        "Runtime truth: this turn runs INSIDE the gateway's hardened systemd unit, not in a "
+        "login shell: no sudo (no_new_privs=%s), no docker socket, /var /etc /usr read-only "
+        "(var_writable=%s), no ~/.ssh. Those limits belong to this turn, not to the host: "
+        "the host is healthy unless you prove otherwise from a command you ran in this turn. "
+        "If the work needs those privileges, say so in one sentence and stop; never infer a "
+        "host or disk fault from a permission error."
+        % (str(facts["no_new_privs"]).lower(), str(facts["var_writable"]).lower())
+    )
+
+
+def compose_prompt(context: dict[str, Any], settings: ActiveSettings, launcher: str = "direct") -> str:
     """The turn as the harness sees it: who said what, where you are, what to do.
 
     A bound session is the engineer who owns the work, not a chat persona.
@@ -151,9 +236,10 @@ def compose_prompt(context: dict[str, Any], settings: ActiveSettings) -> str:
         "You own this work. Do what the message needs with your tools first (reproduce, fix, "
         "rerun, verify), then reply. Report with evidence: file and line, command and exit "
         "code, PR link, test count.",
-        "Runtime truth: you have the same user, groups, sudo and docker access as the operator "
-        "who started this session. If a command is denied or a service is down, say exactly "
-        "what failed and ask; never infer a host or disk fault from a permission error.",
+        runtime_truth(launcher),
+        "Reply contract: whatever you print is posted verbatim into the thread by Tether. Do "
+        "not call tether reply/post/notify, do not mention bridge ids or reply keys, do not "
+        "write 'Reply to' headers or any note to your operator; the thread is your reader.",
         f"Reply in at most {max(settings.max_reply_sentences, 3)} short sentences, as a colleague: "
         "no meta-narration, no restating the question. Mention people as <@USERID>. If the "
         "messages need no reply from you, respond with exactly NO_REPLY.",
@@ -351,16 +437,18 @@ class ActiveSlice:
 
     def _drive(self, attempt: dict[str, Any]) -> None:
         context = self.runtime.attempt_context(attempt["attempt_id"])
-        prompt = compose_prompt(context, self.settings)
+        launcher = resolve_launcher(self.settings)
+        prompt = compose_prompt(context, self.settings, launcher)
         try:
             command = self.command_factory(context, self.settings, prompt)
             cwd = Path(str(context["source"].get("cwd") or os.getcwd()))
             if not cwd.is_dir():
                 cwd = Path.home()
-            launched = self.driver.launch(
-                attempt, command=command, cwd=cwd,
-                env=child_env(passthrough=self.settings.harness_env),
+            argv, popen_env, launcher = launch_plan(
+                command, cwd, child_env(passthrough=self.settings.harness_env), self.settings,
             )
+            logger.info("tether: attempt %s launcher=%s", attempt["attempt_id"], launcher)
+            launched = self.driver.launch(attempt, command=argv, cwd=cwd, env=popen_env)
             result = self.driver.reap(
                 attempt, launched, timeout_seconds=self.settings.native_timeout_seconds
             )
@@ -378,6 +466,8 @@ class ActiveSlice:
             self._unreact(context["channel_id"], ts, self.settings.ack_emoji)
             self._react(context["channel_id"], ts, marker)
         if state != "completed_with_response":
+            if state not in {"no_reply"}:
+                self._post_failure_notice(context, attempt, result)
             return
         final = self.runtime.attempt_context(attempt["attempt_id"])
         text = self._read_response(final.get("response_ref"))
@@ -389,6 +479,49 @@ class ActiveSlice:
             logger.error("tether: egress failed for %s", attempt["attempt_id"], exc_info=True)
             for ts in self._turn_message_ids(context):
                 self._react(context["channel_id"], ts, self.settings.fail_emoji)
+
+    def _post_failure_notice(self, context: dict[str, Any], attempt: dict[str, Any], result: dict[str, Any]) -> None:
+        """A failed turn says so, in one line, with the harness's own words.
+
+        Silence after a warning emoji reads as being ignored. The reason is
+        whatever the harness printed (rate limit, auth, crash), redacted to a
+        single line, so the thread knows whether to wait or to escalate.
+        """
+        reason = ""
+        try:
+            work = self.driver._attempt_dir(attempt["attempt_id"])  # noqa: SLF001 - same package
+            for name in ("response.out", "stderr.log"):
+                path = work / name
+                if path.exists():
+                    text = path.read_text(encoding="utf-8", errors="replace").strip()
+                    if text:
+                        reason = text.splitlines()[-1].strip()[:200]
+                        break
+        except Exception:  # best effort: the notice must never fail the drive
+            reason = ""
+        code = str(result.get("error_code") or "")
+        if not code:
+            try:
+                code = str(self.runtime.attempt_context(attempt["attempt_id"]).get("error_code") or "")
+            except Exception:
+                code = ""
+        code = code or str(result.get("state") or "failed")
+        who = ""
+        for turn in context.get("turns", []):
+            try:
+                who = str(json.loads(turn.get("payload_inline") or "{}").get("user") or "")
+            except ValueError:
+                pass
+        mention = f"<@{who}> " if who and who != "operator" else ""
+        detail = f": {reason}" if reason else ""
+        text = (
+            f"{mention}I could not take this turn ({code}{detail}). "
+            "Reply here again later to retry, or ping my operator if it is urgent."
+        )
+        try:
+            self.egress(context["channel_id"], context["thread_ts"], text)
+        except Exception:
+            logger.error("tether: failure notice egress failed for %s", attempt["attempt_id"], exc_info=True)
 
     def _read_response(self, response_ref: str | None) -> str:
         if not response_ref:
@@ -473,6 +606,7 @@ class ActiveSlice:
         owners = tuple(self.descriptor.authorized_owner_ids)
         return {
             "implementation": "tether",
+            "harness_launcher": resolve_launcher(self.settings),
             "protocol_version": 6,
             "peer_uid_enforced": True,
             "root_refused": True,
