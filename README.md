@@ -8,7 +8,7 @@ Our collection of portable Agent Skills for Claude Code, Codex, and pi.
 |---|---|---|
 | [`hands-free`](hands-free/) | Calls your phone when the coding agent needs an answer or approval. | Same Python/Vapi contract in all three harnesses. |
 | [`parable`](parable/) | Plans implementation batches, routes work to cheaper executors, verifies, and reviews. | Claude/native subagents are used only when available; stock pi needs a configured CLI-backed executor. |
-| [`cascade`](cascade/) | Runs large projects as bounded, evidence-gated development loops. | Falls back to a file-backed task graph when the harness has no task or wake primitives. |
+| [`cascade`](cascade/) | Carries large projects through verifiable tasks and parallel work. | Keeps a living task graph; executes serially when parallel tools are unavailable. |
 | [`recall`](recall/) | Indexed local search over prior Claude Code and Codex sessions. | Runs from pi, but does not index pi's own transcripts yet. |
 | [`recap`](recap/) | Reconstructs everything observable that happened in one exact coding-agent session. | Uses Recall's Claude/Codex evidence; pi can run it but is not yet an indexed source. |
 | [`tether`](tether/) | Keeps Slack threads attached to the exact agents that created them. | Codex and Claude Code resume natively; stock pi publishes as a headless run. End-to-end routing also installs an external Hermes plugin/runtime. |

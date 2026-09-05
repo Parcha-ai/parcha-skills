@@ -1,7 +1,7 @@
 {
   "name": "@parcha/cascade",
   "version": "0.1.0",
-  "description": "Authority-aware, evidence-gated development loops for Claude Code, Codex, and pi",
+  "description": "Carry large projects through verifiable tasks, parallel work, and durable progress.",
   "files": [
     ".claude-plugin/",
     ".codex-plugin/",

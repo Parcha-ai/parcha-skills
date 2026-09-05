@@ -1,7 +1,7 @@
 {
   "name": "cascade",
   "version": "0.1.0",
-  "description": "Plan and execute short, authority-aware development loops with evidence-gated exits.",
+  "description": "Carry large projects through verifiable tasks, parallel work, and durable progress.",
   "author": {
     "name": "Miguel Rios",
     "url": "https://github.com/miguelrios"
@@ -18,8 +18,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Cascade",
-    "shortDescription": "Evidence-gated development loops",
-    "longDescription": "Turn a consequential task into a short portable chain with explicit authority, bounded attempts, and acceptance criteria mapped to fresh evidence before anything advances.",
+    "shortDescription": "Verifiable tasks and parallel project work",
+    "longDescription": "Keep one living project plan with outcomes, task dependencies, exit checks, evidence, and resume notes. Delegate independent work and verify the integrated result.",
     "developerName": "Miguel Rios",
     "category": "Developer Tools",
     "capabilities": [
@@ -28,7 +28,7 @@
     ],
     "websiteURL": "https://github.com/miguelrios/unc-skills/tree/main/cascade",
     "defaultPrompt": [
-      "Cascade this task into short, authority-aware, evidence-gated loops."
+      "Use Cascade to break this project into verifiable tasks and keep working through the dependency graph."
     ]
   }
 }

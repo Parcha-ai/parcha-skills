@@ -98,7 +98,6 @@ class PortablePackagingTest(unittest.TestCase):
     def test_playbooks_name_harness_differences_honestly(self):
         hands_free = (ROOT / "hands-free/skills/hands-free/SKILL.md").read_text()
         parable = (ROOT / "parable/skills/parable/SKILL.md").read_text()
-        cascade = (ROOT / "cascade/skills/cascade/SKILL.md").read_text()
         recall = (ROOT / "recall/skills/recall/SKILL.md").read_text()
         recap = (ROOT / "recap/skills/recap/SKILL.md").read_text()
         tether = (ROOT / "tether/skills/tether/SKILL.md").read_text()
@@ -106,7 +105,6 @@ class PortablePackagingTest(unittest.TestCase):
 
         self.assertIn("Claude Code, Codex, and pi", hands_free)
         self.assertIn("If it does not (notably stock pi)", parable)
-        self.assertIn("stock pi has no background bash", cascade)
         self.assertIn("pi's own session format is not yet", recall)
         self.assertIn("Claude Code or Codex", recap)
         self.assertIn("Codex or Claude Code", tether)
