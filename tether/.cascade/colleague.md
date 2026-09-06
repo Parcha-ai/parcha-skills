@@ -27,9 +27,9 @@ replies with evidence) passes on all primary gateways; Tether Python under 3,000
 ## Tasks
 | ID | Deliverable | Depends | Exit check | Status | Evidence |
 |---|---|---|---|---|---|
-| C1 | Baseline eval re-run on last 48 h of #agent-hub (ruler verified first) | — | measure + judge JSON saved under evals/conversation/fixtures/baseline-2026-09-06.json | todo | |
-| C2 | Hermes upgrade path proven on claudio: snapshot, upgrade to v2026.8.31, plugin loads, doctor 14/0, rollback recipe written | — | `hermes --version` = 0.21.0; `tether doctor` 14 ok 0 fail; bound-thread smoke in #agent-hub passes | todo | |
-| C3 | Knobs on claudio: native streaming on, native_task_cards on, long_running_notifications off, presence reactions off, peers via config | C2 | config diff committed to fleet notes; a thread shows streamed reply + task cards and no "⏳ Working" line | todo | |
+| C1 | Baseline eval re-run on last 48 h of #agent-hub | — | measure + judge JSON saved under evals/conversation/fixtures/baseline-2026-09-06.json | done | 7 threads: answered 1.86 lane 1.71 evidence 1.71 tone 1.43; status lines 1, leaks 1, bare 0, extra voices 3, median 20 s. Ruler = rubric v2 calibrated 2026-09-04; not re-verified on this corpus (small, 7 threads) |
+| C2 | Hermes upgrade path proven on claudio | — | `hermes --version` = 0.21.0; `tether doctor` 14 ok 0 fail; bound-thread smoke in #agent-hub passes | doing | v0.21.0 main 245e4800; snapshot ~/.hermes/backups/pre-upgrade-20260906 (+ hermes zip pre-update-2026-09-06-004446.zip); rollback: `git checkout b9ba7c78e4 && venv/bin/pip install -e .`; config migrated 33→40 (delegation limits 50→250 / 3→10, bg notifications all→concise); stale git shallow.lock had to be removed; doctor 14/0 after restart; smoke pending |
+| C3 | Knobs on claudio: native streaming on, native_task_cards on, long_running_notifications off, presence reactions off (tether presence=false, SLACK_REACTIONS=false) | C2 | config diff committed to fleet notes; a thread shows streamed reply + task cards and no "⏳ Working" line | doing | applied 2026-09-06 00:5x UTC; verification pending |
 | C4 | Eval after C3 (same corpus window rules) | C1,C3 | status lines 0, leaks 0; answered/lane/evidence/tone ≥ baseline − 0.1 | todo | |
 | C5 | Fleet roll: Hermes v2026.8.31 + knobs on all 8 gateways | C4 | doctors clean fleet-wide; q2/claudio cross-agent loop passes | todo | |
 | C6 | Move 2 design note: stream-json driver per binding, hooks → broker, what deletes | C2 | note in tether/docs/plans/ with line-count ledger and test plan | todo | |
