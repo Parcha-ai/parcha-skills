@@ -397,7 +397,11 @@ class JournalThreadingTests(unittest.TestCase):
         import importlib, threading
         journal_mod = importlib.import_module("runtime.plugin_next.journal")
         with tempfile.TemporaryDirectory() as tmp:
-            journal = journal_mod.DurableJournal(Path(tmp))
+            home = Path(tmp) / "home"
+            home.mkdir(mode=0o700)
+            data = home / "tether"
+            data.mkdir(mode=0o700)
+            journal = journal_mod.DurableJournal(data)
             results: dict[str, object] = {}
 
             def worker():
