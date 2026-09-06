@@ -1228,6 +1228,22 @@ class DomainRuntime:
                 "turns": [dict(turn) for turn in turns],
             }
 
+    def recent_turn_actors(self, binding_id: str, limit: int = 2) -> list[str]:
+        """Actors of the newest ``limit`` turns on a binding, newest first."""
+        with self._transaction() as db:
+            rows = db.execute(
+                "SELECT payload_inline FROM queued_turns WHERE binding_id=? "
+                "ORDER BY ordered_at DESC LIMIT ?",
+                (binding_id, int(limit)),
+            ).fetchall()
+        actors: list[str] = []
+        for row in rows:
+            try:
+                actors.append(str(json.loads(row["payload_inline"] or "{}").get("user") or ""))
+            except ValueError:
+                actors.append("")
+        return actors
+
     def close_binding(self, binding_id: str) -> dict[str, Any]:
         """Close one binding. The schema refuses while ready turns remain."""
         with self._transaction() as db:

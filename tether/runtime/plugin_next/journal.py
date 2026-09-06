@@ -16,6 +16,7 @@ import contextlib
 import json
 import os
 import sqlite3
+import threading
 import stat
 import time
 from pathlib import Path
@@ -59,8 +60,12 @@ class DurableJournal:
         _secure_directory(directory)
         self.path = directory / "shadow.db"
         existed = self.path.exists()
-        self._db = sqlite3.connect(self.path, timeout=10)
+        # Hermes 0.21 fires pre_gateway_dispatch from a worker thread, not the
+        # thread that loaded the plugin; one connection guarded by a lock is
+        # simpler than a connection per thread for a write-mostly journal.
+        self._db = sqlite3.connect(self.path, timeout=10, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
+        self._lock = threading.Lock()
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=FULL")
         self._db.execute(_SCHEMA)
@@ -75,6 +80,10 @@ class DurableJournal:
         """Insert one decision; returns False when the key was a replay."""
         if not event_key:
             raise JournalError("an event key is required")
+        with self._lock:
+            return self._record_locked(event_key, decision, fields)
+
+    def _record_locked(self, event_key: str, decision: dict[str, Any], fields: dict[str, Any]) -> bool:
         cursor = self._db.execute(
             """
             INSERT OR IGNORE INTO shadow_events(
@@ -100,6 +109,10 @@ class DurableJournal:
         return cursor.rowcount == 1
 
     def summary(self) -> dict[str, Any]:
+        with self._lock:
+            return self._summary_locked()
+
+    def _summary_locked(self) -> dict[str, Any]:
         counts = {
             str(row["verdict"]): int(row["n"])
             for row in self._db.execute(

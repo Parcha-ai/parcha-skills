@@ -245,7 +245,11 @@ def register(ctx: Any) -> None:
             claimed = None
             if slice_ is not None and decision.get("verdict") == "admit":
                 try:
-                    claimed = slice_.claim(fields, str(getattr(event, "text", "") or ""))
+                    claimed = slice_.claim(
+                        fields, str(getattr(event, "text", "") or ""),
+                        peer=decision.get("reason") == "trusted_peer_on_bound_thread",
+                        peers=frozenset(settings.trusted_bot_users),
+                    )
                 except Exception:
                     logger.exception("tether: claim failed for %s; event falls through", event_key)
                 decision = dict(decision, claimed=claimed is not None)
