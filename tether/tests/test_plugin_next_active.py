@@ -394,7 +394,8 @@ class LauncherTests(unittest.TestCase):
 
 class JournalThreadingTests(unittest.TestCase):
     def test_record_and_summary_work_from_another_thread(self):
-        import importlib, threading
+        import importlib
+        import threading
         journal_mod = importlib.import_module("runtime.plugin_next.journal")
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
@@ -412,7 +413,8 @@ class JournalThreadingTests(unittest.TestCase):
                     results["error"] = repr(exc)
 
             t = threading.Thread(target=worker)
-            t.start(); t.join(10)
+            t.start()
+            t.join(10)
             self.assertNotIn("error", results, results.get("error"))
             self.assertTrue(results["record"])
             self.assertEqual(results["summary"]["events"], 1)
