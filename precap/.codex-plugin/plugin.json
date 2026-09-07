@@ -1,0 +1,21 @@
+{
+  "name": "precap",
+  "version": "0.1.0",
+  "description": "Write a grounded recap of a task as if it were already done, then use it to check whether a long-running agent is still on the imagined path.",
+  "author": { "name": "Miguel Rios", "url": "https://github.com/miguelrios" },
+  "homepage": "https://github.com/miguelrios/unc-skills/tree/main/precap",
+  "repository": "https://github.com/miguelrios/unc-skills/tree/main/precap",
+  "license": "MIT",
+  "keywords": ["precap", "planning", "long-running-agents", "drift"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Precap",
+    "shortDescription": "Recap the task before doing it",
+    "longDescription": "Investigate the repo, plan, and git state, write precap.md as the recap of the finished work, and check the running agent against it for drift.",
+    "developerName": "Miguel Rios",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"],
+    "websiteURL": "https://github.com/miguelrios/unc-skills/tree/main/precap",
+    "defaultPrompt": ["Precap this task: investigate, then write precap.md."]
+  }
+}

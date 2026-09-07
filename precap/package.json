@@ -1,0 +1,28 @@
+{
+  "name": "@parcha/precap",
+  "version": "0.1.0",
+  "description": "Recap a task before doing it: a grounded, past-tense account of the finished work that long-running agents check themselves against",
+  "files": [
+    ".claude-plugin/",
+    ".codex-plugin/",
+    "skills/",
+    "!skills/**/__pycache__/**",
+    "!skills/**/*.pyc",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "python3 -m unittest discover -s tests -v && python3 -m py_compile skills/precap/scripts/precap.py && python3 -m json.tool .claude-plugin/plugin.json >/dev/null && python3 -m json.tool .codex-plugin/plugin.json >/dev/null",
+    "pack:check": "npm pack --dry-run"
+  },
+  "engines": { "node": ">=18" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/miguelrios/unc-skills.git",
+    "directory": "precap"
+  },
+  "keywords": ["agent-skills", "claude-code", "codex", "pi-package", "precap", "planning", "long-running-agents"],
+  "pi": { "skills": ["./skills"] },
+  "author": "Miguel Rios",
+  "license": "MIT"
+}

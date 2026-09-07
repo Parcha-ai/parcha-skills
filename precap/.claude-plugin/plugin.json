@@ -1,0 +1,6 @@
+{
+  "name": "precap",
+  "version": "0.1.0",
+  "description": "Write a grounded recap of a task as if it were already done, then use it to check whether a long-running agent is still on the imagined path.",
+  "author": { "name": "Miguel Rios", "url": "https://github.com/miguelrios" }
+}
