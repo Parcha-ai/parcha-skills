@@ -55,6 +55,12 @@
       "source": "./autoqa",
       "version": "0.1.0",
       "description": "Self-QA a repo's running app end-to-end — discover run/auth/features, build a feature×modality test matrix, execute it live, and produce a witnessed pass/fail report."
+    },
+    {
+      "name": "precap",
+      "source": "./precap",
+      "version": "0.1.0",
+      "description": "Recap a task before doing it — a grounded, past-tense account of the finished work that long-running agents check themselves against for drift."
     }
   ]
 }

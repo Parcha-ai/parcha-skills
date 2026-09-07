@@ -1,0 +1,26 @@
+{
+  "skill_name": "precap",
+  "evals": [
+    {
+      "id": 1,
+      "name": "write-mode-small-change",
+      "prompt": "/precap I'm about to add a --json flag to recap's render-synthesis command in this repo so the rendered output can be consumed by tether. Write the precap.",
+      "expected_output": "precap.md with every Path step grounded in a real file:line from recap/skills/recap/scripts, a Footprint naming synthesis.py, recap.py, a test file and the SKILL.md, a Verification section citing the recap package's npm test, at least one fork on output shape, and validate exit 0.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "check-mode-on-resume",
+      "prompt": "I'm resuming after a compaction. There's a precap.md in this worktree. Are we still on track?",
+      "expected_output": "Runs precap.py drift, walks the Path checkpoints against git and the tree, and answers with the current step plus a verdict of on path, ahead, drifted at step N, or blocked. Does not rewrite precap.md.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "name": "user-owned-fork",
+      "prompt": "precap this: migrate the connector registry from JSON files to sqlite. not sure if we keep the JSON readers around for old clients.",
+      "expected_output": "Investigates callers of the registry, then asks the user with AskUserQuestion whether the JSON readers stay before writing the fork as decided; the written precap lists the compatibility decision under Forks, not as a settled past-tense step.",
+      "files": []
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Precap"
+  short_description: "Write the recap of a task before doing it, then check the run against it"
+  default_prompt: "Use $precap to investigate this task and write precap.md, the imagined path to done."

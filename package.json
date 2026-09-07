@@ -24,7 +24,8 @@
       "./recap/skills",
       "./tether/skills",
       "./desloppify/skills",
-      "./autoqa/skills"
+      "./autoqa/skills",
+      "./precap/skills"
     ]
   },
   "license": "MIT"
