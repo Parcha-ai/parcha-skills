@@ -56,6 +56,7 @@ npx skills add miguelrios/unc-skills --skill recall
 npx skills add miguelrios/unc-skills --skill recap
 npx skills add miguelrios/unc-skills --skill tether
 npx skills add miguelrios/unc-skills --skill desloppify
+npx skills add miguelrios/unc-skills --skill autoqa
 npx skills add miguelrios/unc-skills --skill precap
 ```
 
@@ -86,6 +87,7 @@ claude plugin install recall@unc-skills
 claude plugin install recap@unc-skills
 claude plugin install tether@unc-skills
 claude plugin install desloppify@unc-skills
+claude plugin install autoqa@unc-skills
 claude plugin install precap@unc-skills
 ```
 
@@ -102,6 +104,7 @@ codex plugin add recall@unc-skills
 codex plugin add recap@unc-skills
 codex plugin add tether@unc-skills
 codex plugin add desloppify@unc-skills
+codex plugin add autoqa@unc-skills
 codex plugin add precap@unc-skills
 ```
 
