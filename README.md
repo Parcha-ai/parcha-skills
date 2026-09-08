@@ -14,6 +14,7 @@ Our collection of portable Agent Skills for Claude Code, Codex, and pi.
 | [`tether`](tether/) | Keeps Slack threads attached to the exact agents that created them. | Codex and Claude Code resume natively; stock pi publishes as a headless run. End-to-end routing also installs an external Hermes plugin/runtime. |
 | [`desloppify`](desloppify/) | Turns whole-codebase slop into evidence-backed cleanup with Peter O'Malley's official engine. | One canonical workflow selects honest native or prepared-packet review routes per harness. |
 | [`autoqa`](autoqa/) | Points at any repo, discovers how it runs, and QAs the live app end-to-end with a witnessed report. | Uses whatever browser tooling the harness has; API/CLI checks work everywhere. |
+| [`precap`](precap/) | Recaps a task before doing it: a grounded, past-tense account of the finished work that long-running agents check themselves against for drift. | Pure markdown plus a stdlib Python checker; identical in all three harnesses. |
 
 The skill payloads are canonical `skills/<name>/SKILL.md` directories. Harness-specific
 manifests package those same files; there are no Claude/Codex/pi forks to drift apart.
@@ -38,7 +39,7 @@ The install commands below cover skills only. To install a snippet, paste its
 
 ## Install with skills.sh
 
-Browse all eight skills at [skills.sh/miguelrios/unc-skills](https://skills.sh/miguelrios/unc-skills),
+Browse all nine skills at [skills.sh/miguelrios/unc-skills](https://skills.sh/miguelrios/unc-skills),
 or install interactively:
 
 ```bash
@@ -55,6 +56,8 @@ npx skills add miguelrios/unc-skills --skill recall
 npx skills add miguelrios/unc-skills --skill recap
 npx skills add miguelrios/unc-skills --skill tether
 npx skills add miguelrios/unc-skills --skill desloppify
+npx skills add miguelrios/unc-skills --skill autoqa
+npx skills add miguelrios/unc-skills --skill precap
 ```
 
 Add `--global` for a user-level install or `--agent claude-code`, `--agent codex`, or
@@ -84,6 +87,8 @@ claude plugin install recall@unc-skills
 claude plugin install recap@unc-skills
 claude plugin install tether@unc-skills
 claude plugin install desloppify@unc-skills
+claude plugin install autoqa@unc-skills
+claude plugin install precap@unc-skills
 ```
 
 Install only the skills you want. Start a new session after installation.
@@ -99,6 +104,8 @@ codex plugin add recall@unc-skills
 codex plugin add recap@unc-skills
 codex plugin add tether@unc-skills
 codex plugin add desloppify@unc-skills
+codex plugin add autoqa@unc-skills
+codex plugin add precap@unc-skills
 ```
 
 Codex uses the native `.agents/plugins/marketplace.json` and package
