@@ -192,6 +192,14 @@ class StoreTests(unittest.TestCase):
         self.assertIsNone(self.store.find_active_binding(team_id="T1", channel_id="C9", thread_ts="500.2"))
         self.assertEqual(self.store.import_legacy_bindings(Path(self.temp.name) / "missing.db"), 0)
 
+    def test_binding_index_reads_the_store(self):
+        from runtime.plugin_next import BindingIndex
+        self.bind("700.1")
+        index = BindingIndex(self.store.path, ttl_seconds=0.0, query=BindingIndex.STORE_QUERY)
+        self.assertEqual(index.bound_threads(), frozenset({("C1", "700.1")}))
+        self.store.close_binding(self.store.find_active_binding(team_id="T1", channel_id="C1", thread_ts="700.1")["binding_id"])
+        self.assertEqual(index.bound_threads(), frozenset())
+
     def test_no_reply_marker(self):
         self.assertTrue(is_no_reply("NO_REPLY"))
         self.assertTrue(is_no_reply("done here\n\nNO_REPLY"))

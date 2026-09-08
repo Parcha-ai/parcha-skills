@@ -95,9 +95,13 @@ def load_settings(path: Path | None = None) -> admission.AdmissionSettings:
 class BindingIndex:
     """Read-only, throttled snapshot of Tether's bound Slack threads."""
 
-    def __init__(self, database: Path, ttl_seconds: float = _BINDING_CACHE_TTL_SECONDS):
+    # The session driver's store keeps bindings in its own table.
+    STORE_QUERY = "SELECT channel_id,thread_ts FROM bindings WHERE thread_ts!='' AND state='active'"
+
+    def __init__(self, database: Path, ttl_seconds: float = _BINDING_CACHE_TTL_SECONDS, query: str | None = None):
         self.database = Path(database)
         self.ttl_seconds = ttl_seconds
+        self.query = query
         self._cached: frozenset[tuple[str, str]] = frozenset()
         self._loaded_at = 0.0
 
@@ -113,7 +117,9 @@ class BindingIndex:
                 schema_version = int(
                     connection.execute("PRAGMA user_version").fetchone()[0]
                 )
-                if schema_version >= 18:
+                if self.query:
+                    rows = connection.execute(self.query)
+                elif schema_version >= 18:
                     rows = connection.execute(
                         # Only 'active' is live. 'rebind_required' means the
                         # endpoint's incarnation moved and the domain will
@@ -174,10 +180,14 @@ def register(ctx: Any) -> None:
     bindings = BindingIndex(home / "bridges.db")
     # Threads bound in the schema-18 domain (active mode) count as bound too:
     # admission stays the single gate, it just reads both stores.
-    domain_bindings = BindingIndex(home / "plugin-data" / "tether" / "domain.db", ttl_seconds=0.0)
     settings = load_settings()
-
     active_settings = active_module.load_active_settings(_config_path())
+    if active_settings.driver == "session":
+        domain_bindings = BindingIndex(
+            home / "plugin-data" / "tether" / "tether.db", ttl_seconds=0.0, query=BindingIndex.STORE_QUERY,
+        )
+    else:
+        domain_bindings = BindingIndex(home / "plugin-data" / "tether" / "domain.db", ttl_seconds=0.0)
     slice_: active_module.ActiveSlice | None = None
     if active_settings.enabled and settings.configured:
         slice_ = _build_active_slice(ctx, home, settings, active_settings)
