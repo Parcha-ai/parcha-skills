@@ -27,7 +27,6 @@ import logging
 import os
 import re
 import sqlite3
-import sys
 import time
 import tomllib
 from pathlib import Path
@@ -93,15 +92,13 @@ def load_settings(path: Path | None = None) -> admission.AdmissionSettings:
 
 
 class BindingIndex:
-    """Read-only, throttled snapshot of Tether's bound Slack threads."""
+    """Read-only, throttled snapshot of the threads the store holds active."""
 
-    # The session driver's store keeps bindings in its own table.
-    STORE_QUERY = "SELECT channel_id,thread_ts FROM bindings WHERE thread_ts!='' AND state='active'"
+    QUERY = "SELECT channel_id,thread_ts FROM bindings WHERE thread_ts!='' AND state='active'"
 
-    def __init__(self, database: Path, ttl_seconds: float = _BINDING_CACHE_TTL_SECONDS, query: str | None = None):
+    def __init__(self, database: Path, ttl_seconds: float = _BINDING_CACHE_TTL_SECONDS):
         self.database = Path(database)
         self.ttl_seconds = ttl_seconds
-        self.query = query
         self._cached: frozenset[tuple[str, str]] = frozenset()
         self._loaded_at = 0.0
 
@@ -114,35 +111,11 @@ class BindingIndex:
             uri = f"{self.database.resolve().as_uri()}?mode=ro"
             connection = sqlite3.connect(uri, uri=True, timeout=2)
             try:
-                schema_version = int(
-                    connection.execute("PRAGMA user_version").fetchone()[0]
-                )
-                if self.query:
-                    rows = connection.execute(self.query)
-                elif schema_version >= 18:
-                    rows = connection.execute(
-                        # Only 'active' is live. 'rebind_required' means the
-                        # endpoint's incarnation moved and the domain will
-                        # refuse the turn; treating it as bound would admit
-                        # traffic against a dead binding once active mode
-                        # ships. 'pending_root' has no thread yet.
-                        "SELECT channel_id,thread_ts FROM thread_bindings "
-                        "WHERE thread_ts IS NOT NULL AND state='active'"
-                    )
-                else:
-                    rows = connection.execute(
-                        "SELECT channel_id,thread_ts FROM bridges "
-                        "WHERE thread_ts IS NOT NULL AND thread_ts!=''"
-                    )
-                threads = {
-                    (str(row[0]), str(row[1]))
-                    for row in rows
-                }
+                threads = {(str(r[0]), str(r[1])) for r in connection.execute(self.QUERY)}
             finally:
                 connection.close()
         except (sqlite3.Error, OSError, ValueError):
-            # Fail closed to "nothing bound": Tether then claims nothing.
-            threads = set()
+            threads = set()  # fail closed: Tether then claims nothing
         self._cached = frozenset(threads)
         self._loaded_at = now
         return self._cached
@@ -177,17 +150,11 @@ def register(ctx: Any) -> None:
     home = _hermes_home()
     logger.info("tether: register() entered")
     journal = DurableJournal(home / "plugin-data" / "tether")
-    bindings = BindingIndex(home / "bridges.db")
-    # Threads bound in the schema-18 domain (active mode) count as bound too:
-    # admission stays the single gate, it just reads both stores.
     settings = load_settings()
     active_settings = active_module.load_active_settings(_config_path())
-    if active_settings.driver == "session":
-        domain_bindings = BindingIndex(
-            home / "plugin-data" / "tether" / "tether.db", ttl_seconds=0.0, query=BindingIndex.STORE_QUERY,
-        )
-    else:
-        domain_bindings = BindingIndex(home / "plugin-data" / "tether" / "domain.db", ttl_seconds=0.0)
+    store_db = home / "plugin-data" / "tether" / "tether.db"
+    bindings = BindingIndex(store_db, ttl_seconds=0.0)
+    domain_bindings = bindings
     slice_: active_module.ActiveSlice | None = None
     if active_settings.enabled and settings.configured:
         slice_ = _build_active_slice(ctx, home, settings, active_settings)
@@ -406,60 +373,7 @@ def _build_active_slice(
     settings: admission.AdmissionSettings,
     active_settings: active_module.ActiveSettings,
 ) -> active_module.ActiveSlice | None:
-    """Wire the store/driver pair the config asks for, plus Hermes egress."""
-    if active_settings.driver == "session":
-        return _build_session_slice(home, settings, active_settings)
-    try:
-        import domain_runtime
-        import domain_schema
-        import native_driver
-    except ImportError:
-        # Installed layout: runtime modules live in $XDG_DATA_HOME/tether; the
-        # source layout keeps them one directory above this package.
-        data_home = Path(
-            os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))
-        ).expanduser()
-        for candidate in (data_home / "tether", Path(__file__).resolve().parents[1]):
-            if str(candidate) not in sys.path and candidate.is_dir():
-                sys.path.insert(0, str(candidate))
-        try:
-            import domain_runtime
-            import domain_schema
-            import native_driver
-        except ImportError:
-            logger.error("tether: active mode requested but domain runtime is not installed")
-            return None
-    root = home / "plugin-data" / "tether"
-    root.mkdir(parents=True, exist_ok=True)
-    database = root / "domain.db"
-    if not database.exists():
-        connection = sqlite3.connect(database)
-        try:
-            domain_schema.install_schema(connection)
-            connection.execute(f"PRAGMA user_version={domain_schema.SCHEMA_VERSION}")
-            connection.commit()
-        finally:
-            connection.close()
-        os.chmod(database, 0o600)
-    runtime = domain_runtime.DomainRuntime(database)
-    driver = native_driver.NativeDriver(runtime, work_root=root / "driver")
-    descriptor = domain_schema.SecurityDomainDescriptor(
-        instance_uid=os.geteuid(),
-        workspace_id=settings.workspace_id,
-        persona_id=active_settings.persona_id,
-        authorized_owner_ids=tuple(sorted(settings.allowed_users)),
-        policy_generation=active_settings.policy_generation,
-    )
-
-    slack = SlackEgress()
-
-    def egress(channel_id: str, thread_ts: str, text: str) -> Any:
-        return slack.post(channel_id, text, thread_ts=thread_ts)
-
-    slice_ = active_module.ActiveSlice(
-        runtime=runtime, driver=driver, settings=active_settings,
-        egress=egress, descriptor=descriptor, slack=slack,
-    )
-    server = broker_module.BrokerServer(home / "bridge.sock", slice_.handle)
-    slice_.broker = server
-    return slice_
+    """Wire the store, the session driver and Hermes egress."""
+    if active_settings.driver not in ("session", ""):
+        logger.warning("tether: driver=%r is retired; running the session driver", active_settings.driver)
+    return _build_session_slice(home, settings, active_settings)

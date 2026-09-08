@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import os
-import stat
 import sys
 import tempfile
-import textwrap
 import unittest
 from pathlib import Path
 
@@ -17,52 +15,14 @@ from runtime.plugin_next import active  # noqa: E402
 from runtime.plugin_next.session_driver import SessionDriver  # noqa: E402
 from runtime.plugin_next.store import Store  # noqa: E402
 
-# A stand-in for `claude -p --input-format stream-json --output-format stream-json`.
-# It echoes each user turn as a result, keeps a turn counter (so we can prove the
-# process stays alive across turns), obeys a few magic words, and exits on EOF.
-FAKE_CLAUDE = textwrap.dedent(
-    """\
-    #!/usr/bin/env python3
-    import json, sys, os, time
-    sid = sys.argv[sys.argv.index("--resume") + 1] if "--resume" in sys.argv else "fresh"
-    n = 0
-    log = os.environ.get("FAKE_LOG")
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        n += 1
-        text = json.loads(line)["message"]["content"][0]["text"]
-        if log:
-            open(log, "a").write(f"{os.getpid()} {n} {text[:40]}\\n")
-        if "SLEEP" in text:
-            time.sleep(5)
-        if "CRASH" in text:
-            sys.stderr.write("You've hit your session limit\\n"); sys.exit(1)
-        if "SILENT" in text:
-            reply = "nothing to add here\\nNO_REPLY"
-        elif "ERRORFLAG" in text:
-            print(json.dumps({"type": "result", "is_error": True, "result": "API overloaded", "session_id": sid})); sys.stdout.flush(); continue
-        else:
-            reply = f"turn {n} of pid {os.getpid()}: {text.splitlines()[-1][:60]}"
-        print(json.dumps({"type": "assistant", "session_id": sid}))
-        print(json.dumps({"type": "result", "result": reply, "session_id": sid, "is_error": False}))
-        sys.stdout.flush()
-    """
-)
-
-
-def _direct_launch(command, cwd, env, settings):
-    return command, env, "direct"
+from tests.fakes import direct_launch as _direct_launch, write_fake_claude  # noqa: E402
 
 
 class SessionDriverTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
-        self.fake = root / "fake-claude"
-        self.fake.write_text(FAKE_CLAUDE, encoding="utf-8")
-        self.fake.chmod(self.fake.stat().st_mode | stat.S_IEXEC)
+        self.fake = write_fake_claude(root)
         self.log = root / "turns.log"
         os.environ["FAKE_LOG"] = str(self.log)
         self.store = Store(root / "tether.db")

@@ -585,11 +585,6 @@ build_install_plan() {
     exit 2
   }
   resolve_harness
-  add_file "$ROOT_DIR/runtime/domain_control.py" "$RUNTIME_HOME/domain_control.py" 600
-  add_file "$ROOT_DIR/runtime/domain_schema.py" "$RUNTIME_HOME/domain_schema.py" 600
-  add_file "$ROOT_DIR/runtime/domain_runtime.py" "$RUNTIME_HOME/domain_runtime.py" 600
-  add_file "$ROOT_DIR/runtime/native_driver.py" "$RUNTIME_HOME/native_driver.py" 600
-  add_file "$ROOT_DIR/runtime/security.py" "$RUNTIME_HOME/security.py" 600
   add_file "$SKILL_SOURCE/scripts/tether_notify.py" "$RUNTIME_HOME/tether_notify.py" 700
   add_file "$SKILL_SOURCE/scripts/tether_team.py" "$RUNTIME_HOME/tether_team.py" 700
   add_file "$ROOT_DIR/team/TEAM.md" "$RUNTIME_HOME/team/TEAM.md" 600

@@ -120,17 +120,19 @@ class PluginEnvironment(unittest.TestCase):
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         path.chmod(0o600)
 
-    def seed_v17_binding(self, channel="C1", thread="100.1"):
-        db = self.home / ".hermes" / "bridges.db"
+    def seed_v17_binding(self, channel="C1", thread="100.1", state="active", team="T12345678"):
+        root = self.home / ".hermes" / "plugin-data" / "tether"
+        root.mkdir(parents=True, exist_ok=True)
+        db = root / "tether.db"
         connection = sqlite3.connect(db)
         try:
             connection.execute(
-                "CREATE TABLE IF NOT EXISTS bridges("
-                "bridge_id TEXT PRIMARY KEY,channel_id TEXT,thread_ts TEXT)"
+                "CREATE TABLE IF NOT EXISTS bindings(binding_id TEXT PRIMARY KEY, team_id TEXT, "
+                "channel_id TEXT, thread_ts TEXT, state TEXT)"
             )
             connection.execute(
-                "INSERT OR IGNORE INTO bridges VALUES(?,?,?)",
-                (f"brg-{channel}-{thread}", channel, thread),
+                "INSERT OR REPLACE INTO bindings VALUES(?,?,?,?,?)",
+                (f"bnd-{channel}-{thread}-{state}", team, channel, thread, state),
             )
             connection.commit()
         finally:
@@ -272,22 +274,7 @@ class ShadowHookTest(PluginEnvironment):
         self.assertEqual(rows[0]["reason"], "thread_not_bound")
 
     def test_v18_thread_bindings_are_read_when_schema_is_migrated(self):
-        db = self.home / ".hermes" / "bridges.db"
-        connection = sqlite3.connect(db)
-        try:
-            connection.execute(
-                "CREATE TABLE thread_bindings("
-                "binding_id TEXT PRIMARY KEY,channel_id TEXT,thread_ts TEXT,"
-                "state TEXT)"
-            )
-            connection.execute(
-                "INSERT INTO thread_bindings VALUES('bnd-1','C1','100.1','active')"
-            )
-            connection.execute("PRAGMA user_version=18")
-            connection.commit()
-        finally:
-            connection.close()
-        os.chmod(db, 0o600)
+        self.seed_v17_binding("C1", "100.1")
         ctx = self.register()
         self.assertIsNone(self.dispatch(ctx))
         self.assertEqual(self.journal_rows()[0]["verdict"], "admit")
@@ -330,23 +317,7 @@ class InvalidatedBindingTest(PluginEnvironment):
     """An invalidated binding is not a live one."""
 
     def seed_v18_binding(self, state):
-        db = self.home / ".hermes" / "bridges.db"
-        connection = sqlite3.connect(db)
-        try:
-            connection.execute(
-                "CREATE TABLE IF NOT EXISTS thread_bindings("
-                "binding_id TEXT PRIMARY KEY,channel_id TEXT,thread_ts TEXT,"
-                "state TEXT)"
-            )
-            connection.execute(
-                "INSERT OR REPLACE INTO thread_bindings VALUES(?,?,?,?)",
-                (f"bnd-{state}", "C1", "100.1", state),
-            )
-            connection.execute("PRAGMA user_version=18")
-            connection.commit()
-        finally:
-            connection.close()
-        os.chmod(db, 0o600)
+        self.seed_v17_binding("C1", "100.1", state=state)
 
     def dispatch_verdict(self):
         module = load_plugin(f"tether_plugin_next_states_{id(self)}")

@@ -169,11 +169,6 @@ class TetherCliTest(unittest.TestCase):
         codex = self.home / ".codex"
         claude = self.home / ".claude"
         candidates: dict[pathlib.Path, int] = {
-            runtime / "domain_control.py": 0o600,
-            runtime / "domain_schema.py": 0o600,
-            runtime / "domain_runtime.py": 0o600,
-            runtime / "native_driver.py": 0o600,
-            runtime / "security.py": 0o600,
             runtime / "tether_notify.py": 0o700,
             runtime / "tether_team.py": 0o700,
             runtime / "team" / "TEAM.md": 0o600,
@@ -705,7 +700,7 @@ class TetherCliTest(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertIn("ok broker socket is private", payload["checks"])
         self.assertIn(
-            "ok managed install integrity verified (25 files; harness=codex)",
+            "ok managed install integrity verified (20 files; harness=codex)",
             payload["checks"],
         )
         self.assertEqual(payload["status"]["protocol_version"], 6)
@@ -743,7 +738,7 @@ class TetherCliTest(unittest.TestCase):
 
     def test_doctor_fails_when_a_managed_file_drifted(self) -> None:
         self.write_managed_install(harness="codex")
-        runtime = self.root / "data" / "tether" / "domain_runtime.py"
+        runtime = self.root / "data" / "tether" / "tether_notify.py"
         runtime.write_text("# drifted\n", encoding="utf-8")
 
         with FakeBroker(
@@ -843,7 +838,7 @@ class TetherCliTest(unittest.TestCase):
             result = self.run_cli("doctor", socket_path=broker.path)
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn(
-            "ok managed install integrity verified (32 files; harness=both)",
+            "ok managed install integrity verified (27 files; harness=both)",
             result.stdout,
         )
 
@@ -881,7 +876,7 @@ class TetherCliTest(unittest.TestCase):
         runtime = self.root / "data" / "tether"
         runtime.mkdir(parents=True)
         candidates = (
-            runtime / "domain_runtime.py",
+            runtime / "tether_team.py",
             runtime / "tether_notify.py",
             runtime / "install.sh",
         )

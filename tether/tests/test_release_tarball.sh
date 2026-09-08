@@ -329,20 +329,6 @@ npm install \
 
 INSTALLED_ROOT="$INSTALL_PREFIX/node_modules/@parcha/tether"
 [[ -x "$INSTALLED_ROOT/install.sh" ]] || fail "tarball omitted executable install.sh"
-[[ -f "$INSTALLED_ROOT/runtime/domain_runtime.py" ]] ||
-  fail "tarball omitted bridge runtime"
-[[ -f "$INSTALLED_ROOT/runtime/domain_control.py" ]] ||
-  fail "tarball omitted domain control runtime"
-[[ -f "$INSTALLED_ROOT/runtime/domain_schema.py" ]] ||
-  fail "tarball omitted domain schema runtime"
-[[ -f "$INSTALLED_ROOT/runtime/native_driver.py" ]] ||
-  fail "tarball omitted schema orchestrator"
-[[ -f "$INSTALLED_ROOT/runtime/security.py" ]] ||
-  fail "tarball omitted Slack protocol runtime"
-python3 -m py_compile "$INSTALLED_ROOT/runtime/security.py"
-python3 -m py_compile "$INSTALLED_ROOT/runtime/domain_control.py"
-python3 -m py_compile "$INSTALLED_ROOT/runtime/domain_schema.py"
-python3 -m py_compile "$INSTALLED_ROOT/runtime/native_driver.py"
 
 export HOME="$TEST_ROOT/home"
 export XDG_DATA_HOME="$TEST_ROOT/data"
@@ -367,12 +353,12 @@ chmod 700 "$HERMES_BIN"
 
 "$INSTALLED_ROOT/install.sh" install --harness=codex >/dev/null
 launcher="$HOME/.local/bin/tether"
-runtime="$XDG_DATA_HOME/tether/domain_runtime.py"
-slack_protocol="$XDG_DATA_HOME/tether/security.py"
+runtime="$XDG_DATA_HOME/tether/tether_notify.py"
+slack_protocol="$XDG_DATA_HOME/tether/tether_team.py"
 config="$XDG_CONFIG_HOME/tether/config.toml"
 [[ -x "$launcher" ]] || fail "tarball install did not create the launcher"
 [[ -f "$runtime" ]] || fail "tarball install did not create the runtime"
-[[ -f "$slack_protocol" ]] || fail "tarball install omitted Slack protocol runtime"
+[[ -f "$slack_protocol" ]] || fail "tarball install omitted the team script"
 python3 -m py_compile "$slack_protocol"
 [[ -f "$config" ]] || fail "tarball install did not create config"
 set +e
