@@ -169,6 +169,20 @@ class SessionDriverTests(unittest.TestCase):
         finally:
             os.environ.pop("FAKE_CODEX_FAIL", None)
 
+    def test_codex_turn_without_turn_completed_ends_after_quiet(self):
+        from runtime.plugin_next.session_driver import CodexAppServer
+        os.environ["FAKE_CODEX_NO_COMPLETE"] = "1"
+        previous = CodexAppServer.QUIET_AFTER
+        CodexAppServer.QUIET_AFTER = 0.5
+        try:
+            self.bind_codex()
+            self.slice.claim(self.codex_fields("500.2"), "go")
+            self.assertEqual(self.slice.run_once(), 1)
+            self.assertIn("codex turn 1 of pid", self.sent[0][2])
+        finally:
+            CodexAppServer.QUIET_AFTER = previous
+            os.environ.pop("FAKE_CODEX_NO_COMPLETE", None)
+
     def test_codex_no_reply_is_silence(self):
         os.environ["FAKE_CODEX_REPLY"] = "done\nNO_REPLY"
         try:

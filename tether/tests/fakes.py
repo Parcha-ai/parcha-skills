@@ -64,7 +64,7 @@ def direct_launch(command, cwd, env, settings):
 
 
 def child_env(passthrough=()):
-    keys = ("PATH", "FAKE_LOG", "FAKE_PROMPTS", "FAKE_REPLY", "FAKE_CODEX_REPLY", "FAKE_CODEX_FAIL", *passthrough)
+    keys = ("PATH", "FAKE_LOG", "FAKE_PROMPTS", "FAKE_REPLY", "FAKE_CODEX_REPLY", "FAKE_CODEX_FAIL", "FAKE_CODEX_NO_COMPLETE", *passthrough)
     return {k: os.environ[k] for k in keys if k in os.environ}
 
 
@@ -112,6 +112,8 @@ FAKE_CODEX = textwrap.dedent(
             reply = os.environ.get("FAKE_CODEX_REPLY") or f"codex turn {n} of pid {os.getpid()}"
             item = {"type": "agentMessage", "id": f"msg-{n}", "text": reply, "phase": "final_answer"}
             out({"method": "item/completed", "params": {"threadId": tid, "turnId": f"turn-{n}", "item": item}})
+            if os.environ.get("FAKE_CODEX_NO_COMPLETE"):
+                continue
             out({"method": "turn/completed", "params": {"threadId": tid, "turn": {"id": f"turn-{n}", "items": [item], "status": "completed", "error": None}}})
     """
 )
