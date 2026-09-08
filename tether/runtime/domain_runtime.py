@@ -90,7 +90,19 @@ def _now_text(offset_seconds: int = 0) -> str:
 
 
 def is_no_reply(response_text: str) -> bool:
-    return response_text.strip() == NO_REPLY_TOKEN
+    """Silence marker: the whole reply is NO_REPLY, or its last line is.
+
+    Models asked to "respond with exactly NO_REPLY" sometimes narrate first and
+    put the marker last. The marker still means "do not post"; posting the
+    narration plus a literal NO_REPLY was the leak seen live on 2026-09-08.
+    """
+    stripped = (response_text or "").strip()
+    if not stripped:
+        return False
+    if stripped == NO_REPLY_TOKEN:
+        return True
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    return bool(lines) and lines[-1] == NO_REPLY_TOKEN and len(stripped) <= 2000
 
 
 class DomainRuntime:
