@@ -888,9 +888,6 @@ class ActiveSlice:
             "use hermes tether status to inspect",
         )
 
-    def op_herdr_context(self, request: dict[str, Any]) -> dict[str, Any]:
-        raise BrokerRefused("unsupported_op", "Herdr panes are not supported by Tether v2")
-
     def _slack(self) -> Any:
         slack = getattr(self, "slack", None)
         if slack is None or not slack.configured:

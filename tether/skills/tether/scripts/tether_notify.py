@@ -168,14 +168,6 @@ def working_directory_identity(cwd: str) -> dict[str, str]:
     }
 
 
-def zellij_pane_identity(*args: object, **kwargs: object) -> dict[str, str] | None:
-    # Zellij panes are not a Tether v2 source; only exact Claude Code / Codex
-    # sessions are bindable. Ambient terminal detection therefore yields nothing.
-    return None
-
-
-def herdr_agent_identity(*args: object, **kwargs: object) -> dict[str, str] | None:
-    return None
 
 
 def _safe_error(error: BaseException) -> str:
@@ -185,163 +177,25 @@ def _safe_error(error: BaseException) -> str:
     return detail[:500] or type(error).__name__
 
 
-def _terminal_source(identity: dict[str, str]) -> dict[str, str]:
-    if identity.get("herdr_terminal_id"):
-        return {
-            key: identity[key]
-            for key in (
-                "herdr_session",
-                "herdr_socket_path",
-                "herdr_terminal_id",
-                "herdr_pane_id",
-                "herdr_agent_name",
-                "herdr_agent_session_source",
-                "herdr_agent_session_kind",
-                "herdr_agent_session_value",
-                "herdr_protocol",
-                "pane_agent",
-                "process_identity",
-            )
-        }
-    return {
-        "zellij_session": identity["session_name"],
-        "zellij_pane_id": identity["pane_id"],
-        "pane_agent": identity["pane_agent"],
-        "process_identity": identity["process_identity"],
-        "pane_command_hash": identity["pane_command_hash"],
-    }
-
 
 def _select_native_source(
     *,
     claude_session_id: str,
     codex_session_id: str,
     cwd: str,
-    terminal_identity: dict[str, str] | None,
 ) -> tuple[str, dict[str, str]] | None:
-    available = {
-        "claude": claude_session_id,
-        "codex": codex_session_id,
-    }
-    available = {agent: value for agent, value in available.items() if value}
-    if terminal_identity is not None:
-        pane_agent = terminal_identity["pane_agent"]
-        if pane_agent not in {"claude", "codex"}:
-            raise SystemExit(
-                "captured terminal does not match a supported native agent"
-            )
-        native_session_id = terminal_identity.get("native_session_id", "")
-        if not available and not native_session_id:
-            return None
-        if pane_agent not in available:
-            if native_session_id and not available:
-                available[pane_agent] = native_session_id
-            else:
-                expected = " or ".join(sorted(available)) or "none"
-                raise SystemExit(
-                    f"Captured pane runs {pane_agent}, but ambient native session is {expected}; "
-                    "rebind from the intended agent"
-                )
-        selected = pane_agent
-        if native_session_id and native_session_id != available[selected]:
-            raise SystemExit(
-                "Herdr native session identity does not match the active agent environment; "
-                "rebind from the intended agent"
-            )
-        terminal = _terminal_source(terminal_identity)
-    else:
-        if not available:
-            return None
-        if len(available) != 1:
-            expected = " or ".join(sorted(available))
-            raise SystemExit(
-                f"Both Claude and Codex session IDs are present ({expected}) without an exact "
-                "pane identity; pass an explicit session to attach or clear the inherited variable"
-            )
-        selected = next(iter(available))
-        terminal = {}
-    return (
-        f"{selected}_session",
-        {
-            "session_id": available[selected],
-            **working_directory_identity(cwd),
-            **terminal,
-        },
-    )
-
-
-def _ambient_terminal_identity(cwd: str) -> dict[str, str] | None:
-    raw_session = os.getenv("HERDR_SESSION", "")
-    herdr_values = {
-        # Herdr intentionally omits HERDR_SESSION for its canonical default
-        # session. The socket and pane markers remain authoritative.
-        "session": raw_session or "default",
-        "socket": os.getenv("HERDR_SOCKET_PATH", ""),
-        "pane": os.getenv("HERDR_PANE_ID", ""),
-    }
-    if (
-        os.getenv("HERDR_ENV")
-        or raw_session
-        or herdr_values["socket"]
-        or herdr_values["pane"]
-    ):
-        if not all(herdr_values.values()):
-            raise SystemExit(
-                "Herdr environment is incomplete; reattach the intended Herdr session"
-            )
-        return herdr_agent_identity(
-            herdr_values["socket"],
-            herdr_values["pane"],
-            herdr_values["session"],
-            cwd,
-        )
-    if os.getenv("ZELLIJ_SESSION_NAME") and os.getenv("ZELLIJ_PANE_ID"):
-        return zellij_pane_identity(
-            os.environ["ZELLIJ_SESSION_NAME"],
-            os.environ["ZELLIJ_PANE_ID"],
-            cwd,
-        )
-    return None
-
-
-def _herdr_identity_for_pane(
-    pane_id: str,
-    cwd: str,
-    *,
-    assign_name: bool,
-) -> dict[str, str]:
-    socket_path = os.getenv("HERDR_SOCKET_PATH", "")
-    if not os.getenv("HERDR_ENV") or not socket_path or not pane_id:
+    """Exactly one native session id selects the harness; none means "not found"."""
+    available = {agent: value for agent, value in (("claude", claude_session_id), ("codex", codex_session_id)) if value}
+    if not available:
+        return None
+    if len(available) != 1:
+        expected = " or ".join(sorted(available))
         raise SystemExit(
-            "Herdr context is incomplete; run this command from a Herdr plugin or pane"
+            f"Both Claude and Codex session IDs are present ({expected}); pass an explicit "
+            "--claude-session-id or --codex-session-id, or clear the inherited variable"
         )
-    return herdr_agent_identity(
-        socket_path,
-        pane_id,
-        os.getenv("HERDR_SESSION", "") or "default",
-        cwd,
-        assign_name=assign_name,
-    )
-
-
-def _herdr_source_for_pane(pane_id: str, cwd: str) -> tuple[str, dict[str, str]]:
-    identity = _herdr_identity_for_pane(pane_id, cwd, assign_name=True)
-    agent = identity.get("pane_agent", "")
-    if agent not in {"codex", "claude"}:
-        raise SystemExit("Tether's Herdr beta supports Codex and Claude Code only")
-    native_session = identity.get("native_session_id", "")
-    if not native_session:
-        raise SystemExit(
-            "Herdr has no official native session reference; install its agent integration"
-        )
-    return (
-        f"{agent}_session",
-        {
-            "session_id": native_session,
-            **working_directory_identity(cwd),
-            **_terminal_source(identity),
-        },
-    )
+    selected = next(iter(available))
+    return f"{selected}_session", {"session_id": available[selected], **working_directory_identity(cwd)}
 
 
 def parse_slack_thread_url(value: str) -> tuple[str, str]:
@@ -380,168 +234,46 @@ def slack_thread_url(args: argparse.Namespace) -> str:
     return value
 
 
-def run_herdr_command(args: argparse.Namespace) -> int:
-    pane_id = str(getattr(args, "pane", "") or "")
-    cwd = str(Path(getattr(args, "cwd", None) or Path.cwd()).resolve())
-    if args.herdr_command == "status":
-        identity = _herdr_identity_for_pane(
-            pane_id,
-            cwd,
-            assign_name=False,
-        )
-        agent = identity.get("pane_agent", "")
-        supported = agent in {"codex", "claude"}
-        context: dict[str, object] = {
-            "ok": True,
-            "supported": supported,
-            "agent": agent,
-            "pane_id": identity.get("herdr_pane_id", ""),
-            "terminal_id": identity.get("herdr_terminal_id", ""),
-            "named": bool(identity.get("herdr_agent_name")),
-            "native_session": bool(identity.get("herdr_agent_session_value")),
-        }
-        if supported and identity.get("herdr_agent_session_value"):
-            context.update(
-                broker_call({
-                    "op": "herdr_context",
-                    "herdr_terminal_id": identity["herdr_terminal_id"],
-                    "herdr_agent_name": identity["herdr_agent_name"],
-                    "herdr_agent_session_value": identity["herdr_agent_session_value"],
-                    "herdr_agent": agent,
-                })
-            )
-        else:
-            context.update({"bound": False, "queued": 0, "uncertain": 0})
-        print(json.dumps(context, ensure_ascii=False, sort_keys=True))
-        return 0
-
-    if args.herdr_command == "detach":
-        result = broker_call({
-            "op": "close",
-            "bridge_id": args.bridge_id,
-            "expected_generation": args.expected_generation,
-            "team_id": args.team or "",
-        })
-    else:
-        kind, source = _herdr_source_for_pane(pane_id, cwd)
-        if args.herdr_command == "create":
-            result = broker_call({
-                "op": "notify",
-                "text": message_text(args),
-                "source_kind": kind,
-                "source": source,
-                "owner_user_id": args.owner or "",
-                "channel_id": args.channel or "",
-                "team_id": args.team or "",
-                "idempotency_key": args.idempotency_key,
-                "file_path": None,
-            })
-        elif args.herdr_command == "attach":
-            channel, thread_ts = parse_slack_thread_url(slack_thread_url(args))
-            result = broker_call({
-                "op": "attach",
-                "source_kind": kind,
-                "source": source,
-                "owner_user_id": args.owner or "",
-                "channel_id": channel,
-                "team_id": args.team or "",
-                "thread_ts": thread_ts,
-                "idempotency_key": args.idempotency_key,
-            })
-        elif args.herdr_command == "rebind":
-            result = broker_call({
-                "op": "rebind",
-                "source_kind": kind,
-                "source": source,
-                "channel_id": args.channel,
-                "team_id": args.team or "",
-                "thread_ts": args.thread_ts,
-            })
-        else:  # pragma: no cover - argparse owns the command set
-            raise SystemExit("unsupported Herdr command")
-    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-    return 0
-
 
 def detected_source(args: argparse.Namespace) -> tuple[str, dict[str, str]]:
     cwd = str(Path.cwd())
     explicit_source = (
-        "headless run"
-        if getattr(args, "run_id", None)
-        else "Hermes session"
-        if getattr(args, "hermes_session_id", None)
-        else ""
+        "headless run" if getattr(args, "run_id", None)
+        else "Hermes session" if getattr(args, "hermes_session_id", None) else ""
     )
-    if explicit_source:
-        if any(
-            os.getenv(name)
-            for name in (
-                "CLAUDE_CODE_SESSION_ID",
-                "CODEX_THREAD_ID",
-                "ZELLIJ_SESSION_NAME",
-                "ZELLIJ_PANE_ID",
-                "HERDR_ENV",
-                "HERDR_SESSION",
-                "HERDR_SOCKET_PATH",
-                "HERDR_PANE_ID",
-            )
-        ):
-            raise SystemExit(
-                f"an explicit {explicit_source} cannot replace an active "
-                "Codex, Claude Code, Herdr, or Zellij binding; repair or rebind the "
-                "exact native session"
-            )
+    if explicit_source and any(os.getenv(name) for name in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")):
+        raise SystemExit(
+            f"an explicit {explicit_source} cannot replace an active Codex or Claude Code "
+            "binding; repair or rebind the exact native session"
+        )
     if getattr(args, "run_id", None):
         return "headless_run", {"run_id": args.run_id, "queue_id": args.run_id, "cwd": cwd}
     if getattr(args, "hermes_session_id", None):
         return "hermes_session", {"session_id": args.hermes_session_id, "cwd": cwd}
-    terminal_identity = _ambient_terminal_identity(cwd)
     selected = _select_native_source(
         claude_session_id=os.getenv("CLAUDE_CODE_SESSION_ID", ""),
         codex_session_id=os.getenv("CODEX_THREAD_ID", ""),
         cwd=cwd,
-        terminal_identity=terminal_identity,
     )
     if selected is not None:
         return selected
-    if terminal_identity:
-        return "zellij_pane", terminal_identity
-    raise SystemExit("No resumable context found; pass --run-id for a headless run")
+    raise SystemExit(
+        "No resumable context found; run from inside a Claude Code or Codex session, "
+        "pass --claude-session-id/--codex-session-id, or --run-id for a headless run"
+    )
 
 
 def attached_source(args: argparse.Namespace) -> tuple[str, dict[str, str]]:
     cwd = str(Path(args.cwd or Path.cwd()).resolve())
-    zellij_session = str(args.zellij_session or "")
-    zellij_pane = str(args.zellij_pane_id or "")
-    if bool(zellij_session) != bool(zellij_pane):
-        raise SystemExit("--zellij-session and --zellij-pane-id must be provided together")
-    has_ambient_herdr = bool(
-        os.getenv("HERDR_ENV")
-        or os.getenv("HERDR_SESSION")
-        or os.getenv("HERDR_SOCKET_PATH")
-        or os.getenv("HERDR_PANE_ID")
-    )
-    if has_ambient_herdr and zellij_session:
-        raise SystemExit(
-            "an explicit Zellij endpoint cannot replace the active Herdr endpoint"
-        )
-    terminal_identity = None
-    if zellij_session:
-        terminal_identity = zellij_pane_identity(zellij_session, zellij_pane, cwd)
-    elif has_ambient_herdr:
-        terminal_identity = _ambient_terminal_identity(cwd)
     if args.claude_session_id and args.codex_session_id:
         raise SystemExit("choose one native session ID")
     selected = _select_native_source(
         claude_session_id=str(args.claude_session_id or ""),
         codex_session_id=str(args.codex_session_id or ""),
         cwd=cwd,
-        terminal_identity=terminal_identity,
     )
     if selected is not None:
         return selected
-    if terminal_identity:
-        return "zellij_pane", terminal_identity
     return detected_source(args)
 
 
@@ -640,8 +372,6 @@ def build_parser() -> argparse.ArgumentParser:
     attach.add_argument("--idempotency-key", required=True)
     attach.add_argument("--claude-session-id")
     attach.add_argument("--codex-session-id")
-    attach.add_argument("--zellij-session")
-    attach.add_argument("--zellij-pane-id")
     attach.add_argument("--run-id")
     attach.add_argument("--hermes-session-id")
     attach.add_argument("--cwd")
@@ -677,43 +407,6 @@ def build_parser() -> argparse.ArgumentParser:
     setup = sub.add_parser("setup")
     setup.add_argument("--non-interactive", action="store_true")
     setup.add_argument("--no-restart", action="store_true")
-    herdr = sub.add_parser("herdr")
-    herdr_sub = herdr.add_subparsers(dest="herdr_command", required=True)
-    herdr_status = herdr_sub.add_parser("status")
-    herdr_status.add_argument("--pane", required=True)
-    herdr_status.add_argument("--cwd")
-    herdr_status.add_argument("--json", action="store_true")
-    herdr_create = herdr_sub.add_parser("create")
-    herdr_create.add_argument("--pane", required=True)
-    herdr_create.add_argument("--cwd")
-    herdr_create.add_argument("--channel")
-    herdr_create.add_argument("--owner")
-    herdr_create.add_argument("--team")
-    herdr_create.add_argument("--idempotency-key", required=True)
-    herdr_create.add_argument("--json", action="store_true")
-    _add_message_input(herdr_create)
-    herdr_attach = herdr_sub.add_parser("attach")
-    herdr_attach.add_argument("--pane", required=True)
-    herdr_attach.add_argument("--cwd")
-    herdr_attach_url = herdr_attach.add_mutually_exclusive_group(required=True)
-    herdr_attach_url.add_argument("--slack-url")
-    herdr_attach_url.add_argument("--slack-url-stdin", action="store_true")
-    herdr_attach.add_argument("--owner")
-    herdr_attach.add_argument("--team")
-    herdr_attach.add_argument("--idempotency-key", required=True)
-    herdr_attach.add_argument("--json", action="store_true")
-    herdr_rebind = herdr_sub.add_parser("rebind")
-    herdr_rebind.add_argument("--pane", required=True)
-    herdr_rebind.add_argument("--cwd")
-    herdr_rebind.add_argument("--channel", required=True)
-    herdr_rebind.add_argument("--thread-ts", required=True)
-    herdr_rebind.add_argument("--team")
-    herdr_rebind.add_argument("--json", action="store_true")
-    herdr_detach = herdr_sub.add_parser("detach")
-    herdr_detach.add_argument("--bridge-id", required=True)
-    herdr_detach.add_argument("--expected-generation", type=int, required=True)
-    herdr_detach.add_argument("--team")
-    herdr_detach.add_argument("--json", action="store_true")
     return parser
 
 
@@ -1011,8 +704,6 @@ def run_setup(args: argparse.Namespace) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.command == "herdr":
-        return run_herdr_command(args)
     if args.command == "doctor":
         ok, checks = doctor()
         print("\n".join(checks))
