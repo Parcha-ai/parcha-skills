@@ -340,10 +340,14 @@ def register(ctx: Any) -> None:
 
 
 class _OwnerDescriptor:
-    """The only descriptor field ActiveSlice reads outside the legacy core."""
+    """The descriptor fields ActiveSlice reads outside the legacy core."""
 
-    def __init__(self, owners: tuple[str, ...]):
+    def __init__(self, owners: tuple[str, ...], workspace_id: str, persona_id: str, policy_generation: int):
         self.authorized_owner_ids = owners
+        self.canonical_owner_ids = owners
+        self.workspace_id = workspace_id
+        self.persona_id = persona_id
+        self.policy_generation = policy_generation
 
 
 def _build_session_slice(
@@ -357,6 +361,9 @@ def _build_session_slice(
     root = home / "plugin-data" / "tether"
     root.mkdir(parents=True, exist_ok=True)
     store = store_module.Store(root / "tether.db")
+    imported = store.import_legacy_bindings(root / "domain.db")
+    if imported:
+        logger.warning("tether: imported %d active binding(s) from the legacy domain.db", imported)
     orphans = store.fail_orphans()
     if orphans:
         logger.warning("tether: failed %d attempt(s) left running by the previous gateway", orphans)
@@ -372,7 +379,11 @@ def _build_session_slice(
 
     slice_ = active_module.ActiveSlice(
         runtime=store, driver=driver, settings=active_settings, egress=egress,
-        descriptor=_OwnerDescriptor(tuple(sorted(settings.allowed_users))), slack=slack,
+        descriptor=_OwnerDescriptor(
+            tuple(sorted(settings.allowed_users)), settings.workspace_id,
+            active_settings.persona_id, active_settings.policy_generation,
+        ),
+        slack=slack,
     )
     server = broker_module.BrokerServer(home / "bridge.sock", slice_.handle)
     slice_.broker = server

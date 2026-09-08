@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -166,6 +167,30 @@ class StoreTests(unittest.TestCase):
         t.join(5)
         self.assertEqual(errors, [])
         self.assertEqual(self.store.counts()["ready_turns"], 1)
+
+    def test_import_legacy_bindings_is_idempotent(self):
+        legacy = Path(self.temp.name) / "domain.db"
+        db = sqlite3.connect(legacy)
+        db.executescript(
+            "CREATE TABLE endpoints(endpoint_id TEXT, endpoint_key TEXT, endpoint_kind TEXT, source_kind TEXT, source_json TEXT);"
+            "CREATE TABLE thread_bindings(binding_id TEXT, endpoint_id TEXT, team_id TEXT, channel_id TEXT, thread_ts TEXT, "
+            "owner_user_id TEXT, state TEXT, created_at TEXT);"
+            "INSERT INTO endpoints VALUES('e1','detached_native:claude_session:old-1','detached_native','claude_session','{\"session_id\":\"old-1\",\"cwd\":\"/w\"}');"
+            "INSERT INTO thread_bindings VALUES('b1','e1','T1','C9','500.1','U1','active','2026-09-01');"
+            "INSERT INTO thread_bindings VALUES('b2','e1','T1','C9','500.2','U1','closed','2026-09-01');"
+        )
+        db.commit()
+        db.close()
+        self.assertEqual(self.store.import_legacy_bindings(legacy), 1)
+        self.assertEqual(self.store.import_legacy_bindings(legacy), 0, "second import adds nothing")
+        found = self.store.find_active_binding(team_id="T1", channel_id="C9", thread_ts="500.1")
+        self.assertIsNotNone(found)
+        ctx_source = self.store.register_endpoint(
+            endpoint_key="detached_native:claude_session:old-1", endpoint_kind="detached_native",
+            source_kind="claude_session", source_json='{"session_id":"old-1","cwd":"/w"}')["source"]
+        self.assertEqual(ctx_source["session_id"], "old-1")
+        self.assertIsNone(self.store.find_active_binding(team_id="T1", channel_id="C9", thread_ts="500.2"))
+        self.assertEqual(self.store.import_legacy_bindings(Path(self.temp.name) / "missing.db"), 0)
 
     def test_no_reply_marker(self):
         self.assertTrue(is_no_reply("NO_REPLY"))

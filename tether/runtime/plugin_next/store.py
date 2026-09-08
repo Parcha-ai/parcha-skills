@@ -442,6 +442,48 @@ class Store:
             self.finish_attempt(row["attempt_id"], state="failed", error_code="gateway_restarted")
         return len(rows)
 
+    def import_legacy_bindings(self, domain_db: Path) -> int:
+        """One-time import of active thread bindings from the schema-18 ``domain.db``.
+
+        Idempotent: threads already bound here are skipped. Endpoints keep their
+        key and source (session id, cwd). Returns the number of bindings added.
+        """
+        domain_db = Path(domain_db)
+        if not domain_db.exists():
+            return 0
+        try:
+            legacy = sqlite3.connect(f"file:{domain_db}?mode=ro", uri=True)
+            legacy.row_factory = sqlite3.Row
+            rows = legacy.execute(
+                "SELECT b.team_id, b.channel_id, b.thread_ts, b.owner_user_id, e.endpoint_key, "
+                "e.endpoint_kind, e.source_kind, e.source_json FROM thread_bindings b "
+                "JOIN endpoints e ON e.endpoint_id=b.endpoint_id "
+                "WHERE b.state='active' AND b.thread_ts!='' ORDER BY b.created_at"
+            ).fetchall()
+            legacy.close()
+        except sqlite3.Error:
+            return 0
+        added = 0
+        for row in rows:
+            if self.find_active_binding(team_id=row["team_id"], channel_id=row["channel_id"],
+                                        thread_ts=row["thread_ts"]) is not None:
+                continue
+            try:
+                endpoint = self.register_endpoint(
+                    endpoint_key=row["endpoint_key"], endpoint_kind=row["endpoint_kind"] or "detached_native",
+                    source_kind=row["source_kind"], source_json=row["source_json"] or "{}",
+                )
+                self.bind_thread(
+                    endpoint_id=endpoint["endpoint_id"], team_id=row["team_id"], channel_id=row["channel_id"],
+                    owner_user_id=row["owner_user_id"] or "",
+                    idempotency_key=f"bind:{row['team_id']}:{row['channel_id']}:{row['thread_ts']}",
+                    thread_ts=row["thread_ts"],
+                )
+                added += 1
+            except StoreError:
+                continue
+        return added
+
     def counts(self) -> dict[str, int]:
         with self._lock:
             ready = self._db.execute("SELECT COUNT(*) FROM turns WHERE state='ready'").fetchone()[0]
