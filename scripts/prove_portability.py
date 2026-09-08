@@ -23,6 +23,7 @@ SKILLS = (
     "tether",
     "desloppify",
     "autoqa",
+    "precap",
 )
 
 
@@ -179,6 +180,12 @@ def main() -> int:
         run(
             "smoke-autoqa",
             ["python3", "-m", "unittest", "discover", "-s", "autoqa/tests", "-v"],
+            smoke_env,
+            output,
+        )
+        run(
+            "smoke-precap",
+            ["python3", "-m", "unittest", "discover", "-s", "precap/tests", "-v"],
             smoke_env,
             output,
         )
