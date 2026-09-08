@@ -660,3 +660,14 @@ class EndpointRepointTest(DomainRuntimeTest):
         self.assertEqual(caught.exception.code, "endpoint_busy")
         # The live attempt keeps its target; nothing was yanked mid-flight.
         self.assertEqual(self.endpoint_row()[0], '{"session_id":"A","pid":111}')
+
+
+class NoReplyMarkerTests(unittest.TestCase):
+    def test_trailing_marker_line_is_silence(self):
+        from runtime.domain_runtime import is_no_reply
+        self.assertTrue(is_no_reply("NO_REPLY"))
+        self.assertTrue(is_no_reply("  NO_REPLY\n"))
+        self.assertTrue(is_no_reply("The parent was mine and the smoke passed.\n\nNO_REPLY"))
+        self.assertFalse(is_no_reply("NO_REPLY is what I would say if asked."))
+        self.assertFalse(is_no_reply("All good, shipping it."))
+        self.assertFalse(is_no_reply(""))

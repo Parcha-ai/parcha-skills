@@ -68,6 +68,21 @@ def child_env(
     return env
 
 
+def is_silence(text: str) -> bool:
+    """NO_REPLY as the whole message or as its last line means: do not post.
+
+    Same rule as domain_runtime.is_no_reply; kept local because the plugin is
+    loaded as a top-level package on the gateway and cannot import its sibling.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    if stripped == "NO_REPLY":
+        return True
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    return bool(lines) and lines[-1] == "NO_REPLY" and len(stripped) <= 2000
+
+
 def user_bus_path(uid: int | None = None) -> Path:
     return Path(f"/run/user/{os.getuid() if uid is None else uid}/bus")
 
@@ -149,6 +164,10 @@ class ActiveSettings:
     # in between before further peer messages are left alone. Two agents that
     # keep @mentioning each other otherwise talk forever.
     peer_chain_limit: int = 2
+    # "native": one claude --print process per turn on the schema-18 core (legacy).
+    # "session": one stream-json process per binding on the small Store (move 2).
+    driver: str = "native"
+    session_idle_seconds: int = 900
     presence: bool = True
     ack_emoji: str = "eyes"
     done_emoji: str = "white_check_mark"
@@ -183,6 +202,8 @@ def load_active_settings(path: Path) -> ActiveSettings:
         harness_env=strings("harness_env"),
         launcher=str(raw.get("launcher") or "auto"),
         peer_chain_limit=integer("peer_chain_limit", 2),
+        driver=str(raw.get("driver") or "native"),
+        session_idle_seconds=integer("session_idle_seconds", 900),
         presence=bool(raw.get("presence", True)),
         extra={"default_channel": str(raw.get("default_channel") or "")},
     )
@@ -463,6 +484,10 @@ class ActiveSlice:
         except Exception:
             logger.debug("tether: un-reaction %s failed", emoji, exc_info=True)
 
+    @staticmethod
+    def runtime_is_no_reply(text: str) -> bool:
+        return is_silence(text)
+
     def _turn_message_ids(self, context: dict[str, Any]) -> list[str]:
         ids: list[str] = []
         for turn in context.get("turns", []):
@@ -490,18 +515,24 @@ class ActiveSlice:
         launcher = resolve_launcher(self.settings)
         prompt = compose_prompt(context, self.settings, launcher)
         try:
-            command = self.command_factory(context, self.settings, prompt)
             cwd = Path(str(context["source"].get("cwd") or os.getcwd()))
             if not cwd.is_dir():
                 cwd = Path.home()
-            argv, popen_env, launcher = launch_plan(
-                command, cwd, child_env(passthrough=self.settings.harness_env), self.settings,
-            )
-            logger.info("tether: attempt %s launcher=%s", attempt["attempt_id"], launcher)
-            launched = self.driver.launch(attempt, command=argv, cwd=cwd, env=popen_env)
-            result = self.driver.reap(
-                attempt, launched, timeout_seconds=self.settings.native_timeout_seconds
-            )
+            if hasattr(self.driver, "run_turn"):
+                # session driver: the binding's long-lived process takes the turn
+                result = self.driver.run_turn(
+                    attempt, context, prompt, cwd, self.settings.native_timeout_seconds,
+                )
+            else:
+                command = self.command_factory(context, self.settings, prompt)
+                argv, popen_env, launcher = launch_plan(
+                    command, cwd, child_env(passthrough=self.settings.harness_env), self.settings,
+                )
+                logger.info("tether: attempt %s launcher=%s", attempt["attempt_id"], launcher)
+                launched = self.driver.launch(attempt, command=argv, cwd=cwd, env=popen_env)
+                result = self.driver.reap(
+                    attempt, launched, timeout_seconds=self.settings.native_timeout_seconds
+                )
         except Exception as exc:
             logger.error(
                 "tether: attempt %s did not reach a receipt (%s)",
@@ -538,10 +569,14 @@ class ActiveSlice:
         single line, so the thread knows whether to wait or to escalate.
         """
         reason = ""
+        if hasattr(self.driver, "failure_reason"):
+            reason = str(self.driver.failure_reason(attempt["attempt_id"]) or "")
         try:
             work = self.driver._attempt_dir(attempt["attempt_id"])  # noqa: SLF001 - same package
             for name in ("response.out", "stderr.log"):
                 path = work / name
+                if reason:
+                    break
                 if path.exists():
                     text = path.read_text(encoding="utf-8", errors="replace").strip()
                     if text:
@@ -811,6 +846,8 @@ class ActiveSlice:
             closed = self.runtime.close_binding(binding_id)
         except Exception as exc:
             raise BrokerRefused(getattr(exc, "code", "binding_busy"), str(exc), retryable=True) from exc
+        if hasattr(self.driver, "close_binding"):
+            self.driver.close_binding(binding_id)
         return {"status": "closed", "bridge_id": closed["binding_id"], "team_id": team_id,
                 "channel_id": closed.get("channel_id"), "thread_ts": closed.get("thread_ts")}
 
@@ -820,7 +857,7 @@ class ActiveSlice:
         thread_ts = str(request.get("thread_ts") or "")
         if not text or not channel_id or not thread_ts:
             raise BrokerRefused("thread_required", "channel, thread-ts and text are required")
-        if text.strip() == "NO_REPLY":
+        if self.runtime_is_no_reply(text):
             return {"status": "no_reply", "team_id": self._team(request), "channel_id": channel_id, "thread_ts": thread_ts}
         ts = self._post(channel_id, text, thread_ts)
         team_id = self._team(request)
@@ -842,7 +879,7 @@ class ActiveSlice:
         context = self.runtime.binding_thread(binding_id) if hasattr(self.runtime, "binding_thread") else None
         if context is None:
             raise BrokerRefused("binding_unknown")
-        if text.strip() == "NO_REPLY":
+        if self.runtime_is_no_reply(text):
             return {"status": "no_reply", "bridge_id": binding_id, "team_id": context["team_id"],
                     "channel_id": context["channel_id"], "thread_ts": context["thread_ts"],
                     "reply_key": request.get("reply_key")}
@@ -909,6 +946,12 @@ class ActiveSlice:
 
     def stop(self) -> None:
         self._stop.set()
+        shutdown = getattr(self.driver, "shutdown", None)
+        if callable(shutdown):
+            try:
+                shutdown()
+            except Exception:
+                logger.debug("tether: driver shutdown failed", exc_info=True)
 
     def _loop(self) -> None:
         heartbeat = Path(self.driver.work_root).parent / "active.heartbeat"

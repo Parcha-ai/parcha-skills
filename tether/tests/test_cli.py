@@ -185,6 +185,8 @@ class TetherCliTest(unittest.TestCase):
             plugin / "broker.py": 0o600,
             plugin / "journal.py": 0o600,
             plugin / "slack_egress.py": 0o600,
+            plugin / "store.py": 0o600,
+            plugin / "session_driver.py": 0o600,
             plugin / "plugin.yaml": 0o644,
             local_bin / "tether": 0o700,
         }
@@ -703,7 +705,7 @@ class TetherCliTest(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertIn("ok broker socket is private", payload["checks"])
         self.assertIn(
-            "ok managed install integrity verified (23 files; harness=codex)",
+            "ok managed install integrity verified (25 files; harness=codex)",
             payload["checks"],
         )
         self.assertEqual(payload["status"]["protocol_version"], 6)
@@ -841,7 +843,7 @@ class TetherCliTest(unittest.TestCase):
             result = self.run_cli("doctor", socket_path=broker.path)
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn(
-            "ok managed install integrity verified (30 files; harness=both)",
+            "ok managed install integrity verified (32 files; harness=both)",
             result.stdout,
         )
 
