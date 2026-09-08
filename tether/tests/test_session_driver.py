@@ -79,7 +79,8 @@ class SessionDriverTests(unittest.TestCase):
         self.slice = active.ActiveSlice(
             runtime=self.store, driver=self.driver, settings=self.settings,
             egress=lambda c, t, text: self.sent.append((c, t, text)),
-            descriptor=type("D", (), {"authorized_owner_ids": ("U12345678",)})(),
+            descriptor=type("D", (), {"authorized_owner_ids": ("U12345678",), "canonical_owner_ids": ("U12345678",), "workspace_id": "T1",
+                                      "persona_id": "primary", "policy_generation": 1})(),
         )
         self.binding = self.slice.bind(
             source_kind="claude_session", session_id="sess-A", cwd=self.temp.name,
@@ -157,6 +158,18 @@ class SessionDriverTests(unittest.TestCase):
         self.slice.claim(self.fields("100.3"), "still there?")
         self.slice.run_once()
         self.assertIn("turn 1 of pid", self.sent[1][2], "relaunched after the sweep")
+
+    def test_spawn_and_identity_ops_work_on_the_session_slice(self):
+        # spawn seeds a session through create_session; stub it so no harness is needed
+        self.slice._create_session = lambda kind, cwd, task: "sess-spawned"
+        posted: list[tuple[str, str, str | None]] = []
+        self.slice._post = lambda channel, text, thread: (posted.append((channel, text, thread)) or "300.1")
+        spawned = self.slice.handle({"op": "spawn", "task": "look into it", "channel_id": "C1", "cwd": self.temp.name})
+        self.assertEqual((spawned["status"], spawned["session_id"], spawned["thread_ts"], spawned["team_id"]),
+                         ("spawned", "sess-spawned", "300.1", "T1"))
+        self.assertEqual(posted[0][0], "C1")
+        found = self.store.find_active_binding(team_id="T1", channel_id="C1", thread_ts="300.1")
+        self.assertEqual(found["binding_id"], spawned["bridge_id"])
 
     def test_status_reports_the_store_counts(self):
         status = self.slice.handle({"op": "status"})
