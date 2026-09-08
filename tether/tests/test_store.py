@@ -195,7 +195,7 @@ class StoreTests(unittest.TestCase):
     def test_binding_index_reads_the_store(self):
         from runtime.plugin_next import BindingIndex
         self.bind("700.1")
-        index = BindingIndex(self.store.path, ttl_seconds=0.0, query=BindingIndex.STORE_QUERY)
+        index = BindingIndex(self.store.path, ttl_seconds=0.0)
         self.assertEqual(index.bound_threads(), frozenset({("C1", "700.1")}))
         self.store.close_binding(self.store.find_active_binding(team_id="T1", channel_id="C1", thread_ts="700.1")["binding_id"])
         self.assertEqual(index.bound_threads(), frozenset())

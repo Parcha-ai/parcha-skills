@@ -323,18 +323,13 @@ RUNTIME="$XDG_DATA_HOME/tether"
 STATE="$XDG_STATE_HOME/tether-installer"
 CONFIG="$XDG_CONFIG_HOME/tether/config.toml"
 LAUNCHER="$HOME/.local/bin/tether"
-BRIDGE="$RUNTIME/domain_runtime.py"
-DOMAIN_CONTROL="$RUNTIME/domain_control.py"
-DOMAIN_SCHEMA="$RUNTIME/domain_schema.py"
-SCHEMA_ORCHESTRATOR="$RUNTIME/native_driver.py"
-HERMES_COMPAT="$RUNTIME/domain_schema.py"
-ROUTING="$RUNTIME/domain_control.py"
-SECURITY="$RUNTIME/security.py"
-SLACK_PROTOCOL="$RUNTIME/security.py"
+NOTIFIER="$RUNTIME/tether_notify.py"
+TEAM="$RUNTIME/tether_team.py"
+TEAM_MD="$RUNTIME/team/TEAM.md"
 CODEX_SKILL="$CODEX_HOME/skills/tether/SKILL.md"
 CLAUDE_SKILL="$CLAUDE_HOME/skills/tether/SKILL.md"
 
-for path in "$BRIDGE" "$DOMAIN_CONTROL" "$DOMAIN_SCHEMA" "$SCHEMA_ORCHESTRATOR" "$HERMES_COMPAT" "$ROUTING" "$SECURITY" "$SLACK_PROTOCOL" \
+for path in "$NOTIFIER" "$TEAM" "$TEAM_MD" \
   "$RUNTIME/install.sh" "$RUNTIME/package.json" "$LAUNCHER" "$CODEX_SKILL" \
   "$CLAUDE_SKILL" \
   "$STATE/current.tsv" "$CONFIG"

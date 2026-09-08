@@ -193,9 +193,11 @@ class Store:
             existing = self._db.execute(
                 "SELECT * FROM bindings WHERE idempotency_key=?", (idempotency_key,)).fetchone()
             if existing is not None:
-                same = (existing["endpoint_id"], existing["team_id"], existing["channel_id"],
-                        existing["thread_ts"]) == (endpoint_id, team_id, channel_id, thread_ts or "")
+                same = (existing["endpoint_id"], existing["team_id"], existing["channel_id"]) == (
+                    endpoint_id, team_id, channel_id,
+                ) and (not thread_ts or existing["thread_ts"] in ("", thread_ts))
                 if same and existing["state"] != "closed":
+                    # a retried notify arrives without a thread: the row already has it
                     return self._binding_view(existing)
                 if existing["state"] != "closed":
                     raise StoreError("idempotency_conflict")

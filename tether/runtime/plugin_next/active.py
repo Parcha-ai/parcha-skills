@@ -164,9 +164,8 @@ class ActiveSettings:
     # in between before further peer messages are left alone. Two agents that
     # keep @mentioning each other otherwise talk forever.
     peer_chain_limit: int = 2
-    # "native": one claude --print process per turn on the schema-18 core (legacy).
-    # "session": one stream-json process per binding on the small Store (move 2).
-    driver: str = "native"
+    # Retired knob kept for old config files; the session driver is the only driver.
+    driver: str = "session"
     session_idle_seconds: int = 900
     presence: bool = True
     ack_emoji: str = "eyes"
@@ -202,7 +201,7 @@ def load_active_settings(path: Path) -> ActiveSettings:
         harness_env=strings("harness_env"),
         launcher=str(raw.get("launcher") or "auto"),
         peer_chain_limit=integer("peer_chain_limit", 2),
-        driver=str(raw.get("driver") or "native"),
+        driver=str(raw.get("driver") or "session"),
         session_idle_seconds=integer("session_idle_seconds", 900),
         presence=bool(raw.get("presence", True)),
         extra={"default_channel": str(raw.get("default_channel") or "")},
@@ -346,21 +345,6 @@ def claude_session_id(stdout: str) -> str:
     return found
 
 
-def harness_command(context: dict[str, Any], settings: ActiveSettings, prompt: str) -> list[str]:
-    source = context["source"]
-    session_id = str(source.get("session_id") or "")
-    if not session_id:
-        raise ValueError("endpoint source has no session_id")
-    if context["source_kind"] == "codex_session":
-        binary = shutil.which(settings.codex_binary) or settings.codex_binary
-        return [binary, "exec", "resume", *settings.codex_resume_args, session_id, prompt]
-    binary = shutil.which(settings.claude_binary) or settings.claude_binary
-    return [
-        binary, "--print", "--resume", session_id, "--output-format", "text",
-        *settings.claude_resume_args, prompt,
-    ]
-
-
 class ActiveSlice:
     def __init__(
         self,
@@ -370,7 +354,6 @@ class ActiveSlice:
         settings: ActiveSettings,
         egress: Egress,
         descriptor: Any,
-        command_factory: Callable[[dict[str, Any], ActiveSettings, str], list[str]] = harness_command,
         slack: Any = None,
     ):
         self.runtime = runtime
@@ -378,7 +361,6 @@ class ActiveSlice:
         self.settings = settings
         self.egress = egress
         self.descriptor = descriptor
-        self.command_factory = command_factory
         self.slack: Any = slack
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -518,21 +500,9 @@ class ActiveSlice:
             cwd = Path(str(context["source"].get("cwd") or os.getcwd()))
             if not cwd.is_dir():
                 cwd = Path.home()
-            if hasattr(self.driver, "run_turn"):
-                # session driver: the binding's long-lived process takes the turn
-                result = self.driver.run_turn(
-                    attempt, context, prompt, cwd, self.settings.native_timeout_seconds,
-                )
-            else:
-                command = self.command_factory(context, self.settings, prompt)
-                argv, popen_env, launcher = launch_plan(
-                    command, cwd, child_env(passthrough=self.settings.harness_env), self.settings,
-                )
-                logger.info("tether: attempt %s launcher=%s", attempt["attempt_id"], launcher)
-                launched = self.driver.launch(attempt, command=argv, cwd=cwd, env=popen_env)
-                result = self.driver.reap(
-                    attempt, launched, timeout_seconds=self.settings.native_timeout_seconds
-                )
+            result = self.driver.run_turn(
+                attempt, context, prompt, cwd, self.settings.native_timeout_seconds,
+            )
         except Exception as exc:
             logger.error(
                 "tether: attempt %s did not reach a receipt (%s)",

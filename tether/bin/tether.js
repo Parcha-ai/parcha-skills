@@ -31,7 +31,7 @@ const dataHome = process.env.XDG_DATA_HOME || path.join(home, ".local", "share")
 const runtimeHome = path.join(dataHome, "tether");
 const installedInstaller = path.join(runtimeHome, "install.sh");
 const notifier = path.join(runtimeHome, "tether_notify.py");
-const installedRuntime = path.join(runtimeHome, "domain_runtime.py");
+const installedRuntime = path.join(process.env.HERMES_HOME || path.join(home, ".hermes"), "plugins", "tether", "store.py");
 const installedSchemaOrchestrator = path.join(runtimeHome, "schema_orchestrator.py");
 const stateHome = path.join(
   process.env.XDG_STATE_HOME || path.join(home, ".local", "state"),
@@ -177,11 +177,6 @@ function expectedManagedTargetModes(metadata) {
   }
 
   const targets = new Map([
-    [path.join(runtimeRoot, "domain_control.py"), 0o600],
-    [path.join(runtimeRoot, "domain_schema.py"), 0o600],
-    [path.join(runtimeRoot, "domain_runtime.py"), 0o600],
-    [path.join(runtimeRoot, "native_driver.py"), 0o600],
-    [path.join(runtimeRoot, "security.py"), 0o600],
     [path.join(runtimeRoot, "tether_notify.py"), 0o700],
     [path.join(runtimeRoot, "tether_team.py"), 0o700],
     [path.join(runtimeRoot, "team", "TEAM.md"), 0o600],

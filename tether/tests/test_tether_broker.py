@@ -5,10 +5,11 @@ from __future__ import annotations
 
 import os
 import pathlib
-import sqlite3
 import sys
 import tempfile
 import unittest
+
+from tests import fakes
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 RUNTIME = ROOT / "runtime"
@@ -54,39 +55,33 @@ class BrokerTest(unittest.TestCase):
         previous = list(sys.path)
         sys.path.insert(0, str(RUNTIME))
         try:
-            for name in ("domain_runtime", "domain_schema", "native_driver", "plugin_next",
-                         "plugin_next.active", "plugin_next.broker"):
+            for name in ("plugin_next", "plugin_next.active", "plugin_next.broker",
+                         "plugin_next.store", "plugin_next.session_driver"):
                 sys.modules.pop(name, None)
-            import domain_runtime, domain_schema, native_driver  # noqa: E401
-            from plugin_next import active, broker
+            from plugin_next import active, broker, session_driver, store
         finally:
             sys.path[:] = previous
         self.temp = tempfile.TemporaryDirectory(prefix="tether-broker-")
         base = pathlib.Path(self.temp.name)
         os.chmod(base, 0o700)
-        db = base / "domain.db"
-        connection = sqlite3.connect(db)
-        domain_schema.install_schema(connection)
-        connection.execute(f"PRAGMA user_version={domain_schema.SCHEMA_VERSION}")
-        connection.commit()
-        connection.close()
-        self.schema = domain_schema
-        self.db = db
-        runtime = domain_runtime.DomainRuntime(db)
-        driver = native_driver.NativeDriver(runtime, work_root=base / "driver")
-        descriptor = domain_schema.SecurityDomainDescriptor(
-            instance_uid=os.geteuid(), workspace_id="T12345678", persona_id="primary",
-            authorized_owner_ids=("U12345678",), policy_generation=1,
+        self.db = base / "tether.db"
+        runtime = store.Store(self.db)
+        self.runtime = runtime
+        fake = fakes.write_fake_claude(base)
+        os.environ["FAKE_REPLY"] = "printf 'listo'"
+        settings = active.ActiveSettings(enabled=True, native_timeout_seconds=30, launcher="direct",
+                                         claude_binary=str(fake), extra={"default_channel": "C1"})
+        self.driver = session_driver.SessionDriver(
+            runtime, base / "session", settings, launch_plan=fakes.direct_launch,
+            child_env=fakes.child_env, idle_seconds=60,
         )
+        descriptor = fakes.Descriptor()
         self.slack = FakeSlack()
         self.sent = []
         self.slice = active.ActiveSlice(
-            runtime=runtime, driver=driver,
-            settings=active.ActiveSettings(enabled=True, native_timeout_seconds=30,
-                                           extra={"default_channel": "C1"}),
+            runtime=runtime, driver=self.driver, settings=settings,
             egress=lambda c, t, x: self.sent.append((c, t, x)),
             descriptor=descriptor, slack=self.slack,
-            command_factory=lambda ctx, st, prompt: ["/bin/sh", "-c", "printf 'listo'"],
         )
         self.broker_module = broker
         self.server = broker.BrokerServer(base / "b.sock", self.slice.handle)
@@ -95,6 +90,9 @@ class BrokerTest(unittest.TestCase):
 
     def tearDown(self):
         self.server.stop()
+        self.driver.shutdown()
+        self.runtime.close()
+        os.environ.pop("FAKE_REPLY", None)
         self.temp.cleanup()
 
     def call(self, **request):
@@ -131,9 +129,6 @@ class BrokerTest(unittest.TestCase):
         self.assertIsNotNone(self.slice.claim(fields, "status?"))
         self.assertEqual(self.slice.run_once(), 1)
         self.assertEqual(self.sent, [("C1", first["thread_ts"], "listo")])
-        connection = sqlite3.connect(self.db)
-        self.assertEqual(self.schema.invariant_violations(connection), [])
-        connection.close()
 
     def test_attach_rebind_close_and_thread_ops(self):
         attached = self.call(op="attach", channel_id="C1", thread_ts="100.1", idempotency_key="a1", **self.source())
@@ -180,20 +175,6 @@ class BrokerTest(unittest.TestCase):
             self.assertEqual(identity["cwd_realpath"], os.path.realpath(self.temp.name))
         finally:
             os.environ.pop("TETHER_BROKER_SOCKET", None)
-
-    def test_same_session_in_another_domain_is_refused_with_a_code(self):
-        other = self.schema.SecurityDomainDescriptor(
-            instance_uid=os.geteuid(), workspace_id="T12345678", persona_id="other",
-            authorized_owner_ids=("U99999999",), policy_generation=1,
-        )
-        self.slice.runtime.register_endpoint(
-            endpoint_key="detached_native:claude_session:sess-x", endpoint_kind="detached_native",
-            source_kind="claude_session", source_json='{"session_id":"sess-x"}', ref_version=1,
-            descriptor=other,
-        )
-        refused = self.call(op="attach", channel_id="C1", thread_ts="100.9", idempotency_key="ax", **self.source("sess-x"))
-        self.assertFalse(refused["ok"])
-        self.assertEqual(refused["code"], "endpoint_key_conflict")
 
     def test_spawn_creates_a_session_binds_it_and_the_thread_drives_it(self):
         created = []
@@ -288,7 +269,7 @@ class BrokerTest(unittest.TestCase):
         self.assertEqual(seen["env"]["DBUS_SESSION_BUS_ADDRESS"], f"unix:path={bus}")
 
     def test_failed_turn_marks_the_message_with_a_warning(self):
-        self.slice.command_factory = lambda ctx, st, prompt: ["/bin/sh", "-c", "exit 3"]
+        os.environ["FAKE_REPLY"] = "exit 3"
         self.call(op="attach", channel_id="C1", thread_ts="100.3", idempotency_key="f1", **self.source("sess-f"))
         self.slack.reactions.clear()
         fields = {"workspace": "T12345678", "channel": "C1", "thread": "100.3", "actor": "U12345678", "message_id": "1700000000.000031"}
@@ -297,7 +278,7 @@ class BrokerTest(unittest.TestCase):
         self.assertIn(("add", "C1", "1700000000.000031", "warning"), self.slack.reactions)
         # ...and says so once, instead of leaving the thread staring at an emoji.
         self.assertEqual(len(self.sent), 1)
-        self.assertIn("I could not take this turn (exit_3)", self.sent[0][2])
+        self.assertIn("I could not take this turn (harness_exited", self.sent[0][2])
 
     def test_post_into_a_bound_thread_wakes_the_session(self):
         self.call(op="attach", channel_id="C1", thread_ts="100.5", idempotency_key="w1", **self.source("sess-w"))
