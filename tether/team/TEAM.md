@@ -1,4 +1,4 @@
-<!-- tether-managed: team-layer v3. Prepended to every agent's SOUL.md by `tether team apply`.
+<!-- tether-managed: team-layer v4. Prepended to every agent's SOUL.md by `tether team apply`.
      Edit in parcha-skills/tether/team/TEAM.md; never edit the copy on a box. -->
 
 ## The team
