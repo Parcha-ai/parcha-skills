@@ -339,13 +339,55 @@ def register(ctx: Any) -> None:
                     ctx.on_unload(broker.stop)
 
 
+class _OwnerDescriptor:
+    """The only descriptor field ActiveSlice reads outside the legacy core."""
+
+    def __init__(self, owners: tuple[str, ...]):
+        self.authorized_owner_ids = owners
+
+
+def _build_session_slice(
+    home: Path,
+    settings: admission.AdmissionSettings,
+    active_settings: active_module.ActiveSettings,
+) -> active_module.ActiveSlice:
+    from . import session_driver as session_driver_module
+    from . import store as store_module
+
+    root = home / "plugin-data" / "tether"
+    root.mkdir(parents=True, exist_ok=True)
+    store = store_module.Store(root / "tether.db")
+    orphans = store.fail_orphans()
+    if orphans:
+        logger.warning("tether: failed %d attempt(s) left running by the previous gateway", orphans)
+    driver = session_driver_module.SessionDriver(
+        store, root / "session", active_settings,
+        launch_plan=active_module.launch_plan, child_env=active_module.child_env,
+        idle_seconds=float(active_settings.session_idle_seconds),
+    )
+    slack = SlackEgress()
+
+    def egress(channel_id: str, thread_ts: str, text: str) -> Any:
+        return slack.post(channel_id, text, thread_ts=thread_ts)
+
+    slice_ = active_module.ActiveSlice(
+        runtime=store, driver=driver, settings=active_settings, egress=egress,
+        descriptor=_OwnerDescriptor(tuple(sorted(settings.allowed_users))), slack=slack,
+    )
+    server = broker_module.BrokerServer(home / "bridge.sock", slice_.handle)
+    slice_.broker = server
+    return slice_
+
+
 def _build_active_slice(
     ctx: Any,
     home: Path,
     settings: admission.AdmissionSettings,
     active_settings: active_module.ActiveSettings,
 ) -> active_module.ActiveSlice | None:
-    """Wire the schema-18 domain, the exact-turn driver, and Hermes egress."""
+    """Wire the store/driver pair the config asks for, plus Hermes egress."""
+    if active_settings.driver == "session":
+        return _build_session_slice(home, settings, active_settings)
     try:
         import domain_runtime
         import domain_schema

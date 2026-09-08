@@ -193,6 +193,8 @@ function expectedManagedTargetModes(metadata) {
     [path.join(pluginRoot, "broker.py"), 0o600],
     [path.join(pluginRoot, "journal.py"), 0o600],
     [path.join(pluginRoot, "slack_egress.py"), 0o600],
+    [path.join(pluginRoot, "store.py"), 0o600],
+    [path.join(pluginRoot, "session_driver.py"), 0o600],
     [path.join(pluginRoot, "plugin.yaml"), 0o644],
     [path.join(localBin, "tether"), 0o700],
   ]);
