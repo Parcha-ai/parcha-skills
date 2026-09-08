@@ -27,7 +27,6 @@ import logging
 import os
 import re
 import sqlite3
-import sys
 import time
 import tomllib
 from pathlib import Path
