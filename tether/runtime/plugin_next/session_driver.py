@@ -121,6 +121,129 @@ class SessionProcess:
                 self.process.kill()
 
 
+class CodexAppServer:
+    """One ``codex app-server`` child per gateway, JSON-RPC over stdio.
+
+    Probe on greppy3 (2026-09-08): with ``-c mcp_servers={}`` a turn completes in
+    ~7 s; the reply is the ``agentMessage`` items on ``turn/completed``. Threads
+    are resumed once per binding with ``thread/resume`` and then driven with
+    ``turn/start``. MCP servers from ~/.codex/config.toml are disabled for Tether
+    turns because their start-up stalled turns in the probe.
+    """
+
+    def __init__(self, argv: list[str], cwd: Path, env: dict[str, str], popen: Callable[..., subprocess.Popen]):
+        self.process = popen(  # nosec B603 - fixed argv, no shell
+            argv, cwd=str(cwd), env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, bufsize=1, start_new_session=True,
+        )
+        self._events: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        self._next_id = 1
+        self._resumed: set[str] = set()
+        self.lock = threading.Lock()
+        self.last_used = time.monotonic()
+        threading.Thread(target=self._pump, name="tether-codex-app-server", daemon=True).start()
+        self._call("initialize", {"clientInfo": {"name": "tether", "version": "0.4.0"}, "capabilities": {}}, 30)
+        self._notify("initialized", {})
+
+    def _pump(self) -> None:
+        stdout = self.process.stdout
+        if stdout is None:  # pragma: no cover
+            self._events.put(None)
+            return
+        try:
+            for line in stdout:
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(event, dict):
+                    self._events.put(event)
+        except (OSError, ValueError):
+            pass
+        finally:
+            self._events.put(None)
+
+    def alive(self) -> bool:
+        return self.process.poll() is None
+
+    def _send(self, payload: dict[str, Any]) -> None:
+        if self.process.stdin is None:  # pragma: no cover
+            raise OSError("app-server has no stdin")
+        self.process.stdin.write(json.dumps(payload) + "\n")
+        self.process.stdin.flush()
+
+    def _notify(self, method: str, params: dict[str, Any]) -> None:
+        self._send({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def _call(self, method: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
+        request_id = self._next_id
+        self._next_id += 1
+        self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(method)
+            try:
+                event = self._events.get(timeout=min(remaining, 1.0))
+            except queue.Empty:
+                continue
+            if event is None:
+                raise OSError("app-server exited")
+            if event.get("id") == request_id:
+                if event.get("error"):
+                    raise RuntimeError(str(event["error"].get("message") or event["error"])[:200])
+                return event.get("result") or {}
+
+    def turn(self, thread_id: str, text: str, cwd: Path, *, sandbox: str, approval: str, timeout: float) -> dict[str, Any]:
+        """Run one turn on ``thread_id``; returns {"text", "status", "error"}."""
+        if thread_id not in self._resumed:
+            self._call("thread/resume", {"threadId": thread_id, "cwd": str(cwd), "approvalPolicy": approval,
+                                         "sandbox": sandbox}, 60)
+            self._resumed.add(thread_id)
+        self._call("turn/start", {"threadId": thread_id, "cwd": str(cwd), "approvalPolicy": approval,
+                                  "input": [{"type": "text", "text": text}]}, 30)
+        deadline = time.monotonic() + timeout
+        texts: list[str] = []
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {"text": "".join(texts), "status": "timeout", "error": "turn timed out"}
+            try:
+                event = self._events.get(timeout=min(remaining, 1.0))
+            except queue.Empty:
+                continue
+            if event is None:
+                return {"text": "".join(texts), "status": "exited", "error": "app-server exited"}
+            method = event.get("method")
+            params = event.get("params") or {}
+            if params.get("threadId") not in (None, thread_id):
+                continue
+            if method == "turn/completed":
+                turn = params.get("turn") or {}
+                items = [i for i in turn.get("items") or [] if i.get("type") == "agentMessage" and i.get("text")]
+                final = [i["text"] for i in items if i.get("phase") == "final_answer"] or [i["text"] for i in items]
+                error = turn.get("error")
+                return {"text": "\n".join(final) if final else "".join(texts),
+                        "status": str(turn.get("status") or "completed"),
+                        "error": (error.get("message") if isinstance(error, dict) else error) if error else None}
+
+    def terminate(self) -> None:
+        try:
+            if self.process.stdin is not None:
+                self.process.stdin.close()
+        except (OSError, ValueError):
+            pass
+        try:
+            self.process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+
+
 class SessionDriver:
     """``run_turn`` drives one attempt to a terminal state and records it in the Store."""
 
@@ -145,6 +268,7 @@ class SessionDriver:
         self._popen = popen
         self.idle_seconds = idle_seconds
         self._sessions: dict[str, SessionProcess] = {}
+        self._codex: CodexAppServer | None = None
         self._lock = threading.Lock()
 
     # -- lifecycle ------------------------------------------------------------------
@@ -171,8 +295,11 @@ class SessionDriver:
         with self._lock:
             sessions = list(self._sessions.values())
             self._sessions.clear()
+            codex, self._codex = self._codex, None
         for session in sessions:
             session.terminate()
+        if codex is not None:
+            codex.terminate()
 
     # -- one turn -------------------------------------------------------------------
 
@@ -195,7 +322,9 @@ class SessionDriver:
         source = context.get("source") or {}
         session_id = str(source.get("session_id") or "")
         if context.get("source_kind") == "codex_session":
-            return self._run_codex_turn(attempt_id, session_id, prompt, cwd, timeout_seconds)
+            if getattr(self.settings, "codex_driver", "app-server") == "exec":
+                return self._run_codex_turn(attempt_id, session_id, prompt, cwd, timeout_seconds)
+            return self._run_codex_app_server_turn(attempt_id, session_id, prompt, cwd, timeout_seconds)
         try:
             session = self._session_for(binding_id, session_id, cwd)
         except OSError as exc:
@@ -247,6 +376,48 @@ class SessionDriver:
             session = SessionProcess(binding_id, process, session_id)
             self._sessions[binding_id] = session
             return session
+
+    def _codex_server(self, cwd: Path) -> CodexAppServer:
+        with self._lock:
+            if self._codex is not None and self._codex.alive():
+                return self._codex
+            binary = shutil.which(self.settings.codex_binary) or self.settings.codex_binary
+            command = [binary, "app-server", "-c", "mcp_servers={}"]
+            env = self._child_env(passthrough=self.settings.harness_env)
+            argv, popen_env, launcher = self._launch_plan(command, cwd, env, self.settings)
+            logger.info("tether: codex app-server launcher=%s", launcher)
+            self._codex = CodexAppServer(argv, cwd, popen_env, self._popen)
+            return self._codex
+
+    def _run_codex_app_server_turn(
+        self, attempt_id: str, session_id: str, prompt: str, cwd: Path, timeout_seconds: float,
+    ) -> dict[str, Any]:
+        bypass = any("bypass" in a for a in self.settings.codex_resume_args)
+        sandbox = "danger-full-access" if bypass else "workspace-write"
+        try:
+            server = self._codex_server(cwd)
+        except (OSError, RuntimeError, TimeoutError) as exc:
+            return self._finish(attempt_id, "failed", str(exc)[:200], error_code="codex_app_server_unavailable")
+        with server.lock:
+            try:
+                result = server.turn(session_id, prompt, cwd, sandbox=sandbox, approval="never", timeout=timeout_seconds)
+            except (OSError, RuntimeError, TimeoutError) as exc:
+                with self._lock:
+                    self._codex = None
+                server.terminate()
+                return self._finish(attempt_id, "failed", str(exc)[:200], error_code="codex_app_server_error")
+            server.last_used = time.monotonic()
+        if result["status"] in ("timeout", "exited"):
+            with self._lock:
+                self._codex = None
+            server.terminate()
+            return self._finish(attempt_id, "failed", result["error"] or "", error_code=result["status"])
+        if result["status"] != "completed" or result.get("error"):
+            return self._finish(attempt_id, "failed", str(result.get("error") or result["status"])[:200], error_code="codex_turn_failed")
+        text = result["text"]
+        if is_no_reply(text):
+            return self._finish(attempt_id, "no_reply", text)
+        return self._finish(attempt_id, "completed_with_response", text)
 
     def _run_codex_turn(
         self, attempt_id: str, session_id: str, prompt: str, cwd: Path, timeout_seconds: float,

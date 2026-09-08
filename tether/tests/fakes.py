@@ -64,7 +64,7 @@ def direct_launch(command, cwd, env, settings):
 
 
 def child_env(passthrough=()):
-    keys = ("PATH", "FAKE_LOG", "FAKE_PROMPTS", "FAKE_REPLY", *passthrough)
+    keys = ("PATH", "FAKE_LOG", "FAKE_PROMPTS", "FAKE_REPLY", "FAKE_CODEX_REPLY", "FAKE_CODEX_FAIL", *passthrough)
     return {k: os.environ[k] for k in keys if k in os.environ}
 
 
@@ -75,3 +75,50 @@ class Descriptor:
         self.workspace_id = workspace_id
         self.persona_id = "primary"
         self.policy_generation = 1
+
+
+# A stand-in for `codex app-server`: JSON-RPC over stdio. Answers initialize and
+# thread/resume, and turns every turn/start into turn/started, an agentMessage
+# item and turn/completed. FAKE_CODEX_REPLY overrides the text; FAKE_CODEX_FAIL
+# makes the turn complete with status "failed".
+FAKE_CODEX = textwrap.dedent(
+    """\
+    #!/usr/bin/env python3
+    import json, os, sys
+    n = 0
+    log = os.environ.get("FAKE_LOG")
+    def out(o):
+        print(json.dumps(o)); sys.stdout.flush()
+    for line in sys.stdin:
+        try:
+            req = json.loads(line)
+        except ValueError:
+            continue
+        method, rid, params = req.get("method"), req.get("id"), req.get("params") or {}
+        if method == "initialize":
+            out({"id": rid, "result": {"userAgent": "fake-codex"}})
+        elif method == "thread/resume":
+            out({"id": rid, "result": {"thread": {"id": params["threadId"]}}})
+        elif method == "turn/start":
+            n += 1
+            tid = params["threadId"]; text = params["input"][0]["text"]
+            if log:
+                open(log, "a").write(f"{os.getpid()} {n} {text[:40]}\\n")
+            out({"id": rid, "result": {"turn": {"id": f"turn-{n}"}}})
+            out({"method": "turn/started", "params": {"threadId": tid, "turn": {"id": f"turn-{n}", "status": "inProgress"}}})
+            if os.environ.get("FAKE_CODEX_FAIL"):
+                out({"method": "turn/completed", "params": {"threadId": tid, "turn": {"id": f"turn-{n}", "items": [], "status": "failed", "error": {"message": "model refused"}}}})
+                continue
+            reply = os.environ.get("FAKE_CODEX_REPLY") or f"codex turn {n} of pid {os.getpid()}"
+            item = {"type": "agentMessage", "id": f"msg-{n}", "text": reply, "phase": "final_answer"}
+            out({"method": "item/completed", "params": {"threadId": tid, "turnId": f"turn-{n}", "item": item}})
+            out({"method": "turn/completed", "params": {"threadId": tid, "turn": {"id": f"turn-{n}", "items": [item], "status": "completed", "error": None}}})
+    """
+)
+
+
+def write_fake_codex(directory: Path) -> Path:
+    path = Path(directory) / "fake-codex"
+    path.write_text(FAKE_CODEX, encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IEXEC)
+    return path
