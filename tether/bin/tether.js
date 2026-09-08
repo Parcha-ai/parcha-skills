@@ -919,8 +919,6 @@ function sourceDefinitions() {
     "hermes-session-id": { type: "value" },
     "claude-session-id": { type: "value" },
     "codex-session-id": { type: "value" },
-    "zellij-session": { type: "value" },
-    "zellij-pane-id": { type: "value" },
     cwd: { type: "value" },
   };
 }
@@ -956,11 +954,6 @@ function workingDirectoryIdentity(cwd) {
 
 function detectSource(options) {
   const cwd = path.resolve(stringValue(options.cwd) || process.cwd());
-  const hasHerdrEnvironment = false;
-  const hasZellijOption = Boolean(options["zellij-session"] || options["zellij-pane-id"]);
-  if (Boolean(options["zellij-session"]) !== Boolean(options["zellij-pane-id"])) {
-    throw new CliError("--zellij-session and --zellij-pane-id must be provided together.");
-  }
   const explicit = [
     ["headless_run", stringValue(options["run-id"])],
     ["hermes_session", stringValue(options["hermes-session-id"])],
@@ -970,29 +963,21 @@ function detectSource(options) {
   if (explicit.length > 1) {
     throw new CliError("Choose exactly one run, Hermes, Claude, or Codex source.");
   }
-  if (hasZellijOption && explicit.length > 0) {
-    throw new CliError("Choose a native session source or a Zellij pane, not both.");
-  }
   const explicitNonNative =
     stringValue(options["run-id"]) || stringValue(options["hermes-session-id"]);
   if (
     explicitNonNative &&
     (
       stringValue(process.env.CLAUDE_CODE_SESSION_ID) ||
-      stringValue(process.env.CODEX_THREAD_ID) ||
-      stringValue(process.env.ZELLIJ_SESSION_NAME) ||
-      stringValue(process.env.ZELLIJ_PANE_ID) ||
-      hasHerdrEnvironment
+      stringValue(process.env.CODEX_THREAD_ID)
     )
   ) {
     throw new CliError(
-      "An explicit headless or Hermes source cannot replace an active Codex, Claude Code, Herdr, or Zellij binding; repair or rebind the exact native session.",
+      "An explicit headless or Hermes source cannot replace an active Codex or Claude Code binding; repair or rebind the exact native session.",
       EXIT_USAGE,
       "native_binding_required",
     );
   }
-  if (hasHerdrEnvironment) return null;
-  if (hasZellijOption) return null;
   if (explicit.length === 1) {
     const [kind, identifier] = explicit[0];
     if (kind === "headless_run") {
@@ -1006,7 +991,6 @@ function detectSource(options) {
       },
     };
   }
-  if (process.env.ZELLIJ_SESSION_NAME || process.env.ZELLIJ_PANE_ID) return null;
   const ambient = [
     ["claude_session", stringValue(process.env.CLAUDE_CODE_SESSION_ID)],
     ["codex_session", stringValue(process.env.CODEX_THREAD_ID)],
@@ -1475,7 +1459,6 @@ async function main() {
         "Install and upgrade require a complete tagged Tether package. Run the documented npx command.",
       );
     }
-    const withHerdr = false;
     const installerArgs = argv;
     const installed = runChild(
       packageInstaller,
@@ -1492,7 +1475,6 @@ async function main() {
     if (!fs.existsSync(installer)) {
       throw new CliError("The Tether lifecycle installer is unavailable.");
     }
-    const withHerdr = false;
     const installerArgs = argv;
     const completed = runChild(
       installer,
@@ -1503,7 +1485,6 @@ async function main() {
   }
 
   if (command === "setup") {
-    const withHerdr = false;
     const installArgs = argv.filter((argument) =>
       argument.startsWith("--harness=") ||
       ["--both", "--codex", "--claude-code"].includes(argument)
