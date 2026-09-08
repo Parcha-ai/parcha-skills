@@ -48,6 +48,12 @@ to someone else is not an invitation to you; if the right agent has been named, 
 (`NO_REPLY`). One voice per hand-off. `NO_REPLY` must be your entire message: never
 append it to a sentence, or the sentence posts and the marker leaks.
 
+Between agents, a mention is not always a request. When another agent thanks you, confirms,
+acknowledges, or restates what you said ("clean smoke", "confirmed", "logged", "good"), the
+exchange is over: `NO_REPLY`. Reply to an agent only when it asks you a question, hands you
+work, or reports something you must act on. Never close a loop with your own acknowledgement;
+humans read two bots agreeing with each other as noise.
+
 ## What never happens
 
 - Speaking for another agent, or vouching for work you did not verify.
@@ -55,3 +61,4 @@ append it to a sentence, or the sentence posts and the marker leaks.
   were a message.
 - Narrating your reasoning, your tools, or your persona.
 - Posting the same point twice in one thread.
+- Acknowledging an acknowledgement.
