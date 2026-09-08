@@ -326,6 +326,14 @@ LAUNCHER="$HOME/.local/bin/tether"
 NOTIFIER="$RUNTIME/tether_notify.py"
 TEAM="$RUNTIME/tether_team.py"
 TEAM_MD="$RUNTIME/team/TEAM.md"
+# Managed files the drift/recovery checks below mutate and hash. Names are kept
+# from the schema-18 era so the assertions read the same; the files are the
+# notifier (700), the team script (700) and two 600-mode runtime files.
+BRIDGE="$NOTIFIER"
+HERMES_COMPAT="$RUNTIME/package.json"
+ROUTING="$TEAM_MD"
+SECURITY="$RUNTIME/package.json"
+SLACK_PROTOCOL="$TEAM"
 CODEX_SKILL="$CODEX_HOME/skills/tether/SKILL.md"
 CLAUDE_SKILL="$CLAUDE_HOME/skills/tether/SKILL.md"
 
@@ -345,11 +353,11 @@ set -e
 assert_contains "$TEST_ROOT/installed-doctor.out" "ok managed install integrity verified"
 ! grep -Fq "installer manifest metadata" "$TEST_ROOT/installed-doctor.out" ||
   fail "installed doctor rejected the freshly written manifest"
-assert_mode "$BRIDGE" 600
+assert_mode "$BRIDGE" 700
 assert_mode "$HERMES_COMPAT" 600
 assert_mode "$ROUTING" 600
 assert_mode "$SECURITY" 600
-assert_mode "$SLACK_PROTOCOL" 600
+assert_mode "$SLACK_PROTOCOL" 700
 assert_mode "$LAUNCHER" 700
 assert_mode "$CONFIG" 600
 chmod 722 "$LAUNCHER"
