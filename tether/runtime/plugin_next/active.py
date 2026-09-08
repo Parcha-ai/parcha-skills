@@ -167,6 +167,9 @@ class ActiveSettings:
     # Retired knob kept for old config files; the session driver is the only driver.
     driver: str = "session"
     session_idle_seconds: int = 900
+    # "app-server": one codex app-server per gateway, threads resumed in place.
+    # "exec": one `codex exec resume` process per turn (the v1 path).
+    codex_driver: str = "app-server"
     presence: bool = True
     ack_emoji: str = "eyes"
     done_emoji: str = "white_check_mark"
@@ -203,6 +206,7 @@ def load_active_settings(path: Path) -> ActiveSettings:
         peer_chain_limit=integer("peer_chain_limit", 2),
         driver=str(raw.get("driver") or "session"),
         session_idle_seconds=integer("session_idle_seconds", 900),
+        codex_driver=str(raw.get("codex_driver") or "app-server"),
         presence=bool(raw.get("presence", True)),
         extra={"default_channel": str(raw.get("default_channel") or "")},
     )

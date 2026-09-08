@@ -15,7 +15,7 @@ from runtime.plugin_next import active  # noqa: E402
 from runtime.plugin_next.session_driver import SessionDriver  # noqa: E402
 from runtime.plugin_next.store import Store  # noqa: E402
 
-from tests.fakes import direct_launch as _direct_launch, write_fake_claude  # noqa: E402
+from tests.fakes import child_env, direct_launch as _direct_launch, write_fake_claude, write_fake_codex  # noqa: E402
 
 
 class SessionDriverTests(unittest.TestCase):
@@ -26,13 +26,15 @@ class SessionDriverTests(unittest.TestCase):
         self.log = root / "turns.log"
         os.environ["FAKE_LOG"] = str(self.log)
         self.store = Store(root / "tether.db")
+        self.fake_codex = write_fake_codex(root)
         self.settings = active.ActiveSettings(
             enabled=True, driver="session", launcher="direct", claude_binary=str(self.fake),
+            codex_binary=str(self.fake_codex), codex_resume_args=("--dangerously-bypass-approvals-and-sandbox",),
             native_timeout_seconds=20, harness_env=("FAKE_LOG",),
         )
         self.driver = SessionDriver(
             self.store, root / "session", self.settings, launch_plan=_direct_launch,
-            child_env=lambda passthrough=(): {k: os.environ[k] for k in ("PATH", *passthrough) if k in os.environ},
+            child_env=child_env,
             idle_seconds=60,
         )
         self.sent: list[tuple[str, str, str]] = []
@@ -130,6 +132,66 @@ class SessionDriverTests(unittest.TestCase):
         self.assertEqual(posted[0][0], "C1")
         found = self.store.find_active_binding(team_id="T1", channel_id="C1", thread_ts="300.1")
         self.assertEqual(found["binding_id"], spawned["bridge_id"])
+
+    def bind_codex(self, thread="500.1", session_id="thread-abc"):
+        return self.slice.bind(
+            source_kind="codex_session", session_id=session_id, cwd=self.temp.name,
+            team_id="T1", channel_id="C1", thread_ts=thread, owner_user_id="U12345678",
+        )
+
+    def codex_fields(self, ts: str, thread="500.1") -> dict:
+        return {"workspace": "T1", "channel": "C1", "thread": thread, "actor": "U12345678", "message_id": ts}
+
+    def test_codex_turns_share_one_app_server_and_resume_the_thread(self):
+        self.bind_codex()
+        self.slice.claim(self.codex_fields("500.2"), "first")
+        self.assertEqual(self.slice.run_once(), 1)
+        self.slice.claim(self.codex_fields("500.3"), "second")
+        self.assertEqual(self.slice.run_once(), 1)
+        self.assertEqual(len(self.sent), 2)
+        self.assertIn("codex turn 1 of pid", self.sent[0][2])
+        self.assertIn("codex turn 2 of pid", self.sent[1][2], "same app-server took the second turn")
+        self.assertEqual(len(set(self.pids())), 1)
+        # a second codex binding shares the server but resumes its own thread
+        self.bind_codex(thread="600.1", session_id="thread-xyz")
+        self.slice.claim(self.codex_fields("600.2", thread="600.1"), "other thread")
+        self.assertEqual(self.slice.run_once(), 1)
+        self.assertIn("codex turn 3 of pid", self.sent[2][2])
+        self.assertEqual(len(set(self.pids())), 1)
+
+    def test_codex_failed_turn_posts_the_reason(self):
+        os.environ["FAKE_CODEX_FAIL"] = "1"
+        try:
+            self.bind_codex()
+            self.slice.claim(self.codex_fields("500.2"), "go")
+            self.assertEqual(self.slice.run_once(), 1)
+            self.assertIn("I could not take this turn (codex_turn_failed: model refused", self.sent[0][2])
+        finally:
+            os.environ.pop("FAKE_CODEX_FAIL", None)
+
+    def test_codex_turn_without_turn_completed_ends_after_quiet(self):
+        from runtime.plugin_next.session_driver import CodexAppServer
+        os.environ["FAKE_CODEX_NO_COMPLETE"] = "1"
+        previous = CodexAppServer.QUIET_AFTER
+        CodexAppServer.QUIET_AFTER = 0.5
+        try:
+            self.bind_codex()
+            self.slice.claim(self.codex_fields("500.2"), "go")
+            self.assertEqual(self.slice.run_once(), 1)
+            self.assertIn("codex turn 1 of pid", self.sent[0][2])
+        finally:
+            CodexAppServer.QUIET_AFTER = previous
+            os.environ.pop("FAKE_CODEX_NO_COMPLETE", None)
+
+    def test_codex_no_reply_is_silence(self):
+        os.environ["FAKE_CODEX_REPLY"] = "done\nNO_REPLY"
+        try:
+            self.bind_codex()
+            self.slice.claim(self.codex_fields("500.2"), "fyi")
+            self.assertEqual(self.slice.run_once(), 1)
+            self.assertEqual(self.sent, [])
+        finally:
+            os.environ.pop("FAKE_CODEX_REPLY", None)
 
     def test_status_reports_the_store_counts(self):
         status = self.slice.handle({"op": "status"})
