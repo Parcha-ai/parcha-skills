@@ -145,6 +145,10 @@ class ActiveSettings:
     # hardening. "auto" picks systemd-user when possible and says so in the prompt
     # when it cannot, so the session never mistakes the sandbox for the host.
     launcher: str = "auto"
+    # How many consecutive peer-agent turns a bound thread takes with no human
+    # in between before further peer messages are left alone. Two agents that
+    # keep @mentioning each other otherwise talk forever.
+    peer_chain_limit: int = 2
     presence: bool = True
     ack_emoji: str = "eyes"
     done_emoji: str = "white_check_mark"
@@ -178,6 +182,7 @@ def load_active_settings(path: Path) -> ActiveSettings:
         policy_generation=integer("policy_generation", 1),
         harness_env=strings("harness_env"),
         launcher=str(raw.get("launcher") or "auto"),
+        peer_chain_limit=integer("peer_chain_limit", 2),
         presence=bool(raw.get("presence", True)),
         extra={"default_channel": str(raw.get("default_channel") or "")},
     )
@@ -390,8 +395,16 @@ class ActiveSlice:
 
     # -- ingress -------------------------------------------------------------------
 
-    def claim(self, fields: dict[str, Any], text: str) -> dict[str, Any] | None:
-        """Admit one authorized Slack message on a bound thread. None = not ours."""
+    def claim(
+        self, fields: dict[str, Any], text: str, *, peer: bool = False,
+        peers: frozenset[str] | set[str] = frozenset(),
+    ) -> dict[str, Any] | None:
+        """Admit one authorized Slack message on a bound thread. None = not ours.
+
+        ``peer`` marks a message from a trusted peer agent. After
+        ``peer_chain_limit`` consecutive peer turns with no human in between,
+        further peer messages are not ours: the humans get the thread back.
+        """
         binding = self.runtime.find_active_binding(
             team_id=str(fields.get("workspace") or ""),
             channel_id=str(fields.get("channel") or ""),
@@ -399,6 +412,11 @@ class ActiveSlice:
         )
         if binding is None:
             return None
+        if peer and self.settings.peer_chain_limit > 0:
+            recent = self.runtime.recent_turn_actors(binding["binding_id"], self.settings.peer_chain_limit)
+            if len(recent) >= self.settings.peer_chain_limit and all(a in peers for a in recent):
+                logger.info("tether: peer chain capped on %s (%d peer turns, no human)", binding["binding_id"], len(recent))
+                return None
         message_id = str(fields.get("message_id") or "")
         event_key = f"slack:{fields.get('workspace')}:{fields.get('channel')}:{message_id}"
         payload = json.dumps(

@@ -148,6 +148,27 @@ class ActiveSliceTest(unittest.TestCase):
         self.assertEqual(slice_.run_once(), 0)
         self.assertEqual(len(self.sent), 1)
 
+    def test_peer_chain_is_capped_after_two_peer_turns_without_a_human(self):
+        slice_ = self.make_slice("printf 'ok'")
+        slice_.bind(
+            source_kind="claude_session", session_id="sess-peer", cwd=self.temp.name,
+            team_id="T12345678", channel_id="C1", thread_ts="200.1",
+            owner_user_id="U12345678",
+        )
+        peers = frozenset({"UPEER1", "UPEER2"})
+        base = {"workspace": "T12345678", "channel": "C1", "thread": "200.1"}
+        first = slice_.claim(dict(base, actor="UPEER1", message_id="200.2"), "ping", peer=True, peers=peers)
+        second = slice_.claim(dict(base, actor="UPEER2", message_id="200.3"), "pong", peer=True, peers=peers)
+        third = slice_.claim(dict(base, actor="UPEER1", message_id="200.4"), "ping again", peer=True, peers=peers)
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertIsNone(third, "two peer turns with no human in between end the exchange")
+        # A human speaking resets the chain; the next peer message is ours again.
+        human = slice_.claim(dict(base, actor="U12345678", message_id="200.5"), "humans here", peer=False)
+        self.assertIsNotNone(human)
+        fourth = slice_.claim(dict(base, actor="UPEER2", message_id="200.6"), "reply to human", peer=True, peers=peers)
+        self.assertIsNotNone(fourth)
+
     def test_no_reply_is_silent_and_terminal(self):
         slice_ = self.make_slice("printf 'NO_REPLY\\n'")
         slice_.bind(
@@ -369,3 +390,32 @@ class LauncherTests(unittest.TestCase):
         self.assertIn("operator's own systemd user session", self.active.runtime_truth("systemd-user"))
         self.assertIn("INSIDE the gateway's hardened systemd unit", self.active.runtime_truth("direct"))
         self.assertIn("not to the host", self.active.runtime_truth("direct"))
+
+
+class JournalThreadingTests(unittest.TestCase):
+    def test_record_and_summary_work_from_another_thread(self):
+        import importlib
+        import threading
+        journal_mod = importlib.import_module("runtime.plugin_next.journal")
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            home.mkdir(mode=0o700)
+            data = home / "tether"
+            data.mkdir(mode=0o700)
+            journal = journal_mod.DurableJournal(data)
+            results: dict[str, object] = {}
+
+            def worker():
+                try:
+                    results["record"] = journal.record("slack:T:C:1", {"verdict": "admit", "reason": "test"}, platform="slack")
+                    results["summary"] = journal.summary()
+                except Exception as exc:  # pragma: no cover - the assertion below reports it
+                    results["error"] = repr(exc)
+
+            t = threading.Thread(target=worker)
+            t.start()
+            t.join(10)
+            self.assertNotIn("error", results, results.get("error"))
+            self.assertTrue(results["record"])
+            self.assertEqual(results["summary"]["events"], 1)
+            journal.close()
