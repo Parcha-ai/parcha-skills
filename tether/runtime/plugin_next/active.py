@@ -68,6 +68,21 @@ def child_env(
     return env
 
 
+def is_silence(text: str) -> bool:
+    """NO_REPLY as the whole message or as its last line means: do not post.
+
+    Same rule as domain_runtime.is_no_reply; kept local because the plugin is
+    loaded as a top-level package on the gateway and cannot import its sibling.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    if stripped == "NO_REPLY":
+        return True
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    return bool(lines) and lines[-1] == "NO_REPLY" and len(stripped) <= 2000
+
+
 def user_bus_path(uid: int | None = None) -> Path:
     return Path(f"/run/user/{os.getuid() if uid is None else uid}/bus")
 
@@ -445,6 +460,10 @@ class ActiveSlice:
         except Exception:
             logger.debug("tether: un-reaction %s failed", emoji, exc_info=True)
 
+    @staticmethod
+    def runtime_is_no_reply(text: str) -> bool:
+        return is_silence(text)
+
     def _turn_message_ids(self, context: dict[str, Any]) -> list[str]:
         ids: list[str] = []
         for turn in context.get("turns", []):
@@ -802,7 +821,7 @@ class ActiveSlice:
         thread_ts = str(request.get("thread_ts") or "")
         if not text or not channel_id or not thread_ts:
             raise BrokerRefused("thread_required", "channel, thread-ts and text are required")
-        if text.strip() == "NO_REPLY":
+        if self.runtime_is_no_reply(text):
             return {"status": "no_reply", "team_id": self._team(request), "channel_id": channel_id, "thread_ts": thread_ts}
         ts = self._post(channel_id, text, thread_ts)
         team_id = self._team(request)
@@ -824,7 +843,7 @@ class ActiveSlice:
         context = self.runtime.binding_thread(binding_id) if hasattr(self.runtime, "binding_thread") else None
         if context is None:
             raise BrokerRefused("binding_unknown")
-        if text.strip() == "NO_REPLY":
+        if self.runtime_is_no_reply(text):
             return {"status": "no_reply", "bridge_id": binding_id, "team_id": context["team_id"],
                     "channel_id": context["channel_id"], "thread_ts": context["thread_ts"],
                     "reply_key": request.get("reply_key")}
