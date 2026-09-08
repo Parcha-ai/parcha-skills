@@ -38,4 +38,5 @@ replies with evidence) passes on all primary gateways; Tether Python under 3,000
 
 ## Owners, blockers, next actions
 - Owner: claudio session 7f97ffb2 (this one). Miguel: decisions only.
-- Next: merge PR 460 → fleet flip (`driver = "session"` on all 8, deploy, verify import + one remote smoke) → C8 deletion PR (domain_*, native_driver, tests, security trim, tether_notify stubs) → eval C4 after 48 h. C4 after 48 h of traffic (from 2026-09-08). Also: docs/plans + scripts/fleet now live on main via PR 458; this branch keeps only .cascade/.
+- Fleet flip done 2026-09-08 04:2x UTC: main 392d15b on all 8, `driver = "session"` everywhere, doctors clean, legacy bindings imported (claudio 40, sam 7, bc 2, mikael 2, m 2, cr 1, irma 0, mg 0). Remote smoke on greppy-bc pending.
+- Next: C8 deletion PR (domain_*, native_driver, their tests, security trim, tether_notify stubs, native builder branch) → eval C4 after 48 h of traffic. C4 after 48 h of traffic (from 2026-09-08). Also: docs/plans + scripts/fleet now live on main via PR 458; this branch keeps only .cascade/.
