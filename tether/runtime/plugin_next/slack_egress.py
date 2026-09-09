@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -125,13 +126,25 @@ class SlackEgress:
                     for entry in entries or []:
                         ts = ts or str(entry.get("ts") or "")
         if not ts:
-            info = self._call("files.info", {"file": file_id}, get=True)
-            shares = ((info.get("file") or {}).get("shares") or {})
-            for scope in ("public", "private"):
-                for _channel, entries in (shares.get(scope) or {}).items():
-                    for entry in entries or []:
-                        ts = ts or str(entry.get("ts") or "")
+            ts = self._message_carrying(channel_id, file_id, thread_ts)
         return {"file_id": file_id, "ts": ts}
+
+    def _message_carrying(self, channel_id: str, file_id: str, thread_ts: str | None, attempts: int = 4) -> str:
+        """Slack shares appear a moment after completeUploadExternal; find the message by file id."""
+        for attempt in range(attempts):
+            try:
+                if thread_ts:
+                    body = self._call("conversations.replies", {"channel": channel_id, "ts": thread_ts, "limit": 20}, get=True)
+                else:
+                    body = self._call("conversations.history", {"channel": channel_id, "limit": 20}, get=True)
+            except SlackError:
+                body = {}
+            for message in reversed(body.get("messages") or []):
+                if any((f or {}).get("id") == file_id for f in message.get("files") or []):
+                    return str(message.get("ts") or "")
+            if attempt < attempts - 1:
+                time.sleep(1.0)
+        return ""
 
     def thread_replies(self, channel_id: str, thread_ts: str, *, limit: int = 50) -> list[dict[str, Any]]:
         body = self._call(

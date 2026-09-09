@@ -37,7 +37,9 @@ class UploadTests(unittest.TestCase):
             if "files.completeUploadExternal" in url:
                 body = json.loads(request.data)
                 assert body["channel_id"] == "C1" and body["thread_ts"] == "100.1" and body["initial_comment"] == "demo"
-                return _Response(json.dumps({"ok": True, "files": [{"id": "F9", "shares": {"public": {"C1": [{"ts": "170.5"}]}}}]}).encode())
+                return _Response(json.dumps({"ok": True, "files": [{"id": "F9", "shares": None}]}).encode())
+            if "conversations.replies" in url:
+                return _Response(json.dumps({"ok": True, "messages": [{"ts": "100.1"}, {"ts": "170.5", "files": [{"id": "F9"}]}]}).encode())
             raise AssertionError(url)
 
         with tempfile.TemporaryDirectory() as tmp:
