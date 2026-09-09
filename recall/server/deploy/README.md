@@ -329,20 +329,31 @@ python -m recall_server.cli backfill-parquet-scan \
 ```
 
 The managed projection worker continuously drains later invalidations. Before
-enabling `recall_scan`, publish the official `duckdb_cli-linux-arm64` binary
-into the private evidence archive. Archil serverless execution runs on aarch64;
-an amd64 binary stages successfully but cannot execute. Verify the release
-asset checksum against DuckDB's official release metadata; the command
-independently rechecks the uncompressed binary's exact digest before upload:
+enabling `recall_scan`, publish the official DuckDB CLI into the private
+evidence archive for **every architecture Archil may execute on**. Archil has
+run sandboxes on both aarch64 and x86_64; a build for the wrong machine stages
+successfully but fails with `Exec format error`. The sandbox selects the build
+matching `uname -m` at execution time and, when no build exists for that
+machine, `duckdb` exits 69 with an explicit message instead. Pin both the
+release zip digest (GitHub's published asset digest) and the extracted
+binary's digest; the command rechecks both before upload:
 
 ```bash
 python -m recall_server.cli publish-archil-duckdb \
-  --path /private/duckdb --version 1.5.5 \
-  --sha256 64-lowercase-hex-characters
+  --release-zip-url https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-arm64.zip \
+  --zip-sha256 <asset digest> --version 1.5.5 --sha256 <binary digest> --arch linux-arm64
+python -m recall_server.cli publish-archil-duckdb \
+  --release-zip-url https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-amd64.zip \
+  --zip-sha256 <asset digest> --version 1.5.5 --sha256 <binary digest> --arch linux-x86_64
 ```
 
-Configure the returned opaque object identity as
-`RECALL_ARCHIL_DUCKDB_OBJECT_KEY` and `RECALL_ARCHIL_DUCKDB_SHA256`. At execution
+`--path /private/duckdb` remains available for an already-verified local file.
+
+Configure the returned opaque object identities as
+`RECALL_ARCHIL_DUCKDB_OBJECT_KEY` / `RECALL_ARCHIL_DUCKDB_SHA256` (arm64) and
+`RECALL_ARCHIL_DUCKDB_X86_64_OBJECT_KEY` / `RECALL_ARCHIL_DUCKDB_X86_64_SHA256`
+(x86_64). Either pair alone is accepted, but only sandboxes of that
+architecture can then run DuckDB. At execution
 time Recall mounts only shards inside the caller's tenant/source grants, stages
 that checksum-pinned binary into the networkless sandbox, and verifies every
 emitted `recall://` receipt against current canonical evidence before returning
@@ -354,6 +365,17 @@ client may cancel its own request sooner; Recall does not impose the 30-second
 interactive-document limit on these broad scans. Scan stdout is capped at 16 KiB
 with explicit truncation and `complete=false`; callers should return compact
 passage-derived candidate IDs and open selected full documents separately.
+
+Size the database pool for ingest fan-in. `RECALL_DATABASE_POOL_MAX_SIZE`
+(default 8, range 4 to 32) bounds pooled PostgreSQL connections per process.
+Every collector host posts archive objects and canonical batches through the
+same web service that serves MCP, so a pool sized for a single client will
+saturate under a fleet: `/readyz` then answers `busy` (200) for up to two
+minutes after its last successful probe rather than `not_ready`, and requests
+that cannot obtain a connection within five seconds receive `503 brain_busy`
+with a `Retry-After` header that collectors honor with jitter. Persistent
+`recall_http_pool_busy_total` growth in `/metrics` means the pool, the
+database tier, or the number of collector hosts needs attention.
 
 Enable the canonical v2 write plane only after the archive probe and database
 migrations pass:

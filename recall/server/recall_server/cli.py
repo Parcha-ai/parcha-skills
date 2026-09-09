@@ -62,6 +62,45 @@ from .mcp_conformance import (
 from .semantic import SemanticRuntime
 
 
+
+DUCKDB_RELEASE_URL_RE = re.compile(
+    r"https://github\.com/duckdb/duckdb/releases/download/v[0-9]+\.[0-9]+\.[0-9]+/"
+    r"duckdb_cli-linux-(?:arm64|amd64)\.zip"
+)
+
+
+def fetch_duckdb_release_binary(url: str, *, zip_sha256: str | None) -> bytes:
+    """Download one official DuckDB CLI release zip and return its `duckdb` binary.
+
+    Only the official GitHub release path is accepted, the archive digest must
+    be supplied and must match GitHub's published asset digest, and redirects
+    are followed only within https. The caller still pins the extracted
+    binary's own digest, so the published tool is checksum-verified twice.
+    """
+    import io
+    import urllib.request
+    import zipfile
+
+    if (
+        not isinstance(url, str)
+        or DUCKDB_RELEASE_URL_RE.fullmatch(url) is None
+        or not isinstance(zip_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", zip_sha256) is None
+    ):
+        raise ValueError("DuckDB release download is invalid")
+    with urllib.request.urlopen(url, timeout=300) as response:  # noqa: S310 - https pinned above
+        if not response.geturl().startswith("https://"):
+            raise ValueError("DuckDB release download is invalid")
+        archive = response.read(200_000_000)
+    if hashlib.sha256(archive).hexdigest() != zip_sha256:
+        raise ValueError("DuckDB release archive digest mismatch")
+    with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+        names = bundle.namelist()
+        if names != ["duckdb"]:
+            raise ValueError("DuckDB release archive layout is unexpected")
+        return bundle.read("duckdb")
+
+
 def _worker_pool_max_size(args: argparse.Namespace) -> int | None:
     """Size worker pools from real concurrency, not an unrelated floor."""
 
@@ -1503,9 +1542,18 @@ def main() -> None:
     sub.add_parser("archive-check")
     sub.add_parser("evidence-archive-check")
     publish_duckdb = sub.add_parser("publish-archil-duckdb")
-    publish_duckdb.add_argument("--path", type=Path, required=True)
+    publish_source = publish_duckdb.add_mutually_exclusive_group(required=True)
+    publish_source.add_argument("--path", type=Path)
+    publish_source.add_argument(
+        "--release-zip-url",
+        help="official duckdb_cli-linux-*.zip release URL; requires --zip-sha256",
+    )
+    publish_duckdb.add_argument("--zip-sha256")
     publish_duckdb.add_argument("--version", required=True)
     publish_duckdb.add_argument("--sha256", required=True)
+    publish_duckdb.add_argument(
+        "--arch", choices=("linux-arm64", "linux-x86_64"), default="linux-arm64",
+    )
     capability = sub.add_parser("capability-check")
     capability.add_argument(
         "--profile", choices=("production", "local-fixture"), default="production"
@@ -1861,12 +1909,16 @@ def main() -> None:
             raise SystemExit(2) from None
         return
     if args.command == "publish-archil-duckdb":
-        if (
-            not args.path.is_file()
-            or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", args.version) is None
-        ):
+        if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", args.version) is None:
             raise ValueError("DuckDB tool artifact is invalid")
-        payload = args.path.read_bytes()
+        if args.release_zip_url:
+            payload = fetch_duckdb_release_binary(
+                args.release_zip_url, zip_sha256=args.zip_sha256
+            )
+        else:
+            if not args.path.is_file():
+                raise ValueError("DuckDB tool artifact is invalid")
+            payload = args.path.read_bytes()
         digest = hashlib.sha256(payload).hexdigest()
         if (
             not 1_000_000 <= len(payload) <= 100_000_000
@@ -1876,10 +1928,11 @@ def main() -> None:
         reference = build_evidence_archive_store().put_raw(
             tenant_id="tenant:system:tools",
             source_id="source:system:tools",
-            # Archil serverless execution currently runs on aarch64. Keep the
-            # architecture in the immutable source identity so an x86 build
-            # cannot silently replace the executable used by recall_scan.
-            native_id=f"archil-duckdb:{args.version}:linux-arm64",
+            # Archil serverless execution has run on both aarch64 and x86_64.
+            # Keep the architecture in the immutable source identity so one
+            # build can never silently replace the other; the sandbox selects
+            # the build that matches the machine it actually runs on.
+            native_id=f"archil-duckdb:{args.version}:{args.arch}",
             payload=payload,
             media_type="application/vnd.duckdb.cli",
             created_at=datetime.now(timezone.utc).isoformat(),
@@ -1887,6 +1940,7 @@ def main() -> None:
         print(json.dumps({
             "status": "published",
             "version": args.version,
+            "arch": args.arch,
             "object_key": reference["object_key"],
             "content_sha256": reference["content_sha256"],
             "size_bytes": reference["size_bytes"],

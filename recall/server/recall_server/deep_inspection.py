@@ -43,6 +43,14 @@ for arg in "$@"; do
 done
 exec /tmp/recall-agent/duckdb-real "${args[@]}"
 '''
+DUCKDB_UNAVAILABLE_STUB = r'''#!/usr/bin/env bash
+echo "duckdb is not available in this sandbox: no published build for $(uname -m)" >&2
+exit 69
+'''
+# Archil does not promise one execution architecture; the published DuckDB
+# tool is selected inside the sandbox from the machine that actually runs it.
+TOOL_ARCHITECTURES = {"aarch64": "linux-arm64", "arm64": "linux-arm64",
+                      "x86_64": "linux-x86_64", "amd64": "linux-x86_64"}
 RECEIPT_TOKEN_PATTERN = (
     r"recall://[A-Za-z0-9:._@+-]+/[^\s\"'<>()[\]{},;]{1,1900}"
 )
@@ -424,7 +432,7 @@ def _agent_exec_command(
     routing_receipts: dict[str, tuple[str, ...]],
     timeout_seconds: int,
     dataset_aliases: dict[str, str] | None = None,
-    tool_object: AgentExecObject | None = None,
+    tool_objects: dict[str, AgentExecObject] | None = None,
     allow_missing_objects: bool = False,
 ) -> str:
     """Build a content-addressed, no-network view for an agent-authored program."""
@@ -481,31 +489,35 @@ def _agent_exec_command(
     )
     encoded_tool = encode(
         json.dumps(
-            (
-                {
-                    "object_key": tool_object.object_key,
-                    "content_sha256": tool_object.content_sha256,
+            {
+                arch: {
+                    "object_key": item.object_key,
+                    "content_sha256": item.content_sha256,
                 }
-                if tool_object is not None
-                else None
-            ),
+                for arch, item in sorted((tool_objects or {}).items())
+            },
             separators=(",", ":"),
             sort_keys=True,
         ).encode()
     )
+    encoded_duckdb_stub = encode(DUCKDB_UNAVAILABLE_STUB.encode())
     encoded_duckdb_wrapper = encode(DUCKDB_SCAN_WRAPPER.encode())
     encoded_allow_missing = "1" if allow_missing_objects else "0"
     stage_script = r"""
-import base64,gzip,hashlib,json,pathlib,re,shutil,subprocess,sys,time
+import base64,gzip,hashlib,json,pathlib,platform,re,shutil,subprocess,sys,time
 def mark(name):
     print(f"RECALL_EXEC_TIMING_V1\t{name}\t{time.time_ns()//1000}",file=sys.stderr,flush=True)
 mark("stage_start")
 items=json.loads(gzip.decompress(base64.b64decode(sys.argv[1])))
 aliases=json.loads(gzip.decompress(base64.b64decode(sys.argv[2])))
 datasets=json.loads(gzip.decompress(base64.b64decode(sys.argv[3])))
-tool=json.loads(gzip.decompress(base64.b64decode(sys.argv[4])))
+tools=json.loads(gzip.decompress(base64.b64decode(sys.argv[4])))
 duckdb_wrapper=gzip.decompress(base64.b64decode(sys.argv[5]))
 allow_missing=sys.argv[6]=="1"
+duckdb_stub=gzip.decompress(base64.b64decode(sys.argv[7]))
+tool_keys={item["object_key"] for item in tools.values()}
+arch={"aarch64":"linux-arm64","arm64":"linux-arm64","x86_64":"linux-x86_64","amd64":"linux-x86_64"}.get(platform.machine())
+tool=tools.get(arch) if arch else None
 source=pathlib.Path("/mnt/archil/evidence").resolve()
 target=pathlib.Path("/tmp/recall-authorized").resolve()
 docs=pathlib.Path("/tmp/recall-docs").resolve()
@@ -522,7 +534,7 @@ for item in items:
     if source not in src.parents:
         raise SystemExit(64)
     if not src.is_file():
-        if allow_missing and (tool is None or item["object_key"]!=tool["object_key"]):
+        if allow_missing and item["object_key"] not in tool_keys:
             missing.add(item["object_key"])
             continue
         raise SystemExit(66)
@@ -601,6 +613,9 @@ if tool is not None:
     pathlib.Path("/tmp/recall-agent/duckdb-real").chmod(0o500)
     pathlib.Path("/tmp/recall-agent/duckdb").write_bytes(duckdb_wrapper)
     pathlib.Path("/tmp/recall-agent/duckdb").chmod(0o500)
+elif tools:
+    pathlib.Path("/tmp/recall-agent/duckdb").write_bytes(duckdb_stub)
+    pathlib.Path("/tmp/recall-agent/duckdb").chmod(0o500)
 mark("tool_ready")
 mark("stage_end")
 """.strip()
@@ -657,6 +672,8 @@ printf 'RECALL_EXEC_TIMING_V1\t%s\t%s\n' "$1" "${EPOCHREALTIME/./}" >&2
             + shlex.quote(encoded_duckdb_wrapper)
             + " "
             + encoded_allow_missing
+            + " "
+            + shlex.quote(encoded_duckdb_stub)
         ),
         "mount --rbind /tmp/recall-authorized /mnt/archil/evidence",
         "mount -o remount,bind,ro /mnt/archil/evidence",
@@ -827,6 +844,7 @@ class ArchilDeepInspector:
         disk_id: str,
         region: str,
         duckdb_tool: AgentExecObject | None = None,
+        duckdb_tools: dict[str, AgentExecObject] | None = None,
         transport: HttpTransport | None = None,
     ) -> None:
         if (
@@ -841,7 +859,17 @@ class ArchilDeepInspector:
         self.api_key = api_key
         self.disk_id = disk_id
         self.region = region
-        self.duckdb_tool = duckdb_tool
+        tools = dict(duckdb_tools or {})
+        if duckdb_tool is not None:
+            tools.setdefault("linux-arm64", duckdb_tool)
+        if any(
+            arch not in set(TOOL_ARCHITECTURES.values())
+            or not isinstance(item, AgentExecObject)
+            for arch, item in tools.items()
+        ):
+            raise DeepInspectionError("deep_inspector_configuration_invalid")
+        self.duckdb_tool = tools.get("linux-arm64")
+        self.duckdb_tools = tools
         self.transport = transport or UrllibTransport()
 
     def execute(
@@ -973,7 +1001,7 @@ class ArchilDeepInspector:
         """Run DuckDB beside only authorized source/month Parquet shards."""
 
         if (
-            self.duckdb_tool is None
+            not self.duckdb_tools
             or not isinstance(tenant_id, str)
             or not tenant_id
             or not isinstance(program, str)
@@ -1001,13 +1029,13 @@ class ArchilDeepInspector:
             raise DeepInspectionError("deep_inspector_exec_invalid")
         command = _agent_exec_command(
             program=program,
-            objects=(*objects, self.duckdb_tool),
+            objects=(*objects, *self.duckdb_tools.values()),
             document_aliases={},
             record_spans={},
             routing_receipts={},
             timeout_seconds=timeout_seconds,
             dataset_aliases=dataset_aliases,
-            tool_object=self.duckdb_tool,
+            tool_objects=self.duckdb_tools,
             allow_missing_objects=True,
         )
         if len(command.encode()) > MAX_ARCHIL_COMMAND_BYTES:

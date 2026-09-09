@@ -585,9 +585,8 @@ class CanonicalV2ClientTest(unittest.TestCase):
             )
         self.assertEqual(result, artifact)
         self.assertEqual(opened.call_count, 3)
-        self.assertEqual(
-            [call.args[0] for call in slept.call_args_list],
-            [1, 2],
+        self._assert_jittered(
+            [call.args[0] for call in slept.call_args_list], [1, 2],
         )
         bodies = [
             json.loads(call.args[0].data)
@@ -623,10 +622,47 @@ class CanonicalV2ClientTest(unittest.TestCase):
         self.assertEqual(raised.exception.error_code, "archive_unavailable")
         self.assertNotIn("upstream", str(raised.exception))
         self.assertEqual(opened.call_count, 5)
-        self.assertEqual(
-            [call.args[0] for call in slept.call_args_list],
-            [1, 2, 4, 8],
+        self._assert_jittered(
+            [call.args[0] for call in slept.call_args_list], [1, 2, 4, 8],
         )
+
+    def _assert_jittered(self, delays: list[float], expected: list[float]) -> None:
+        """Backoff keeps its exponential shape with +/-25% jitter per attempt."""
+        self.assertEqual(len(delays), len(expected))
+        for delay, base in zip(delays, expected, strict=True):
+            self.assertTrue(base * 0.75 <= delay <= base * 1.25, (delay, base))
+
+    def test_archive_honors_retry_after_when_the_brain_is_busy(self) -> None:
+        archive = CanonicalArchiveClient(
+            endpoint="https://brain.example.invalid",
+            token="synthetic",
+            source_id="source:personal",
+            tenant_id="tenant:personal",
+            principal_id="principal:owner",
+        )
+        artifact = {"object_key": "objects/aa/" + "a" * 64, "content_sha256": "b" * 64, "size_bytes": 9}
+        busy = urllib.error.HTTPError(
+            "https://brain.example.invalid/v2/archive/objects", 503, "busy",
+            {"Retry-After": "40"}, io.BytesIO(b'{"error":"brain_busy"}'),
+        )
+        with (
+            mock.patch(
+                "client.mac.open_no_redirect",
+                side_effect=[busy, FakeResponse(201, artifact)],
+            ) as opened,
+            mock.patch("client.mac.time.sleep") as slept,
+        ):
+            result = archive.put_raw(
+                tenant_id="tenant:personal",
+                source_id="source:personal",
+                native_id="native:busy",
+                payload=b"synthetic",
+                media_type="application/json",
+                created_at="2026-07-20T00:00:00Z",
+            )
+        self.assertEqual(result, artifact)
+        self.assertEqual(opened.call_count, 2)
+        self._assert_jittered([call.args[0] for call in slept.call_args_list], [40])
 
 
 class ExplicitMemoryTest(unittest.TestCase):

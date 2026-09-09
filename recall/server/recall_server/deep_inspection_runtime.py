@@ -14,6 +14,15 @@ ARCHIL_SETTINGS = (
     "RECALL_ARCHIL_REGION",
     "RECALL_ARCHIL_DUCKDB_OBJECT_KEY",
     "RECALL_ARCHIL_DUCKDB_SHA256",
+    "RECALL_ARCHIL_DUCKDB_X86_64_OBJECT_KEY",
+    "RECALL_ARCHIL_DUCKDB_X86_64_SHA256",
+)
+
+# Env prefix -> published tool architecture. The unsuffixed pair is the
+# original arm64 build; the sandbox picks whichever matches its own machine.
+DUCKDB_TOOL_ENV = (
+    ("RECALL_ARCHIL_DUCKDB", "linux-arm64"),
+    ("RECALL_ARCHIL_DUCKDB_X86_64", "linux-x86_64"),
 )
 
 
@@ -49,27 +58,27 @@ def build_deep_inspector(
         if not isinstance(value, str) or not value.strip():
             raise ValueError("deep inspector configuration is incomplete")
         required[name] = value.strip()
-    tool_key_value = values.get("RECALL_ARCHIL_DUCKDB_OBJECT_KEY", "")
-    tool_sha256_value = values.get("RECALL_ARCHIL_DUCKDB_SHA256", "")
-    if not isinstance(tool_key_value, str) or not isinstance(
-        tool_sha256_value, str
-    ):
-        raise ValueError("DuckDB tool configuration is incomplete")
-    tool_key = tool_key_value.strip()
-    tool_sha256 = tool_sha256_value.strip()
-    if bool(tool_key) != bool(tool_sha256):
-        raise ValueError("DuckDB tool configuration is incomplete")
+    tools: dict[str, AgentExecObject] = {}
+    for prefix, arch in DUCKDB_TOOL_ENV:
+        tool_key_value = values.get(prefix + "_OBJECT_KEY", "")
+        tool_sha256_value = values.get(prefix + "_SHA256", "")
+        if not isinstance(tool_key_value, str) or not isinstance(
+            tool_sha256_value, str
+        ):
+            raise ValueError("DuckDB tool configuration is incomplete")
+        tool_key = tool_key_value.strip()
+        tool_sha256 = tool_sha256_value.strip()
+        if bool(tool_key) != bool(tool_sha256):
+            raise ValueError("DuckDB tool configuration is incomplete")
+        if tool_key:
+            tools[arch] = AgentExecObject(
+                object_key=tool_key,
+                content_sha256=tool_sha256,
+            )
     return ArchilDeepInspector(
         api_key=required["ARCHIL_API_KEY"],
         disk_id=required["RECALL_ARCHIL_DISK_ID"],
         region=required["RECALL_ARCHIL_REGION"],
-        duckdb_tool=(
-            AgentExecObject(
-                object_key=tool_key,
-                content_sha256=tool_sha256,
-            )
-            if tool_key
-            else None
-        ),
+        duckdb_tools=tools or None,
         transport=transport,
     )
