@@ -68,6 +68,23 @@ def child_env(
     return env
 
 
+def reply_body(text: str) -> str:
+    """Drop narration that precedes the addressed reply.
+
+    The harness's result is the whole final message; models sometimes think out
+    loud first ("Miguel was right and my first answer was wrong. Reporting.")
+    and only then write the reply that starts with the mention. The contract
+    says the message starts with the mention, so anything before the first line
+    that does is not for the thread.
+    """
+    stripped = (text or "").strip()
+    lines = stripped.splitlines()
+    for index, line in enumerate(lines):
+        if line.lstrip().startswith("<@U") and index > 0:
+            return "\n".join(lines[index:]).strip()
+    return stripped
+
+
 def is_silence(text: str) -> bool:
     """NO_REPLY as the whole message or as its last line means: do not post.
 
@@ -269,7 +286,11 @@ def compose_prompt(context: dict[str, Any], settings: ActiveSettings, launcher: 
         runtime_truth(launcher),
         "Reply contract: whatever you print is posted verbatim into the thread by Tether. Do "
         "not call tether reply/post/notify, do not mention bridge ids or reply keys, do not "
-        "write 'Reply to' headers or any note to your operator; the thread is your reader.",
+        "write 'Reply to' headers or any note to your operator; the thread is your reader. "
+        "Your message is only the reply: start it with the <@USERID> of the person you answer, "
+        "no preamble, no account of what you just did or thought. Lead with the answer, then "
+        "evidence. If you cannot do part of it, say so in one clause and do the rest; do not "
+        "offer a menu of options.",
         f"Reply in at most {max(settings.max_reply_sentences, 3)} short sentences, as a colleague: "
         "no meta-narration, no restating the question. Mention people as <@USERID>. If the "
         "messages need no reply from you, respond with exactly NO_REPLY.",
@@ -559,7 +580,7 @@ class ActiveSlice:
                 self._post_failure_notice(context, attempt, result)
             return
         final = self.runtime.attempt_context(attempt["attempt_id"])
-        text = self._read_response(final.get("response_ref"))
+        text = reply_body(self._read_response(final.get("response_ref")))
         if not text.strip():
             return
         try:
@@ -803,7 +824,7 @@ class ActiveSlice:
         reported = ""
         if seed_result.strip() and not is_silence(seed_result):
             try:
-                reported = self._post(channel_id, seed_result.strip(), thread_ts)
+                reported = self._post(channel_id, reply_body(seed_result), thread_ts)
             except BrokerRefused:
                 logger.error("tether: spawn could not post the seed result for %s", session_id, exc_info=True)
         return {"status": "spawned", "harness": kind, "session_id": session_id, "cwd": str(cwd),
