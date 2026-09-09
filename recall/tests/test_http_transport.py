@@ -63,3 +63,36 @@ class AuthenticatedTransportTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RetryDelayTest(unittest.TestCase):
+    def _error(self, retry_after: str | None) -> urllib.error.HTTPError:
+        headers = {} if retry_after is None else {"Retry-After": retry_after}
+        return urllib.error.HTTPError("https://brain.invalid/", 503, "busy", headers, None)
+
+    def test_exponential_backoff_is_capped_and_jittered(self) -> None:
+        from privacy.transport import retry_delay_seconds
+
+        for attempt in range(6):
+            delay = retry_delay_seconds(self._error(None), attempt, base_cap=10)
+            expected = min(2.0 ** attempt, 10)
+            self.assertTrue(expected * 0.75 <= delay <= expected * 1.25, (attempt, delay))
+
+    def test_retry_after_header_extends_the_delay(self) -> None:
+        from privacy.transport import retry_delay_seconds
+
+        delay = retry_delay_seconds(self._error("45"), 0, base_cap=10)
+        self.assertTrue(45 * 0.75 <= delay <= 45 * 1.25, delay)
+
+    def test_retry_after_never_exceeds_the_ceiling(self) -> None:
+        from privacy.transport import retry_delay_seconds
+
+        delay = retry_delay_seconds(self._error("100000"), 0, base_cap=10)
+        self.assertLessEqual(delay, 120 * 1.25)
+
+    def test_malformed_retry_after_and_non_http_errors_fall_back(self) -> None:
+        from privacy.transport import retry_delay_seconds
+
+        for error in (self._error("soon"), OSError("down"), None):
+            delay = retry_delay_seconds(error, 2, base_cap=10)
+            self.assertTrue(4 * 0.75 <= delay <= 4 * 1.25, (error, delay))

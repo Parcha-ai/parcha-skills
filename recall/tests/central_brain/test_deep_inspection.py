@@ -1084,6 +1084,78 @@ class DeepInspectionContractTests(unittest.TestCase):
             "RECALL_ARCHIL_DUCKDB_SHA256": "e" * 64,
         })
         self.assertEqual(inspector.duckdb_tool.content_sha256, "e" * 64)
+        self.assertEqual(set(inspector.duckdb_tools), {"linux-arm64"})
+
+    def test_runtime_accepts_one_duckdb_build_per_sandbox_architecture(self):
+        base = {
+            "RECALL_DEEP_INSPECTOR": "archil",
+            "ARCHIL_API_KEY": "synthetic-key",
+            "RECALL_ARCHIL_DISK_ID": "dsk-0123456789abcdef",
+            "RECALL_ARCHIL_REGION": "aws-us-west-2",
+            "RECALL_ARCHIL_DUCKDB_OBJECT_KEY": "objects/dd/" + "d" * 64,
+            "RECALL_ARCHIL_DUCKDB_SHA256": "e" * 64,
+            "RECALL_ARCHIL_DUCKDB_X86_64_OBJECT_KEY": "objects/11/" + "1" * 64,
+            "RECALL_ARCHIL_DUCKDB_X86_64_SHA256": "2" * 64,
+        }
+        inspector = build_deep_inspector(mock.Mock(), base)
+        self.assertEqual(
+            {arch: tool.content_sha256 for arch, tool in inspector.duckdb_tools.items()},
+            {"linux-arm64": "e" * 64, "linux-x86_64": "2" * 64},
+        )
+        with self.assertRaisesRegex(ValueError, "configuration is incomplete"):
+            build_deep_inspector(mock.Mock(), {
+                **base, "RECALL_ARCHIL_DUCKDB_X86_64_SHA256": "",
+            })
+        # An x86_64-only deployment is valid: the sandbox picks by machine.
+        only_x86 = {
+            key: value for key, value in base.items()
+            if key not in {"RECALL_ARCHIL_DUCKDB_OBJECT_KEY", "RECALL_ARCHIL_DUCKDB_SHA256"}
+        }
+        self.assertEqual(set(build_deep_inspector(mock.Mock(), only_x86).duckdb_tools), {"linux-x86_64"})
+
+    def test_parquet_scan_ships_every_architecture_build_and_selects_in_sandbox(self):
+        transport = RecordingTransport({
+            "success": True,
+            "data": {"stdout": "", "stderr": "", "exitCode": 0,
+                     "timing": {"totalMs": 1, "queueMs": 0, "executeMs": 1}},
+        })
+        arm = AgentExecObject(object_key="objects/dd/" + "d" * 64, content_sha256="e" * 64)
+        x86 = AgentExecObject(object_key="objects/11/" + "1" * 64, content_sha256="2" * 64)
+        data = AgentExecObject(object_key="objects/aa/" + "a" * 64, content_sha256="b" * 64)
+        ArchilDeepInspector(
+            api_key="synthetic-key",
+            disk_id="dsk-0123456789abcdef",
+            region="aws-us-west-2",
+            duckdb_tools={"linux-arm64": arm, "linux-x86_64": x86},
+            transport=transport,
+        ).execute_scan(
+            tenant_id=TENANT,
+            program="duckdb -c 'select 1'",
+            objects=(data,),
+            dataset_aliases={data.object_key: "s1/2026-08/passages-part-00000.parquet"},
+            timeout_seconds=30,
+        )
+        body = transport.calls[0]["body"]
+        command = body["command"]
+        self.assertIn("platform.machine()", command)
+        self.assertIn('"x86_64":"linux-x86_64"', command)
+        self.assertIn('"aarch64":"linux-arm64"', command)
+        self.assertIn("duckdb_stub=", command)
+        # Builds are admitted through the read-only evidence view, never inlined.
+        self.assertNotIn("d" * 64, command)
+        self.assertNotIn("1" * 64, command)
+
+    def test_duckdb_unavailable_stub_fails_loudly_for_an_unbuilt_architecture(self):
+        from recall_server.deep_inspection import DUCKDB_UNAVAILABLE_STUB
+
+        with tempfile.TemporaryDirectory() as directory:
+            stub = Path(directory) / "duckdb"
+            stub.write_text(DUCKDB_UNAVAILABLE_STUB)
+            stub.chmod(0o500)
+            result = subprocess.run([str(stub), "-c", "select 1"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 69)
+        self.assertIn("no published build for", result.stderr)
+        self.assertNotIn("Exec format error", result.stderr)
 
     def test_runtime_rejects_required_or_residual_archil_configuration_when_off(self):
         for environment in (
@@ -1271,3 +1343,51 @@ class DeepInspectionContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DuckdbReleaseFetchTests(unittest.TestCase):
+    def _zip(self, members: dict[str, bytes]) -> bytes:
+        import io
+        import zipfile
+
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as bundle:
+            for name, data in members.items():
+                bundle.writestr(name, data)
+        return buffer.getvalue()
+
+    def _patched_fetch(self, archive: bytes, url: str, *, zip_sha256: str) -> bytes:
+        import hashlib
+        from recall_server.cli import fetch_duckdb_release_binary
+
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.geturl.return_value = url
+        response.read.return_value = archive
+        with mock.patch("urllib.request.urlopen", return_value=response):
+            return fetch_duckdb_release_binary(url, zip_sha256=zip_sha256 or hashlib.sha256(archive).hexdigest())
+
+    def test_official_release_zip_is_verified_and_unpacked(self):
+        import hashlib
+
+        archive = self._zip({"duckdb": b"\x7fELF-synthetic"})
+        url = "https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-amd64.zip"
+        self.assertEqual(
+            self._patched_fetch(archive, url, zip_sha256=hashlib.sha256(archive).hexdigest()),
+            b"\x7fELF-synthetic",
+        )
+
+    def test_release_fetch_rejects_wrong_digest_url_or_layout(self):
+        import hashlib
+
+        archive = self._zip({"duckdb": b"x"})
+        good = "https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-arm64.zip"
+        with self.assertRaisesRegex(ValueError, "digest mismatch"):
+            self._patched_fetch(archive, good, zip_sha256="0" * 64)
+        with self.assertRaisesRegex(ValueError, "download is invalid"):
+            self._patched_fetch(archive, "https://example.invalid/duckdb.zip", zip_sha256=hashlib.sha256(archive).hexdigest())
+        with self.assertRaisesRegex(ValueError, "download is invalid"):
+            self._patched_fetch(archive, good.replace("https://", "http://"), zip_sha256=hashlib.sha256(archive).hexdigest())
+        extra = self._zip({"duckdb": b"x", "README": b"y"})
+        with self.assertRaisesRegex(ValueError, "layout is unexpected"):
+            self._patched_fetch(extra, good, zip_sha256=hashlib.sha256(extra).hexdigest())

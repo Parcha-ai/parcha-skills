@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import psycopg
-from psycopg_pool import ConnectionPool
+from psycopg_pool import ConnectionPool, PoolTimeout
 from psycopg.rows import dict_row
 
 from . import PROJECTOR_VERSION
@@ -126,6 +126,7 @@ class BrainStore:
         self.dsn = dsn
         self._pool: ConnectionPool | None = None
         self._pool_lock = threading.Lock()
+        self._last_ready_at: float | None = None
         try:
             configured_pool_size = (
                 pool_max_size
@@ -1356,13 +1357,38 @@ class BrainStore:
             "replay": replay,
         }
 
+    READINESS_BUSY_GRACE_SECONDS = 120.0
+
     def readiness(self) -> dict[str, str]:
-        """Prove the database is reachable without scanning runtime data."""
-        with self.connect() as conn:
-            row = conn.execute("SELECT 1 AS ready").fetchone()
+        """Prove the database is reachable without scanning runtime data.
+
+        A saturated connection pool means the process is alive and busy serving
+        ingest, not dead. Reporting that as "not ready" makes the platform kill
+        a healthy instance under load and the retrying collectors then stampede
+        the replacement. When every pooled connection is in use, answer "busy"
+        as long as a real probe succeeded recently; only a failing probe or a
+        prolonged inability to reach the database is "not ready".
+        """
+        try:
+            with self._readiness_connection() as conn:
+                row = conn.execute("SELECT 1 AS ready").fetchone()
+        except PoolTimeout:
+            last = self._last_ready_at
+            if last is not None and time.monotonic() - last <= self.READINESS_BUSY_GRACE_SECONDS:
+                return {"status": "busy"}
+            raise
         if not row or row["ready"] != 1:
             raise RuntimeError("database readiness probe failed")
+        self._last_ready_at = time.monotonic()
         return {"status": "ready"}
+
+    def _readiness_connection(self):
+        """A pooled connection with a short wait so the probe answers quickly."""
+        if self._pool is None:
+            self.connect()
+        if self._pool is not None:
+            return self._pool.connection(timeout=1.0)
+        return self.connect()
 
     def operational_health(self) -> dict[str, str | int]:
         """Return client health without scanning the corpus or exact metric totals."""

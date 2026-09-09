@@ -21,7 +21,7 @@ from skills.recall.scripts.codex_identity import (
     stable_codex_record_key,
 )
 from privacy.policy import PrivacyPolicy, summarize_receipts
-from privacy.transport import open_no_redirect
+from privacy.transport import open_no_redirect, retry_delay_seconds
 
 COLLECTOR_VERSION = 1
 MAX_BATCH_BYTES = 8_000_000
@@ -1645,7 +1645,9 @@ class Collector:
                 headers={"Authorization": "Bearer " + self.token, "Content-Type": "application/json", "Idempotency-Key": key},
             )
             acknowledgement = None
+            last_error = None
             for attempt in range(5):
+                last_error = None
                 try:
                     if self.brain_writer is not None:
                         acknowledgement = self.brain_writer.ingest(events)
@@ -1670,6 +1672,7 @@ class Collector:
                             else "brain_rejected"
                         )
                         return result
+                    last_error = exc
                     self._record_error("brain_unavailable")
                 except PermissionError:
                     result["errors"] += 1
@@ -1690,7 +1693,7 @@ class Collector:
                     result["errors"] += 1
                     self._record_error("brain_unavailable")
                 if attempt < 4:
-                    time.sleep(min(2 ** attempt, 10))
+                    time.sleep(retry_delay_seconds(last_error, attempt, base_cap=10))
             if acknowledgement is None:
                 return result
             receipts = acknowledgement.get("receipts", [])

@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import random
 import socket
 import socketserver
 import stat
@@ -13,6 +14,8 @@ import struct
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from psycopg_pool import PoolTimeout
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 from .admin_web import (
@@ -66,6 +69,8 @@ from connectors.slack_events import slack_event_to_webhook
 
 LOG = logging.getLogger("recall.brainstore")
 MAX_BODY_BYTES = 12 * 1024 * 1024
+POOL_BUSY_RETRY_MIN = 20
+POOL_BUSY_RETRY_MAX = 90
 MAX_CANONICAL_EVENTS_BYTES = 8_000_000
 MAX_ADMIN_BODY_BYTES = 64 * 1024
 SLACK_WEBHOOK_PATH = "/webhooks/v1/slack"
@@ -89,6 +94,7 @@ MCP_BRAIN_PATH = re.compile(
 COUNTERS = {
     "http_requests": 0,
     "http_errors": 0,
+    "http_pool_busy": 0,
     "http_duration_count": 0,
     "http_duration_sum": 0.0,
     "auth_denied": 0,
@@ -601,6 +607,9 @@ class Handler(BaseHTTPRequestHandler):
             "# HELP recall_http_errors_total HTTP responses with status 4xx or 5xx.",
             "# TYPE recall_http_errors_total counter",
             f"recall_http_errors_total {counters['http_errors']}",
+            "# HELP recall_http_pool_busy_total Requests refused with 503 because every database connection was in use.",
+            "# TYPE recall_http_pool_busy_total counter",
+            f"recall_http_pool_busy_total {counters['http_pool_busy']}",
             "# HELP recall_http_request_duration_seconds Request handling time without route or content labels.",
             "# TYPE recall_http_request_duration_seconds summary",
             f"recall_http_request_duration_seconds_count {counters['http_duration_count']}",
@@ -629,7 +638,24 @@ class Handler(BaseHTTPRequestHandler):
         with COUNTER_LOCK:
             COUNTERS["http_requests"] += 1
         try:
-            super().handle_one_request()
+            try:
+                super().handle_one_request()
+            except PoolTimeout:
+                # Every pooled database connection is busy. Tell the client to
+                # back off instead of dropping the socket, so collectors do not
+                # retry in a tight loop while the instance is under load.
+                with COUNTER_LOCK:
+                    COUNTERS["http_pool_busy"] += 1
+                retry_after = str(random.randint(POOL_BUSY_RETRY_MIN, POOL_BUSY_RETRY_MAX))
+                self.close_connection = True
+                try:
+                    self.send_json(
+                        503,
+                        {"error": "brain_busy", "retry_after_seconds": int(retry_after)},
+                        headers=[("Retry-After", retry_after)],
+                    )
+                except (OSError, ValueError):
+                    pass
         finally:
             with COUNTER_LOCK:
                 COUNTERS["http_duration_count"] += 1

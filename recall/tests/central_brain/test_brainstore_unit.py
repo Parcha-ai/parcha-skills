@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -34,6 +35,10 @@ from recall_server.actor_attribution import (
     actor_id_for_principal,
     claimable_actor_for_display_name,
 )
+from http.server import BaseHTTPRequestHandler
+
+from psycopg_pool import PoolTimeout
+
 from recall_server.app import Handler, serve, serve_unix, validate_http_profile
 from recall_server.capture import build_capture_event
 from recall_server.db import (
@@ -2383,3 +2388,79 @@ class EnvelopeContractTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IngestBackpressureTest(unittest.TestCase):
+    """A saturated pool is "busy", never "dead"; clients are told to back off."""
+
+    def _busy_store(self) -> BrainStore:
+        store = BrainStore("postgresql://synthetic.invalid/recall")
+        pool = mock.MagicMock()
+        pool.connection.side_effect = PoolTimeout("couldn't get a connection")
+        store._pool = pool
+        return store
+
+    def test_readiness_reports_busy_when_pool_saturated_after_recent_success(self) -> None:
+        store = self._busy_store()
+        store._last_ready_at = time.monotonic()
+
+        self.assertEqual(store.readiness(), {"status": "busy"})
+        store._pool.connection.assert_called_once_with(timeout=1.0)
+
+    def test_readiness_fails_when_pool_saturated_with_no_recent_success(self) -> None:
+        store = self._busy_store()
+        store._last_ready_at = None
+
+        with self.assertRaises(PoolTimeout):
+            store.readiness()
+
+    def test_readiness_fails_when_busy_grace_expired(self) -> None:
+        store = self._busy_store()
+        store._last_ready_at = time.monotonic() - store.READINESS_BUSY_GRACE_SECONDS - 1
+
+        with self.assertRaises(PoolTimeout):
+            store.readiness()
+
+    def test_readiness_records_successful_probe_time(self) -> None:
+        connection = mock.MagicMock()
+        connection.execute.return_value.fetchone.return_value = {"ready": 1}
+        context = mock.MagicMock()
+        context.__enter__.return_value = connection
+        store = BrainStore("postgresql://synthetic.invalid/recall")
+        store.connect = mock.MagicMock(return_value=context)
+
+        self.assertIsNone(store._last_ready_at)
+        self.assertEqual(store.readiness(), {"status": "ready"})
+        self.assertIsNotNone(store._last_ready_at)
+
+    def test_pool_timeout_becomes_503_with_retry_after(self) -> None:
+        handler = object.__new__(Handler)
+        handler.send_json = mock.MagicMock()
+        with mock.patch.object(
+            BaseHTTPRequestHandler, "handle_one_request",
+            side_effect=PoolTimeout("couldn't get a connection"),
+        ):
+            Handler.handle_one_request(handler)
+
+        self.assertTrue(handler.close_connection)
+        status, body = handler.send_json.call_args.args
+        headers = handler.send_json.call_args.kwargs["headers"]
+        self.assertEqual(status, 503)
+        self.assertEqual(body["error"], "brain_busy")
+        retry_after = dict(headers)["Retry-After"]
+        self.assertEqual(int(retry_after), body["retry_after_seconds"])
+        self.assertTrue(20 <= int(retry_after) <= 90)
+
+    def test_pool_timeout_response_is_counted_for_metrics(self) -> None:
+        from recall_server import app as app_module
+
+        before = app_module.COUNTERS["http_pool_busy"]
+        handler = object.__new__(Handler)
+        handler.send_json = mock.MagicMock()
+        with mock.patch.object(
+            BaseHTTPRequestHandler, "handle_one_request",
+            side_effect=PoolTimeout("busy"),
+        ):
+            Handler.handle_one_request(handler)
+
+        self.assertEqual(app_module.COUNTERS["http_pool_busy"], before + 1)

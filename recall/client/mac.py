@@ -24,7 +24,7 @@ except ModuleNotFoundError:  # installed bundle imports sibling package
     from ..collector.collector import canonical_json, sanitize
 
 from privacy.policy import PrivacyPolicy, summarize_receipts
-from privacy.transport import open_no_redirect
+from privacy.transport import open_no_redirect, retry_delay_seconds
 
 
 FORBIDDEN_PRIVATE_PATHS = (
@@ -506,9 +506,11 @@ class CanonicalArchiveClient(_CanonicalClient):
         }
         for attempt in range(MAX_CANONICAL_ARCHIVE_ATTEMPTS):
             retryable = False
+            last_error = None
             try:
                 return self._request("/v2/archive/objects", body=body)
             except urllib.error.HTTPError as error:
+                last_error = error
                 if error.code == 409:
                     try:
                         response = json.loads(error.read(4096))
@@ -526,7 +528,7 @@ class CanonicalArchiveClient(_CanonicalClient):
                 retryable = True
             if not retryable or attempt + 1 == MAX_CANONICAL_ARCHIVE_ATTEMPTS:
                 raise CanonicalClientError("archive_unavailable") from None
-            time.sleep(min(2**attempt, 8))
+            time.sleep(retry_delay_seconds(last_error, attempt, base_cap=8))
         raise AssertionError("unreachable")
 
 
