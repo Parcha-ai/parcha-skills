@@ -298,6 +298,10 @@ class ActiveSliceTest(unittest.TestCase):
                 def get_config(self, key, default=None):
                     return default
 
+                def register_tool(self, name, toolset, schema, handler, **kwargs):
+                    self.tools = getattr(self, "tools", {})
+                    self.tools[name] = (toolset, schema, handler)
+
                 def on_unload(self, callback):
                     self.unload.append(callback)
 
@@ -305,9 +309,36 @@ class ActiveSliceTest(unittest.TestCase):
                     dispatched.append((name, args))
                     return json.dumps({"success": True})
 
+            # a Hermes state.db row maps the tool call's session to its Slack thread
+            (home).mkdir(parents=True, exist_ok=True)
+            state = sqlite3.connect(home / "state.db")
+            state.executescript(
+                "CREATE TABLE sessions(id TEXT, source TEXT, chat_id TEXT, thread_id TEXT, user_id TEXT);"
+                "INSERT INTO sessions VALUES('hermes-s1','slack','C1','300.1','U12345678');"
+            )
+            state.commit()
+            state.close()
+            fake = pathlib.Path(self.temp.name) / "fake-claude-json"
+            fake.write_text("#!/bin/sh\necho \"{\\\"type\\\":\\\"result\\\",\\\"session_id\\\":\\\"s-$$\\\"}\"\n", encoding="utf-8")
+            fake.chmod(0o700)
+            (config_home / "tether" / "config.toml").write_text(
+                'active = true\nteam_id = "T12345678"\nallowed_users = ["U12345678"]\nlauncher = "direct"\n'
+                f'claude_binary = "{fake}"\nclaude_resume_args = []\n',
+                encoding="utf-8",
+            )
             ctx = Ctx()
             self.plugin_next.register(ctx)
             hook = ctx.hooks["pre_gateway_dispatch"]
+            # The model gets a first-class verb: tether_spawn binds a fresh session to the calling thread.
+            toolset, schema, spawn = ctx.tools["tether_spawn"]
+            self.assertEqual(toolset, "tether")
+            self.assertEqual(schema["parameters"]["required"], ["task"])
+            told = spawn({"task": "look into the flash_model migration", "cwd": self.temp.name}, session_id="hermes-s1")
+            self.assertIn("Started a claude session s-", told)
+            self.assertIn("thread 300.1 in C1", told)
+            again = spawn({"task": "and again"}, session_id="hermes-s1")
+            self.assertIn("already tethered", again)
+            self.assertIn("Slack conversation only", spawn({"task": "x"}, session_id="unknown"))
             # Unbound thread: observed, not claimed.
             self.assertIsNone(hook(event=FakeEvent("hi")))
             # Bind through the CLI surface, then the same event is claimed.

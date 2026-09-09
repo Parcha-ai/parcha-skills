@@ -208,7 +208,8 @@ def load_active_settings(path: Path) -> ActiveSettings:
         session_idle_seconds=integer("session_idle_seconds", 900),
         codex_driver=str(raw.get("codex_driver") or "app-server"),
         presence=bool(raw.get("presence", True)),
-        extra={"default_channel": str(raw.get("default_channel") or "")},
+        extra={"default_channel": str(raw.get("default_channel") or ""),
+               "default_cwd": str(raw.get("default_cwd") or "")},
     )
 
 

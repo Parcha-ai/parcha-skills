@@ -266,6 +266,80 @@ def register(ctx: Any) -> None:
         return None
 
     ctx.register_hook("transform_llm_output", on_transform_llm_output)
+
+    # -- agent tools: Tether verbs the model can call directly -------------------
+
+    def _session_thread(session_id: str) -> dict[str, str]:
+        """Slack channel/thread/user of the Hermes session a tool call came from."""
+        try:
+            connection = sqlite3.connect(f"file:{home / 'state.db'}?mode=ro", uri=True, timeout=2)
+            try:
+                row = connection.execute(
+                    "SELECT source, chat_id, thread_id, user_id FROM sessions WHERE id=?", (session_id,)
+                ).fetchone()
+            finally:
+                connection.close()
+        except (sqlite3.Error, OSError):
+            row = None
+        if not row or row[0] != "slack":
+            return {}
+        return {"channel_id": str(row[1] or ""), "thread_ts": str(row[2] or ""), "user_id": str(row[3] or "")}
+
+    def tether_spawn(args: dict, session_id: str = "", **_kwargs: Any) -> str:
+        """Start a Claude Code / Codex session for a task and bind it to this thread."""
+        if slice_ is None:
+            return "Tether is not active on this gateway."
+        task = str(args.get("task") or "").strip()
+        if not task:
+            return "task is required: the request, verbatim, plus any links."
+        where = _session_thread(session_id)
+        if not where.get("channel_id"):
+            return "This tool works from a Slack conversation only."
+        cwd = str(args.get("cwd") or active_settings.extra.get("default_cwd") or Path.home())
+        request = {
+            "op": "spawn", "task": task, "harness": str(args.get("harness") or "claude"), "cwd": cwd,
+            "channel_id": where["channel_id"], "thread_ts": where.get("thread_ts") or "",
+            "actor": where.get("user_id") or "",
+        }
+        try:
+            result = slice_.handle(request)
+        except broker_module.BrokerRefused as refused:
+            if refused.code in ("thread_claim_conflict", "idempotency_conflict"):
+                return ("This thread is already tethered to a session; that session will pick the message up. "
+                        "Reply that you are on it, nothing else.")
+            return f"Could not start a session ({refused.code}): {refused}"
+        return (
+            f"Started a {result['harness']} session {result['session_id']} in {result['cwd']}, bound to "
+            f"thread {result['thread_ts']} in {result['channel_id']}. It has the task and will report in "
+            "this thread with evidence. Reply with one short sentence saying it is running; do not restate the task."
+        )
+
+    if hasattr(ctx, "register_tool"):
+        try:
+            ctx.register_tool(
+                name="tether_spawn", toolset="tether",
+                schema={
+                    "name": "tether_spawn",
+                    "description": (
+                        "Hand a task to a fresh Claude Code (or Codex) session on this machine and bind it to "
+                        "the current Slack thread. Use it whenever a person asks for work in a repo, in "
+                        "'claude code', in 'a session', or for anything that needs the terminal, tests, git or "
+                        "a PR. Pass the request verbatim (with links) as task and the repo path as cwd."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "task": {"type": "string", "description": "The request, verbatim, with links and context."},
+                            "cwd": {"type": "string", "description": "Repository or working directory for the session."},
+                            "harness": {"type": "string", "enum": ["claude", "codex"], "description": "Which harness; default claude."},
+                        },
+                        "required": ["task"],
+                    },
+                },
+                handler=tether_spawn, description="Start a tethered Claude Code / Codex session for a task", emoji="🧵",
+            )
+        except Exception:
+            logger.warning("tether: could not register the tether_spawn tool", exc_info=True)
     if slice_ is not None:
         slice_.start()
         broker = getattr(slice_, "broker", None)
