@@ -187,7 +187,9 @@ class BrokerTest(unittest.TestCase):
         spawned = self.call(op="spawn", harness="claude", task="fix the flaky test", cwd=self.temp.name)
         self.assertTrue(spawned["ok"], spawned)
         self.assertEqual(spawned["session_id"], "sess-spawned")
-        self.assertEqual(created, [("claude_session", self.temp.name, "fix the flaky test")])
+        self.assertEqual((created[0][0], created[0][1]), ("claude_session", self.temp.name))
+        self.assertTrue(created[0][2].startswith("fix the flaky test"))
+        self.assertIn("Do not post to Slack yourself", created[0][2])
         # No thread given: a root was posted and the new thread is bound.
         self.assertEqual(self.slack.posts[-1][0], "C1")
         self.assertIn("On it: fix the flaky test", self.slack.posts[-1][1])

@@ -301,14 +301,21 @@ def create_session(
         command = [binary, "exec", "--json", *settings.codex_resume_args, task]
         command, env, _ = launch_plan(command, cwd, env, settings)
         completed = runner(command, cwd=str(cwd), env=env, input="", capture_output=True, text=True, timeout=timeout)  # nosec B603
+        thread_id, texts = "", []
         for line in completed.stdout.splitlines():
             try:
                 event = json.loads(line)
             except ValueError:
                 continue
             if event.get("type") == "thread.started" and event.get("thread_id"):
-                return str(event["thread_id"])
-        raise RuntimeError(f"codex did not report a thread id (exit {completed.returncode})")
+                thread_id = str(event["thread_id"])
+            item = event.get("item") or {}
+            if event.get("type") == "item.completed" and item.get("type") == "agent_message" and item.get("text"):
+                texts.append(str(item["text"]))
+        if not thread_id:
+            raise RuntimeError(f"codex did not report a thread id (exit {completed.returncode})")
+        _LAST_SEED_RESULT[thread_id] = texts[-1] if texts else ""
+        return thread_id
     binary = shutil.which(settings.claude_binary) or settings.claude_binary
     command = [binary, "-p", "--output-format", "json", *settings.claude_resume_args, task]
     # Same launcher as bound turns: a spawned session's first turn must not run
@@ -318,7 +325,33 @@ def create_session(
     session_id = claude_session_id(completed.stdout)
     if not session_id:
         raise RuntimeError(f"claude did not report a session id (exit {completed.returncode})")
+    _LAST_SEED_RESULT[session_id] = claude_result_text(completed.stdout)
     return session_id
+
+
+# Seed-turn results by session id, consumed once by op_spawn to post the first reply.
+_LAST_SEED_RESULT: dict[str, str] = {}
+
+
+def claude_result_text(stdout: str) -> str:
+    """The `result` of `claude -p --output-format json` (object or event array)."""
+    text = (stdout or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = json.loads(text)
+        events = parsed if isinstance(parsed, list) else [parsed]
+    except ValueError:
+        events = []
+        for line in text.splitlines():
+            try:
+                events.append(json.loads(line))
+            except ValueError:
+                continue
+    for event in reversed(events):
+        if isinstance(event, dict) and event.get("type") == "result" and event.get("result"):
+            return str(event["result"])
+    return ""
 
 
 def claude_session_id(stdout: str) -> str:
@@ -747,10 +780,19 @@ class ActiveSlice:
         thread_ts = str(request.get("thread_ts") or "")
         if not channel_id:
             raise BrokerRefused("channel_required")
+        seed = (
+            f"{task}\n\n"
+            "Tether: this session is bound to the Slack thread that asked. Whatever you print at the end "
+            "of this turn is posted there by Tether, and later replies in that thread continue this "
+            "session. Do not post to Slack yourself (no tether post/notify/reply, no Slack tools). Do the "
+            "work, then end with a short report with evidence: file and line, command and exit code, PR "
+            "link, test count. Mention people as <@USERID>. If nothing needs saying, end with exactly NO_REPLY."
+        )
         try:
-            session_id = self._create_session(source_kind, cwd, task)
+            session_id = self._create_session(source_kind, cwd, seed)
         except Exception as exc:
             raise BrokerRefused("spawn_failed", str(exc)[:300]) from exc
+        seed_result = _LAST_SEED_RESULT.pop(session_id, "")
         if not thread_ts:
             root = str(request.get("root_text") or "").strip() or f"On it: {task[:200]}"
             thread_ts = self._post(channel_id, root, None)
@@ -758,9 +800,15 @@ class ActiveSlice:
             source_kind=source_kind, session_id=session_id, cwd=str(cwd), team_id=team_id,
             channel_id=channel_id, thread_ts=thread_ts, owner_user_id=self._owner(request),
         )
+        reported = ""
+        if seed_result.strip() and not is_silence(seed_result):
+            try:
+                reported = self._post(channel_id, seed_result.strip(), thread_ts)
+            except BrokerRefused:
+                logger.error("tether: spawn could not post the seed result for %s", session_id, exc_info=True)
         return {"status": "spawned", "harness": kind, "session_id": session_id, "cwd": str(cwd),
                 "team_id": team_id, "channel_id": channel_id, "thread_ts": thread_ts,
-                "bridge_id": binding["binding_id"]}
+                "bridge_id": binding["binding_id"], "reported_ts": reported}
 
     def _create_session(self, source_kind: str, cwd: Path, task: str) -> str:
         return create_session(source_kind, cwd, task, self.settings)
