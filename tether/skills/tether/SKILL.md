@@ -9,6 +9,14 @@ Keep Slack threads attached to the agents that created them.
 
 Use the local Hermes broker as the single Slack boundary. Create a bridge only when the user asks for a Slack notification or an operator automation is explicitly configured to publish one.
 
+## Files: videos, images, PDFs
+
+Post files natively, never as a link to a page: `--file /abs/path.mp4` on `notify`, `post`
+or `reply`. The file lands in the channel or thread exactly like a person dragging it in, with
+the text as its comment (text is optional with `--file`). Do not upload to a docs host and
+link it; do not describe the file instead of sending it. Verify with `tether thread` that the
+message carries the file.
+
 ## Send
 
 Pass the message on standard input:

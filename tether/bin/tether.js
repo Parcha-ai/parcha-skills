@@ -398,13 +398,13 @@ function printHelp(command = "") {
     doctor: "tether doctor [--json] [--socket PATH] [--timeout-ms MS]",
     identity: "tether identity [--json] [--socket PATH] [--timeout-ms MS]",
     maintenance: "tether maintenance [--json] [--socket PATH] [--timeout-ms MS]",
-    notify: "tether notify (--text-stdin|--text-fd FD|--text TEXT [deprecated]) --idempotency-key KEY [--run-id ID|--hermes-session-id ID] [--channel ID] [--team ID]",
-    reply: "tether reply --bridge-id ID (--text-stdin|--text-fd FD|--text TEXT [deprecated]) --reply-key KEY [--team ID]",
+    notify: "tether notify (--text-stdin|--text-fd FD|--text TEXT [deprecated]) [--file PATH] --idempotency-key KEY [--run-id ID|--hermes-session-id ID] [--channel ID] [--team ID]",
+    reply: "tether reply --bridge-id ID (--text-stdin|--text-fd FD|--text TEXT [deprecated]) [--file PATH] --reply-key KEY [--team ID]",
     attach: "tether attach --channel ID --thread-ts TS --idempotency-key KEY [source options]",
     rebind: "tether rebind --channel ID --thread-ts TS [source options] [--team ID]",
     close: "tether close --bridge-id ID | --channel ID --thread-ts TS [--team ID] [--expected-generation N]",
     unbind: "tether unbind --bridge-id ID | --channel ID --thread-ts TS [--team ID] [--expected-generation N]",
-    post: "tether post --channel ID --thread-ts TS (--text-stdin|--text-fd FD|--text TEXT [deprecated]) --idempotency-key KEY [--team ID]",
+    post: "tether post --channel ID --thread-ts TS (--text-stdin|--text-fd FD|--text TEXT [deprecated]) [--file PATH] --idempotency-key KEY [--team ID]",
     team: "tether team apply|status   (apply the shared team layer to this agent's SOUL.md)",
     spawn: "tether spawn --task TEXT [--harness claude|codex] [--cwd DIR] [--channel ID] [--thread-ts TS] [--root-text TEXT] [--team ID]",
     unresolved: "tether unresolved [--team ID] [--json]",
@@ -565,6 +565,9 @@ function resolveMessageText(options) {
     options["text-stdin"] === true,
     options["text-fd"] !== undefined,
   ].filter(Boolean).length;
+  if (sources === 0 && stringValue(options.file)) {
+    return "";  // a native attachment can stand alone; the file is the message
+  }
   if (sources !== 1) {
     throw new CliError(
       "Choose exactly one of --text-stdin, --text-fd, or deprecated --text.",
@@ -592,11 +595,22 @@ function resolveMessageText(options) {
   return readBoundedText(descriptor, `fd ${descriptor}`);
 }
 
+function attachmentPath(options) {
+  const raw = stringValue(options.file);
+  if (!raw) return undefined;
+  const resolved = path.resolve(raw);
+  if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
+    throw new CliError(`--file does not exist or is not a file: ${resolved}`);
+  }
+  return resolved;
+}
+
 function messageDefinitions(extra = {}) {
   return {
     text: { type: "value" },
     "text-stdin": { type: "flag" },
     "text-fd": { type: "value" },
+    file: { type: "value" },
     ...extra,
   };
 }
@@ -1310,6 +1324,7 @@ async function runBrokerCommand(command, argv) {
       bridge_id: requireOption(options, "bridge-id"),
       reply_key: requireOption(options, "reply-key"),
       text: messageText,
+      file: attachmentPath(options),
       team_id: stringValue(options.team),
     };
   } else if (command === "spawn") {
@@ -1329,6 +1344,7 @@ async function runBrokerCommand(command, argv) {
       channel_id: requireOption(options, "channel"),
       thread_ts: requireOption(options, "thread-ts"),
       text: messageText,
+      file: attachmentPath(options),
       idempotency_key: requireOption(options, "idempotency-key"),
       team_id: stringValue(options.team),
     };
@@ -1405,7 +1421,7 @@ async function runBrokerCommand(command, argv) {
         channel_id: stringValue(options.channel),
         team_id: stringValue(options.team),
         idempotency_key: requireOption(options, "idempotency-key"),
-        file_path: stringValue(options.file) || null,
+        file: attachmentPath(options),
       };
     }
   }

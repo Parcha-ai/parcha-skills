@@ -690,7 +690,8 @@ class ActiveSlice:
     def op_notify(self, request: dict[str, Any]) -> dict[str, Any]:
         """Post a root message and bind the calling session to its thread."""
         text = str(request.get("text") or "").strip()
-        if not text:
+        file = self._file(request)
+        if not text and not file:
             raise BrokerRefused("text_required")
         kind, session_id, cwd = self._source(request)
         team_id = self._team(request)
@@ -719,7 +720,7 @@ class ActiveSlice:
             return {"status": "duplicate", "state": "posted", "team_id": team_id,
                     "channel_id": channel_id, "thread_ts": binding["thread_ts"],
                     "message_ts": binding["thread_ts"], "bridge_id": binding["binding_id"]}
-        ts = self._post(channel_id, text, None)
+        ts = self._post(channel_id, text, None, file=file)
         binding = self.runtime.activate_binding(binding["binding_id"], ts)
         return {"status": "posted", "state": "posted", "team_id": team_id, "channel_id": channel_id,
                 "thread_ts": ts, "message_ts": ts, "bridge_id": binding["binding_id"]}
@@ -828,13 +829,14 @@ class ActiveSlice:
 
     def op_thread_reply(self, request: dict[str, Any]) -> dict[str, Any]:
         text = str(request.get("text") or "").strip()
+        file = self._file(request)
         channel_id = str(request.get("channel_id") or "")
         thread_ts = str(request.get("thread_ts") or "")
-        if not text or not channel_id or not thread_ts:
-            raise BrokerRefused("thread_required", "channel, thread-ts and text are required")
-        if self.runtime_is_no_reply(text):
+        if (not text and not file) or not channel_id or not thread_ts:
+            raise BrokerRefused("thread_required", "channel, thread-ts and text or file are required")
+        if text and not file and self.runtime_is_no_reply(text):
             return {"status": "no_reply", "team_id": self._team(request), "channel_id": channel_id, "thread_ts": thread_ts}
-        ts = self._post(channel_id, text, thread_ts)
+        ts = self._post(channel_id, text, thread_ts, file=file)
         team_id = self._team(request)
         # An operator posting into a bound thread through the broker is an
         # instruction to the session that owns it. Slack ingress would drop it
@@ -851,14 +853,15 @@ class ActiveSlice:
         """A bound session answering its thread by binding id (legacy `tether reply`)."""
         binding_id = str(request.get("bridge_id") or "")
         text = str(request.get("text") or "")
+        file = self._file(request)
         context = self.runtime.binding_thread(binding_id) if hasattr(self.runtime, "binding_thread") else None
         if context is None:
             raise BrokerRefused("binding_unknown")
-        if self.runtime_is_no_reply(text):
+        if not file and self.runtime_is_no_reply(text):
             return {"status": "no_reply", "bridge_id": binding_id, "team_id": context["team_id"],
                     "channel_id": context["channel_id"], "thread_ts": context["thread_ts"],
                     "reply_key": request.get("reply_key")}
-        ts = self._post(context["channel_id"], text.strip(), context["thread_ts"])
+        ts = self._post(context["channel_id"], text.strip(), context["thread_ts"], file=file)
         return {"status": "posted", "bridge_id": binding_id, "team_id": context["team_id"],
                 "channel_id": context["channel_id"], "thread_ts": context["thread_ts"],
                 "message_ts": ts, "reply_key": request.get("reply_key")}
@@ -899,8 +902,26 @@ class ActiveSlice:
             raise BrokerRefused("slack_unconfigured", "no Slack bot token in the gateway")
         return slack
 
-    def _post(self, channel_id: str, text: str, thread_ts: str | None) -> str:
+    @staticmethod
+    def _file(request: dict[str, Any]) -> str | None:
+        """An absolute, readable file to attach natively; refused otherwise."""
+        raw = str(request.get("file") or "").strip()
+        if not raw:
+            return None
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            raise BrokerRefused("file_path_relative", "pass an absolute --file path")
+        if not path.is_file():
+            raise BrokerRefused("file_missing", str(path))
+        if path.stat().st_size > 1_000_000_000:
+            raise BrokerRefused("file_too_large", "Slack refuses files over 1 GB")
+        return str(path)
+
+    def _post(self, channel_id: str, text: str, thread_ts: str | None, file: str | None = None) -> str:
+        """Post text, or a native file attachment with the text as its comment."""
         try:
+            if file:
+                return str(self._slack().upload(channel_id, file, thread_ts=thread_ts, initial_comment=text or None)["ts"])
             return self._slack().post(channel_id, text, thread_ts=thread_ts)
         except BrokerRefused:
             raise
