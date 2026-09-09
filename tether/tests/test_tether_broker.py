@@ -190,6 +190,10 @@ class BrokerTest(unittest.TestCase):
         self.assertEqual((created[0][0], created[0][1]), ("claude_session", self.temp.name))
         self.assertTrue(created[0][2].startswith("fix the flaky test"))
         self.assertIn("Do not post to Slack yourself", created[0][2])
+        self.assertNotIn("Asked by", created[0][2], "no actor given: no addressee line")
+        created.clear()
+        self.slice.handle({"op": "spawn", "task": "again", "channel_id": "C1", "thread_ts": "100.77", "cwd": self.temp.name, "actor": "UPEER1"})
+        self.assertIn("Asked by <@UPEER1> in Slack", created[0][2])
         # No thread given: a root was posted and the new thread is bound.
         self.assertEqual(self.slack.posts[-1][0], "C1")
         self.assertIn("On it: fix the flaky test", self.slack.posts[-1][1])

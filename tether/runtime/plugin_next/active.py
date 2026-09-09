@@ -801,13 +801,19 @@ class ActiveSlice:
         thread_ts = str(request.get("thread_ts") or "")
         if not channel_id:
             raise BrokerRefused("channel_required")
+        asked_by = str(request.get("actor") or "").strip()
+        who = f"Asked by <@{asked_by}> in Slack. " if asked_by and asked_by != "operator" else ""
         seed = (
             f"{task}\n\n"
-            "Tether: this session is bound to the Slack thread that asked. Whatever you print at the end "
+            f"Tether: {who}this session is bound to the Slack thread that asked. Whatever you print at the end "
             "of this turn is posted there by Tether, and later replies in that thread continue this "
             "session. Do not post to Slack yourself (no tether post/notify/reply, no Slack tools). Do the "
-            "work, then end with a short report with evidence: file and line, command and exit code, PR "
-            "link, test count. Mention people as <@USERID>. If nothing needs saying, end with exactly NO_REPLY."
+            "work like the engineer who owns it: investigate, decide, fix, test, open the PR. Do not stop "
+            "to ask which option they want; pick the sound one and say what you picked. Ask only when you "
+            "are blocked by access or an irreversible action, in one sentence, after doing everything else. "
+            "Then end with a short report with evidence: file and line, command and exit code, PR link, "
+            "test count. Start your report with the <@USERID> of who asked; never address anyone else "
+            "unless they are in the thread. If nothing needs saying, end with exactly NO_REPLY."
         )
         try:
             session_id = self._create_session(source_kind, cwd, seed)
