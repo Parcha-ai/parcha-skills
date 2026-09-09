@@ -12,6 +12,7 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 API = "https://slack.com/api/"
@@ -78,6 +79,59 @@ class SlackEgress:
             {"channel": channel_id, "text": text, "thread_ts": thread_ts},
         )
         return str(body.get("ts") or "")
+
+    def upload(
+        self, channel_id: str, path: str, *, thread_ts: str | None = None,
+        initial_comment: str | None = None, title: str | None = None,
+    ) -> dict[str, Any]:
+        """Post a file natively (files.getUploadURLExternal → upload → completeUploadExternal).
+
+        Returns ``{"file_id", "ts"}``; ``ts`` is the share message in the channel or
+        thread, the same thing a person gets when they drag a file into Slack.
+        """
+        file_path = Path(path).expanduser()
+        try:
+            data = file_path.read_bytes()
+        except OSError as error:
+            raise SlackError("file_unreadable", f"{file_path}: {error.strerror or error}") from error
+        if not data:
+            raise SlackError("file_empty", str(file_path))
+        ticket = self._call(
+            "files.getUploadURLExternal", {"filename": file_path.name, "length": len(data)}, get=True,
+        )
+        upload_url = str(ticket.get("upload_url") or "")
+        file_id = str(ticket.get("file_id") or "")
+        if not upload_url or not file_id:
+            raise SlackError("upload_url_missing")
+        request = urllib.request.Request(
+            upload_url, data=data, method="POST",
+            headers={"Content-Type": "application/octet-stream", "Content-Length": str(len(data))},
+        )
+        try:
+            with self._open(request, timeout=max(self.timeout, 300.0)) as response:  # nosec B310 - Slack-issued https URL
+                response.read()
+        except urllib.error.URLError as error:
+            raise SlackError("transport", str(error.reason)) from error
+        done = self._call(
+            "files.completeUploadExternal",
+            {"files": [{"id": file_id, "title": title or file_path.name}], "channel_id": channel_id,
+             "thread_ts": thread_ts, "initial_comment": initial_comment},
+        )
+        ts = ""
+        for item in done.get("files") or []:
+            shares = (item.get("shares") or {})
+            for scope in ("public", "private"):
+                for _channel, entries in (shares.get(scope) or {}).items():
+                    for entry in entries or []:
+                        ts = ts or str(entry.get("ts") or "")
+        if not ts:
+            info = self._call("files.info", {"file": file_id}, get=True)
+            shares = ((info.get("file") or {}).get("shares") or {})
+            for scope in ("public", "private"):
+                for _channel, entries in (shares.get(scope) or {}).items():
+                    for entry in entries or []:
+                        ts = ts or str(entry.get("ts") or "")
+        return {"file_id": file_id, "ts": ts}
 
     def thread_replies(self, channel_id: str, thread_ts: str, *, limit: int = 50) -> list[dict[str, Any]]:
         body = self._call(

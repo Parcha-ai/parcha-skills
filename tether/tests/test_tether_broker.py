@@ -280,6 +280,28 @@ class BrokerTest(unittest.TestCase):
         self.assertEqual(len(self.sent), 1)
         self.assertIn("I could not take this turn (harness_exited", self.sent[0][2])
 
+    def test_post_and_reply_attach_files_natively(self):
+        uploads = []
+        self.slack.upload = lambda channel, path, thread_ts=None, initial_comment=None, title=None: (
+            uploads.append((channel, path, thread_ts, initial_comment)) or {"file_id": "F1", "ts": "1700000000.000099"})
+        clip = pathlib.Path(self.temp.name) / "demo.mp4"
+        clip.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+        posted = self.call(op="thread_reply", channel_id="C1", thread_ts="100.7", text="the demo", file=str(clip))
+        self.assertTrue(posted["ok"], posted)
+        self.assertEqual(posted["message_ts"], "1700000000.000099")
+        self.assertEqual(uploads[-1], ("C1", str(clip), "100.7", "the demo"))
+        alone = self.call(op="thread_reply", channel_id="C1", thread_ts="100.7", file=str(clip))
+        self.assertTrue(alone["ok"], "a file can stand alone")
+        self.assertEqual(uploads[-1][3], None)
+        missing = self.call(op="thread_reply", channel_id="C1", thread_ts="100.7", text="x", file=str(clip) + ".nope")
+        self.assertEqual(missing["code"], "file_missing")
+        relative = self.call(op="thread_reply", channel_id="C1", thread_ts="100.7", text="x", file="demo.mp4")
+        self.assertEqual(relative["code"], "file_path_relative")
+        # notify with a file: the share message becomes the bound root
+        first = self.call(op="notify", text="watch this", file=str(clip), idempotency_key="file-1", **self.source("sess-file"))
+        self.assertTrue(first["ok"], first)
+        self.assertEqual(first["thread_ts"], "1700000000.000099")
+
     def test_post_into_a_bound_thread_wakes_the_session(self):
         self.call(op="attach", channel_id="C1", thread_ts="100.5", idempotency_key="w1", **self.source("sess-w"))
         posted = self.call(op="thread_reply", channel_id="C1", thread_ts="100.5", text="fix the env and tell Manuel", idempotency_key="w2")
