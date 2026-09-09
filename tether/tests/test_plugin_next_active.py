@@ -361,6 +361,18 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class ReplyShapeTests(unittest.TestCase):
+    def test_narration_before_the_addressed_reply_is_dropped(self):
+        import importlib
+        active = importlib.import_module("runtime.plugin_next.active")
+        raw = ("Both suggesters changed identically.\n\nMiguel was right and my first answer was wrong. Reporting.\n\n"
+               "<@U051FHN4SN8> You're right, that's ours: PR #8242 changed both suggesters.")
+        self.assertEqual(active.reply_body(raw), "<@U051FHN4SN8> You're right, that's ours: PR #8242 changed both suggesters.")
+        self.assertEqual(active.reply_body("<@U1> plain reply\nwith a second line"), "<@U1> plain reply\nwith a second line")
+        self.assertEqual(active.reply_body("no mention at all, keep it"), "no mention at all, keep it")
+        self.assertEqual(active.reply_body(""), "")
+
+
 class LauncherTests(unittest.TestCase):
     def setUp(self):
         import importlib
