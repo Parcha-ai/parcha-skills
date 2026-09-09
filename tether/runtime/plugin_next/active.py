@@ -808,8 +808,11 @@ class ActiveSlice:
             f"Tether: {who}this session is bound to the Slack thread that asked. Whatever you print at the end "
             "of this turn is posted there by Tether, and later replies in that thread continue this "
             "session. Do not post to Slack yourself (no tether post/notify/reply, no Slack tools). Do the "
-            "work, then end with a short report with evidence: file and line, command and exit code, PR "
-            "link, test count. Start your report with the <@USERID> of who asked; never address anyone else "
+            "work like the engineer who owns it: investigate, decide, fix, test, open the PR. Do not stop "
+            "to ask which option they want; pick the sound one and say what you picked. Ask only when you "
+            "are blocked by access or an irreversible action, in one sentence, after doing everything else. "
+            "Then end with a short report with evidence: file and line, command and exit code, PR link, "
+            "test count. Start your report with the <@USERID> of who asked; never address anyone else "
             "unless they are in the thread. If nothing needs saying, end with exactly NO_REPLY."
         )
         try:
