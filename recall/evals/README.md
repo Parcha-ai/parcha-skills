@@ -39,6 +39,58 @@ PYTHONPATH=recall python -m evals.runner score \
 The runner never queries a private Brain itself. A separately authorized process produces the
 private ranking file so credentials and raw responses stay outside the evaluator and repository.
 
+## Systems card (whole-system evaluation)
+
+`evals/systems_card/` measures the deployed brain the way a client agent uses it: every probe
+goes through the public MCP with an owner-scoped read token. It writes a content-free
+`card.json` (schema `recall.systems-card.v1`), a self-contained `card.html`, and appends one
+line to `history.jsonl` so runs can be compared over time.
+
+| Dimension | Probe | What it measures |
+|---|---|---|
+| availability | `availability.endpoints` | healthz / readyz / MCP ping success and latency; readiness reporting `busy` |
+| latency | `latency.tools` | wall-clock p50/p95/max per tool (search, scope, people, session_context, show, exec, scan), first call kept separately |
+| latency | `latency.search_stages` | server `diagnostics`: elapsed, deadline-exceeded rate, dense arm health, candidates per arm |
+| latency | `latency.archil_phases` | scan `timing`: queue, execute, and every sandbox phase |
+| accuracy | `accuracy.truth_boundary` | the owner-approved 60-question truth set replayed through `recall_search`, scored by `evals.agentic_truth` (boundary recall@20, MRR, case hit rate, false hits on insufficient questions, pointer integrity, per stratum) |
+| accuracy | `accuracy.synthetic_suite` | surfaces a `recall.retrieval-eval.v1` report from the frozen synthetic suite that CI runs |
+| freshness | `freshness.source_age` | age of the newest visible passage per source (sources hashed), `projection_pending` |
+| integrity | `integrity.scan_consistency` | `recall_scope` enumeration vs `recall_scan` distinct documents, `objects_unavailable` |
+| authorization | `authorization.negative_scope` | unauthorized source / unknown person / foreign tenant must return nothing |
+| privacy | `privacy.secret_scan` | secret-shaped strings that survived redaction, counted inside the sandbox; emails/phones reported |
+| cost | `cost.planetscale` | cluster tier, IOPS/throughput, storage bounds, month-to-date invoice, budget alert (optional) |
+
+Gates are initial thresholds, recorded in the card next to the observed value. A failed gate marks
+the dimension `degraded`; a probe that cannot run marks it `failed`; a probe without inputs is
+`skipped` with the reason.
+
+```bash
+cd recall
+python -m evals.systems_card run \
+  --output-dir "$HOME/.recall/systems-card/out" \
+  --private-dir "$HOME/.recall/systems-card" \
+  --truth "$RECALL_PRIVATE_EVAL_DIR/employee-truth-v2-approved.jsonl" --truth-split validation \
+  --since 2026-09-01 --repetitions 3
+```
+
+The MCP URL and token come from `~/.config/recall-brain/client.json` (or `--url` / `--token-file`,
+`RECALL_URL` / `RECALL_TOKEN_FILE`). `--dimensions availability,latency` restricts a run;
+`--queries FILE` replaces the built-in generic latency queries; `--planetscale-org` and
+`--planetscale-database` plus `PLANETSCALE_SERVICE_ACCOUNT_ID` / `PLANETSCALE_SERVICE_TOKEN` enable
+the cost probe. Per-case rankings are written mode-0600 under `--private-dir`, never into the
+card. `python -m evals.systems_card render --output-dir DIR` re-renders HTML from an existing
+`card.json`.
+
+Unit coverage runs against a fake brain (`tests/test_systems_card.py`); the live run is an
+operator action, not a CI step, because it needs the owner token and takes several minutes.
+
+### Agentic truth scorer
+
+`evals/agentic_truth.py` (restored) validates the 60-case truth contract and scores boundary
+rankings. The ranking producer and candidate-matrix tools that drove a server-side agent were
+retired when the calling agent became the retrieval agent; the systems card's accuracy probe is
+the replacement producer, ranking through `recall_search` exactly as clients do.
+
 ## Agentic boundary truth
 
 The agentic evaluator freezes 60 owner-approved questions: 12 each for exact-document,
@@ -68,9 +120,9 @@ latency only. `--split` scores one frozen partition while still validating the
 complete truth contract. Per-question rankings, questions, facts, receipts,
 source bodies, and traces are never copied into Git output.
 
-Generate the private boundary ranking file through an explicitly tenant- and
-source-bound runtime. This step does not inspect gold labels or imply owner
-approval:
+**Retired:** the commands below (`evals.agentic_rankings`, `evals.agentic_candidate_matrix`)
+were removed with the server-side agent; use the systems card accuracy probe instead.
+They are kept here as the historical contract:
 
 ```bash
 PYTHONPATH=recall:recall/server python -m evals.agentic_rankings \
