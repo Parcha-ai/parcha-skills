@@ -216,6 +216,7 @@ class ShadowHookTest(PluginEnvironment):
         self.assertIn("pre_gateway_dispatch", ctx.hooks)
         transform = ctx.hooks["transform_llm_output"]
         self.assertEqual(transform(response_text="all done here\n\nNO_REPLY"), "NO_REPLY")
+        self.assertEqual(transform(response_text="NO_REPLY\n\nNow I'm tech lead and I need to define the contract."), "NO_REPLY")
         self.assertIsNone(transform(response_text="NO_REPLY"), "already exact: leave Hermes' own check to it")
         self.assertIsNone(transform(response_text="shipping it, NO_REPLY is not how I end this"))
         self.assertIn("tether", ctx.cli_commands)

@@ -97,7 +97,9 @@ def is_silence(text: str) -> bool:
     if stripped == "NO_REPLY":
         return True
     lines = [line.strip() for line in stripped.splitlines() if line.strip()]
-    return bool(lines) and lines[-1] == "NO_REPLY" and len(stripped) <= 2000
+    # The marker as the first or the last line means "do not post": models that
+    # decide on silence sometimes narrate after it, or before it.
+    return bool(lines) and (lines[-1] == "NO_REPLY" or lines[0] == "NO_REPLY") and len(stripped) <= 2000
 
 
 def user_bus_path(uid: int | None = None) -> Path:

@@ -350,6 +350,10 @@ class ActiveSliceTest(unittest.TestCase):
             self.assertEqual(handler(args), 0)
             decision = hook(event=FakeEvent("now bound"))
             self.assertEqual(decision, {"action": "skip", "reason": "tether-claimed"})
+            # In a bound thread nothing reaches the gateway's own agent, not even a denied actor
+            # or a status notice: the thread belongs to its session.
+            self.assertEqual(hook(event=FakeEvent("hi", user_id="U_STRANGER")),
+                             {"action": "skip", "reason": "tether-bound-thread"})
             for callback in ctx.unload:
                 callback()
         finally:

@@ -98,7 +98,9 @@ def is_no_reply(text: str) -> bool:
     if stripped == NO_REPLY_TOKEN:
         return True
     lines = [line.strip() for line in stripped.splitlines() if line.strip()]
-    return bool(lines) and lines[-1] == NO_REPLY_TOKEN and len(stripped) <= 2000
+    # The marker as the first or the last line means "do not post": models that
+    # decide on silence sometimes narrate after it, or before it.
+    return bool(lines) and (lines[-1] == NO_REPLY_TOKEN or lines[0] == NO_REPLY_TOKEN) and len(stripped) <= 2000
 
 
 class Store:

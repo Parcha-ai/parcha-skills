@@ -203,6 +203,7 @@ class StoreTests(unittest.TestCase):
     def test_no_reply_marker(self):
         self.assertTrue(is_no_reply("NO_REPLY"))
         self.assertTrue(is_no_reply("done here\n\nNO_REPLY"))
+        self.assertTrue(is_no_reply("NO_REPLY\n\nContinuing my own deliverable while the lead writes the contract."))
         self.assertFalse(is_no_reply("NO_REPLY unless you need me"))
         self.assertFalse(is_no_reply(""))
 

@@ -213,7 +213,7 @@ def register(ctx: Any) -> None:
                 message_id=fields["message_id"],
                 text=str(getattr(event, "text", "") or ""),
                 settings=settings,
-                bound_threads=bindings.bound_threads() | domain_bindings.bound_threads(),
+                bound_threads=(bound_threads_now := bindings.bound_threads() | domain_bindings.bound_threads()),
             )
             event_key = (
                 f"slack:{fields['workspace'] or '-'}:{fields['channel'] or '-'}:"
@@ -246,6 +246,11 @@ def register(ctx: Any) -> None:
             if claimed is not None:
                 # Tether owns this turn; Hermes' own agent must not also answer.
                 return {"action": "skip", "reason": "tether-claimed"}
+            if slice_ is not None and fields["thread"] and (fields["channel"], fields["thread"]) in bound_threads_now:
+                # A bound thread belongs to its session. Whatever was not admitted here
+                # (a status notice, a denied actor, a capped peer chain) is not for the
+                # gateway's own agent either: it would answer on top of the session.
+                return {"action": "skip", "reason": "tether-bound-thread"}
         except Exception:  # pragma: no cover - the gateway must never break
             logger.exception("tether: observation failed; event untouched")
         return None
