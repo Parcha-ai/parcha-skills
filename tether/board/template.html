@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Hub Board</title>
+<style>
+:root {
+  --bg: #fbfbfa; --panel: #ffffff; --ink: #1a1a18; --muted: #6b6b66;
+  --line: #e4e4de; --accent: #2f6f4f; --warn: #a1442c; --quiet: #8a8a82;
+  --num: #242420;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #131315; --panel: #1b1b1e; --ink: #e8e8e4; --muted: #9a9a93;
+    --line: #2e2e33; --accent: #6fbf92; --warn: #e08a6c; --quiet: #77777d;
+    --num: #e8e8e4;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap { max-width: 1080px; margin: 0 auto; padding: 40px 24px 72px; }
+header { border-bottom: 1px solid var(--line); padding-bottom: 20px; margin-bottom: 28px; }
+h1 { font-size: 25px; margin: 0 0 6px; letter-spacing: -0.015em; }
+.sub { color: var(--muted); font-size: 13.5px; margin: 0; }
+.sub .mono { font-family: var(--mono); font-size: 12.5px; }
+
+.tiles { display: flex; flex-wrap: wrap; gap: 10px; margin: 22px 0 34px; }
+.tile {
+  flex: 1 1 150px; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 9px; padding: 13px 15px;
+}
+.tile .k { color: var(--muted); font-size: 11px; text-transform: uppercase;
+           letter-spacing: 0.07em; margin-bottom: 5px; }
+.tile .v { font-size: 21px; font-weight: 600; letter-spacing: -0.02em; }
+.tile .v.ok { color: var(--accent); }
+.tile .v.warn { color: var(--warn); }
+
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em;
+     color: var(--muted); margin: 34px 0 11px; font-weight: 600; }
+
+.panel { background: var(--panel); border: 1px solid var(--line);
+         border-radius: 9px; overflow: hidden; }
+table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+th {
+  text-align: left; font-size: 10.5px; text-transform: uppercase;
+  letter-spacing: 0.07em; color: var(--muted); font-weight: 600;
+  padding: 10px 13px; border-bottom: 1px solid var(--line); white-space: nowrap;
+}
+td { padding: 10px 13px; border-bottom: 1px solid var(--line); vertical-align: top; }
+tr:last-child td { border-bottom: none; }
+th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
+td.num { font-family: var(--mono); color: var(--num); }
+td.mono { font-family: var(--mono); font-size: 12.5px; }
+td.name { font-weight: 600; white-space: nowrap; }
+td.name .sid {
+  display: block; font-family: var(--mono); font-size: 10.5px;
+  color: var(--quiet); font-weight: 400; margin-top: 1px;
+}
+td.lane { color: var(--muted); }
+td.age { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+td.doctor { white-space: nowrap; }
+td.err { color: var(--warn); font-family: var(--mono); font-size: 12.5px; }
+td.empty, li.empty { color: var(--muted); font-style: italic; text-align: center; padding: 20px; }
+
+/* Row tone. A left rule, not a fill: it survives both themes and greyscale. */
+tr.ok td:first-child    { box-shadow: inset 2px 0 0 var(--accent); }
+tr.quiet td:first-child { box-shadow: inset 2px 0 0 var(--quiet); }
+tr.warn td:first-child  { box-shadow: inset 2px 0 0 var(--warn); }
+
+ul.shipped { list-style: none; margin: 0; padding: 0; }
+ul.shipped li {
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  padding: 9px 13px; border-bottom: 1px solid var(--line); font-size: 13.5px;
+}
+ul.shipped li:last-child { border-bottom: none; }
+ul.shipped .pr { font-family: var(--mono); font-size: 12px; color: var(--accent);
+                 min-width: 42px; }
+ul.shipped .t { flex: 1 1 340px; }
+ul.shipped .meta { color: var(--quiet); font-size: 12px; font-family: var(--mono); }
+
+footer { margin-top: 40px; padding-top: 18px; border-top: 1px solid var(--line);
+         color: var(--muted); font-size: 12.5px; }
+footer code { font-family: var(--mono); font-size: 12px; }
+@media (max-width: 620px) {
+  .wrap { padding: 26px 14px 48px; }
+  td.lane, th.lane { display: none; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Agent Hub Board</h1>
+  <p class="sub">Who is live, what the fleet looks like, and what landed this week.
+  Generated <span class="mono">{{GENERATED_AT}}</span> ({{GENERATED_AGE}}) ·
+  tailnet-only.</p>
+</header>
+
+<div class="tiles">
+  <div class="tile"><div class="k">Agents</div><div class="v">{{AGENT_COUNT}}</div></div>
+  <div class="tile"><div class="k">Machines up</div><div class="v">{{MACHINE_COUNT}}</div></div>
+  <div class="tile"><div class="k">Live threads</div><div class="v">{{LIVE_THREADS}}</div></div>
+  <div class="tile"><div class="k">Replies 24h</div><div class="v">{{REPLIES_24H}}</div></div>
+  <div class="tile"><div class="k">Doctor</div><div class="v {{DOCTOR_TONE}}">{{DOCTOR_STATE}}</div></div>
+</div>
+
+<h2>Agents</h2>
+<div class="panel">
+<table>
+  <thead><tr>
+    <th>Agent</th><th class="lane">Lane</th><th>Host</th>
+    <th class="num">Live</th><th class="num">Replies 24h</th>
+    <th class="num">Median latency</th><th>Last reply</th>
+  </tr></thead>
+  <tbody>
+{{AGENT_ROWS}}
+  </tbody>
+</table>
+</div>
+
+<h2>Machines</h2>
+<div class="panel">
+<table>
+  <thead><tr>
+    <th>Host</th><th>Uptime</th><th>Load 1/5/15</th><th class="num">Disk free</th>
+    <th>Hermes</th><th>Tether</th><th>Doctor</th>
+  </tr></thead>
+  <tbody>
+{{MACHINE_ROWS}}
+  </tbody>
+</table>
+</div>
+
+<h2>Shipped this week ({{SHIPPED_COUNT}})</h2>
+<div class="panel">
+<ul class="shipped">
+{{SHIPPED_ITEMS}}
+</ul>
+</div>
+
+<footer>
+  <p>Every number on this page is collected, not entered. Agent metrics come from each
+  gateway's live tether store (<code>~/.hermes/plugin-data/tether/domain.db</code>) read
+  read-only over ssh; machine rows from <code>/proc/uptime</code>, <code>/proc/loadavg</code>,
+  the root filesystem, <code>hermes --version</code>, <code>tether version</code> and
+  <code>tether doctor --json</code> check counts; shipped items from
+  <code>git log origin/main</code>. A host that cannot be reached is shown as unreachable
+  rather than as zero.</p>
+  <p>Median latency is over a 24-hour window and is blank when there were no paired
+  request/reply samples in it. Source: <code>board/collect.py</code> and
+  <code>board/render.py</code> in <code>parcha-skills</code>; refreshed by
+  <code>agent-hub-board.timer</code>.</p>
+</footer>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,15 @@
+[Unit]
+Description=Refresh the Agent Hub Board every 10 minutes
+Documentation=https://docs.greppy3.parcha.dev/2026-09-09-agent-hub-board.html
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=10min
+# Stagger against every other timer on the box so six ssh fan-outs do not
+# land on the same second as a preview build.
+RandomizedDelaySec=45
+Persistent=true
+Unit=agent-hub-board.service
+
+[Install]
+WantedBy=timers.target

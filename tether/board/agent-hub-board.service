@@ -1,0 +1,17 @@
+[Unit]
+Description=Refresh the Agent Hub Board (collect fleet data, render ~/docs page)
+Documentation=https://docs.greppy3.parcha.dev/2026-09-09-agent-hub-board.html
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/worktrees/tether-l2d/tether
+ExecStart=%h/worktrees/tether-l2d/tether/board/refresh.sh
+# The collector fans out over ssh to five gateways; a wedged host must not
+# hold the timer open. collect.py already bounds each host at 45s.
+TimeoutStartSec=180
+Nice=10
+
+[Install]
+WantedBy=default.target

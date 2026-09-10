@@ -1,0 +1,11 @@
+{
+  "_comment": "Static agent roster: lane ownership and Slack identity. The collector fills every other agent field from the live tether store; nothing here is derived, so this is the only file to edit when the team changes.",
+  "agents": [
+    {"name": "claudio_michel",  "slack_id": "U09450ZLS81", "host": "greppy3",   "lane": "tech lead — harness, tether, board"},
+    {"name": "sam_franchesko",  "slack_id": "U0BFC6ZRRQX", "host": "greppy-sam", "lane": "frontend — HTML template"},
+    {"name": "bryan300",        "slack_id": "U0BJN78RJD8", "host": "greppy-bc",  "lane": "metrics — fleet numbers"},
+    {"name": "chris_cache",     "slack_id": "U0BHY13623U", "host": "greppy-cr",  "lane": "systemd — refresh unit"},
+    {"name": "manny",           "slack_id": "U0A9TAX8MSA", "host": "greppy-mg",  "lane": "verification — Codex app-server driver"},
+    {"name": "q2",              "slack_id": "U0BJV7GNXML", "host": "m",          "lane": "QA — board row, spawn-on-request"}
+  ]
+}

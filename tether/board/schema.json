@@ -1,0 +1,74 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://docs.greppy3.parcha.dev/schema/agent-hub-board.json",
+  "title": "Agent Hub Board data contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["generated_at", "agents", "machines", "shipped_this_week"],
+  "properties": {
+    "generated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "UTC ISO-8601 timestamp of the collector run that produced this file."
+    },
+    "agents": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "slack_id", "host", "lane", "live_threads",
+                     "last_reply_at", "latency_median_s", "replies_24h"],
+        "properties": {
+          "name":            {"type": "string", "description": "Tether identity user name, e.g. sam_franchesko."},
+          "slack_id":        {"type": "string", "pattern": "^U[A-Z0-9]+$"},
+          "host":            {"type": "string", "description": "Gateway host the agent runs on."},
+          "lane":            {"type": "string", "description": "What this agent owns. Static, from lanes.json."},
+          "live_threads":    {"type": "integer", "minimum": 0,
+                              "description": "Distinct Slack threads with a bridge in a non-terminal state."},
+          "last_reply_at":   {"type": ["string", "null"], "format": "date-time",
+                              "description": "UTC of this agent's most recent sent reply; null if never."},
+          "latency_median_s":{"type": ["number", "null"], "minimum": 0,
+                              "description": "Median seconds from inbound ingress to sent reply, 24h window; null if no paired samples."},
+          "replies_24h":     {"type": "integer", "minimum": 0}
+        }
+      }
+    },
+    "machines": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["host", "uptime", "load", "disk_free", "hermes_version",
+                     "tether_version", "doctor_ok", "doctor_fail"],
+        "properties": {
+          "host":           {"type": "string"},
+          "uptime":         {"type": ["string", "null"], "description": "Human uptime, e.g. '25 days, 13:38'."},
+          "load":           {"type": ["array", "null"], "items": {"type": "number"},
+                             "minItems": 3, "maxItems": 3, "description": "1/5/15-minute load averages."},
+          "disk_free":      {"type": ["string", "null"], "description": "Free space on the root filesystem, e.g. '412G'."},
+          "hermes_version": {"type": ["string", "null"]},
+          "tether_version": {"type": ["string", "null"]},
+          "doctor_ok":      {"type": "integer", "minimum": 0, "description": "Count of passing `tether doctor` checks."},
+          "doctor_fail":    {"type": "integer", "minimum": 0, "description": "Count of non-passing `tether doctor` checks."},
+          "error":          {"type": "string", "description": "Present only when the host could not be reached; other fields are null/0."}
+        }
+      }
+    },
+    "shipped_this_week": {
+      "type": "array",
+      "description": "Merged work in the trailing 7 days, newest first.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["title", "merged_at"],
+        "properties": {
+          "title":     {"type": "string"},
+          "merged_at": {"type": "string", "format": "date-time"},
+          "pr":        {"type": ["integer", "null"]},
+          "author":    {"type": ["string", "null"]},
+          "url":       {"type": ["string", "null"]}
+        }
+      }
+    }
+  }
+}
