@@ -959,7 +959,7 @@ class ActiveSlice:
         thread_ts = str(request.get("thread_ts") or "")
         if not channel_id or not thread_ts:
             raise BrokerRefused("thread_required")
-        limit = int(request.get("limit") or 500)
+        limit = int(request.get("limit") or 2000)
         return {"team_id": self._team(request), "channel_id": channel_id, "thread_ts": thread_ts,
                 "messages": self._slack().thread_replies(channel_id, thread_ts, limit=max(1, min(limit, 2000)))}
 

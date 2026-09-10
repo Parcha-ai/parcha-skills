@@ -146,17 +146,20 @@ class SlackEgress:
                 time.sleep(1.0)
         return ""
 
-    def thread_replies(self, channel_id: str, thread_ts: str, *, limit: int = 500) -> list[dict[str, Any]]:
-        """The thread oldest-first, following Slack's cursor until ``limit`` messages.
+    def thread_replies(self, channel_id: str, thread_ts: str, *, limit: int = 2000) -> list[dict[str, Any]]:
+        """Up to ``limit`` of the newest replies, returned oldest-first.
 
-        One page of 50 newest was what a lead saw of a 300-message build thread:
-        every real delivery scrolled out behind status notices.
+        Slack pages a thread from its newest reply backwards whatever ``oldest``
+        says (checked live 2026-09-10 on a 600-message thread), so the cursor
+        is followed until ``limit`` and the result is sorted. One page of 50
+        was what a lead saw of that build thread: every real delivery had
+        scrolled out behind status notices.
         """
         out: list[dict[str, Any]] = []
         cursor: str | None = None
         seen: set[str] = set()
         while len(out) < limit:
-            params: dict[str, Any] = {"channel": channel_id, "ts": thread_ts, "oldest": "0",
+            params: dict[str, Any] = {"channel": channel_id, "ts": thread_ts,
                                       "limit": min(200, limit - len(out))}
             if cursor:
                 params["cursor"] = cursor

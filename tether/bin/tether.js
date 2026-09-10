@@ -1361,7 +1361,7 @@ async function runBrokerCommand(command, argv) {
       channel_id: requireOption(options, "channel"),
       thread_ts: requireOption(options, "thread-ts"),
       team_id: stringValue(options.team),
-      limit: parseLimit(options.limit, 500, 2000),
+      limit: parseLimit(options.limit, 2000, 2000),
     };
   } else if (command === "close" || command === "unbind") {
     const bridgeId = stringValue(options["bridge-id"]);
