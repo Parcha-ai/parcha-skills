@@ -85,21 +85,20 @@ def reply_body(text: str) -> str:
     return stripped
 
 
-def is_silence(text: str) -> bool:
-    """NO_REPLY as the whole message or as its last line means: do not post.
+def strip_silence(text: str) -> str:
+    """The message without its NO_REPLY marker lines."""
+    lines = [line for line in (text or "").splitlines() if line.strip() != "NO_REPLY"]
+    return "\n".join(lines).strip()
 
-    Same rule as domain_runtime.is_no_reply; kept local because the plugin is
-    loaded as a top-level package on the gateway and cannot import its sibling.
+
+def is_silence(text: str) -> bool:
+    """Silence is the marker and nothing else; marker plus content is content.
+
+    Same rule as store.is_no_reply; kept local because the plugin is loaded as
+    a top-level package on the gateway and cannot import its sibling.
     """
     stripped = (text or "").strip()
-    if not stripped:
-        return False
-    if stripped == "NO_REPLY":
-        return True
-    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
-    # The marker as the first or the last line means "do not post": models that
-    # decide on silence sometimes narrate after it, or before it.
-    return bool(lines) and (lines[-1] == "NO_REPLY" or lines[0] == "NO_REPLY") and len(stripped) <= 2000
+    return bool(stripped) and not strip_silence(stripped)
 
 
 def user_bus_path(uid: int | None = None) -> Path:
@@ -595,7 +594,7 @@ class ActiveSlice:
                 self._post_failure_notice(context, attempt, result)
             return
         final = self.runtime.attempt_context(attempt["attempt_id"])
-        text = reply_body(self._read_response(final.get("response_ref")))
+        text = reply_body(strip_silence(self._read_response(final.get("response_ref"))))
         if not text.strip():
             return
         try:
@@ -845,7 +844,7 @@ class ActiveSlice:
         reported = ""
         if seed_result.strip() and not is_silence(seed_result):
             try:
-                reported = self._post(channel_id, reply_body(seed_result), thread_ts)
+                reported = self._post(channel_id, reply_body(strip_silence(seed_result)), thread_ts)
             except BrokerRefused:
                 logger.error("tether: spawn could not post the seed result for %s", session_id, exc_info=True)
         return {"status": "spawned", "harness": kind, "session_id": session_id, "cwd": str(cwd),
@@ -926,7 +925,7 @@ class ActiveSlice:
             raise BrokerRefused("thread_required", "channel, thread-ts and text or file are required")
         if text and not file and self.runtime_is_no_reply(text):
             return {"status": "no_reply", "team_id": self._team(request), "channel_id": channel_id, "thread_ts": thread_ts}
-        ts = self._post(channel_id, text, thread_ts, file=file)
+        ts = self._post(channel_id, strip_silence(text), thread_ts, file=file)
         team_id = self._team(request)
         # An operator posting into a bound thread through the broker is an
         # instruction to the session that owns it. Slack ingress would drop it
@@ -951,7 +950,7 @@ class ActiveSlice:
             return {"status": "no_reply", "bridge_id": binding_id, "team_id": context["team_id"],
                     "channel_id": context["channel_id"], "thread_ts": context["thread_ts"],
                     "reply_key": request.get("reply_key")}
-        ts = self._post(context["channel_id"], text.strip(), context["thread_ts"], file=file)
+        ts = self._post(context["channel_id"], strip_silence(text), context["thread_ts"], file=file)
         return {"status": "posted", "bridge_id": binding_id, "team_id": context["team_id"],
                 "channel_id": context["channel_id"], "thread_ts": context["thread_ts"],
                 "message_ts": ts, "reply_key": request.get("reply_key")}

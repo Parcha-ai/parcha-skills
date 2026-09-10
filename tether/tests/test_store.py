@@ -201,9 +201,13 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(index.bound_threads(), frozenset())
 
     def test_no_reply_marker(self):
+        from runtime.plugin_next.store import strip_no_reply
         self.assertTrue(is_no_reply("NO_REPLY"))
-        self.assertTrue(is_no_reply("done here\n\nNO_REPLY"))
-        self.assertTrue(is_no_reply("NO_REPLY\n\nContinuing my own deliverable while the lead writes the contract."))
+        self.assertTrue(is_no_reply("NO_REPLY\n\nNO_REPLY"))
+        # marker plus content is content: the work is posted, the marker is not
+        self.assertFalse(is_no_reply("done here\n\nNO_REPLY"))
+        self.assertFalse(is_no_reply("NO_REPLY\n\nDelivering my contract-aligned metrics fragment."))
+        self.assertEqual(strip_no_reply("NO_REPLY\n\nDelivering my fragment.\nNO_REPLY"), "Delivering my fragment.")
         self.assertFalse(is_no_reply("NO_REPLY unless you need me"))
         self.assertFalse(is_no_reply(""))
 

@@ -75,11 +75,20 @@ class SessionDriverTests(unittest.TestCase):
         self.assertEqual(len(self.pids()), 2)
         self.assertEqual(self.slice.run_once(), 0)
 
-    def test_trailing_no_reply_is_silence(self):
+    def test_marker_only_reply_is_silence(self):
         self.slice.claim(self.fields("100.2"), "SILENT please")
         self.assertEqual(self.slice.run_once(), 1)
         self.assertEqual(self.sent, [])
         self.assertEqual(self.store.counts()["ready_turns"], 0)
+
+    def test_marker_plus_delivery_posts_the_delivery(self):
+        os.environ["FAKE_REPLY"] = "printf 'NO_REPLY\\n\\n<@U12345678> here is the fragment: {\"a\": 1}\\n'"
+        try:
+            self.slice.claim(self.fields("100.2"), "deliver")
+            self.assertEqual(self.slice.run_once(), 1)
+        finally:
+            os.environ.pop("FAKE_REPLY", None)
+        self.assertEqual(self.sent, [("C1", "100.1", '<@U12345678> here is the fragment: {"a": 1}')])
 
     def test_crash_posts_the_reason_and_the_next_turn_relaunches(self):
         self.slice.claim(self.fields("100.2"), "CRASH now")
@@ -184,7 +193,7 @@ class SessionDriverTests(unittest.TestCase):
             os.environ.pop("FAKE_CODEX_NO_COMPLETE", None)
 
     def test_codex_no_reply_is_silence(self):
-        os.environ["FAKE_CODEX_REPLY"] = "done\nNO_REPLY"
+        os.environ["FAKE_CODEX_REPLY"] = "NO_REPLY"
         try:
             self.bind_codex()
             self.slice.claim(self.codex_fields("500.2"), "fyi")

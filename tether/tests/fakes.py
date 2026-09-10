@@ -40,7 +40,7 @@ FAKE_CLAUDE = textwrap.dedent(
             if "CRASH" in text:
                 sys.stderr.write("You've hit your session limit\\n"); sys.exit(1)
             if "SILENT" in text:
-                reply = "nothing to add here\\nNO_REPLY"
+                reply = "NO_REPLY\\n\\nNO_REPLY"
             elif "ERRORFLAG" in text:
                 print(json.dumps({"type": "result", "is_error": True, "result": "API overloaded", "session_id": sid})); sys.stdout.flush(); continue
             else:

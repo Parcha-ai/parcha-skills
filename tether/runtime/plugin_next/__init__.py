@@ -308,16 +308,25 @@ def register(ctx: Any) -> None:
     ctx.register_hook("pre_gateway_dispatch", on_pre_gateway_dispatch)
 
     def on_transform_llm_output(response_text: str = "", **_kwargs: Any) -> str | None:
-        """A reply whose last line is NO_REPLY becomes the exact marker Hermes suppresses.
+        """NO_REPLY alone is the exact marker Hermes suppresses; NO_REPLY plus content is the content.
 
-        Hermes' own silence check is exact-match; models asked to answer with
-        NO_REPLY sometimes narrate first. Seen live 2026-09-08 on the native
-        mention path ("...The loop is closed.\n\nNO_REPLY" posted verbatim).
+        Hermes' own silence check is exact-match. Models asked to answer with
+        NO_REPLY narrate around it ("...The loop is closed.\n\nNO_REPLY", seen
+        2026-09-08) and, worse, deliver work under it ("NO_REPLY\n\nDelivering
+        my metrics fragment: ...", 2026-09-10). Collapsing both to silence lost
+        the delivery; the marker lines are dropped and the rest is posted.
         """
         text = str(response_text or "")
-        if text.strip() != "NO_REPLY" and active_module.is_silence(text):
-            logger.info("tether: trailing NO_REPLY collapsed to silence")
+        stripped = text.strip()
+        if not stripped or stripped == "NO_REPLY" or "NO_REPLY" not in stripped:
+            return None
+        body = active_module.strip_silence(text)
+        if not body:
+            logger.info("tether: NO_REPLY marker lines collapsed to silence")
             return "NO_REPLY"
+        if body != stripped:
+            logger.info("tether: NO_REPLY marker dropped from a reply that carries content")
+            return body
         return None
 
     ctx.register_hook("transform_llm_output", on_transform_llm_output)

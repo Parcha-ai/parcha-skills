@@ -90,17 +90,22 @@ def _id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:24]}"
 
 
+def strip_no_reply(text: str) -> str:
+    """The message without its NO_REPLY marker lines."""
+    lines = [line for line in (text or "").splitlines() if line.strip() != NO_REPLY_TOKEN]
+    return "\n".join(lines).strip()
+
+
 def is_no_reply(text: str) -> bool:
-    """NO_REPLY as the whole message or as its last line means: do not post."""
+    """Silence is the marker and nothing else.
+
+    A model that writes NO_REPLY and then a delivery in the same message (seen
+    2026-09-10: "NO_REPLY / Delivering my contract-aligned metrics fragment...")
+    has contradicted itself; posting the delivery loses nothing, silencing it
+    loses the work. The marker lines are stripped before posting.
+    """
     stripped = (text or "").strip()
-    if not stripped:
-        return False
-    if stripped == NO_REPLY_TOKEN:
-        return True
-    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
-    # The marker as the first or the last line means "do not post": models that
-    # decide on silence sometimes narrate after it, or before it.
-    return bool(lines) and (lines[-1] == NO_REPLY_TOKEN or lines[0] == NO_REPLY_TOKEN) and len(stripped) <= 2000
+    return bool(stripped) and not strip_no_reply(stripped)
 
 
 class Store:
