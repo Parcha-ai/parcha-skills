@@ -1400,3 +1400,130 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SearchArmCostTests(unittest.TestCase):
+    """The arms must not probe canonical_chunks per candidate (PS-80 disk reads)."""
+
+    class _Runtime:
+        passage_fingerprint = "fp-runtime"
+        dimensions = 512
+
+        def embed_query_bounded(self, _query):
+            return [0.0] * 512
+
+    class _Store(ActorRecordingStore):
+        def __init__(self, *, scope_count: int) -> None:
+            super().__init__()
+            self.scope_count = scope_count
+            self.semantic_runtime = SearchArmCostTests._Runtime()
+
+        def _execute_bounded(self, connection, sql, values, deadline_at):
+            if "sum(projected.passage_count)" in sql:
+                self.sql.append(" ".join(sql.split()))
+                self.values.append(tuple(values))
+                count = self.scope_count
+
+                class _One:
+                    @staticmethod
+                    def fetchone():
+                        return {"count": count}
+
+                return _One()
+            return super()._execute_bounded(connection, sql, values, deadline_at)
+
+    def setUp(self) -> None:
+        from recall_server import passage_retrieval
+
+        passage_retrieval.reset_scope_count_cache()
+        self.addCleanup(passage_retrieval.reset_scope_count_cache)
+
+    def _retrieval(self, store):
+        return PassageHintRetrieval(
+            store,
+            tenant_id="tenant:test",
+            sources=["codex:linux:test"],
+            policy_fingerprint="fp-policy",
+        )
+
+    def test_lexical_arm_checks_liveness_only_on_the_ranked_top_k(self) -> None:
+        store = self._Store(scope_count=0)
+        self._retrieval(store)._lexical_candidates(
+            "deploy failed", since=None, until=None, candidate_limit=80,
+            actor_ids=None, actor_relations=None, deadline_at=time.monotonic() + 5,
+        )
+        sql = store.sql[-1]
+        matched, _, outer = sql.partition(") SELECT matched.source_id")
+        self.assertIn("WITH matched AS MATERIALIZED", matched)
+        self.assertNotIn("live_chunk", matched)
+        self.assertEqual(outer.count("LEFT JOIN canonical_chunks live_chunk"), 1)
+        self.assertEqual(store.values[-1][-2:], (160, 80))
+
+    def test_ann_dense_arm_never_joins_chunks_inside_the_index_scan(self) -> None:
+        from recall_server import passage_retrieval
+
+        store = self._Store(scope_count=passage_retrieval.MAX_EXACT_DENSE_SCOPE_PASSAGES + 1)
+        rows, status, strategy, scope = self._retrieval(store)._dense_candidates(
+            "deploy failed", since=None, until=None, candidate_limit=80,
+            actor_ids=None, actor_relations=None, deadline_at=time.monotonic() + 5,
+        )
+        self.assertEqual((status, strategy), ("ok", "ann-oversampled"))
+        sql = store.sql[-1]
+        nearest, _, rest = sql.partition("ranked_documents AS MATERIALIZED")
+        self.assertIn("WITH nearest AS MATERIALIZED", nearest)
+        self.assertNotIn("canonical_passages", nearest)
+        self.assertNotIn("live_chunk", nearest)
+        self.assertEqual(rest.count("LEFT JOIN canonical_chunks live_chunk"), 1)
+
+    def test_exact_dense_arm_defers_liveness_to_ranked_documents(self) -> None:
+        store = self._Store(scope_count=10)
+        _, status, strategy, _ = self._retrieval(store)._dense_candidates(
+            "deploy failed", since="2026-09-01T00:00:00Z", until=None, candidate_limit=80,
+            actor_ids=None, actor_relations=None, deadline_at=time.monotonic() + 5,
+        )
+        self.assertEqual((status, strategy), ("ok", "exact-scoped"))
+        sql = store.sql[-1]
+        eligible, _, rest = sql.partition("ranked_documents AS MATERIALIZED")
+        self.assertIn("WITH eligible AS MATERIALIZED", eligible)
+        self.assertNotIn("live_chunk", eligible)
+        self.assertEqual(rest.count("LEFT JOIN canonical_chunks live_chunk"), 1)
+
+    def test_scope_count_is_cached_per_scope_for_a_short_window(self) -> None:
+        from recall_server import passage_retrieval
+
+        store = self._Store(scope_count=7)
+        retrieval = self._retrieval(store)
+        kwargs = dict(since=None, until=None, actor_ids=None, actor_relations=None, deadline_at=time.monotonic() + 5)
+        self.assertEqual(retrieval._dense_scope_passage_count(**kwargs), 7)
+        self.assertEqual(retrieval._dense_scope_passage_count(**kwargs), 7)
+        count_queries = [s for s in store.sql if "sum(projected.passage_count)" in s]
+        self.assertEqual(len(count_queries), 1)
+        # a different window is a different key
+        retrieval._dense_scope_passage_count(**{**kwargs, "since": "2026-09-01T00:00:00Z"})
+        self.assertEqual(len([s for s in store.sql if "sum(projected.passage_count)" in s]), 2)
+        # expiry
+        key = ("tenant:test", ("codex:linux:test",), "fp-policy", None, None, None, None)
+        self.assertEqual(passage_retrieval._scope_count_cache_get(key), 7)
+        self.assertIsNone(passage_retrieval._scope_count_cache_get(
+            key, now=time.monotonic() + passage_retrieval.SCOPE_COUNT_TTL_SECONDS + 1,
+        ))
+        # deadline failures are not cached
+        class Failing(self._Store):
+            def _execute_bounded(self, connection, sql, values, deadline_at):
+                if "sum(projected.passage_count)" in sql:
+                    raise SearchDeadlineExceeded()
+                return super()._execute_bounded(connection, sql, values, deadline_at)
+
+        passage_retrieval.reset_scope_count_cache()
+        failing = self._retrieval(Failing(scope_count=0))
+        self.assertIsNone(failing._dense_scope_passage_count(**kwargs))
+        self.assertIsNone(passage_retrieval._scope_count_cache_get(key))
+
+    def test_search_diagnostics_report_elapsed_time_per_arm(self) -> None:
+        store = self._Store(scope_count=10)
+        response = self._retrieval(store).search(
+            "deploy failed", lexical_query="deploy failed", since=None, until=None, limit=10,
+        )
+        arms = response["diagnostics"]["arm_elapsed_ms"]
+        self.assertEqual(set(arms), {"dense", "passage_lexical", "sparse_exact"})
+        self.assertTrue(all(isinstance(v, float) and v >= 0 for v in arms.values()))

@@ -258,6 +258,40 @@ def main() -> None:
         ).passage_hints("gateway tenant boundaries")
         assert denied["results"] == []
 
+        # Liveness is enforced after ranking, not inside the candidate scans.
+        # A passage whose chunk was forgotten must still vanish from every arm.
+        with store.connect() as connection:
+            connection.execute(
+                """UPDATE canonical_chunks SET deleted_at=now()
+                    WHERE tenant_id=%s AND source_id=%s AND deleted_at IS NULL""",
+                (tenant, source),
+            )
+            connection.commit()
+        try:
+            hidden = bound.passage_hints(
+                "why did the gateway preserve tenant boundaries?",
+                limit=5,
+            )
+            assert hidden["results"] == [], hidden["diagnostics"]
+            assert hidden["diagnostics"]["dense_status"] == "ok"
+            assert hidden["diagnostics"]["passage_lexical_status"] == "ok"
+            assert set(hidden["diagnostics"]["arm_elapsed_ms"]) == {
+                "dense", "passage_lexical", "sparse_exact",
+            }
+        finally:
+            with store.connect() as connection:
+                connection.execute(
+                    """UPDATE canonical_chunks SET deleted_at=NULL
+                        WHERE tenant_id=%s AND source_id=%s""",
+                    (tenant, source),
+                )
+                connection.commit()
+        restored = bound.passage_hints(
+            "why did the gateway preserve tenant boundaries?",
+            limit=5,
+        )
+        assert len(restored["results"]) == 1
+
     with store.connect() as connection:
         counts = connection.execute(
             """SELECT
