@@ -35,6 +35,7 @@ from typing import Any
 from . import admission
 from . import active as active_module
 from . import broker as broker_module
+from . import notices
 from .slack_egress import SlackEgress
 from .journal import DurableJournal
 
@@ -243,8 +244,22 @@ def register(ctx: Any) -> None:
             )
         return found
 
+    quiet_state = {"installed": False}
+
+    def _quiet_notices() -> None:
+        """Wrap the Slack adapter once it is loaded (it is not, yet, at register time)."""
+        if quiet_state["installed"] or not active_settings.quiet_notices:
+            return
+        try:
+            if notices.install():
+                quiet_state["installed"] = True
+                logger.warning("tether: gateway status notices will not be posted to Slack")
+        except Exception:
+            logger.debug("tether: notice filter not installed", exc_info=True)
+
     def on_pre_gateway_dispatch(event: Any = None, **_kwargs: Any) -> None:
         try:
+            _quiet_notices()
             if event is None:
                 return None
             fields = _event_fields(event)
