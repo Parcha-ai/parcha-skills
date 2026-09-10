@@ -320,24 +320,25 @@ assert_unsafe_root_rejected \
 "$PACKAGE_ROOT/install.sh" install --harness=both
 
 RUNTIME="$XDG_DATA_HOME/tether"
+PLUGIN="$HERMES_HOME/plugins/tether"
 STATE="$XDG_STATE_HOME/tether-installer"
 CONFIG="$XDG_CONFIG_HOME/tether/config.toml"
 LAUNCHER="$HOME/.local/bin/tether"
 NOTIFIER="$RUNTIME/tether_notify.py"
-TEAM="$RUNTIME/tether_team.py"
-TEAM_MD="$RUNTIME/team/TEAM.md"
+TEAM_NOTICES="$PLUGIN/notices.py"
+TEAM_MD="$PLUGIN/team.md"
 # Managed files the drift/recovery checks below mutate and hash. Names are kept
 # from the schema-18 era so the assertions read the same; the files are the
-# notifier (700), the team script (700) and two 600-mode runtime files.
+# notifier (700), a plugin module (600) and the team prompt section source (600).
 BRIDGE="$NOTIFIER"
 HERMES_COMPAT="$RUNTIME/package.json"
 ROUTING="$TEAM_MD"
 SECURITY="$RUNTIME/package.json"
-SLACK_PROTOCOL="$TEAM"
+SLACK_PROTOCOL="$TEAM_NOTICES"
 CODEX_SKILL="$CODEX_HOME/skills/tether/SKILL.md"
 CLAUDE_SKILL="$CLAUDE_HOME/skills/tether/SKILL.md"
 
-for path in "$NOTIFIER" "$TEAM" "$TEAM_MD" \
+for path in "$NOTIFIER" "$TEAM_NOTICES" "$TEAM_MD" \
   "$RUNTIME/install.sh" "$RUNTIME/package.json" "$LAUNCHER" "$CODEX_SKILL" \
   "$CLAUDE_SKILL" \
   "$STATE/current.tsv" "$CONFIG"
@@ -357,7 +358,7 @@ assert_mode "$BRIDGE" 700
 assert_mode "$HERMES_COMPAT" 600
 assert_mode "$ROUTING" 600
 assert_mode "$SECURITY" 600
-assert_mode "$SLACK_PROTOCOL" 700
+assert_mode "$SLACK_PROTOCOL" 600
 assert_mode "$LAUNCHER" 700
 assert_mode "$CONFIG" 600
 chmod 722 "$LAUNCHER"

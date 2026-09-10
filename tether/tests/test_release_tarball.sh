@@ -354,11 +354,11 @@ chmod 700 "$HERMES_BIN"
 "$INSTALLED_ROOT/install.sh" install --harness=codex >/dev/null
 launcher="$HOME/.local/bin/tether"
 runtime="$XDG_DATA_HOME/tether/tether_notify.py"
-slack_protocol="$XDG_DATA_HOME/tether/tether_team.py"
+slack_protocol="$HERMES_HOME/plugins/tether/notices.py"
 config="$XDG_CONFIG_HOME/tether/config.toml"
 [[ -x "$launcher" ]] || fail "tarball install did not create the launcher"
 [[ -f "$runtime" ]] || fail "tarball install did not create the runtime"
-[[ -f "$slack_protocol" ]] || fail "tarball install omitted the team script"
+[[ -f "$slack_protocol" ]] || fail "tarball install omitted a plugin module"
 python3 -m py_compile "$slack_protocol"
 [[ -f "$config" ]] || fail "tarball install did not create config"
 set +e
@@ -377,13 +377,13 @@ if grep -Fq "replaced-by-upgrade" "$runtime"; then
   fail "tarball upgrade did not replace the managed runtime"
 fi
 if grep -Fq "replaced-by-upgrade" "$slack_protocol"; then
-  fail "tarball upgrade did not replace the Slack protocol runtime"
+  fail "tarball upgrade did not replace the managed plugin module"
 fi
 
 "$INSTALLED_ROOT/install.sh" uninstall >/dev/null
 [[ ! -e "$launcher" ]] || fail "tarball uninstall retained the launcher"
 [[ ! -e "$slack_protocol" ]] ||
-  fail "tarball uninstall retained the Slack protocol runtime"
+  fail "tarball uninstall retained the managed plugin module"
 [[ -f "$config" ]] || fail "tarball uninstall removed operator config"
 [[ ! -e "$XDG_STATE_HOME/tether-installer/current.tsv" ]] ||
   fail "tarball uninstall retained the active manifest"

@@ -174,9 +174,54 @@ def _event_files(event: Any) -> list[dict[str, str]]:
     return files
 
 
+_TEAM_MD_PATH = Path(__file__).resolve().parent / "team.md"
+_TEAM_MD_HEADER_END = "-->"
+
+
+def _team_prompt_section_text() -> str | None:
+    """Team-layer body for the system prompt, or None if team.md is absent/unreadable.
+
+    Strips the leading tether-managed HTML comment header (meaningful only to
+    the humans editing the source file, not to a model reading its own prompt).
+    """
+    try:
+        raw = _TEAM_MD_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if raw.lstrip().startswith("<!--") and _TEAM_MD_HEADER_END in raw:
+        raw = raw.split(_TEAM_MD_HEADER_END, 1)[1]
+    text = raw.strip()
+    return text or None
+
+
+def _register_team_prompt_section(ctx: Any) -> None:
+    """Register the team layer as a native Hermes system-prompt section.
+
+    Replaces the old ``tether team apply`` splice into each agent's SOUL.md:
+    every new session now gets this text frozen into its prompt by Hermes
+    core, with no file mutation on the box. Wrapped defensively so a Hermes
+    build without ``register_system_prompt_section`` (pre-native-prompt-seam)
+    still loads the plugin unchanged.
+    """
+    register_section = getattr(ctx, "register_system_prompt_section", None)
+    if not callable(register_section):
+        logger.debug("tether: host has no register_system_prompt_section; team layer not injected")
+        return
+    text = _team_prompt_section_text()
+    if not text:
+        logger.warning("tether: team.md missing or empty; team prompt section not registered")
+        return
+    try:
+        register_section("tether.team", text, position="after_memory")
+        logger.warning("tether: registered team system prompt section (%d chars)", len(text))
+    except Exception:
+        logger.warning("tether: could not register team system prompt section", exc_info=True)
+
+
 def register(ctx: Any) -> None:
     home = _hermes_home()
     logger.info("tether: register() entered")
+    _register_team_prompt_section(ctx)
     journal = DurableJournal(home / "plugin-data" / "tether")
     settings = load_settings()
     active_settings = active_module.load_active_settings(_config_path())

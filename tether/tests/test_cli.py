@@ -170,8 +170,6 @@ class TetherCliTest(unittest.TestCase):
         claude = self.home / ".claude"
         candidates: dict[pathlib.Path, int] = {
             runtime / "tether_notify.py": 0o700,
-            runtime / "tether_team.py": 0o700,
-            runtime / "team" / "TEAM.md": 0o600,
             runtime / "install.sh": 0o700,
             runtime / "package.json": 0o600,
             plugin / "__init__.py": 0o600,
@@ -183,6 +181,7 @@ class TetherCliTest(unittest.TestCase):
             plugin / "store.py": 0o600,
             plugin / "session_driver.py": 0o600,
             plugin / "notices.py": 0o600,
+            plugin / "team.md": 0o600,
             plugin / "plugin.yaml": 0o644,
             local_bin / "tether": 0o700,
         }
@@ -701,7 +700,7 @@ class TetherCliTest(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertIn("ok broker socket is private", payload["checks"])
         self.assertIn(
-            "ok managed install integrity verified (21 files; harness=codex)",
+            "ok managed install integrity verified (20 files; harness=codex)",
             payload["checks"],
         )
         self.assertEqual(payload["status"]["protocol_version"], 6)
@@ -839,7 +838,7 @@ class TetherCliTest(unittest.TestCase):
             result = self.run_cli("doctor", socket_path=broker.path)
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn(
-            "ok managed install integrity verified (28 files; harness=both)",
+            "ok managed install integrity verified (27 files; harness=both)",
             result.stdout,
         )
 
