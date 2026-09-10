@@ -1527,3 +1527,46 @@ class SearchArmCostTests(unittest.TestCase):
         arms = response["diagnostics"]["arm_elapsed_ms"]
         self.assertEqual(set(arms), {"dense", "passage_lexical", "sparse_exact"})
         self.assertTrue(all(isinstance(v, float) and v >= 0 for v in arms.values()))
+
+    def test_sparse_arm_runs_only_for_identifier_shaped_queries(self) -> None:
+        from recall_server.passage_retrieval import sparse_arm_applies
+
+        for prose in ("why did the deploy fail", "what did the team decide about retries", "deploy fail"):
+            self.assertFalse(sparse_arm_applies(prose), prose)
+        for identifier in (
+            "PoolTimeout in recall_server", "48711b38-ce97-47b4-8c88-0987a4adde20",
+            "brain_busy 503", "error E063306", "parcha-backend scripts", "FrontalCortexTool",
+        ):
+            self.assertTrue(sparse_arm_applies(identifier), identifier)
+        store = self._Store(scope_count=10)
+        retrieval = self._retrieval(store)
+        common = dict(since=None, until=None, candidate_limit=80, actor_ids=None,
+                      actor_relations=None, deadline_at=time.monotonic() + 5)
+        rows, status = retrieval._sparse_candidates("deploy fail", **common)
+        self.assertEqual((rows, status), ([], "skipped-prose-query"))
+        self.assertFalse(any("FROM canonical_chunks chunk" in s for s in store.sql))
+        rows, status = retrieval._sparse_candidates("frontalcortextool replacement", original_query="FrontalCortexTool replacement", **common)
+        self.assertEqual(status, "ok")
+        self.assertTrue(any("FROM canonical_chunks chunk" in s for s in store.sql))
+
+    def test_sparse_arm_gets_half_the_remaining_budget(self) -> None:
+        store = self._Store(scope_count=10)
+        deadline = time.monotonic() + 10.0
+        self._retrieval(store)._sparse_candidates(
+            "brain_busy 503", since=None, until=None, candidate_limit=80,
+            actor_ids=None, actor_relations=None, deadline_at=deadline,
+        )
+        self.assertLessEqual(store.deadlines[-1], deadline - 4.5)
+        self.assertGreaterEqual(store.deadlines[-1], deadline - 5.5)
+
+    def test_search_passes_the_original_query_to_the_sparse_arm(self) -> None:
+        store = self._Store(scope_count=10)
+        response = self._retrieval(store).search(
+            "FrontalCortexTool replacement", lexical_query="frontalcortextool replacement",
+            since=None, until=None, limit=10,
+        )
+        self.assertEqual(response["diagnostics"]["sparse_status"], "ok")
+        response = self._retrieval(store).search(
+            "why did the deploy fail", lexical_query="deploy fail", since=None, until=None, limit=10,
+        )
+        self.assertEqual(response["diagnostics"]["sparse_status"], "skipped-prose-query")
