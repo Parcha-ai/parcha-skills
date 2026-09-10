@@ -143,7 +143,34 @@ def _event_fields(event: Any) -> dict[str, Any]:
         "actor_is_bot": bool(getattr(source, "is_bot", False)),
         "message_id": getattr(event, "message_id", None)
         or getattr(source, "message_id", None),
+        "files": _event_files(event),
     }
+
+
+def _event_files(event: Any) -> list[dict[str, str]]:
+    """Attachments as the session can use them: Slack name plus Hermes' cached local path.
+
+    Hermes downloads Slack files before dispatch (``media_urls``); the raw
+    Slack payload carries the names. A turn that drops these reads as an
+    empty message, which is how a lead once told a teammate "no attachment
+    came through" about a file that was right there.
+    """
+    files: list[dict[str, str]] = []
+    raw = getattr(event, "raw_message", None)
+    raw_files = raw.get("files") if isinstance(raw, dict) and isinstance(raw.get("files"), list) else []
+    local = [str(u) for u in (getattr(event, "media_urls", None) or []) if u]
+    for index, item in enumerate(raw_files):
+        if not isinstance(item, dict):
+            continue
+        entry = {"name": str(item.get("name") or item.get("title") or item.get("id") or "file")}
+        if item.get("permalink"):
+            entry["permalink"] = str(item["permalink"])
+        if index < len(local):
+            entry["local"] = local[index]
+        files.append(entry)
+    for path in local[len(raw_files):]:
+        files.append({"name": os.path.basename(path), "local": path})
+    return files
 
 
 def register(ctx: Any) -> None:
@@ -195,6 +222,27 @@ def register(ctx: Any) -> None:
             "released; staying in shadow"
         )
 
+    def _self_user_id() -> str:
+        """Own Slack user id, resolved once it can be; empty until then.
+
+        The startup lookup can fail (Slack not reachable yet); without this the
+        session's own broker posts came back as trusted-peer turns and, being
+        peers, capped the chain that then silenced the lead (2026-09-10).
+        """
+        nonlocal settings
+        if settings.self_user_id or slice_ is None or getattr(slice_, "slack", None) is None:
+            return settings.self_user_id
+        try:
+            found = str(slice_.slack.identity().get("user_id") or "")
+        except Exception:
+            return ""
+        if found:
+            settings = admission.AdmissionSettings(
+                workspace_id=settings.workspace_id, allowed_users=settings.allowed_users,
+                trusted_bot_users=settings.trusted_bot_users, self_user_id=found,
+            )
+        return found
+
     def on_pre_gateway_dispatch(event: Any = None, **_kwargs: Any) -> None:
         try:
             if event is None:
@@ -203,6 +251,7 @@ def register(ctx: Any) -> None:
             logger.debug("tether: hook event %s", fields)
             if fields["platform"] != "slack":
                 return None
+            _self_user_id()
             decision = admission.evaluate(
                 platform=fields["platform"],
                 workspace=fields["workspace"],
@@ -213,7 +262,7 @@ def register(ctx: Any) -> None:
                 message_id=fields["message_id"],
                 text=str(getattr(event, "text", "") or ""),
                 settings=settings,
-                bound_threads=bindings.bound_threads() | domain_bindings.bound_threads(),
+                bound_threads=(bound_threads_now := bindings.bound_threads() | domain_bindings.bound_threads()),
             )
             event_key = (
                 f"slack:{fields['workspace'] or '-'}:{fields['channel'] or '-'}:"
@@ -226,6 +275,7 @@ def register(ctx: Any) -> None:
                         fields, str(getattr(event, "text", "") or ""),
                         peer=decision.get("reason") == "trusted_peer_on_bound_thread",
                         peers=frozenset(settings.trusted_bot_users),
+                        self_user_id=_self_user_id(),
                     )
                 except Exception:
                     logger.exception("tether: claim failed for %s; event falls through", event_key)
@@ -246,6 +296,11 @@ def register(ctx: Any) -> None:
             if claimed is not None:
                 # Tether owns this turn; Hermes' own agent must not also answer.
                 return {"action": "skip", "reason": "tether-claimed"}
+            if slice_ is not None and fields["thread"] and (fields["channel"], fields["thread"]) in bound_threads_now:
+                # A bound thread belongs to its session. Whatever was not admitted here
+                # (a status notice, a denied actor, a capped peer chain) is not for the
+                # gateway's own agent either: it would answer on top of the session.
+                return {"action": "skip", "reason": "tether-bound-thread"}
         except Exception:  # pragma: no cover - the gateway must never break
             logger.exception("tether: observation failed; event untouched")
         return None
@@ -253,16 +308,25 @@ def register(ctx: Any) -> None:
     ctx.register_hook("pre_gateway_dispatch", on_pre_gateway_dispatch)
 
     def on_transform_llm_output(response_text: str = "", **_kwargs: Any) -> str | None:
-        """A reply whose last line is NO_REPLY becomes the exact marker Hermes suppresses.
+        """NO_REPLY alone is the exact marker Hermes suppresses; NO_REPLY plus content is the content.
 
-        Hermes' own silence check is exact-match; models asked to answer with
-        NO_REPLY sometimes narrate first. Seen live 2026-09-08 on the native
-        mention path ("...The loop is closed.\n\nNO_REPLY" posted verbatim).
+        Hermes' own silence check is exact-match. Models asked to answer with
+        NO_REPLY narrate around it ("...The loop is closed.\n\nNO_REPLY", seen
+        2026-09-08) and, worse, deliver work under it ("NO_REPLY\n\nDelivering
+        my metrics fragment: ...", 2026-09-10). Collapsing both to silence lost
+        the delivery; the marker lines are dropped and the rest is posted.
         """
         text = str(response_text or "")
-        if text.strip() != "NO_REPLY" and active_module.is_silence(text):
-            logger.info("tether: trailing NO_REPLY collapsed to silence")
+        stripped = text.strip()
+        if not stripped or stripped == "NO_REPLY" or "NO_REPLY" not in stripped:
+            return None
+        body = active_module.strip_silence(text)
+        if not body:
+            logger.info("tether: NO_REPLY marker lines collapsed to silence")
             return "NO_REPLY"
+        if body != stripped:
+            logger.info("tether: NO_REPLY marker dropped from a reply that carries content")
+            return body
         return None
 
     ctx.register_hook("transform_llm_output", on_transform_llm_output)

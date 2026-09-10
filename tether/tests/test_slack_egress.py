@@ -64,5 +64,35 @@ class UploadTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "file_empty")
 
 
+
+
+class ThreadRepliesTests(unittest.TestCase):
+    def test_thread_replies_follow_the_cursor_and_keep_file_names(self):
+        pages = {
+            "": {"ok": True, "has_more": True, "response_metadata": {"next_cursor": "c2"},
+                 "messages": [{"ts": "100.1", "text": "root", "user": "U1"},
+                              {"ts": "100.2", "text": "", "user": "U2",
+                               "files": [{"id": "F1", "name": "frag.json", "permalink": "https://x/F1", "size": 3, "url_private": "secret"}]}]},
+            "c2": {"ok": True, "has_more": False,
+                   "messages": [{"ts": "100.2", "text": "", "user": "U2"}, {"ts": "100.3", "text": "last", "user": "U3"}]},
+        }
+        calls = []
+
+        def opener(request, timeout=0):
+            from urllib.parse import parse_qs, urlparse
+            query = parse_qs(urlparse(request.full_url).query)
+            cursor = query.get("cursor", [""])[0]
+            calls.append(cursor)
+            return _Response(json.dumps(pages[cursor]).encode())
+
+        egress = SlackEgress(token="xoxb-test", opener=opener)
+        messages = egress.thread_replies("C1", "100.1")
+        self.assertEqual(calls, ["", "c2"])
+        self.assertEqual([m["ts"] for m in messages], ["100.1", "100.2", "100.3"], "oldest first, no duplicates")
+        self.assertEqual(messages[1]["files"], [{"id": "F1", "name": "frag.json", "permalink": "https://x/F1", "size": 3}])
+        self.assertNotIn("url_private", json.dumps(messages))
+        self.assertEqual(len(egress.thread_replies("C1", "100.1", limit=2)), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

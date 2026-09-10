@@ -85,19 +85,20 @@ def reply_body(text: str) -> str:
     return stripped
 
 
-def is_silence(text: str) -> bool:
-    """NO_REPLY as the whole message or as its last line means: do not post.
+def strip_silence(text: str) -> str:
+    """The message without its NO_REPLY marker lines."""
+    lines = [line for line in (text or "").splitlines() if line.strip() != "NO_REPLY"]
+    return "\n".join(lines).strip()
 
-    Same rule as domain_runtime.is_no_reply; kept local because the plugin is
-    loaded as a top-level package on the gateway and cannot import its sibling.
+
+def is_silence(text: str) -> bool:
+    """Silence is the marker and nothing else; marker plus content is content.
+
+    Same rule as store.is_no_reply; kept local because the plugin is loaded as
+    a top-level package on the gateway and cannot import its sibling.
     """
     stripped = (text or "").strip()
-    if not stripped:
-        return False
-    if stripped == "NO_REPLY":
-        return True
-    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
-    return bool(lines) and lines[-1] == "NO_REPLY" and len(stripped) <= 2000
+    return bool(stripped) and not strip_silence(stripped)
 
 
 def user_bus_path(uid: int | None = None) -> Path:
@@ -277,7 +278,12 @@ def compose_prompt(context: dict[str, Any], settings: ActiveSettings, launcher: 
             except ValueError:
                 payload = {"text": str(turn["payload_inline"])}
         who = payload.get("user") or "someone"
-        lines.append(f"<@{who}>: {payload.get('text', '').strip()}")
+        lines.append(f"<@{who}>: {payload.get('text', '').strip()}".rstrip())
+        for item in payload.get("files") or []:
+            if not isinstance(item, dict):
+                continue
+            where = item.get("local") or item.get("permalink") or ""
+            lines.append(f"  [attached: {item.get('name', 'file')}" + (f" -> {where}]" if where else "]"))
     lines += [
         "",
         "You own this work. Do what the message needs with your tools first (reproduce, fix, "
@@ -450,14 +456,20 @@ class ActiveSlice:
 
     def claim(
         self, fields: dict[str, Any], text: str, *, peer: bool = False,
-        peers: frozenset[str] | set[str] = frozenset(),
+        peers: frozenset[str] | set[str] = frozenset(), self_user_id: str = "",
     ) -> dict[str, Any] | None:
         """Admit one authorized Slack message on a bound thread. None = not ours.
 
-        ``peer`` marks a message from a trusted peer agent. After
-        ``peer_chain_limit`` consecutive peer turns with no human in between,
-        further peer messages are not ours: the humans get the thread back.
+        The session's own posts are never its turns. ``peer`` marks a message
+        from a trusted peer agent: after ``peer_chain_limit`` consecutive turns
+        from the *same* peer with nobody else in between, that peer's next
+        message is not ours. That is the ping-pong signature (two bots
+        answering each other); a team thread where several peers deliver in a
+        row is normal work and stays admitted.
         """
+        actor = str(fields.get("actor") or "")
+        if self_user_id and actor == self_user_id:
+            return None
         binding = self.runtime.find_active_binding(
             team_id=str(fields.get("workspace") or ""),
             channel_id=str(fields.get("channel") or ""),
@@ -467,15 +479,17 @@ class ActiveSlice:
             return None
         if peer and self.settings.peer_chain_limit > 0:
             recent = self.runtime.recent_turn_actors(binding["binding_id"], self.settings.peer_chain_limit)
-            if len(recent) >= self.settings.peer_chain_limit and all(a in peers for a in recent):
-                logger.info("tether: peer chain capped on %s (%d peer turns, no human)", binding["binding_id"], len(recent))
+            if (len(recent) >= self.settings.peer_chain_limit and actor in peers
+                    and all(a == actor for a in recent)):
+                logger.warning("tether: peer chain capped on %s (%d turns from %s, nobody else)",
+                               binding["binding_id"], len(recent), actor)
                 return None
         message_id = str(fields.get("message_id") or "")
         event_key = f"slack:{fields.get('workspace')}:{fields.get('channel')}:{message_id}"
-        payload = json.dumps(
-            {"user": fields.get("actor"), "text": text, "ts": message_id},
-            sort_keys=True,
-        )
+        body: dict[str, Any] = {"user": fields.get("actor"), "text": text, "ts": message_id}
+        if fields.get("files"):
+            body["files"] = list(fields["files"])
+        payload = json.dumps(body, sort_keys=True)
         try:
             self.runtime.admit_turn(
                 binding_id=binding["binding_id"],
@@ -571,7 +585,7 @@ class ActiveSlice:
                 self._post_failure_notice(context, attempt, result)
             return
         final = self.runtime.attempt_context(attempt["attempt_id"])
-        text = reply_body(self._read_response(final.get("response_ref")))
+        text = reply_body(strip_silence(self._read_response(final.get("response_ref"))))
         if not text.strip():
             return
         try:
@@ -902,7 +916,7 @@ class ActiveSlice:
             raise BrokerRefused("thread_required", "channel, thread-ts and text or file are required")
         if text and not file and self.runtime_is_no_reply(text):
             return {"status": "no_reply", "team_id": self._team(request), "channel_id": channel_id, "thread_ts": thread_ts}
-        ts = self._post(channel_id, text, thread_ts, file=file)
+        ts = self._post(channel_id, strip_silence(text), thread_ts, file=file)
         team_id = self._team(request)
         # An operator posting into a bound thread through the broker is an
         # instruction to the session that owns it. Slack ingress would drop it
@@ -927,7 +941,7 @@ class ActiveSlice:
             return {"status": "no_reply", "bridge_id": binding_id, "team_id": context["team_id"],
                     "channel_id": context["channel_id"], "thread_ts": context["thread_ts"],
                     "reply_key": request.get("reply_key")}
-        ts = self._post(context["channel_id"], text.strip(), context["thread_ts"], file=file)
+        ts = self._post(context["channel_id"], strip_silence(text), context["thread_ts"], file=file)
         return {"status": "posted", "bridge_id": binding_id, "team_id": context["team_id"],
                 "channel_id": context["channel_id"], "thread_ts": context["thread_ts"],
                 "message_ts": ts, "reply_key": request.get("reply_key")}
@@ -945,8 +959,9 @@ class ActiveSlice:
         thread_ts = str(request.get("thread_ts") or "")
         if not channel_id or not thread_ts:
             raise BrokerRefused("thread_required")
+        limit = int(request.get("limit") or 500)
         return {"team_id": self._team(request), "channel_id": channel_id, "thread_ts": thread_ts,
-                "messages": self._slack().thread_replies(channel_id, thread_ts)}
+                "messages": self._slack().thread_replies(channel_id, thread_ts, limit=max(1, min(limit, 2000)))}
 
     def op_unresolved(self, request: dict[str, Any]) -> dict[str, Any]:
         operations: list[dict[str, Any]] = []

@@ -140,26 +140,44 @@ class ActiveSliceTest(unittest.TestCase):
         self.assertEqual(slice_.run_once(), 0)
         self.assertEqual(len(self.sent), 1)
 
-    def test_peer_chain_is_capped_after_two_peer_turns_without_a_human(self):
+    def test_peer_chain_caps_one_peer_talking_to_itself_not_a_team(self):
         slice_ = self.make_slice("printf 'ok'")
         slice_.bind(
             source_kind="claude_session", session_id="sess-peer", cwd=self.temp.name,
             team_id="T12345678", channel_id="C1", thread_ts="200.1",
             owner_user_id="U12345678",
         )
-        peers = frozenset({"UPEER1", "UPEER2"})
+        peers = frozenset({"UPEER1", "UPEER2", "UPEER3"})
         base = {"workspace": "T12345678", "channel": "C1", "thread": "200.1"}
-        first = slice_.claim(dict(base, actor="UPEER1", message_id="200.2"), "ping", peer=True, peers=peers)
-        second = slice_.claim(dict(base, actor="UPEER2", message_id="200.3"), "pong", peer=True, peers=peers)
-        third = slice_.claim(dict(base, actor="UPEER1", message_id="200.4"), "ping again", peer=True, peers=peers)
-        self.assertIsNotNone(first)
-        self.assertIsNotNone(second)
-        self.assertIsNone(third, "two peer turns with no human in between end the exchange")
-        # A human speaking resets the chain; the next peer message is ours again.
-        human = slice_.claim(dict(base, actor="U12345678", message_id="200.5"), "humans here", peer=False)
-        self.assertIsNotNone(human)
-        fourth = slice_.claim(dict(base, actor="UPEER2", message_id="200.6"), "reply to human", peer=True, peers=peers)
-        self.assertIsNotNone(fourth)
+        # A team delivering in a row is work, not ping-pong: three different peers, all ours.
+        for n, who in enumerate(["UPEER1", "UPEER2", "UPEER3"], start=2):
+            self.assertIsNotNone(slice_.claim(dict(base, actor=who, message_id=f"200.{n}"), "delivery", peer=True, peers=peers))
+        # One peer answering us twice with nobody else in between is the ping-pong signature.
+        self.assertIsNotNone(slice_.claim(dict(base, actor="UPEER1", message_id="200.5"), "ping", peer=True, peers=peers))
+        self.assertIsNotNone(slice_.claim(dict(base, actor="UPEER1", message_id="200.6"), "ping", peer=True, peers=peers))
+        self.assertIsNone(slice_.claim(dict(base, actor="UPEER1", message_id="200.7"), "ping", peer=True, peers=peers),
+                          "two turns from the same peer with nobody else end the exchange")
+        # Anyone else speaking resets it.
+        self.assertIsNotNone(slice_.claim(dict(base, actor="UPEER2", message_id="200.8"), "hi", peer=True, peers=peers))
+        self.assertIsNotNone(slice_.claim(dict(base, actor="UPEER1", message_id="200.9"), "back", peer=True, peers=peers))
+
+    def test_own_posts_are_never_turns_and_files_reach_the_prompt(self):
+        slice_ = self.make_slice("printf 'ok'")
+        slice_.bind(
+            source_kind="claude_session", session_id="sess-self", cwd=self.temp.name,
+            team_id="T12345678", channel_id="C1", thread_ts="300.1",
+            owner_user_id="U12345678",
+        )
+        base = {"workspace": "T12345678", "channel": "C1", "thread": "300.1"}
+        mine = slice_.claim(dict(base, actor="UBOTSELF", message_id="300.2"), "my own report", peer=True,
+                            peers=frozenset({"UBOTSELF", "UPEER1"}), self_user_id="UBOTSELF")
+        self.assertIsNone(mine, "the session's own broker post is not a turn for it")
+        files = [{"name": "frag.metrics.json", "local": "/cache/doc_1_frag.metrics.json", "permalink": "https://x/f"}]
+        self.assertIsNotNone(slice_.claim(dict(base, actor="UPEER1", message_id="300.3", files=files), "", peer=True,
+                                          peers=frozenset({"UPEER1"}), self_user_id="UBOTSELF"))
+        self.assertEqual(slice_.run_once(), 1)
+        self.assertIn("<@UPEER1>:", self.prompts[0])
+        self.assertIn("[attached: frag.metrics.json -> /cache/doc_1_frag.metrics.json]", self.prompts[0])
 
     def test_no_reply_is_silent_and_terminal(self):
         slice_ = self.make_slice("printf 'NO_REPLY\\n'")
@@ -350,6 +368,10 @@ class ActiveSliceTest(unittest.TestCase):
             self.assertEqual(handler(args), 0)
             decision = hook(event=FakeEvent("now bound"))
             self.assertEqual(decision, {"action": "skip", "reason": "tether-claimed"})
+            # In a bound thread nothing reaches the gateway's own agent, not even a denied actor
+            # or a status notice: the thread belongs to its session.
+            self.assertEqual(hook(event=FakeEvent("hi", user_id="U_STRANGER")),
+                             {"action": "skip", "reason": "tether-bound-thread"})
             for callback in ctx.unload:
                 callback()
         finally:
