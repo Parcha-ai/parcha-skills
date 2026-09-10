@@ -182,6 +182,7 @@ class ActiveSettings:
     # in between before further peer messages are left alone. Two agents that
     # keep @mentioning each other otherwise talk forever.
     peer_chain_limit: int = 2
+    quiet_notices: bool = True
     # Retired knob kept for old config files; the session driver is the only driver.
     driver: str = "session"
     session_idle_seconds: int = 900
@@ -222,6 +223,7 @@ def load_active_settings(path: Path) -> ActiveSettings:
         harness_env=strings("harness_env"),
         launcher=str(raw.get("launcher") or "auto"),
         peer_chain_limit=integer("peer_chain_limit", 2),
+        quiet_notices=bool(raw.get("quiet_notices", True)),
         driver=str(raw.get("driver") or "session"),
         session_idle_seconds=integer("session_idle_seconds", 900),
         codex_driver=str(raw.get("codex_driver") or "app-server"),
