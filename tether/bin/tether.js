@@ -615,14 +615,14 @@ function messageDefinitions(extra = {}) {
   };
 }
 
-function parseLimit(value, fallback) {
+function parseLimit(value, fallback, max = 100) {
   if (value === undefined) return fallback;
   if (!/^[0-9]+$/.test(String(value))) {
     throw new CliError("--limit must be a positive integer.");
   }
   const result = Number(value);
-  if (!Number.isSafeInteger(result) || result < 1 || result > 100) {
-    throw new CliError("--limit must be between 1 and 100.");
+  if (!Number.isSafeInteger(result) || result < 1 || result > max) {
+    throw new CliError(`--limit must be between 1 and ${max}.`);
   }
   return result;
 }
@@ -1361,7 +1361,7 @@ async function runBrokerCommand(command, argv) {
       channel_id: requireOption(options, "channel"),
       thread_ts: requireOption(options, "thread-ts"),
       team_id: stringValue(options.team),
-      limit: parseLimit(options.limit, 100),
+      limit: parseLimit(options.limit, 500, 2000),
     };
   } else if (command === "close" || command === "unbind") {
     const bridgeId = stringValue(options["bridge-id"]);

@@ -143,7 +143,34 @@ def _event_fields(event: Any) -> dict[str, Any]:
         "actor_is_bot": bool(getattr(source, "is_bot", False)),
         "message_id": getattr(event, "message_id", None)
         or getattr(source, "message_id", None),
+        "files": _event_files(event),
     }
+
+
+def _event_files(event: Any) -> list[dict[str, str]]:
+    """Attachments as the session can use them: Slack name plus Hermes' cached local path.
+
+    Hermes downloads Slack files before dispatch (``media_urls``); the raw
+    Slack payload carries the names. A turn that drops these reads as an
+    empty message, which is how a lead once told a teammate "no attachment
+    came through" about a file that was right there.
+    """
+    files: list[dict[str, str]] = []
+    raw = getattr(event, "raw_message", None)
+    raw_files = raw.get("files") if isinstance(raw, dict) and isinstance(raw.get("files"), list) else []
+    local = [str(u) for u in (getattr(event, "media_urls", None) or []) if u]
+    for index, item in enumerate(raw_files):
+        if not isinstance(item, dict):
+            continue
+        entry = {"name": str(item.get("name") or item.get("title") or item.get("id") or "file")}
+        if item.get("permalink"):
+            entry["permalink"] = str(item["permalink"])
+        if index < len(local):
+            entry["local"] = local[index]
+        files.append(entry)
+    for path in local[len(raw_files):]:
+        files.append({"name": os.path.basename(path), "local": path})
+    return files
 
 
 def register(ctx: Any) -> None:
@@ -195,6 +222,27 @@ def register(ctx: Any) -> None:
             "released; staying in shadow"
         )
 
+    def _self_user_id() -> str:
+        """Own Slack user id, resolved once it can be; empty until then.
+
+        The startup lookup can fail (Slack not reachable yet); without this the
+        session's own broker posts came back as trusted-peer turns and, being
+        peers, capped the chain that then silenced the lead (2026-09-10).
+        """
+        nonlocal settings
+        if settings.self_user_id or slice_ is None or getattr(slice_, "slack", None) is None:
+            return settings.self_user_id
+        try:
+            found = str(slice_.slack.identity().get("user_id") or "")
+        except Exception:
+            return ""
+        if found:
+            settings = admission.AdmissionSettings(
+                workspace_id=settings.workspace_id, allowed_users=settings.allowed_users,
+                trusted_bot_users=settings.trusted_bot_users, self_user_id=found,
+            )
+        return found
+
     def on_pre_gateway_dispatch(event: Any = None, **_kwargs: Any) -> None:
         try:
             if event is None:
@@ -203,6 +251,7 @@ def register(ctx: Any) -> None:
             logger.debug("tether: hook event %s", fields)
             if fields["platform"] != "slack":
                 return None
+            _self_user_id()
             decision = admission.evaluate(
                 platform=fields["platform"],
                 workspace=fields["workspace"],
@@ -226,6 +275,7 @@ def register(ctx: Any) -> None:
                         fields, str(getattr(event, "text", "") or ""),
                         peer=decision.get("reason") == "trusted_peer_on_bound_thread",
                         peers=frozenset(settings.trusted_bot_users),
+                        self_user_id=_self_user_id(),
                     )
                 except Exception:
                     logger.exception("tether: claim failed for %s; event falls through", event_key)

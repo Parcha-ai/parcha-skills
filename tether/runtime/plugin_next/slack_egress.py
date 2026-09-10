@@ -146,13 +146,31 @@ class SlackEgress:
                 time.sleep(1.0)
         return ""
 
-    def thread_replies(self, channel_id: str, thread_ts: str, *, limit: int = 50) -> list[dict[str, Any]]:
-        body = self._call(
-            "conversations.replies",
-            {"channel": channel_id, "ts": thread_ts, "limit": limit},
-            get=True,
-        )
-        return _messages(body)
+    def thread_replies(self, channel_id: str, thread_ts: str, *, limit: int = 500) -> list[dict[str, Any]]:
+        """The thread oldest-first, following Slack's cursor until ``limit`` messages.
+
+        One page of 50 newest was what a lead saw of a 300-message build thread:
+        every real delivery scrolled out behind status notices.
+        """
+        out: list[dict[str, Any]] = []
+        cursor: str | None = None
+        seen: set[str] = set()
+        while len(out) < limit:
+            params: dict[str, Any] = {"channel": channel_id, "ts": thread_ts, "oldest": "0",
+                                      "limit": min(200, limit - len(out))}
+            if cursor:
+                params["cursor"] = cursor
+            body = self._call("conversations.replies", params, get=True)
+            for message in _messages(body):
+                if message.get("ts") in seen:
+                    continue
+                seen.add(str(message.get("ts")))
+                out.append(message)
+            cursor = str(((body.get("response_metadata") or {}).get("next_cursor")) or "")
+            if not body.get("has_more") or not cursor:
+                break
+        out.sort(key=lambda m: float(m.get("ts") or 0))
+        return out
 
     def history(self, channel_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
         body = self._call("conversations.history", {"channel": channel_id, "limit": limit}, get=True)
@@ -187,9 +205,16 @@ def _messages(body: dict[str, Any]) -> list[dict[str, Any]]:
     for message in body.get("messages", []) or []:
         if not isinstance(message, dict):
             continue
-        out.append({
+        entry = {
             key: message.get(key)
             for key in ("ts", "text", "user", "bot_id", "thread_ts")
             if message.get(key) is not None
-        })
+        }
+        files = [
+            {k: f.get(k) for k in ("id", "name", "permalink", "size") if f.get(k) is not None}
+            for f in (message.get("files") or []) if isinstance(f, dict)
+        ]
+        if files:
+            entry["files"] = files
+        out.append(entry)
     return out
