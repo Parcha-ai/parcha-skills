@@ -411,11 +411,15 @@ class TeamPromptSectionTest(PluginEnvironment):
         # A sentence distinctive to team/TEAM.md's content, not boilerplate
         # that could accidentally match some other registered section.
         self.assertIn(
-            "Never close a loop with your own acknowledgement", section["content"]
+            "two bots agreeing reads as noise", section["content"]
         )
         # The tether-managed HTML comment header is for humans editing the
         # source file, not for the model reading its own system prompt.
         self.assertNotIn("<!--", section["content"])
+        # Hermes drops a section over MAX_SYSTEM_PROMPT_SECTION_CHARS (4000) silently at
+        # render time; team.md must stay under it or every colleague loses the team rules.
+        self.assertLessEqual(len(section["content"]), 4000, "team.md body over Hermes' 4000-char section cap")
+        self.assertIn("`<@U0BJN78RJD8>`", section["content"], "lane table intact")
 
     def test_older_host_without_the_seam_still_loads(self):
         # FloorCtx mirrors Hermes v2026.7.20: no register_system_prompt_section.
