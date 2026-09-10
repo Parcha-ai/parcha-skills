@@ -188,12 +188,19 @@ class BrokerTest(unittest.TestCase):
         self.assertTrue(spawned["ok"], spawned)
         self.assertEqual(spawned["session_id"], "sess-spawned")
         self.assertEqual((created[0][0], created[0][1]), ("claude_session", self.temp.name))
-        self.assertTrue(created[0][2].startswith("fix the flaky test"))
-        self.assertIn("Do not post to Slack yourself", created[0][2])
+        self.assertIn("Tether bootstrap", created[0][2], "the seed only creates the session")
         self.assertNotIn("Asked by", created[0][2], "no actor given: no addressee line")
+        self.assertEqual(spawned["task_turn"], f"spawn:{spawned['bridge_id']}", "the task is the first turn")
         created.clear()
-        self.slice.handle({"op": "spawn", "task": "again", "channel_id": "C1", "thread_ts": "100.77", "cwd": self.temp.name, "actor": "UPEER1"})
+        again = self.slice.handle({"op": "spawn", "task": "again", "channel_id": "C1", "thread_ts": "100.77", "cwd": self.temp.name, "actor": "UPEER1"})
         self.assertIn("Asked by <@UPEER1> in Slack", created[0][2])
+        self.assertEqual(again["task_turn"], f"spawn:{again['bridge_id']}")
+        # the task turn runs like any bound turn: one drive, reply in the thread
+        # the task turn runs like any bound turn; both spawns share one fake session, so one endpoint per pass
+        self.assertEqual(self.slice.run_once(), 1)
+        self.assertEqual(self.slice.run_once(), 1)
+        self.assertEqual([m[2] for m in self.sent], ["listo", "listo"])
+        self.sent.clear()
         # No thread given: a root was posted and the new thread is bound.
         self.assertEqual(self.slack.posts[-1][0], "C1")
         self.assertIn("On it: fix the flaky test", self.slack.posts[-1][1])
