@@ -64,6 +64,7 @@ class ToolLatencyProbe:
         errors: dict[str, int] = {}
         receipt: str | None = None
         ldoc: str | None = None
+        first_search_diagnostics: dict[str, Any] | None = None
 
         def record(outcome: Any) -> None:
             # Every call is a sample; the first call per tool is also kept
@@ -79,6 +80,19 @@ class ToolLatencyProbe:
                 outcome = client.call_tool("recall_search", {"query": query, "filters": filters, "limit": 10})
                 record(outcome)
                 if outcome.ok and outcome.result:
+                    if first_search_diagnostics is None:
+                        # Content-free server diagnostics of the very first
+                        # search: which arm paid for the cold start.
+                        diag = outcome.result.get("diagnostics", {})
+                        first_search_diagnostics = {
+                            key: diag.get(key)
+                            for key in (
+                                "elapsed_ms", "arm_elapsed_ms", "dense_strategy",
+                                "dense_status", "passage_lexical_status", "sparse_status",
+                                "time_clip_elapsed_ms", "deadline_exceeded",
+                            )
+                            if key in diag
+                        }
                     for hit in outcome.result.get("results", []):
                         if ldoc is None and isinstance(hit.get("logical_document_id"), str):
                             ldoc = hit["logical_document_id"]
@@ -112,6 +126,8 @@ class ToolLatencyProbe:
             total_errors += errors.get(tool, 0)
         metrics["calls"] = total_calls
         metrics["error_rate"] = (total_errors / total_calls) if total_calls else None
+        if first_search_diagnostics:
+            metrics["recall_search.first_call_diagnostics"] = first_search_diagnostics
         result.samples = total_calls
         result.metrics = metrics
         result.gates = [
