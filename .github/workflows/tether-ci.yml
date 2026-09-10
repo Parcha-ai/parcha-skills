@@ -72,6 +72,7 @@ jobs:
       - run: python -m py_compile tether/runtime/plugin_next/slack_egress.py
       - run: python -m py_compile tether/runtime/plugin_next/store.py
       - run: python -m py_compile tether/runtime/plugin_next/session_driver.py
+      - run: python -m py_compile tether/runtime/plugin_next/notices.py
       - run: python -m py_compile tether/skills/tether/scripts/tether_notify.py
       - run: npm ci --ignore-scripts --no-audit --no-fund
         working-directory: tether

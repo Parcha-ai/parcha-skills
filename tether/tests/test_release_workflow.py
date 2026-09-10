@@ -106,7 +106,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
             REPOSITORY_ROOT / ".github/workflows/tether-release.yml"
         ).read_text()
 
-        for module in ("store", "session_driver", "active", "admission", "broker", "journal", "slack_egress"):
+        for module in ("store", "session_driver", "active", "admission", "broker", "journal", "slack_egress", "notices"):
             self.assertIn(f"runtime/plugin_next/{module}.py", package["files"])
             self.assertIn(f"{module}.py", installer)
             self.assertIn(f"runtime/plugin_next/{module}.py", package["scripts"]["test"])
