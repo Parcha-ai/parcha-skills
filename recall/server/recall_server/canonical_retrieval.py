@@ -125,6 +125,44 @@ def _informative_query_terms(query: str) -> list[str]:
     return (focused or terms)[:16]
 
 
+def _parse_bound(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if not isinstance(value, str) or not value:
+        return None
+    text = value.strip().replace(" ", "T")
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    elif text.endswith("+00"):
+        text += ":00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _window_inside(window: Any, since: str | None, until: str | None) -> bool:
+    """True when [first, last] of a passage lies within the requested bounds."""
+
+    if not isinstance(window, (list, tuple)) or len(window) != 2:
+        return False
+    first, last = _parse_bound(window[0]), _parse_bound(window[1])
+    if first is None or last is None:
+        return False
+    lower = _parse_bound(since)
+    upper = _parse_bound(until)
+    if since is not None and (lower is None or first < lower):
+        return False
+    if until is not None and (upper is None or last > upper):
+        return False
+    return True
+
+
+def _strip_window(matching_range: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in matching_range.items() if key != "passage_window"}
+
+
 def _timestamp(value: Any) -> str:
     if isinstance(value, datetime):
         return value.isoformat()
@@ -1803,16 +1841,44 @@ class BoundCanonicalRetrieval:
     ) -> dict[str, Any]:
         """Keep hint text and receipts inside the requested event window."""
 
-        receipts = list(dict.fromkeys(
-            receipt
-            for document in response.get("results", ())
-            for matching_range in document.get("matching_ranges", ())
-            for receipt in matching_range.get("receipts", ())
-        ))
         diagnostics = dict(response.get("diagnostics", {}))
+        # Ranges whose passage window lies entirely inside [since, until] need
+        # no per-receipt event lookup: every receipt in them is in the window.
+        # Only ranges that straddle a boundary go to the database.
+        inside_count = 0
+        receipts: list[str] = []
+        seen_receipts: set[str] = set()
+        inside_ranges: set[tuple[str, int]] = set()
+        for document in response.get("results", ()):
+            for index, matching_range in enumerate(document.get("matching_ranges", ())):
+                window = matching_range.get("passage_window")
+                if _window_inside(window, since, until):
+                    inside_ranges.add((document.get("logical_document_id"), index))
+                    inside_count += 1
+                    continue
+                for receipt in matching_range.get("receipts", ()):
+                    if receipt not in seen_receipts:
+                        seen_receipts.add(receipt)
+                        receipts.append(receipt)
         if not receipts:
             diagnostics["time_clip_status"] = "ok"
-            return {**response, "diagnostics": diagnostics}
+            diagnostics["time_clip_elapsed_ms"] = 0.0
+            diagnostics["time_clip_ranges_inside_window"] = inside_count
+            diagnostics["time_clipped_receipts"] = 0
+            return {
+                **response,
+                "results": [
+                    {
+                        **document,
+                        "matching_ranges": [
+                            _strip_window(matching_range)
+                            for matching_range in document.get("matching_ranges", ())
+                        ],
+                    }
+                    for document in response.get("results", ())
+                ],
+                "diagnostics": diagnostics,
+            }
         clip_started = time.monotonic()
         try:
             with self.store.connect() as connection:
@@ -1859,7 +1925,16 @@ class BoundCanonicalRetrieval:
             # overlap. Keep those authorized pointers, but remove prose and
             # receipts whose exact event timestamps could not be verified.
             pointer_results = [
-                {**document, "matching_ranges": []}
+                {
+                    **document,
+                    "matching_ranges": [
+                        _strip_window(matching_range)
+                        for index, matching_range in enumerate(
+                            document.get("matching_ranges", ())
+                        )
+                        if (document.get("logical_document_id"), index) in inside_ranges
+                    ],
+                }
                 for document in response.get("results", ())
             ]
             return {
@@ -1871,7 +1946,10 @@ class BoundCanonicalRetrieval:
         results = []
         for document in response.get("results", ()):
             ranges = []
-            for matching_range in document.get("matching_ranges", ()):
+            for index, matching_range in enumerate(document.get("matching_ranges", ())):
+                if (document.get("logical_document_id"), index) in inside_ranges:
+                    ranges.append(_strip_window(matching_range))
+                    continue
                 range_rows = [
                     eligible[receipt]
                     for receipt in matching_range.get("receipts", ())
@@ -1885,7 +1963,7 @@ class BoundCanonicalRetrieval:
                 ranges.append({
                     key: value
                     for key, value in matching_range.items()
-                    if key != "spans"
+                    if key not in {"spans", "passage_window"}
                 } | {
                     "text": text,
                     "text_clipped": clipped,
@@ -1896,6 +1974,7 @@ class BoundCanonicalRetrieval:
                 results.append({**document, "matching_ranges": ranges})
         diagnostics["time_clip_status"] = "ok"
         diagnostics["time_clip_elapsed_ms"] = round((time.monotonic() - clip_started) * 1000, 3)
+        diagnostics["time_clip_ranges_inside_window"] = inside_count
         diagnostics["time_clipped_receipts"] = len(eligible)
         return {**response, "results": results, "diagnostics": diagnostics}
 
