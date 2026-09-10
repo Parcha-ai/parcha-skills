@@ -590,7 +590,7 @@ build_install_plan() {
   add_file "$ROOT_DIR/team/TEAM.md" "$RUNTIME_HOME/team/TEAM.md" 600
   add_file "$ROOT_DIR/install.sh" "$RUNTIME_HOME/install.sh" 700
   add_file "$ROOT_DIR/package.json" "$RUNTIME_HOME/package.json" 600
-  for module in __init__.py active.py admission.py broker.py journal.py slack_egress.py store.py session_driver.py; do
+  for module in __init__.py active.py admission.py broker.py journal.py slack_egress.py store.py session_driver.py notices.py; do
     add_file "$ROOT_DIR/runtime/plugin_next/$module" "$PLUGIN_HOME/$module" 600
   done
   add_file "$ROOT_DIR/runtime/plugin_next/plugin.yaml" "$PLUGIN_HOME/plugin.yaml" 644
