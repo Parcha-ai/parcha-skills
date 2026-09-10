@@ -205,6 +205,10 @@ class ProbeTest(unittest.TestCase):
         self.assertEqual(result.metrics["recall_exec.n"], 2)
         self.assertEqual(result.metrics["error_rate"], 0.0)
         self.assertIsNotNone(context.options["_shared_receipt"])
+        first = result.metrics["recall_search.first_call_diagnostics"]
+        self.assertEqual(first["elapsed_ms"], 120.0)
+        self.assertEqual(first["dense_strategy"], "exact-scoped")
+        self.assertNotIn("results", json.dumps(first))
 
     def test_search_stage_probe_reads_server_diagnostics(self):
         context = make_context(FakeBrain(default_tools()), queries=["q1", "q2", "q3"])
