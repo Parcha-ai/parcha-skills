@@ -511,9 +511,9 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
         retrieval_source = "\n".join(
             inspect.getsource(method)
             for method in (
-                PassageHintRetrieval._lexical_candidates,
-                PassageHintRetrieval._sparse_candidates,
-                PassageHintRetrieval._dense_scope_passage_count,
+                PassageHintRetrieval._lexical_query,
+                PassageHintRetrieval._sparse_query,
+                PassageHintRetrieval._dense_scope_passage_count_uncached,
                 PassageHintRetrieval._dense_candidates,
             )
         )
@@ -1553,11 +1553,57 @@ class SearchArmCostTests(unittest.TestCase):
         store = self._Store(scope_count=10)
         deadline = time.monotonic() + 10.0
         self._retrieval(store)._sparse_candidates(
+            "brain_busy 503", since="2026-09-01T00:00:00Z", until=None, candidate_limit=80,
+            actor_ids=None, actor_relations=None, deadline_at=deadline,
+        )
+        # explicit window: one phase, on the arm's half budget
+        self.assertLessEqual(store.deadlines[-1], deadline - 4.5)
+        self.assertGreaterEqual(store.deadlines[-1], deadline - 5.5)
+
+    def test_text_arms_rank_everything_first_then_fall_back_to_a_recent_window(self) -> None:
+        from recall_server import passage_retrieval
+
+        class SlowRanking(self._Store):
+            def _execute_bounded(self, connection, sql, values, deadline_at):
+                if "FROM canonical_passages passage" in sql or "FROM canonical_chunks chunk" in sql:
+                    self.sql.append(" ".join(sql.split()))
+                    self.values.append(tuple(values))
+                    self.deadlines = getattr(self, "deadlines", [])
+                    self.deadlines.append(deadline_at)
+                    # the unbounded ranking times out; the recent window succeeds
+                    if values[-6] is None if "canonical_passages passage" in sql else values[-5] is None:
+                        raise SearchDeadlineExceeded()
+                    return Rows([])
+                return super()._execute_bounded(connection, sql, values, deadline_at)
+
+        store = SlowRanking(scope_count=10)
+        retrieval = self._retrieval(store)
+        deadline = time.monotonic() + 10.0
+        rows, status = retrieval._lexical_candidates(
+            "deploy fail", since=None, until=None, candidate_limit=80,
+            actor_ids=None, actor_relations=None, deadline_at=deadline,
+        )
+        self.assertEqual((rows, status), ([], "ok-recent-window"))
+        lexical = [(q, v, d) for q, v, d in zip(store.sql, store.values, store.deadlines, strict=True) if "canonical_passages passage" in q]
+        self.assertEqual(len(lexical), 2)
+        first_deadline, second_deadline = lexical[0][2], lexical[1][2]
+        self.assertLess(first_deadline, deadline - 6.0)   # ~35% of the budget
+        self.assertGreater(second_deadline, deadline - 0.5)  # the full remaining budget
+        self.assertEqual(lexical[0][1][-6], None)
+        self.assertEqual(lexical[1][1][-6], passage_retrieval._recent_window_since())
+
+        rows, status = retrieval._sparse_candidates(
             "brain_busy 503", since=None, until=None, candidate_limit=80,
             actor_ids=None, actor_relations=None, deadline_at=deadline,
         )
-        self.assertLessEqual(store.deadlines[-1], deadline - 4.5)
-        self.assertGreaterEqual(store.deadlines[-1], deadline - 5.5)
+        self.assertEqual((rows, status), ([], "ok-recent-window"))
+
+        # an explicit until before the recent window cannot be rescued
+        rows, status = retrieval._lexical_candidates(
+            "deploy fail", since=None, until="2020-01-01T00:00:00Z", candidate_limit=80,
+            actor_ids=None, actor_relations=None, deadline_at=time.monotonic() + 10.0,
+        )
+        self.assertEqual((rows, status), ([], "deadline-exceeded"))
 
     def test_search_passes_the_original_query_to_the_sparse_arm(self) -> None:
         store = self._Store(scope_count=10)
