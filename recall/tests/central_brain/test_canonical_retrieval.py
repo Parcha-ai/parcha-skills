@@ -539,7 +539,7 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
             for sql, values in zip(store.sql, store.values, strict=True)
             if "FROM canonical_passages passage" in sql
         )
-        self.assertEqual(lexical_values[2], ["codex:linux:test"])
+        self.assertEqual(lexical_values[1], ["codex:linux:test"])
         self.assertFalse(any(
             "FROM canonical_chunks chunk" in sql
             for sql in store.sql
@@ -573,7 +573,7 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
             for sql, values in zip(store.sql, store.values, strict=True)
             if "FROM canonical_passages passage" in sql
         )
-        self.assertEqual(lexical_values[2], ["codex:linux:test"])
+        self.assertEqual(lexical_values[1], ["codex:linux:test"])
         self.assertIsNone(lexical_values[4])
 
     def test_shared_person_source_keeps_exact_passage_actor_filter(
@@ -1453,11 +1453,15 @@ class SearchArmCostTests(unittest.TestCase):
             actor_ids=None, actor_relations=None, deadline_at=time.monotonic() + 5,
         )
         sql = store.sql[-1]
-        matched, _, outer = sql.partition(") SELECT matched.source_id")
-        self.assertIn("WITH matched AS MATERIALIZED", matched)
-        self.assertNotIn("live_chunk", matched)
+        pool, _, outer = sql.partition("SELECT top.source_id")
+        self.assertIn("WITH matched AS MATERIALIZED", pool)
+        self.assertIn(", top AS MATERIALIZED", pool)
+        self.assertNotIn("live_chunk", pool)
+        self.assertNotIn("canonical_passage_documents", pool)
         self.assertEqual(outer.count("LEFT JOIN canonical_chunks live_chunk"), 1)
-        self.assertEqual(store.values[-1][-2:], (160, 80))
+        values = store.values[-1]
+        self.assertIn(160, values)
+        self.assertIn(80, values)
 
     def test_ann_dense_arm_never_joins_chunks_inside_the_index_scan(self) -> None:
         from recall_server import passage_retrieval
@@ -1556,9 +1560,9 @@ class SearchArmCostTests(unittest.TestCase):
             "brain_busy 503", since="2026-09-01T00:00:00Z", until=None, candidate_limit=80,
             actor_ids=None, actor_relations=None, deadline_at=deadline,
         )
-        # explicit window: one phase, on the arm's half budget
-        self.assertLessEqual(store.deadlines[-1], deadline - 4.5)
-        self.assertGreaterEqual(store.deadlines[-1], deadline - 5.5)
+        # ranked phase: 35% of the arm's half budget (10 s * 0.5 * 0.35 = 1.75 s)
+        self.assertLessEqual(store.deadlines[-1], deadline - 8.0)
+        self.assertGreaterEqual(store.deadlines[-1], deadline - 8.5)
 
     def test_text_arms_rank_everything_first_then_fall_back_to_a_recent_window(self) -> None:
         from recall_server import passage_retrieval
@@ -1570,8 +1574,8 @@ class SearchArmCostTests(unittest.TestCase):
                     self.values.append(tuple(values))
                     self.deadlines = getattr(self, "deadlines", [])
                     self.deadlines.append(deadline_at)
-                    # the unbounded ranking times out; the recent window succeeds
-                    if values[-6] is None if "canonical_passages passage" in sql else values[-5] is None:
+                    # the ranked pool times out; the recency pool succeeds
+                    if "ts_rank_cd(passage.search_vector" in sql or "ts_rank_cd(chunk.search_vector" in sql:
                         raise SearchDeadlineExceeded()
                     return Rows([])
                 return super()._execute_bounded(connection, sql, values, deadline_at)
@@ -1583,27 +1587,23 @@ class SearchArmCostTests(unittest.TestCase):
             "deploy fail", since=None, until=None, candidate_limit=80,
             actor_ids=None, actor_relations=None, deadline_at=deadline,
         )
-        self.assertEqual((rows, status), ([], "ok-recent-window"))
+        self.assertEqual((rows, status), ([], "ok-recent-first"))
         lexical = [(q, v, d) for q, v, d in zip(store.sql, store.values, store.deadlines, strict=True) if "canonical_passages passage" in q]
         self.assertEqual(len(lexical), 2)
         first_deadline, second_deadline = lexical[0][2], lexical[1][2]
         self.assertLess(first_deadline, deadline - 6.0)   # ~35% of the budget
         self.assertGreater(second_deadline, deadline - 0.5)  # the full remaining budget
-        self.assertEqual(lexical[0][1][-6], None)
-        self.assertEqual(lexical[1][1][-6], passage_retrieval._recent_window_since())
+        self.assertIn("ts_rank_cd(passage.search_vector", lexical[0][0])
+        self.assertNotIn("ts_rank_cd(passage.search_vector", lexical[1][0])
+        self.assertIn("ORDER BY passage.last_occurred_at DESC", lexical[1][0])
+        self.assertIn("0.0::real AS score", lexical[1][0])
 
         rows, status = retrieval._sparse_candidates(
             "brain_busy 503", since=None, until=None, candidate_limit=80,
             actor_ids=None, actor_relations=None, deadline_at=deadline,
         )
-        self.assertEqual((rows, status), ([], "ok-recent-window"))
-
-        # an explicit until before the recent window cannot be rescued
-        rows, status = retrieval._lexical_candidates(
-            "deploy fail", since=None, until="2020-01-01T00:00:00Z", candidate_limit=80,
-            actor_ids=None, actor_relations=None, deadline_at=time.monotonic() + 10.0,
-        )
-        self.assertEqual((rows, status), ([], "deadline-exceeded"))
+        self.assertEqual((rows, status), ([], "ok-recent-first"))
+        self.assertTrue(passage_retrieval.DENSE_NEAREST_LIMIT <= 400)
 
     def test_search_passes_the_original_query_to_the_sparse_arm(self) -> None:
         store = self._Store(scope_count=10)

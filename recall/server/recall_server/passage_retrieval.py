@@ -45,6 +45,14 @@ SPARSE_ARM_BUDGET_FRACTION = 0.5
 # to ranking only the most recent matches, which the index can stop early.
 RANKED_PHASE_BUDGET_FRACTION = 0.35
 RECENT_WINDOW_DAYS = 30
+# Ranking every full-text match reads each passage's TOASTed search_vector:
+# ~3 random disk reads per match on the managed instance. The fallback orders
+# matches by recency (inline columns only), then ranks just that pool.
+RECENT_POOL_MULTIPLIER = 4
+# HNSW cost grows with the requested neighbour count; 200 neighbours cost
+# ~1.7 s cold on the managed instance versus 3+ s for 400 and far more for
+# the temporal ×50 oversample. Documents are ranked after the scan anyway.
+DENSE_NEAREST_LIMIT = 200
 
 
 def _recent_window_since(now: float | None = None) -> str:
@@ -319,36 +327,27 @@ class PassageHintRetrieval:
         actor_relations: list[str] | None,
         deadline_at: float,
     ) -> tuple[list[dict[str, Any]], str]:
-        """Rank every match if the budget allows; otherwise rank recent matches."""
+        """Rank every match under a short budget; otherwise rank the most recent."""
 
         arguments = {
+            "since": since,
+            "until": until,
             "candidate_limit": candidate_limit,
             "actor_ids": actor_ids,
             "actor_relations": actor_relations,
         }
-        if since is None:
-            try:
-                return self._lexical_query(
-                    lexical_query, since=None, until=until,
-                    deadline_at=_phase_deadline(deadline_at, RANKED_PHASE_BUDGET_FRACTION),
-                    **arguments,
-                ), "ok"
-            except SearchDeadlineExceeded:
-                recent = _recent_window_since()
-                if until is not None and until < recent:
-                    return [], "deadline-exceeded"
-                try:
-                    return self._lexical_query(
-                        lexical_query, since=recent, until=until,
-                        deadline_at=deadline_at, **arguments,
-                    ), "ok-recent-window"
-                except SearchDeadlineExceeded:
-                    return [], "deadline-exceeded"
         try:
             return self._lexical_query(
-                lexical_query, since=since, until=until, deadline_at=deadline_at,
+                lexical_query, order="rank",
+                deadline_at=_phase_deadline(deadline_at, RANKED_PHASE_BUDGET_FRACTION),
                 **arguments,
             ), "ok"
+        except SearchDeadlineExceeded:
+            pass
+        try:
+            return self._lexical_query(
+                lexical_query, order="recent", deadline_at=deadline_at, **arguments,
+            ), "ok-recent-first"
         except SearchDeadlineExceeded:
             return [], "deadline-exceeded"
 
@@ -356,6 +355,7 @@ class PassageHintRetrieval:
         self,
         lexical_query: str,
         *,
+        order: str,
         since: str | None,
         until: str | None,
         candidate_limit: int,
@@ -363,41 +363,53 @@ class PassageHintRetrieval:
         actor_relations: list[str] | None,
         deadline_at: float,
     ) -> list[dict[str, Any]]:
+        """One bounded lexical scan.
+
+        `matched` touches only canonical_passages: the GIN match, the scope
+        filters, and either the rank (reads every match's TOASTed
+        search_vector) or recency (inline columns only). Joins to the current
+        projection, evidence, and chunk liveness run afterwards on the bounded
+        pool, never on the whole match set.
+        """
+        # Fusion consumes rank position, not score magnitude. Recency order is
+        # therefore a complete ranking on its own and never reads the TOASTed
+        # search_vector; the score column is reported for the rank mode only.
+        if order == "rank":
+            pool_order = (
+                "ts_rank_cd(passage.search_vector,plainto_tsquery('simple',%s),32) DESC,"
+                "passage.last_occurred_at DESC,passage.passage_id"
+            )
+            pool_limit = candidate_limit * LIVENESS_OVERSAMPLE
+            order_values: tuple[str, ...] = (lexical_query,)
+            score_sql = "ts_rank_cd(top.search_vector,plainto_tsquery('simple',%s),32)"
+            score_values: tuple[str, ...] = (lexical_query,)
+        elif order == "recent":
+            pool_order = "passage.last_occurred_at DESC,passage.passage_id"
+            pool_limit = candidate_limit * LIVENESS_OVERSAMPLE
+            order_values = ()
+            score_sql = "0.0::real"
+            score_values = ()
+        else:
+            raise ValueError("unsupported lexical order")
         with self.store.connect() as connection:
             return self.store._execute_bounded(
                     connection,
-                    """WITH matched AS MATERIALIZED (
+                    f"""WITH matched AS MATERIALIZED (
                        SELECT passage.tenant_id,
                               passage.source_id,
                               passage.logical_document_id,
-                              passage.revision,evidence.native_parent_id,
-                              evidence.first_occurred_at,
-                              evidence.last_occurred_at,
-                              evidence.manifest_object_key,
-                              evidence.manifest_content_sha256,
+                              passage.revision,
+                              passage.policy_fingerprint,
                               passage.passage_id,
                               passage.ordinal AS passage_ordinal,
                               passage.spans,passage.receipts,
                               passage.text_redacted,
-                              ts_rank_cd(
-                                  passage.search_vector,
-                                  plainto_tsquery('simple',%s),
-                                  32
-                              ) AS score
+                              passage.last_occurred_at,
+                              passage.search_vector
                          FROM canonical_passages passage
-                         JOIN canonical_passage_documents projected
-                           USING(
-                               tenant_id,source_id,logical_document_id,
-                               revision,policy_fingerprint
-                           )
-                         JOIN canonical_evidence_documents evidence
-                           USING(
-                               tenant_id,source_id,logical_document_id,
-                               revision
-                           )
                         WHERE passage.tenant_id=%s
                           AND passage.source_id=ANY(%s)
-                          AND projected.policy_fingerprint=%s
+                          AND passage.policy_fingerprint=%s
                           AND (
                               %s::text[] IS NULL
                               OR EXISTS (
@@ -419,37 +431,48 @@ class PassageHintRetrieval:
                                OR passage.last_occurred_at>=%s)
                           AND (%s::timestamptz IS NULL
                                OR passage.first_occurred_at<=%s)
-                        ORDER BY score DESC,passage.last_occurred_at DESC,
-                                 passage.passage_id
+                        ORDER BY {pool_order}
                         LIMIT %s
                        )
-                       SELECT matched.source_id,matched.logical_document_id,
-                              matched.revision,matched.native_parent_id,
-                              matched.first_occurred_at,matched.last_occurred_at,
-                              matched.manifest_object_key,
-                              matched.manifest_content_sha256,
-                              matched.passage_id,matched.passage_ordinal,
-                              matched.spans,matched.receipts,
-                              matched.text_redacted,matched.score
-                         FROM matched
+                       , top AS MATERIALIZED (
+                       SELECT * FROM matched
+                        ORDER BY {pool_order.replace("passage.", "matched.")}
+                        LIMIT %s
+                       )
+                       SELECT top.source_id,top.logical_document_id,
+                              top.revision,evidence.native_parent_id,
+                              evidence.first_occurred_at,evidence.last_occurred_at,
+                              evidence.manifest_object_key,
+                              evidence.manifest_content_sha256,
+                              top.passage_id,top.passage_ordinal,
+                              top.spans,top.receipts,
+                              top.text_redacted,
+                              {score_sql} AS score
+                         FROM top
+                         JOIN canonical_passage_documents projected
+                           USING(
+                               tenant_id,source_id,logical_document_id,
+                               revision,policy_fingerprint
+                           )
+                         JOIN canonical_evidence_documents evidence
+                           USING(
+                               tenant_id,source_id,logical_document_id,
+                               revision
+                           )
                         WHERE NOT EXISTS (
                               SELECT 1
-                                FROM unnest(matched.receipts)
+                                FROM unnest(top.receipts)
                                      AS passage_receipt(receipt)
                                 LEFT JOIN canonical_chunks live_chunk
-                                  ON live_chunk.tenant_id=matched.tenant_id
-                                 AND live_chunk.source_id=matched.source_id
+                                  ON live_chunk.tenant_id=top.tenant_id
+                                 AND live_chunk.source_id=top.source_id
                                  AND live_chunk.receipt=
                                      passage_receipt.receipt
                                  AND live_chunk.deleted_at IS NULL
                                WHERE live_chunk.receipt IS NULL
                           )
-                        ORDER BY matched.score DESC,
-                                 matched.last_occurred_at DESC,
-                                 matched.passage_id
-                        LIMIT %s""",
+                        ORDER BY {pool_order.replace("passage.", "top.")}""",
                     (
-                        lexical_query,
                         self.tenant_id,
                         self.sources,
                         self.policy_fingerprint,
@@ -462,8 +485,12 @@ class PassageHintRetrieval:
                         since,
                         until,
                         until,
-                        candidate_limit * LIVENESS_OVERSAMPLE,
+                        *order_values,
+                        pool_limit,
+                        *order_values,
                         candidate_limit,
+                        *score_values,
+                        *order_values,
                     ),
                     deadline_at,
                 ).fetchall()
@@ -491,33 +518,24 @@ class PassageHintRetrieval:
             return [], "skipped-prose-query"
         arm_deadline = _phase_deadline(deadline_at, SPARSE_ARM_BUDGET_FRACTION)
         arguments = {
+            "since": since,
+            "until": until,
             "candidate_limit": candidate_limit,
             "actor_ids": actor_ids,
             "actor_relations": actor_relations,
         }
-        if since is None:
-            try:
-                return self._sparse_query(
-                    lexical_query, since=None, until=until,
-                    deadline_at=_phase_deadline(arm_deadline, RANKED_PHASE_BUDGET_FRACTION),
-                    **arguments,
-                ), "ok"
-            except SearchDeadlineExceeded:
-                recent = _recent_window_since()
-                if until is not None and until < recent:
-                    return [], "deadline-exceeded"
-                try:
-                    return self._sparse_query(
-                        lexical_query, since=recent, until=until,
-                        deadline_at=arm_deadline, **arguments,
-                    ), "ok-recent-window"
-                except SearchDeadlineExceeded:
-                    return [], "deadline-exceeded"
         try:
             return self._sparse_query(
-                lexical_query, since=since, until=until, deadline_at=arm_deadline,
+                lexical_query, order="rank",
+                deadline_at=_phase_deadline(arm_deadline, RANKED_PHASE_BUDGET_FRACTION),
                 **arguments,
             ), "ok"
+        except SearchDeadlineExceeded:
+            pass
+        try:
+            return self._sparse_query(
+                lexical_query, order="recent", deadline_at=arm_deadline, **arguments,
+            ), "ok-recent-first"
         except SearchDeadlineExceeded:
             return [], "deadline-exceeded"
 
@@ -525,6 +543,7 @@ class PassageHintRetrieval:
         self,
         lexical_query: str,
         *,
+        order: str,
         since: str | None,
         until: str | None,
         candidate_limit: int,
@@ -532,23 +551,61 @@ class PassageHintRetrieval:
         actor_relations: list[str] | None,
         deadline_at: float,
     ) -> list[dict[str, Any]]:
+        """One bounded exact-identifier scan over canonical_chunks.
+
+        `matched` touches only the chunk table through its GIN index; the
+        document, event, evidence, actor, and time joins run on the bounded
+        pool. Recency uses chunk.created_at (inline) so no TOASTed
+        search_vector is read before the LIMIT.
+        """
+        if order == "rank":
+            pool_order = (
+                "ts_rank_cd(chunk.search_vector,plainto_tsquery('simple',%s),32) DESC,"
+                "chunk.created_at DESC,chunk.chunk_id"
+            )
+            order_values: tuple[str, ...] = (lexical_query,)
+            score_sql = "ts_rank_cd(top.search_vector,plainto_tsquery('simple',%s),32)"
+            score_values: tuple[str, ...] = (lexical_query,)
+        elif order == "recent":
+            pool_order = "chunk.created_at DESC,chunk.chunk_id"
+            order_values = ()
+            score_sql = "0.0::real"
+            score_values = ()
+        else:
+            raise ValueError("unsupported sparse order")
+        pool_limit = candidate_limit * LIVENESS_OVERSAMPLE
         with self.store.connect() as connection:
             return self.store._execute_bounded(
                     connection,
-                    """SELECT event.source_id,
+                    f"""WITH matched AS MATERIALIZED (
+                       SELECT chunk.tenant_id,chunk.source_id,
+                              chunk.document_id,chunk.chunk_id,
+                              chunk.ordinal,chunk.receipt,
+                              chunk.text_redacted,chunk.created_at,
+                              chunk.search_vector
+                         FROM canonical_chunks chunk
+                        WHERE chunk.tenant_id=%s
+                          AND chunk.source_id=ANY(%s)
+                          AND chunk.deleted_at IS NULL
+                          AND chunk.search_vector @@
+                              plainto_tsquery('simple',%s)
+                        ORDER BY {pool_order}
+                        LIMIT %s
+                       ), top AS MATERIALIZED (
+                       SELECT * FROM matched
+                        ORDER BY {pool_order.replace("chunk.", "matched.")}
+                        LIMIT %s
+                       )
+                       SELECT event.source_id,
                               evidence.logical_document_id,
                               evidence.revision,evidence.native_parent_id,
                               evidence.first_occurred_at,
                               evidence.last_occurred_at,
                               evidence.manifest_object_key,
                               evidence.manifest_content_sha256,
-                              chunk.receipt,chunk.text_redacted,
-                              ts_rank_cd(
-                                  chunk.search_vector,
-                                  plainto_tsquery('simple',%s),
-                                  32
-                              ) AS score
-                         FROM canonical_chunks chunk
+                              top.receipt,top.text_redacted,
+                              {score_sql} AS score
+                         FROM top
                          JOIN canonical_documents document
                            USING(tenant_id,source_id,document_id)
                          JOIN canonical_events event
@@ -559,10 +616,7 @@ class PassageHintRetrieval:
                           AND evidence.native_parent_id=COALESCE(
                               event.native_parent_id,event.native_id
                           )
-                        WHERE chunk.tenant_id=%s
-                          AND chunk.source_id=ANY(%s)
-                          AND chunk.deleted_at IS NULL
-                          AND document.is_current
+                        WHERE document.is_current
                           AND document.deleted_at IS NULL
                           AND (
                               %s::text[] IS NULL
@@ -581,29 +635,29 @@ class PassageHintRetrieval:
                                      )
                               )
                           )
-                          AND chunk.search_vector @@
-                              plainto_tsquery('simple',%s)
                           AND (%s::timestamptz IS NULL
                                OR event.occurred_at>=%s)
                           AND (%s::timestamptz IS NULL
                                OR event.occurred_at<=%s)
                         ORDER BY score DESC,event.occurred_at DESC,
-                                 chunk.chunk_id
-                        LIMIT %s""",
+                                 top.chunk_id""",
                     (
-                        lexical_query,
                         self.tenant_id,
                         self.sources,
-                        actor_ids,
-                        actor_ids,
-                        actor_relations,
-                        actor_relations,
                         lexical_query,
-                        since,
-                        since,
-                        until,
-                        until,
+                        *order_values,
+                        pool_limit,
+                        *order_values,
                         candidate_limit,
+                        *score_values,
+                        actor_ids,
+                        actor_ids,
+                        actor_relations,
+                        actor_relations,
+                        since,
+                        since,
+                        until,
+                        until,
                     ),
                     deadline_at,
                 ).fetchall()
@@ -803,6 +857,7 @@ class PassageHintRetrieval:
                 )
             else:
                 dense_strategy = "ann-oversampled"
+                nearest_limit = min(DENSE_NEAREST_LIMIT, candidate_limit * dense_oversample)
                 # Liveness (forgotten chunks) is checked once on the
                 # oversampled top-K in ranked_documents, never inside the
                 # index scan: probing canonical_chunks per ANN candidate is
@@ -825,7 +880,7 @@ class PassageHintRetrieval:
                     self.sources,
                     runtime.passage_fingerprint,
                     vector,
-                    candidate_limit * dense_oversample,
+                    nearest_limit,
                 )
             dense_sql = nearest_sql + """, ranked_documents AS MATERIALIZED (
                            SELECT DISTINCT ON (passage.logical_document_id)
@@ -881,6 +936,18 @@ class PassageHintRetrieval:
                         ORDER BY distance,last_occurred_at DESC,passage_id
                         LIMIT %s"""
             with self.store.connect() as connection:
+                if dense_strategy == "ann-oversampled":
+                    # Strict order keeps the ranking reproducible; ef_search at
+                    # the requested neighbour count is the cheapest exact-enough
+                    # setting (pgvector returns at most ef_search per scan).
+                    connection.execute(
+                        "SELECT set_config('hnsw.iterative_scan',%s,true)",
+                        ("strict_order",),
+                    )
+                    connection.execute(
+                        "SELECT set_config('hnsw.ef_search',%s,true)",
+                        (str(nearest_limit),),
+                    )
                 rows = self.store._execute_bounded(
                     connection,
                     dense_sql,
