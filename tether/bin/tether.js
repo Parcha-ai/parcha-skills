@@ -178,8 +178,6 @@ function expectedManagedTargetModes(metadata) {
 
   const targets = new Map([
     [path.join(runtimeRoot, "tether_notify.py"), 0o700],
-    [path.join(runtimeRoot, "tether_team.py"), 0o700],
-    [path.join(runtimeRoot, "team", "TEAM.md"), 0o600],
     [path.join(runtimeRoot, "install.sh"), 0o700],
     [path.join(runtimeRoot, "package.json"), 0o600],
     [path.join(pluginRoot, "__init__.py"), 0o600],
@@ -191,6 +189,7 @@ function expectedManagedTargetModes(metadata) {
     [path.join(pluginRoot, "store.py"), 0o600],
     [path.join(pluginRoot, "session_driver.py"), 0o600],
     [path.join(pluginRoot, "notices.py"), 0o600],
+    [path.join(pluginRoot, "team.md"), 0o600],
     [path.join(pluginRoot, "plugin.yaml"), 0o644],
     [path.join(localBin, "tether"), 0o700],
   ]);
@@ -406,7 +405,6 @@ function printHelp(command = "") {
     close: "tether close --bridge-id ID | --channel ID --thread-ts TS [--team ID] [--expected-generation N]",
     unbind: "tether unbind --bridge-id ID | --channel ID --thread-ts TS [--team ID] [--expected-generation N]",
     post: "tether post --channel ID --thread-ts TS (--text-stdin|--text-fd FD|--text TEXT [deprecated]) [--file PATH] --idempotency-key KEY [--team ID]",
-    team: "tether team apply|status   (apply the shared team layer to this agent's SOUL.md)",
     spawn: "tether spawn --task TEXT [--harness claude|codex] [--cwd DIR] [--channel ID] [--thread-ts TS] [--root-text TEXT] [--team ID]",
     unresolved: "tether unresolved [--team ID] [--json]",
     history: "tether history [--channel ID] [--limit N] [--team ID]",
@@ -425,7 +423,6 @@ Usage:
   tether rollback|uninstall [--dry-run] [--restart]
   tether doctor|status|identity|maintenance [--json]
   tether notify|reply|attach|rebind|close|unbind|post|spawn|history|thread [options]
-  tether team apply|status
   tether schema status [--json]
   tether unresolved [options]
   tether version
@@ -815,7 +812,7 @@ function brokerCall(request, options) {
 function assertNonRoot(command) {
   const mutating = new Set([
     "setup", "install", "upgrade", "rollback", "uninstall", "maintenance",
-    "notify", "reply", "attach", "rebind", "close", "unbind", "post", "spawn", "team",
+    "notify", "reply", "attach", "rebind", "close", "unbind", "post", "spawn",
   ]);
   if (
     mutating.has(command) &&
@@ -1201,13 +1198,6 @@ async function runDoctor(options) {
 }
 
 async function runBrokerCommand(command, argv) {
-  if (command === "team") {
-    const script = path.join(runtimeHome, "tether_team.py");
-    const teamMd = path.join(runtimeHome, "team", "TEAM.md");
-    const sub = argv[1] || "apply";
-    const child = spawnSync("python3", [script, sub, "--team-md", teamMd], { stdio: "inherit" });
-    return child.status ?? 1;
-  }
   const source = sourceDefinitions();
   let definitions;
   switch (command) {

@@ -81,6 +81,19 @@ class RichCtx(FloorCtx):
         self.unload_callbacks.append(callback)
 
 
+class SystemPromptCtx(RichCtx):
+    """Hermes host exposing the native system-prompt-section seam."""
+
+    def __init__(self, config=None):
+        super().__init__(config)
+        self.system_prompt_sections = []
+
+    def register_system_prompt_section(self, id, content, *, position="after_memory", max_chars=4000):
+        self.system_prompt_sections.append(
+            {"id": id, "content": content, "position": position, "max_chars": max_chars}
+        )
+
+
 class PluginEnvironment(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="tether-plugin-next-")
@@ -380,3 +393,33 @@ class AllowlistResolutionTest(PluginEnvironment):
         ):
             settings = self.module.load_settings()
         self.assertEqual({"U12345678"}, set(settings.allowed_users))
+
+
+class TeamPromptSectionTest(PluginEnvironment):
+    """team.md is injected as a native Hermes system-prompt section.
+
+    Replaces the old ``tether team apply`` splice into each agent's SOUL.md.
+    """
+
+    def test_registers_team_section_when_host_supports_it(self):
+        ctx = SystemPromptCtx()
+        self.module.register(ctx)
+        sections = {entry["id"]: entry for entry in ctx.system_prompt_sections}
+        self.assertIn("tether.team", sections)
+        section = sections["tether.team"]
+        self.assertEqual(section["position"], "after_memory")
+        # A sentence distinctive to team/TEAM.md's content, not boilerplate
+        # that could accidentally match some other registered section.
+        self.assertIn(
+            "Never close a loop with your own acknowledgement", section["content"]
+        )
+        # The tether-managed HTML comment header is for humans editing the
+        # source file, not for the model reading its own system prompt.
+        self.assertNotIn("<!--", section["content"])
+
+    def test_older_host_without_the_seam_still_loads(self):
+        # FloorCtx mirrors Hermes v2026.7.20: no register_system_prompt_section.
+        ctx = FloorCtx()
+        self.assertFalse(hasattr(ctx, "register_system_prompt_section"))
+        self.module.register(ctx)  # must not raise
+        self.assertIn("pre_gateway_dispatch", ctx.hooks)

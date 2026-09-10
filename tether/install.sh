@@ -586,13 +586,12 @@ build_install_plan() {
   }
   resolve_harness
   add_file "$SKILL_SOURCE/scripts/tether_notify.py" "$RUNTIME_HOME/tether_notify.py" 700
-  add_file "$SKILL_SOURCE/scripts/tether_team.py" "$RUNTIME_HOME/tether_team.py" 700
-  add_file "$ROOT_DIR/team/TEAM.md" "$RUNTIME_HOME/team/TEAM.md" 600
   add_file "$ROOT_DIR/install.sh" "$RUNTIME_HOME/install.sh" 700
   add_file "$ROOT_DIR/package.json" "$RUNTIME_HOME/package.json" 600
   for module in __init__.py active.py admission.py broker.py journal.py slack_egress.py store.py session_driver.py notices.py; do
     add_file "$ROOT_DIR/runtime/plugin_next/$module" "$PLUGIN_HOME/$module" 600
   done
+  add_file "$ROOT_DIR/runtime/plugin_next/team.md" "$PLUGIN_HOME/team.md" 600
   add_file "$ROOT_DIR/runtime/plugin_next/plugin.yaml" "$PLUGIN_HOME/plugin.yaml" 644
   add_file "$ROOT_DIR/bin/tether.js" "$LOCAL_BIN/tether" 700
   if [[ "$HARNESS" == "codex" || "$HARNESS" == "both" ]]; then

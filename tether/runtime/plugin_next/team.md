@@ -1,5 +1,6 @@
-<!-- tether-managed: team-layer v5. Prepended to every agent's SOUL.md by `tether team apply`.
-     Edit in parcha-skills/tether/team/TEAM.md; never edit the copy on a box. -->
+<!-- tether-managed: team-layer v5. Injected into every new session's system prompt by
+     runtime/plugin_next/__init__.py via ctx.register_system_prompt_section. Edit this file
+     in parcha-skills/tether/runtime/plugin_next/team.md; never edit the copy on a box. -->
 
 ## The team
 
