@@ -43,7 +43,7 @@ SPARSE_ARM_BUDGET_FRACTION = 0.5
 # the match set. Common words match most of the corpus. Each text arm first
 # tries the full ranking under a short share of the budget, then falls back
 # to ranking only the most recent matches, which the index can stop early.
-RANKED_PHASE_BUDGET_FRACTION = 0.35
+RANKED_PHASE_BUDGET_FRACTION = 0.7
 RECENT_WINDOW_DAYS = 30
 # Ranking every full-text match reads each passage's TOASTed search_vector:
 # ~3 random disk reads per match on the managed instance. The fallback orders
@@ -52,7 +52,7 @@ RECENT_POOL_MULTIPLIER = 4
 # HNSW cost grows with the requested neighbour count; 200 neighbours cost
 # ~1.7 s cold on the managed instance versus 3+ s for 400 and far more for
 # the temporal ×50 oversample. Documents are ranked after the scan anyway.
-DENSE_NEAREST_LIMIT = 200
+DENSE_NEAREST_LIMIT = 400
 
 
 def _recent_window_since(now: float | None = None) -> str:
@@ -936,18 +936,10 @@ class PassageHintRetrieval:
                         ORDER BY distance,last_occurred_at DESC,passage_id
                         LIMIT %s"""
             with self.store.connect() as connection:
-                if dense_strategy == "ann-oversampled":
-                    # Strict order keeps the ranking reproducible; ef_search at
-                    # the requested neighbour count is the cheapest exact-enough
-                    # setting (pgvector returns at most ef_search per scan).
-                    connection.execute(
-                        "SELECT set_config('hnsw.iterative_scan',%s,true)",
-                        ("strict_order",),
-                    )
-                    connection.execute(
-                        "SELECT set_config('hnsw.ef_search',%s,true)",
-                        (str(nearest_limit),),
-                    )
+                # Leave hnsw.iterative_scan / ef_search at the server defaults.
+                # strict_order with a real (short) query vector walked the
+                # graph for 16 s p50 in production, against 1.7 s measured
+                # with a passage vector as the query.
                 rows = self.store._execute_bounded(
                     connection,
                     dense_sql,

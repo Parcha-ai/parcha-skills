@@ -1561,8 +1561,9 @@ class SearchArmCostTests(unittest.TestCase):
             actor_ids=None, actor_relations=None, deadline_at=deadline,
         )
         # ranked phase: 35% of the arm's half budget (10 s * 0.5 * 0.35 = 1.75 s)
-        self.assertLessEqual(store.deadlines[-1], deadline - 8.0)
-        self.assertGreaterEqual(store.deadlines[-1], deadline - 8.5)
+        # ranked phase: 70% of the arm's half budget (10 s * 0.5 * 0.7 = 3.5 s)
+        self.assertLessEqual(store.deadlines[-1], deadline - 6.3)
+        self.assertGreaterEqual(store.deadlines[-1], deadline - 6.7)
 
     def test_text_arms_rank_everything_first_then_fall_back_to_a_recent_window(self) -> None:
         from recall_server import passage_retrieval
@@ -1591,7 +1592,7 @@ class SearchArmCostTests(unittest.TestCase):
         lexical = [(q, v, d) for q, v, d in zip(store.sql, store.values, store.deadlines, strict=True) if "canonical_passages passage" in q]
         self.assertEqual(len(lexical), 2)
         first_deadline, second_deadline = lexical[0][2], lexical[1][2]
-        self.assertLess(first_deadline, deadline - 6.0)   # ~35% of the budget
+        self.assertLess(first_deadline, deadline - 2.5)   # ~70% of the budget
         self.assertGreater(second_deadline, deadline - 0.5)  # the full remaining budget
         self.assertIn("ts_rank_cd(passage.search_vector", lexical[0][0])
         self.assertNotIn("ts_rank_cd(passage.search_vector", lexical[1][0])
