@@ -33,10 +33,30 @@ IDENTIFIER_TOKEN_RE = re.compile(
     r"[A-Za-z0-9_-]*\d[A-Za-z0-9_-]*"          # anything with a digit: ids, versions, ports
     r"|[A-Za-z][A-Za-z0-9]*(?:[_./:#-][A-Za-z0-9]+)+"  # snake_case, dotted, paths, k8s names
     r"|[A-Z][a-z]+(?:[A-Z][a-z0-9]+)+"           # CamelCase symbols
-    r"|[A-Z]{2,}[A-Z0-9_]*"                     # ALL_CAPS constants, error codes
+    r"|[A-Z]+_[A-Z0-9_]+"                       # ALL_CAPS constants with a separator
     r")"
 )
+# Acronyms such as MCP, API, or SQL are ordinary vocabulary here, not exact
+# identifiers; they stay with the passage-lexical arm.
 SPARSE_ARM_BUDGET_FRACTION = 0.5
+# Ranking every full-text match by ts_rank_cd is proportional to the size of
+# the match set. Common words match most of the corpus. Each text arm first
+# tries the full ranking under a short share of the budget, then falls back
+# to ranking only the most recent matches, which the index can stop early.
+RANKED_PHASE_BUDGET_FRACTION = 0.35
+RECENT_WINDOW_DAYS = 30
+
+
+def _recent_window_since(now: float | None = None) -> str:
+    moment = time.time() if now is None else now
+    return time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(moment - RECENT_WINDOW_DAYS * 86400)
+    )
+
+
+def _phase_deadline(deadline_at: float, fraction: float) -> float:
+    now = time.monotonic()
+    return min(deadline_at, now + max(0.0, deadline_at - now) * fraction)
 
 
 def sparse_arm_applies(lexical_query: str) -> bool:
@@ -299,9 +319,52 @@ class PassageHintRetrieval:
         actor_relations: list[str] | None,
         deadline_at: float,
     ) -> tuple[list[dict[str, Any]], str]:
+        """Rank every match if the budget allows; otherwise rank recent matches."""
+
+        arguments = {
+            "candidate_limit": candidate_limit,
+            "actor_ids": actor_ids,
+            "actor_relations": actor_relations,
+        }
+        if since is None:
+            try:
+                return self._lexical_query(
+                    lexical_query, since=None, until=until,
+                    deadline_at=_phase_deadline(deadline_at, RANKED_PHASE_BUDGET_FRACTION),
+                    **arguments,
+                ), "ok"
+            except SearchDeadlineExceeded:
+                recent = _recent_window_since()
+                if until is not None and until < recent:
+                    return [], "deadline-exceeded"
+                try:
+                    return self._lexical_query(
+                        lexical_query, since=recent, until=until,
+                        deadline_at=deadline_at, **arguments,
+                    ), "ok-recent-window"
+                except SearchDeadlineExceeded:
+                    return [], "deadline-exceeded"
         try:
-            with self.store.connect() as connection:
-                rows = self.store._execute_bounded(
+            return self._lexical_query(
+                lexical_query, since=since, until=until, deadline_at=deadline_at,
+                **arguments,
+            ), "ok"
+        except SearchDeadlineExceeded:
+            return [], "deadline-exceeded"
+
+    def _lexical_query(
+        self,
+        lexical_query: str,
+        *,
+        since: str | None,
+        until: str | None,
+        candidate_limit: int,
+        actor_ids: list[str] | None,
+        actor_relations: list[str] | None,
+        deadline_at: float,
+    ) -> list[dict[str, Any]]:
+        with self.store.connect() as connection:
+            return self.store._execute_bounded(
                     connection,
                     """WITH matched AS MATERIALIZED (
                        SELECT passage.tenant_id,
@@ -404,9 +467,6 @@ class PassageHintRetrieval:
                     ),
                     deadline_at,
                 ).fetchall()
-        except SearchDeadlineExceeded:
-            return [], "deadline-exceeded"
-        return rows, "ok"
 
     def _sparse_candidates(
         self,
@@ -429,14 +489,51 @@ class PassageHintRetrieval:
             or (original_query is not None and sparse_arm_applies(original_query))
         ):
             return [], "skipped-prose-query"
-        arm_deadline = min(
-            deadline_at,
-            time.monotonic()
-            + max(0.0, deadline_at - time.monotonic()) * SPARSE_ARM_BUDGET_FRACTION,
-        )
+        arm_deadline = _phase_deadline(deadline_at, SPARSE_ARM_BUDGET_FRACTION)
+        arguments = {
+            "candidate_limit": candidate_limit,
+            "actor_ids": actor_ids,
+            "actor_relations": actor_relations,
+        }
+        if since is None:
+            try:
+                return self._sparse_query(
+                    lexical_query, since=None, until=until,
+                    deadline_at=_phase_deadline(arm_deadline, RANKED_PHASE_BUDGET_FRACTION),
+                    **arguments,
+                ), "ok"
+            except SearchDeadlineExceeded:
+                recent = _recent_window_since()
+                if until is not None and until < recent:
+                    return [], "deadline-exceeded"
+                try:
+                    return self._sparse_query(
+                        lexical_query, since=recent, until=until,
+                        deadline_at=arm_deadline, **arguments,
+                    ), "ok-recent-window"
+                except SearchDeadlineExceeded:
+                    return [], "deadline-exceeded"
         try:
-            with self.store.connect() as connection:
-                rows = self.store._execute_bounded(
+            return self._sparse_query(
+                lexical_query, since=since, until=until, deadline_at=arm_deadline,
+                **arguments,
+            ), "ok"
+        except SearchDeadlineExceeded:
+            return [], "deadline-exceeded"
+
+    def _sparse_query(
+        self,
+        lexical_query: str,
+        *,
+        since: str | None,
+        until: str | None,
+        candidate_limit: int,
+        actor_ids: list[str] | None,
+        actor_relations: list[str] | None,
+        deadline_at: float,
+    ) -> list[dict[str, Any]]:
+        with self.store.connect() as connection:
+            return self.store._execute_bounded(
                     connection,
                     """SELECT event.source_id,
                               evidence.logical_document_id,
@@ -508,11 +605,8 @@ class PassageHintRetrieval:
                         until,
                         candidate_limit,
                     ),
-                    arm_deadline,
+                    deadline_at,
                 ).fetchall()
-        except SearchDeadlineExceeded:
-            return [], "deadline-exceeded"
-        return rows, "ok"
 
     def _dense_scope_passage_count(
         self,
