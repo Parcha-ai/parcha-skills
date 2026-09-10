@@ -150,6 +150,8 @@ class SearchStageProbe:
         deadline_exceeded = 0
         dense_ok = 0
         arms = {"dense_candidates": [], "passage_lexical_candidates": [], "sparse_candidates": []}
+        arm_ms: dict[str, list[float]] = {}
+        clip_ms: list[float] = []
         empty = 0
         n = 0
         strategies: dict[str, int] = {}
@@ -169,6 +171,11 @@ class SearchStageProbe:
                 value = diag.get(key)
                 if isinstance(value, (int, float)):
                     arms[key].append(float(value))
+            for arm, value in (diag.get("arm_elapsed_ms") or {}).items():
+                if isinstance(value, (int, float)):
+                    arm_ms.setdefault(str(arm), []).append(float(value))
+            if isinstance(diag.get("time_clip_elapsed_ms"), (int, float)):
+                clip_ms.append(float(diag["time_clip_elapsed_ms"]))
             if not outcome.result.get("results"):
                 empty += 1
         result.samples = n
@@ -187,6 +194,14 @@ class SearchStageProbe:
             metrics[f"{key}.zero_rate"] = (sum(1 for v in values if v == 0) / len(values)) if values else None
         for strategy, count in strategies.items():
             metrics[f"dense_strategy.{strategy}"] = count
+        for arm, values in arm_ms.items():
+            summary = summarize_latency(values)
+            metrics[f"arm.{arm}.p50_ms"] = summary["p50_ms"]
+            metrics[f"arm.{arm}.p95_ms"] = summary["p95_ms"]
+        if clip_ms:
+            summary = summarize_latency(clip_ms)
+            metrics["time_clip.p50_ms"] = summary["p50_ms"]
+            metrics["time_clip.p95_ms"] = summary["p95_ms"]
         result.metrics = metrics
         result.gates = [
             Gate("deadline_exceeded_rate", "<=", 0.05).evaluate(metrics["deadline_exceeded_rate"]),

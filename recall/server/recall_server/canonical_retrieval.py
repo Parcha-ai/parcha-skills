@@ -1813,6 +1813,7 @@ class BoundCanonicalRetrieval:
         if not receipts:
             diagnostics["time_clip_status"] = "ok"
             return {**response, "diagnostics": diagnostics}
+        clip_started = time.monotonic()
         try:
             with self.store.connect() as connection:
                 rows = self.store._execute_bounded(
@@ -1852,6 +1853,7 @@ class BoundCanonicalRetrieval:
                 ).fetchall()
         except SearchDeadlineExceeded:
             diagnostics["time_clip_status"] = "deadline-exceeded"
+            diagnostics["time_clip_elapsed_ms"] = round((time.monotonic() - clip_started) * 1000, 3)
             diagnostics["time_filter_requires_exec"] = True
             # Every retrieval arm already applied the document-level time
             # overlap. Keep those authorized pointers, but remove prose and
@@ -1893,6 +1895,7 @@ class BoundCanonicalRetrieval:
             if ranges:
                 results.append({**document, "matching_ranges": ranges})
         diagnostics["time_clip_status"] = "ok"
+        diagnostics["time_clip_elapsed_ms"] = round((time.monotonic() - clip_started) * 1000, 3)
         diagnostics["time_clipped_receipts"] = len(eligible)
         return {**response, "results": results, "diagnostics": diagnostics}
 

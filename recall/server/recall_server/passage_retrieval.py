@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
@@ -17,6 +18,42 @@ from .passage_representations import FINGERPRINT_RE, VECTOR_COLUMNS
 
 MAX_BUNDLE_SEARCH_WORKERS = 4
 MAX_EXACT_DENSE_SCOPE_PASSAGES = 20_000
+# Forgotten passages are rare: rank first, then drop the few whose chunks are
+# gone from an oversampled top-K instead of probing canonical_chunks per hit.
+LIVENESS_OVERSAMPLE = 2
+# The exact-vs-ANN decision only needs an approximate scope size; reuse it for
+# a short window so the count query does not run before every search.
+SCOPE_COUNT_TTL_SECONDS = 60.0
+SCOPE_COUNT_CACHE_ENTRIES = 256
+_SCOPE_COUNT_CACHE: dict[tuple, tuple[float, int]] = {}
+_SCOPE_COUNT_LOCK = threading.Lock()
+
+
+def _scope_count_cache_get(key: tuple, *, now: float | None = None) -> int | None:
+    moment = time.monotonic() if now is None else now
+    with _SCOPE_COUNT_LOCK:
+        entry = _SCOPE_COUNT_CACHE.get(key)
+        if entry is None:
+            return None
+        expires_at, value = entry
+        if expires_at < moment:
+            _SCOPE_COUNT_CACHE.pop(key, None)
+            return None
+        return value
+
+
+def _scope_count_cache_put(key: tuple, value: int, *, now: float | None = None) -> None:
+    moment = time.monotonic() if now is None else now
+    with _SCOPE_COUNT_LOCK:
+        if len(_SCOPE_COUNT_CACHE) >= SCOPE_COUNT_CACHE_ENTRIES:
+            oldest = min(_SCOPE_COUNT_CACHE, key=lambda k: _SCOPE_COUNT_CACHE[k][0])
+            _SCOPE_COUNT_CACHE.pop(oldest, None)
+        _SCOPE_COUNT_CACHE[key] = (moment + SCOPE_COUNT_TTL_SECONDS, value)
+
+
+def reset_scope_count_cache() -> None:
+    with _SCOPE_COUNT_LOCK:
+        _SCOPE_COUNT_CACHE.clear()
 
 
 def collapse_document_candidates(
@@ -238,7 +275,9 @@ class PassageHintRetrieval:
             with self.store.connect() as connection:
                 rows = self.store._execute_bounded(
                     connection,
-                    """SELECT passage.source_id,
+                    """WITH matched AS MATERIALIZED (
+                       SELECT passage.tenant_id,
+                              passage.source_id,
                               passage.logical_document_id,
                               passage.revision,evidence.native_parent_id,
                               evidence.first_occurred_at,
@@ -285,24 +324,38 @@ class PassageHintRetrieval:
                           )
                           AND passage.search_vector @@
                               plainto_tsquery('simple',%s)
-                          AND NOT EXISTS (
-                              SELECT 1
-                                FROM unnest(passage.receipts)
-                                     AS passage_receipt(receipt)
-                                LEFT JOIN canonical_chunks live_chunk
-                                  ON live_chunk.tenant_id=passage.tenant_id
-                                 AND live_chunk.source_id=passage.source_id
-                                 AND live_chunk.receipt=
-                                     passage_receipt.receipt
-                                 AND live_chunk.deleted_at IS NULL
-                               WHERE live_chunk.receipt IS NULL
-                          )
                           AND (%s::timestamptz IS NULL
                                OR passage.last_occurred_at>=%s)
                           AND (%s::timestamptz IS NULL
                                OR passage.first_occurred_at<=%s)
                         ORDER BY score DESC,passage.last_occurred_at DESC,
                                  passage.passage_id
+                        LIMIT %s
+                       )
+                       SELECT matched.source_id,matched.logical_document_id,
+                              matched.revision,matched.native_parent_id,
+                              matched.first_occurred_at,matched.last_occurred_at,
+                              matched.manifest_object_key,
+                              matched.manifest_content_sha256,
+                              matched.passage_id,matched.passage_ordinal,
+                              matched.spans,matched.receipts,
+                              matched.text_redacted,matched.score
+                         FROM matched
+                        WHERE NOT EXISTS (
+                              SELECT 1
+                                FROM unnest(matched.receipts)
+                                     AS passage_receipt(receipt)
+                                LEFT JOIN canonical_chunks live_chunk
+                                  ON live_chunk.tenant_id=matched.tenant_id
+                                 AND live_chunk.source_id=matched.source_id
+                                 AND live_chunk.receipt=
+                                     passage_receipt.receipt
+                                 AND live_chunk.deleted_at IS NULL
+                               WHERE live_chunk.receipt IS NULL
+                          )
+                        ORDER BY matched.score DESC,
+                                 matched.last_occurred_at DESC,
+                                 matched.passage_id
                         LIMIT %s""",
                     (
                         lexical_query,
@@ -318,6 +371,7 @@ class PassageHintRetrieval:
                         since,
                         until,
                         until,
+                        candidate_limit * LIVENESS_OVERSAMPLE,
                         candidate_limit,
                     ),
                     deadline_at,
@@ -420,6 +474,38 @@ class PassageHintRetrieval:
         return rows, "ok"
 
     def _dense_scope_passage_count(
+        self,
+        *,
+        since: str | None,
+        until: str | None,
+        actor_ids: list[str] | None,
+        actor_relations: list[str] | None,
+        deadline_at: float,
+    ) -> int | None:
+        key = (
+            self.tenant_id,
+            tuple(self.sources),
+            self.policy_fingerprint,
+            since,
+            until,
+            tuple(actor_ids) if actor_ids else None,
+            tuple(actor_relations) if actor_relations else None,
+        )
+        cached = _scope_count_cache_get(key)
+        if cached is not None:
+            return cached
+        count = self._dense_scope_passage_count_uncached(
+            since=since,
+            until=until,
+            actor_ids=actor_ids,
+            actor_relations=actor_relations,
+            deadline_at=deadline_at,
+        )
+        if count is not None:
+            _scope_count_cache_put(key, count)
+        return count
+
+    def _dense_scope_passage_count_uncached(
         self,
         *,
         since: str | None,
@@ -535,17 +621,6 @@ class PassageHintRetrieval:
                               AND embedding.source_id=ANY(%s)
                               AND embedding.runtime_fingerprint=%s
                               AND projected.policy_fingerprint=%s
-                              AND NOT EXISTS (
-                                  SELECT 1
-                                    FROM unnest(passage.receipts)
-                                         AS passage_receipt(receipt)
-                                    LEFT JOIN canonical_chunks live_chunk
-                                      ON live_chunk.tenant_id=passage.tenant_id
-                                     AND live_chunk.source_id=passage.source_id
-                                     AND live_chunk.receipt=passage_receipt.receipt
-                                     AND live_chunk.deleted_at IS NULL
-                                   WHERE live_chunk.receipt IS NULL
-                              )
                               AND (%s::timestamptz IS NULL
                                    OR passage.last_occurred_at>=%s)
                               AND (%s::timestamptz IS NULL
@@ -593,28 +668,19 @@ class PassageHintRetrieval:
                 )
             else:
                 dense_strategy = "ann-oversampled"
+                # Liveness (forgotten chunks) is checked once on the
+                # oversampled top-K in ranked_documents, never inside the
+                # index scan: probing canonical_chunks per ANN candidate is
+                # what turned every search into ~1,000 disk reads.
                 nearest_sql = """WITH nearest AS MATERIALIZED (
                            SELECT embedding.tenant_id,
                                   embedding.source_id,
                                   embedding.passage_id,
                                   embedding.embedding <=> %s::halfvec AS distance
                              FROM canonical_passage_embeddings embedding
-                             JOIN canonical_passages passage
-                               USING(tenant_id,source_id,passage_id)
                             WHERE embedding.tenant_id=%s
                               AND embedding.source_id=ANY(%s)
                               AND embedding.runtime_fingerprint=%s
-                              AND NOT EXISTS (
-                                  SELECT 1
-                                    FROM unnest(passage.receipts)
-                                         AS passage_receipt(receipt)
-                                    LEFT JOIN canonical_chunks live_chunk
-                                      ON live_chunk.tenant_id=passage.tenant_id
-                                     AND live_chunk.source_id=passage.source_id
-                                     AND live_chunk.receipt=passage_receipt.receipt
-                                     AND live_chunk.deleted_at IS NULL
-                                   WHERE live_chunk.receipt IS NULL
-                              )
                             ORDER BY embedding.embedding <=> %s::halfvec
                             LIMIT %s
                        )"""
@@ -740,21 +806,26 @@ class PassageHintRetrieval:
             "actor_relations": actor_relations,
             "deadline_at": deadline_at,
         }
+        arm_elapsed_ms: dict[str, float] = {}
+
+        def timed_arm(name: str, method: Any, *args: Any) -> Any:
+            arm_started = time.monotonic()
+            try:
+                return method(*args, **common)
+            finally:
+                arm_elapsed_ms[name] = round(
+                    (time.monotonic() - arm_started) * 1000, 3
+                )
+
         with ThreadPoolExecutor(max_workers=3) as executor:
             lexical_future = executor.submit(
-                self._lexical_candidates,
-                lexical_query,
-                **common,
+                timed_arm, "passage_lexical", self._lexical_candidates, lexical_query,
             )
             sparse_future = executor.submit(
-                self._sparse_candidates,
-                lexical_query,
-                **common,
+                timed_arm, "sparse_exact", self._sparse_candidates, lexical_query,
             )
             dense_future = executor.submit(
-                self._dense_candidates,
-                query,
-                **common,
+                timed_arm, "dense", self._dense_candidates, query,
             )
             lexical, lexical_status = lexical_future.result()
             sparse, sparse_status = sparse_future.result()
@@ -787,6 +858,7 @@ class PassageHintRetrieval:
                 "dense_scope_passages": dense_scope_passages,
                 "passage_lexical_status": lexical_status,
                 "sparse_status": sparse_status,
+                "arm_elapsed_ms": arm_elapsed_ms,
                 "elapsed_ms": round(
                     (time.monotonic() - started_at) * 1000,
                     3,

@@ -102,7 +102,7 @@ def history_row(card: dict[str, Any]) -> dict[str, Any]:
     picks = {
         "availability.endpoints": ["mcp_ping_p95_ms", "readyz_success_rate"],
         "latency.tools": ["recall_search.p95_ms", "recall_scan.p95_ms", "recall_exec.p95_ms", "error_rate"],
-        "latency.search_stages": ["server_p95_ms", "dense_ok_rate", "deadline_exceeded_rate"],
+        "latency.search_stages": ["server_p95_ms", "dense_ok_rate", "deadline_exceeded_rate", "arm.dense.p50_ms", "arm.passage_lexical.p50_ms", "arm.sparse_exact.p50_ms"],
         "accuracy.truth_boundary": ["boundary_recall@20", "boundary_mrr", "negative_false_hit_rate"],
         "freshness.source_age": ["newest_age_hours_min", "newest_age_hours_median", "projection_pending"],
         "integrity.scan_consistency": ["scope_scan_agreement", "objects_unavailable"],
