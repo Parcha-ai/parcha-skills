@@ -44,22 +44,13 @@ SPARSE_ARM_BUDGET_FRACTION = 0.5
 # tries the full ranking under a short share of the budget, then falls back
 # to ranking only the most recent matches, which the index can stop early.
 RANKED_PHASE_BUDGET_FRACTION = 0.7
-RECENT_WINDOW_DAYS = 30
 # Ranking every full-text match reads each passage's TOASTed search_vector:
 # ~3 random disk reads per match on the managed instance. The fallback orders
-# matches by recency (inline columns only), then ranks just that pool.
-RECENT_POOL_MULTIPLIER = 4
+# matches by recency (inline columns only) instead.
 # HNSW cost grows with the requested neighbour count; 200 neighbours cost
 # ~1.7 s cold on the managed instance versus 3+ s for 400 and far more for
 # the temporal ×50 oversample. Documents are ranked after the scan anyway.
 DENSE_NEAREST_LIMIT = 400
-
-
-def _recent_window_since(now: float | None = None) -> str:
-    moment = time.time() if now is None else now
-    return time.strftime(
-        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(moment - RECENT_WINDOW_DAYS * 86400)
-    )
 
 
 def _phase_deadline(deadline_at: float, fraction: float) -> float:
@@ -169,6 +160,15 @@ def collapse_document_candidates(
                         "passage_ordinal": int(row["passage_ordinal"]),
                         "spans": row["spans"],
                     })
+                if row.get("passage_first_occurred_at") is not None and row.get(
+                    "passage_last_occurred_at"
+                ) is not None:
+                    # Lets the time clip skip the per-receipt event lookup when
+                    # the whole range already sits inside the requested window.
+                    hint["passage_window"] = [
+                        str(row["passage_first_occurred_at"]),
+                        str(row["passage_last_occurred_at"]),
+                    ]
                 value["_ranges"][range_key] = hint
     ranked = sorted(
         documents.values(),
@@ -404,6 +404,7 @@ class PassageHintRetrieval:
                               passage.ordinal AS passage_ordinal,
                               passage.spans,passage.receipts,
                               passage.text_redacted,
+                              passage.first_occurred_at,
                               passage.last_occurred_at,
                               passage.search_vector
                          FROM canonical_passages passage
@@ -447,6 +448,8 @@ class PassageHintRetrieval:
                               top.passage_id,top.passage_ordinal,
                               top.spans,top.receipts,
                               top.text_redacted,
+                              top.first_occurred_at AS passage_first_occurred_at,
+                              top.last_occurred_at AS passage_last_occurred_at,
                               {score_sql} AS score
                          FROM top
                          JOIN canonical_passage_documents projected
@@ -604,6 +607,8 @@ class PassageHintRetrieval:
                               evidence.manifest_object_key,
                               evidence.manifest_content_sha256,
                               top.receipt,top.text_redacted,
+                              event.occurred_at AS passage_first_occurred_at,
+                              event.occurred_at AS passage_last_occurred_at,
                               {score_sql} AS score
                          FROM top
                          JOIN canonical_documents document
@@ -896,6 +901,10 @@ class PassageHintRetrieval:
                                   passage.ordinal AS passage_ordinal,
                                   passage.spans,passage.receipts,
                                   passage.text_redacted,
+                                  passage.first_occurred_at
+                                      AS passage_first_occurred_at,
+                                  passage.last_occurred_at
+                                      AS passage_last_occurred_at,
                                   nearest.distance
                              FROM nearest
                              JOIN canonical_passages passage
@@ -1260,6 +1269,10 @@ class PassageHintRetrieval:
                                   passage.ordinal AS passage_ordinal,
                                   passage.spans,passage.receipts,
                                   passage.text_redacted,
+                                  passage.first_occurred_at
+                                      AS passage_first_occurred_at,
+                                  passage.last_occurred_at
+                                      AS passage_last_occurred_at,
                                   nearest.distance
                              FROM nearest
                              JOIN canonical_passages passage

@@ -1617,3 +1617,97 @@ class SearchArmCostTests(unittest.TestCase):
             "why did the deploy fail", lexical_query="deploy fail", since=None, until=None, limit=10,
         )
         self.assertEqual(response["diagnostics"]["sparse_status"], "skipped-prose-query")
+
+
+class TimeClipWindowTests(unittest.TestCase):
+    """The time clip only queries receipts of ranges that straddle the window."""
+
+    class _ClipStore(ActorRecordingStore):
+        search_deadline_ms = 20000
+
+        def _execute_bounded(self, connection, sql, values, deadline_at):
+            self.sql.append(" ".join(sql.split()))
+            self.values.append(tuple(values))
+            if "FROM canonical_chunks chunk" in sql:
+                receipts = values[2]
+                return Rows([
+                    {"receipt": r, "text_redacted": "inside", "occurred_at": "2026-09-05T00:00:00+00:00"}
+                    for r in receipts if r.endswith("#item=0")
+                ])
+            return Rows([])
+
+    def _response(self):
+        return {
+            "results": [
+                {
+                    "logical_document_id": "ldoc_" + "a" * 32,
+                    "source_id": "codex:linux:test",
+                    "matching_ranges": [
+                        {"kind": "dense", "receipts": ["recall://codex:linux:test/x-1?rev=1#item=0"],
+                         "text": "t", "text_clipped": False, "spans": [],
+                         "passage_window": ["2026-09-03 10:00:00+00", "2026-09-04 10:00:00+00"]},
+                        {"kind": "passage-lexical", "receipts": ["recall://codex:linux:test/y-1?rev=1#item=0", "recall://codex:linux:test/y-1?rev=1#item=1"],
+                         "text": "t", "text_clipped": False, "spans": [],
+                         "passage_window": ["2026-08-30 10:00:00+00", "2026-09-04 10:00:00+00"]},
+                    ],
+                }
+            ],
+            "diagnostics": {},
+        }
+
+    def _bound(self, store):
+        return BoundCanonicalRetrieval(
+            store, tenant_id="tenant:test", principal_id="principal:test",
+            authorized_sources=("codex:linux:test",),
+        )
+
+    def test_ranges_inside_the_window_skip_the_database(self) -> None:
+        from recall_server.canonical_retrieval import _window_inside
+
+        self.assertTrue(_window_inside(["2026-09-03T00:00:00Z", "2026-09-04T00:00:00Z"], "2026-09-01T00:00:00Z", None))
+        self.assertFalse(_window_inside(["2026-08-30T00:00:00Z", "2026-09-04T00:00:00Z"], "2026-09-01T00:00:00Z", None))
+        self.assertFalse(_window_inside(["2026-09-03T00:00:00Z", "2026-09-04T00:00:00Z"], None, "2026-09-03T12:00:00Z"))
+        self.assertFalse(_window_inside(None, "2026-09-01T00:00:00Z", None))
+        store = self._ClipStore()
+        response = self._response()
+        response["results"][0]["matching_ranges"].pop(1)
+        clipped = self._bound(store)._clip_passage_hints_to_time_window(
+            response, sources=["codex:linux:test"], since="2026-09-01T00:00:00Z", until=None,
+        )
+        self.assertFalse(any("FROM canonical_chunks chunk" in s for s in store.sql))
+        self.assertEqual(clipped["diagnostics"]["time_clip_status"], "ok")
+        self.assertEqual(clipped["diagnostics"]["time_clip_ranges_inside_window"], 1)
+        self.assertEqual(len(clipped["results"][0]["matching_ranges"]), 1)
+        self.assertNotIn("passage_window", clipped["results"][0]["matching_ranges"][0])
+
+    def test_only_straddling_ranges_are_looked_up(self) -> None:
+        store = self._ClipStore()
+        clipped = self._bound(store)._clip_passage_hints_to_time_window(
+            self._response(), sources=["codex:linux:test"], since="2026-09-01T00:00:00Z", until=None,
+        )
+        lookups = [v for s, v in zip(store.sql, store.values, strict=True) if "FROM canonical_chunks chunk" in s]
+        self.assertEqual(len(lookups), 1)
+        self.assertEqual(lookups[0][2], ["recall://codex:linux:test/y-1?rev=1#item=0", "recall://codex:linux:test/y-1?rev=1#item=1"])
+        ranges = clipped["results"][0]["matching_ranges"]
+        self.assertEqual(len(ranges), 2)
+        self.assertEqual(ranges[0]["kind"], "dense")
+        self.assertNotIn("time_clipped", ranges[0])
+        self.assertTrue(ranges[1]["time_clipped"])
+        self.assertEqual(ranges[1]["receipts"], ["recall://codex:linux:test/y-1?rev=1#item=0"])
+        self.assertTrue(all("passage_window" not in r for r in ranges))
+        self.assertEqual(clipped["diagnostics"]["time_clip_ranges_inside_window"], 1)
+
+    def test_deadline_keeps_inside_ranges_and_drops_unverified_ones(self) -> None:
+        class Slow(self._ClipStore):
+            def _execute_bounded(self, connection, sql, values, deadline_at):
+                if "FROM canonical_chunks chunk" in sql:
+                    raise SearchDeadlineExceeded()
+                return super()._execute_bounded(connection, sql, values, deadline_at)
+
+        clipped = self._bound(Slow())._clip_passage_hints_to_time_window(
+            self._response(), sources=["codex:linux:test"], since="2026-09-01T00:00:00Z", until=None,
+        )
+        self.assertEqual(clipped["diagnostics"]["time_clip_status"], "deadline-exceeded")
+        ranges = clipped["results"][0]["matching_ranges"]
+        self.assertEqual([r["kind"] for r in ranges], ["dense"])
+        self.assertNotIn("passage_window", ranges[0])
