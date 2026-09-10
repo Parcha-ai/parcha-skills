@@ -17,3 +17,12 @@ and drops a message that is exactly one of these notices.
 
 Upstream ask: `display.status_notices: off | on` (default on) honoured by all five
 sites, or a `pre_platform_send` hook so a plugin can decide.
+
+## Related ask: token-less `hermes send`
+
+`hermes send` posts straight to the platform with the bot token from the caller's environment
+(`hermes_cli/send_cmd.py`). Coding sessions on our gateways never hold the Slack token (privilege
+tiers), so from a session shell it answers "Platform 'slack' is not configured" and the Tether
+broker post stays. Ask: let `hermes send` route through the running gateway's control socket
+(`gateway/control_socket.py` accepts plugin verb handlers) when no token is present, so a
+session posts with the gateway's credentials without ever seeing them.
