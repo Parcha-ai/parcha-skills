@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 import urllib.error
@@ -21,6 +22,33 @@ MAX_EXACT_DENSE_SCOPE_PASSAGES = 20_000
 # Forgotten passages are rare: rank first, then drop the few whose chunks are
 # gone from an oversampled top-K instead of probing canonical_chunks per hit.
 LIVENESS_OVERSAMPLE = 2
+# The sparse-exact arm scans canonical_chunks (every record, tool output
+# included) through one global GIN index. It exists to match identifiers
+# exactly; for prose it scores millions of chunks by rank and runs to the
+# deadline while dense and passage-lexical already cover the same words.
+# Run it only when the query carries identifier-shaped tokens, and never
+# let it hold the rest of the search past its own share of the budget.
+IDENTIFIER_TOKEN_RE = re.compile(
+    r"(?:"
+    r"[A-Za-z0-9_-]*\d[A-Za-z0-9_-]*"          # anything with a digit: ids, versions, ports
+    r"|[A-Za-z][A-Za-z0-9]*(?:[_./:#-][A-Za-z0-9]+)+"  # snake_case, dotted, paths, k8s names
+    r"|[A-Z][a-z]+(?:[A-Z][a-z0-9]+)+"           # CamelCase symbols
+    r"|[A-Z]{2,}[A-Z0-9_]*"                     # ALL_CAPS constants, error codes
+    r")"
+)
+SPARSE_ARM_BUDGET_FRACTION = 0.5
+
+
+def sparse_arm_applies(lexical_query: str) -> bool:
+    """True when the query has at least one token that looks like an identifier."""
+
+    for token in lexical_query.split():
+        stripped = token.strip("\"'`()[]{},;")
+        if len(stripped) < 3:
+            continue
+        if IDENTIFIER_TOKEN_RE.fullmatch(stripped):
+            return True
+    return False
 # The exact-vs-ANN decision only needs an approximate scope size; reuse it for
 # a short window so the count query does not run before every search.
 SCOPE_COUNT_TTL_SECONDS = 60.0
@@ -390,9 +418,22 @@ class PassageHintRetrieval:
         actor_ids: list[str] | None,
         actor_relations: list[str] | None,
         deadline_at: float,
+        original_query: str | None = None,
     ) -> tuple[list[dict[str, Any]], str]:
         if self.actor_scope:
             return [], "skipped-actor-scope"
+        # The informative-term query is casefolded; check the original text
+        # too so CamelCase symbols and ALL_CAPS codes still qualify.
+        if not (
+            sparse_arm_applies(lexical_query)
+            or (original_query is not None and sparse_arm_applies(original_query))
+        ):
+            return [], "skipped-prose-query"
+        arm_deadline = min(
+            deadline_at,
+            time.monotonic()
+            + max(0.0, deadline_at - time.monotonic()) * SPARSE_ARM_BUDGET_FRACTION,
+        )
         try:
             with self.store.connect() as connection:
                 rows = self.store._execute_bounded(
@@ -467,7 +508,7 @@ class PassageHintRetrieval:
                         until,
                         candidate_limit,
                     ),
-                    deadline_at,
+                    arm_deadline,
                 ).fetchall()
         except SearchDeadlineExceeded:
             return [], "deadline-exceeded"
@@ -822,7 +863,11 @@ class PassageHintRetrieval:
                 timed_arm, "passage_lexical", self._lexical_candidates, lexical_query,
             )
             sparse_future = executor.submit(
-                timed_arm, "sparse_exact", self._sparse_candidates, lexical_query,
+                timed_arm, "sparse_exact",
+                lambda text, **kwargs: self._sparse_candidates(
+                    text, original_query=query, **kwargs
+                ),
+                lexical_query,
             )
             dense_future = executor.submit(
                 timed_arm, "dense", self._dense_candidates, query,
