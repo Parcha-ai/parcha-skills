@@ -356,6 +356,11 @@ def register(ctx: Any) -> None:
             if claimed is not None:
                 # Tether owns this turn; Hermes' own agent must not also answer.
                 return {"action": "skip", "reason": "tether-claimed"}
+            if decision.get("reason") == "peer_status_notice":
+                # A teammate gateway's housekeeping line (task card title, stall notice, model
+                # fallback) is a message for nobody; answering it is how a thread fills with bots
+                # narrating each other's status. Bound or not, the agent never sees it.
+                return {"action": "skip", "reason": "peer-status-notice"}
             if slice_ is not None and fields["thread"] and (fields["channel"], fields["thread"]) in bound_threads_now:
                 # A bound thread belongs to its session. Whatever was not admitted here
                 # (a status notice, a denied actor, a capped peer chain) is not for the

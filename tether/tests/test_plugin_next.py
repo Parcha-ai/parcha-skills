@@ -213,6 +213,25 @@ class AdmissionPolicyTest(PluginEnvironment):
         self.assertEqual(decision["verdict"], "unconfigured")
 
 
+class PeerStatusNoticeTest(PluginEnvironment):
+    """A teammate gateway's housekeeping line never becomes a turn, bound thread or not."""
+
+    def test_peer_status_line_on_an_unbound_thread_is_skipped(self):
+        self.write_config(trusted_bot_users=["U0BJN78RJD8"])
+        ctx = FloorCtx()
+        self.module.register(ctx)
+        hook = ctx.hooks["pre_gateway_dispatch"]
+        for text in ("Hermes is working\n- Bash - ls - complete", ":warning: Model fallback: gpt-5.6 unavailable",
+                     ":warning: Agent session appears stalled (last activity 6 min ago).",
+                     ":information_source: Context compression deferred — summary still streaming."):
+            event = FakeEvent(user_id="U0BJN78RJD8", is_bot=True, thread_id="900.1", message_id="900.2")
+            event.text = text
+            self.assertEqual(hook(event=event), {"action": "skip", "reason": "peer-status-notice"}, text)
+        real = FakeEvent(user_id="U0BJN78RJD8", is_bot=True, thread_id="900.1", message_id="900.3")
+        real.text = "<@U09450ZLS81> numbers attached, method in the file"
+        self.assertIsNone(hook(event=real), "a real peer message on an unbound thread goes to the agent")
+
+
 class ShadowHookTest(PluginEnvironment):
     def register(self, ctx=None):
         context = ctx or FloorCtx()
