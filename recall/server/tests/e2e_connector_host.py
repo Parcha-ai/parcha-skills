@@ -184,9 +184,13 @@ def main() -> None:
         }
         private_file(config_path, json.dumps(config, sort_keys=True, separators=(",", ":")))
         log = (private / "server.log").open("w")
+        # The host posts to /v1/ingest/batches and BrainClient reads /v1/search;
+        # this script pins the v1 store contract (H1-T6 canonical-mode coverage
+        # lives in e2e_webhook_ingest.py).
         env = os.environ | {
             "PYTHONPATH": str(SERVER), "RECALL_DATABASE_URL": database,
             "RECALL_PORT": str(brain_port),
+            "RECALL_LEGACY_WRITES": "1", "RECALL_LEGACY_READS": "1",
         }
         process = subprocess.Popen([sys.executable, "-m", "recall_server.app"], env=env, stdout=log, stderr=log)
         base = f"http://127.0.0.1:{brain_port}"

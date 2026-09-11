@@ -187,6 +187,9 @@ def main() -> None:
                 "PYTHONPATH": str(SERVER),
                 "RECALL_DATABASE_URL": database,
                 "RECALL_PORT": str(port),
+                # v1 store contract (H1-T6): BrainClient.search reads /v1/search.
+                "RECALL_LEGACY_WRITES": "1",
+                "RECALL_LEGACY_READS": "1",
             },
             stdout=log,
             stderr=log,
