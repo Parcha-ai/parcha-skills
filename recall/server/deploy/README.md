@@ -63,8 +63,37 @@ required. It does not contact a provider, read a source, render a reference, or 
 infrastructure. The example is synthetic; a live manifest belongs in a private mode-0600
 location and contains references, never credential values.
 
+### Parquet scan fragments
+
+The scan plane (`{documents,passages,records,actors}-part-NNNNN.parquet` per
+tenant/source/month) is a set of fragments. `canonical_parquet_scan_fragment_documents`
+records which logical documents each live part holds; `canonical_parquet_scan_dirty_documents`
+records which documents a queued month must reconsider. A queued month rewrites only the
+fragments that hold a changed, forgotten, or new document; unchanged siblings keep their
+immutable objects. New parts are uploaded first, under indexes above every surviving part,
+and the catalog flips in one transaction; replaced objects go through
+`canonical_evidence_cleanup_queue`, so a reader holding an object list is never cut off.
+Gaps in `shard_index` are normal.
+
+- **Compaction**: a month with more than `RECALL_PARQUET_COMPACTION_FRAGMENTS` (default 16)
+  live parts in any dataset, or more than half its recorded documents dead, is rebuilt fully.
+  The worker does this through `scan.project_pending(compaction_budget=1)`: at most one
+  month per cycle. Raise the cap or lower the budget if the cycle log shows `parquet_rows`
+  dominated by compactions; a `reason='backfill'` queue row plus a `*` dirty row forces a
+  full rebuild of one month.
+- **Cycle log**: `parquet_fragments_rewritten` (parts uploaded), `parquet_fragments_total`
+  (live parts), `parquet_documents_dirty`. Expect `parquet_rows` per day to fall by an order
+  of magnitude against the pre-fragment plane; `parquet_shards` still counts committed
+  source-months.
+- **First deploy**: months that have parts but no membership rows are rebuilt fully the next
+  time they are queued (no migration-time requeue). Migration 061 only creates two tables
+  and an index; migration 051 no longer re-keys the shards table on every run.
+- **Manual full rebuild**: `python -m recall_server.cli backfill-parquet-scan --tenant T
+  [--source S]` queues every month of the scope with the `*` sentinel; a content-identical
+  month is a no-op (`mode=reuse`) and keeps its objects.
+
 The production database gate requires a standard PostgreSQL URL with
-`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 60,
+`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 61,
 pgvector 0.8.0 or newer, and a runtime role without superuser, database/role creation,
 replication, or RLS-bypass privilege:
 

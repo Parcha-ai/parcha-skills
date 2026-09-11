@@ -71,6 +71,9 @@ class ManagedWorkerComposioTests(unittest.TestCase):
                 "parquet_shards": 1,
                 "parquet_rows": 13,
                 "parquet_stale": 0,
+                "parquet_fragments_rewritten": 0,
+                "parquet_fragments_total": 0,
+                "parquet_documents_dirty": 0,
             },
         )
         self.assertEqual(

@@ -167,6 +167,9 @@ def run_projection_worker(
                 "rows": 0,
                 "stale": 0,
                 "contended": 0,
+                "fragments_rewritten": 0,
+                "fragments_total": 0,
+                "documents_dirty": 0,
             }
         )
         parquet_elapsed_ms = elapsed_ms(phase_started)
@@ -226,6 +229,9 @@ def run_projection_worker(
             "parquet_rows": int(scanned["rows"]),
             "parquet_stale": int(scanned["stale"]),
             "parquet_contended": int(scanned["contended"]),
+            "parquet_fragments_rewritten": int(scanned.get("fragments_rewritten", 0)),
+            "parquet_fragments_total": int(scanned.get("fragments_total", 0)),
+            "parquet_documents_dirty": int(scanned.get("documents_dirty", 0)),
             "canonical_bodies_thinned": int(thinned["documents"]),
             "thin_mode": "busy" if thin_busy else "idle",
             "canonical_bodies_refused": int(thinned["refused"]),
@@ -258,6 +264,8 @@ def run_projection_worker(
             "embedding_error=%s "
             "parquet_shards=%s "
             "parquet_rows=%s parquet_stale=%s parquet_contended=%s "
+            "parquet_fragments_rewritten=%s parquet_fragments_total=%s "
+            "parquet_documents_dirty=%s "
             "canonical_bodies_thinned=%s canonical_bodies_refused=%s "
             "thin_mode=%s "
             "canonical_document_bytes_removed=%s "
@@ -288,6 +296,9 @@ def run_projection_worker(
                     "parquet_rows",
                     "parquet_stale",
                     "parquet_contended",
+                    "parquet_fragments_rewritten",
+                    "parquet_fragments_total",
+                    "parquet_documents_dirty",
                     "canonical_bodies_thinned",
                     "canonical_bodies_refused",
                     "thin_mode",

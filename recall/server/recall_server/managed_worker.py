@@ -143,6 +143,11 @@ def _run_projection_cycle(
         "parquet_shards": int(scan_result["shards"]),
         "parquet_rows": int(scan_result["rows"]),
         "parquet_stale": int(scan_result["stale"]),
+        "parquet_fragments_rewritten": int(
+            scan_result.get("fragments_rewritten", 0)
+        ),
+        "parquet_fragments_total": int(scan_result.get("fragments_total", 0)),
+        "parquet_documents_dirty": int(scan_result.get("documents_dirty", 0)),
     }
 
 
@@ -694,6 +699,9 @@ def run_managed_worker(
             "parquet_shards": 0,
             "parquet_rows": 0,
             "parquet_stale": 0,
+            "parquet_fragments_rewritten": 0,
+            "parquet_fragments_total": 0,
+            "parquet_documents_dirty": 0,
         }
         if (
             logical_projector is not None
