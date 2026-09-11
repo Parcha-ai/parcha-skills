@@ -71,5 +71,11 @@ can press to trigger the next step.
   transport should classify quota/auth errors as failed turns (should_retire) and Hermes' fallback model
   should take over. Also: Hermes injects 'Thread context' on a fresh session, so archiving a Claude Code
   transcript is a clean identity reset.
+- Gap (Hermes): a fresh session's injected 'Thread context' carries text only; attachments delivered to
+  earlier turns are not re-annotated, so after a transcript reset the lead looked for Bryan's file on disk
+  and found nothing although Hermes had cached it (~/.hermes/cache/documents/doc_..._agent_hub_numbers.json).
+  Upstream ask #8: include cached attachment paths in thread-context injection.
+- Behavior seen 2026-09-11 06:05: the lead pointed QA at the old page and Irma signed off on it; Manny's
+  pushback made the lead concede in one line ('you're right and I was wrong') and start v2. Good sign.
 - Next: read the v2 thread cold once it settles (H9 evidence); then H7, H8, H10, H13. Upstream asks now 7: cwd (done in
   series), media (done), notices knob, NO_REPLY+content, peer guard, inbound journal, token-less `hermes send`.
