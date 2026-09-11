@@ -95,5 +95,9 @@ can press to trigger the next step.
 - My own mistakes tonight: restarted host m mid-turn (Q's turn failed and the failure posted twice); backticks
   in a message sent through Chris's broker ran as shell on his box and posted docker tables. Rules: check
   `response ready` before any restart; send broker text from a file.
+- 08:04 Miguel approved in the thread; 08:12 claudio ran the docker build-cache prune and retired 27 lease-expired
+  previews through the preview manager, posted df before/after (841G→732G). Verified from here 08:15: 711G used,
+  158G free, 82%. A real task, done by the team, approved by the human in Slack, executed by a Claude Code session
+  with operator privileges through Hermes. Disk-report thread = the reference transcript for 'colleagues'.
 - Next: H7 profile routing, H8 kanban lanes, H10 A2A, H13 buttons. Upstream PR still needs Miguel's fork. Upstream asks now 7: cwd (done in
   series), media (done), notices knob, NO_REPLY+content, peer guard, inbound journal, token-less `hermes send`.
