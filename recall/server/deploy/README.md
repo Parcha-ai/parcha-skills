@@ -329,6 +329,28 @@ CONCURRENTLY` builds the `(…, policy_fingerprint, ordinal)` key and drops the
 revision-keyed document index. Between the two files passages briefly lack a
 document-ordinal uniqueness guarantee, which is why the worker stays stopped
 until `migrate` returns. Every statement is idempotent, so a rerun is safe.
+
+Passage ids are stable (H1-T3): a passage is identified by its tenant, source,
+logical document, policy fingerprint, text hash and canonical span JSON, never
+by revision or ordinal, and the passage projector commits differentially
+(delete the windows that disappeared, insert the new ones, keep the rest in
+place with their embeddings). Before the first deploy that carries the new id
+function, run the read-only parity gate on a sample of production sessions;
+it recomputes the passages of up to `--limit` current passage documents of one
+source and reports counts only (no text):
+
+```bash
+python -m recall_server.cli passage-shadow-diff   --tenant tenant:company:example --source codex:example --limit 50
+```
+
+`receipt_parity` must be `true` (every compared document covers the identical
+receipt multiset). `ids_shared` is 0 for rows written by the old id function
+and equals `passages_existing` after the first re-projection; the first
+re-projection of each session after the deploy is therefore a one-time full
+rewrite (all old ids are deleted, embeddings are re-attached by content hash),
+after which appends only insert the new tail windows. The worker log reports
+`passages_inserted`, `passages_deleted` and `passages_retained` per cycle;
+`passages` stays equal to `passages_inserted`.
 Each authorized source and UTC month has `documents`, `passages`, `records`, and
 `actors` shards. Passages contain bounded visible-message text, time, attribution,
 and receipt pointers; records retain complete projected JSON for exact inspection.

@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 from .logical_evidence import (
     LogicalEvidenceError,
@@ -18,6 +18,7 @@ from .passage_projection import (
     LosslessPassage,
     PassagePolicy,
     build_passages,
+    canonical_spans_json,
     decode_logical_record,
     visible_messages,
 )
@@ -26,6 +27,11 @@ MAX_PASSAGE_PROJECTION_BATCH = 1_000
 MAX_PASSAGE_EMBEDDING_BATCH = 5_000
 PASSAGE_POOL_WARM_SIZE = 4
 PASSAGE_COMMIT_WORKERS = 8
+# Retained passages whose ordinal moved are parked above every real ordinal
+# before they take their final position, so the (document, policy, ordinal)
+# unique index never sees a transient duplicate. ``ordinal`` is a CHECK >= 0
+# integer; no document has 2**30 passages.
+PASSAGE_ORDINAL_PARK_OFFSET = 1 << 30
 
 
 @dataclass(frozen=True)
@@ -47,6 +53,86 @@ class PreparedPassageDocument:
     dense_message_count: int
     dense_message_bytes: int
     passages: tuple[LosslessPassage, ...]
+
+
+@dataclass(frozen=True)
+class PassageDiff:
+    """Differential plan for one document's passage rows.
+
+    ``to_insert`` are new passages (ids absent from the table), ``to_delete``
+    are existing ids the new build no longer produces (shifted or edited
+    windows, or a superseded policy), ``retained`` are ids present on both
+    sides. ``moved`` is the subset of retained ids whose ordinal changed, with
+    their new ordinal; ``revision_stale`` are retained ids whose stored
+    revision differs from the candidate revision.
+    """
+
+    to_insert: tuple[LosslessPassage, ...]
+    to_delete: tuple[str, ...]
+    retained: tuple[str, ...]
+    moved: tuple[tuple[str, int], ...]
+    revision_stale: tuple[str, ...]
+
+    @property
+    def counters(self) -> dict[str, int]:
+        return {
+            "inserted": len(self.to_insert),
+            "deleted": len(self.to_delete),
+            "retained": len(self.retained),
+        }
+
+
+def classify_passages(
+    existing: Iterable[dict[str, Any]],
+    passages: tuple[LosslessPassage, ...],
+    *,
+    revision: int,
+) -> PassageDiff:
+    """Split the new passage set against the stored rows of one document.
+
+    ``existing`` rows carry ``passage_id``, ``ordinal`` and ``revision`` (any
+    policy fingerprint: rows of a superseded policy have different ids and are
+    deleted). Identity is the stable passage id, so a retained row has the
+    same text and spans by construction and its ``text_redacted`` is never
+    rewritten.
+    """
+
+    stored: dict[str, dict[str, Any]] = {}
+    for row in existing:
+        passage_id = row["passage_id"]
+        if passage_id in stored:
+            raise LogicalEvidenceError("passage_rows_duplicate")
+        stored[passage_id] = row
+    new_ids = {passage.passage_id for passage in passages}
+    if len(new_ids) != len(passages):
+        raise LogicalEvidenceError("passage_identity_collision")
+    to_insert = tuple(
+        passage for passage in passages if passage.passage_id not in stored
+    )
+    retained = tuple(
+        passage.passage_id for passage in passages if passage.passage_id in stored
+    )
+    moved = tuple(
+        (passage.passage_id, passage.ordinal)
+        for passage in passages
+        if passage.passage_id in stored
+        and int(stored[passage.passage_id]["ordinal"]) != passage.ordinal
+    )
+    revision_stale = tuple(
+        passage_id
+        for passage_id in retained
+        if int(stored[passage_id]["revision"]) != revision
+    )
+    to_delete = tuple(
+        passage_id for passage_id in stored if passage_id not in new_ids
+    )
+    return PassageDiff(
+        to_insert=to_insert,
+        to_delete=to_delete,
+        retained=retained,
+        moved=moved,
+        revision_stale=revision_stale,
+    )
 
 
 class CanonicalPassageProjector:
@@ -273,7 +359,13 @@ class CanonicalPassageProjector:
             )
         return max(0, result.rowcount)
 
-    def _prepare(self, candidate: PassageCandidate) -> PreparedPassageDocument:
+    def _prepare(
+        self,
+        candidate: PassageCandidate,
+        *,
+        policy: PassagePolicy | None = None,
+    ) -> PreparedPassageDocument:
+        policy = self.policy if policy is None else policy
         manifest = self.logical_projection.read_manifest(
             candidate.manifest_reference,
             tenant_id=candidate.tenant_id,
@@ -336,7 +428,7 @@ class CanonicalPassageProjector:
                 logical_document_id=candidate.logical_document_id,
                 revision=candidate.revision,
                 messages=messages,
-                policy=self.policy,
+                policy=policy,
             )
             if messages
             else ()
@@ -348,7 +440,7 @@ class CanonicalPassageProjector:
             passages=passages,
         )
 
-    def _commit(self, prepared: PreparedPassageDocument) -> str:
+    def _commit(self, prepared: PreparedPassageDocument) -> dict[str, Any]:
         candidate = prepared.candidate
         with self.store.connect() as connection:
             with connection.transaction():
@@ -389,44 +481,97 @@ class CanonicalPassageProjector:
                     or current["document_content_sha256"]
                     != candidate.source_document_sha256
                 ):
-                    return "stale"
-                connection.execute(
-                    """CREATE TEMP TABLE
-                           recall_reusable_passage_embeddings
-                           ON COMMIT DROP AS
-                       SELECT embedding.model,embedding.dimensions,
-                              embedding.content_sha256,
-                              embedding.runtime_fingerprint,
-                              embedding.embedding,embedding.embedded_at
-                         FROM canonical_passage_embeddings embedding
-                         JOIN canonical_passages passage
-                           USING(tenant_id,source_id,passage_id)
-                        WHERE passage.tenant_id=%s
-                          AND passage.source_id=%s
-                          AND passage.logical_document_id=%s""",
-                    (
-                        candidate.tenant_id,
-                        candidate.source_id,
-                        candidate.logical_document_id,
-                    ),
-                )
-                connection.execute(
-                    """DELETE FROM canonical_passage_documents
+                    return {"status": "stale"}
+                existing = connection.execute(
+                    """SELECT passage_id,ordinal,revision
+                         FROM canonical_passages
                         WHERE tenant_id=%s AND source_id=%s
-                          AND logical_document_id=%s""",
+                          AND logical_document_id=%s
+                        FOR UPDATE""",
                     (
                         candidate.tenant_id,
                         candidate.source_id,
                         candidate.logical_document_id,
                     ),
+                ).fetchall()
+                diff = classify_passages(
+                    existing,
+                    prepared.passages,
+                    revision=candidate.revision,
                 )
+                # Write order (the (document, policy, ordinal) unique index
+                # is not deferrable):
+                #   1. capture reusable embeddings for the texts about to be
+                #      inserted, before the rows that hold them are deleted;
+                #   2. DELETE to_delete (frees their ordinals; cascades their
+                #      actors and embeddings only);
+                #   3. UPSERT the pointer row in place;
+                #   4. park moved retained rows above every real ordinal,
+                #      then set their final ordinal + revision (two phases,
+                #      so a moved row never lands on an ordinal another
+                #      retained row still holds);
+                #   5. bump revision on the other retained rows (HOT update:
+                #      no indexed column changes, text_redacted untouched);
+                #   6. COPY to_insert passages + actors into the freed
+                #      ordinals;
+                #   7. re-attach embeddings for to_insert by content hash.
+                if diff.to_insert:
+                    connection.execute(
+                        """CREATE TEMP TABLE
+                               recall_reusable_passage_embeddings
+                               ON COMMIT DROP AS
+                           SELECT embedding.model,embedding.dimensions,
+                                  embedding.content_sha256,
+                                  embedding.runtime_fingerprint,
+                                  embedding.embedding,embedding.embedded_at
+                             FROM canonical_passage_embeddings embedding
+                             JOIN canonical_passages passage
+                               USING(tenant_id,source_id,passage_id)
+                            WHERE passage.tenant_id=%s
+                              AND passage.source_id=%s
+                              AND passage.logical_document_id=%s
+                              AND passage.text_sha256=ANY(%s::text[])""",
+                        (
+                            candidate.tenant_id,
+                            candidate.source_id,
+                            candidate.logical_document_id,
+                            sorted({
+                                passage.text_sha256
+                                for passage in diff.to_insert
+                            }),
+                        ),
+                    )
+                if diff.to_delete:
+                    connection.execute(
+                        """DELETE FROM canonical_passages
+                            WHERE tenant_id=%s AND source_id=%s
+                              AND logical_document_id=%s
+                              AND passage_id=ANY(%s::text[])""",
+                        (
+                            candidate.tenant_id,
+                            candidate.source_id,
+                            candidate.logical_document_id,
+                            list(diff.to_delete),
+                        ),
+                    )
                 connection.execute(
                     """INSERT INTO canonical_passage_documents(
                            tenant_id,source_id,logical_document_id,revision,
                            policy_fingerprint,target_tokens,overlap_tokens,
                            source_document_sha256,dense_message_count,
                            dense_message_bytes,passage_count
-                       ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                       ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                       ON CONFLICT(tenant_id,source_id,logical_document_id)
+                       DO UPDATE SET
+                           revision=excluded.revision,
+                           policy_fingerprint=excluded.policy_fingerprint,
+                           target_tokens=excluded.target_tokens,
+                           overlap_tokens=excluded.overlap_tokens,
+                           source_document_sha256=
+                               excluded.source_document_sha256,
+                           dense_message_count=excluded.dense_message_count,
+                           dense_message_bytes=excluded.dense_message_bytes,
+                           passage_count=excluded.passage_count""",
                     (
                         candidate.tenant_id,
                         candidate.source_id,
@@ -441,7 +586,56 @@ class CanonicalPassageProjector:
                         len(prepared.passages),
                     ),
                 )
-                if prepared.passages:
+                if diff.moved:
+                    moved_ids = [passage_id for passage_id, _ in diff.moved]
+                    connection.execute(
+                        """UPDATE canonical_passages
+                              SET ordinal=ordinal+%s
+                            WHERE tenant_id=%s AND source_id=%s
+                              AND passage_id=ANY(%s::text[])""",
+                        (
+                            PASSAGE_ORDINAL_PARK_OFFSET,
+                            candidate.tenant_id,
+                            candidate.source_id,
+                            moved_ids,
+                        ),
+                    )
+                    connection.execute(
+                        """UPDATE canonical_passages passage
+                              SET ordinal=moved.ordinal,revision=%s
+                             FROM unnest(%s::text[],%s::int[])
+                                  AS moved(passage_id,ordinal)
+                            WHERE passage.tenant_id=%s
+                              AND passage.source_id=%s
+                              AND passage.passage_id=moved.passage_id""",
+                        (
+                            candidate.revision,
+                            moved_ids,
+                            [ordinal for _, ordinal in diff.moved],
+                            candidate.tenant_id,
+                            candidate.source_id,
+                        ),
+                    )
+                moved_ids = {passage_id for passage_id, _ in diff.moved}
+                revision_stale = [
+                    passage_id
+                    for passage_id in diff.revision_stale
+                    if passage_id not in moved_ids
+                ]
+                if revision_stale:
+                    connection.execute(
+                        """UPDATE canonical_passages
+                              SET revision=%s
+                            WHERE tenant_id=%s AND source_id=%s
+                              AND passage_id=ANY(%s::text[])""",
+                        (
+                            candidate.revision,
+                            candidate.tenant_id,
+                            candidate.source_id,
+                            revision_stale,
+                        ),
+                    )
+                if diff.to_insert:
                     with connection.cursor() as cursor:
                         with cursor.copy(
                             """COPY canonical_passages(
@@ -454,7 +648,7 @@ class CanonicalPassageProjector:
                                    text_sha256
                                ) FROM STDIN"""
                         ) as copy:
-                            for passage in prepared.passages:
+                            for passage in diff.to_insert:
                                 copy.write_row((
                                     passage.tenant_id,
                                     passage.source_id,
@@ -470,10 +664,7 @@ class CanonicalPassageProjector:
                                     passage.last_occurred_at,
                                     list(passage.roles),
                                     list(passage.receipts),
-                                    json.dumps([
-                                        asdict(span)
-                                        for span in passage.spans
-                                    ]),
+                                    canonical_spans_json(passage.spans),
                                     passage.text,
                                     passage.text_sha256,
                                 ))
@@ -483,7 +674,7 @@ class CanonicalPassageProjector:
                                    actor_id,relation
                                ) FROM STDIN"""
                         ) as copy:
-                            for passage in prepared.passages:
+                            for passage in diff.to_insert:
                                 for link in passage.actor_links:
                                     copy.write_row((
                                         passage.tenant_id,
@@ -520,17 +711,13 @@ class CanonicalPassageProjector:
                              ) reusable ON true
                             WHERE passage.tenant_id=%s
                               AND passage.source_id=%s
-                              AND passage.logical_document_id=%s
-                              AND passage.revision=%s
-                              AND passage.policy_fingerprint=%s
+                              AND passage.passage_id=ANY(%s::text[])
                            ON CONFLICT(tenant_id,source_id,passage_id)
                            DO NOTHING""",
                         (
                             candidate.tenant_id,
                             candidate.source_id,
-                            candidate.logical_document_id,
-                            candidate.revision,
-                            self.policy.fingerprint,
+                            [passage.passage_id for passage in diff.to_insert],
                         ),
                     )
                 deleted = connection.execute(
@@ -572,7 +759,198 @@ class CanonicalPassageProjector:
                         candidate.logical_document_id,
                     ),
                 )
-        return "committed"
+        return {"status": "committed", **diff.counters}
+
+    def shadow_diff(
+        self,
+        *,
+        tenant_id: str,
+        source_id: str,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Read-only parity gate: recompute passages and compare with the rows.
+
+        For up to ``limit`` passage documents of one source whose projection
+        is current (pointer revision and source hash match the evidence
+        catalog), rebuild the passage set from the archived logical document
+        with the stored policy and the current id function. Reports, per
+        document and in total, how many stored rows exist, how many were
+        recomputed, how many ids are shared, and whether the multiset of
+        receipts covered is identical. Nothing is written. The output carries
+        ids and counts only, never passage text.
+        """
+
+        tenant_id = self._tenant(tenant_id)
+        if (
+            not isinstance(tenant_id, str)
+            or not tenant_id
+            or not isinstance(source_id, str)
+            or not source_id
+            or isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= MAX_PASSAGE_PROJECTION_BATCH
+        ):
+            raise ValueError("passage shadow diff scope is invalid")
+        with self.store.connect() as connection:
+            rows = connection.execute(
+                """SELECT projected.tenant_id,projected.source_id,
+                          projected.logical_document_id,projected.revision,
+                          projected.policy_fingerprint,projected.target_tokens,
+                          projected.overlap_tokens,
+                          projected.source_document_sha256,
+                          projected.passage_count,
+                          evidence.revision AS evidence_revision,
+                          evidence.document_content_sha256,
+                          evidence.manifest_artifact_id,
+                          evidence.manifest_storage_backend,
+                          evidence.manifest_object_key,
+                          evidence.manifest_content_sha256,
+                          evidence.manifest_size_bytes,
+                          evidence.manifest_media_type,
+                          evidence.manifest_encryption,
+                          evidence.manifest_version_id,
+                          evidence.created_at AS manifest_created_at,
+                          part.part_ordinal,
+                          part.artifact_id AS part_artifact_id,
+                          part.storage_backend AS part_storage_backend,
+                          part.object_key AS part_object_key,
+                          part.content_sha256 AS part_content_sha256,
+                          part.size_bytes AS part_size_bytes,
+                          part.media_type AS part_media_type,
+                          part.encryption AS part_encryption,
+                          part.version_id AS part_version_id,
+                          part.created_at AS part_created_at
+                     FROM (
+                           SELECT *
+                             FROM canonical_passage_documents sampled
+                            WHERE sampled.tenant_id=%s AND sampled.source_id=%s
+                            ORDER BY sampled.created_at DESC,
+                                     sampled.logical_document_id
+                            LIMIT %s
+                     ) projected
+                     JOIN canonical_evidence_documents evidence
+                       ON evidence.tenant_id=projected.tenant_id
+                      AND evidence.source_id=projected.source_id
+                      AND evidence.logical_document_id
+                          =projected.logical_document_id
+                     JOIN canonical_evidence_document_parts part
+                       ON part.tenant_id=evidence.tenant_id
+                      AND part.source_id=evidence.source_id
+                      AND part.logical_document_id
+                          =evidence.logical_document_id
+                      AND part.revision=evidence.revision
+                    ORDER BY projected.logical_document_id,part.part_ordinal""",
+                (tenant_id, source_id, limit),
+            ).fetchall()
+            grouped: dict[str, list[dict[str, Any]]] = {}
+            for row in rows:
+                grouped.setdefault(row["logical_document_id"], []).append(row)
+            existing_rows = connection.execute(
+                """SELECT logical_document_id,passage_id,receipts
+                     FROM canonical_passages
+                    WHERE tenant_id=%s AND source_id=%s
+                      AND logical_document_id=ANY(%s::text[])""",
+                (tenant_id, source_id, sorted(grouped)),
+            ).fetchall()
+        existing: dict[str, dict[str, tuple[str, ...]]] = {}
+        for row in existing_rows:
+            existing.setdefault(row["logical_document_id"], {})[
+                row["passage_id"]
+            ] = tuple(row["receipts"])
+        documents = []
+        totals = {
+            "documents": 0,
+            "documents_stale": 0,
+            "documents_policy_mismatch": 0,
+            "passages_existing": 0,
+            "passages_recomputed": 0,
+            "ids_shared": 0,
+            "receipt_set_equal": 0,
+        }
+        for logical_document_id in sorted(grouped):
+            values = grouped[logical_document_id]
+            first = values[0]
+            stored = existing.get(logical_document_id, {})
+            report: dict[str, Any] = {
+                "logical_document_id": logical_document_id,
+                "revision": int(first["revision"]),
+                "passages_existing": len(stored),
+            }
+            if (
+                int(first["evidence_revision"]) != int(first["revision"])
+                or first["document_content_sha256"]
+                != first["source_document_sha256"]
+            ):
+                # The stored projection lags the evidence catalog; the queue
+                # will catch it up. Comparing would measure the append, not
+                # the id function.
+                report["status"] = "stale"
+                totals["documents_stale"] += 1
+                documents.append(report)
+                continue
+            policy = PassagePolicy(
+                target_tokens=int(first["target_tokens"]),
+                overlap_tokens=int(first["overlap_tokens"]),
+            )
+            if policy.fingerprint != str(first["policy_fingerprint"]).strip():
+                report["status"] = "policy_mismatch"
+                totals["documents_policy_mismatch"] += 1
+                documents.append(report)
+                continue
+            candidate = PassageCandidate(
+                tenant_id=first["tenant_id"],
+                source_id=first["source_id"],
+                logical_document_id=logical_document_id,
+                revision=int(first["revision"]),
+                generation=0,
+                changed_at=first["manifest_created_at"],
+                source_document_sha256=first["document_content_sha256"],
+                manifest_reference=self._reference(first, prefix="manifest_"),
+                part_references=tuple(
+                    self._reference(row, prefix="part_") for row in values
+                ),
+            )
+            prepared = self._prepare(candidate, policy=policy)
+            recomputed = {
+                passage.passage_id: passage.receipts
+                for passage in prepared.passages
+            }
+            shared = stored.keys() & recomputed.keys()
+            existing_receipts = Counter(
+                receipt
+                for receipts in stored.values()
+                for receipt in receipts
+            )
+            recomputed_receipts = Counter(
+                receipt
+                for receipts in recomputed.values()
+                for receipt in receipts
+            )
+            receipt_set_equal = existing_receipts == recomputed_receipts
+            report.update({
+                "status": "compared",
+                "passages_recomputed": len(recomputed),
+                "ids_shared": len(shared),
+                "receipt_set_equal": receipt_set_equal,
+            })
+            totals["documents"] += 1
+            totals["passages_existing"] += len(stored)
+            totals["passages_recomputed"] += len(recomputed)
+            totals["ids_shared"] += len(shared)
+            totals["receipt_set_equal"] += int(receipt_set_equal)
+            documents.append(report)
+        return {
+            "status": "ok",
+            "tenant_id": tenant_id,
+            "source_id": source_id,
+            "limit": limit,
+            "read_only": True,
+            "totals": totals,
+            "receipt_parity": (
+                totals["receipt_set_equal"] == totals["documents"]
+            ),
+            "documents": documents,
+        }
 
     def project_pending(
         self,
@@ -600,6 +978,7 @@ class CanonicalPassageProjector:
             prepare_pool(min(PASSAGE_POOL_WARM_SIZE, concurrency))
         started = time.monotonic()
         documents = passages = stale = requeued = unavailable = batches = 0
+        deleted = retained = 0
         while batches < max_batches:
             candidates = self._pending(
                 tenant_id=tenant_id,
@@ -628,7 +1007,7 @@ class CanonicalPassageProjector:
                             unavailable_in_batch += 1
                         else:
                             raise
-            statuses: list[str] = []
+            statuses: list[dict[str, Any]] = []
             if prepared_documents:
                 with ThreadPoolExecutor(
                     max_workers=min(
@@ -647,11 +1026,15 @@ class CanonicalPassageProjector:
                 statuses,
                 strict=True,
             ):
-                if status == "stale":
+                if status["status"] == "stale":
                     stale += 1
                     continue
                 documents += 1
-                passages += len(prepared.passages)
+                # ``passages`` counts rows written (inserted), which is what
+                # the churn probe and the worker's idle check consume.
+                passages += int(status["inserted"])
+                deleted += int(status["deleted"])
+                retained += int(status["retained"])
             requeued += requeued_in_batch
             unavailable += unavailable_in_batch
             batches += 1
@@ -673,6 +1056,9 @@ class CanonicalPassageProjector:
             "status": "complete" if int(pending) == 0 else "pending",
             "documents": documents,
             "passages": passages,
+            "inserted": passages,
+            "deleted": deleted,
+            "retained": retained,
             "stale": stale,
             "requeued": requeued,
             "unavailable": unavailable,

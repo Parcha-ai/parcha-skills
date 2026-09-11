@@ -178,7 +178,14 @@ def run_projection_worker(
             "passage_pending": int(projected.get("pending", 0)),
             "passage_requeued": int(projected.get("requeued", 0)),
             "passage_unavailable": int(projected.get("unavailable", 0)),
+            # ``passages`` stays the number of passage rows written
+            # (inserted) for the churn probe and the idle check; the
+            # differential commit (H1-T3) also reports what it deleted and
+            # kept in place.
             "passages": int(projected["passages"]),
+            "passages_inserted": int(projected.get("inserted", projected["passages"])),
+            "passages_deleted": int(projected.get("deleted", 0)),
+            "passages_retained": int(projected.get("retained", 0)),
             "embedded": int(embedded["processed"]),
             "embedding_error": embedding_error,
             "parquet_shards": int(scanned["shards"]),
@@ -203,7 +210,8 @@ def run_projection_worker(
             "logical_pending=%s logical_waiting=%s records=%s "
             "passage_documents=%s passage_pending=%s "
             "passage_requeued=%s passage_unavailable=%s "
-            "passages=%s embedded=%s "
+            "passages=%s passages_inserted=%s passages_deleted=%s "
+            "passages_retained=%s embedded=%s "
             "embedding_error=%s "
             "parquet_shards=%s "
             "parquet_rows=%s parquet_stale=%s parquet_contended=%s "
@@ -226,6 +234,9 @@ def run_projection_worker(
                     "passage_requeued",
                     "passage_unavailable",
                     "passages",
+                    "passages_inserted",
+                    "passages_deleted",
+                    "passages_retained",
                     "embedded",
                     "embedding_error",
                     "parquet_shards",
