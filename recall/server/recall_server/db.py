@@ -1706,7 +1706,63 @@ class BrainStore:
                     """SELECT count(*) AS n FROM items
                     WHERE deleted_at IS NULL AND btrim(text_redacted) <> ''"""
                 ).fetchone()["n"]
+            metrics.update(self._projection_churn_metrics(conn))
             return metrics
+
+    # Anti-join rows examined before the unembedded gauge stops counting.
+    PASSAGES_UNEMBEDDED_CAP = 250_000
+
+    def _projection_churn_metrics(self, conn) -> dict[str, int]:
+        """DB-derived churn gauges any process can serve (worker or web)."""
+
+        churn = {
+            "passages_total": 0,
+            "passages_unembedded": -1,
+            "passages_written_24h": 0,
+            "passage_documents_projected_24h": 0,
+        }
+        if not conn.execute(
+            "SELECT to_regclass('public.canonical_passages') AS value"
+        ).fetchone()["value"]:
+            return churn
+        churn["passages_total"] = int(
+            conn.execute(
+                """SELECT GREATEST(0, reltuples)::bigint AS n FROM pg_class
+                   WHERE oid='public.canonical_passages'::regclass"""
+            ).fetchone()["n"]
+        )
+        churn["passages_written_24h"] = int(
+            conn.execute(
+                """SELECT count(*) AS n FROM canonical_passages
+                   WHERE created_at > now() - interval '24 hours'"""
+            ).fetchone()["n"]
+        )
+        churn["passage_documents_projected_24h"] = int(
+            conn.execute(
+                """SELECT count(*) AS n FROM canonical_passage_documents
+                   WHERE created_at > now() - interval '24 hours'"""
+            ).fetchone()["n"]
+        )
+        passage_fingerprint = getattr(self.semantic_runtime, "passage_fingerprint", None)
+        if isinstance(passage_fingerprint, str) and passage_fingerprint:
+            churn["passages_unembedded"] = int(
+                conn.execute(
+                    """SELECT count(*) AS n FROM (
+                           SELECT 1 FROM canonical_passages passage
+                           WHERE NOT EXISTS (
+                               SELECT 1 FROM canonical_passage_embeddings embedding
+                               WHERE embedding.tenant_id=passage.tenant_id
+                                 AND embedding.source_id=passage.source_id
+                                 AND embedding.passage_id=passage.passage_id
+                                 AND embedding.runtime_fingerprint=%s
+                                 AND embedding.content_sha256=passage.text_sha256
+                           )
+                           LIMIT %s
+                       ) missing""",
+                    (passage_fingerprint, self.PASSAGES_UNEMBEDDED_CAP),
+                ).fetchone()["n"]
+            )
+        return churn
 
     def embed_pending(
         self, batch_size: int = 128, max_batches: int | None = None,

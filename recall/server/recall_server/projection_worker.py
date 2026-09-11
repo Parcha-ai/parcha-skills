@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 import urllib.error
 from collections.abc import Callable
@@ -15,6 +16,38 @@ from .parquet_scan import CanonicalParquetScanProjector
 
 
 LOG = logging.getLogger(__name__)
+
+# Per-process churn totals. The worker and the web service are separate
+# processes, so these only appear on /metrics when a worker serves it; the
+# DB-derived gauges in ``BrainStore.service_metrics`` cover the other case.
+PROJECTION_TOTALS: dict[str, int] = {
+    "passages_written": 0,
+    "documents_projected": 0,
+    "passages_embedded": 0,
+    "parquet_rows_written": 0,
+    "bodies_thinned": 0,
+}
+PROJECTION_TOTALS_LOCK = threading.Lock()
+_CYCLE_TO_TOTAL = {
+    "passages": "passages_written",
+    "passage_documents": "documents_projected",
+    "embedded": "passages_embedded",
+    "parquet_rows": "parquet_rows_written",
+    "canonical_bodies_thinned": "bodies_thinned",
+}
+
+
+def record_cycle(result: dict[str, int | str]) -> None:
+    """Fold one projection cycle into the process-lifetime totals."""
+
+    with PROJECTION_TOTALS_LOCK:
+        for cycle_key, total_key in _CYCLE_TO_TOTAL.items():
+            PROJECTION_TOTALS[total_key] += max(0, int(result.get(cycle_key, 0)))
+
+
+def projection_totals() -> dict[str, int]:
+    with PROJECTION_TOTALS_LOCK:
+        return dict(PROJECTION_TOTALS)
 
 
 def run_projection_worker(
@@ -159,6 +192,7 @@ def run_projection_worker(
             "pruned": int(documents["pruned"]),
             "cleanup_failures": int(documents["cleanup_failures"]),
         }
+        record_cycle(result)
         LOG.info(
             "projection cycle status=%s documents=%s logical_repaired=%s "
             "logical_pending=%s records=%s "

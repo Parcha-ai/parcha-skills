@@ -13,6 +13,7 @@ from typing import Any
 
 from .accuracy import SyntheticSuiteProbe, TruthBoundaryProbe
 from .availability import AvailabilityProbe
+from .churn import ProjectionChurnProbe
 from .corpus import AuthorizationProbe, FreshnessProbe, ScanConsistencyProbe, SecretScanProbe
 from .cost import PlanetScaleCostProbe
 from .forget import ForgetLatencyProbe
@@ -26,7 +27,7 @@ PROBES: dict[str, Any] = {
     "availability": [AvailabilityProbe],
     "latency": [ToolLatencyProbe, SearchStageProbe, ArchilPhaseProbe],
     "accuracy": [TruthBoundaryProbe, SyntheticSuiteProbe],
-    "freshness": [FreshnessProbe],
+    "freshness": [FreshnessProbe, ProjectionChurnProbe],
     "integrity": [ScanConsistencyProbe, ForgetLatencyProbe],
     "authorization": [AuthorizationProbe],
     "privacy": [SecretScanProbe],
@@ -106,6 +107,7 @@ def history_row(card: dict[str, Any]) -> dict[str, Any]:
         "latency.search_stages": ["server_p95_ms", "dense_ok_rate", "deadline_exceeded_rate", "arm.dense.p50_ms", "arm.passage_lexical.p50_ms", "arm.sparse_exact.p50_ms"],
         "accuracy.truth_boundary": ["boundary_recall@20", "boundary_mrr", "negative_false_hit_rate"],
         "freshness.source_age": ["newest_age_hours_min", "newest_age_hours_median", "projection_pending"],
+        "freshness.projection_churn": ["passages_written_24h", "documents_projected_24h", "passages_unembedded", "embedding_lag_ratio"],
         "integrity.scan_consistency": ["scope_scan_agreement", "objects_unavailable"],
         "integrity.forget_latency": ["forgotten_after_s", "capture_visible_after_s"],
         "authorization.negative_scope": ["leaks"],
@@ -153,6 +155,7 @@ def run_card(args: argparse.Namespace) -> dict[str, Any]:
         "planetscale_database": args.planetscale_database,
         "active_window_hours": args.active_window_hours,
         "forget_probe": bool(args.forget_probe),
+        "metrics_token_file": args.metrics_token_file,
     }
     if args.queries:
         queries_path = Path(args.queries).expanduser()
@@ -202,6 +205,7 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--planetscale-database")
     run.add_argument("--active-window-hours", type=float, default=72.0)
     run.add_argument("--forget-probe", action="store_true", help="capture, then forget, one synthetic memory and time its disappearance from search (writes to the brain)")
+    run.add_argument("--metrics-token-file", help="mode-0600 JSON {\"token\": ...} with the metrics scope (default: RECALL_METRICS_TOKEN_FILE)")
     run.add_argument("--repo-root", default=str(Path(__file__).resolve().parents[3]))
     render = commands.add_parser("render", help="re-render card.html from an existing card.json")
     render.add_argument("--output-dir", required=True)

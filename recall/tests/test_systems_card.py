@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import tempfile
 import unittest
 import urllib.error
 from pathlib import Path
+from unittest import mock
 
-from evals.systems_card import accuracy, corpus, forget, latency
+from evals.systems_card import accuracy, churn, corpus, forget, latency
 from evals.systems_card.availability import AvailabilityProbe
 from evals.systems_card.mcp_client import McpClient, McpClientError, load_profile
 from evals.systems_card.model import Gate, ProbeResult, dimension_status, percentile, summarize_latency
@@ -264,6 +266,92 @@ class ProbeTest(unittest.TestCase):
         program = corpus.secret_scan_program()
         self.assertIn("regexp_matches(text", program)
         self.assertNotIn("\n", program)
+
+    def _metrics_text(self, written: int = 150000, unembedded: int = 1234) -> bytes:
+        return (
+            "# HELP recall_http_requests_total HTTP requests handled.\n"
+            "# TYPE recall_http_requests_total counter\n"
+            "recall_http_requests_total 10\n"
+            "recall_embedding_lag 0\n"
+            "recall_passages_total 400000\n"
+            f"recall_passages_unembedded {unembedded}\n"
+            f"recall_passages_written_24h {written}\n"
+            "recall_passage_documents_projected_24h 320\n"
+            "recall_projection_passages_written_total 77\n"
+            "recall_projection_passages_embedded_total 8\n"
+            'labeled_metric{path="/x"} 1\n'
+            "garbage line without number x\n"
+        ).encode()
+
+    def _token_file(self, directory: str) -> str:
+        path = Path(directory) / "metrics.json"
+        path.write_text(json.dumps({"token": "synthetic-metrics"}))
+        path.chmod(0o600)
+        return str(path)
+
+    def test_projection_churn_probe_parses_metrics_and_gates_on_baseline(self):
+        seen: list[tuple[str, dict]] = []
+
+        def getter(url, headers, timeout):
+            seen.append((url, headers))
+            return 200, self._metrics_text()
+
+        with tempfile.TemporaryDirectory() as directory:
+            context = make_context(FakeBrain(default_tools()), metrics_token_file=self._token_file(directory), _metrics_get=getter)
+            result = churn.ProjectionChurnProbe().run(context)
+        self.assertEqual(seen[0][0], "https://brain.invalid/metrics")
+        self.assertEqual(seen[0][1]["Authorization"], "Bearer synthetic-metrics")
+        self.assertEqual(result.status, "degraded")
+        self.assertEqual(result.metrics["passages_written_24h"], 150000)
+        self.assertEqual(result.metrics["documents_projected_24h"], 320)
+        self.assertEqual(result.metrics["passages_unembedded"], 1234)
+        self.assertEqual(result.metrics["passages_written_total"], 77)
+        self.assertEqual(result.metrics["passages_embedded_total"], 8)
+        self.assertNotIn("bodies_thinned_total", result.metrics)
+        self.assertAlmostEqual(result.metrics["embedding_lag_ratio"], 1234 / 400000, places=4)
+        gates = {g.metric: g for g in result.gates}
+        self.assertFalse(gates["passages_written_24h"].passed)  # baseline churn fails by design
+        self.assertTrue(gates["embedding_lag_ratio"].passed)
+        self.assertNotIn("labeled_metric", result.metrics)
+
+    def test_projection_churn_probe_passes_under_target_and_handles_missing_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = make_context(FakeBrain(default_tools()), metrics_token_file=self._token_file(directory), _metrics_get=lambda u, h, t: (200, self._metrics_text(written=500, unembedded=-1)))
+            result = churn.ProjectionChurnProbe().run(context)
+        self.assertEqual(result.status, "ok")
+        self.assertIsNone(result.metrics["embedding_lag_ratio"])
+        gates = {g.metric: g for g in result.gates}
+        self.assertTrue(gates["passages_written_24h"].passed)
+        self.assertIsNone(gates["embedding_lag_ratio"].passed)
+        self.assertTrue(any("semantic runtime" in note for note in result.notes))
+
+    def test_projection_churn_probe_skips_without_metrics_token(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("RECALL_METRICS_TOKEN_FILE", None)
+            result = churn.ProjectionChurnProbe().run(make_context(FakeBrain(default_tools())))
+        self.assertEqual(result.status, "skipped")
+        self.assertEqual(result.metrics, {})
+        self.assertEqual(result.gates, [])
+
+    def test_projection_churn_probe_fails_closed_on_denied_or_old_server(self):
+        with tempfile.TemporaryDirectory() as directory:
+            token = self._token_file(directory)
+            denied = churn.ProjectionChurnProbe().run(make_context(FakeBrain(default_tools()), metrics_token_file=token, _metrics_get=lambda u, h, t: (403, b"")))
+            old = churn.ProjectionChurnProbe().run(make_context(FakeBrain(default_tools()), metrics_token_file=token, _metrics_get=lambda u, h, t: (200, b"recall_http_requests_total 1\n")))
+        self.assertEqual(denied.status, "failed")
+        self.assertIn("403", denied.notes[0])
+        self.assertEqual(old.status, "failed")
+        self.assertIn("lacks 4 churn gauges", old.notes[0])
+
+    def test_churn_probe_is_registered_and_picked_into_history(self):
+        from evals.systems_card.runner import PROBES
+        self.assertIn(churn.ProjectionChurnProbe, PROBES["freshness"])
+        result = ProbeResult("freshness.projection_churn", "freshness", "degraded", metrics={"passages_written_24h": 150000, "embedding_lag_ratio": 0.003})
+        with tempfile.TemporaryDirectory() as directory:
+            card = build_card([result], base_url="https://brain.invalid/mcp", started_at=0.0, repo_root=Path(directory), options={})
+        row = history_row(card)
+        self.assertEqual(row["freshness.projection_churn.passages_written_24h"], 150000)
+        self.assertEqual(row["freshness.projection_churn.embedding_lag_ratio"], 0.003)
 
     def test_timed_wraps_probe_exceptions(self):
         class Broken:

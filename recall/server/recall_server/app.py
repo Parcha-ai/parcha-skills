@@ -49,6 +49,7 @@ from .evidence_projection import (
     EvidenceProjectionStore,
 )
 from .invitation_email import onboarding_page
+from .projection_worker import projection_totals
 from .mcp import (
     LATEST_PROTOCOL_VERSION,
     SUPPORTED_PROTOCOL_VERSIONS,
@@ -629,8 +630,28 @@ class Handler(BaseHTTPRequestHandler):
             f"recall_source_freshness_seconds {db['source_freshness_seconds']}",
             f"recall_embedded_items {db['embedded_items']}",
             f"recall_embedding_lag {db['embedding_lag']}",
-            "",
+            "# HELP recall_passages_total Estimated canonical passages (pg_class.reltuples).",
+            "# TYPE recall_passages_total gauge",
+            f"recall_passages_total {db.get('passages_total', 0)}",
+            "# HELP recall_passages_unembedded Canonical passages without an embedding for the current runtime (capped; -1 when no runtime).",
+            "# TYPE recall_passages_unembedded gauge",
+            f"recall_passages_unembedded {db.get('passages_unembedded', -1)}",
+            "# HELP recall_passages_written_24h Canonical passages created in the last 24 hours.",
+            "# TYPE recall_passages_written_24h gauge",
+            f"recall_passages_written_24h {db.get('passages_written_24h', 0)}",
+            "# HELP recall_passage_documents_projected_24h Canonical passage documents created in the last 24 hours.",
+            "# TYPE recall_passage_documents_projected_24h gauge",
+            f"recall_passage_documents_projected_24h {db.get('passage_documents_projected_24h', 0)}",
         ]
+        for key, value in projection_totals().items():
+            lines.extend(
+                [
+                    f"# HELP recall_projection_{key}_total Projection worker {key.replace('_', ' ')} since process start.",
+                    f"# TYPE recall_projection_{key}_total counter",
+                    f"recall_projection_{key}_total {value}",
+                ]
+            )
+        lines.append("")
         return "\n".join(lines).encode()
 
     def handle_one_request(self) -> None:
