@@ -1058,7 +1058,7 @@ class PassageProjectionTests(unittest.TestCase):
             "recall_reusable_passage_embeddings"
         )
         delete = source.index(
-            "DELETE FROM canonical_passage_documents"
+            "DELETE FROM canonical_passages\n"
         )
         restore = source.rindex(
             "INSERT INTO canonical_passage_embeddings"
@@ -1068,6 +1068,10 @@ class PassageProjectionTests(unittest.TestCase):
         self.assertIn("cached.content_sha256=", source)
         self.assertIn("passage.text_sha256", source)
         self.assertIn("ON COMMIT DROP", source)
+        # H1-T3: the pointer row is updated in place and passages of the
+        # document are never deleted wholesale.
+        self.assertNotIn("DELETE FROM canonical_passage_documents", source)
+        self.assertIn("ON CONFLICT(tenant_id,source_id,logical_document_id)", source)
 
     def test_projection_bulk_loads_passages_in_one_copy_stream(self) -> None:
         source = inspect.getsource(CanonicalPassageProjector._commit)

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from itertools import islice
 from typing import Iterable, Iterator
@@ -316,6 +317,48 @@ def reconstruct_passage(
     return value
 
 
+def canonical_spans_json(spans: tuple[PassageSpan, ...]) -> str:
+    """Canonical JSON for a passage's record windows (sorted keys, no spaces)."""
+
+    return json.dumps(
+        [asdict(span) for span in spans],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def passage_identity(
+    *,
+    tenant_id: str,
+    source_id: str,
+    logical_document_id: str,
+    policy_fingerprint: str,
+    text_sha256: str,
+    spans: tuple[PassageSpan, ...],
+) -> str:
+    """Stable passage id: a record window keeps its id across later appends.
+
+    The identity deliberately excludes the document revision and the passage
+    count/ordinal. ``build_passages`` windows tokens from record 0 with a fixed
+    policy, so appending records only changes the final (short) window; every
+    earlier window has byte-identical text and spans and therefore the same id.
+    A mid-document edit reflows every window after the edit, which changes
+    their spans and so their ids: those rows are replaced, the prefix is kept.
+    """
+
+    identity = "\0".join(
+        (
+            tenant_id,
+            source_id,
+            logical_document_id,
+            policy_fingerprint,
+            text_sha256,
+            canonical_spans_json(spans),
+        )
+    )
+    return "psg_" + hashlib.sha256(identity.encode()).hexdigest()[:32]
+
+
 def build_passages(
     *,
     tenant_id: str,
@@ -381,31 +424,19 @@ def build_passages(
                 value.replace("Z", "+00:00")
             )
         )
-        identity = "\0".join(
-            (
-                tenant_id,
-                source_id,
-                logical_document_id,
-                str(revision),
-                str(len(passages)),
-                policy.fingerprint,
-                text_sha256,
-                *(
-                    f"{span.record_ordinal}:{span.record_count}:"
-                    f"{span.source_byte_start}:"
-                    f"{span.source_byte_end}"
-                    for span in spans
-                ),
-            )
-        )
         passages.append(
             LosslessPassage(
                 tenant_id=tenant_id,
                 source_id=source_id,
                 logical_document_id=logical_document_id,
                 revision=revision,
-                passage_id=(
-                    "psg_" + hashlib.sha256(identity.encode()).hexdigest()[:32]
+                passage_id=passage_identity(
+                    tenant_id=tenant_id,
+                    source_id=source_id,
+                    logical_document_id=logical_document_id,
+                    policy_fingerprint=policy.fingerprint,
+                    text_sha256=text_sha256,
+                    spans=spans,
                 ),
                 ordinal=len(passages),
                 policy_fingerprint=policy.fingerprint,

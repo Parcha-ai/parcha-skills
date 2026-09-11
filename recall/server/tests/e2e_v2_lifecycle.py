@@ -23,6 +23,12 @@ from recall_server.canonical import (
     CanonicalPlane,
 )
 from recall_server.db import BrainStore
+from recall_server.logical_evidence import LogicalEvidenceProjectionStore
+from recall_server.logical_evidence_projection import (
+    CanonicalLogicalEvidenceProjector,
+)
+from recall_server.passage_index import CanonicalPassageProjector
+from recall_server.passage_projection import PassagePolicy
 from recall_server.projectors import canonical_json
 
 
@@ -79,7 +85,7 @@ def main() -> None:
             media_type="application/json",
             created_at=created_at,
         )
-        content = {"text": redacted_text}
+        content = {"text": redacted_text, "role": "user"}
         event = {
             "schema_version": 1,
             "source_id": source_id,
@@ -99,7 +105,17 @@ def main() -> None:
             },
             "content_sha256": hashlib.sha256(canonical_json(content)).hexdigest(),
         }
-        plane = CanonicalPlane(store, unreliable_archive)
+        logical = CanonicalLogicalEvidenceProjector(
+            store,
+            LogicalEvidenceProjectionStore(archive_store),
+            bound_tenant_id=tenant_id,
+            raw_archive=archive_store,
+        )
+        plane = CanonicalPlane(
+            store,
+            unreliable_archive,
+            evidence_projector=logical,
+        )
         first = plane.ingest_document(
             tenant_id=tenant_id,
             principal_id=principal_id,
@@ -135,6 +151,46 @@ def main() -> None:
             ).fetchone()["count"]
         if raw_leaks:
             raise RuntimeError("raw archive bytes crossed into canonical projections")
+
+        # H1-T3: project the logical document and its passages so forget is
+        # exercised against the stable-id passage plane too.
+        # Ingest already queued the group; seeding is idempotent here.
+        logical.seed_backfill(tenant_id=tenant_id)
+        logical_result = logical.project_pending(
+            tenant_id=tenant_id,
+            batch_size=10,
+            max_batches=1,
+            upload_concurrency=1,
+        )
+        if logical_result["documents"] != 1:
+            raise RuntimeError("logical projection did not build the document")
+        passages = CanonicalPassageProjector(
+            store,
+            LogicalEvidenceProjectionStore(archive_store),
+            policy=PassagePolicy(target_tokens=4, overlap_tokens=1),
+            bound_tenant_id=tenant_id,
+        )
+        passage_result = passages.project_pending(
+            tenant_id=tenant_id,
+            batch_size=10,
+            max_batches=1,
+            concurrency=1,
+        )
+        if passage_result["documents"] != 1 or passage_result["inserted"] < 1:
+            raise RuntimeError(f"passage projection did not build passages: {passage_result}")
+        with store.connect() as connection:
+            forgotten_receipts = sorted({
+                receipt
+                for row in connection.execute(
+                    """SELECT receipts FROM canonical_passages
+                        WHERE tenant_id=%s AND source_id=%s""",
+                    (tenant_id, source_id),
+                ).fetchall()
+                for receipt in row["receipts"]
+            })
+        if not forgotten_receipts:
+            raise RuntimeError("passages carry no receipts")
+        passages_before_forget = passage_result["inserted"]
         forget = {
             "contract": "recall.forget-request.v1",
             "schema_version": 1,
@@ -217,6 +273,31 @@ def main() -> None:
             ).fetchone()
             if tuple(counts.values()) != (0, 0, 0, 0, 1):
                 raise RuntimeError("authoritative forget left canonical evidence behind")
+            passage_counts = connection.execute(
+                """SELECT
+                     (SELECT count(*) FROM canonical_evidence_documents
+                       WHERE tenant_id=%s AND source_id=%s) AS evidence,
+                     (SELECT count(*) FROM canonical_passage_documents
+                       WHERE tenant_id=%s AND source_id=%s) AS passage_documents,
+                     (SELECT count(*) FROM canonical_passages
+                       WHERE tenant_id=%s AND source_id=%s) AS passages,
+                     (SELECT count(*) FROM canonical_passage_embeddings
+                       WHERE tenant_id=%s AND source_id=%s) AS embeddings,
+                     (SELECT count(*) FROM canonical_passage_actors
+                       WHERE tenant_id=%s AND source_id=%s) AS actors,
+                     (SELECT count(*) FROM canonical_passages
+                       WHERE tenant_id=%s AND receipts && %s::text[])
+                       AS forgotten_receipt_overlap""",
+                (
+                    tenant_id, source_id, tenant_id, source_id,
+                    tenant_id, source_id, tenant_id, source_id,
+                    tenant_id, source_id, tenant_id, forgotten_receipts,
+                ),
+            ).fetchone()
+            if any(passage_counts.values()):
+                raise RuntimeError(
+                    f"forget left passage-plane rows behind: {dict(passage_counts)}"
+                )
             try:
                 with connection.transaction():
                     connection.execute(
@@ -251,6 +332,9 @@ def main() -> None:
         "forget_retry": True,
         "raw_versions_remaining": 0,
         "derived_rows_remaining": 0,
+        "passages_before_forget": passages_before_forget,
+        "passages_after_forget": 0,
+        "forgotten_receipt_overlap": 0,
         "resurrection_rejections": 2,
         "public_payload_canary_leaks": 0,
     }, sort_keys=True))

@@ -1658,6 +1658,16 @@ def main() -> None:
     passage_backfill.add_argument("--batch-size", type=int, default=100)
     passage_backfill.add_argument("--max-batches", type=int, default=10)
     passage_backfill.add_argument("--concurrency", type=int, default=4)
+    passage_shadow = sub.add_parser(
+        "passage-shadow-diff",
+        help=(
+            "read-only: recompute the passages of up to --limit documents of "
+            "one source and report id/receipt parity with the stored rows"
+        ),
+    )
+    passage_shadow.add_argument("--tenant", required=True)
+    passage_shadow.add_argument("--source", required=True)
+    passage_shadow.add_argument("--limit", type=int, default=50)
     passage_worker = sub.add_parser("lossless-passage-worker")
     passage_worker.add_argument("--tenant", required=True)
     passage_worker.add_argument("--target-tokens", type=int, default=1024)
@@ -2216,6 +2226,21 @@ def main() -> None:
                 interval_seconds=args.interval_seconds,
                 once=args.once,
             )
+        print(json.dumps(result, sort_keys=True))
+    elif args.command == "passage-shadow-diff":
+        # The policy per document comes from its stored passage document row;
+        # the projector's own policy is only a constructor requirement here.
+        projector = CanonicalPassageProjector(
+            store,
+            LogicalEvidenceProjectionStore(build_evidence_archive_store()),
+            policy=PassagePolicy(target_tokens=1024, overlap_tokens=128),
+            bound_tenant_id=args.tenant,
+        )
+        result = projector.shadow_diff(
+            tenant_id=args.tenant,
+            source_id=args.source,
+            limit=args.limit,
+        )
         print(json.dumps(result, sort_keys=True))
     elif args.command in {
         "backfill-lossless-passages",
