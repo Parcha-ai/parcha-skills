@@ -77,5 +77,11 @@ can press to trigger the next step.
   Upstream ask #8: include cached attachment paths in thread-context injection.
 - Behavior seen 2026-09-11 06:05: the lead pointed QA at the old page and Irma signed off on it; Manny's
   pushback made the lead concede in one line ('you're right and I was wrong') and start v2. Good sign.
-- Next: read the v2 thread cold once it settles (H9 evidence); then H7, H8, H10, H13. Upstream asks now 7: cwd (done in
+- 06:13 v2 published at the brief's URL by the lead; Irma re-signed off on served bytes. Cold read at 06:14 (96
+  msgs): 21 task-card titles, 14 lead narrations (all pre-prompt-fix), 5 quota lines, 3 watchdog, 0 shutdown
+  notices, 0 marker leaks. After the prompt fix the lead still posted reasoning + trailing NO_REPLY and wrote
+  bare `@U…` (Q never got the turn) → Hermes commit 310b85f66 (runtime reply contract; formatter wraps bare
+  ids) and Tether fix/tether-peer-status-skip (peer housekeeping lines never become turns, any thread).
+- Next: restart the runtime gateways onto the 9-commit series + Tether skip; wait for Manny's report and Q's
+  row; then H7, H8, H10, H13. Upstream asks now 7: cwd (done in
   series), media (done), notices knob, NO_REPLY+content, peer guard, inbound journal, token-less `hermes send`.
