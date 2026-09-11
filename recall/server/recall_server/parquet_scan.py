@@ -516,7 +516,6 @@ class CanonicalParquetScanProjector:
                        ON pointer.tenant_id=document.tenant_id
                       AND pointer.source_id=document.source_id
                       AND pointer.logical_document_id=document.logical_document_id
-                      AND pointer.revision=document.revision
                      LEFT JOIN LATERAL (
                           SELECT jsonb_agg(jsonb_build_object(
                                      'actor_id',link.actor_id,
@@ -531,7 +530,6 @@ class CanonicalParquetScanProjector:
                              AND link.source_id=document.source_id
                              AND link.logical_document_id=
                                  document.logical_document_id
-                             AND link.revision=document.revision
                      ) attributed ON true
                     WHERE document.tenant_id=%s AND document.source_id=%s
                       AND document.last_occurred_at >= %s

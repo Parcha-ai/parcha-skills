@@ -21,6 +21,7 @@ from recall_server.managed_worker import run_managed_worker
 from recall_server.logical_evidence import LogicalEvidenceError, LogicalEvidenceRecord
 from recall_server.logical_evidence_projection import (
     CanonicalLogicalEvidenceProjector,
+    LogicalGroupCandidate,
     _explicit_roles,
 )
 from recall_server.passage_index import (
@@ -82,7 +83,7 @@ class PassageProjectionTests(unittest.TestCase):
         )
         rendered = " ".join(migration.read_text().split()).casefold()
 
-        self.assertEqual(SCHEMA_VERSION, 59)
+        self.assertEqual(SCHEMA_VERSION, 60)
         self.assertIn(
             "create table if not exists canonical_passage_documents",
             rendered,
@@ -108,6 +109,29 @@ class PassageProjectionTests(unittest.TestCase):
         )
         self.assertNotIn("summary", rendered)
         self.assertNotIn("synthetic_question", rendered)
+
+        # Migration 060 re-keys the passage plane off revision so a logical
+        # revision never cascades through passages.
+        stable = " ".join((
+            Path(__file__).resolve().parents[1]
+            / "server"
+            / "schema"
+            / "060_stable_projection_keys.sql"
+        ).read_text().split()).casefold()
+        self.assertIn(
+            "add constraint canonical_passages_document_fkey "
+            "foreign key (tenant_id, source_id, logical_document_id) "
+            "references canonical_passage_documents( "
+            "tenant_id, source_id, logical_document_id ) on delete cascade",
+            stable,
+        )
+        self.assertIn(
+            "add constraint canonical_passage_documents_document_fkey "
+            "foreign key (tenant_id, source_id, logical_document_id) "
+            "references canonical_evidence_documents( "
+            "tenant_id, source_id, logical_document_id ) on delete cascade",
+            stable,
+        )
 
         representations = (
             Path(__file__).resolve().parents[1]
@@ -686,6 +710,193 @@ class PassageProjectionTests(unittest.TestCase):
         )
         self.assertIn("'logical-update'", source)
         self.assertNotIn("canonical_passage_embeddings", source)
+        # A revision is an in-place update of the catalog row; nothing on the
+        # normal commit path deletes the document, so no child cascade fires.
+        self.assertNotIn("DELETE FROM canonical_evidence_documents", source)
+        self.assertIn("ON CONFLICT(tenant_id,source_id,native_parent_id)", source)
+        self.assertNotIn("created_at=excluded.created_at", source)
+
+    def test_logical_revision_upserts_the_document_and_rewrites_only_parts_and_actors(
+        self,
+    ) -> None:
+        changed_at = datetime(2026, 7, 12, 20, 5, tzinfo=timezone.utc)
+        occurred = datetime(2026, 7, 12, 20, 0, tzinfo=timezone.utc)
+        tenant, source, parent = "tenant:company:test", "source:test", "session-1"
+        ldoc = "ldoc_" + "a" * 32
+
+        def reference(artifact: str) -> dict:
+            return {
+                "tenant_id": tenant,
+                "source_id": source,
+                "artifact_id": artifact,
+                "storage_backend": "s3",
+                "object_key": "objects/aa/" + "a" * 64,
+                "content_sha256": "c" * 64,
+                "size_bytes": 10,
+                "media_type": "application/vnd.recall.logical-document-part+jsonl",
+                "encryption": "sse-s3",
+                "version_id": artifact + "-v",
+                "created_at": "2026-07-12T20:00:00Z",
+            }
+
+        class Result:
+            def __init__(self, one=None, rowcount=1):
+                self.one = one
+                self.rowcount = rowcount
+
+            def fetchone(self):
+                return self.one
+
+        class Cursor:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def executemany(self, sql, values):
+                self.connection.statements.append(
+                    (" ".join(sql.split()), list(values))
+                )
+
+        class Connection:
+            def __init__(self):
+                self.statements: list[tuple[str, object]] = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def transaction(self):
+                return mock.MagicMock()
+
+            def cursor(self):
+                return Cursor(self)
+
+            def execute(self, sql, params=None):
+                normalized = " ".join(sql.split())
+                self.statements.append((normalized, params))
+                if "FROM canonical_evidence_document_queue" in normalized:
+                    if normalized.startswith("DELETE"):
+                        return Result(rowcount=1)
+                    return Result(one={"generation": 3, "changed_at": changed_at})
+                if normalized.startswith("SELECT revision,source_updated_at"):
+                    return Result(one={
+                        "revision": 1,
+                        "source_updated_at": occurred,
+                        "receipt_count": 2,
+                        "document_content_sha256": "0" * 64,
+                        "manifest_artifact_id": "art_" + "0" * 32,
+                        "first_occurred_at": occurred,
+                        "last_occurred_at": occurred,
+                    })
+                return Result(rowcount=1)
+
+        connection = Connection()
+        projector = CanonicalLogicalEvidenceProjector(
+            SimpleNamespace(connect=lambda: connection),
+            object(),  # type: ignore[arg-type]
+        )
+        old_manifest = reference("art_" + "0" * 32)
+        kept_part = reference("art_" + "1" * 32)
+        replaced_tail = reference("art_" + "2" * 32)
+        new_tail = reference("art_" + "3" * 32)
+        new_manifest = reference("art_" + "4" * 32)
+        projector._old_references = mock.Mock(  # type: ignore[method-assign]
+            return_value=(old_manifest, [kept_part, replaced_tail])
+        )
+        part = lambda ordinal: SimpleNamespace(  # noqa: E731
+            ordinal=ordinal,
+            first_record_ordinal=ordinal,
+            last_record_ordinal=ordinal,
+            first_occurred_at="2026-07-12T20:00:00Z",
+            last_occurred_at="2026-07-12T20:00:00Z",
+            receipt_count=1,
+        )
+        upload = SimpleNamespace(
+            prepared=SimpleNamespace(
+                tenant_id=tenant,
+                source_id=source,
+                logical_document_id=ldoc,
+                native_parent_id=parent,
+                revision=2,
+                evidence_id="evd_" + "b" * 32,
+                document_content_sha256="9" * 64,
+                record_count=3,
+                receipt_count=3,
+                parts=(part(0), part(1)),
+                first_occurred_at="2026-07-12T20:00:00Z",
+                last_occurred_at="2026-07-12T20:09:00Z",
+            ),
+            manifest_reference=new_manifest,
+            part_references=(kept_part, new_tail),
+            all_references=(new_manifest, kept_part, new_tail),
+        )
+        candidate = LogicalGroupCandidate(
+            tenant_id=tenant,
+            source_id=source,
+            native_parent_id=parent,
+            source_updated_at=changed_at,
+            generation=3,
+            revision=2,
+        )
+
+        self.assertEqual(projector._commit(candidate, upload), "committed")
+
+        sql = [statement for statement, _ in connection.statements]
+        self.assertFalse(
+            [s for s in sql if s.startswith("DELETE FROM canonical_evidence_documents")]
+        )
+        upsert = [
+            (s, params) for s, params in connection.statements
+            if s.startswith("INSERT INTO canonical_evidence_documents(")
+        ]
+        self.assertEqual(len(upsert), 1)
+        self.assertIn(
+            "ON CONFLICT(tenant_id,source_id,native_parent_id) DO UPDATE SET "
+            "revision=excluded.revision",
+            upsert[0][0],
+        )
+        self.assertNotIn("created_at=excluded", upsert[0][0])
+        self.assertIn("revision <excluded.revision", upsert[0][0])
+        self.assertEqual(upsert[0][1][4], 2)
+        # Parts and actor links are rewritten for the new revision by key,
+        # never through a cascade from the document row.
+        self.assertTrue(
+            [s for s in sql if s.startswith("DELETE FROM canonical_evidence_document_parts")]
+        )
+        self.assertTrue(
+            [s for s in sql if s.startswith("DELETE FROM canonical_evidence_document_actors")]
+        )
+        parts_insert = [
+            values for s, values in connection.statements
+            if s.startswith("INSERT INTO canonical_evidence_document_parts(")
+        ]
+        self.assertEqual(
+            [row[5] for row in parts_insert[0]],
+            [kept_part["artifact_id"], new_tail["artifact_id"]],
+        )
+        # Cleanup receives the old manifest and the replaced tail only.
+        cleanup = [
+            values for s, values in connection.statements
+            if s.startswith("INSERT INTO canonical_evidence_cleanup_queue(")
+        ]
+        self.assertEqual(
+            sorted(row[2] for row in cleanup[0]),
+            sorted([old_manifest["artifact_id"], replaced_tail["artifact_id"]]),
+        )
+        queue = [
+            params for s, params in connection.statements
+            if s.startswith("INSERT INTO canonical_passage_projection_queue(")
+        ]
+        self.assertEqual(queue[0][3], 2)
+        self.assertNotIn("canonical_passages", " ".join(sql))
+        self.assertNotIn("canonical_passage_documents", " ".join(sql))
 
     def test_embedding_path_uses_passages_and_never_a_completion_model(
         self,

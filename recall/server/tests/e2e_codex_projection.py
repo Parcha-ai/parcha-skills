@@ -96,7 +96,7 @@ def main() -> None:
         log_path = Path(temporary) / "server.log"
         with log_path.open("w") as log:
             environment = os.environ | {
-                "PYTHONPATH": str(SERVER),
+                "PYTHONPATH": os.pathsep.join((str(RECALL), str(SERVER))),
                 "RECALL_DATABASE_URL": dsn,
                 "RECALL_PORT": str(port),
                 "RECALL_AUTH_REQUIRED": "1",

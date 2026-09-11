@@ -806,7 +806,7 @@ class CanonicalLogicalEvidenceProjector:
                       part.encryption,part.version_id,part.created_at
                  FROM canonical_evidence_document_parts part
                  JOIN canonical_evidence_documents document
-                   USING(tenant_id,source_id,logical_document_id,revision)
+                   USING(tenant_id,source_id,logical_document_id)
                 WHERE document.tenant_id=%s AND document.source_id=%s
                   AND document.native_parent_id=%s
                 ORDER BY part.part_ordinal""",
@@ -1213,17 +1213,14 @@ class CanonicalLogicalEvidenceProjector:
                         )
                     ),
                 )
-                connection.execute(
-                    """DELETE FROM canonical_evidence_documents
-                        WHERE tenant_id=%s AND source_id=%s
-                          AND native_parent_id=%s""",
-                    (
-                        candidate.tenant_id,
-                        candidate.source_id,
-                        candidate.native_parent_id,
-                    ),
-                )
-                connection.execute(
+                # A revision updates the catalog row in place. The child
+                # tables reference (tenant_id, source_id, logical_document_id)
+                # without revision, so passages, embeddings, contexts, and
+                # actors survive a session append; only the parts and actor
+                # links below are rewritten, and only the passage queue tells
+                # the passage projector to catch up. `created_at` is the
+                # document's first projection time and is never overwritten.
+                committed = connection.execute(
                     """INSERT INTO canonical_evidence_documents(
                            tenant_id,source_id,logical_document_id,
                            native_parent_id,revision,evidence_id,
@@ -1237,7 +1234,33 @@ class CanonicalLogicalEvidenceProjector:
                        ) VALUES (
                            %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                            %s,%s,%s,%s,%s,%s,%s,%s
-                       )""",
+                       )
+                       ON CONFLICT(tenant_id,source_id,native_parent_id)
+                       DO UPDATE SET
+                           revision=excluded.revision,
+                           evidence_id=excluded.evidence_id,
+                           manifest_artifact_id=excluded.manifest_artifact_id,
+                           manifest_storage_backend=
+                               excluded.manifest_storage_backend,
+                           manifest_object_key=excluded.manifest_object_key,
+                           manifest_content_sha256=
+                               excluded.manifest_content_sha256,
+                           manifest_size_bytes=excluded.manifest_size_bytes,
+                           manifest_media_type=excluded.manifest_media_type,
+                           manifest_encryption=excluded.manifest_encryption,
+                           manifest_version_id=excluded.manifest_version_id,
+                           document_content_sha256=
+                               excluded.document_content_sha256,
+                           record_count=excluded.record_count,
+                           receipt_count=excluded.receipt_count,
+                           part_count=excluded.part_count,
+                           first_occurred_at=excluded.first_occurred_at,
+                           last_occurred_at=excluded.last_occurred_at,
+                           source_updated_at=excluded.source_updated_at
+                       WHERE canonical_evidence_documents.logical_document_id
+                             =excluded.logical_document_id
+                         AND canonical_evidence_documents.revision
+                             <excluded.revision""",
                     (
                         prepared.tenant_id,
                         prepared.source_id,
@@ -1261,6 +1284,21 @@ class CanonicalLogicalEvidenceProjector:
                         prepared.last_occurred_at,
                         candidate.source_updated_at,
                         manifest_reference["created_at"],
+                    ),
+                )
+                if committed.rowcount != 1:
+                    raise LogicalEvidenceError("logical_evidence_state_invalid")
+                # Parts are replaced per revision; unchanged parts keep their
+                # artifact ids, so the cleanup queue above received only the
+                # manifest and the rewritten tail part(s).
+                connection.execute(
+                    """DELETE FROM canonical_evidence_document_parts
+                        WHERE tenant_id=%s AND source_id=%s
+                          AND logical_document_id=%s""",
+                    (
+                        prepared.tenant_id,
+                        prepared.source_id,
+                        prepared.logical_document_id,
                     ),
                 )
                 with connection.cursor() as cursor:
@@ -1305,6 +1343,18 @@ class CanonicalLogicalEvidenceProjector:
                             )
                         ],
                     )
+                # Actor links are tiny and derived; rewrite them for the new
+                # revision without touching any passage-level attribution.
+                connection.execute(
+                    """DELETE FROM canonical_evidence_document_actors
+                        WHERE tenant_id=%s AND source_id=%s
+                          AND logical_document_id=%s""",
+                    (
+                        prepared.tenant_id,
+                        prepared.source_id,
+                        prepared.logical_document_id,
+                    ),
+                )
                 connection.execute(
                     """INSERT INTO canonical_evidence_document_actors(
                            tenant_id,source_id,logical_document_id,revision,

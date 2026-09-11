@@ -24,6 +24,8 @@ from recall_server.db import BrainStore  # noqa: E402
 from recall_server.logical_evidence import (  # noqa: E402
     LogicalEvidenceProjectionStore,
 )
+from recall_server.passage_index import CanonicalPassageProjector  # noqa: E402
+from recall_server.passage_projection import PassagePolicy  # noqa: E402
 from recall_server.logical_evidence_projection import (  # noqa: E402
     CanonicalLogicalEvidenceProjector,
     mark_logical_evidence_dirty,
@@ -407,6 +409,62 @@ def main() -> None:
             limit=10,
         ) == []
 
+        # Project passages for both documents before the revision so the
+        # in-place update below has children that must survive it.
+        passages = CanonicalPassageProjector(
+            store,
+            projection,
+            policy=PassagePolicy(target_tokens=4, overlap_tokens=1),
+            bound_tenant_id=tenant,
+        )
+        passage_first = passages.project_pending(
+            tenant_id=tenant,
+            batch_size=10,
+            max_batches=1,
+            concurrency=1,
+        )
+        assert passage_first["documents"] == 2, passage_first
+        with store.connect() as connection:
+            evidence_before = connection.execute(
+                """SELECT logical_document_id,revision,created_at,
+                          manifest_artifact_id
+                     FROM canonical_evidence_documents
+                    WHERE tenant_id=%s AND source_id=%s""",
+                (tenant, claude),
+            ).fetchone()
+            parts_before = {
+                row["artifact_id"]
+                for row in connection.execute(
+                    """SELECT artifact_id
+                         FROM canonical_evidence_document_parts
+                        WHERE tenant_id=%s AND source_id=%s""",
+                    (tenant, claude),
+                ).fetchall()
+            }
+            passage_document_before = connection.execute(
+                """SELECT revision,passage_count,xmin::text AS xmin
+                     FROM canonical_passage_documents
+                    WHERE tenant_id=%s AND source_id=%s""",
+                (tenant, claude),
+            ).fetchone()
+            passages_before = {
+                row["passage_id"]
+                for row in connection.execute(
+                    """SELECT passage_id FROM canonical_passages
+                        WHERE tenant_id=%s AND source_id=%s""",
+                    (tenant, claude),
+                ).fetchall()
+            }
+            actors_before = connection.execute(
+                """SELECT count(*) AS count
+                     FROM canonical_evidence_document_actors
+                    WHERE tenant_id=%s AND source_id=%s""",
+                (tenant, claude),
+            ).fetchone()["count"]
+        assert evidence_before["revision"] == 1
+        assert passage_document_before["revision"] == 1
+        assert passage_document_before["passage_count"] >= 1
+        assert len(passages_before) == passage_document_before["passage_count"]
         with store.connect() as connection:
             receipts["claude-3"] = insert_record(
                 connection,
@@ -452,6 +510,110 @@ def main() -> None:
         assert revised["cleanup_failures"] == 1
         assert revised["cleanup_pending"] == 1
         assert archive_object_count(archive_root) == 6
+        # The revision updated the catalog row in place: no cascade reached
+        # the passage plane, and only the replaced objects were queued.
+        with store.connect() as connection:
+            evidence_after = connection.execute(
+                """SELECT logical_document_id,revision,created_at,
+                          manifest_artifact_id
+                     FROM canonical_evidence_documents
+                    WHERE tenant_id=%s AND source_id=%s""",
+                (tenant, claude),
+            ).fetchone()
+            parts_after = {
+                row["artifact_id"]
+                for row in connection.execute(
+                    """SELECT artifact_id
+                         FROM canonical_evidence_document_parts
+                        WHERE tenant_id=%s AND source_id=%s""",
+                    (tenant, claude),
+                ).fetchall()
+            }
+            passage_document_after = connection.execute(
+                """SELECT revision,passage_count,xmin::text AS xmin
+                     FROM canonical_passage_documents
+                    WHERE tenant_id=%s AND source_id=%s""",
+                (tenant, claude),
+            ).fetchone()
+            passages_after = {
+                row["passage_id"]
+                for row in connection.execute(
+                    """SELECT passage_id FROM canonical_passages
+                        WHERE tenant_id=%s AND source_id=%s""",
+                    (tenant, claude),
+                ).fetchall()
+            }
+            actors_after = connection.execute(
+                """SELECT count(*) AS count,max(revision) AS revision
+                     FROM canonical_evidence_document_actors
+                    WHERE tenant_id=%s AND source_id=%s""",
+                (tenant, claude),
+            ).fetchone()
+            cleanup_queued = {
+                row["artifact_id"]
+                for row in connection.execute(
+                    """SELECT artifact_id FROM canonical_evidence_cleanup_queue
+                        WHERE tenant_id=%s AND source_id=%s""",
+                    (tenant, claude),
+                ).fetchall()
+            }
+            passage_queue = connection.execute(
+                """SELECT revision,reason
+                     FROM canonical_passage_projection_queue
+                    WHERE tenant_id=%s AND source_id=%s""",
+                (tenant, claude),
+            ).fetchall()
+        assert evidence_after["logical_document_id"] == (
+            evidence_before["logical_document_id"]
+        )
+        assert evidence_after["revision"] == 2, evidence_after
+        assert evidence_after["created_at"] == evidence_before["created_at"]
+        assert evidence_after["manifest_artifact_id"] != (
+            evidence_before["manifest_artifact_id"]
+        )
+        assert passage_document_after == passage_document_before, (
+            passage_document_before,
+            passage_document_after,
+        )
+        assert passages_after == passages_before
+        assert actors_after["count"] == actors_before
+        assert actors_before == 0 or actors_after["revision"] == 2
+        replaced_objects = (parts_before - parts_after) | {
+            evidence_before["manifest_artifact_id"]
+        }
+        assert cleanup_queued, cleanup_queued
+        assert cleanup_queued <= replaced_objects, (cleanup_queued, replaced_objects)
+        assert not (cleanup_queued & parts_after)
+        assert evidence_after["manifest_artifact_id"] not in cleanup_queued
+        assert [
+            (int(row["revision"]), row["reason"]) for row in passage_queue
+        ] == [(2, "logical-update")], passage_queue
+        # The passage projector catches up from the queue afterwards.
+        passage_revised = passages.project_pending(
+            tenant_id=tenant,
+            batch_size=10,
+            max_batches=1,
+            concurrency=1,
+        )
+        assert passage_revised["documents"] == 1, passage_revised
+        with store.connect() as connection:
+            passage_document_revised = connection.execute(
+                """SELECT revision,passage_count
+                     FROM canonical_passage_documents
+                    WHERE tenant_id=%s AND source_id=%s""",
+                (tenant, claude),
+            ).fetchone()
+            passage_revisions = {
+                int(row["revision"])
+                for row in connection.execute(
+                    """SELECT DISTINCT revision FROM canonical_passages
+                        WHERE tenant_id=%s AND source_id=%s""",
+                    (tenant, claude),
+                ).fetchall()
+            }
+        assert passage_document_revised["revision"] == 2
+        assert passage_document_revised["passage_count"] >= 1
+        assert passage_revisions == {2}, passage_revisions
         cleanup = projector.drain_cleanup(tenant_id=tenant)
         assert cleanup["completed"] == 1
         assert cleanup["deleted"] == 1
@@ -602,6 +764,29 @@ def main() -> None:
             assert str(error) == "logical_evidence_tenant_not_configured"
         else:
             raise AssertionError("bound projector accepted another tenant")
+        # Forget never waits for a quiet period.
+        with store.connect() as connection:
+            mark_logical_evidence_dirty(
+                connection,
+                tenant_id=tenant,
+                source_id=claude,
+                native_ids=[f"claude-record-{nonce}-3"],
+                reason="forget",
+            )
+        forgotten = projector.project_pending(
+            tenant_id=tenant,
+            batch_size=10,
+            max_batches=1,
+            upload_concurrency=1,
+            quiet_seconds=300,
+            max_wait_seconds=3_600,
+        )
+        # The unchanged document is repaired in place rather than rewritten;
+        # what matters is that the forget request was not held back.
+        assert forgotten["documents"] + forgotten["repaired"] == 1, forgotten
+        assert forgotten["waiting"] == 0, forgotten
+        assert forgotten["pending"] == 0, forgotten
+
 
     with store.connect() as connection:
         counts = connection.execute(
@@ -621,26 +806,6 @@ def main() -> None:
         "receipt_documents": 2,
         "receipts": 7,
     }
-    # Forget never waits for a quiet period.
-    with store.connect() as connection:
-        mark_logical_evidence_dirty(
-            connection,
-            tenant_id=tenant,
-            source_id=claude,
-            native_ids=[f"claude-record-{nonce}-3"],
-            reason="forget",
-        )
-    forgotten = projector.project_pending(
-        tenant_id=tenant,
-        batch_size=10,
-        max_batches=1,
-        upload_concurrency=1,
-        quiet_seconds=300,
-        max_wait_seconds=3_600,
-    )
-    assert forgotten["documents"] == 1, forgotten
-    assert forgotten["waiting"] == 0, forgotten
-
     print(
         json.dumps(
             {
@@ -651,6 +816,9 @@ def main() -> None:
                 "oversized_sql_restorations": 1,
                 "idempotent_reprojects": 2,
                 "revision_replacements": 1,
+                "revision_in_place_updates": 1,
+                "revision_cascaded_passages": 0,
+                "revision_created_at_preserved": True,
                 "durable_cleanup_retries": 1,
                 "protected_cleanup_deletes": 0,
                 "forgotten_receipt_hits": 0,
