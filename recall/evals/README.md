@@ -60,6 +60,16 @@ line to `history.jsonl` so runs can be compared over time.
 | authorization | `authorization.negative_scope` | unauthorized source / unknown person / foreign tenant must return nothing |
 | privacy | `privacy.secret_scan` | secret-shaped strings that survived redaction, counted inside the sandbox; emails/phones reported |
 | cost | `cost.planetscale` | cluster tier, IOPS/throughput, storage bounds, month-to-date invoice, budget alert (optional) |
+| cost | `cost.storage` | where the bytes are: Postgres database size and the 12 largest tables (from the brain's `/metrics`, needs a metrics-scoped token), PlanetScale storage min/max bounds, evidence-bucket bytes under `objects/` (page-capped); gate `postgres_database_gib <= 40` |
+
+`cost.storage` reads three optional sources and notes each one it skips: the brain's `/metrics`
+(`--metrics-token-file` or `RECALL_METRICS_TOKEN_FILE`, a mode-0600 JSON `{"token": ...}` with the
+`metrics` scope; the brain exports `recall_database_bytes` and `recall_table_bytes{table=...}`),
+the PlanetScale branch (same credentials as `cost.planetscale`; the API publishes no per-table
+sizes), and the evidence bucket (`RECALL_EVIDENCE_ARCHIVE_BUCKET` plus either the archive keys or
+ambient AWS credentials; listing stops after 200 pages of 1000 keys and reports
+`s3_listing_complete`). The 40 GiB gate is the H1 target and fails at the 108 GB baseline on
+purpose; H3 lowers it to 10.
 
 Gates are initial thresholds, recorded in the card next to the observed value. A failed gate marks
 the dimension `degraded`; a probe that cannot run marks it `failed`; a probe without inputs is

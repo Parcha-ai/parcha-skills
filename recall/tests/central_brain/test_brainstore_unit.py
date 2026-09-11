@@ -976,6 +976,104 @@ class HttpBoundaryContractTest(unittest.TestCase):
                 {"passages_written": 42, "documents_projected": 3, "passages_embedded": 8, "parquet_rows_written": 100, "bodies_thinned": 1},
             )
 
+    # storage breakdown
+    def test_service_metrics_reports_bounded_storage_breakdown(self) -> None:
+        connection = mock.MagicMock()
+        tables = [
+            {"table": "canonical_chunks", "n": 84825604096},
+            {"table": "canonical_events", "n": 24696061952},
+        ]
+
+        def execute(sql, params=None):
+            cursor = mock.MagicMock()
+            text = " ".join(sql.split())
+            if "to_regclass" in text:
+                cursor.fetchone.return_value = {"value": None}
+            elif "pg_database_size" in text:
+                cursor.fetchone.return_value = {"n": 115964116992}
+            elif "pg_total_relation_size" in text:
+                self.assertIn("pg_class", text)
+                self.assertIn("relkind IN ('r','m','p')", text)
+                self.assertIn("LIMIT %s", text)
+                self.assertEqual(params, (12,))
+                cursor.fetchall.return_value = tables
+            else:
+                cursor.fetchone.return_value = {"n": 7}
+            return cursor
+
+        connection.execute.side_effect = execute
+        context = mock.MagicMock()
+        context.__enter__.return_value = connection
+        store = BrainStore("postgresql://synthetic.invalid/recall")
+        store.connect = mock.MagicMock(return_value=context)
+
+        metrics = store.service_metrics()
+
+        self.assertEqual(metrics["database_bytes"], 115964116992)
+        self.assertEqual(
+            metrics["table_bytes"],
+            {"canonical_chunks": 84825604096, "canonical_events": 24696061952},
+        )
+        self.assertEqual(metrics["source_events"], 7)
+        storage_sql = [
+            " ".join(call.args[0].split())
+            for call in connection.execute.call_args_list
+            if "pg_total_relation_size" in call.args[0]
+        ]
+        self.assertEqual(len(storage_sql), 1)
+        self.assertNotIn("pg_stat_user_tables", storage_sql[0])  # catalog only, no stats scan
+
+    def test_metrics_endpoint_exports_storage_gauges_with_table_labels_only(self) -> None:
+        handler = object.__new__(Handler)
+        handler.store = mock.MagicMock()
+        handler.store.service_metrics.return_value = {
+            "source_events": 1,
+            "dead_letters": 0,
+            "projection_lag": 0,
+            "source_freshness_seconds": 0,
+            "embedded_items": 1,
+            "embedding_lag": 0,
+            "database_bytes": 115964116992,
+            "table_bytes": {
+                "canonical_events": 24696061952,
+                "canonical_chunks": 84825604096,
+                'bad"name{x=1}': 5,
+            },
+        }
+
+        text = Handler.metrics(handler).decode()
+
+        self.assertIn("# TYPE recall_database_bytes gauge", text)
+        self.assertIn("recall_database_bytes 115964116992", text)
+        self.assertIn("# TYPE recall_table_bytes gauge", text)
+        lines = [line for line in text.splitlines() if line.startswith("recall_table_bytes{")]
+        self.assertEqual(
+            lines,
+            [
+                'recall_table_bytes{table="canonical_chunks"} 84825604096',
+                'recall_table_bytes{table="canonical_events"} 24696061952',
+            ],
+        )
+        self.assertNotIn("bad", text)
+        self.assertTrue(text.endswith("\n"))
+
+    def test_metrics_endpoint_tolerates_stores_without_storage_breakdown(self) -> None:
+        handler = object.__new__(Handler)
+        handler.store = mock.MagicMock()
+        handler.store.service_metrics.return_value = {
+            "source_events": 1,
+            "dead_letters": 0,
+            "projection_lag": 0,
+            "source_freshness_seconds": 0,
+            "embedded_items": 1,
+            "embedding_lag": 0,
+        }
+
+        text = Handler.metrics(handler).decode()
+
+        self.assertIn("recall_database_bytes 0", text)
+        self.assertNotIn("recall_table_bytes{", text)
+
 
     def test_remote_doctor_uses_bounded_health_not_full_metrics(self) -> None:
         handler = object.__new__(Handler)

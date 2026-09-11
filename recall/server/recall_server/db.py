@@ -36,6 +36,8 @@ from .ranking import DEFAULT_SEARCH_DEADLINE_MS, evidence_rank_components, shoul
 from .semantic import SemanticRuntime
 
 MAX_SEARCH_RESULT_TEXT_CHARS = 4096
+# storage breakdown: relations reported by service_metrics()["table_bytes"]
+STORAGE_BREAKDOWN_TABLES = 12
 TURN_USER_MARKER = "User request:\n"
 TURN_ASSISTANT_MARKER = "\nAssistant response:\n"
 TURN_CONTINUATION_MARKER = "\n\nAssistant continuation:\n"
@@ -1707,6 +1709,26 @@ class BrainStore:
                     WHERE deleted_at IS NULL AND btrim(text_redacted) <> ''"""
                 ).fetchone()["n"]
             metrics.update(self._projection_churn_metrics(conn))
+            # storage breakdown: where the bytes are, bounded to the largest
+            # public relations. Catalog-only (no heap scan); label = table name.
+            metrics["database_bytes"] = int(
+                conn.execute(
+                    "SELECT pg_database_size(current_database()) AS n"
+                ).fetchone()["n"] or 0
+            )
+            metrics["table_bytes"] = {
+                str(row["table"]): int(row["n"] or 0)
+                for row in conn.execute(
+                    """SELECT cls.relname AS "table",
+                              pg_total_relation_size(cls.oid) AS n
+                       FROM pg_class cls
+                       JOIN pg_namespace nsp ON nsp.oid=cls.relnamespace
+                       WHERE nsp.nspname='public' AND cls.relkind IN ('r','m','p')
+                       ORDER BY n DESC, cls.relname
+                       LIMIT %s""",
+                    (STORAGE_BREAKDOWN_TABLES,),
+                ).fetchall()
+            }
             return metrics
 
     # Anti-join rows examined before the unembedded gauge stops counting.
