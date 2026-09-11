@@ -15,6 +15,7 @@ from .accuracy import SyntheticSuiteProbe, TruthBoundaryProbe
 from .availability import AvailabilityProbe
 from .corpus import AuthorizationProbe, FreshnessProbe, ScanConsistencyProbe, SecretScanProbe
 from .cost import PlanetScaleCostProbe
+from .forget import ForgetLatencyProbe
 from .latency import ArchilPhaseProbe, SearchStageProbe, ToolLatencyProbe
 from .mcp_client import McpClient, load_profile
 from .model import DIMENSIONS, SCHEMA_VERSION, ProbeResult, dimension_status
@@ -26,7 +27,7 @@ PROBES: dict[str, Any] = {
     "latency": [ToolLatencyProbe, SearchStageProbe, ArchilPhaseProbe],
     "accuracy": [TruthBoundaryProbe, SyntheticSuiteProbe],
     "freshness": [FreshnessProbe],
-    "integrity": [ScanConsistencyProbe],
+    "integrity": [ScanConsistencyProbe, ForgetLatencyProbe],
     "authorization": [AuthorizationProbe],
     "privacy": [SecretScanProbe],
     "cost": [PlanetScaleCostProbe],
@@ -106,6 +107,7 @@ def history_row(card: dict[str, Any]) -> dict[str, Any]:
         "accuracy.truth_boundary": ["boundary_recall@20", "boundary_mrr", "negative_false_hit_rate"],
         "freshness.source_age": ["newest_age_hours_min", "newest_age_hours_median", "projection_pending"],
         "integrity.scan_consistency": ["scope_scan_agreement", "objects_unavailable"],
+        "integrity.forget_latency": ["forgotten_after_s", "capture_visible_after_s"],
         "authorization.negative_scope": ["leaks"],
         "privacy.secret_scan": ["secret_hits_total"],
         "cost.planetscale": ["invoice_mtd_usd", "storage_iops"],
@@ -150,6 +152,7 @@ def run_card(args: argparse.Namespace) -> dict[str, Any]:
         "planetscale_org": args.planetscale_org,
         "planetscale_database": args.planetscale_database,
         "active_window_hours": args.active_window_hours,
+        "forget_probe": bool(args.forget_probe),
     }
     if args.queries:
         queries_path = Path(args.queries).expanduser()
@@ -198,6 +201,7 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--planetscale-org")
     run.add_argument("--planetscale-database")
     run.add_argument("--active-window-hours", type=float, default=72.0)
+    run.add_argument("--forget-probe", action="store_true", help="capture, then forget, one synthetic memory and time its disappearance from search (writes to the brain)")
     run.add_argument("--repo-root", default=str(Path(__file__).resolve().parents[3]))
     render = commands.add_parser("render", help="re-render card.html from an existing card.json")
     render.add_argument("--output-dir", required=True)

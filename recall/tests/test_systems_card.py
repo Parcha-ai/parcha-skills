@@ -8,13 +8,13 @@ import unittest
 import urllib.error
 from pathlib import Path
 
-from evals.systems_card import accuracy, corpus, latency
+from evals.systems_card import accuracy, corpus, forget, latency
 from evals.systems_card.availability import AvailabilityProbe
 from evals.systems_card.mcp_client import McpClient, McpClientError, load_profile
 from evals.systems_card.model import Gate, ProbeResult, dimension_status, percentile, summarize_latency
 from evals.systems_card.probes import ProbeContext, timed
 from evals.systems_card.render import render_html
-from evals.systems_card.runner import build_card, history_row, parser
+from evals.systems_card.runner import PROBES, build_card, history_row, parser
 from tests.test_agentic_truth import truth_cases
 
 
@@ -334,6 +334,209 @@ class AccuracyTest(unittest.TestCase):
         hits = [{"logical_document_id": "ldoc_" + "a" * 32, "source_id": "s", "revision": 3}] * 3
         self.assertEqual(len(accuracy.candidates_from_search({"results": hits})), 1)
         self.assertEqual(accuracy.candidates_from_search({"results": hits})[0]["revision"], 3)
+
+
+class _FakeClock:
+    """Sleeping advances the clock; nothing else does, so polls are deterministic."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.slept: list[float] = []
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.now += seconds
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class ForgetBrainState:
+    """Memory becomes searchable after `visible_after` polls and disappears `absent_after` polls after forget."""
+
+    RECEIPT = "recall://manual:capture:owner/mem-0123456789abcdef?rev=1#item=0"
+
+    def __init__(self, *, visible_after: int | None = 2, absent_after: int | None = 3, capture_ok: bool = True, forget_ok: bool = True, resolves_after_forget: bool = False) -> None:
+        self.visible_after = visible_after
+        self.absent_after = absent_after
+        self.capture_ok = capture_ok
+        self.forget_ok = forget_ok
+        self.resolves_after_forget = resolves_after_forget
+        self.captured: dict | None = None
+        self.forgotten = False
+        self.searches = 0
+        self.searches_after_forget = 0
+
+    def _visible(self) -> bool:
+        if self.captured is None:
+            return False
+        if self.forgotten:
+            return self.absent_after is not None and self.searches_after_forget <= self.absent_after
+        return self.visible_after is not None and self.searches > self.visible_after
+
+    def capture(self, arguments: dict) -> dict | None:
+        if not self.capture_ok:
+            return None
+        self.captured = arguments
+        return {"receipt": self.RECEIPT, "status": "accepted", "duplicate": False}
+
+    def forget(self, arguments: dict) -> dict | None:
+        if not self.forget_ok:
+            return None
+        self.forgotten = arguments["receipt"] == self.RECEIPT
+        return {"status": "forgotten", "deleted_receipt": self.RECEIPT.split("#", 1)[0]}
+
+    def search(self, arguments: dict) -> dict:
+        self.searches += 1
+        if self.forgotten:
+            self.searches_after_forget += 1
+        hits = [{"logical_document_id": "ldoc_" + "9" * 32, "source_id": "other", "revision": 1, "matching_ranges": [{"receipts": ["recall://other/record-1?rev=1#item=0"]}]}]
+        if self._visible():
+            body = self.captured["body"]
+            hits.insert(0, {"logical_document_id": "ldoc_" + "1" * 32, "source_id": "manual:capture:owner", "revision": 1,
+                            "matching_ranges": [{"receipts": [self.RECEIPT], "text": body}]})
+        return {"results": hits, "diagnostics": {"elapsed_ms": 5.0}}
+
+    def resolve(self, arguments: dict) -> dict | None:
+        if self.captured is None or arguments["target"].split("#", 1)[0] != self.RECEIPT.split("#", 1)[0]:
+            return None
+        if self.forgotten and not self.resolves_after_forget:
+            return None
+        return {"records": [], "content": []}
+
+    def tools(self) -> dict:
+        value = default_tools()
+        value.update({
+            "recall_capture": self.capture,
+            "recall_forget": self.forget,
+            "recall_search": self.search,
+            "recall_show": self.resolve,
+            "recall_session_context": self.resolve,
+        })
+        return value
+
+
+def forget_context(state: ForgetBrainState, clock: _FakeClock, **options) -> tuple[FakeBrain, ProbeContext]:
+    brain = FakeBrain(state.tools())
+    context = make_context(brain, forget_probe=True, _sleep=clock.sleep, _clock=clock, **options)
+    return brain, context
+
+
+class ForgetLatencyTest(unittest.TestCase):
+    def test_skipped_unless_flag(self):
+        brain = FakeBrain(ForgetBrainState().tools())
+        result = forget.ForgetLatencyProbe().run(make_context(brain))
+        self.assertEqual(result.status, "skipped")
+        self.assertEqual(brain.calls, [])
+        self.assertIn("--forget-probe", result.notes[0])
+
+    def test_measures_visible_and_forgotten_latency(self):
+        state = ForgetBrainState(visible_after=2, absent_after=3)
+        clock = _FakeClock()
+        brain, context = forget_context(state, clock)
+        result = forget.ForgetLatencyProbe(poll_interval_s=15).run(context)
+        self.assertEqual(result.status, "ok", result.notes)
+        metrics = result.metrics
+        self.assertTrue(metrics["capture_ok"])
+        self.assertTrue(metrics["forget_ok"])
+        self.assertEqual(metrics["capture_visible_after_s"], 30.0)  # 2 misses -> 2 sleeps
+        self.assertEqual(metrics["forgotten_after_s"], 45.0)  # 3 hits after forget -> 3 sleeps
+        self.assertTrue(metrics["receipt_unresolvable"])
+        self.assertEqual(metrics["polls"], 3 + 4)
+        self.assertEqual(metrics["search_errors"], 0)
+        self.assertTrue(all(g.passed for g in result.gates), [(g.metric, g.passed) for g in result.gates])
+        self.assertEqual({g.metric for g in result.gates}, {"capture_ok", "capture_visible_after_s", "forget_ok", "forgotten_after_s", "receipt_unresolvable"})
+        self.assertEqual(clock.slept, [15.0] * 5)
+        # The capture went through the documented write schema; forget used the returned receipt.
+        capture_args = next(a for n, a in brain.calls if n == "recall_capture")
+        self.assertEqual(capture_args["schema_version"], 1)
+        self.assertEqual(capture_args["title"], "systems card forget probe")
+        self.assertEqual(capture_args["provenance"], {"uri": "manual://systems-card/forget-probe"})
+        self.assertEqual(capture_args["tags"], ["systems-card"])
+        self.assertIn("systemscard-forget-probe", capture_args["body"])
+        self.assertEqual(next(a for n, a in brain.calls if n == "recall_forget"), {"receipt": ForgetBrainState.RECEIPT})
+        searches = [a for n, a in brain.calls if n == "recall_search"]
+        self.assertTrue(all(a["limit"] == 5 and a["query"] in capture_args["body"] for a in searches))
+        self.assertEqual([n for n, _ in brain.calls][-2:], ["recall_show", "recall_session_context"])
+        # Nothing content-bearing reaches the card.
+        rendered = json.dumps(result.as_dict())
+        self.assertNotIn(ForgetBrainState.RECEIPT, rendered)
+        self.assertNotIn(ForgetBrainState.RECEIPT.split("#", 1)[0], rendered)
+        self.assertNotIn(capture_args["body"], rendered)
+        nonce = capture_args["body"].split("Marker: ", 1)[1].split(".", 1)[0]
+        self.assertNotIn(nonce, rendered)
+        self.assertNotIn(nonce.split(" ")[-1], rendered)
+
+    def test_never_visible_is_degraded_but_still_forgets(self):
+        state = ForgetBrainState(visible_after=None, absent_after=None)
+        clock = _FakeClock()
+        brain, context = forget_context(state, clock)
+        result = forget.ForgetLatencyProbe(poll_interval_s=100, visible_timeout_s=300, absent_timeout_s=300).run(context)
+        self.assertEqual(result.status, "degraded")
+        self.assertTrue(state.forgotten)
+        self.assertIsNone(result.metrics["capture_visible_after_s"])
+        self.assertIsNone(result.metrics["forgotten_after_s"])
+        self.assertTrue(result.metrics["receipt_unresolvable"])
+        self.assertIsNone(next(g for g in result.gates if g.metric == "forgotten_after_s").passed)
+        self.assertEqual(result.metrics["polls"], 4 + 4)  # polls at 0,100,200,300 in each phase
+        self.assertNotIn(ForgetBrainState.RECEIPT, json.dumps(result.as_dict()))
+
+    def test_still_searchable_after_timeout_fails(self):
+        state = ForgetBrainState(visible_after=0, absent_after=10_000)
+        clock = _FakeClock()
+        _, context = forget_context(state, clock)
+        result = forget.ForgetLatencyProbe(poll_interval_s=60, absent_timeout_s=120).run(context)
+        self.assertEqual(result.status, "failed")
+        self.assertIsNone(result.metrics["forgotten_after_s"])
+        self.assertIn("still searchable", result.notes[0])
+        self.assertNotIn(ForgetBrainState.RECEIPT, json.dumps(result.as_dict()))
+
+    def test_receipt_that_still_resolves_fails(self):
+        state = ForgetBrainState(visible_after=0, absent_after=0, resolves_after_forget=True)
+        _, context = forget_context(state, _FakeClock())
+        result = forget.ForgetLatencyProbe().run(context)
+        self.assertEqual(result.status, "failed")
+        self.assertFalse(result.metrics["receipt_unresolvable"])
+        self.assertFalse(next(g for g in result.gates if g.metric == "receipt_unresolvable").passed)
+
+    def test_capture_failure_writes_nothing_more(self):
+        state = ForgetBrainState(capture_ok=False)
+        brain, context = forget_context(state, _FakeClock())
+        result = forget.ForgetLatencyProbe().run(context)
+        self.assertEqual(result.status, "failed")
+        self.assertFalse(result.metrics["capture_ok"])
+        self.assertEqual([n for n, _ in brain.calls], ["recall_capture"])
+
+    def test_forget_failure_is_reported(self):
+        state = ForgetBrainState(visible_after=0, forget_ok=False)
+        brain, context = forget_context(state, _FakeClock())
+        result = forget.ForgetLatencyProbe().run(context)
+        self.assertEqual(result.status, "failed")
+        self.assertFalse(result.metrics["forget_ok"])
+        self.assertIn("may remain", result.notes[0])
+        self.assertNotIn("recall_show", [n for n, _ in brain.calls])
+
+    def test_receipt_matching_and_result_receipts(self):
+        captured = "recall://s/x?rev=1#item=3"
+        self.assertTrue(forget.receipt_matches(captured, captured))
+        self.assertTrue(forget.receipt_matches("recall://s/x?rev=1#item=0", captured))
+        self.assertTrue(forget.receipt_matches("recall://s/x?rev=1", captured))
+        self.assertFalse(forget.receipt_matches("recall://s/x?rev=10#item=0", captured))
+        self.assertEqual(forget.result_receipts({"results": [{"receipt": "a", "matching_ranges": [{"receipts": ["b", 1]}, "junk"]}, 5]}), ["a", "b"])
+        self.assertEqual(forget.result_receipts({}), [])
+
+    def test_registered_in_runner_and_history(self):
+        self.assertIn(forget.ForgetLatencyProbe, PROBES["integrity"])
+        args = parser().parse_args(["run", "--output-dir", "/tmp/x"])
+        self.assertFalse(args.forget_probe)
+        self.assertTrue(parser().parse_args(["run", "--output-dir", "/tmp/x", "--forget-probe"]).forget_probe)
+        results = [ProbeResult("integrity.forget_latency", "integrity", "ok", metrics={"forgotten_after_s": 12.0, "capture_visible_after_s": 3.0, "polls": 4})]
+        with tempfile.TemporaryDirectory() as directory:
+            card = build_card(results, base_url="https://brain.invalid/mcp", started_at=0.0, repo_root=Path(directory), options={})
+        row = history_row(card)
+        self.assertEqual(row["integrity.forget_latency.forgotten_after_s"], 12.0)
+        self.assertEqual(row["integrity.forget_latency.capture_visible_after_s"], 3.0)
+        self.assertNotIn("integrity.forget_latency.polls", row)
 
 
 class CardTest(unittest.TestCase):

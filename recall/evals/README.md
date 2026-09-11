@@ -56,6 +56,7 @@ line to `history.jsonl` so runs can be compared over time.
 | accuracy | `accuracy.synthetic_suite` | surfaces a `recall.retrieval-eval.v1` report from the frozen synthetic suite that CI runs |
 | freshness | `freshness.source_age` | age of the newest visible passage per source (sources hashed), `projection_pending` |
 | integrity | `integrity.scan_consistency` | `recall_scope` enumeration vs `recall_scan` distinct documents, `objects_unavailable` |
+| integrity | `integrity.forget_latency` | capture one synthetic memory, wait until search sees it (`capture_visible_after_s`), forget it, wait until search and receipt resolution no longer return it (`forgotten_after_s`, `receipt_unresolvable`); off unless `--forget-probe` because it writes to the brain |
 | authorization | `authorization.negative_scope` | unauthorized source / unknown person / foreign tenant must return nothing |
 | privacy | `privacy.secret_scan` | secret-shaped strings that survived redaction, counted inside the sandbox; emails/phones reported |
 | cost | `cost.planetscale` | cluster tier, IOPS/throughput, storage bounds, month-to-date invoice, budget alert (optional) |
@@ -77,7 +78,8 @@ The MCP URL and token come from `~/.config/recall-brain/client.json` (or `--url`
 `RECALL_URL` / `RECALL_TOKEN_FILE`). `--dimensions availability,latency` restricts a run;
 `--queries FILE` replaces the built-in generic latency queries; `--planetscale-org` and
 `--planetscale-database` plus `PLANETSCALE_SERVICE_ACCOUNT_ID` / `PLANETSCALE_SERVICE_TOKEN` enable
-the cost probe. Per-case rankings are written mode-0600 under `--private-dir`, never into the
+the cost probe; `--forget-probe` enables the write-then-forget latency probe (needs a token with
+`write` scope; the receipt and body never reach the card). Per-case rankings are written mode-0600 under `--private-dir`, never into the
 card. `python -m evals.systems_card render --output-dir DIR` re-renders HTML from an existing
 `card.json`.
 
