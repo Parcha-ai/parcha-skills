@@ -26,6 +26,15 @@ PROJECTION_TOTALS: dict[str, int] = {
     "passages_embedded": 0,
     "parquet_rows_written": 0,
     "bodies_thinned": 0,
+    # Wall-clock spent per phase, in milliseconds, so a slow cycle can be
+    # attributed to embedding, passages, logical (including S3 cleanup),
+    # parquet, or thinning from /metrics alone.
+    "cycle_elapsed_ms": 0,
+    "embed_elapsed_ms": 0,
+    "passage_elapsed_ms": 0,
+    "logical_elapsed_ms": 0,
+    "parquet_elapsed_ms": 0,
+    "thin_elapsed_ms": 0,
 }
 PROJECTION_TOTALS_LOCK = threading.Lock()
 _CYCLE_TO_TOTAL = {
@@ -35,6 +44,15 @@ _CYCLE_TO_TOTAL = {
     "parquet_rows": "parquet_rows_written",
     "canonical_bodies_thinned": "bodies_thinned",
 }
+PHASE_ELAPSED_KEYS = (
+    "cycle_elapsed_ms",
+    "embed_elapsed_ms",
+    "passage_elapsed_ms",
+    "logical_elapsed_ms",
+    "parquet_elapsed_ms",
+    "thin_elapsed_ms",
+)
+_CYCLE_TO_TOTAL.update({key: key for key in PHASE_ELAPSED_KEYS})
 
 
 def record_cycle(result: dict[str, int | str]) -> None:
@@ -68,17 +86,24 @@ def run_projection_worker(
     body_thinner: Callable[[], dict[str, Any]] | None = None,
     quiet_seconds: float = 0.0,
     max_wait_seconds: float = 0.0,
+    clock: Callable[[], float] = time.monotonic,
 ) -> dict[str, int | str]:
     """Service every projection stage without upstream backfill starvation."""
 
     if not 0.1 <= interval_seconds <= 300:
         raise ValueError("projection worker interval is invalid")
+
+    def elapsed_ms(started: float) -> int:
+        return max(0, int(round((clock() - started) * 1000)))
+
     while True:
+        cycle_started = clock()
         # Drain already-ready downstream work before an expensive logical
         # document batch. New upstream output becomes eligible next cycle;
         # dependency correctness stays in each projector while searchable
         # freshness no longer waits behind an unbounded backfill.
         embedding_error = 0
+        phase_started = clock()
         try:
             embedded = passages.embed_pending(
                 tenant_id=tenant_id,
@@ -100,12 +125,16 @@ def run_projection_worker(
                 "projection embedding unavailable type=%s",
                 type(error).__name__,
             )
+        embed_elapsed_ms = elapsed_ms(phase_started)
+        phase_started = clock()
         projected = passages.project_pending(
             tenant_id=tenant_id,
             batch_size=passage_batch_size,
             max_batches=max_batches_per_cycle,
             concurrency=passage_concurrency,
         )
+        passage_elapsed_ms = elapsed_ms(phase_started)
+        phase_started = clock()
         documents = logical.project_pending(
             tenant_id=tenant_id,
             batch_size=logical_batch_size,
@@ -114,6 +143,8 @@ def run_projection_worker(
             quiet_seconds=quiet_seconds,
             max_wait_seconds=max_wait_seconds,
         )
+        logical_elapsed_ms = elapsed_ms(phase_started)
+        phase_started = clock()
         # Parquet shards are source/month materializations of the authoritative
         # logical documents. During a large retrofit, every logical batch can
         # dirty the same shards. Wait until that queue drains so each dirty
@@ -138,6 +169,8 @@ def run_projection_worker(
                 "contended": 0,
             }
         )
+        parquet_elapsed_ms = elapsed_ms(phase_started)
+        phase_started = clock()
         # The thinner has its own row-level authority gates: live S3 raw data,
         # an S3 logical manifest, retained searchable chunks, and no queued
         # reprojection for that source group. Run one bounded batch every cycle
@@ -154,6 +187,7 @@ def run_projection_worker(
                 "event_bytes_replaced": 0,
             }
         )
+        thin_elapsed_ms = elapsed_ms(phase_started)
         result: dict[str, int | str] = {
             "status": (
                 "complete"
@@ -196,6 +230,15 @@ def run_projection_worker(
             "stale": int(projected["stale"]),
             "pruned": int(documents["pruned"]),
             "cleanup_failures": int(documents["cleanup_failures"]),
+            "logical_cleanup_completed": int(documents.get("cleanup_completed", 0)),
+            "logical_cleanup_pending": int(documents.get("cleanup_pending", 0)),
+            "old_objects_deleted": int(documents.get("old_objects_deleted", 0)),
+            "cycle_elapsed_ms": elapsed_ms(cycle_started),
+            "embed_elapsed_ms": embed_elapsed_ms,
+            "passage_elapsed_ms": passage_elapsed_ms,
+            "logical_elapsed_ms": logical_elapsed_ms,
+            "parquet_elapsed_ms": parquet_elapsed_ms,
+            "thin_elapsed_ms": thin_elapsed_ms,
         }
         record_cycle(result)
         LOG.info(
@@ -211,7 +254,11 @@ def run_projection_worker(
             "canonical_document_bytes_removed=%s "
             "canonical_event_bytes_replaced=%s "
             "stale=%s pruned=%s "
-            "cleanup_failures=%s",
+            "cleanup_failures=%s "
+            "logical_cleanup_completed=%s logical_cleanup_pending=%s "
+            "old_objects_deleted=%s "
+            "cycle_elapsed_ms=%s embed_elapsed_ms=%s passage_elapsed_ms=%s "
+            "logical_elapsed_ms=%s parquet_elapsed_ms=%s thin_elapsed_ms=%s",
             *(
                 result[key]
                 for key in (
@@ -239,6 +286,10 @@ def run_projection_worker(
                     "stale",
                     "pruned",
                     "cleanup_failures",
+                    "logical_cleanup_completed",
+                    "logical_cleanup_pending",
+                    "old_objects_deleted",
+                    *PHASE_ELAPSED_KEYS,
                 )
             ),
         )
