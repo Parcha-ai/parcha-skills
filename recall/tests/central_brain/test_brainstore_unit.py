@@ -42,6 +42,8 @@ from psycopg_pool import PoolTimeout
 from recall_server.app import Handler, serve, serve_unix, validate_http_profile
 from recall_server.capture import build_capture_event
 from recall_server.db import (
+    CONCURRENT_MIGRATION_SUFFIX,
+    concurrent_migration_statements,
     BrainStore,
     bounded_search_text,
     enough_session_anchors,
@@ -78,7 +80,12 @@ def envelope(**updates):
 
 class SchemaMigrationContractTest(unittest.TestCase):
     def test_migration_versions_are_unique_contiguous_and_current(self) -> None:
-        migrations = sorted((SERVER / "schema").glob("*.sql"))
+        every = sorted((SERVER / "schema").glob("*.sql"))
+        companions = [
+            path for path in every
+            if path.name.endswith(CONCURRENT_MIGRATION_SUFFIX)
+        ]
+        migrations = [path for path in every if path not in companions]
         versions = [int(path.name.split("_", 1)[0]) for path in migrations]
         self.assertEqual(versions, list(range(1, SCHEMA_VERSION + 1)))
         for version, path in zip(versions, migrations, strict=True):
@@ -86,6 +93,116 @@ class SchemaMigrationContractTest(unittest.TestCase):
                 path.read_text(),
                 rf"schema_migrations\(version\) VALUES \({version}\)",
             )
+        # A *_concurrent.sql companion runs statement by statement in
+        # autocommit right after its numbered migration: same version prefix
+        # plus a letter, sorted after it, no transaction control, no
+        # dollar-quoted bodies, and it never records a version of its own.
+        for path in companions:
+            prefix = path.name.split("_", 1)[0]
+            self.assertRegex(prefix, r"^\d{3}[a-z]$")
+            self.assertIn(int(prefix[:3]), versions)
+            self.assertLess(
+                every.index(migrations[int(prefix[:3]) - 1]), every.index(path)
+            )
+            text = path.read_text()
+            self.assertNotIn("$$", text)
+            self.assertNotIn("schema_migrations", text)
+            statements = concurrent_migration_statements(text)
+            self.assertTrue(statements)
+            for statement in statements:
+                self.assertRegex(
+                    statement,
+                    r"^(CREATE (UNIQUE )?INDEX CONCURRENTLY IF NOT EXISTS"
+                    r"|DROP INDEX CONCURRENTLY IF EXISTS"
+                    r"|ALTER TABLE \w+\s+VALIDATE CONSTRAINT)",
+                )
+
+    def test_concurrent_migration_statements_run_bare_in_autocommit(self) -> None:
+        text = (
+            "-- comment; with a semicolon\n"
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS a ON t(x);\n\n"
+            "ALTER TABLE t\n    VALIDATE CONSTRAINT c;\n"
+        )
+        self.assertEqual(
+            concurrent_migration_statements(text),
+            [
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS a ON t(x)",
+                "ALTER TABLE t\n    VALIDATE CONSTRAINT c",
+            ],
+        )
+        with self.assertRaises(ValueError):
+            concurrent_migration_statements("BEGIN; CREATE INDEX x ON t(y); COMMIT;")
+
+        class Connection:
+            def __init__(self):
+                self.autocommit = False
+                self.log = []
+
+            def commit(self):
+                self.log.append("commit")
+
+            def execute(self, sql):
+                self.log.append((self.autocommit, sql))
+
+        connection = Connection()
+        BrainStore._migrate_concurrently(connection, text)
+        self.assertEqual(connection.log[0], "commit")
+        self.assertEqual(
+            connection.log[1:],
+            [
+                (True, "CREATE INDEX CONCURRENTLY IF NOT EXISTS a ON t(x)"),
+                (True, "ALTER TABLE t\n    VALIDATE CONSTRAINT c"),
+            ],
+        )
+        self.assertFalse(connection.autocommit)
+        migrate = inspect.getsource(BrainStore.migrate)
+        self.assertIn("CONCURRENT_MIGRATION_SUFFIX", migrate)
+        self.assertIn("_migrate_concurrently", migrate)
+
+    def test_stable_projection_keys_rekey_children_off_revision(self) -> None:
+        migration = SERVER / "schema" / "060_stable_projection_keys.sql"
+        rendered = " ".join(migration.read_text().split()).casefold()
+        for table in (
+            "canonical_evidence_document_parts",
+            "canonical_passage_documents",
+            "canonical_evidence_document_actors",
+            "canonical_passage_projection_queue",
+        ):
+            self.assertIn(
+                f"alter table {table} add constraint {table}_document_fkey "
+                "foreign key (tenant_id, source_id, logical_document_id) "
+                "references canonical_evidence_documents( "
+                "tenant_id, source_id, logical_document_id ) "
+                "on delete cascade not valid",
+                rendered,
+            )
+        self.assertIn(
+            "alter table canonical_passages add constraint "
+            "canonical_passages_document_fkey "
+            "foreign key (tenant_id, source_id, logical_document_id) "
+            "references canonical_passage_documents( "
+            "tenant_id, source_id, logical_document_id ) "
+            "on delete cascade not valid",
+            rendered,
+        )
+        # Old constraints are found by shape, never by a guessed name.
+        self.assertIn("from pg_constraint con", rendered)
+        self.assertIn("attname = 'revision'", rendered)
+        self.assertNotIn("drop constraint canonical_", rendered)
+        companion = (
+            SERVER / "schema" / "060b_stable_projection_keys_concurrent.sql"
+        )
+        statements = concurrent_migration_statements(companion.read_text())
+        normalized = [" ".join(s.split()).casefold() for s in statements]
+        self.assertIn(
+            "create unique index concurrently if not exists "
+            "canonical_passages_document_policy_ordinal_key "
+            "on canonical_passages( tenant_id, source_id, "
+            "logical_document_id, policy_fingerprint, ordinal )",
+            normalized,
+        )
+        validated = [s for s in normalized if "validate constraint" in s]
+        self.assertEqual(len(validated), 5)
 
     def test_turn_backfill_anchor_cursor_has_a_session_id_index(self) -> None:
         migration = SERVER / "schema" / "022_turn_anchor_cursor_index.sql"

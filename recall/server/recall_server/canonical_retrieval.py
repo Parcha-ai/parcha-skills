@@ -1291,7 +1291,6 @@ class BoundCanonicalRetrieval:
                                      AND actor.source_id=document.source_id
                                      AND actor.logical_document_id=
                                          document.logical_document_id
-                                     AND actor.revision=document.revision
                                      AND actor.actor_id=ANY(%s)
                                      AND (
                                          %s::text IS NULL

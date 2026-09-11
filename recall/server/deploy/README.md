@@ -64,7 +64,7 @@ infrastructure. The example is synthetic; a live manifest belongs in a private m
 location and contains references, never credential values.
 
 The production database gate requires a standard PostgreSQL URL with
-`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 59,
+`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 60,
 pgvector 0.8.0 or newer, and a runtime role without superuser, database/role creation,
 replication, or RLS-bypass privilege:
 
@@ -310,6 +310,25 @@ Migration 49 repairs actor bindings for legacy `coding_history` sources whose
 owner principal already maps to a brain actor. It deliberately does not infer an
 author for Slack, email, or any other shared source. Migration 50 adds a derived
 Parquet scan plane; migration 53 adds its compact `passages` planning dataset.
+
+Migration 60 re-keys every child of `canonical_evidence_documents` (parts,
+passage documents, passages, actor links, the passage queue) to the stable
+`(tenant_id, source_id, logical_document_id)` identity, so a logical
+document revision is an in-place update and a session append no longer
+cascades through passages, embeddings, contexts, and actors. Forget still
+deletes the catalog row and cascades. Runbook: stop the projection worker,
+then run `migrate` once as usual. `060_stable_projection_keys.sql` runs in
+one transaction and holds only brief `ACCESS EXCLUSIVE` locks while it drops
+the revision-keyed constraints and adds the replacements as `NOT VALID`
+(metadata only; no table scan). Its companion
+`060b_stable_projection_keys_concurrent.sql` runs afterwards, statement by
+statement in autocommit: each `VALIDATE CONSTRAINT` scans its table once
+under a `SHARE UPDATE EXCLUSIVE` lock (the `canonical_passages` scan is the
+long one; reads and writes continue), then `CREATE UNIQUE INDEX
+CONCURRENTLY` builds the `(…, policy_fingerprint, ordinal)` key and drops the
+revision-keyed document index. Between the two files passages briefly lack a
+document-ordinal uniqueness guarantee, which is why the worker stays stopped
+until `migrate` returns. Every statement is idempotent, so a rerun is safe.
 Each authorized source and UTC month has `documents`, `passages`, `records`, and
 `actors` shards. Passages contain bounded visible-message text, time, attribution,
 and receipt pointers; records retain complete projected JSON for exact inspection.

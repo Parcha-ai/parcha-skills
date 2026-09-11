@@ -744,7 +744,7 @@ class CanonicalPassageProjector:
                              JOIN canonical_passage_documents document
                                USING(
                                    tenant_id,source_id,logical_document_id,
-                                   revision,policy_fingerprint
+                                   policy_fingerprint
                                )
                              LEFT JOIN canonical_passage_embeddings embedding
                                ON embedding.tenant_id=passage.tenant_id
@@ -825,7 +825,7 @@ class CanonicalPassageProjector:
                              JOIN canonical_passage_documents document
                                USING(
                                    tenant_id,source_id,logical_document_id,
-                                   revision,policy_fingerprint
+                                   policy_fingerprint
                                )
                              LEFT JOIN canonical_passage_embeddings embedding
                                ON embedding.tenant_id=passage.tenant_id

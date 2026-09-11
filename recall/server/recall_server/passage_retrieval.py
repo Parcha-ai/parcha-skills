@@ -441,7 +441,7 @@ class PassageHintRetrieval:
                         LIMIT %s
                        )
                        SELECT top.source_id,top.logical_document_id,
-                              top.revision,evidence.native_parent_id,
+                              evidence.revision,evidence.native_parent_id,
                               evidence.first_occurred_at,evidence.last_occurred_at,
                               evidence.manifest_object_key,
                               evidence.manifest_content_sha256,
@@ -455,13 +455,10 @@ class PassageHintRetrieval:
                          JOIN canonical_passage_documents projected
                            USING(
                                tenant_id,source_id,logical_document_id,
-                               revision,policy_fingerprint
+                               policy_fingerprint
                            )
                          JOIN canonical_evidence_documents evidence
-                           USING(
-                               tenant_id,source_id,logical_document_id,
-                               revision
-                           )
+                           USING(tenant_id,source_id,logical_document_id)
                         WHERE NOT EXISTS (
                               SELECT 1
                                 FROM unnest(top.receipts)
@@ -632,7 +629,6 @@ class PassageHintRetrieval:
                                      AND actor.source_id=evidence.source_id
                                      AND actor.logical_document_id=
                                          evidence.logical_document_id
-                                     AND actor.revision=evidence.revision
                                      AND actor.actor_id=ANY(%s)
                                      AND (
                                          %s::text[] IS NULL
@@ -715,9 +711,7 @@ class PassageHintRetrieval:
                     """SELECT COALESCE(sum(projected.passage_count),0) AS count
                          FROM canonical_passage_documents projected
                          JOIN canonical_evidence_documents evidence
-                           USING(
-                               tenant_id,source_id,logical_document_id,revision
-                           )
+                           USING(tenant_id,source_id,logical_document_id)
                         WHERE projected.tenant_id=%s
                           AND projected.source_id=ANY(%s)
                           AND projected.policy_fingerprint=%s
@@ -734,7 +728,6 @@ class PassageHintRetrieval:
                                      AND actor.source_id=projected.source_id
                                      AND actor.logical_document_id=
                                          projected.logical_document_id
-                                     AND actor.revision=projected.revision
                                      AND actor.actor_id=ANY(%s)
                                      AND (
                                          %s::text[] IS NULL
@@ -808,8 +801,7 @@ class PassageHintRetrieval:
                              JOIN canonical_passage_documents projected
                                USING(
                                    tenant_id,source_id,
-                                   logical_document_id,
-                                   revision,policy_fingerprint
+                                   logical_document_id,policy_fingerprint
                                )
                             WHERE embedding.tenant_id=%s
                               AND embedding.source_id=ANY(%s)
@@ -891,7 +883,7 @@ class PassageHintRetrieval:
                            SELECT DISTINCT ON (passage.logical_document_id)
                                   passage.source_id,
                                   passage.logical_document_id,
-                                  passage.revision,
+                                  evidence.revision,
                                   evidence.native_parent_id,
                                   evidence.first_occurred_at,
                                   evidence.last_occurred_at,
@@ -912,13 +904,10 @@ class PassageHintRetrieval:
                              JOIN canonical_passage_documents projected
                                USING(
                                    tenant_id,source_id,logical_document_id,
-                                   revision,policy_fingerprint
+                                   policy_fingerprint
                                )
                              JOIN canonical_evidence_documents evidence
-                               USING(
-                                   tenant_id,source_id,
-                                   logical_document_id,revision
-                               )
+                               USING(tenant_id,source_id,logical_document_id)
                             WHERE projected.policy_fingerprint=%s
                               AND NOT EXISTS (
                                   SELECT 1
@@ -1259,7 +1248,7 @@ class PassageHintRetrieval:
                                   )
                                   passage.source_id,
                                   passage.logical_document_id,
-                                  passage.revision,
+                                  evidence.revision,
                                   evidence.native_parent_id,
                                   evidence.first_occurred_at,
                                   evidence.last_occurred_at,
@@ -1280,13 +1269,10 @@ class PassageHintRetrieval:
                              JOIN canonical_passage_documents projected
                                USING(
                                    tenant_id,source_id,logical_document_id,
-                                   revision,policy_fingerprint
+                                   policy_fingerprint
                                )
                              JOIN canonical_evidence_documents evidence
-                               USING(
-                                   tenant_id,source_id,
-                                   logical_document_id,revision
-                               )
+                               USING(tenant_id,source_id,logical_document_id)
                             WHERE projected.policy_fingerprint=%s
                               AND NOT EXISTS (
                                   SELECT 1
@@ -1356,7 +1342,7 @@ class PassageHintRetrieval:
                         connection,
                         """SELECT passage.source_id,
                                   passage.logical_document_id,
-                                  passage.revision,
+                                  evidence.revision,
                                   evidence.native_parent_id,
                                   evidence.first_occurred_at,
                                   evidence.last_occurred_at,
@@ -1377,13 +1363,10 @@ class PassageHintRetrieval:
                              JOIN canonical_passage_documents projected
                                USING(
                                    tenant_id,source_id,logical_document_id,
-                                   revision,policy_fingerprint
+                                   policy_fingerprint
                                )
                              JOIN canonical_evidence_documents evidence
-                               USING(
-                                   tenant_id,source_id,
-                                   logical_document_id,revision
-                               )
+                               USING(tenant_id,source_id,logical_document_id)
                             WHERE context.tenant_id=%s
                               AND context.source_id=ANY(%s)
                               AND context.context_fingerprint=%s

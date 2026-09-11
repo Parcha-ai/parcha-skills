@@ -38,6 +38,26 @@ from .ranking import DEFAULT_SEARCH_DEADLINE_MS, evidence_rank_components, shoul
 from .semantic import SemanticRuntime
 
 MAX_SEARCH_RESULT_TEXT_CHARS = 4096
+CONCURRENT_MIGRATION_SUFFIX = "_concurrent.sql"
+
+
+def concurrent_migration_statements(text: str) -> list[str]:
+    """Split a *_concurrent.sql file into bare statements.
+
+    Comment lines are dropped first; the remainder splits on semicolons, so a
+    concurrent file must not use dollar-quoted bodies or transaction control.
+    """
+
+    stripped = "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("--")
+    )
+    statements = [part.strip() for part in stripped.split(";")]
+    for statement in statements:
+        if statement.split(None, 1)[:1] in (["BEGIN"], ["COMMIT"]):
+            raise ValueError("concurrent migration must not control transactions")
+    return [statement for statement in statements if statement]
+
+
 # storage breakdown: relations reported by service_metrics()["table_bytes"]
 STORAGE_BREAKDOWN_TABLES = 12
 TURN_USER_MARKER = "User request:\n"
@@ -236,7 +256,28 @@ class BrainStore:
         schema_dir = Path(__file__).resolve().parents[1] / "schema"
         with self.connect() as conn:
             for schema in sorted(schema_dir.glob("*.sql")):
+                if schema.name.endswith(CONCURRENT_MIGRATION_SUFFIX):
+                    self._migrate_concurrently(conn, schema.read_text())
+                    continue
                 conn.execute(schema.read_text())
+
+    @staticmethod
+    def _migrate_concurrently(conn: Any, text: str) -> None:
+        """Run a companion migration statement by statement in autocommit.
+
+        CREATE INDEX CONCURRENTLY and a lock-light VALIDATE CONSTRAINT cannot
+        run inside a transaction block, and a multi-statement string is one
+        implicit transaction, so each statement goes out alone.
+        """
+
+        conn.commit()
+        conn.autocommit = True
+        try:
+            for statement in concurrent_migration_statements(text):
+                conn.execute(statement)
+        finally:
+            conn.autocommit = False
+
 
     def create_collector_token(
         self,
