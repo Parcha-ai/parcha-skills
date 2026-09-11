@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Recall Architecture Assessment</title>
+<style>
+:root{--bg:#f7f7f5;--fg:#14171c;--muted:#5b6470;--card:#fff;--line:#e2e4e8;--acc:#1f5fbf;--warn:#b7791f;--bad:#c53030;--ok:#1f8f4e}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--fg:#e6e6e6;--muted:#9aa4b2;--card:#171a21;--line:#262b35;--acc:#4c9be8}}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace}
+main{max-width:1040px;margin:0 auto;padding:32px 22px 70px}
+h1{font-size:22px;margin:0 0 4px}h2{font-size:16px;margin:34px 0 10px;border-bottom:1px solid var(--line);padding-bottom:6px}h3{font-size:14px;margin:20px 0 6px}
+.sub{color:var(--muted);font-size:12px}p{margin:8px 0}
+table{border-collapse:collapse;width:100%;font-size:12.5px;margin:8px 0}th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-weight:500}td.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.box{background:var(--card);border:1px solid var(--line);padding:12px 14px;margin:10px 0}
+.tag{display:inline-block;padding:0 6px;font-size:11px;color:#fff;background:var(--acc)}.tag.w{background:var(--warn)}.tag.b{background:var(--bad)}.tag.g{background:var(--ok)}
+ul{margin:6px 0 6px 18px;padding:0}li{margin:3px 0}code{font-size:12px;background:var(--card);border:1px solid var(--line);padding:0 4px}
+svg{max-width:100%}
+.src{font-size:11.5px;color:var(--muted)}
+</style></head><body><main>
+<h1>Recall Architecture Assessment</h1>
+<div class="sub">2026-09-11 · for Miguel · what the company brain is today, what the 2026 state of the art says, and what to do to scale it. Provenance: systems card runs 2026-09-09..11, PlanetScale insights and EXPLAIN ANALYZE 2026-09-10, code inventory of <code>recall/</code> at a23fd3c, four research briefings with URLs cited inline. Content-free: no transcript text, receipts, or credentials.</div>
+
+<h2>1. The one-paragraph verdict</h2>
+<div class="box">Recall is a <b>write-dominated system built like a read-heavy one</b>. In the last 24 hours the MCP served about 50 tool calls while the collectors wrote about 1,100 objects. Each ingested record ends up as text in <b>seven places</b> and vectors in four, six of them inside a managed Postgres whose buffer cache cannot hold its own derived indexes. Every change to a live session re-projects the whole session, so the database rewrites ~150k passages a day for ~320 documents, keeps its cache cold, and falls two days behind on freshness. Meanwhile the read path that already scales and that the literature now favors, <b>the agent running code over raw evidence in S3</b>, is the one Recall pioneered and under-invests in. The fix is not a bigger database. It is to make Postgres a catalog, move the search plane next to the evidence on object storage, project incrementally at turn granularity, and add a reranker and session recaps on top. Done in that order, each step is measurable with the systems card and none needs a rewrite.</div>
+
+<h2>2. Where we are</h2>
+<h3>2.1 Workload</h3>
+<table><tr><th>fact</th><th class="n">value</th><th>source</th></tr>
+<tr><td>people ingesting</td><td class="n">7</td><td>fleet admin, 14 sources: 7 Claude, 7 Codex, 1 Slack</td></tr>
+<tr><td>logical documents (sessions)</td><td class="n">15.9k</td><td>recall_scan documents dataset</td></tr>
+<tr><td>records</td><td class="n">7.8M, +1.1..1.9M / month</td><td>documents dataset by month</td></tr>
+<tr><td>passages</td><td class="n">369k, median 8k chars (~2k tokens)</td><td>passages dataset</td></tr>
+<tr><td>Postgres rows</td><td class="n">12M chunks, 11.7M events, 11.4M documents</td><td>pg_class estimates</td></tr>
+<tr><td>Postgres size</td><td class="n">108 GB; canonical_chunks 79 GB incl. 15 GB GIN</td><td>pg_total_relation_size</td></tr>
+<tr><td>reads vs writes, 24 h</td><td class="n">~50 MCP calls vs ~1,100 archive PUTs</td><td>Render proxy logs (sampled)</td></tr>
+<tr><td>projection throughput</td><td class="n">~320 docs / day, 150k passages rewritten, 8k embedded</td><td>worker cycle logs</td></tr>
+<tr><td>freshness</td><td class="n">newest passage 58 h old, 13 projections pending</td><td>systems card 2026-09-11</td></tr>
+<tr><td>database</td><td class="n">PlanetScale PS-160 (2 vCPU / 16 GB, 2 GB shared_buffers), $286 / mo</td><td>resized 2026-09-10 from PS-80</td></tr>
+<tr><td>search, warm / cold</td><td class="n">59 ms / ~2 s p50 server-side</td><td>same 8 queries twice, 2026-09-11 01:05</td></tr>
+</table>
+
+<h3>2.2 Data model: seven copies of every record</h3>
+<svg viewBox="0 0 980 300" role="img" aria-label="Data copies diagram">
+<style>.b{fill:var(--card);stroke:var(--line)}.t{font:12px 'JetBrains Mono',monospace;fill:var(--fg)}.m{font:11px 'JetBrains Mono',monospace;fill:var(--muted)}.a{stroke:var(--muted);stroke-width:1.2;fill:none;marker-end:url(#ar)}</style>
+<defs><marker id="ar" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--muted)"/></marker></defs>
+<rect class="b" x="10" y="120" width="130" height="60"/><text class="t" x="20" y="145">collector</text><text class="m" x="20" y="162">JSONL sessions</text>
+<rect class="b" x="200" y="20" width="200" height="56"/><text class="t" x="210" y="42">1 S3 raw object</text><text class="m" x="210" y="60">authority, content-addressed</text>
+<rect class="b" x="200" y="100" width="200" height="56"/><text class="t" x="210" y="122">2 canonical_events</text><text class="m" x="210" y="140">jsonb body (thinnable)</text>
+<rect class="b" x="200" y="180" width="200" height="56"/><text class="t" x="210" y="202">3 canonical_documents</text><text class="m" x="210" y="220">text_redacted</text>
+<rect class="b" x="200" y="240" width="200" height="56"/><text class="t" x="210" y="262">4 canonical_chunks</text><text class="m" x="210" y="280">text + tsvector · 79 GB</text>
+<rect class="b" x="480" y="60" width="210" height="56"/><text class="t" x="490" y="82">5 evidence parts (S3)</text><text class="m" x="490" y="100">JSONL, what exec reads</text>
+<rect class="b" x="480" y="140" width="210" height="56"/><text class="t" x="490" y="162">6 canonical_passages</text><text class="m" x="490" y="180">text + tsvector + receipts</text>
+<rect class="b" x="480" y="220" width="210" height="56"/><text class="t" x="490" y="242">7 parquet passages (S3)</text><text class="m" x="490" y="260">what scan reads</text>
+<rect class="b" x="770" y="100" width="200" height="56"/><text class="t" x="780" y="122">vectors ×4</text><text class="m" x="780" y="140">chunk, passage, repr, legacy</text>
+<path class="a" d="M140,150 L200,48"/><path class="a" d="M140,150 L200,128"/><path class="a" d="M140,150 L200,208"/><path class="a" d="M140,150 L200,268"/>
+<path class="a" d="M400,268 L480,88"/><path class="a" d="M690,88 L690,140" /><path class="a" d="M690,196 L690,220"/><path class="a" d="M690,168 L770,128"/>
+</svg>
+<p>Full text lives in the S3 raw object, <code>canonical_events.canonical_redacted</code>, <code>canonical_documents.text_redacted</code>, <code>canonical_chunks.text_redacted</code> plus its generated tsvector, the evidence JSONL parts, <code>canonical_passages.text_redacted</code> plus its tsvector, and the Parquet passages dataset. Vectors live in chunk, passage, representation, and legacy tables. Only the S3 parts and the passages are on the paths that matter. The legacy plane is still written for Slack webhooks and read by the <code>/v1</code> routes.</p>
+
+<h3>2.3 Flows: full replacement on every change</h3>
+<ul>
+<li><b>Per record</b>: one S3 PUT, one canonical transaction that inserts the event, flips the previous document to not-current, inserts the document and N chunks, writes an audit row, and upserts tenant, principal, source and grant rows (four identity writes per request, one of them an unconditional UPDATE).</li>
+<li><b>Per session change</b>: the logical-evidence projector rebuilds every JSONL part; the passage projector <b>deletes all passages of the document and re-copies them</b>, re-attaching embeddings by content hash; the Parquet projector <b>rebuilds all four datasets for the whole source-month</b>. A growing Codex session with 500 passages does this every collector cycle it changes.</li>
+<li><b>Per MCP call</b>: one authorization audit row on its own connection before any read.</li>
+<li><b>Reads</b>: <code>search</code> uses passages GIN and HNSW plus a chunk-liveness join; <code>show</code>, <code>session_context</code>, and <code>related</code> read the 79 GB chunk table directly; <code>exec</code> and <code>scan</code> read S3 through Archil and touch Postgres only for the catalog.</li>
+</ul>
+
+<h3>2.4 What the latency hill proved (2026-09-10)</h3>
+<table><tr><th>metric</th><th class="n">Sep 9</th><th class="n">software only</th><th class="n">+ PS-160 warm</th></tr>
+<tr><td>server p95</td><td class="n">20.0 s</td><td class="n">9.1 s</td><td class="n">0.24 s</td></tr>
+<tr><td>deadline exceeded</td><td class="n">62.5%</td><td class="n">0%</td><td class="n">0%</td></tr>
+<tr><td>recall@20 / MRR (validation)</td><td class="n">0.54 / 0.23</td><td class="n">0.54 / 0.35</td><td class="n">0.54 / 0.35</td></tr>
+</table>
+<p>Software removed the pathological cost (liveness joins inside index scans, a sparse arm ranking millions of chunks for prose, ts_rank over TOASTed vectors). Memory removed the rest while warm. The cache goes cold within minutes because the projection churn streams through it. That is the structural problem; everything below follows from it.</p>
+
+<h2>3. What the state of the art says (2025-26)</h2>
+<table><tr><th>finding</th><th>evidence</th><th>implication for Recall</th></tr>
+<tr><td>Agent with code over raw trajectory files beats the best RAG pipeline on agent-trajectory memory</td><td>LongMemEval-V2: 72.5% vs 48.5% (<a href="https://arxiv.org/pdf/2605.12493">2605.12493</a>); Letta filesystem agent 74.0% vs Mem0 68.5% (<a href="https://www.letta.com/blog/benchmarking-ai-agent-memory/">Letta</a>)</td><td>Our caller-as-agent + <code>exec</code>/<code>scan</code> design is the right bet. Invest there.</td></tr>
+<tr><td>Hybrid + reranker is the largest measured retrieval gain</td><td>Recall@5 0.644 BM25 → 0.695 hybrid → 0.816 with rerank (<a href="https://arxiv.org/html/2604.01733v1">2604.01733</a>); failure rate −67% (<a href="https://www.anthropic.com/news/contextual-retrieval">Anthropic</a>)</td><td>We have hybrid, no reranker, no contextual headers.</td></tr>
+<tr><td>Convex score fusion beats RRF once tuned on ~40 labeled queries</td><td><a href="https://dl.acm.org/doi/10.1145/3596512">TOIS</a></td><td>We use fixed RRF weights 0.15/0.30/0.55; the truth set can tune α.</td></tr>
+<tr><td>Index turns, keep verbatim text; extracted facts only as extra keys</td><td>Round-level +9.4% recall (<a href="https://arxiv.org/html/2410.10813">LongMemEval</a>); artifacts-instead-of-verbatim −16..−22 pts (<a href="https://arxiv.org/abs/2601.00821">2601.00821</a>)</td><td>Our 1024-token passages are close; make the unit the turn, stable across appends.</td></tr>
+<tr><td>Learned sparse helps identifiers only with code-tuned models; BM25 with identifier-preserving tokenizer still wins on IDs/paths</td><td><a href="https://arxiv.org/abs/2603.22008">SPLADE-Code</a></td><td>Keep an exact arm; make it cheap (it currently scans 79 GB).</td></tr>
+<tr><td>tsvector GIN cannot rank from the index; real BM25 needs pg_search / RUM / an external engine, none on PlanetScale</td><td><a href="https://www.paradedb.com/blog/introducing-search">ParadeDB</a>, <a href="https://neon.com/docs/extensions/pg_search">Neon</a></td><td>Lexical ranking will stay IO-bound on Postgres.</td></tr>
+<tr><td>Object-storage-native search fits "S3 authority, derived index": Lance (vector + FTS + SQL, DuckDB-readable), turbopuffer (managed, namespace per tenant)</td><td><a href="https://duckdb.org/2026/05/21/test-driving-lance">DuckDB</a>, <a href="https://turbopuffer.com/docs/architecture">turbopuffer</a></td><td>Lance drops into the Archil/DuckDB sandbox we already run.</td></tr>
+<tr><td>pgvectorscale and pg_prewarm are available on PlanetScale; VectorChord and pg_search are not</td><td><a href="https://planetscale.com/changelog/postgres-extension-vectorscale">PlanetScale</a></td><td>Ceiling of the stay-on-Postgres path is known.</td></tr>
+<tr><td>Per-session recaps and dated decision facts pay off; full knowledge graphs do not for single-entity, time-filtered questions</td><td>GraphRAG-Bench (<a href="https://arxiv.org/html/2506.05690">2506.05690</a>), Claude Code session memory</td><td>Add recaps and decisions as indexed supplements. Skip GraphRAG.</td></tr>
+<tr><td>Embedding market: voyage-4 family shares one space across sizes; voyage-code-4 targets agentic code queries; OpenAI v3 unchanged since 2024</td><td><a href="https://blog.voyageai.com/2026/01/15/voyage-4/">Voyage</a></td><td>Stay on voyage-4 for now; evaluate code-4 with the card.</td></tr>
+</table>
+
+<h2>4. Target architecture</h2>
+<svg viewBox="0 0 980 330" role="img" aria-label="Target architecture">
+<style>.b2{fill:var(--card);stroke:var(--acc);stroke-width:1.2}.h{font:12px 'JetBrains Mono',monospace;fill:var(--fg);font-weight:600}</style>
+<rect class="b2" x="10" y="20" width="230" height="290"/><text class="h" x="22" y="42">Postgres = control plane</text>
+<text class="m" x="22" y="64">tenants, principals, grants</text><text class="m" x="22" y="82">actors and identities</text><text class="m" x="22" y="100">document catalog: ids, times,</text><text class="m" x="22" y="116">actors, revision, S3 pointers</text><text class="m" x="22" y="134">receipt → object map</text><text class="m" x="22" y="152">queues, outbox, tombstones</text><text class="m" x="22" y="170">audit (sampled)</text>
+<text class="m" x="22" y="200">no bodies · no tsvectors ·</text><text class="m" x="22" y="216">no vectors · &lt; 10 GB</text><text class="m" x="22" y="246">PS-80 or Metal is enough</text>
+<rect class="b2" x="280" y="20" width="400" height="290"/><text class="h" x="292" y="42">S3 = evidence + search plane</text>
+<text class="m" x="292" y="64">raw objects (authority, as today)</text><text class="m" x="292" y="82">evidence JSONL parts (as today)</text>
+<text class="m" x="292" y="112">Lance datasets per workspace-month:</text><text class="m" x="292" y="130">turns: text, receipts, actors, times,</text><text class="m" x="292" y="146">session_goal header, recap_id</text><text class="m" x="292" y="164">vector index (halfvec 512) + BM25 FTS</text><text class="m" x="292" y="182">append fragments, optimize every 10 min,</text><text class="m" x="292" y="198">compact nightly, content-hash reuse</text>
+<text class="m" x="292" y="228">recaps dataset: per session, dated</text><text class="m" x="292" y="246">decisions dataset: dated, source-linked,</text><text class="m" x="292" y="262">superseded_by</text>
+<text class="m" x="292" y="292">Parquet records stay for exec/scan</text>
+<rect class="b2" x="720" y="20" width="250" height="290"/><text class="h" x="732" y="42">MCP = agent tool surface</text>
+<text class="m" x="732" y="64">search: hybrid BM25+dense over Lance,</text><text class="m" x="732" y="80">convex fusion, rerank 50→20,</text><text class="m" x="732" y="96">time/actor as catalog filters</text>
+<text class="m" x="732" y="126">open / session_context: S3 parts</text><text class="m" x="732" y="156">exec / scan: DuckDB + LanceDB in</text><text class="m" x="732" y="172">the Archil sandbox (code mode)</text>
+<text class="m" x="732" y="202">recap / decisions: first-class tools</text>
+<text class="m" x="732" y="232">receipts verified against catalog</text>
+<text class="m" x="732" y="262">ingest API split from MCP service</text>
+</svg>
+
+<h3>4.1 Principles</h3>
+<ul>
+<li><b>One authority, derived indexes.</b> S3 raw objects and evidence parts are the truth. Everything else is a projection that can be rebuilt from them, cheaply, incrementally.</li>
+<li><b>Postgres is a catalog.</b> It answers "which documents, whose, when, where are they" in milliseconds and stays small enough to live in cache on a modest tier. It stops holding text, tsvectors, and vectors.</li>
+<li><b>The unit is the turn.</b> A user message with its assistant reply and tool calls, with a stable id. Growing sessions append turns; nothing already indexed is rewritten. Embedding cost scales with new content only.</li>
+<li><b>Search lives next to the evidence.</b> Lance datasets on S3 give vector plus BM25 plus SQL in one format that DuckDB already reads, so <code>search</code> and <code>scan</code> query the same files and code mode gets the index for free. turbopuffer is the managed fallback with the same outbox.</li>
+<li><b>The agent is the retriever.</b> Search returns compact candidates with receipts; open and exec do the reading; recaps and decisions give it a short path for the common questions. Budget for the tokens; that spend is what makes it good.</li>
+<li><b>Everything gated by the card.</b> No change ships without a before and after on latency, recall, freshness, and cost.</li>
+</ul>
+
+<h3>4.2 Scaling story</h3>
+<table><tr><th></th><th class="n">today, 7 seats</th><th class="n">50 seats</th><th class="n">500 seats</th></tr>
+<tr><td>records / year</td><td class="n">~25M</td><td class="n">~180M</td><td class="n">~1.8B</td></tr>
+<tr><td>turns indexed / year</td><td class="n">~0.7M</td><td class="n">~5M</td><td class="n">~50M</td></tr>
+<tr><td>vectors, halfvec 512</td><td class="n">0.7 GB</td><td class="n">5 GB</td><td class="n">50 GB</td></tr>
+<tr><td>Postgres catalog</td><td class="n">&lt; 5 GB</td><td class="n">~20 GB</td><td class="n">~200 GB, partitioned by workspace</td></tr>
+<tr><td>S3 evidence + Lance</td><td class="n">~150 GB</td><td class="n">~1 TB</td><td class="n">~10 TB, $230 / mo at rest</td></tr>
+<tr><td>embedding spend, new content only</td><td class="n">free tier</td><td class="n">~$50 / mo</td><td class="n">~$500 / mo</td></tr>
+<tr><td>what breaks first</td><td class="n">churn, cache</td><td class="n">single-month Lance datasets get big: shard by workspace</td><td class="n">per-workspace namespaces; cold-start pinning for hot ones</td></tr>
+</table>
+<p class="src">Assumptions: ~250k records and ~3k turns per seat per month at current usage; embedding ~2k tokens per turn at $0.06/M; S3 at $0.023/GB. Postgres today is 108 GB because it holds six derived copies; as a catalog it is an order of magnitude smaller. The current design cannot reach 500 seats on any Postgres tier: 1.8B canonical_chunks rows with a global GIN is not a thing.</p>
+
+<h2>5. The plan, as hills</h2>
+<table><tr><th>hill</th><th>what</th><th>why first</th><th>gate on the card</th><th>size</th></tr>
+<tr><td><span class="tag b">H1</span> Stop the churn</td><td>Append-only turn projection with stable ids and content-hash reuse; debounce hot sessions 60-120 s; Parquet rebuild per document-month delta instead of whole month; drop the four per-request identity writes to a cached check; sample authorization audit; REINDEX the passage GIN; retire legacy plane writes and <code>canonical_evidence_objects</code>; thin chunk and document bodies (the code exists, <code>thin_canonical_bodies</code>).</td><td>It is the root of latency, freshness, the $800 embedding bill, and the 79 GB. Everything else inherits the churn if this is not first.</td><td>passages rewritten / day &lt; 20k; projection_pending 0; newest age &lt; 15 min; Postgres &lt; 40 GB; cold search p50 &lt; 1 s</td><td>2-3 weeks</td></tr>
+<tr><td><span class="tag w">H2</span> Retrieval quality</td><td>Contextual header per turn (session goal, repo, date, actors) before embedding; convex fusion with α tuned on the truth set; reranker 50→20 (voyage rerank-2.5 or Cohere 4; self-host bge later); raise <code>recall_search</code> limit to 50; make the exact arm read passages, not chunks; expose time/actor filters as catalog queries.</td><td>Largest measured gains in the literature; our recall@20 is 0.54 and every miss is a wasted agent turn.</td><td>recall@20 ≥ 0.75, MRR ≥ 0.5 on validation; test split untouched until the end; warm p95 &lt; 1 s</td><td>2 weeks</td></tr>
+<tr><td><span class="tag">H3</span> Search plane to S3</td><td>Lance datasets per workspace-month from the same outbox; vector + FTS indexes built by the worker; <code>search</code> and <code>scan</code> read Lance in the sandbox; <code>show</code> and <code>session_context</code> read S3 parts; Postgres shrinks to the catalog; PlanetScale back to a small tier or Metal. turbopuffer if owning compaction turns out to hurt.</td><td>Removes the last reason the database needs memory; makes 100× a storage bill, not an architecture change.</td><td>same accuracy gates; Postgres &lt; 10 GB; cold search p95 &lt; 2 s; cost per seat down</td><td>4-6 weeks</td></tr>
+<tr><td><span class="tag g">H4</span> Memory layer</td><td>Per-session recap at session close (what, why, outcome, files, actors, time) indexed with the turns; dated decision facts with <code>superseded_by</code>, extracted by a cheap model, verbatim text stays primary; recap and decisions as MCP tools; canonical person table already exists, wire Slack and git identities into it.</td><td>The questions people actually ask ("what did we decide", "who worked on", "how did we fix") get a short path with receipts; it is what Claude Code and Letta converged on.</td><td>new truth strata for those question types; answer-quality judge on validation; no regression on raw recall</td><td>3 weeks</td></tr>
+<tr><td><span class="tag">H5</span> Operate it</td><td>Split ingest API from MCP; workers sized independently; nightly card with Slack summary via tether; embedding-lag and daily-embed-cap probes; SLOs: warm search p95 1 s, freshness 15 min, zero leaks, cost per active seat.</td><td>Three outages this month were operational, not algorithmic.</td><td>card green for 14 days</td><td>ongoing</td></tr>
+</table>
+
+<h2>6. What not to do</h2>
+<ul>
+<li>Do not buy PS-320 to hide the churn. It works until the next 10×.</li>
+<li>Do not build a knowledge graph over everything. Our questions are single-entity with a time filter; recaps and dated facts cover them at 1% of the cost.</li>
+<li>Do not replace verbatim text with extracted summaries anywhere in the index. Supplement only.</li>
+<li>Do not bring back a server-side retrieval agent. The caller is the agent; give it better tools and receipts.</li>
+<li>Do not switch embedding models during H1-H3. Re-embedding the corpus is the exact storm that cost $800; do it once, after the turn projection exists, with the card as the ruler.</li>
+</ul>
+
+<h2>7. What makes it dope</h2>
+<p>Nobody else has a company's entire agent history, Slack, and docs as one corpus with receipts, people, and time, queryable by the agents themselves in code. The 2026 evidence says that is the winning shape. The work above is not a pivot; it is removing the six copies, the rewrite-everything projector, and the database-as-index habit that keep it from behaving like what it already is.</p>
+
+<p class="src">Related: systems card <a href="https://docs.greppy3.parcha.dev/2026-09-09-recall-systems-card.html">2026-09-09</a>; latency hill plan in <code>~/worktrees/recall-search-latency-20260910/.cascade/recall-search-latency.md</code>; research briefings and the schema inventory are in this session's task outputs and will move into <code>recall/docs/</code> with the H1 PR.</p>
+</main></body></html>
