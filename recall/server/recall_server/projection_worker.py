@@ -66,6 +66,8 @@ def run_projection_worker(
     once: bool = False,
     sleep: Callable[[float], Any] = time.sleep,
     body_thinner: Callable[[], dict[str, Any]] | None = None,
+    quiet_seconds: float = 0.0,
+    max_wait_seconds: float = 0.0,
 ) -> dict[str, int | str]:
     """Service every projection stage without upstream backfill starvation."""
 
@@ -109,6 +111,8 @@ def run_projection_worker(
             batch_size=logical_batch_size,
             max_batches=max_batches_per_cycle,
             upload_concurrency=upload_concurrency,
+            quiet_seconds=quiet_seconds,
+            max_wait_seconds=max_wait_seconds,
         )
         # Parquet shards are source/month materializations of the authoritative
         # logical documents. During a large retrofit, every logical batch can
@@ -168,6 +172,7 @@ def run_projection_worker(
             "documents": int(documents["documents"]),
             "logical_repaired": int(documents.get("repaired", 0)),
             "logical_pending": int(documents.get("pending", 0)),
+            "logical_waiting": int(documents.get("waiting", 0)),
             "records": int(documents["records"]),
             "passage_documents": int(projected["documents"]),
             "passage_pending": int(projected.get("pending", 0)),
@@ -195,7 +200,7 @@ def run_projection_worker(
         record_cycle(result)
         LOG.info(
             "projection cycle status=%s documents=%s logical_repaired=%s "
-            "logical_pending=%s records=%s "
+            "logical_pending=%s logical_waiting=%s records=%s "
             "passage_documents=%s passage_pending=%s "
             "passage_requeued=%s passage_unavailable=%s "
             "passages=%s embedded=%s "
@@ -214,6 +219,7 @@ def run_projection_worker(
                     "documents",
                     "logical_repaired",
                     "logical_pending",
+                    "logical_waiting",
                     "records",
                     "passage_documents",
                     "passage_pending",
