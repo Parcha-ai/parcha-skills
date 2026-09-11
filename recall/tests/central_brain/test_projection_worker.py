@@ -22,10 +22,12 @@ class _Logical:
         self.pruned = pruned
         self.cleanup_failures = cleanup_failures
 
-    def project_pending(self, **_kwargs):
+    def project_pending(self, **kwargs):
         self.calls.append("logical")
+        self.kwargs = kwargs
         return {
             "status": "complete" if self.pending == 0 else "pending",
+            "waiting": kwargs.get("quiet_seconds", 0) and 7 or 0,
             "documents": self.work,
             "repaired": 0,
             "records": self.work * 3,
@@ -409,3 +411,29 @@ class ProjectionWorkerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DebounceTests(unittest.TestCase):
+    def test_worker_passes_quiet_budget_and_reports_waiting_groups(self):
+        calls: list[str] = []
+        logical = _Logical(calls, work=0)
+        result = run_projection_worker(
+            logical,  # type: ignore[arg-type]
+            _Passages(calls, work=0),  # type: ignore[arg-type]
+            tenant_id="tenant:company:test",
+            logical_batch_size=1,
+            passage_batch_size=2,
+            embedding_batch_size=2,
+            max_batches_per_cycle=1,
+            upload_concurrency=1,
+            passage_concurrency=1,
+            interval_seconds=30,
+            once=True,
+            quiet_seconds=90,
+            max_wait_seconds=600,
+        )
+        self.assertEqual(logical.kwargs["quiet_seconds"], 90)
+        self.assertEqual(logical.kwargs["max_wait_seconds"], 600)
+        self.assertEqual(result["logical_waiting"], 7)
+        # waiting groups are not pending work: the cycle is still complete
+        self.assertEqual(result["status"], "complete")

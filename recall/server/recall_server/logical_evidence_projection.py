@@ -399,7 +399,15 @@ class CanonicalLogicalEvidenceProjector:
         *,
         tenant_id: str | None,
         limit: int,
+        quiet_seconds: float = 0.0,
+        max_wait_seconds: float = 0.0,
     ) -> list[LogicalGroupCandidate]:
+        """Queued groups ready to project.
+
+        With a quiet period, a group is ready only once it has not changed for
+        `quiet_seconds`, or has been waiting longer than `max_wait_seconds`
+        since it first entered the queue. Forget and backfill never wait.
+        """
         with self.store.connect() as connection:
             rows = connection.execute(
                 """SELECT queue.tenant_id,queue.source_id,
@@ -430,10 +438,26 @@ class CanonicalLogicalEvidenceProjector:
                                  AND part.revision=evidence.revision
                      ) evidence_size ON true
                     WHERE (%s::text IS NULL OR queue.tenant_id=%s)
+                      AND (
+                          %s::float8<=0
+                          OR queue.reason IN ('forget','backfill')
+                          OR queue.changed_at
+                             < clock_timestamp()-%s*interval '1 second'
+                          OR (
+                              %s::float8>0
+                              AND queue.first_queued_at
+                                  < clock_timestamp()-%s*interval '1 second'
+                          )
+                      )
                     ORDER BY queue.changed_at,queue.tenant_id,
                              queue.source_id,queue.native_parent_id
                     LIMIT %s""",
-                (tenant_id, tenant_id, limit),
+                (
+                    tenant_id, tenant_id,
+                    quiet_seconds, quiet_seconds,
+                    max_wait_seconds, max_wait_seconds,
+                    limit,
+                ),
             ).fetchall()
         return [
             LogicalGroupCandidate(
@@ -1489,7 +1513,19 @@ class CanonicalLogicalEvidenceProjector:
         batch_size: int = 25,
         max_batches: int = 10,
         upload_concurrency: int = 2,
+        quiet_seconds: float = 0.0,
+        max_wait_seconds: float = 0.0,
     ) -> dict[str, int | str]:
+        if (
+            isinstance(quiet_seconds, bool)
+            or not isinstance(quiet_seconds, (int, float))
+            or not 0 <= quiet_seconds <= 3_600
+            or isinstance(max_wait_seconds, bool)
+            or not isinstance(max_wait_seconds, (int, float))
+            or not 0 <= max_wait_seconds <= 86_400
+            or (max_wait_seconds and max_wait_seconds < quiet_seconds)
+        ):
+            raise LogicalEvidenceError("logical_evidence_budget_invalid")
         if (
             isinstance(batch_size, bool)
             or not isinstance(batch_size, int)
@@ -1527,7 +1563,12 @@ class CanonicalLogicalEvidenceProjector:
         cleanup_completed += int(cleanup["completed"])
         cleanup_pending = int(cleanup["pending"])
         for _ in range(max_batches):
-            candidates = self._pending(tenant_id=tenant_id, limit=batch_size)
+            candidates = self._pending(
+                tenant_id=tenant_id,
+                limit=batch_size,
+                quiet_seconds=float(quiet_seconds),
+                max_wait_seconds=float(max_wait_seconds),
+            )
             if not candidates:
                 break
             worker_count = min(upload_concurrency, len(candidates))
@@ -1670,12 +1711,29 @@ class CanonicalLogicalEvidenceProjector:
             cleanup_completed += int(cleanup["completed"])
             cleanup_pending = int(cleanup["pending"])
         with self.store.connect() as connection:
-            pending = connection.execute(
-                """SELECT count(*) AS count
+            counts = connection.execute(
+                """SELECT count(*) AS queued,
+                          count(*) FILTER (
+                              WHERE %s::float8>0
+                                AND reason NOT IN ('forget','backfill')
+                                AND changed_at
+                                    >= clock_timestamp()-%s*interval '1 second'
+                                AND NOT (
+                                    %s::float8>0
+                                    AND first_queued_at
+                                        < clock_timestamp()-%s*interval '1 second'
+                                )
+                          ) AS waiting
                      FROM canonical_evidence_document_queue
                     WHERE (%s::text IS NULL OR tenant_id=%s)""",
-                (tenant_id, tenant_id),
-            ).fetchone()["count"]
+                (
+                    float(quiet_seconds), float(quiet_seconds),
+                    float(max_wait_seconds), float(max_wait_seconds),
+                    tenant_id, tenant_id,
+                ),
+            ).fetchone()
+        waiting = int(counts["waiting"])
+        pending = int(counts["queued"]) - waiting
         return {
             "status": "complete" if int(pending) == 0 else "pending",
             "documents": documents,
@@ -1690,6 +1748,7 @@ class CanonicalLogicalEvidenceProjector:
             "cleanup_failures": cleanup_failures,
             "cleanup_pending": cleanup_pending,
             "pending": int(pending),
+            "waiting": waiting,
             "source_races": source_races,
             "pruned": pruned,
         }

@@ -1701,6 +1701,14 @@ def main() -> None:
     projection_worker.add_argument("--passage-concurrency", type=int, default=4)
     projection_worker.add_argument("--cursor-fetch-rows", type=int, default=10_000)
     projection_worker.add_argument("--interval-seconds", type=float, default=5)
+    projection_worker.add_argument(
+        "--quiet-seconds", type=float, default=0.0,
+        help="project a changed session only after it has been quiet this long",
+    )
+    projection_worker.add_argument(
+        "--max-wait-seconds", type=float, default=0.0,
+        help="project regardless once a session has waited this long since first queued",
+    )
     projection_worker.add_argument("--once", action="store_true")
     sub.add_parser("export")
     conformance = sub.add_parser("mcp-conformance")
@@ -2298,6 +2306,8 @@ def main() -> None:
                     passage_concurrency=args.passage_concurrency,
                     interval_seconds=args.interval_seconds,
                     once=args.once,
+                    quiet_seconds=args.quiet_seconds,
+                    max_wait_seconds=args.max_wait_seconds,
                     body_thinner=lambda: thin_canonical_bodies(
                         store,
                         tenant_id=args.tenant,

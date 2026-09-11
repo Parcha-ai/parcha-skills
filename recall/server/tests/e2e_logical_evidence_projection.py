@@ -425,6 +425,20 @@ def main() -> None:
                 native_ids=[f"claude-record-{nonce}-3"],
                 reason="ingest",
             )
+        # Debounce: a group that changed seconds ago waits out the quiet
+        # period and is reported as waiting, not pending.
+        debounced = projector.project_pending(
+            tenant_id=tenant,
+            batch_size=10,
+            max_batches=1,
+            upload_concurrency=2,
+            quiet_seconds=300,
+            max_wait_seconds=3_600,
+        )
+        assert debounced["documents"] == 0, debounced
+        assert debounced["waiting"] == 1, debounced
+        assert debounced["pending"] == 0, debounced
+        assert debounced["status"] == "complete", debounced
         archive.failures_remaining = 1
         revised = projector.project_pending(
             tenant_id=tenant,
@@ -607,6 +621,26 @@ def main() -> None:
         "receipt_documents": 2,
         "receipts": 7,
     }
+    # Forget never waits for a quiet period.
+    with store.connect() as connection:
+        mark_logical_evidence_dirty(
+            connection,
+            tenant_id=tenant,
+            source_id=claude,
+            native_ids=[f"claude-record-{nonce}-3"],
+            reason="forget",
+        )
+    forgotten = projector.project_pending(
+        tenant_id=tenant,
+        batch_size=10,
+        max_batches=1,
+        upload_concurrency=1,
+        quiet_seconds=300,
+        max_wait_seconds=3_600,
+    )
+    assert forgotten["documents"] == 1, forgotten
+    assert forgotten["waiting"] == 0, forgotten
+
     print(
         json.dumps(
             {

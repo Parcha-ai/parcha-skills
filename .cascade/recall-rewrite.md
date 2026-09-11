@@ -3,16 +3,19 @@
 _Living plan. Status legend: todo / doing / done / blocked. Evidence = PR + card history row timestamp._
 
 ## Status board
+
+_Ops note 2026-09-11: root disk hit 100% on greppy3 during H0 (agents used TMPDIR=scratchpad); cleanup recorded below._
 | task | status | owner | evidence |
 |---|---|---|---|
-| H0-0 plan + briefings committed | doing | lead | |
-| H0-1 churn probe | doing | agent churn | |
-| H0-2 forget-latency probe | doing | agent forget | |
-| H0-3 storage cost probe | doing | agent storage | |
-| H0-4 shadow-projection tool | todo | | |
-| H0-5 ship_and_measure in repo | doing | lead | |
-| H0-6 nightly card + Slack | todo | | |
-| H1 T1..T7 | todo | | |
+| H0-0 plan + briefings committed | done | lead | PR #489 merged (eef1216) |
+| H0-1 churn probe | review | agent churn | PR #492 (schema 058 churn indexes; 1092 unit OK) |
+| H0-2 forget-latency probe | review | agent forget | PR #490 (31 card tests; live run pending behind --forget-probe) |
+| H0-3 storage cost probe | review | agent storage | PR #491 (rebase after #492: db.py/app.py metrics blocks) |
+| H0-4 shadow-projection tool | folded into H1-T3 (`passage-shadow-diff`) | lead | |
+| H0-5 ship_and_measure in repo | done | lead | recall/scripts/ship_and_measure.sh in #489 |
+| H0-6 nightly card + Slack | done (dry run) | lead | ~/bin/recall-nightly-card.sh, cron 06:00 UTC; dry run 2026-09-11 05:43 wrote the docs page; first Slack post at the next run |
+| H1-T1 debounce | doing | lead | branch feat/recall-h1-t1-debounce-20260911; migration renumbered 059 after #492 |
+| H1 T2..T7 | todo | | |
 | H2 a..e | todo | | |
 | H3 a..f | todo | | |
 | H4 1..4 | todo | | |
