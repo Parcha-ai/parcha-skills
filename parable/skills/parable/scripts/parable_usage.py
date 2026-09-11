@@ -105,20 +105,60 @@ def _duration_label(seconds, fallback: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# CLIProxyAPI-stored credentials
+#
+# `parable setup`'s subscription-only path delegates each vendor's native OAuth
+# into a loopback CLIProxyAPI, which writes one <vendor>-<id>.json per connected
+# account with a flat `access_token`. In that setup the vendors' own CLI
+# credential files are never created, so a probe that only knows the native path
+# reports `unknown` for a subscription that is in fact connected — and unknown
+# headroom routes as "has room".
+# ---------------------------------------------------------------------------
+
+def _cliproxy_auth_dir() -> Path:
+    return Path(os.environ.get(
+        "CLIPROXY_AUTH_DIR", str(Path.home() / ".cli-proxy-api"))).expanduser()
+
+
+def _cliproxy_token(prefix: str) -> str | None:
+    """`access_token` from the newest <prefix>-*.json CLIProxyAPI wrote.
+
+    Read-only, like every credential access in this module: it never mints,
+    refreshes, or writes a token.
+    """
+    try:
+        found = sorted(_cliproxy_auth_dir().glob(f"{prefix}-*.json"),
+                       key=lambda f: f.stat().st_mtime, reverse=True)
+    except Exception:
+        return None
+    for path in found:
+        try:
+            token = json.loads(path.read_text()).get("access_token")
+        except Exception:
+            continue
+        if token:
+            return token
+    return None
+
+
+# ---------------------------------------------------------------------------
 # claude — Anthropic subscription (OAuth)
 # ---------------------------------------------------------------------------
 
 def probe_claude() -> dict:
     cred = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude"))) / ".credentials.json"
-    if not cred.is_file():
-        return _unknown("claude", f"no {cred}")
-    try:
-        oauth = json.loads(cred.read_text()).get("claudeAiOauth", {})
-        token = oauth.get("accessToken")
-    except Exception as e:
-        return _unknown("claude", f"unreadable credentials ({e})")
+    oauth: dict = {}
+    token = None
+    if cred.is_file():
+        try:
+            oauth = json.loads(cred.read_text()).get("claudeAiOauth", {}) or {}
+            token = oauth.get("accessToken")
+        except Exception as e:
+            return _unknown("claude", f"unreadable credentials ({e})")
     if not token:
-        return _unknown("claude", "no accessToken in credentials")
+        token = _cliproxy_token("claude")
+    if not token:
+        return _unknown("claude", f"no {cred} and no claude-*.json in {_cliproxy_auth_dir()}")
     try:
         body = _get_json(
             "https://api.anthropic.com/api/oauth/usage",
@@ -306,7 +346,128 @@ def probe_cursor(env_key: str = "CURSOR_API_KEY") -> dict:
                          "limit_usd": round(limit / 100, 2)}]}
 
 
-PROBES = {"claude": probe_claude, "codex": probe_codex, "cursor": probe_cursor}
+# ---------------------------------------------------------------------------
+# kimi — Kimi Code subscription (OAuth, via CLIProxyAPI's stored credential)
+# ---------------------------------------------------------------------------
+
+KIMI_USAGE_URL = "https://api.kimi.com/coding/v1/usages"
+
+
+def _kimi_token() -> str | None:
+    """Kimi's access token: an explicit override, else CLIProxyAPI's store.
+
+    Kimi Code has no native CLI credential path to fall back to — `parable auth
+    login` is the only writer — so the proxy store is the sole source.
+    """
+    explicit = os.environ.get("PARABLE_KIMI_CRED")
+    if explicit:
+        path = Path(explicit).expanduser()
+        if not path.is_file():
+            return None
+        try:
+            return json.loads(path.read_text()).get("access_token")
+        except Exception:
+            return None
+    return _cliproxy_token("kimi")
+
+
+def _kimi_pct(limit, remaining) -> float | None:
+    """used% from a limit/remaining pair; None when the shape is unusable."""
+    try:
+        limit, remaining = float(limit), float(remaining)
+    except (TypeError, ValueError):
+        return None
+    if limit <= 0:
+        return None
+    return round(max(0.0, min(100.0, (1.0 - remaining / limit) * 100.0)), 1)
+
+
+def _kimi_pair(entry: dict) -> float | None:
+    """limit/remaining may sit on the entry or one level down in a detail object."""
+    pct = _kimi_pct(entry.get("limit"), entry.get("remaining"))
+    if pct is not None:
+        return pct
+    for value in entry.values():
+        if isinstance(value, dict):
+            pct = _kimi_pct(value.get("limit"), value.get("remaining"))
+            if pct is not None:
+                return pct
+    return None
+
+
+def probe_kimi() -> dict:
+    token = _kimi_token()
+    if not token:
+        return _unknown("kimi", f"no kimi-*.json in {_cliproxy_auth_dir()}")
+    try:
+        body = _get_json(KIMI_USAGE_URL,
+                         {"Authorization": f"Bearer {token}",
+                          "Accept": "application/json",
+                          "User-Agent": "parable-usage/1"})
+    except urllib.error.HTTPError as e:
+        # Kimi access tokens are short-lived and CLIProxyAPI refreshes them as it
+        # proxies, persisting each new one to the auth dir. A 401 outside a running
+        # session just means nothing has refreshed the stored token lately — which is
+        # harmless, because the probe only informs routing while a session is live.
+        return _unknown("kimi", f"HTTP {e.code}" + (
+            " (stored token stale; refreshes once a parable session is running —"
+            " re-auth only if it persists)" if e.code == 401 else ""))
+    except Exception as e:
+        return _unknown("kimi", f"probe failed ({e})")
+
+    plan = None
+    user = body.get("user")
+    if isinstance(user, dict) and isinstance(user.get("membership"), dict):
+        plan = user["membership"].get("level")
+    return {"pool": "kimi", "status": "ok", "plan": plan,
+            "windows": kimi_windows(body), "billing": {}}
+
+
+def kimi_windows(body: dict) -> list[dict]:
+    """Normalize /usages into window dicts.
+
+    Kimi meters two things independently, and the tightest one governs routing:
+      * ``usage``    — the billing-cycle (weekly) quota
+      * ``limits[]`` — rolling rate windows; ``window.duration`` plus
+                       ``window.timeUnit`` give the cadence (duration=300 with
+                       TIME_UNIT_MINUTE is the 5-hour session window).
+
+    These field names come from Kimi's undocumented console endpoint, so every
+    read is defensive: an unparseable section is skipped, never fatal.
+    """
+    windows = []
+
+    overall = body.get("usage")
+    if isinstance(overall, dict):
+        pct = _kimi_pct(overall.get("limit"), overall.get("remaining"))
+        if pct is not None:
+            windows.append({"window": "cycle", "used_pct": pct,
+                            "resets_in_min": _mins_until(overall.get("resetTime")
+                                                         or overall.get("reset_time"))})
+
+    for entry in body.get("limits") or []:
+        if not isinstance(entry, dict):
+            continue
+        pct = _kimi_pair(entry)
+        if pct is None:
+            continue
+        win = entry.get("window") if isinstance(entry.get("window"), dict) else {}
+        try:
+            unit = str(win.get("timeUnit") or win.get("time_unit") or "").upper()
+            seconds = int(float(win.get("duration")) * (
+                60 if "MINUTE" in unit else
+                3600 if "HOUR" in unit else
+                86400 if "DAY" in unit else 1))
+        except (TypeError, ValueError):
+            seconds = None
+        windows.append({"window": _duration_label(seconds, "window"), "used_pct": pct,
+                        "resets_in_min": _mins_until(entry.get("resetTime")
+                                                     or entry.get("reset_time"))})
+    return windows
+
+
+PROBES = {"claude": probe_claude, "codex": probe_codex, "cursor": probe_cursor,
+          "kimi": probe_kimi}
 
 
 def _probe_one(name: str, cursor_env_key: str) -> dict:
