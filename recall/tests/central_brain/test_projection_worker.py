@@ -437,3 +437,179 @@ class DebounceTests(unittest.TestCase):
         self.assertEqual(result["logical_waiting"], 7)
         # waiting groups are not pending work: the cycle is still complete
         self.assertEqual(result["status"], "complete")
+
+
+
+class _FakeClock:
+    """Monotonic clock that only moves when a phase fake advances it."""
+
+    def __init__(self):
+        self.now = 100.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class _TimedLogical(_Logical):
+    clock: _FakeClock
+    seconds = 1.5
+    cleanup: dict[str, int] = {}
+
+    def project_pending(self, **kwargs):
+        self.clock.advance(self.seconds)
+        result = super().project_pending(**kwargs)
+        result.update(self.cleanup)
+        return result
+
+
+class _TimedPassages(_Passages):
+    clock: _FakeClock
+    embed_seconds = 0.2
+    project_seconds = 0.3
+
+    def embed_pending(self, **kwargs):
+        self.clock.advance(self.embed_seconds)
+        return super().embed_pending(**kwargs)
+
+    def project_pending(self, **kwargs):
+        self.clock.advance(self.project_seconds)
+        return super().project_pending(**kwargs)
+
+
+class _TimedScan(_Scan):
+    clock: _FakeClock
+    seconds = 0.05
+
+    def project_pending(self, **kwargs):
+        self.clock.advance(self.seconds)
+        return super().project_pending(**kwargs)
+
+
+ELAPSED_KEYS = (
+    "cycle_elapsed_ms",
+    "embed_elapsed_ms",
+    "passage_elapsed_ms",
+    "logical_elapsed_ms",
+    "parquet_elapsed_ms",
+    "thin_elapsed_ms",
+)
+
+
+class CycleTimingTests(unittest.TestCase):
+    def _run(
+        self,
+        clock: _FakeClock,
+        *,
+        cleanup: dict[str, int] | None = None,
+        scan: bool = True,
+        thinner: bool = True,
+        logical_seconds: float = 1.5,
+    ):
+        calls: list[str] = []
+        logical = _TimedLogical(calls, work=0)
+        logical.clock = clock
+        logical.seconds = logical_seconds
+        logical.cleanup = cleanup or {}
+        passages = _TimedPassages(calls, work=0)
+        passages.clock = clock
+        scanner = _TimedScan(calls, work=0)
+        scanner.clock = clock
+
+        def thin():
+            clock.advance(0.01)
+            return {
+                "status": "complete",
+                "documents": 3,
+                "refused": 0,
+                "document_bytes_removed": 30,
+                "event_bytes_replaced": 3,
+            }
+
+        return run_projection_worker(
+            logical,  # type: ignore[arg-type]
+            passages,  # type: ignore[arg-type]
+            scanner if scan else None,  # type: ignore[arg-type]
+            tenant_id="tenant:company:test",
+            logical_batch_size=25,
+            passage_batch_size=100,
+            embedding_batch_size=128,
+            max_batches_per_cycle=10,
+            upload_concurrency=2,
+            passage_concurrency=4,
+            interval_seconds=5,
+            once=True,
+            body_thinner=thin if thinner else None,
+            clock=clock,
+        )
+
+    def test_per_phase_elapsed_uses_the_injected_clock(self):
+        result = self._run(_FakeClock())
+
+        self.assertEqual(result["embed_elapsed_ms"], 200)
+        self.assertEqual(result["passage_elapsed_ms"], 300)
+        self.assertEqual(result["logical_elapsed_ms"], 1500)
+        self.assertEqual(result["parquet_elapsed_ms"], 50)
+        self.assertEqual(result["thin_elapsed_ms"], 10)
+        self.assertEqual(result["cycle_elapsed_ms"], 2060)
+        for key in ELAPSED_KEYS:
+            self.assertIsInstance(result[key], int)
+
+    def test_deferred_phases_still_report_zero_elapsed(self):
+        result = self._run(_FakeClock(), scan=False, thinner=False)
+
+        self.assertEqual(result["parquet_elapsed_ms"], 0)
+        self.assertEqual(result["thin_elapsed_ms"], 0)
+        self.assertEqual(result["cycle_elapsed_ms"], 2000)
+
+    def test_cycle_log_line_carries_timing_and_cleanup_fields(self):
+        cleanup = {
+            "old_objects_deleted": 4321,
+            "cleanup_completed": 12,
+            "cleanup_pending": 987,
+        }
+
+        with self.assertLogs("recall_server.projection_worker", level="INFO") as logs:
+            result = self._run(_FakeClock(), cleanup=cleanup)
+
+        line = next(m for m in logs.output if "projection cycle status=" in m)
+        for fragment in (
+            "cycle_elapsed_ms=2060",
+            "embed_elapsed_ms=200",
+            "passage_elapsed_ms=300",
+            "logical_elapsed_ms=1500",
+            "parquet_elapsed_ms=50",
+            "thin_elapsed_ms=10",
+            "old_objects_deleted=4321",
+            "logical_cleanup_completed=12",
+            "logical_cleanup_pending=987",
+        ):
+            self.assertIn(fragment, line)
+        self.assertEqual(result["old_objects_deleted"], 4321)
+        self.assertEqual(result["logical_cleanup_pending"], 987)
+        self.assertEqual(result["logical_cleanup_completed"], 12)
+
+    def test_record_cycle_accumulates_phase_totals(self):
+        from unittest import mock
+
+        from recall_server import projection_worker
+
+        with mock.patch.dict(
+            projection_worker.PROJECTION_TOTALS,
+            {key: 0 for key in projection_worker.PROJECTION_TOTALS},
+        ):
+            first = self._run(_FakeClock())
+            second = self._run(_FakeClock(), logical_seconds=0.5)
+            totals = projection_worker.projection_totals()
+
+        self.assertEqual(first["cycle_elapsed_ms"], 2060)
+        self.assertEqual(second["cycle_elapsed_ms"], 1060)
+        self.assertEqual(totals["cycle_elapsed_ms"], 3120)
+        self.assertEqual(totals["embed_elapsed_ms"], 400)
+        self.assertEqual(totals["passage_elapsed_ms"], 600)
+        self.assertEqual(totals["logical_elapsed_ms"], 2000)
+        self.assertEqual(totals["parquet_elapsed_ms"], 100)
+        self.assertEqual(totals["thin_elapsed_ms"], 20)
+        self.assertEqual(totals["bodies_thinned"], 6)

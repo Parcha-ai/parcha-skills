@@ -963,17 +963,22 @@ class HttpBoundaryContractTest(unittest.TestCase):
         self.assertIn("recall_passages_total 400000\n", body)
         self.assertIn("recall_projection_passages_written_total 77\n", body)
         self.assertIn("# TYPE recall_projection_bodies_thinned_total counter\n", body)
+        for phase in ("cycle", "embed", "passage", "logical", "parquet", "thin"):
+            self.assertIn(f"# TYPE recall_projection_{phase}_elapsed_ms_total counter\n", body)
         self.assertTrue(body.endswith("\n"))
 
     def test_projection_worker_accumulates_process_totals(self) -> None:
         from recall_server import projection_worker
 
         with mock.patch.dict(projection_worker.PROJECTION_TOTALS, {key: 0 for key in projection_worker.PROJECTION_TOTALS}):
-            projection_worker.record_cycle({"passages": 40, "passage_documents": 2, "embedded": 8, "parquet_rows": 100, "canonical_bodies_thinned": 1, "status": "pending"})
-            projection_worker.record_cycle({"passages": 2, "passage_documents": 1, "embedded": 0, "parquet_rows": 0, "canonical_bodies_thinned": 0})
+            projection_worker.record_cycle({"passages": 40, "passage_documents": 2, "embedded": 8, "parquet_rows": 100, "canonical_bodies_thinned": 1, "status": "pending", "cycle_elapsed_ms": 1500, "embed_elapsed_ms": 200, "logical_elapsed_ms": 1000})
+            projection_worker.record_cycle({"passages": 2, "passage_documents": 1, "embedded": 0, "parquet_rows": 0, "canonical_bodies_thinned": 0, "cycle_elapsed_ms": 500, "embed_elapsed_ms": 100, "thin_elapsed_ms": 50})
             self.assertEqual(
                 projection_worker.projection_totals(),
-                {"passages_written": 42, "documents_projected": 3, "passages_embedded": 8, "parquet_rows_written": 100, "bodies_thinned": 1},
+                {
+                    "passages_written": 42, "documents_projected": 3, "passages_embedded": 8, "parquet_rows_written": 100, "bodies_thinned": 1,
+                    "cycle_elapsed_ms": 2000, "embed_elapsed_ms": 300, "passage_elapsed_ms": 0, "logical_elapsed_ms": 1000, "parquet_elapsed_ms": 0, "thin_elapsed_ms": 50,
+                },
             )
 
     # storage breakdown
