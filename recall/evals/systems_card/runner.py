@@ -15,7 +15,7 @@ from .accuracy import SyntheticSuiteProbe, TruthBoundaryProbe
 from .availability import AvailabilityProbe
 from .churn import ProjectionChurnProbe
 from .corpus import AuthorizationProbe, FreshnessProbe, ScanConsistencyProbe, SecretScanProbe
-from .cost import PlanetScaleCostProbe
+from .cost import PlanetScaleCostProbe, StorageProbe
 from .forget import ForgetLatencyProbe
 from .latency import ArchilPhaseProbe, SearchStageProbe, ToolLatencyProbe
 from .mcp_client import McpClient, load_profile
@@ -31,7 +31,7 @@ PROBES: dict[str, Any] = {
     "integrity": [ScanConsistencyProbe, ForgetLatencyProbe],
     "authorization": [AuthorizationProbe],
     "privacy": [SecretScanProbe],
-    "cost": [PlanetScaleCostProbe],
+    "cost": [PlanetScaleCostProbe, StorageProbe],
 }
 
 
@@ -113,6 +113,7 @@ def history_row(card: dict[str, Any]) -> dict[str, Any]:
         "authorization.negative_scope": ["leaks"],
         "privacy.secret_scan": ["secret_hits_total"],
         "cost.planetscale": ["invoice_mtd_usd", "storage_iops"],
+        "cost.storage": ["postgres_database_gib", "s3_evidence_gib"],
     }
     for dimension in card["dimensions"].values():
         for probe in dimension["probes"]:
@@ -189,6 +190,7 @@ def parser() -> argparse.ArgumentParser:
     run = commands.add_parser("run", help="run every probe against a live brain and write the card")
     run.add_argument("--url", help="MCP URL (default: RECALL_URL or ~/.config/recall-brain/client.json)")
     run.add_argument("--token-file", help="mode-0600 JSON {\"token\": ...} (default: RECALL_TOKEN_FILE or client profile)")
+    run.add_argument("--metrics-token-file", help="mode-0600 JSON {\"token\": ...} with the metrics scope, for probes that read /metrics (default: RECALL_METRICS_TOKEN_FILE)")
     run.add_argument("--output-dir", required=True)
     run.add_argument("--private-dir", help="owner-only directory for per-case rankings (outside git)")
     run.add_argument("--truth", help="owner-private agentic truth JSONL (60 approved cases)")
@@ -205,7 +207,6 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--planetscale-database")
     run.add_argument("--active-window-hours", type=float, default=72.0)
     run.add_argument("--forget-probe", action="store_true", help="capture, then forget, one synthetic memory and time its disappearance from search (writes to the brain)")
-    run.add_argument("--metrics-token-file", help="mode-0600 JSON {\"token\": ...} with the metrics scope (default: RECALL_METRICS_TOKEN_FILE)")
     run.add_argument("--repo-root", default=str(Path(__file__).resolve().parents[3]))
     render = commands.add_parser("render", help="re-render card.html from an existing card.json")
     render.add_argument("--output-dir", required=True)

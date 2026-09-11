@@ -10,7 +10,7 @@ import urllib.error
 from pathlib import Path
 from unittest import mock
 
-from evals.systems_card import accuracy, churn, corpus, forget, latency
+from evals.systems_card import accuracy, churn, corpus, cost, forget, latency
 from evals.systems_card.availability import AvailabilityProbe
 from evals.systems_card.mcp_client import McpClient, McpClientError, load_profile
 from evals.systems_card.model import Gate, ProbeResult, dimension_status, percentile, summarize_latency
@@ -626,6 +626,221 @@ class ForgetLatencyTest(unittest.TestCase):
         self.assertEqual(row["integrity.forget_latency.capture_visible_after_s"], 3.0)
         self.assertNotIn("integrity.forget_latency.polls", row)
 
+PROMETHEUS_TEXT = """# HELP recall_http_requests_total HTTP requests handled.
+# TYPE recall_http_requests_total counter
+recall_http_requests_total 42
+recall_source_events 1200
+recall_embedded_items 900
+# HELP recall_database_bytes pg_database_size of the brain database.
+# TYPE recall_database_bytes gauge
+recall_database_bytes 115964116992
+# TYPE recall_table_bytes gauge
+recall_table_bytes{table="canonical_chunks"} 84825604096
+recall_table_bytes{table="canonical_events"} 24696061952
+recall_table_bytes{table="canonical_documents"} 13958643712
+recall_table_bytes{table="canonical_passages"} 10307921510
+recall_table_bytes{table="canonical_passage_embeddings"} 1395864371
+this line is junk and must be ignored
+recall_storage_toast_bytes 6120328396
+"""
+
+STORAGE_ENV = {
+    "PLANETSCALE_SERVICE_ACCOUNT_ID": "acct-synthetic",
+    "PLANETSCALE_SERVICE_TOKEN": "pscale-secret-synthetic",
+    "RECALL_PLANETSCALE_ORG": "org-synthetic",
+    "RECALL_PLANETSCALE_DATABASE": "db-synthetic",
+    "RECALL_EVIDENCE_ARCHIVE_BUCKET": "recall-evidence-synthetic",
+    "RECALL_EVIDENCE_ARCHIVE_ENDPOINT_URL": "https://s3.us-west-2.amazonaws.com",
+    "RECALL_EVIDENCE_ARCHIVE_REGION": "us-west-2",
+    "RECALL_EVIDENCE_ARCHIVE_ACCESS_KEY_ID": "evidence-access-synthetic",
+    "RECALL_EVIDENCE_ARCHIVE_SECRET_ACCESS_KEY": "evidence-secret-synthetic",
+}
+
+
+class FakeS3Paginator:
+    def __init__(self, pages: list[dict]) -> None:
+        self.pages = pages
+        self.calls: list[dict] = []
+
+    def paginate(self, **kwargs):
+        self.calls.append(kwargs)
+        yield from self.pages
+
+
+class FakeS3Client:
+    def __init__(self, pages: list[dict]) -> None:
+        self.paginator = FakeS3Paginator(pages)
+
+    def get_paginator(self, name: str):
+        assert name == "list_objects_v2"
+        return self.paginator
+
+
+def s3_pages(count: int, *, truncated_last: bool = False) -> list[dict]:
+    pages = []
+    for index in range(count):
+        pages.append({
+            "Contents": [{"Key": f"objects/ab/{index:02d}{i:02d}", "Size": 1024} for i in range(3)],
+            "IsTruncated": index < count - 1 or truncated_last,
+        })
+    return pages
+
+
+def metrics_token_file(directory: str) -> str:
+    path = Path(directory) / "metrics-token.json"
+    path.write_text('{"token": "metrics-secret-synthetic"}')
+    path.chmod(0o600)
+    return str(path)
+
+
+class StorageProbeTest(unittest.TestCase):
+    def test_parse_prometheus_handles_labels_and_junk(self):
+        samples = cost.parse_prometheus(PROMETHEUS_TEXT)
+        names = [name for name, _, _ in samples]
+        self.assertNotIn("this", names)
+        by_table = {labels["table"]: value for name, labels, value in samples if name == "recall_table_bytes"}
+        self.assertEqual(by_table["canonical_chunks"], 84825604096.0)
+        self.assertEqual(len(by_table), 5)
+
+    def test_all_sources_measured_and_gate_fails_at_baseline(self):
+        planetscale_calls: list[str] = []
+
+        def planetscale_get(url: str, headers: dict) -> dict:
+            planetscale_calls.append(url)
+            return {"cluster_display_name": "PS-80", "minimum_storage_bytes": 10 * cost.GIB, "maximum_storage_bytes": 400 * cost.GIB,
+                    "storage_used_bytes": 120 * cost.GIB, "name": "main"}
+
+        metrics_calls: list[tuple[str, dict]] = []
+
+        def metrics_get(url: str, headers: dict) -> tuple[int, str]:
+            metrics_calls.append((url, headers))
+            return 200, PROMETHEUS_TEXT
+
+        clients: list[FakeS3Client] = []
+        factories: list[dict] = []
+
+        def factory(**kwargs) -> FakeS3Client:
+            factories.append(kwargs)
+            client = FakeS3Client(s3_pages(2))
+            clients.append(client)
+            return client
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, STORAGE_ENV, clear=False):
+            context = make_context(
+                FakeBrain(default_tools()),
+                metrics_token_file=metrics_token_file(directory),
+                _planetscale_get=planetscale_get,
+                _metrics_get=metrics_get,
+                _s3_client_factory=factory,
+            )
+            result = cost.StorageProbe().run(context)
+        self.assertEqual(result.status, "degraded")
+        self.assertEqual(result.samples, 3)
+        m = result.metrics
+        self.assertTrue(m["postgres_available"] and m["planetscale_available"] and m["s3_available"])
+        self.assertEqual(m["postgres_database_gib"], 108.0)
+        self.assertEqual(m["postgres_largest_table"], "canonical_chunks")
+        self.assertEqual(m["postgres_table_gib"]["canonical_chunks"], 79.0)
+        self.assertEqual(m["postgres_tables_reported"], 5)
+        self.assertEqual(m["source_events"], 1200)
+        self.assertEqual(m["embedded_items"], 900)
+        self.assertEqual(m["storage_toast_bytes"], 6120328396.0)
+        self.assertEqual(m["db_storage_min_gib"], 10.0)
+        self.assertEqual(m["db_storage_max_gib"], 400.0)
+        self.assertEqual(m["db_storage_used_gib"], 120.0)
+        self.assertEqual(m["db_storage_used_field"], "storage_used_bytes")
+        self.assertEqual(m["s3_objects_sampled"], 6)
+        self.assertEqual(m["s3_bytes_sampled"], 6144)
+        self.assertTrue(m["s3_listing_complete"])
+        self.assertEqual(m["s3_evidence_gib"], 0.0)
+        gate = result.gates[0]
+        self.assertEqual(gate.metric, "postgres_database_gib")
+        self.assertEqual(gate.threshold, 40.0)
+        self.assertFalse(gate.passed)
+        # transport plumbing
+        self.assertEqual(metrics_calls[0][0], "https://brain.invalid/metrics")
+        self.assertEqual(metrics_calls[0][1]["Authorization"], "Bearer metrics-secret-synthetic")
+        self.assertIn("/organizations/org-synthetic/databases/db-synthetic/branches/main", planetscale_calls[0])
+        self.assertEqual(factories[0]["aws_access_key_id"], "evidence-access-synthetic")
+        self.assertEqual(clients[0].paginator.calls[0]["Prefix"], "objects/")
+        self.assertEqual(clients[0].paginator.calls[0]["Bucket"], "recall-evidence-synthetic")
+        # no secrets, bucket names, or tokens in the card
+        rendered = json.dumps(result.as_dict())
+        for secret in ("metrics-secret-synthetic", "pscale-secret-synthetic", "evidence-secret-synthetic",
+                       "evidence-access-synthetic", "acct-synthetic", "recall-evidence-synthetic", "objects/ab"):
+            self.assertNotIn(secret, rendered)
+
+    def test_s3_page_cap_marks_listing_incomplete(self):
+        with mock.patch.dict(os.environ, STORAGE_ENV, clear=False):
+            context = make_context(
+                FakeBrain(default_tools()),
+                s3_page_cap=2,
+                _s3_client_factory=lambda **kwargs: FakeS3Client(s3_pages(5)),
+            )
+            result = cost.StorageProbe().run(context)
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.metrics["s3_pages_listed"], 2)
+        self.assertEqual(result.metrics["s3_objects_sampled"], 6)
+        self.assertFalse(result.metrics["s3_listing_complete"])
+        self.assertTrue(any("lower bound" in note for note in result.notes))
+        self.assertIsNone(result.gates[0].passed)  # postgres not measured -> gate unknown, not failed
+
+    def test_every_source_skipped_when_nothing_configured(self):
+        scrubbed = {key: "" for key in STORAGE_ENV}
+        scrubbed.update({"RECALL_METRICS_TOKEN_FILE": "", "AWS_ACCESS_KEY_ID": "", "AWS_PROFILE": ""})
+        with mock.patch.dict(os.environ, scrubbed, clear=False):
+            result = cost.StorageProbe().run(make_context(FakeBrain(default_tools())))
+        self.assertEqual(result.status, "skipped")
+        self.assertEqual(result.gates, [])
+        self.assertEqual(len(result.notes), 3)
+        self.assertFalse(result.metrics["postgres_available"])
+
+    def test_partial_failures_are_notes_not_crashes(self):
+        def broken_planetscale(url, headers):
+            raise urllib.error.URLError("nope")
+
+        def factory(**kwargs):
+            raise PermissionError("denied")
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, STORAGE_ENV, clear=False):
+            token = Path(directory) / "loose.json"
+            token.write_text('{"token": "x"}')
+            token.chmod(0o644)
+            context = make_context(
+                FakeBrain(default_tools()),
+                metrics_token_file=str(token),
+                _planetscale_get=broken_planetscale,
+                _s3_client_factory=factory,
+            )
+            result = cost.StorageProbe().run(context)
+        self.assertEqual(result.status, "skipped")
+        self.assertTrue(any("token file unusable" in n for n in result.notes))
+        self.assertTrue(any("PlanetScale branch lookup failed (URLError)" in n for n in result.notes))
+        self.assertTrue(any("listing failed (PermissionError)" in n for n in result.notes))
+
+    def test_metrics_without_storage_breakdown_is_noted(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {key: "" for key in STORAGE_ENV}, clear=False):
+            context = make_context(
+                FakeBrain(default_tools()),
+                metrics_token_file=metrics_token_file(directory),
+                _metrics_get=lambda url, headers: (200, "recall_source_events 5\n"),
+            )
+            result = cost.StorageProbe().run(context)
+        self.assertEqual(result.status, "ok")
+        self.assertTrue(result.metrics["postgres_available"])
+        self.assertEqual(result.metrics["source_events"], 5)
+        self.assertNotIn("postgres_database_gib", result.metrics)
+        self.assertTrue(any("no storage breakdown" in n for n in result.notes))
+
+    def test_history_row_picks_storage_metrics(self):
+        results = [ProbeResult("cost.storage", "cost", "degraded", metrics={"postgres_database_gib": 108.0, "s3_evidence_gib": 2.5, "postgres_table_gib": {}})]
+        with tempfile.TemporaryDirectory() as directory:
+            card = build_card(results, base_url="https://brain.invalid/mcp", started_at=0.0, repo_root=Path(directory), options={})
+        row = history_row(card)
+        self.assertEqual(row["cost.storage.postgres_database_gib"], 108.0)
+        self.assertEqual(row["cost.storage.s3_evidence_gib"], 2.5)
+        self.assertNotIn("cost.storage.postgres_table_gib", row)
+
 
 class CardTest(unittest.TestCase):
     def _results(self) -> list[ProbeResult]:
@@ -664,6 +879,9 @@ class CardTest(unittest.TestCase):
         self.assertEqual(args.truth_split, "validation")
         self.assertEqual(args.repetitions, 3)
         self.assertIsNone(args.dimensions)
+        self.assertIsNone(args.metrics_token_file)
+        args = parser().parse_args(["run", "--output-dir", "/tmp/x", "--metrics-token-file", "/tmp/m.json"])
+        self.assertEqual(args.metrics_token_file, "/tmp/m.json")
 
 
 if __name__ == "__main__":

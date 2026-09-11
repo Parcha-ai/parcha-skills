@@ -70,6 +70,8 @@ from connectors.slack_events import slack_event_to_webhook
 
 LOG = logging.getLogger("recall.brainstore")
 MAX_BODY_BYTES = 12 * 1024 * 1024
+# storage breakdown: only plain relation names may become a metrics label
+STORAGE_TABLE_LABEL_RE = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 POOL_BUSY_RETRY_MIN = 20
 POOL_BUSY_RETRY_MAX = 90
 MAX_CANONICAL_EVENTS_BYTES = 8_000_000
@@ -651,6 +653,19 @@ class Handler(BaseHTTPRequestHandler):
                     f"recall_projection_{key}_total {value}",
                 ]
             )
+        # storage breakdown: database size and the largest relations, labelled
+        # by table name only (no tenant, source, or content labels).
+        lines += [
+            "# HELP recall_database_bytes pg_database_size of the brain database.",
+            "# TYPE recall_database_bytes gauge",
+            f"recall_database_bytes {int(db.get('database_bytes') or 0)}",
+            "# HELP recall_table_bytes pg_total_relation_size of the largest public relations.",
+            "# TYPE recall_table_bytes gauge",
+        ]
+        table_bytes = db.get("table_bytes") or {}
+        for table, size in sorted(table_bytes.items(), key=lambda item: (-item[1], item[0])):
+            if STORAGE_TABLE_LABEL_RE.fullmatch(table):
+                lines.append(f'recall_table_bytes{{table="{table}"}} {int(size)}')
         lines.append("")
         return "\n".join(lines).encode()
 
