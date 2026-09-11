@@ -23,6 +23,7 @@ import urllib.request
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .authorization import normalize_verified_email
+from .identity_cache import invalidate_tenant as invalidate_registration_cache
 from .invitation_email import (
     InvitationEmail,
     InvitationEmailError,
@@ -1843,6 +1844,7 @@ class ControlPlane:
                        ) VALUES (%s,%s,'brain.invitation.revoke','success',%s)""",
                     (uuid.uuid4(), principal_id, _digest(str(parsed_id))),
                 )
+        invalidate_registration_cache(invitation["tenant_id"])
         return {"id": str(parsed_id), "status": "revoked"}
 
     def state(self, principal_id: str) -> dict[str, Any]:

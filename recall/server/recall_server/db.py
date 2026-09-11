@@ -23,6 +23,7 @@ from .actor_attribution import (
     actor_id_for_principal,
     claimable_actor_for_display_name,
 )
+from .audit_batch import AuthorizationAuditBatcher, batch_settings_from_env
 from .authorization import normalize_verified_email
 from .capture import (
     CAPTURE_ORIGIN_RE,
@@ -31,6 +32,7 @@ from .capture import (
     parse_capture_receipt,
 )
 from .federation import SOURCE_FAMILIES, SourceProfile, freshness_score, normalized_evidence
+from .identity_cache import invalidate_tenant as invalidate_registration_cache
 from .projectors import KIND_RE, SOURCE_ID_RE, advisory_lock_key, canonical_json, effective_session_id, event_receipt, legacy_engine, partial_lexical_probes, phrase_query_spec, preferred_phrase_probes, project, redact_text, validate_envelope
 from .ranking import DEFAULT_SEARCH_DEADLINE_MS, evidence_rank_components, should_run_partial
 from .semantic import SemanticRuntime
@@ -124,11 +126,25 @@ class BrainStore:
     def __init__(self, dsn: str, search_deadline_ms: int | None = None,
                  semantic_runtime: SemanticRuntime | None = None,
                  semantic_minimum_similarity: float | None = None,
-                 pool_max_size: int | None = None):
+                 pool_max_size: int | None = None,
+                 audit_batch_rows: int | None = None,
+                 audit_batch_seconds: float | None = None):
         self.dsn = dsn
         self._pool: ConnectionPool | None = None
         self._pool_lock = threading.Lock()
         self._last_ready_at: float | None = None
+        env_batch_rows, env_batch_seconds = batch_settings_from_env()
+        self.audit_batcher = AuthorizationAuditBatcher(
+            self.connect,
+            batch_rows=(
+                env_batch_rows if audit_batch_rows is None else audit_batch_rows
+            ),
+            batch_seconds=(
+                env_batch_seconds
+                if audit_batch_seconds is None
+                else audit_batch_seconds
+            ),
+        )
         try:
             configured_pool_size = (
                 pool_max_size
@@ -205,9 +221,16 @@ class BrainStore:
         self._pool.resize(minimum_size, self.pool_max_size)
         self._pool.wait(timeout=timeout)
 
+    def flush_authorization_audit(self) -> int:
+        """Force every queued allowed-decision audit row to the database."""
+        return self.audit_batcher.flush()
+
     def close(self) -> None:
-        if self._pool is not None:
-            self._pool.close()
+        try:
+            self.audit_batcher.close()
+        finally:
+            if self._pool is not None:
+                self._pool.close()
 
     def migrate(self) -> None:
         schema_dir = Path(__file__).resolve().parents[1] / "schema"
@@ -424,6 +447,7 @@ class BrainStore:
                     or configured["slug"] != slug
                 ):
                     raise ValueError("brain provisioning conflict")
+        invalidate_registration_cache(tenant_id)
         return {
             "organization_id": organization_id,
             "organization_kind": organization_kind,
@@ -959,14 +983,11 @@ class BrainStore:
         )
         if any(not isinstance(value, str) or not value for value in values):
             raise ValueError("authorization audit identity invalid")
-        with self.connect() as conn:
-            conn.execute(
-                """INSERT INTO authorization_audit_events(
-                       principal_kind,principal_id,tenant_id,action,
-                       decision,reason,policy_version
-                   ) VALUES (%s,%s,%s,%s,%s,%s,%s)""",
-                values,
-            )
+        if not allowed:
+            # A denial must be durable before the 403 leaves the process.
+            self.audit_batcher.write_sync([values])
+            return
+        self.audit_batcher.enqueue(values)
 
     def resolve_external_identity(
         self,
@@ -1259,6 +1280,7 @@ class BrainStore:
                         ).hexdigest(),
                     ),
                 )
+        invalidate_registration_cache(invitation["tenant_id"])
         return self.resolve_external_identity(
             issuer=issuer,
             subject=subject,
