@@ -1709,6 +1709,14 @@ def main() -> None:
         "--max-wait-seconds", type=float, default=0.0,
         help="project regardless once a session has waited this long since first queued",
     )
+    projection_worker.add_argument(
+        "--thin-batch-size", type=int, default=1_000,
+        help="canonical bodies thinned per cycle when no projection work is queued",
+    )
+    projection_worker.add_argument(
+        "--thin-busy-batch-size", type=int, default=100,
+        help="canonical bodies thinned per cycle while logical or passage work is queued",
+    )
     projection_worker.add_argument("--once", action="store_true")
     sub.add_parser("export")
     conformance = sub.add_parser("mcp-conformance")
@@ -2308,10 +2316,14 @@ def main() -> None:
                     once=args.once,
                     quiet_seconds=args.quiet_seconds,
                     max_wait_seconds=args.max_wait_seconds,
-                    body_thinner=lambda: thin_canonical_bodies(
+                    body_thinner=lambda busy: thin_canonical_bodies(
                         store,
                         tenant_id=args.tenant,
-                        batch_size=1_000,
+                        batch_size=(
+                            args.thin_busy_batch_size
+                            if busy
+                            else args.thin_batch_size
+                        ),
                         max_batches=1,
                     ),
                 ),

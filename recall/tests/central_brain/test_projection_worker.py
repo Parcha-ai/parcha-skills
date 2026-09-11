@@ -290,7 +290,7 @@ class ProjectionWorkerTest(unittest.TestCase):
     def test_thins_authoritative_rows_after_each_projection_cycle(self):
         calls: list[str] = []
 
-        def thin():
+        def thin(busy=False):
             calls.append("thin")
             return {
                 "status": "complete",
@@ -327,7 +327,7 @@ class ProjectionWorkerTest(unittest.TestCase):
     def test_unrelated_projection_backlog_does_not_starve_safe_thinning(self):
         calls: list[str] = []
 
-        def thin():
+        def thin(busy=False):
             calls.append("thin")
             return {
                 "status": "pending",
@@ -518,7 +518,7 @@ class CycleTimingTests(unittest.TestCase):
         scanner = _TimedScan(calls, work=0)
         scanner.clock = clock
 
-        def thin():
+        def thin(busy=False):
             clock.advance(0.01)
             return {
                 "status": "complete",
@@ -613,3 +613,50 @@ class CycleTimingTests(unittest.TestCase):
         self.assertEqual(totals["parquet_elapsed_ms"], 100)
         self.assertEqual(totals["thin_elapsed_ms"], 20)
         self.assertEqual(totals["bodies_thinned"], 6)
+
+
+class ThinnerBusyModeTests(unittest.TestCase):
+    """Thinning yields to queued freshness work: busy batches while a backlog exists."""
+
+    def _run(self, *, logical_pending: int) -> tuple[list[bool], dict]:
+        seen: list[bool] = []
+
+        def thin(busy=False):
+            seen.append(busy)
+            return {
+                "status": "complete",
+                "documents": 1,
+                "refused": 0,
+                "document_bytes_removed": 1,
+                "event_bytes_replaced": 1,
+            }
+
+        calls: list[str] = []
+        logical = _Logical(calls, work=0)
+        logical.pending = logical_pending  # type: ignore[attr-defined]
+        result = run_projection_worker(
+            logical,  # type: ignore[arg-type]
+            _Passages(calls, work=0),  # type: ignore[arg-type]
+            _Scan(calls, work=0),  # type: ignore[arg-type]
+            tenant_id="tenant:company:test",
+            logical_batch_size=5,
+            passage_batch_size=5,
+            embedding_batch_size=64,
+            max_batches_per_cycle=1,
+            upload_concurrency=1,
+            passage_concurrency=1,
+            interval_seconds=30,
+            once=True,
+            body_thinner=thin,
+        )
+        return seen, result
+
+    def test_thinner_is_busy_while_logical_work_is_queued(self):
+        seen, result = self._run(logical_pending=3)
+        self.assertEqual(seen, [True])
+        self.assertEqual(result["thin_mode"], "busy")
+
+    def test_thinner_is_idle_when_nothing_is_queued(self):
+        seen, result = self._run(logical_pending=0)
+        self.assertEqual(seen, [False])
+        self.assertEqual(result["thin_mode"], "idle")

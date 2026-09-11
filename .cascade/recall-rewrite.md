@@ -4,18 +4,23 @@ _Living plan. Status legend: todo / doing / done / blocked. Evidence = PR + card
 
 ## Status board
 
-_Ops note 2026-09-11: root disk hit 100% on greppy3 during H0 (agents used TMPDIR=scratchpad); cleanup recorded below._
+_Ops note 2026-09-11: root disk hit 100% on greppy3 during H0; back to 95% (44 GB free) by 06:15 UTC without deleting anything of ours. Worker finding 06:40 UTC: recall-logical-evidence-worker cycles take ~20 min at 5 docs/cycle while logical_pending grows 212 → 278 in 80 min; freshness 64 h behind. Root cause under investigation (thinning 1000 bodies/cycle + embedding 64/cycle share the cycle)._
 | task | status | owner | evidence |
 |---|---|---|---|
 | H0-0 plan + briefings committed | done | lead | PR #489 merged (eef1216) |
-| H0-1 churn probe | review | agent churn | PR #492 (schema 058 churn indexes; 1092 unit OK) |
-| H0-2 forget-latency probe | review | agent forget | PR #490 (31 card tests; live run pending behind --forget-probe) |
-| H0-3 storage cost probe | review | agent storage | PR #491 (rebase after #492: db.py/app.py metrics blocks) |
+| H0-1 churn probe | done | agent churn | PR #492 merged (main 1889db0) after rebase + FakeSemanticRuntime fix |
+| H0-2 forget-latency probe | done | agent forget | PR #490 merged (main 6e5f1ce); live row still pending behind --forget-probe |
+| H0-3 storage cost probe | done (code) | agent storage | PR #491 merged (main f28ad8e), MCP deployed dep-dahq42h594qs738434jg; card 06:5x UTC: cost.storage skipped in ship_and_measure (no PS/S3 creds passed) — nightly script has them; verify at 06:00 UTC run |
 | H0-4 shadow-projection tool | folded into H1-T3 (`passage-shadow-diff`) | lead | |
 | H0-5 ship_and_measure in repo | done | lead | recall/scripts/ship_and_measure.sh in #489 |
 | H0-6 nightly card + Slack | done (dry run) | lead | ~/bin/recall-nightly-card.sh, cron 06:00 UTC; dry run 2026-09-11 05:43 wrote the docs page; first Slack post at the next run |
-| H1-T1 debounce | doing | lead | branch feat/recall-h1-t1-debounce-20260911; migration renumbered 059 after #492 |
-| H1 T2..T7 | todo | | |
+| H1-T1 debounce | done (code) / flag off in prod | lead | PR #493 merged (main d750446), MCP deployed dep-dahpts1594qs73838ov0; e2e quiet=300 → 0 docs/1 waiting, forget immediate; 1102 unit OK. Card row 2026-09-11 ~06:40 UTC: server p95 8.1 s cold after restart, recall@20 0.5417, MRR 0.346. Migrations 058+059 applied to prod 07:0x UTC via temp PlanetScale role (CIDR + role deleted, file shredded; 058 built CONCURRENTLY, schema=59, runtime grants refreshed). Worker deploy to f28ad8e triggered 07:1x UTC. Miguel approved 07:05 UTC: worker dockerCommand += `--quiet-seconds 90 --max-wait-seconds 600` (Render PATCH 200), redeploy triggered; verify `logical_waiting` in cycle logs and logical_pending trend over the next 24 h |
+| H1-T5 identity cache + audit batching | doing | agent h1-t5 | worktree ~/worktrees/recall-h1-t5 |
+| H1-T6 legacy write retirement | review | agent h1-t6 | PR #494 rebased on main (1140 unit OK); CI pending. Before merge: MCP env needs RECALL_LEGACY_INGEST_TENANT_ID=tenant:company:parcha (default tenant:personal) — prod-config write, ask Miguel |
+| H0-7 per-phase cycle timing | done | agent h0-7 | PR #496 merged (main 518e802); MCP + worker deployed 08:4x UTC; card 16/16 gates ok on availability+latency (server p95 139 ms); recall_exec/scan p95 ~11 s on this run (cold sandbox after deploy, watch) |
+| H1-T2 in-place logical revisions | doing | agent h1-t2 | worktree ~/worktrees/recall-h1-t2, migration 060 (+060b concurrent) |
+| H1-T7a thinning yields to freshness | doing | lead | H0-7 first timed cycle 08:41 UTC: cycle 916 s = thin 713 s + embed 101 s + logical 51 s + passage 51 s; thinner now takes a 100-body batch while work is queued (`--thin-busy-batch-size`), 1000 when idle |
+| H1 T3, T4, T7 | todo | | T3 starts when T2 PR is open (shares keys) |
 | H2 a..e | todo | | |
 | H3 a..f | todo | | |
 | H4 1..4 | todo | | |
