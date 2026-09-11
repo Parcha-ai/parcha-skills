@@ -873,8 +873,14 @@ class CanonicalLogicalEvidenceProjector:
         source_id: str,
         ranges: tuple[tuple[Any, Any], ...],
         reason: str,
+        logical_document_id: str | None = None,
     ) -> int:
-        """Invalidate only source/month shards touched by a logical change."""
+        """Invalidate only source/month fragments touched by a logical change.
+
+        The queue row marks the source-month; the dirty-document row names the
+        logical document so the scan projector rewrites only the fragments that
+        hold it. A pending ``backfill`` (full rebuild) is never downgraded.
+        """
 
         if not ranges:
             return 0
@@ -906,9 +912,32 @@ class CanonicalLogicalEvidenceProjector:
                ON CONFLICT(tenant_id,source_id,bucket_start)
                DO UPDATE SET
                    generation=canonical_parquet_scan_queue.generation+1,
-                   reason=excluded.reason,changed_at=clock_timestamp()""",
+                   reason=CASE
+                       WHEN canonical_parquet_scan_queue.reason='backfill'
+                       THEN 'backfill' ELSE excluded.reason END,
+                   changed_at=clock_timestamp()""",
             (tenant_id, source_id, reason, starts, ends),
         )
+        if logical_document_id is not None:
+            connection.execute(
+                """INSERT INTO canonical_parquet_scan_dirty_documents(
+                       tenant_id,source_id,bucket_start,
+                       logical_document_id,reason,queued_at
+                   )
+                   SELECT %s,%s,month.value::date,%s,%s,clock_timestamp()
+                     FROM unnest(%s::timestamptz[],%s::timestamptz[])
+                          AS span(first_at,last_at)
+                     CROSS JOIN LATERAL generate_series(
+                         date_trunc('month',span.first_at),
+                         date_trunc('month',span.last_at),
+                         interval '1 month'
+                     ) month(value)
+                    GROUP BY month.value
+                   ON CONFLICT(tenant_id,source_id,bucket_start,logical_document_id)
+                   DO UPDATE SET reason=excluded.reason,
+                                 queued_at=clock_timestamp()""",
+                (tenant_id, source_id, logical_document_id, reason, starts, ends),
+            )
         return max(0, result.rowcount)
 
     def _schedule_cleanup(
@@ -1430,6 +1459,7 @@ class CanonicalLogicalEvidenceProjector:
                     source_id=prepared.source_id,
                     ranges=tuple(ranges),
                     reason="logical-update",
+                    logical_document_id=prepared.logical_document_id,
                 )
                 deleted = connection.execute(
                     """DELETE FROM canonical_evidence_document_queue
@@ -1486,7 +1516,8 @@ class CanonicalLogicalEvidenceProjector:
                     candidate,
                 )
                 old_document = connection.execute(
-                    """SELECT first_occurred_at,last_occurred_at
+                    """SELECT logical_document_id,first_occurred_at,
+                              last_occurred_at
                          FROM canonical_evidence_documents
                         WHERE tenant_id=%s AND source_id=%s
                           AND native_parent_id=%s""",
@@ -1524,6 +1555,7 @@ class CanonicalLogicalEvidenceProjector:
                             old_document["last_occurred_at"],
                         ),),
                         reason="forget",
+                        logical_document_id=old_document["logical_document_id"],
                     )
                 deleted = connection.execute(
                     """DELETE FROM canonical_evidence_document_queue
