@@ -884,6 +884,98 @@ class HttpBoundaryContractTest(unittest.TestCase):
         self.assertIn("ORDER BY id DESC LIMIT 1", sql)
         self.assertNotIn("count(", sql.casefold())
 
+    def _churn_store(self, *, runtime: bool) -> tuple[BrainStore, mock.MagicMock]:
+        connection = mock.MagicMock()
+
+        def execute(sql: str, params=()):
+            cursor = mock.MagicMock()
+            folded = " ".join(sql.split()).casefold()
+            if "to_regclass" in folded:
+                row = {"value": "canonical_passages" if "canonical_passages" in folded else None}
+            elif "reltuples" in folded:
+                row = {"n": 400000}
+            elif "not exists" in folded:
+                row = {"n": 1234}
+            elif "from canonical_passage_documents" in folded:
+                row = {"n": 320}
+            elif "from canonical_passages" in folded:
+                row = {"n": 150000}
+            else:
+                row = {"n": 0, "embedded": 0, "live": 0}
+            cursor.fetchone.return_value = row
+            return cursor
+
+        connection.execute.side_effect = execute
+        context = mock.MagicMock()
+        context.__enter__.return_value = connection
+        store = BrainStore("postgresql://synthetic.invalid/recall")
+        store.connect = mock.MagicMock(return_value=context)
+        if runtime:
+            store.semantic_runtime = mock.MagicMock(passage_fingerprint="fp-passages", fingerprint="fp-docs")
+        return store, connection
+
+    def test_service_metrics_reports_projection_churn_gauges(self) -> None:
+        store, connection = self._churn_store(runtime=True)
+        metrics = store.service_metrics()
+        self.assertEqual(metrics["passages_total"], 400000)
+        self.assertEqual(metrics["passages_written_24h"], 150000)
+        self.assertEqual(metrics["passage_documents_projected_24h"], 320)
+        self.assertEqual(metrics["passages_unembedded"], 1234)
+        unembedded = [
+            call for call in connection.execute.call_args_list
+            if "NOT EXISTS" in call.args[0]
+        ]
+        self.assertEqual(len(unembedded), 1)
+        sql, params = unembedded[0].args
+        self.assertIn("LIMIT %s", sql)
+        self.assertEqual(params, ("fp-passages", BrainStore.PASSAGES_UNEMBEDDED_CAP))
+        window = [
+            call.args[0] for call in connection.execute.call_args_list
+            if "interval '24 hours'" in call.args[0]
+        ]
+        self.assertEqual(len(window), 2)
+        for sql in window:
+            self.assertNotIn("tenant_id", sql)
+
+    def test_service_metrics_reports_minus_one_unembedded_without_runtime(self) -> None:
+        store, connection = self._churn_store(runtime=False)
+        metrics = store.service_metrics()
+        self.assertEqual(metrics["passages_unembedded"], -1)
+        self.assertEqual(metrics["passages_written_24h"], 150000)
+        self.assertFalse(any("NOT EXISTS" in call.args[0] for call in connection.execute.call_args_list))
+
+    def test_metrics_endpoint_serves_churn_gauges_and_worker_totals(self) -> None:
+        from recall_server import projection_worker
+
+        handler = object.__new__(Handler)
+        handler.store = mock.MagicMock()
+        handler.store.service_metrics.return_value = {
+            "source_events": 1, "dead_letters": 0, "projection_lag": 0,
+            "source_freshness_seconds": 5, "embedded_items": 1, "embedding_lag": 0,
+            "passages_total": 400000, "passages_unembedded": 1234,
+            "passages_written_24h": 150000, "passage_documents_projected_24h": 320,
+        }
+        with mock.patch.dict(projection_worker.PROJECTION_TOTALS, {"passages_written": 77}):
+            body = Handler.metrics(handler).decode()
+        self.assertIn("recall_passages_written_24h 150000\n", body)
+        self.assertIn("recall_passage_documents_projected_24h 320\n", body)
+        self.assertIn("recall_passages_unembedded 1234\n", body)
+        self.assertIn("recall_passages_total 400000\n", body)
+        self.assertIn("recall_projection_passages_written_total 77\n", body)
+        self.assertIn("# TYPE recall_projection_bodies_thinned_total counter\n", body)
+        self.assertTrue(body.endswith("\n"))
+
+    def test_projection_worker_accumulates_process_totals(self) -> None:
+        from recall_server import projection_worker
+
+        with mock.patch.dict(projection_worker.PROJECTION_TOTALS, {key: 0 for key in projection_worker.PROJECTION_TOTALS}):
+            projection_worker.record_cycle({"passages": 40, "passage_documents": 2, "embedded": 8, "parquet_rows": 100, "canonical_bodies_thinned": 1, "status": "pending"})
+            projection_worker.record_cycle({"passages": 2, "passage_documents": 1, "embedded": 0, "parquet_rows": 0, "canonical_bodies_thinned": 0})
+            self.assertEqual(
+                projection_worker.projection_totals(),
+                {"passages_written": 42, "documents_projected": 3, "passages_embedded": 8, "parquet_rows_written": 100, "bodies_thinned": 1},
+            )
+
 
     def test_remote_doctor_uses_bounded_health_not_full_metrics(self) -> None:
         handler = object.__new__(Handler)
