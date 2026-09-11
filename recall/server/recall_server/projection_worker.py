@@ -83,7 +83,7 @@ def run_projection_worker(
     interval_seconds: float,
     once: bool = False,
     sleep: Callable[[float], Any] = time.sleep,
-    body_thinner: Callable[[], dict[str, Any]] | None = None,
+    body_thinner: Callable[[bool], dict[str, Any]] | None = None,
     quiet_seconds: float = 0.0,
     max_wait_seconds: float = 0.0,
     clock: Callable[[], float] = time.monotonic,
@@ -175,9 +175,16 @@ def run_projection_worker(
         # an S3 logical manifest, retained searchable chunks, and no queued
         # reprojection for that source group. Run one bounded batch every cycle
         # so steady ingestion cannot permanently prevent safe rows from being
-        # thinned merely because an unrelated global queue is non-empty.
+        # thinned merely because an unrelated global queue is non-empty. While
+        # freshness work is queued the thinner is told it is busy so it takes
+        # a small batch: measured in production, a 1000-body batch held the
+        # cycle for ~12 minutes while the logical queue grew.
+        thin_busy = (
+            int(documents.get("pending", 0)) > 0
+            or int(projected.get("pending", 0)) > 0
+        )
         thinned = (
-            body_thinner()
+            body_thinner(thin_busy)
             if body_thinner is not None
             else {
                 "status": "deferred" if body_thinner is not None else "complete",
@@ -220,6 +227,7 @@ def run_projection_worker(
             "parquet_stale": int(scanned["stale"]),
             "parquet_contended": int(scanned["contended"]),
             "canonical_bodies_thinned": int(thinned["documents"]),
+            "thin_mode": "busy" if thin_busy else "idle",
             "canonical_bodies_refused": int(thinned["refused"]),
             "canonical_document_bytes_removed": int(
                 thinned["document_bytes_removed"]
@@ -251,6 +259,7 @@ def run_projection_worker(
             "parquet_shards=%s "
             "parquet_rows=%s parquet_stale=%s parquet_contended=%s "
             "canonical_bodies_thinned=%s canonical_bodies_refused=%s "
+            "thin_mode=%s "
             "canonical_document_bytes_removed=%s "
             "canonical_event_bytes_replaced=%s "
             "stale=%s pruned=%s "
@@ -281,6 +290,7 @@ def run_projection_worker(
                     "parquet_contended",
                     "canonical_bodies_thinned",
                     "canonical_bodies_refused",
+                    "thin_mode",
                     "canonical_document_bytes_removed",
                     "canonical_event_bytes_replaced",
                     "stale",
