@@ -52,10 +52,12 @@ class AdmissionSettings:
 # conversation; a peer must never treat them as a turn to answer.
 _STATUS_PREFIXES = (
     ":hourglass_flowing_sand:", ":zap:", ":warning:", ":arrow_right_hook:", ":stopwatch:",
+    ":information_source:", "Hermes is working",
 )
 _STATUS_PHRASES = (
     "Working —", "Working -", "Gateway shutting down", "Interrupting current task",
-    "Redirected current run", "was interrupted before processing",
+    "Redirected current run", "was interrupted before processing", "Context compression deferred",
+    "liveness watchdog", "stopped making progress", "Agent session appears stalled", "Model fallback:",
 )
 
 
@@ -113,6 +115,13 @@ def evaluate(
         return decision
     if not settings.configured:
         decision.update(verdict=VERDICT_UNCONFIGURED, reason="security_domain_incomplete")
+        return decision
+
+    # A trusted teammate's housekeeping line (task card title, stall notice, model fallback) is
+    # classified before the bound-thread gate: it is a message for nobody on any thread.
+    if (actor_is_bot and actor and actor in settings.trusted_bot_users
+            and workspace == settings.workspace_id and message_id and is_status_notice(text)):
+        decision.update(verdict=VERDICT_NOT_OURS, reason="peer_status_notice")
         return decision
 
     binding_key = (channel or "", thread or "")
