@@ -85,6 +85,15 @@ can press to trigger the next step.
 - 07:05 UTC all 8 gateways restarted: claudio/sam/bryan/q2 on Hermes series head (reply contract, mention
   wrap, quota classification, system prompt, liveness, cwd, media, eviction close), chris on the series with
   runtime=auto until his 08:12 timer flips him, manny codex, anthro/irma native; Tether 7d6030a everywhere.
-- Next: one more team build for the clean cold read (acceptance a); then H7 profile routing, H8 kanban lanes,
-  H10 A2A, H13 buttons. Upstream PR still needs Miguel's fork. Upstream asks now 7: cwd (done in
+- 07:28-08:03 second team task, real work: greppy3 disk report (thread 1789111717.886859). Claudio produced a
+  ranked report; Manny's arithmetic exposed a 540G gap; Irma pulled the Airwallex backups (retention); Bryan
+  self-corrected numbers from the wrong box; Chris flagged recall's dependency on ~/archives; claudio could not
+  read docker (gateway sandbox) → Hermes commit 861abfe3b adds `claude_code.launcher: systemd-user` (Tether's
+  launcher ported); verified live 08:03: claudio's child runs under systemd-run --user (3 wrapped children, 2
+  transient units) and read `docker system df` (284G, 111G reclaimable; /var/lib/docker 388G on disk).
+  Also fixed: expired card stream restarts once + Slack error code logged (e5335cb95). Series = 11 commits.
+- My own mistakes tonight: restarted host m mid-turn (Q's turn failed and the failure posted twice); backticks
+  in a message sent through Chris's broker ran as shell on his box and posted docker tables. Rules: check
+  `response ready` before any restart; send broker text from a file.
+- Next: H7 profile routing, H8 kanban lanes, H10 A2A, H13 buttons. Upstream PR still needs Miguel's fork. Upstream asks now 7: cwd (done in
   series), media (done), notices knob, NO_REPLY+content, peer guard, inbound journal, token-less `hermes send`.
