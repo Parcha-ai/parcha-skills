@@ -1743,7 +1743,8 @@ class BrainStore:
                    WHERE created_at > now() - interval '24 hours'"""
             ).fetchone()["n"]
         )
-        if self.semantic_runtime is not None:
+        passage_fingerprint = getattr(self.semantic_runtime, "passage_fingerprint", None)
+        if isinstance(passage_fingerprint, str) and passage_fingerprint:
             churn["passages_unembedded"] = int(
                 conn.execute(
                     """SELECT count(*) AS n FROM (
@@ -1758,10 +1759,7 @@ class BrainStore:
                            )
                            LIMIT %s
                        ) missing""",
-                    (
-                        self.semantic_runtime.passage_fingerprint,
-                        self.PASSAGES_UNEMBEDDED_CAP,
-                    ),
+                    (passage_fingerprint, self.PASSAGES_UNEMBEDDED_CAP),
                 ).fetchone()["n"]
             )
         return churn
