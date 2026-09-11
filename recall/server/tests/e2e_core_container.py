@@ -112,7 +112,12 @@ def main() -> None:
     image = os.environ.get("RECALL_CORE_IMAGE", "recall-core:e2e")
     name = f"recall-core-e2e-{os.getpid()}"
     dsn = runtime_dsn(admin_dsn)
-    child_env = {**os.environ, "RECALL_DATABASE_URL": dsn}
+    child_env = {
+        **os.environ,
+        "RECALL_DATABASE_URL": dsn,
+        "RECALL_LEGACY_WRITES": "1",
+        "RECALL_LEGACY_READS": "1",
+    }
     try:
         configure_role(admin_dsn)
         identity = run(
@@ -166,7 +171,10 @@ def main() -> None:
             raise RuntimeError("database capability contract failed")
         run(
             "docker", "run", "-d", "--name", name, "--read-only", "--network", "host",
-            "-e", "RECALL_DATABASE_URL", image,
+            "-e", "RECALL_DATABASE_URL",
+            # This contract drives the v1 REST routes with a plain collector
+            # token and no archive; pin the v1 plane (H1-T6).
+            "-e", "RECALL_LEGACY_WRITES", "-e", "RECALL_LEGACY_READS", image,
             "serve", "--host", "0.0.0.0", "--port", "18788", "--require-auth",
             "--capability-profile", "local-fixture",
             env=child_env,

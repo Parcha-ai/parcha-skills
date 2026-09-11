@@ -36,7 +36,13 @@ paths:
         '401': {description: Unauthorized}
   /v1/ingest/batches:
     post:
-      summary: Commit an idempotent source-event batch
+      summary: Commit a source-event batch onto the canonical plane
+      description: >
+        H1-T6: envelopes are archived into raw_artifacts and committed through the
+        canonical v2 plane; the legacy v1 tables receive no writes unless
+        RECALL_LEGACY_WRITES=1. Dedupe is content-addressed: an exact replay
+        answers 200 with duplicate_events=1 and the same receipts. Requires a
+        configured canonical plane (503 otherwise).
       operationId: ingestBatch
       security:
         - bearerAuth: []
@@ -57,13 +63,14 @@ paths:
                   type: array
                   items: {$ref: '#/components/schemas/EnvelopeV1'}
       responses:
-        '201': {description: Committed}
-        '200': {description: Idempotent replay}
+        '201': {description: Committed to the canonical plane}
+        '200': {description: Replay (duplicate_events counts the repeated envelopes)}
         '400': {description: Invalid envelope}
-        '409': {description: Idempotency conflict}
+        '409': {description: Idempotency conflict (legacy mode) or identity forgotten}
         '413': {description: Body too large}
         '401': {description: Unauthorized}
-        '403': {description: Collector source scope mismatch}
+        '403': {description: Collector source scope mismatch or canonical authority forbidden}
+        '503': {description: Canonical plane unavailable and RECALL_LEGACY_WRITES=0}
   /webhooks/v1/events:
     post:
       summary: Commit one typed source-scoped webhook event
@@ -71,6 +78,8 @@ paths:
         The bearer credential owns source identity, principal identity, private
         visibility, provenance, and scrub/drop policy. The request cannot override
         those fields. Exact retries are idempotent; deletion is explicit only.
+        H1-T6: the raw body is archived into raw_artifacts and the event commits
+        through the canonical v2 plane; the response carries duplicate_events.
       operationId: ingestWebhookEvent
       security:
         - webhookBearer: []
@@ -82,16 +91,18 @@ paths:
               $ref: '#/components/schemas/WebhookEventV1'
       responses:
         '201': {description: New canonical version committed}
-        '200': {description: Exact idempotent replay}
+        '200': {description: Exact idempotent replay (duplicate_events=1)}
         '202': {description: Event dropped by the credential privacy policy}
         '400': {description: Invalid closed or typed event}
         '401': {description: Missing, invalid, wrong-capability, or revoked credential}
-        '409': {description: Idempotency conflict}
+        '403': {description: Canonical authority forbidden for the bound source}
+        '409': {description: Idempotency conflict or identity forgotten}
         '413': {description: Body too large}
         '415': {description: Unsupported content type}
+        '503': {description: Canonical plane unavailable and RECALL_LEGACY_WRITES=0}
   /v1/receipts/resolve:
     get:
-      summary: Resolve a sanitized evidence receipt
+      summary: Resolve a sanitized evidence receipt (canonical plane first)
       operationId: resolveReceipt
       security:
         - bearerAuth: []
@@ -106,7 +117,11 @@ paths:
         '401': {description: Unauthorized}
   /v1/search:
     post:
+      deprecated: true
       summary: Search authorized projected evidence with receipts and WHY legs
+      description: >
+        Retired legacy v1 route (H1-T6). Answers 410 Gone by default; use the
+        `recall_search` MCP tool. RECALL_LEGACY_READS=1 restores the previous behavior.
       operationId: searchRecall
       security:
         - bearerAuth: []
@@ -122,22 +137,40 @@ paths:
                 filters: {type: object}
                 limit: {type: integer, minimum: 1, maximum: 20, default: 10}
       responses:
+        '410':
+          description: Legacy v1 plane retired (default); set RECALL_LEGACY_READS=1 to restore
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LegacyPlaneRetired'}
         '200': {description: Ranked receipt-bearing results or an abstention reason}
         '400': {description: Invalid query or filter}
         '401': {description: Unauthorized}
   /v1/show:
     post:
+      deprecated: true
       summary: Read a bounded source-session window by path or receipt
+      description: >
+        Retired legacy v1 route (H1-T6). Answers 410 Gone by default; use the
+        `recall_show` MCP tool. RECALL_LEGACY_READS=1 restores the previous behavior.
       operationId: showRecall
       security:
         - bearerAuth: []
       responses:
+        '410':
+          description: Legacy v1 plane retired (default); set RECALL_LEGACY_READS=1 to restore
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LegacyPlaneRetired'}
         '200': {description: Ordered sanitized chunks with receipts}
         '404': {description: Source session not found}
         '401': {description: Unauthorized}
   /v1/session-export:
     post:
+      deprecated: true
       summary: Page through one immutable sanitized session snapshot
+      description: >
+        Retired legacy v1 route (H1-T6). Answers 410 Gone by default; use the
+        `recall_session_context` MCP tool. RECALL_LEGACY_READS=1 restores the previous behavior.
       operationId: exportRecallSession
       security:
         - bearerAuth: []
@@ -155,17 +188,31 @@ paths:
                 - required: [target]
                 - required: [cursor]
       responses:
+        '410':
+          description: Legacy v1 plane retired (default); set RECALL_LEGACY_READS=1 to restore
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LegacyPlaneRetired'}
         '200': {description: Ordered redacted evidence page with snapshot and coverage receipts}
         '400': {description: Invalid target, cursor, or limit}
         '404': {description: Session/cursor not found or outside caller source scope}
         '401': {description: Unauthorized}
   /v1/related:
     post:
+      deprecated: true
       summary: Find source sessions related by worktree and branch context
+      description: >
+        Retired legacy v1 route (H1-T6). Answers 410 Gone by default; use the
+        `recall_related` MCP tool. RECALL_LEGACY_READS=1 restores the previous behavior.
       operationId: relatedRecall
       security:
         - bearerAuth: []
       responses:
+        '410':
+          description: Legacy v1 plane retired (default); set RECALL_LEGACY_READS=1 to restore
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LegacyPlaneRetired'}
         '200': {description: Ranked related sessions with provenance}
         '401': {description: Unauthorized}
   /v1/doctor:
@@ -334,6 +381,16 @@ components:
       schema: {type: string, minLength: 32, maxLength: 256}
       description: Must equal the Strict CSRF cookie and the server-side session digest.
   schemas:
+    LegacyPlaneRetired:
+      type: object
+      required: [error, code, replacement]
+      properties:
+        error: {type: string, enum: [gone]}
+        code: {type: string, enum: [legacy_plane_retired]}
+        replacement:
+          type: string
+          description: Canonical MCP tool that replaces the retired route
+          enum: [recall_search, recall_show, recall_related, recall_session_context]
     ConnectorRouteV1:
       type: object
       additionalProperties: false

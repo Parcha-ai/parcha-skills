@@ -144,6 +144,9 @@ class WebhookHttpContractTest(unittest.TestCase):
                 "RECALL_AUTH_REQUIRED": "1",
                 "RECALL_HTTP_PROFILE": "public-edge",
                 "RECALL_TRUST_TAILSCALE_HEADERS": "0",
+                # These tests pin the v1 store contract; the retired default
+                # (canonical-only writes) is covered in test_legacy_plane.py.
+                "RECALL_LEGACY_WRITES": "1",
             },
             clear=False,
         )

@@ -50,6 +50,14 @@ from .evidence_projection import (
 )
 from .invitation_email import onboarding_page
 from .projection_worker import projection_totals
+from .legacy_plane import (
+    LEGACY_READ_ROUTES,
+    CanonicalPlaneUnavailable,
+    LegacyIngestBridge,
+    legacy_reads_enabled,
+    legacy_retired_response,
+    validate_legacy_flags,
+)
 from .mcp import (
     LATEST_PROTOCOL_VERSION,
     SUPPORTED_PROTOCOL_VERSIONS,
@@ -117,6 +125,27 @@ class Handler(BaseHTTPRequestHandler):
     canonical_retrieval: CanonicalRetrieval | None = None
     control_plane: ControlPlane | None = None
     external_identity_verifier: ExternalIdentityVerifier | None = None
+
+    def legacy_ingest(self) -> LegacyIngestBridge:
+        """v1 write entry points route through the canonical plane (H1-T6)."""
+        return LegacyIngestBridge(
+            self.store,
+            self.canonical_plane,
+            self.archive_store,
+        )
+
+    @staticmethod
+    def legacy_write_error_status(exc: CanonicalLifecycleError) -> int:
+        code = exc.error_code
+        if code in {"canonical_identity_forgotten", "archive_identity_forgotten"}:
+            return 409
+        if code in {
+            "canonical_authority_forbidden",
+            "canonical_lineage_invalid",
+            "archive_authority_forbidden",
+        }:
+            return 403
+        return 400
 
     def log_message(self, fmt: str, *args) -> None:
         LOG.info(
@@ -1460,7 +1489,7 @@ class Handler(BaseHTTPRequestHandler):
                 with self.store.connect() as connection:
                     routes = connection.execute(
                         """SELECT installation.source_id,installation.principal_id,
-                                  installation.privacy_mode
+                                  installation.privacy_mode,installation.tenant_id
                              FROM connector_installations installation
                              JOIN provider_connections provider
                                ON provider.id=installation.connection_id
@@ -1473,6 +1502,7 @@ class Handler(BaseHTTPRequestHandler):
                     ).fetchall()
                 committed = 0
                 replayed = 0
+                duplicate_events = 0
                 for route in routes:
                     prepared = build_webhook_event(adapted.webhook, {
                         "source_id": route["source_id"],
@@ -1482,18 +1512,37 @@ class Handler(BaseHTTPRequestHandler):
                     })
                     if prepared.event is None:
                         continue
-                    _acknowledgement, replay = self.store.ingest(
-                        prepared.idempotency_key, [prepared.event],
+                    acknowledgement, replay = self.legacy_ingest().ingest(
+                        prepared.idempotency_key,
+                        [prepared.event],
+                        principal={
+                            "tenant_id": route["tenant_id"],
+                            "principal_id": route["principal_id"],
+                            "source_id": route["source_id"],
+                        },
+                        raw_payload=raw,
                     )
                     committed += 1
                     replayed += int(replay)
+                    duplicate_events += int(
+                        acknowledgement.get("duplicate_events") or 0
+                    )
                 self.send_json(200, {
-                    "status": "accepted", "routes": committed, "replays": replayed,
+                    "status": "accepted",
+                    "routes": committed,
+                    "replays": replayed,
+                    "duplicate_events": duplicate_events,
                 })
             except (WebhookError, ValueError):
                 self.send_json(400, {"error": "invalid slack webhook"})
             except IdempotencyConflict:
                 self.send_json(409, {"error": "slack webhook conflict"})
+            except CanonicalPlaneUnavailable:
+                self.send_json(503, {"error": "canonical plane unavailable"})
+            except CanonicalLifecycleError as exc:
+                self.send_json(
+                    self.legacy_write_error_status(exc), {"error": exc.error_code},
+                )
             except Exception as exc:
                 LOG.error("slack webhook failed type=%s", type(exc).__name__)
                 self.send_json(500, {"error": "slack webhook failed"})
@@ -1512,7 +1561,8 @@ class Handler(BaseHTTPRequestHandler):
             if length is None:
                 return
             try:
-                body = json.loads(self.rfile.read(length))
+                raw = self.rfile.read(length)
+                body = json.loads(raw)
                 prepared = build_webhook_event(body, principal)
                 if prepared.event is None:
                     self.send_json(
@@ -1525,9 +1575,11 @@ class Handler(BaseHTTPRequestHandler):
                         },
                     )
                     return
-                acknowledgement, replay = self.store.ingest(
+                acknowledgement, replay = self.legacy_ingest().ingest(
                     prepared.idempotency_key,
                     [prepared.event],
+                    principal=principal,
+                    raw_payload=raw,
                 )
                 receipts = acknowledgement.get("receipts")
                 if not isinstance(receipts, list) or len(receipts) != 1:
@@ -1538,6 +1590,9 @@ class Handler(BaseHTTPRequestHandler):
                         "status": acknowledgement.get("status", "committed"),
                         "receipt": receipts[0],
                         "replay": replay,
+                        "duplicate_events": int(
+                            acknowledgement.get("duplicate_events") or 0
+                        ),
                         "privacy": prepared.privacy,
                     },
                 )
@@ -1545,6 +1600,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "invalid webhook"})
             except IdempotencyConflict:
                 self.send_json(409, {"error": "webhook conflict"})
+            except CanonicalPlaneUnavailable:
+                self.send_json(503, {"error": "canonical plane unavailable"})
+            except CanonicalLifecycleError as exc:
+                self.send_json(
+                    self.legacy_write_error_status(exc), {"error": exc.error_code},
+                )
             except Exception as exc:
                 LOG.error("webhook failed type=%s", type(exc).__name__)
                 self.send_json(500, {"error": "webhook failed"})
@@ -1653,7 +1714,10 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.send_json(200, bound_mcp_response(response, request_id))
             return
-        if path in {"/v1/search", "/v1/show", "/v1/related", "/v1/session-export"}:
+        if path in LEGACY_READ_ROUTES:
+            if not legacy_reads_enabled():
+                self.send_json(410, legacy_retired_response(path))
+                return
             principal = self.require("read")
             if not principal:
                 return
@@ -1734,14 +1798,22 @@ class Handler(BaseHTTPRequestHandler):
                         COUNTERS["auth_denied"] += 1
                     self.send_json(403, {"error": "collector source scope mismatch"})
                     return
-            ack, replay = self.store.ingest(
-                self.headers.get("Idempotency-Key", ""), body["events"]
+            ack, replay = self.legacy_ingest().ingest(
+                self.headers.get("Idempotency-Key", ""),
+                body["events"],
+                principal=principal,
             )
             with COUNTER_LOCK:
                 COUNTERS["ingest_replays" if replay else "ingest_commits"] += 1
             self.send_json(200 if replay else 201, {**ack, "replay": replay})
         except IdempotencyConflict as exc:
             self.send_json(409, {"error": str(exc)})
+        except CanonicalPlaneUnavailable:
+            self.send_json(503, {"error": "canonical plane unavailable"})
+        except CanonicalLifecycleError as exc:
+            self.send_json(
+                self.legacy_write_error_status(exc), {"error": exc.error_code},
+            )
         except (ValueError, KeyError, json.JSONDecodeError) as exc:
             LOG.warning("ingest rejected type=%s", type(exc).__name__)
             self.store.record_dead_letter(type(exc).__name__, str(exc))
@@ -1777,6 +1849,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def validate_http_profile() -> None:
+    validate_legacy_flags()
     profile = os.environ.get("RECALL_HTTP_PROFILE", "")
     if profile not in {"", "public-edge", "public-mcp"}:
         raise RuntimeError("unsupported HTTP profile")
@@ -1898,6 +1971,11 @@ def configure_runtime(dsn: str) -> None:
             Handler.evidence_projector,
             actor_identity_index,
         )
+        Handler.store.legacy_ingest_bridge = LegacyIngestBridge(
+            Handler.store,
+            Handler.canonical_plane,
+            Handler.archive_store,
+        )
         Handler.canonical_retrieval = (
             CanonicalRetrieval(
                 Handler.store,
@@ -1915,6 +1993,7 @@ def configure_runtime(dsn: str) -> None:
         Handler.deep_inspector = None
         Handler.canonical_plane = None
         Handler.canonical_retrieval = None
+        Handler.store.legacy_ingest_bridge = None
 
 
 def serve(dsn: str, host: str = "127.0.0.1", port: int = 8788) -> None:

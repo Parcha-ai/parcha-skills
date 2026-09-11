@@ -297,7 +297,7 @@ class BrainStore:
             raise ValueError("write credential requires a source")
         if tenant_id is not None and (
             not V2_AUTHORITY_RE.fullmatch(tenant_id)
-            or "write" not in scopes
+            or not ({"write", "webhook"} & set(scopes))
             or not isinstance(source_id, str)
             or not V2_AUTHORITY_RE.fullmatch(source_id)
             or not isinstance(principal_id, str)
@@ -1373,12 +1373,30 @@ class BrainStore:
             ).fetchall()
         return [row["source_id"] for row in rows]
 
+    # Set by ``recall_server.app.configure_runtime`` (and tests) so MCP capture
+    # writes reach the canonical plane. ``None`` means legacy-only when
+    # ``RECALL_LEGACY_WRITES=1`` and a fail-closed error otherwise (H1-T6).
+    legacy_ingest_bridge: Any = None
+
+    def _legacy_bridge(self):
+        bridge = self.legacy_ingest_bridge
+        if bridge is None:
+            from .legacy_plane import LegacyIngestBridge
+
+            bridge = LegacyIngestBridge(self, None, None)
+        return bridge
+
     def capture(self, principal: dict, arguments: dict) -> dict:
         event, privacy = build_capture_event(arguments, principal)
         idempotency_key = (
             "mcp-capture-v1-" + hashlib.sha256(canonical_json(event)).hexdigest()
         )
-        acknowledgement, replay = self.ingest(idempotency_key, [event])
+        acknowledgement, replay = self._legacy_bridge().ingest(
+            idempotency_key,
+            [event],
+            principal=principal,
+            connector_id="mcp.capture",
+        )
         result = {
             "status": acknowledgement.get("status", "committed"),
             "native_id": event["native_id"],
@@ -1386,7 +1404,8 @@ class BrainStore:
             "privacy": privacy,
         }
         if acknowledgement.get("receipts"):
-            result["receipt"] = acknowledgement["receipts"][0] + "#item=0"
+            receipt = acknowledgement["receipts"][0]
+            result["receipt"] = receipt if "#" in receipt else receipt + "#item=0"
         return result
 
     def forget_capture(self, principal: dict, receipt: str) -> dict:
@@ -1397,11 +1416,20 @@ class BrainStore:
         native_id, revision, event_part = parse_capture_receipt(receipt, source_id)
         with self.connect() as conn:
             captured = conn.execute(
-                """SELECT occurred_at FROM source_events
+                """SELECT occurred_at FROM canonical_events
                    WHERE source_id=%s AND native_id=%s AND revision=%s
-                     AND kind='capture' AND principal_id=%s""",
+                     AND kind='capture'
+                     AND canonical_redacted->>'principal_id'=%s
+                   ORDER BY created_at LIMIT 1""",
                 (source_id, native_id, revision, principal_id),
             ).fetchone()
+            if not captured:
+                captured = conn.execute(
+                    """SELECT occurred_at FROM source_events
+                       WHERE source_id=%s AND native_id=%s AND revision=%s
+                         AND kind='capture' AND principal_id=%s""",
+                    (source_id, native_id, revision, principal_id),
+                ).fetchone()
         if not captured:
             raise ValueError("capture receipt not found")
         event = build_forget_event(
@@ -1414,7 +1442,12 @@ class BrainStore:
         idempotency_key = (
             "mcp-forget-v1-" + hashlib.sha256(canonical_json(event)).hexdigest()
         )
-        acknowledgement, replay = self.ingest(idempotency_key, [event])
+        acknowledgement, replay = self._legacy_bridge().ingest(
+            idempotency_key,
+            [event],
+            principal=principal,
+            connector_id="mcp.capture",
+        )
         return {
             "status": acknowledgement.get("status", "committed"),
             "native_id": native_id,
@@ -2654,6 +2687,11 @@ class BrainStore:
         except (ValueError, TypeError):
             raise ValueError("invalid receipt") from None
         with self.connect() as conn:
+            canonical = self._resolve_canonical(
+                conn, source_id, native_id, revision, authorized_source,
+            )
+            if canonical is not None:
+                return canonical
             event = conn.execute(
                 """SELECT id,source_id,native_id,native_parent_id,kind,occurred_at,observed_at,principal_id,
                    visibility,content_type,content_sha256,revision,is_tombstone,
@@ -2687,6 +2725,79 @@ class BrainStore:
                 (event["id"],),
             ).fetchall()
             return {"event": {key: value for key, value in event.items() if key != "id"}, "items": items}
+
+    @staticmethod
+    def _resolve_canonical(
+        conn,
+        source_id: str,
+        native_id: str,
+        revision: int,
+        authorized_source: str | None,
+    ) -> dict | None:
+        """Resolve a receipt against the canonical v2 plane.
+
+        The v1 plane is retired (H1-T6); receipts minted by the canonical
+        writer live in ``canonical_events`` and project through
+        ``canonical_chunks``. The response keeps the v1 shape so existing
+        callers keep working. Content stays out except for redacted chunk text.
+        """
+        event = conn.execute(
+            """SELECT event.tenant_id,event.event_id,event.source_id,event.native_id,
+                      event.native_parent_id,event.kind,event.occurred_at,
+                      event.observed_at,
+                      event.canonical_redacted->>'principal_id' AS principal_id,
+                      COALESCE(event.canonical_redacted->>'visibility','private')
+                        AS visibility,
+                      COALESCE(event.canonical_redacted->>'content_type',
+                               'application/json') AS content_type,
+                      event.content_sha256,event.revision,event.is_tombstone,
+                      jsonb_strip_nulls(jsonb_build_object(
+                        'connector_id',
+                          event.canonical_redacted #>> '{provenance,connector_id}',
+                        'uri', event.canonical_redacted #>> '{provenance,uri}',
+                        'original_path',
+                          event.canonical_redacted #>> '{provenance,original_path}',
+                        'harness', event.canonical_redacted #>> '{provenance,harness}',
+                        'cwd', event.canonical_redacted #>> '{provenance,cwd}',
+                        'branch', event.canonical_redacted #>> '{provenance,branch}'
+                      )) AS provenance
+               FROM canonical_events event
+               WHERE event.source_id=%s AND event.native_id=%s AND event.revision=%s
+                 AND (%s::text IS NULL OR event.source_id=%s)
+                 AND NOT EXISTS (
+                   SELECT 1 FROM canonical_events later
+                   WHERE later.tenant_id=event.tenant_id
+                     AND later.source_id=event.source_id
+                     AND later.native_id=event.native_id
+                     AND later.revision>event.revision
+                     AND later.is_tombstone
+                 )
+               ORDER BY event.created_at
+               LIMIT 1""",
+            (source_id, native_id, revision, authorized_source, authorized_source),
+        ).fetchone()
+        if not event:
+            return None
+        items = conn.execute(
+            """SELECT chunk.ordinal,%s::timestamptz AS occurred_at,
+                      NULL::text AS role,NULL::text AS surface,
+                      chunk.text_redacted,chunk.receipt
+               FROM canonical_chunks chunk
+               JOIN canonical_documents document
+                 USING(tenant_id,source_id,document_id)
+               WHERE document.tenant_id=%s AND document.source_id=%s
+                 AND document.event_id=%s AND chunk.deleted_at IS NULL
+               ORDER BY chunk.ordinal""",
+            (event["occurred_at"], event["tenant_id"], source_id, event["event_id"]),
+        ).fetchall()
+        return {
+            "event": {
+                key: value
+                for key, value in event.items()
+                if key not in {"tenant_id", "event_id"}
+            },
+            "items": items,
+        }
 
     @staticmethod
     def _read_filters(

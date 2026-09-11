@@ -1316,6 +1316,7 @@ class IngestTransactionContractTest(unittest.TestCase):
 
 
 class DeliberateCaptureContractTest(unittest.TestCase):
+    @mock.patch.dict(os.environ, {"RECALL_LEGACY_WRITES": "1"})
     def test_capture_returns_the_canonical_searchable_item_receipt(self) -> None:
         store = BrainStore("postgresql://synthetic.invalid/recall")
         store.ingest = mock.MagicMock(
