@@ -171,7 +171,10 @@ def main() -> None:
             raise RuntimeError("database capability contract failed")
         run(
             "docker", "run", "-d", "--name", name, "--read-only", "--network", "host",
-            "-e", "RECALL_DATABASE_URL", image,
+            "-e", "RECALL_DATABASE_URL",
+            # This contract drives the v1 REST routes with a plain collector
+            # token and no archive; pin the v1 plane (H1-T6).
+            "-e", "RECALL_LEGACY_WRITES", "-e", "RECALL_LEGACY_READS", image,
             "serve", "--host", "0.0.0.0", "--port", "18788", "--require-auth",
             "--capability-profile", "local-fixture",
             env=child_env,
