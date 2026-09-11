@@ -95,6 +95,8 @@ def main() -> None:
         log_path = Path(tmp) / "server.log"
         log = log_path.open("w")
         env = os.environ | {
+            "RECALL_LEGACY_WRITES": "1",
+            "RECALL_LEGACY_READS": "1",
             "PYTHONPATH": os.pathsep.join((str(RECALL), str(SERVER))),
             "RECALL_DATABASE_URL": dsn,
             "RECALL_PORT": str(port),

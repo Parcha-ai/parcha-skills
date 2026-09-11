@@ -124,12 +124,16 @@ def main() -> None:
             "RECALL_AUTH_REQUIRED",
             "RECALL_HTTP_PROFILE",
             "RECALL_TRUST_TAILSCALE_HEADERS",
+            "RECALL_LEGACY_WRITES",
         )
     }
     os.environ.update({
         "RECALL_AUTH_REQUIRED": "1",
         "RECALL_HTTP_PROFILE": "public-mcp",
         "RECALL_TRUST_TAILSCALE_HEADERS": "0",
+        # v1 store contract proof; canonical-mode capture is covered by
+        # e2e_webhook_ingest.py (H1-T6).
+        "RECALL_LEGACY_WRITES": "1",
     })
     Handler.store = store
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)

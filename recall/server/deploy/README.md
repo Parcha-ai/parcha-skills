@@ -31,6 +31,28 @@ webhook-capability bearer bound to one source, principal, and `scrub` or `drop` 
 exposes the generic batch-ingest, credential, migration, metrics, doctor, debug, or administrative
 surfaces. Use `public-mcp` when no incoming webhook is required.
 
+## Legacy v1 plane retirement (H1-T6)
+
+The v1 tables (`sources`, `source_grants`, `source_events`, `items`, `chunks`, `entities`,
+`item_embeddings`, `sessions`, `turn_embedding*`, `projection_watermarks`, `projection_backfills`,
+`ingest_batches`, `embedding_projection_watermarks`) no longer receive writes. Webhooks and
+`POST /v1/ingest/batches` archive the raw body into `raw_artifacts` and commit through the
+canonical plane, so any profile that accepts them needs `RECALL_CANONICAL_V2_ENABLED=1` and the
+`RECALL_ARCHIVE_*` settings; without a canonical plane those routes answer `503` and write
+nothing. `POST /v1/search`, `/v1/show`, `/v1/related`, and `/v1/session-export` answer
+`410 Gone` with `{"error":"gone","code":"legacy_plane_retired","replacement":"<MCP tool>"}`.
+`GET /v1/receipts/resolve` stays and resolves canonical receipts.
+
+```text
+RECALL_LEGACY_WRITES=0              # 1 = rollback: dual-write the v1 tables again
+RECALL_LEGACY_READS=0               # 1 = restore the four v1 read routes
+RECALL_LEGACY_INGEST_TENANT_ID=tenant:personal   # tenant for non-tenant-bound v1 callers
+```
+
+The tables are dropped thirty days after both flags have been `0` in production; the drop is a
+separate change. Flags, rollback steps, the drop order, and the pre-drop checklist live in
+`docs/architecture/storage-runbook.md`.
+
 Create one webhook-only credential through an administrative process and write the one-time value
 directly to a new private file:
 

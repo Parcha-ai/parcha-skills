@@ -112,7 +112,12 @@ def main() -> None:
     image = os.environ.get("RECALL_CORE_IMAGE", "recall-core:e2e")
     name = f"recall-core-e2e-{os.getpid()}"
     dsn = runtime_dsn(admin_dsn)
-    child_env = {**os.environ, "RECALL_DATABASE_URL": dsn}
+    child_env = {
+        **os.environ,
+        "RECALL_DATABASE_URL": dsn,
+        "RECALL_LEGACY_WRITES": "1",
+        "RECALL_LEGACY_READS": "1",
+    }
     try:
         configure_role(admin_dsn)
         identity = run(
