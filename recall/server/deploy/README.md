@@ -377,6 +377,28 @@ with a `Retry-After` header that collectors honor with jitter. Persistent
 `recall_http_pool_busy_total` growth in `/metrics` means the pool, the
 database tier, or the number of collector hosts needs attention.
 
+Recall is write-dominated (roughly 1,100 collector writes for every 50 MCP
+reads per day), so two hot write paths are cached or batched in process:
+
+- `RECALL_IDENTITY_CACHE_TTL_SECONDS` (default 600; `0` disables) and
+  `RECALL_IDENTITY_CACHE_MAX` (default 10000) bound the identity-write cache.
+  Every collector write registers its tenant, principal, source, owner grant,
+  and derived read grants; the cache remembers identity tuples whose source
+  row was already committed so a repeat write runs zero registration
+  statements. Only positive results are cached, a brand-new source is never
+  cached inside its own transaction, and membership changes (brain
+  provisioning, invitation acceptance, member revocation) invalidate the
+  tenant. The cache is per process; the TTL bounds staleness across replicas.
+- `RECALL_AUDIT_BATCH_ROWS` (default 500; `0` writes every row synchronously)
+  and `RECALL_AUDIT_BATCH_SECONDS` (default 2) batch the authorization audit
+  rows for allowed MCP decisions. Denied decisions are always written
+  synchronously so the row is durable before the 403 returns. Allowed rows
+  wait in a bounded queue (four batches deep) that a daemon thread flushes at
+  the row or time threshold, whichever comes first; on overflow the caller
+  writes its row synchronously, so no audit row is dropped. Shutdown flushes
+  the queue, and `BrainStore.flush_authorization_audit()` forces a flush for
+  tests and operators. The `authorization_audit_events` schema is unchanged.
+
 Enable the canonical v2 write plane only after the archive probe and database
 migrations pass:
 

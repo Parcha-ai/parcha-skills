@@ -11,6 +11,7 @@ from contracts.v2 import ContractError, IDENTITY_RE, validate_contract
 
 from .actor_attribution import ActorIdentityIndex, attribute_canonical_events
 from .db import BrainStore
+from .identity_cache import REGISTRATION_CACHE, IdentityRegistrationCache
 from .canonical_text import (
     MAX_CANONICAL_CHUNK_BYTES as MAX_CANONICAL_CHUNK_BYTES,
     MAX_CANONICAL_TEXT_BYTES,
@@ -269,7 +270,19 @@ class CanonicalPlane:
         tenant_id: str,
         principal_id: str,
         source_id: str,
+        cache: IdentityRegistrationCache | None = None,
     ) -> None:
+        """Register the identity tuple, or skip every statement on a cache hit.
+
+        A hit means an earlier call on this process saw the source row already
+        committed with this owner, so the ownership check and the idempotent
+        upserts are known to hold. Membership mutations invalidate the tenant;
+        see ``identity_cache`` for the safety argument.
+        """
+        registration_cache = REGISTRATION_CACHE if cache is None else cache
+        key = (tenant_id, principal_id, source_id)
+        if registration_cache.contains(key):
+            return
         conn.execute(
             "INSERT INTO brain_tenants(tenant_id) VALUES (%s) ON CONFLICT DO NOTHING",
             (tenant_id,),
@@ -279,11 +292,14 @@ class CanonicalPlane:
                VALUES (%s,%s) ON CONFLICT DO NOTHING""",
             (tenant_id, principal_id),
         )
-        conn.execute(
+        inserted_source = conn.execute(
             """INSERT INTO canonical_sources(tenant_id,source_id,owner_principal_id)
                VALUES (%s,%s,%s) ON CONFLICT DO NOTHING""",
             (tenant_id, source_id, principal_id),
         )
+        # Only a source that already existed before this transaction is safe
+        # to remember: a fresh insert may still roll back with the caller.
+        source_preexisted = getattr(inserted_source, "rowcount", None) == 0
         owner = conn.execute(
             """SELECT owner_principal_id
                FROM canonical_sources
@@ -337,6 +353,8 @@ class CanonicalPlane:
                END""",
             (source_id, principal_id, tenant_id),
         )
+        if source_preexisted:
+            registration_cache.remember(key)
 
     def ingest_document(
         self,

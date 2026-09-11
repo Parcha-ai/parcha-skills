@@ -1123,6 +1123,8 @@ def main() -> None:
                 {"target": personal_receipt},
             )
             assert deleted_show["error"]["message"] == "receipt not found"
+            # Allowed decisions are batched; force them to disk before asserting.
+            store.flush_authorization_audit()
             with store.connect() as connection:
                 audits = connection.execute(
                     """SELECT principal_kind,principal_id,tenant_id,action,
