@@ -7,6 +7,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /opt/recall
 
+# Debian security fixes newer than the pinned base image (CI trivy gate:
+# CRITICAL/HIGH with fixes must not ship). Upgrade installed packages only.
+RUN apt-get update \
+    && apt-get upgrade --yes --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY server/requirements.txt /opt/recall/requirements.txt
 RUN python -m pip install --no-cache-dir --disable-pip-version-check --no-compile -r requirements.txt \
     && groupadd --gid 10001 recall \
