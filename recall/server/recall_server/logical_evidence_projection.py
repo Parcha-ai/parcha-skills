@@ -1597,7 +1597,16 @@ class CanonicalLogicalEvidenceProjector:
         upload_concurrency: int = 2,
         quiet_seconds: float = 0.0,
         max_wait_seconds: float = 0.0,
+        cleanup_concurrency: int | None = None,
     ) -> dict[str, int | str]:
+        if cleanup_concurrency is None:
+            cleanup_concurrency = upload_concurrency
+        if (
+            isinstance(cleanup_concurrency, bool)
+            or not isinstance(cleanup_concurrency, int)
+            or not 1 <= cleanup_concurrency <= 64
+        ):
+            raise LogicalEvidenceError("logical_evidence_budget_invalid")
         if (
             isinstance(quiet_seconds, bool)
             or not isinstance(quiet_seconds, (int, float))
@@ -1635,10 +1644,13 @@ class CanonicalLogicalEvidenceProjector:
         repaired = 0
         old_objects_deleted = cleanup_failures = source_races = pruned = 0
         cleanup_completed = cleanup_pending = 0
+        # Object deletes are S3 round trips, not database work: measured at
+        # ~8 s each in production when serialized, they held one cycle for
+        # 25 minutes. Fan them out independently of the upload budget.
         cleanup = self.drain_cleanup(
             tenant_id=tenant_id,
             limit=5_000,
-            concurrency=upload_concurrency,
+            concurrency=cleanup_concurrency,
         )
         old_objects_deleted += int(cleanup["deleted"])
         cleanup_failures += int(cleanup["failures"])
@@ -1723,7 +1735,7 @@ class CanonicalLogicalEvidenceProjector:
                 self.drain_cleanup(
                     tenant_id=tenant_id,
                     limit=5_000,
-                    concurrency=upload_concurrency,
+                    concurrency=cleanup_concurrency,
                 )
                 raise
             if failures:
@@ -1731,7 +1743,7 @@ class CanonicalLogicalEvidenceProjector:
                 self.drain_cleanup(
                     tenant_id=tenant_id,
                     limit=5_000,
-                    concurrency=upload_concurrency,
+                    concurrency=cleanup_concurrency,
                 )
                 raise failures[0]
             statuses: list[str | None] = [None] * len(candidates)
@@ -1759,7 +1771,11 @@ class CanonicalLogicalEvidenceProjector:
                     except Exception as error:
                         failures.append(error)
             if failures:
-                self.drain_cleanup(tenant_id=tenant_id, limit=5_000)
+                self.drain_cleanup(
+                    tenant_id=tenant_id,
+                    limit=5_000,
+                    concurrency=cleanup_concurrency,
+                )
                 raise failures[0]
             for upload, status in zip(uploads, statuses, strict=True):
                 if status == "stale":

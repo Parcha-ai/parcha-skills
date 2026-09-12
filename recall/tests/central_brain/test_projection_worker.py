@@ -660,3 +660,65 @@ class ThinnerBusyModeTests(unittest.TestCase):
         seen, result = self._run(logical_pending=0)
         self.assertEqual(seen, [False])
         self.assertEqual(result["thin_mode"], "idle")
+
+
+class ParquetNeverStarvesTests(unittest.TestCase):
+    """The scan plane rebuilds at least every N cycles even while logical work is queued."""
+
+    def _run(self, *, logical_pending: int, every: int) -> tuple[list[str], dict, "_Logical"]:
+        calls: list[str] = []
+        logical = _Logical(calls, work=0, pending=logical_pending)
+        result = run_projection_worker(
+            logical,  # type: ignore[arg-type]
+            _Passages(calls, work=0),  # type: ignore[arg-type]
+            _Scan(calls, work=0),  # type: ignore[arg-type]
+            tenant_id="tenant:company:test",
+            logical_batch_size=5,
+            passage_batch_size=5,
+            embedding_batch_size=64,
+            max_batches_per_cycle=1,
+            upload_concurrency=1,
+            passage_concurrency=1,
+            interval_seconds=30,
+            once=True,
+            parquet_every_cycles=every,
+            cleanup_concurrency=8,
+        )
+        return calls, result, logical
+
+    def test_parquet_runs_when_the_cycle_budget_is_due_despite_backlog(self):
+        calls, result, _ = self._run(logical_pending=12, every=1)
+        self.assertIn("scan", calls)
+        self.assertNotEqual(result["status"], "deferred")
+
+    def test_parquet_is_deferred_before_the_budget_while_backlog_exists(self):
+        calls, _, _ = self._run(logical_pending=12, every=2)
+        self.assertNotIn("scan", calls)
+
+    def test_parquet_runs_immediately_when_queues_are_drained(self):
+        calls, _, _ = self._run(logical_pending=0, every=50)
+        self.assertIn("scan", calls)
+
+    def test_cleanup_concurrency_is_passed_to_the_logical_projector(self):
+        _, _, logical = self._run(logical_pending=0, every=3)
+        self.assertEqual(logical.kwargs["cleanup_concurrency"], 8)
+
+    def test_invalid_budgets_are_rejected(self):
+        calls: list[str] = []
+        for bad in ({"parquet_every_cycles": 0}, {"cleanup_concurrency": 65}, {"parquet_every_cycles": True}):
+            with self.assertRaises(ValueError):
+                run_projection_worker(
+                    _Logical(calls, work=0),  # type: ignore[arg-type]
+                    _Passages(calls, work=0),  # type: ignore[arg-type]
+                    _Scan(calls, work=0),  # type: ignore[arg-type]
+                    tenant_id="tenant:company:test",
+                    logical_batch_size=5,
+                    passage_batch_size=5,
+                    embedding_batch_size=64,
+                    max_batches_per_cycle=1,
+                    upload_concurrency=1,
+                    passage_concurrency=1,
+                    interval_seconds=30,
+                    once=True,
+                    **bad,
+                )

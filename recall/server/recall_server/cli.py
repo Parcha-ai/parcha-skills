@@ -1724,6 +1724,14 @@ def main() -> None:
         help="canonical bodies thinned per cycle when no projection work is queued",
     )
     projection_worker.add_argument(
+        "--parquet-every-cycles", type=int, default=3,
+        help="run the parquet scan projector at least every N cycles even while logical work is queued",
+    )
+    projection_worker.add_argument(
+        "--cleanup-concurrency", type=int, default=8,
+        help="parallel S3 object deletes while draining the evidence cleanup queue",
+    )
+    projection_worker.add_argument(
         "--thin-busy-batch-size", type=int, default=100,
         help="canonical bodies thinned per cycle while logical or passage work is queued",
     )
@@ -2341,6 +2349,8 @@ def main() -> None:
                     once=args.once,
                     quiet_seconds=args.quiet_seconds,
                     max_wait_seconds=args.max_wait_seconds,
+                    parquet_every_cycles=args.parquet_every_cycles,
+                    cleanup_concurrency=args.cleanup_concurrency,
                     body_thinner=lambda busy: thin_canonical_bodies(
                         store,
                         tenant_id=args.tenant,
