@@ -4,6 +4,8 @@ _Living plan. Status legend: todo / doing / done / blocked. Evidence = PR + card
 
 ## Status board
 
+_2026-09-12 summary: the day-long search regression was IO saturation from the tombstone lineage query (T9), compounded by never-analyzed statistics on the 12M-row tables and a frozen parquet plane (T8). All three fixed and deployed by 21:35 UTC._
+
 _Ops note 2026-09-11: root disk hit 100% on greppy3 during H0; back to 95% (44 GB free) by 06:15 UTC without deleting anything of ours. Worker finding 06:40 UTC: recall-logical-evidence-worker cycles take ~20 min at 5 docs/cycle while logical_pending grows 212 → 278 in 80 min; freshness 64 h behind. Root cause under investigation (thinning 1000 bodies/cycle + embedding 64/cycle share the cycle)._
 | task | status | owner | evidence |
 |---|---|---|---|
@@ -24,7 +26,9 @@ _Ops note 2026-09-11: root disk hit 100% on greppy3 during H0; back to 95% (44 G
 | H1-T7a thinning yields to freshness | done | lead | PR #499 merged (main 7d46879), worker live 08:55 UTC; cycles 916 s → 89-270 s, thin 713 s → 33 s (100 bodies), logical_pending 283 → 274 in 10 min and falling | H0-7 first timed cycle 08:41 UTC: cycle 916 s = thin 713 s + embed 101 s + logical 51 s + passage 51 s; thinner now takes a 100-body batch while work is queued (`--thin-busy-batch-size`), 1000 when idle |
 | H1-T6b legacy table drop (≥ 30 days after 2026-09-11) | todo | | before the `sources` drop: move `db.py bind_coding_sources_to_employee` off `INSERT INTO sources`; passage projector enqueue still writes no parquet dirty row (fingerprint diff covers it) — add for symmetry |
 | H1-T7 thinning steady state + REINDEX | todo | | after ≥ 2 quiet days post-cutover: REINDEX passages GIN/HNSW CONCURRENTLY, VACUUM ANALYZE, storage runbook |
-| H1-T8 (new) cleanup + embedding throughput | todo | | 18:22 UTC cycle: 200 S3 deletes took 933 s in the logical phase (≈4.6 s/object, upload_concurrency 1) → batch DeleteObjects + concurrency; embed 64 passages = 100-150 s every cycle (voyage, RECALL_EMBEDDING_WORKERS=4) → embedding is the steady-state bottleneck, size per H5-2/H5-3 |
+| H1-T8 parquet never starves + parallel cleanup | deployed | lead | PR #505 merged (main 17f3d1d) after #507 unblocked the trivy gate (both images now apt-get upgrade); MCP + worker live 665d3b2 at 21:3x UTC. Cause found on the 09-12 card (freshness 101 h, scan agreement 0.65, search p95 16 s): parquet gate required an empty logical queue, never true since 09-10 → scan plane frozen 4 days; S3 cleanup serialized at ~8 s/object. Now `--parquet-every-cycles 3`, `--cleanup-concurrency 8`. Also found: planner stats stale (evidence_documents estimated 314 rows vs 30,039 real; never auto-analyzed) → ANALYZE run by hand 20:15 UTC; passages heap cache hit 21%; canonical_chunks 76% dead tuples never vacuumed. Embedding 64/cycle still 40-125 s → H5-2/H5-3 |
+| H1-T9 lineage lookup index fix | deployed | lead | PR #506 merged (main 665d3b2); card 21:31 UTC 16/16 ok: server p95 15.4 s → 133 ms, dense p95 18 ms, lexical p95 130 ms, search p50 448 ms, session_context p95 40 s → 0.85 s. pg_stat_activity 20:25 UTC: tombstone lineage query (`_linked_native_ids*`, ingest path) filtering `native_parent_id=X` scanned 3.58M events / 12 GB / 518 s per call on claude:linux:greppy3; rewritten onto the COALESCE expression index → 0.67 s. Likely the IO saturation behind cold search since the source grew. Also: session_context p95 40 s → 5.3 s right after ANALYZE of events/documents (stats were 20-30× off, never auto-analyzed) |
+| H1-T7 vacuum/analyze/reindex | todo (next) | lead | VACUUM (ANALYZE) canonical_chunks (325k dead rows, 84 GB), REINDEX CONCURRENTLY passages GIN (2.9 GB) + HNSW, then re-measure lexical/dense p95; lower autovacuum scale factor on evidence/passage tables (migration) |
 | H2 a..e | todo | | |
 | H3 a..f | todo | | |
 | H4 1..4 | todo | | |
