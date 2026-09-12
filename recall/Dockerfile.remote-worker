@@ -7,8 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /opt/recall
 
 RUN apt-get update \
-    && apt-get install --only-upgrade --yes --no-install-recommends \
-         libssl3t64 openssl openssl-provider-legacy util-linux \
+    && apt-get upgrade --yes --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY connectors/requirements.txt /opt/recall/requirements.txt
