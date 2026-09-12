@@ -73,14 +73,23 @@ def _linked_native_ids(
 ) -> list[str]:
     rows = conn.execute(
         """WITH RECURSIVE linked(native_id) AS (
+               -- Children are looked up through the expression index on
+               -- COALESCE(native_parent_id, native_id) (session_order_idx);
+               -- a bare native_parent_id predicate has no index and scanned
+               -- every event of the source (12 GB, 518 s on the largest one).
                SELECT DISTINCT native_id
                FROM canonical_events
-               WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s
+               WHERE tenant_id=%s AND source_id=%s
+                 AND COALESCE(native_parent_id,native_id)=%s
+                 AND native_parent_id IS NOT NULL
                UNION
                SELECT event.native_id
                FROM canonical_events event
-               JOIN linked parent ON event.native_parent_id=parent.native_id
+               JOIN linked parent
+                 ON COALESCE(event.native_parent_id,event.native_id)
+                    =parent.native_id
                WHERE event.tenant_id=%s AND event.source_id=%s
+                 AND event.native_parent_id IS NOT NULL
            )
            SELECT native_id FROM linked ORDER BY native_id LIMIT %s""",
         (
@@ -116,12 +125,17 @@ def _linked_native_ids_batch(
                FROM roots root
                JOIN canonical_events event
                  ON event.tenant_id=%s AND event.source_id=%s
-                AND event.native_parent_id=root.root_native_id
+                AND COALESCE(event.native_parent_id,event.native_id)
+                    =root.root_native_id
+                AND event.native_parent_id IS NOT NULL
                UNION
                SELECT parent.root_native_id,event.native_id
                FROM canonical_events event
-               JOIN linked parent ON event.native_parent_id=parent.native_id
+               JOIN linked parent
+                 ON COALESCE(event.native_parent_id,event.native_id)
+                    =parent.native_id
                WHERE event.tenant_id=%s AND event.source_id=%s
+                 AND event.native_parent_id IS NOT NULL
            ), bounded AS (
                SELECT root_native_id,native_id,
                       row_number() OVER (
