@@ -87,11 +87,23 @@ def run_projection_worker(
     quiet_seconds: float = 0.0,
     max_wait_seconds: float = 0.0,
     clock: Callable[[], float] = time.monotonic,
+    parquet_every_cycles: int = 3,
+    cleanup_concurrency: int = 8,
 ) -> dict[str, int | str]:
     """Service every projection stage without upstream backfill starvation."""
 
     if not 0.1 <= interval_seconds <= 300:
         raise ValueError("projection worker interval is invalid")
+    if (
+        isinstance(parquet_every_cycles, bool)
+        or not isinstance(parquet_every_cycles, int)
+        or not 1 <= parquet_every_cycles <= 1000
+        or isinstance(cleanup_concurrency, bool)
+        or not isinstance(cleanup_concurrency, int)
+        or not 1 <= cleanup_concurrency <= 64
+    ):
+        raise ValueError("projection worker budget is invalid")
+    cycles_since_parquet = 0
 
     def elapsed_ms(started: float) -> int:
         return max(0, int(round((clock() - started) * 1000)))
@@ -142,25 +154,32 @@ def run_projection_worker(
             upload_concurrency=upload_concurrency,
             quiet_seconds=quiet_seconds,
             max_wait_seconds=max_wait_seconds,
+            cleanup_concurrency=cleanup_concurrency,
         )
         logical_elapsed_ms = elapsed_ms(phase_started)
         phase_started = clock()
         # Parquet shards are source/month materializations of the authoritative
-        # logical documents. During a large retrofit, every logical batch can
-        # dirty the same shards. Wait until that queue drains so each dirty
-        # shard is rebuilt once instead of rewriting the corpus every cycle.
+        # logical documents. Prefer to run them once the upstream queues have
+        # drained so a dirty month is rebuilt once, but never starve them: with
+        # steady ingestion plus debounce the logical queue is never empty, and
+        # the scan plane went 4 days without a rebuild in production. Every
+        # `parquet_every_cycles` cycles the (now fragment-level) rebuild runs
+        # regardless of the backlog.
+        cycles_since_parquet += 1
+        parquet_due = (
+            int(documents.get("pending", 0)) == 0
+            and projected["status"] == "complete"
+            and int(projected["documents"]) == 0
+        ) or cycles_since_parquet >= parquet_every_cycles
+        if scan is not None and parquet_due:
+            cycles_since_parquet = 0
         scanned = (
             scan.project_pending(
                 tenant_id=tenant_id,
                 batch_size=min(4, logical_batch_size),
                 max_batches=max_batches_per_cycle,
             )
-            if (
-                scan is not None
-                and int(documents.get("pending", 0)) == 0
-                and projected["status"] == "complete"
-                and int(projected["documents"]) == 0
-            )
+            if scan is not None and parquet_due
             else {
                 "status": "deferred" if scan is not None else "complete",
                 "shards": 0,
