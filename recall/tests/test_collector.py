@@ -1689,6 +1689,128 @@ class CollectorTest(unittest.TestCase):
         self.assertFalse(any(x["error_code"] == "PayloadTooLarge" for x in collector.doctor()["dead_letters"]))
         collector.close()
 
+    def _reference_for(self, kwargs: dict, payload: bytes) -> dict:
+        digest = hashlib.sha256(payload).hexdigest()
+        return {
+            "contract": "recall.artifact-ref.v1",
+            "schema_version": 1,
+            "tenant_id": kwargs["tenant_id"],
+            "source_id": kwargs["source_id"],
+            "artifact_id": "art_" + digest[:32],
+            "storage_backend": "s3",
+            "object_key": "objects/aa/" + digest,
+            "content_sha256": digest,
+            "size_bytes": len(payload),
+            "media_type": kwargs["media_type"],
+            "encryption": "sse-s3",
+            "version_id": "synthetic-version",
+            "created_at": kwargs["created_at"],
+        }
+
+    def test_oversized_pointer_always_describes_the_archived_bytes(self) -> None:
+        transcript = self.root / "session.jsonl"
+        transcript.write_text(
+            claude_line("line one\r\nline two\n\n" + "\u00f1" * 6_000 + "\n\n\n")
+        )
+        archived: list[dict] = []
+        ingested: list[dict] = []
+        test = self
+
+        class Archive:
+            def put_raw(self, **kwargs):
+                archived.append(kwargs)
+                return test._reference_for(kwargs, kwargs["payload"])
+
+        class Writer:
+            def ingest(self, events):
+                ingested.extend(events)
+                return {
+                    "status": "committed",
+                    "inserted": len(events),
+                    "duplicate_events": 0,
+                    "receipts": [
+                        f"recall://{event['source_id']}/{event['native_id']}?rev=1"
+                        for event in events
+                    ],
+                    "replay": False,
+                }
+
+        collector = Collector(
+            root=self.root,
+            harness="claude",
+            source_id="claude:linux:test",
+            spool_path=self.spool,
+            endpoint=self.endpoint,
+            token="test-token-not-a-secret",
+            archive=Archive(),
+            brain_writer=Writer(),
+            tenant_id="tenant:personal",
+            bulk_manifest_archive=True,
+            privacy=PrivacyPolicy(mode="scrub"),
+        )
+        with (
+            mock.patch("collector.collector.MAX_BATCH_BYTES", 4_000),
+            mock.patch("collector.collector.OVERSIZED_PROJECTION_TEXT_CHARS", 64),
+        ):
+            collector.scan()
+            collector.flush()
+        full = [
+            item for item in archived
+            if item["media_type"] == "application/vnd.recall.oversized-record+gzip"
+        ]
+        self.assertEqual(len(full), 1)
+        self.assertEqual(len(ingested), 1)
+        content = ingested[0]["content"]
+        reference = ingested[0]["provenance"]["artifact_ref"]
+        uncompressed = gzip.decompress(full[0]["payload"])
+        self.assertEqual(content["contract"], "recall.oversized-projection.v1")
+        self.assertEqual(content["full_size_bytes"], len(uncompressed))
+        self.assertEqual(
+            content["full_content_sha256"],
+            hashlib.sha256(uncompressed).hexdigest(),
+        )
+        self.assertEqual(content["archive_size_bytes"], reference["size_bytes"])
+        self.assertEqual(
+            reference["content_sha256"],
+            hashlib.sha256(full[0]["payload"]).hexdigest(),
+        )
+        self.assertIsInstance(json.loads(uncompressed), dict)
+        collector.close()
+
+    def test_archive_reference_for_other_bytes_is_refused(self) -> None:
+        (self.root / "session.jsonl").write_text(claude_line("x" * 10_000))
+        test = self
+
+        class StaleArchive:
+            def put_raw(self, **kwargs):
+                if kwargs["media_type"].endswith("+gzip"):
+                    return test._reference_for(kwargs, b"bytes of a different record")
+                return test._reference_for(kwargs, kwargs["payload"])
+
+        collector = Collector(
+            root=self.root,
+            harness="claude",
+            source_id="claude:linux:test",
+            spool_path=self.spool,
+            endpoint=self.endpoint,
+            token="test-token-not-a-secret",
+            archive=StaleArchive(),
+            brain_writer=object(),
+            tenant_id="tenant:personal",
+            bulk_manifest_archive=True,
+            privacy=PrivacyPolicy(mode="scrub"),
+        )
+        with (
+            mock.patch("collector.collector.MAX_BATCH_BYTES", 4_000),
+            mock.patch("collector.collector.OVERSIZED_PROJECTION_TEXT_CHARS", 64),
+            self.assertRaises(CollectorRuntimeError) as caught,
+        ):
+            collector.scan()
+        self.assertEqual(caught.exception.error_code, "archive_reference_mismatch")
+        self.assertEqual(collector.doctor()["last_error_code"], "archive_reference_mismatch")
+        self.assertEqual(len(collector.pending_envelopes()), 0)
+        collector.close()
+
 
 if __name__ == "__main__":
     unittest.main()
