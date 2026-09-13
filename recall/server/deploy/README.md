@@ -823,6 +823,66 @@ order before their idempotent database write. Keep query embedding on the
 ordinary bounded path and raise worker concurrency only within the provider's
 document rate limits.
 
+### Dedicated passage embedding worker with a daily cap (H5-2/H5-3)
+
+Measured in production (voyage-4, `RECALL_EMBEDDING_WORKERS=4`), the embedding
+phase of `projection-worker` takes 40 to 125 s of every cycle for 64 passages,
+the largest steady-state phase, and it delays logical, passage, and parquet
+freshness behind the provider. Run embedding as its own service with its own
+database pool, and cap the total volume per day so an accidental full
+re-embed (September 2026: about $800) stops at a known budget.
+
+Two services from the same immutable image, same database, same embedding
+settings:
+
+```bash
+# Service 1: projection worker, embedding phase handed off.
+python -m recall_server.cli projection-worker \
+  --tenant tenant:company:example \
+  --skip-embedding \
+  --logical-batch-size 25 --passage-batch-size 100 \
+  --max-batches-per-cycle 10 --interval-seconds 5
+
+# Service 2: embedding worker with a rolling daily cap.
+RECALL_EMBEDDING_DAILY_CAP=200000 \
+python -m recall_server.cli embedding-worker \
+  --tenant tenant:company:example \
+  --batch-size 128 --max-batches-per-cycle 10 --interval-seconds 5
+```
+
+- `--skip-embedding` is off by default; without it the projection worker
+  behaves exactly as before. With it the cycle log still reports
+  `embedded=0 embed_elapsed_ms=0`, the idle check ignores embedding, and the
+  advisory embedding lock is never taken by that process.
+- `embedding-worker` needs the database and embedding settings only (no
+  evidence-archive or collector credentials). Give it the same
+  `--target-tokens` / `--overlap-tokens` as the projection worker (defaults
+  match) because only passages of that policy fingerprint are embedded.
+- `--daily-cap` (or `RECALL_EMBEDDING_DAILY_CAP`, default `200000`) is the
+  number of passages sent to the provider per rolling day, read every cycle
+  from `canonical_embedding_ledger (tenant_id, day date, embedded int)`
+  (schema 064). The window is the UTC day buckets that intersect the last
+  24 hours, so it never under-counts. The ledger is upserted after every
+  cycle, so the cap survives restarts and covers every replica. When the
+  budget is exhausted the worker logs `embedding cap reached ...`, stops
+  calling the provider, and polls the ledger every `--interval-seconds`
+  until the window rolls. Raise the cap and restart the service to resume
+  sooner.
+- Each cycle logs `embedding cycle status=... embedded=N pending=0|1 lag=L
+  embedded_24h=T cap=C cap_remaining=R elapsed_ms=...`. `lag` is a bounded
+  count (up to 10000) of passages still without a vector; it is `0` after a
+  complete drain and `-1` when no embedding runtime is configured.
+- `/metrics` on the web service exports `recall_embedding_daily_total`
+  (ledger window, all tenants) and `recall_embedding_daily_cap` next to
+  `recall_passages_unembedded`; the systems card probe
+  `freshness.embedding_lag` gates `passages_unembedded <= 5000` and
+  `cap_remaining > 0`.
+
+Rollback: remove `--skip-embedding` from the projection worker and stop the
+embedding worker. Both processes share the same advisory lock per tenant, so
+running them together during the switch is safe; the ledger table stays and
+is harmless without a reader.
+
 `RECALL_DATABASE_URL` must be a PlanetScale application role URL with
 `sslmode=verify-full` and an explicit trust root. Prefer
 `sslrootcert=/etc/ssl/certs/ca-certificates.crt` in the pinned Linux container;

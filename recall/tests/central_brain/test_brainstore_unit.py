@@ -1001,18 +1001,26 @@ class HttpBoundaryContractTest(unittest.TestCase):
         self.assertIn("ORDER BY id DESC LIMIT 1", sql)
         self.assertNotIn("count(", sql.casefold())
 
-    def _churn_store(self, *, runtime: bool) -> tuple[BrainStore, mock.MagicMock]:
+    def _churn_store(self, *, runtime: bool, ledger: bool = False) -> tuple[BrainStore, mock.MagicMock]:
         connection = mock.MagicMock()
 
         def execute(sql: str, params=()):
             cursor = mock.MagicMock()
             folded = " ".join(sql.split()).casefold()
             if "to_regclass" in folded:
-                row = {"value": "canonical_passages" if "canonical_passages" in folded else None}
+                row = {
+                    "value": (
+                        "canonical_passages" if "canonical_passages" in folded
+                        else "canonical_embedding_ledger" if ledger and "canonical_embedding_ledger" in folded
+                        else None
+                    )
+                }
             elif "reltuples" in folded:
                 row = {"n": 400000}
             elif "not exists" in folded:
                 row = {"n": 1234}
+            elif "from canonical_embedding_ledger" in folded:
+                row = {"n": 15000}
             elif "from canonical_passage_documents" in folded:
                 row = {"n": 320}
             elif "from canonical_passages" in folded:
@@ -1045,7 +1053,9 @@ class HttpBoundaryContractTest(unittest.TestCase):
         self.assertEqual(len(unembedded), 1)
         sql, params = unembedded[0].args
         self.assertIn("LIMIT %s", sql)
-        self.assertEqual(params, ("fp-passages", BrainStore.PASSAGES_UNEMBEDDED_CAP))
+        # Shared helper (embedding_ledger.count_unembedded_passages): an empty
+        # tenant scope counts every tenant, as the gauge always did.
+        self.assertEqual(params, ("", "", "fp-passages", BrainStore.PASSAGES_UNEMBEDDED_CAP))
         window = [
             call.args[0] for call in connection.execute.call_args_list
             if "interval '24 hours'" in call.args[0]
@@ -1053,6 +1063,20 @@ class HttpBoundaryContractTest(unittest.TestCase):
         self.assertEqual(len(window), 2)
         for sql in window:
             self.assertNotIn("tenant_id", sql)
+        # Without schema 064 the ledger total is 0, never an error.
+        self.assertEqual(metrics["embedding_daily_total"], 0)
+
+    def test_service_metrics_reports_the_embedding_ledger_window(self) -> None:
+        store, connection = self._churn_store(runtime=True, ledger=True)
+        metrics = store.service_metrics()
+        self.assertEqual(metrics["embedding_daily_total"], 15000)
+        ledger = [
+            call.args for call in connection.execute.call_args_list
+            if "FROM canonical_embedding_ledger" in call.args[0]
+        ]
+        self.assertEqual(len(ledger), 1)
+        self.assertIn("interval '24 hours'", ledger[0][0])
+        self.assertEqual(ledger[0][1], ("", ""))  # every tenant
 
     def test_service_metrics_reports_minus_one_unembedded_without_runtime(self) -> None:
         store, connection = self._churn_store(runtime=False)
@@ -1071,9 +1095,14 @@ class HttpBoundaryContractTest(unittest.TestCase):
             "source_freshness_seconds": 5, "embedded_items": 1, "embedding_lag": 0,
             "passages_total": 400000, "passages_unembedded": 1234,
             "passages_written_24h": 150000, "passage_documents_projected_24h": 320,
+            "embedding_daily_total": 15000,
         }
-        with mock.patch.dict(projection_worker.PROJECTION_TOTALS, {"passages_written": 77}):
+        with mock.patch.dict(projection_worker.PROJECTION_TOTALS, {"passages_written": 77}), \
+                mock.patch.dict(os.environ, {"RECALL_EMBEDDING_DAILY_CAP": "123456"}):
             body = Handler.metrics(handler).decode()
+        self.assertIn("recall_embedding_daily_total 15000\n", body)
+        self.assertIn("recall_embedding_daily_cap 123456\n", body)
+        self.assertIn("# TYPE recall_embedding_daily_cap gauge\n", body)
         self.assertIn("recall_passages_written_24h 150000\n", body)
         self.assertIn("recall_passage_documents_projected_24h 320\n", body)
         self.assertIn("recall_passages_unembedded 1234\n", body)

@@ -25,6 +25,7 @@ from .actor_attribution import (
 )
 from .audit_batch import AuthorizationAuditBatcher, batch_settings_from_env
 from .authorization import normalize_verified_email
+from .embedding_ledger import count_unembedded_passages, ledger_exists, window_total
 from .capture import (
     CAPTURE_ORIGIN_RE,
     build_capture_event,
@@ -1886,23 +1887,18 @@ class BrainStore:
         )
         passage_fingerprint = getattr(self.semantic_runtime, "passage_fingerprint", None)
         if isinstance(passage_fingerprint, str) and passage_fingerprint:
-            churn["passages_unembedded"] = int(
-                conn.execute(
-                    """SELECT count(*) AS n FROM (
-                           SELECT 1 FROM canonical_passages passage
-                           WHERE NOT EXISTS (
-                               SELECT 1 FROM canonical_passage_embeddings embedding
-                               WHERE embedding.tenant_id=passage.tenant_id
-                                 AND embedding.source_id=passage.source_id
-                                 AND embedding.passage_id=passage.passage_id
-                                 AND embedding.runtime_fingerprint=%s
-                                 AND embedding.content_sha256=passage.text_sha256
-                           )
-                           LIMIT %s
-                       ) missing""",
-                    (passage_fingerprint, self.PASSAGES_UNEMBEDDED_CAP),
-                ).fetchone()["n"]
+            churn["passages_unembedded"] = count_unembedded_passages(
+                conn,
+                passage_fingerprint=passage_fingerprint,
+                limit=self.PASSAGES_UNEMBEDDED_CAP,
             )
+        # H5-3: passages the embedding worker sent to the provider in the UTC
+        # day buckets covering the last 24 hours, across every tenant. The cap
+        # itself is process configuration (RECALL_EMBEDDING_DAILY_CAP) and is
+        # exported by the web service next to this total.
+        churn["embedding_daily_total"] = (
+            window_total(conn) if ledger_exists(conn) else 0
+        )
         return churn
 
     def embed_pending(
