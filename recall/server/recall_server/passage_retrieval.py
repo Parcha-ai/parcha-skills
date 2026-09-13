@@ -53,6 +53,9 @@ RANKED_PHASE_BUDGET_FRACTION = 0.7
 DENSE_NEAREST_LIMIT = 400
 # candidate_limit (20) x 20 = 400 = DENSE_NEAREST_LIMIT for a normal query.
 DENSE_PROSE_OVERSAMPLE = 20
+# hnsw.ef_search for the dense pool; must be >= DENSE_NEAREST_LIMIT or the
+# index scan silently returns fewer rows than the LIMIT asks for.
+DENSE_EF_SEARCH = 400
 
 
 def _phase_deadline(deadline_at: float, fraction: float) -> float:
@@ -888,7 +891,25 @@ class PassageHintRetrieval:
                     vector,
                     nearest_limit,
                 )
-            dense_sql = nearest_sql + """, ranked_documents AS MATERIALIZED (
+            # Identical passage text (subagent transcripts, replayed tool
+            # output) carries identical vectors: production had 102k passages
+            # in 12.8k duplicate groups, one text repeated 879 times. Keep one
+            # row per distinct text before the per-document collapse so the
+            # pool spans documents instead of copies.
+            dense_sql = nearest_sql + """, distinct_texts AS MATERIALIZED (
+                           SELECT DISTINCT ON (passage.text_sha256)
+                                  nearest.tenant_id,
+                                  nearest.source_id,
+                                  nearest.passage_id,
+                                  nearest.distance
+                             FROM nearest
+                             JOIN canonical_passages passage
+                               USING(tenant_id,source_id,passage_id)
+                            ORDER BY passage.text_sha256,
+                                     nearest.distance,
+                                     passage.last_occurred_at DESC,
+                                     passage.passage_id
+                       ), ranked_documents AS MATERIALIZED (
                            SELECT DISTINCT ON (passage.logical_document_id)
                                   passage.source_id,
                                   passage.logical_document_id,
@@ -907,7 +928,7 @@ class PassageHintRetrieval:
                                   passage.last_occurred_at
                                       AS passage_last_occurred_at,
                                   nearest.distance
-                             FROM nearest
+                             FROM distinct_texts nearest
                              JOIN canonical_passages passage
                                USING(tenant_id,source_id,passage_id)
                              JOIN canonical_passage_documents projected
@@ -947,6 +968,15 @@ class PassageHintRetrieval:
                 # strict_order with a real (short) query vector walked the
                 # graph for 16 s p50 in production, against 1.7 s measured
                 # with a passage vector as the query.
+                # ef_search caps how many rows one index scan can return: at the
+                # default 40 the 'top 400' pool was 40 passages (17 documents)
+                # regardless of LIMIT. Raise it, transaction-locally, to the pool
+                # size (753 ms cold for 400 rows on PS-160). iterative_scan stays
+                # at the default: strict_order walked the graph for 16 s p50.
+                connection.execute(
+                    "SELECT set_config('hnsw.ef_search', %s, true)",
+                    (str(int(DENSE_EF_SEARCH)),),
+                )
                 rows = self.store._execute_bounded(
                     connection,
                     dense_sql,
