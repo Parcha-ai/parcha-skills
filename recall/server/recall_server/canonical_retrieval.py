@@ -1718,7 +1718,7 @@ class BoundCanonicalRetrieval:
         if (
             isinstance(limit, bool)
             or not isinstance(limit, int)
-            or not 1 <= limit <= 50
+            or not 1 <= limit <= 20
         ):
             raise ValueError("invalid passage hint limit")
         effective_filters = dict(filters or {})
