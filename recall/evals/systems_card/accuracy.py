@@ -20,7 +20,7 @@ from ..private_holdout import _load_jsonl, _private_path
 from .model import Gate, ProbeResult
 from .probes import ProbeContext
 
-CANDIDATE_LIMIT = 20  # recall_search maximum; boundary_recall@50 therefore equals @20 over MCP
+CANDIDATE_LIMIT = 50  # recall_search maximum (H2-d); boundary_recall@50 is measured at real depth
 
 
 def _revision(hit: dict[str, Any]) -> int:
@@ -124,11 +124,12 @@ class TruthBoundaryProbe:
             "receipt_resolution_checks": resolution_checked,
         }
         for stratum, values in report.get("strata", {}).items():
-            for key in ("boundary_recall@20", "boundary_mrr", "negative_false_hit_rate", "case_hit_rate@50"):
+            for key in ("boundary_recall@20", "boundary_recall@50", "boundary_mrr", "negative_false_hit_rate", "case_hit_rate@50"):
                 if key in values and values[key] is not None:
                     metrics[f"stratum.{stratum}.{key}"] = round(values[key], 4)
         result.metrics = metrics
         result.notes.append("negative_false_hit_rate is reported, not gated: recall_search is a hint engine and abstention belongs to the calling agent")
+        result.notes.append("boundary_recall@50 is reported at candidate_depth 50, not gated; boundary_recall@20 stays the gate")
         result.gates = [
             Gate("boundary_recall@20", ">=", 0.6).evaluate(aggregate.get("boundary_recall@20")),
             Gate("boundary_mrr", ">=", 0.3).evaluate(aggregate.get("boundary_mrr")),

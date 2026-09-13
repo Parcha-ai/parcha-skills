@@ -690,7 +690,7 @@ class RemoteMcpContractTest(unittest.TestCase):
         )
         self.assertEqual(
             tools["recall_search"]["properties"]["limit"]["maximum"],
-            20,
+            50,
         )
         self.assertEqual(
             tools["recall_search"]["properties"]["filters"]["properties"]["since"],
@@ -1136,7 +1136,12 @@ class RemoteMcpContractTest(unittest.TestCase):
         cases = (
             (
                 "recall_search",
-                {"query": "synthetic", "limit": 21},
+                {"query": "synthetic", "limit": 51},
+                "search",
+            ),
+            (
+                "recall_search",
+                {"query": "synthetic", "limit": 0},
                 "search",
             ),
             (
@@ -1171,6 +1176,26 @@ class RemoteMcpContractTest(unittest.TestCase):
                     store_call,
                     {call[0] for call in self.store.calls},
                 )
+
+    def test_search_accepts_depth_fifty_and_forwards_it_to_the_store(self) -> None:
+        self.store.calls.clear()
+        with McpHttpServer(self.store) as server:
+            status, _, raw = server.request(
+                "POST",
+                request(
+                    "tools/call",
+                    params={
+                        "name": "recall_search",
+                        "arguments": {"query": "synthetic", "limit": 50},
+                    },
+                ),
+                protocol="2025-11-25",
+            )
+        self.assertEqual(status, 200)
+        self.assertNotIn("error", json.loads(raw))
+        searches = [call for call in self.store.calls if call[0] == "search"]
+        self.assertEqual(len(searches), 1)
+        self.assertIn(50, searches[0][1:])
 
     def test_public_profile_hides_every_non_mcp_route_before_store_io(self) -> None:
         self.environment.stop()
