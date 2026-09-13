@@ -126,6 +126,8 @@ class TruthBoundaryProbe:
         rows: list[dict[str, Any]] = []
         arm_scores: dict[str, list[dict[str, Any] | None]] = {}
         fusion_diagnostics: dict[str, Any] | None = None
+        rerank_model: str | None = None
+        rerank_statuses: dict[str, int] = {}
         resolution_ok = 0
         resolution_checked = 0
         for case in selected:
@@ -143,6 +145,12 @@ class TruthBoundaryProbe:
                         "mode": fusion.get("mode"),
                         "alphas": fusion.get("alphas"),
                     }
+                diagnostics = outcome.result.get("diagnostics", {})
+                status = diagnostics.get("rerank_status")
+                if isinstance(status, str):
+                    rerank_statuses[status] = rerank_statuses.get(status, 0) + 1
+                if rerank_model is None and isinstance(diagnostics.get("rerank_model"), str):
+                    rerank_model = diagnostics["rerank_model"]
                 error = ""
                 receipt = first_receipt(outcome.result)
                 if receipt and resolution_checked < pointer_checks:
@@ -174,8 +182,16 @@ class TruthBoundaryProbe:
         if fusion_diagnostics is not None:
             metrics["fusion.mode"] = fusion_diagnostics["mode"]
             metrics["fusion.alphas"] = fusion_diagnostics["alphas"]
+        if rerank_model is not None:
+            metrics["rerank.model"] = rerank_model
+        for status, count in sorted(rerank_statuses.items()):
+            metrics[f"rerank.status.{status}"] = count
         for stratum, values in report.get("strata", {}).items():
-            for key in ("boundary_recall@20", "boundary_recall@50", "boundary_mrr", "negative_false_hit_rate", "case_hit_rate@50"):
+            for key in (
+                "boundary_recall@5", "boundary_recall@10", "boundary_recall@20",
+                "boundary_recall@50", "boundary_mrr", "negative_false_hit_rate",
+                "case_hit_rate@50",
+            ):
                 if key in values and values[key] is not None:
                     metrics[f"stratum.{stratum}.{key}"] = round(values[key], 4)
         result.metrics = metrics

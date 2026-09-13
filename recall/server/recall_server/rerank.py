@@ -46,6 +46,10 @@ PROVIDERS: dict[str, dict[str, str]] = {
 }
 
 DEFAULT_TIMEOUT_SECONDS = 2.5
+# The rerank call sits on the query path after the arms. Search only runs it
+# when at least this much of the deadline remains, so a slow arm never turns
+# into a reranker timeout stacked on top of it.
+DEFAULT_RERANK_MIN_BUDGET_SECONDS = 1.0
 DEFAULT_MAX_CANDIDATES = 50
 DEFAULT_MAX_DOC_CHARS = 2000
 MAX_CANDIDATES_CEILING = 1000
@@ -401,6 +405,23 @@ class RerankRuntime:
             # A cooperative transport that overran the budget is still a miss.
             raise RerankUnavailable("rerank_deadline_exhausted")
         return self._parse_results(payload, expected, top_k)
+
+
+def rerank_min_budget_seconds_from_env() -> float:
+    """``RECALL_RERANK_MIN_BUDGET_SECONDS`` (0.05–30); default 1.0."""
+
+    raw = os.environ.get("RECALL_RERANK_MIN_BUDGET_SECONDS", "").strip()
+    if not raw:
+        return DEFAULT_RERANK_MIN_BUDGET_SECONDS
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "RECALL_RERANK_MIN_BUDGET_SECONDS must be between 0.05 and 30"
+        ) from exc
+    if not math.isfinite(value) or not 0.05 <= value <= 30.0:
+        raise ValueError("RECALL_RERANK_MIN_BUDGET_SECONDS must be between 0.05 and 30")
+    return value
 
 
 def build_rerank_runtime(transport: RerankTransport | None = None) -> RerankRuntime | None:

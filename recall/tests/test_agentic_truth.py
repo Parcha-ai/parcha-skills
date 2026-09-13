@@ -497,3 +497,58 @@ class AgenticTruthSetTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RecallAtFiveAndTenTests(unittest.TestCase):
+    def test_scores_recall_at_five_and_ten(self) -> None:
+        cases = truth_cases()
+        target = next(
+            case for case in cases
+            if case["answerability"] == "answerable" and len(case["gold_boundaries"]) == 1
+        )
+        gold = target["gold_boundaries"][0]
+
+        def padding(count: int) -> list[dict]:
+            return [
+                {
+                    "logical_document_id": "ldoc_" + f"{index:032x}",
+                    "source_id": "source:padding",
+                    "revision": 1,
+                    "pointer_valid": True,
+                    "authorized": True,
+                }
+                for index in range(count)
+            ]
+
+        def run(position: int) -> dict:
+            hit = {
+                "logical_document_id": gold["logical_document_id"],
+                "source_id": gold["source_id"],
+                "revision": gold["revision"],
+                "pointer_valid": True,
+                "authorized": True,
+            }
+            candidates = padding(position - 1) + [hit]
+            results = [
+                {
+                    "id": case["id"],
+                    "candidates": candidates if case["id"] == target["id"] else [],
+                    "latency_ms": 25.0,
+                    "backend_error": "",
+                }
+                for case in cases
+            ]
+            return score_boundary_candidates(cases, results)
+
+        positives = sum(1 for case in cases if case["answerability"] == "answerable")
+        share = 1.0 / positives
+        for position, expected in ((3, (share, share, share)), (8, (0.0, share, share)), (15, (0.0, 0.0, share))):
+            aggregate = run(position)["aggregate"]
+            self.assertAlmostEqual(aggregate["boundary_recall@5"], expected[0], msg=position)
+            self.assertAlmostEqual(aggregate["boundary_recall@10"], expected[1], msg=position)
+            self.assertAlmostEqual(aggregate["boundary_recall@20"], expected[2], msg=position)
+            self.assertLessEqual(aggregate["boundary_recall@5"], aggregate["boundary_recall@10"])
+            self.assertLessEqual(aggregate["boundary_recall@10"], aggregate["boundary_recall@20"])
+        for stratum in run(3)["strata"].values():
+            self.assertIn("boundary_recall@5", stratum)
+            self.assertIn("boundary_recall@10", stratum)

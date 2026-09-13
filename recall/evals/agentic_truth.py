@@ -505,6 +505,16 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, int | float]:
         "queries": len(rows),
         "answerable_queries": len(positives),
         "insufficient_queries": len(negatives),
+        "boundary_recall@5": statistics.fmean(
+            row["boundary_recall@5"] for row in positives
+        )
+        if positives
+        else 0.0,
+        "boundary_recall@10": statistics.fmean(
+            row["boundary_recall@10"] for row in positives
+        )
+        if positives
+        else 0.0,
         "boundary_recall@20": statistics.fmean(
             row["boundary_recall@20"] for row in positives
         )
@@ -671,6 +681,16 @@ def score_boundary_candidates(
                 "exact_revision_count": sum(
                     revision == boundary_revision(gold[identity])
                     for identity, revision in matched
+                ),
+                "boundary_recall@5": (
+                    len(set(ranked[:5]).intersection(gold)) / len(gold)
+                    if gold
+                    else 0.0
+                ),
+                "boundary_recall@10": (
+                    len(set(ranked[:10]).intersection(gold)) / len(gold)
+                    if gold
+                    else 0.0
                 ),
                 "boundary_recall@20": (
                     len(set(ranked).intersection(gold)) / len(gold)

@@ -474,3 +474,20 @@ class RerankRuntimeContractTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RerankMinBudgetEnvTests(unittest.TestCase):
+    def test_min_budget_defaults_and_validates(self) -> None:
+        from recall_server.rerank import (
+            DEFAULT_RERANK_MIN_BUDGET_SECONDS,
+            rerank_min_budget_seconds_from_env,
+        )
+
+        with mock.patch.dict(os.environ, {"RECALL_RERANK_MIN_BUDGET_SECONDS": ""}):
+            self.assertEqual(rerank_min_budget_seconds_from_env(), DEFAULT_RERANK_MIN_BUDGET_SECONDS)
+        with mock.patch.dict(os.environ, {"RECALL_RERANK_MIN_BUDGET_SECONDS": "0.4"}):
+            self.assertEqual(rerank_min_budget_seconds_from_env(), 0.4)
+        for bad in ("0", "31", "nan", "soon"):
+            with mock.patch.dict(os.environ, {"RECALL_RERANK_MIN_BUDGET_SECONDS": bad}):
+                with self.assertRaises(ValueError):
+                    rerank_min_budget_seconds_from_env()
