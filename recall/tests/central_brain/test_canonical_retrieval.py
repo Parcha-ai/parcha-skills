@@ -1711,3 +1711,12 @@ class TimeClipWindowTests(unittest.TestCase):
         ranges = clipped["results"][0]["matching_ranges"]
         self.assertEqual([r["kind"] for r in ranges], ["dense"])
         self.assertNotIn("passage_window", ranges[0])
+
+
+class DensePoolDepthTests(unittest.TestCase):
+    def test_prose_queries_pull_the_full_dense_pool(self) -> None:
+        from recall_server import passage_retrieval
+        # candidate_limit 20 x DENSE_PROSE_OVERSAMPLE reaches DENSE_NEAREST_LIMIT,
+        # so one large session cannot crowd a small one out of the pool.
+        self.assertGreaterEqual(20 * passage_retrieval.DENSE_PROSE_OVERSAMPLE, passage_retrieval.DENSE_NEAREST_LIMIT)
+        self.assertLessEqual(passage_retrieval.DENSE_NEAREST_LIMIT, 400)

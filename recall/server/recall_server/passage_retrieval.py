@@ -51,6 +51,8 @@ RANKED_PHASE_BUDGET_FRACTION = 0.7
 # ~1.7 s cold on the managed instance versus 3+ s for 400 and far more for
 # the temporal ×50 oversample. Documents are ranked after the scan anyway.
 DENSE_NEAREST_LIMIT = 400
+# candidate_limit (20) x 20 = 400 = DENSE_NEAREST_LIMIT for a normal query.
+DENSE_PROSE_OVERSAMPLE = 20
 
 
 def _phase_deadline(deadline_at: float, fraction: float) -> float:
@@ -776,7 +778,14 @@ class PassageHintRetrieval:
                 else runtime.embed_query(query)
             )
             temporal_scope = since is not None or until is not None
-            dense_oversample = 50 if temporal_scope else 5
+            # A non-temporal query used to pull only candidate_limit x 5 = 100
+            # nearest passages; one 5,000-passage session on a related topic
+            # filled the whole pool and a small session's single passage never
+            # reached the per-document collapse (validation recall@20 fell
+            # 0.54 -> 0.46 after H1 re-windowed the big sessions). Pull the
+            # full DENSE_NEAREST_LIMIT for every query; liveness is still
+            # checked once on the pool, so the cost is bounded.
+            dense_oversample = 50 if temporal_scope else DENSE_PROSE_OVERSAMPLE
             scope_passages = self._dense_scope_passage_count(
                 since=since,
                 until=until,
@@ -1208,7 +1217,14 @@ class PassageHintRetrieval:
                 else runtime.embed_query(query)
             )
             temporal_scope = since is not None or until is not None
-            dense_oversample = 50 if temporal_scope else 5
+            # A non-temporal query used to pull only candidate_limit x 5 = 100
+            # nearest passages; one 5,000-passage session on a related topic
+            # filled the whole pool and a small session's single passage never
+            # reached the per-document collapse (validation recall@20 fell
+            # 0.54 -> 0.46 after H1 re-windowed the big sessions). Pull the
+            # full DENSE_NEAREST_LIMIT for every query; liveness is still
+            # checked once on the pool, so the cost is bounded.
+            dense_oversample = 50 if temporal_scope else DENSE_PROSE_OVERSAMPLE
             with self.store.connect() as connection:
                 dense = self.store._execute_bounded(
                     connection,
