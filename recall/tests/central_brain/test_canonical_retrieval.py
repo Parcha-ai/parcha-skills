@@ -1473,10 +1473,13 @@ class SearchArmCostTests(unittest.TestCase):
         )
         self.assertEqual((status, strategy), ("ok", "ann-oversampled"))
         sql = store.sql[-1]
-        nearest, _, rest = sql.partition("ranked_documents AS MATERIALIZED")
+        # The index scan CTE stays a pure ANN scan; text dedupe joins
+        # canonical_passages only after the LIMIT, in distinct_texts.
+        nearest, _, rest = sql.partition("distinct_texts AS MATERIALIZED")
         self.assertIn("WITH nearest AS MATERIALIZED", nearest)
         self.assertNotIn("canonical_passages", nearest)
         self.assertNotIn("live_chunk", nearest)
+        self.assertIn("ranked_documents AS MATERIALIZED", rest)
         self.assertEqual(rest.count("LEFT JOIN canonical_chunks live_chunk"), 1)
 
     def test_exact_dense_arm_defers_liveness_to_ranked_documents(self) -> None:
@@ -1720,3 +1723,14 @@ class DensePoolDepthTests(unittest.TestCase):
         # so one large session cannot crowd a small one out of the pool.
         self.assertGreaterEqual(20 * passage_retrieval.DENSE_PROSE_OVERSAMPLE, passage_retrieval.DENSE_NEAREST_LIMIT)
         self.assertLessEqual(passage_retrieval.DENSE_NEAREST_LIMIT, 400)
+
+
+class DensePoolShapeTests(unittest.TestCase):
+    def test_dense_pool_dedupes_text_and_sets_ef_search(self) -> None:
+        import inspect
+        from recall_server import passage_retrieval
+        source = inspect.getsource(passage_retrieval.PassageHintRetrieval._dense_candidates)
+        self.assertIn("DISTINCT ON (passage.text_sha256)", source)
+        self.assertIn("FROM distinct_texts nearest", source)
+        self.assertIn("set_config('hnsw.ef_search'", source)
+        self.assertGreaterEqual(passage_retrieval.DENSE_EF_SEARCH, passage_retrieval.DENSE_NEAREST_LIMIT)
