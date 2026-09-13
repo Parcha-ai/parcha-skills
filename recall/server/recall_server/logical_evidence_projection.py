@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import logging
 import hashlib
 import io
 import json
@@ -32,7 +33,13 @@ DEFAULT_EXCLUDED_STRUCTURAL_TYPES = (
     "token_count",
     "turn_context",
 )
+LOG = logging.getLogger(__name__)
 MAX_LOGICAL_EVIDENCE_BATCH_SIZE = 10_000
+# A queued group is retried with exponential backoff (60 s doubling, capped
+# at 6 h) and quarantined after this many failed projection attempts.
+MAX_LOGICAL_ATTEMPTS = 8
+LOGICAL_BACKOFF_BASE_SECONDS = 60
+LOGICAL_BACKOFF_CAP_SECONDS = 6 * 3600
 
 
 @dataclass(frozen=True)
@@ -438,6 +445,11 @@ class CanonicalLogicalEvidenceProjector:
                                  AND part.revision=evidence.revision
                      ) evidence_size ON true
                     WHERE (%s::text IS NULL OR queue.tenant_id=%s)
+                      AND queue.attempts<%s
+                      AND (
+                          queue.next_attempt_at IS NULL
+                          OR queue.next_attempt_at<=clock_timestamp()
+                      )
                       AND (
                           %s::float8<=0
                           OR queue.reason IN ('forget','backfill')
@@ -454,6 +466,7 @@ class CanonicalLogicalEvidenceProjector:
                     LIMIT %s""",
                 (
                     tenant_id, tenant_id,
+                    MAX_LOGICAL_ATTEMPTS,
                     quiet_seconds, quiet_seconds,
                     max_wait_seconds, max_wait_seconds,
                     limit,
@@ -548,6 +561,49 @@ class CanonicalLogicalEvidenceProjector:
                 (tenant_id, tenant_id, source_id, source_id),
             )
         return max(0, result.rowcount)
+
+    def _mark_failed(
+        self,
+        candidate: LogicalGroupCandidate,
+        error: BaseException,
+    ) -> None:
+        """Record a failed projection attempt and schedule the retry.
+
+        The row keeps its generation and changed_at, so a later collector
+        write still supersedes the backoff; only the worker's own retry is
+        delayed. Logged content-free: identifiers and the error code only.
+        """
+        code = str(error) if isinstance(error, LogicalEvidenceError) else type(error).__name__
+        with self.store.connect() as connection:
+            with connection.transaction():
+                row = connection.execute(
+                    """UPDATE canonical_evidence_document_queue
+                          SET attempts=attempts+1,
+                              next_attempt_at=clock_timestamp()
+                                  +least(%s,%s*power(2,attempts))
+                                  *interval '1 second',
+                              last_error_code=left(%s,120)
+                        WHERE tenant_id=%s AND source_id=%s
+                          AND native_parent_id=%s
+                    RETURNING attempts""",
+                    (
+                        LOGICAL_BACKOFF_CAP_SECONDS,
+                        LOGICAL_BACKOFF_BASE_SECONDS,
+                        code,
+                        candidate.tenant_id,
+                        candidate.source_id,
+                        candidate.native_parent_id,
+                    ),
+                ).fetchone()
+        attempts = int(row["attempts"]) if row else 0
+        LOG.warning(
+            "logical projection failed source=%s parent=%s code=%s attempts=%s%s",
+            candidate.source_id,
+            candidate.native_parent_id,
+            code,
+            attempts,
+            " quarantined" if attempts >= MAX_LOGICAL_ATTEMPTS else "",
+        )
 
     def _prepare_batch_and_upload(
         self,
@@ -1641,7 +1697,7 @@ class CanonicalLogicalEvidenceProjector:
             prepare_pool(min(upload_concurrency, batch_size))
         tenant_id = self._tenant(tenant_id)
         documents = records = receipts = objects = bytes_uploaded = batches = 0
-        repaired = 0
+        repaired = failed = 0
         old_objects_deleted = cleanup_failures = source_races = pruned = 0
         cleanup_completed = cleanup_pending = 0
         # Object deletes are S3 round trips, not database work: measured at
@@ -1686,7 +1742,8 @@ class CanonicalLogicalEvidenceProjector:
                 shard_loads[shard_index] += candidate.estimated_bytes
             uploads: list[LogicalEvidenceUpload | None] = [None] * len(candidates)
             successful: list[LogicalEvidenceUpload] = []
-            failures: list[Exception] = []
+            failed_shards: list[tuple[list[tuple[int, LogicalGroupCandidate]], Exception]] = []
+            skipped: set[int] = set()
             futures = []
             try:
                 with ThreadPoolExecutor(
@@ -1707,7 +1764,7 @@ class CanonicalLogicalEvidenceProjector:
                         try:
                             shard_uploads = future.result()
                         except Exception as error:
-                            failures.append(error)
+                            failed_shards.append((shard, error))
                             continue
                         for (index, _candidate), upload in zip(
                             shard,
@@ -1738,16 +1795,29 @@ class CanonicalLogicalEvidenceProjector:
                     concurrency=cleanup_concurrency,
                 )
                 raise
-            if failures:
-                self._schedule_upload_cleanup(successful)
-                self.drain_cleanup(
-                    tenant_id=tenant_id,
-                    limit=5_000,
-                    concurrency=cleanup_concurrency,
-                )
-                raise failures[0]
+            # A failing group must not poison its batch, let alone the
+            # worker: retry the members of a failed multi-group shard one by
+            # one so only the guilty group is backed off; everything else in
+            # the batch commits normally this cycle.
+            for shard, error in failed_shards:
+                if len(shard) == 1:
+                    (index, candidate), = shard
+                    skipped.add(index)
+                    self._mark_failed(candidate, error)
+                    continue
+                for index, candidate in shard:
+                    try:
+                        (upload,) = self._prepare_batch_and_upload((candidate,))
+                    except Exception as single_error:
+                        skipped.add(index)
+                        self._mark_failed(candidate, single_error)
+                        continue
+                    uploads[index] = upload
+                    if upload is not None:
+                        successful.append(upload)
+            failed += len(skipped)
             statuses: list[str | None] = [None] * len(candidates)
-            failures = []
+            failures: list[Exception] = []
             with ThreadPoolExecutor(
                 max_workers=worker_count,
                 thread_name_prefix="recall-logical-commit",
@@ -1764,6 +1834,7 @@ class CanonicalLogicalEvidenceProjector:
                     for index, (candidate, upload) in enumerate(
                         zip(candidates, uploads, strict=True)
                     )
+                    if index not in skipped
                 ]
                 for index, future in commit_futures:
                     try:
@@ -1777,7 +1848,11 @@ class CanonicalLogicalEvidenceProjector:
                     concurrency=cleanup_concurrency,
                 )
                 raise failures[0]
-            for upload, status in zip(uploads, statuses, strict=True):
+            for index, (upload, status) in enumerate(
+                zip(uploads, statuses, strict=True)
+            ):
+                if index in skipped:
+                    continue
                 if status == "stale":
                     source_races += 1
                     continue
@@ -1821,17 +1896,30 @@ class CanonicalLogicalEvidenceProjector:
                                     AND first_queued_at
                                         < clock_timestamp()-%s*interval '1 second'
                                 )
-                          ) AS waiting
+                          ) AS waiting,
+                          count(*) FILTER (
+                              WHERE attempts>=%s
+                          ) AS quarantined,
+                          count(*) FILTER (
+                              WHERE attempts<%s
+                                AND next_attempt_at IS NOT NULL
+                                AND next_attempt_at>clock_timestamp()
+                          ) AS backoff
                      FROM canonical_evidence_document_queue
                     WHERE (%s::text IS NULL OR tenant_id=%s)""",
                 (
                     float(quiet_seconds), float(quiet_seconds),
                     float(max_wait_seconds), float(max_wait_seconds),
+                    MAX_LOGICAL_ATTEMPTS, MAX_LOGICAL_ATTEMPTS,
                     tenant_id, tenant_id,
                 ),
             ).fetchone()
         waiting = int(counts["waiting"])
-        pending = int(counts["queued"]) - waiting
+        quarantined = int(counts["quarantined"])
+        backoff = int(counts["backoff"])
+        pending = max(
+            0, int(counts["queued"]) - waiting - quarantined - backoff
+        )
         return {
             "status": "complete" if int(pending) == 0 else "pending",
             "documents": documents,
@@ -1847,6 +1935,9 @@ class CanonicalLogicalEvidenceProjector:
             "cleanup_pending": cleanup_pending,
             "pending": int(pending),
             "waiting": waiting,
+            "failed": failed,
+            "backoff": backoff,
+            "quarantined": quarantined,
             "source_races": source_races,
             "pruned": pruned,
         }

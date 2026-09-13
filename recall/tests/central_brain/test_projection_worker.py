@@ -722,3 +722,83 @@ class ParquetNeverStarvesTests(unittest.TestCase):
                     once=True,
                     **bad,
                 )
+
+
+class CycleResilienceTests(unittest.TestCase):
+    """A failing cycle is logged and the worker keeps going; `once` still raises."""
+
+    class _FlakyLogical(_Logical):
+        def __init__(self, calls, fail_first: int):
+            super().__init__(calls, work=0)
+            self.fail_first = fail_first
+            self.attempts = 0
+
+        def project_pending(self, **kwargs):
+            self.attempts += 1
+            if self.attempts <= self.fail_first:
+                raise RuntimeError("logical_evidence_full_record_corrupt")
+            return super().project_pending(**kwargs)
+
+    def _kwargs(self):
+        return dict(
+            tenant_id="tenant:company:test",
+            logical_batch_size=5,
+            passage_batch_size=5,
+            embedding_batch_size=64,
+            max_batches_per_cycle=1,
+            upload_concurrency=1,
+            passage_concurrency=1,
+            interval_seconds=1,
+        )
+
+    def test_worker_survives_a_failed_cycle_and_reports_the_next_one(self):
+        calls: list[str] = []
+        logical = self._FlakyLogical(calls, fail_first=1)
+        slept: list[float] = []
+        with self.assertLogs("recall_server.projection_worker", level="ERROR") as logs:
+            result = run_projection_worker(
+                logical,  # type: ignore[arg-type]
+                _Passages(calls, work=0),  # type: ignore[arg-type]
+                _Scan(calls, work=0),  # type: ignore[arg-type]
+                sleep=slept.append,
+                max_cycles=2,
+                **self._kwargs(),
+            )
+        self.assertEqual(logical.attempts, 2)
+        self.assertEqual(slept[:1], [1])
+        self.assertIn("projection cycle failed type=RuntimeError", logs.output[0])
+        self.assertNotIn("corrupt", logs.output[0].splitlines()[0])
+        self.assertEqual(result["logical_failed"], 0)
+
+    def test_once_still_raises(self):
+        calls: list[str] = []
+        with self.assertRaises(RuntimeError), self.assertLogs("recall_server.projection_worker", level="ERROR"):
+            run_projection_worker(
+                self._FlakyLogical(calls, fail_first=1),  # type: ignore[arg-type]
+                _Passages(calls, work=0),  # type: ignore[arg-type]
+                _Scan(calls, work=0),  # type: ignore[arg-type]
+                once=True,
+                **self._kwargs(),
+            )
+
+    def test_cycle_log_carries_failed_backoff_quarantined(self):
+        calls: list[str] = []
+        logical = _Logical(calls, work=0)
+        original = logical.project_pending
+
+        def project_pending(**kwargs):
+            value = original(**kwargs)
+            value.update({"failed": 1, "backoff": 2, "quarantined": 3})
+            return value
+
+        logical.project_pending = project_pending  # type: ignore[method-assign]
+        with self.assertLogs("recall_server.projection_worker", level="INFO") as logs:
+            result = run_projection_worker(
+                logical,  # type: ignore[arg-type]
+                _Passages(calls, work=0),  # type: ignore[arg-type]
+                _Scan(calls, work=0),  # type: ignore[arg-type]
+                once=True,
+                **self._kwargs(),
+            )
+        self.assertEqual((result["logical_failed"], result["logical_backoff"], result["logical_quarantined"]), (1, 2, 3))
+        self.assertTrue(any("logical_failed=1 logical_backoff=2 logical_quarantined=3" in line for line in logs.output))

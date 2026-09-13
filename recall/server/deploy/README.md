@@ -115,7 +115,7 @@ Gaps in `shard_index` are normal.
   month is a no-op (`mode=reuse`) and keeps its objects.
 
 The production database gate requires a standard PostgreSQL URL with
-`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 61,
+`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 62,
 pgvector 0.8.0 or newer, and a runtime role without superuser, database/role creation,
 replication, or RLS-bypass privilege:
 

@@ -168,3 +168,84 @@ class LogicalEvidenceInterruptTests(TestCase):
 
         self.assertEqual(projector.cleanup_batches, [[projector.upload]])
         self.assertEqual(projector.drain_calls, 2)
+
+
+class PoisonedGroupIsolationTests(TestCase):
+    """One failing group is backed off; the rest of the batch still commits."""
+
+    def _projector(self):
+        from recall_server.logical_evidence_projection import LogicalEvidenceError
+
+        class Connection:
+            def execute(self, query, values=()):
+                return SimpleNamespace(
+                    fetchone=lambda: {"queued": 3, "waiting": 0, "quarantined": 0, "backoff": 1},
+                    fetchall=lambda: [],
+                )
+
+        class Store:
+            pool_max_size = 2
+
+            def prepare_pool(self, _n):
+                return None
+
+            def connect(self):
+                return nullcontext(Connection())
+
+        class Projector(InterruptingProjector):
+            def __init__(self):
+                super().__init__()
+                self.store = Store()
+                self.upload = SimpleNamespace(
+                    all_references=({"tenant_id": self.bound_tenant_id, "source_id": "source:synthetic", "artifact_id": "art_" + "a" * 32, "size_bytes": 1},),
+                    prepared=SimpleNamespace(record_count=1, receipt_count=1),
+                )
+                self.marked: list[tuple[str, str]] = []
+                self.committed: list[str] = []
+                self.prepare_calls: list[tuple[str, ...]] = []
+
+            def _pending(self, **_values):
+                return [
+                    LogicalGroupCandidate(
+                        tenant_id=self.bound_tenant_id,
+                        source_id="source:synthetic",
+                        native_parent_id=parent,
+                        source_updated_at=SimpleNamespace(),
+                        generation=1,
+                        revision=1,
+                    )
+                    for parent in ("good-a", "poison", "good-b")
+                ]
+
+            def _prepare_batch_and_upload(self, candidates):
+                self.prepare_calls.append(tuple(c.native_parent_id for c in candidates))
+                if any(c.native_parent_id == "poison" for c in candidates):
+                    raise LogicalEvidenceError("logical_evidence_full_record_corrupt")
+                return [self.upload for _ in candidates]
+
+            def _mark_failed(self, candidate, error):
+                self.marked.append((candidate.native_parent_id, str(error)))
+
+            def _commit_upload(self, candidate, upload):
+                self.committed.append(candidate.native_parent_id)
+                return "committed"
+
+        return Projector()
+
+    def test_poisoned_group_is_isolated_and_others_commit(self) -> None:
+        projector = self._projector()
+        result = projector.project_pending(
+            tenant_id=projector.bound_tenant_id,
+            batch_size=3,
+            max_batches=1,
+            upload_concurrency=1,
+        )
+        # The single shard (concurrency 1) failed, was retried one group at a
+        # time, and only the poisoned group was marked.
+        self.assertEqual(projector.prepare_calls[0], ("good-a", "poison", "good-b"))
+        self.assertEqual(projector.marked, [("poison", "logical_evidence_full_record_corrupt")])
+        self.assertEqual(sorted(projector.committed), ["good-a", "good-b"])
+        self.assertEqual(result["documents"], 2)
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual(result["backoff"], 1)
+        self.assertEqual(result["pending"], 2)
