@@ -1578,7 +1578,8 @@ class SearchArmCostTests(unittest.TestCase):
             store.sql.clear()
             store.values.clear()
             retrieval._sparse_query(
-                ["brain_busy", "503"], order=order, since="2026-09-01T00:00:00Z", until=None,
+                ["brain_busy", "503"], lexical_query="brain_busy 503 deploy", order=order,
+                since="2026-09-01T00:00:00Z", until=None,
                 candidate_limit=80, actor_ids=["actor_" + "0" * 32], actor_relations=["author"],
                 deadline_at=time.monotonic() + 5,
             )
@@ -1590,10 +1591,12 @@ class SearchArmCostTests(unittest.TestCase):
             self.assertNotIn("canonical_chunks", pool)
             self.assertNotIn("canonical_documents", sql)
             self.assertNotIn("canonical_events", sql)
+            # any identifier phrase qualifies a passage
             self.assertIn(
-                "passage.search_vector @@ (phraseto_tsquery('simple',%s) && phraseto_tsquery('simple',%s))",
+                "passage.search_vector @@ (phraseto_tsquery('simple',%s) || phraseto_tsquery('simple',%s))",
                 pool,
             )
+            self.assertNotIn("&&", sql)
             # scoped exactly like the passage-lexical arm
             self.assertIn("passage.policy_fingerprint=%s", pool)
             self.assertIn("FROM canonical_passage_actors actor", pool)
@@ -1610,15 +1613,73 @@ class SearchArmCostTests(unittest.TestCase):
             self.assertIn(160, values)
             self.assertIn(80, values)
             if order == "rank":
-                self.assertIn("ts_rank_cd(passage.search_vector,phraseto_tsquery", pool)
+                # full-query matches first, then identifier density, then recency
+                self.assertIn(
+                    "ORDER BY ts_rank_cd(passage.search_vector,plainto_tsquery('simple',%s),32) DESC,"
+                    "ts_rank_cd(passage.search_vector,(phraseto_tsquery('simple',%s) || phraseto_tsquery('simple',%s)),32) DESC,"
+                    "passage.last_occurred_at DESC,passage.passage_id",
+                    pool,
+                )
+                self.assertIn("brain_busy 503 deploy", values)
+                self.assertLess(values.index("brain_busy 503 deploy"), values.index(160))
             else:
+                self.assertNotIn("brain_busy 503 deploy", values)
                 self.assertNotIn("ts_rank_cd", sql)
                 self.assertIn("0.0::real AS score", sql)
         with self.assertRaises(ValueError):
             retrieval._sparse_query(
-                [], order="rank", since=None, until=None, candidate_limit=80,
+                [], lexical_query="x", order="rank", since=None, until=None, candidate_limit=80,
                 actor_ids=None, actor_relations=None, deadline_at=time.monotonic() + 5,
             )
+
+    def test_prose_query_fusion_is_byte_identical_without_the_sparse_arm(self) -> None:
+        """A query without identifiers never reaches the sparse arm; fusion sees the same two legs as before."""
+
+        from recall_server import passage_retrieval
+        from recall_server.passage_retrieval import collapse_document_candidates
+
+        def row(document, passage, score, when):
+            return {
+                "source_id": "codex:linux:test", "logical_document_id": document, "revision": 1,
+                "native_parent_id": document + "-parent", "first_occurred_at": when, "last_occurred_at": when,
+                "manifest_object_key": "k/" + document, "manifest_content_sha256": "c" * 64,
+                "passage_id": passage, "passage_ordinal": 0, "spans": [], "receipts": [f"recall://codex:linux:test/{document}?rev=1#item=0"],
+                "text_redacted": f"text of {passage}", "passage_first_occurred_at": when, "passage_last_occurred_at": when, "score": score,
+            }
+
+        dense_rows = [row("ldoc_a", "psg_a1", 0.9, "2026-09-02"), row("ldoc_b", "psg_b1", 0.8, "2026-09-01")]
+        lexical_rows = [row("ldoc_b", "psg_b2", 0.7, "2026-09-01"), row("ldoc_c", "psg_c1", 0.6, "2026-09-03")]
+
+        class Legs(self._Store):
+            def _execute_bounded(self, connection, sql, values, deadline_at):
+                if "phraseto_tsquery" in sql:
+                    raise AssertionError("sparse arm ran for a prose query")
+                if "FROM canonical_passages passage" in sql:
+                    self.sql.append(" ".join(sql.split()))
+                    self.values.append(tuple(values))
+                    return Rows(lexical_rows)
+                if "WITH eligible AS MATERIALIZED" in sql or "WITH nearest AS MATERIALIZED" in sql:
+                    self.sql.append(" ".join(sql.split()))
+                    self.values.append(tuple(values))
+                    return Rows(dense_rows)
+                return super()._execute_bounded(connection, sql, values, deadline_at)
+
+        passage_retrieval.reset_scope_count_cache()
+        store = Legs(scope_count=10)
+        response = self._retrieval(store).search(
+            "why did the deploy fail", lexical_query="deploy fail", since=None, until=None, limit=20,
+        )
+        self.assertEqual(response["diagnostics"]["sparse_status"], "skipped-prose-query")
+        self.assertEqual(response["diagnostics"]["sparse_candidates"], 0)
+        expected = collapse_document_candidates(
+            (("dense", 0.15, dense_rows), ("passage-lexical", 0.30, lexical_rows), ("sparse-exact", 0.55, [])),
+            limit=20,
+        )
+        self.assertEqual(
+            json.dumps(response["results"], sort_keys=True, default=str),
+            json.dumps(expected, sort_keys=True, default=str),
+        )
+        self.assertEqual([r["logical_document_id"] for r in expected], ["ldoc_b", "ldoc_c", "ldoc_a"])
 
     def test_search_diagnostics_report_candidate_depth(self) -> None:
         store = self._Store(scope_count=10)
@@ -1630,6 +1691,47 @@ class SearchArmCostTests(unittest.TestCase):
             self.assertEqual(diagnostics["candidate_depth"], depth)
             self.assertEqual(diagnostics["result_limit"], limit)
             self.assertEqual(diagnostics["sparse_source"], "passages")
+
+    def test_search_diagnostics_report_which_arms_were_truncated(self) -> None:
+        from recall_server import passage_retrieval
+
+        passage_retrieval.reset_scope_count_cache()
+        store = self._Store(scope_count=10)
+        response = self._retrieval(store).search(
+            "brain_busy 503", lexical_query="brain_busy 503", since=None, until=None, limit=10,
+        )
+        self.assertEqual(response["diagnostics"]["arms_truncated"], [])
+
+        class RankedPhasesTimeOut(self._Store):
+            def _execute_bounded(self, connection, sql, values, deadline_at):
+                if "ts_rank_cd(passage.search_vector" in sql:
+                    raise SearchDeadlineExceeded()
+                return super()._execute_bounded(connection, sql, values, deadline_at)
+
+        passage_retrieval.reset_scope_count_cache()
+        response = self._retrieval(RankedPhasesTimeOut(scope_count=10)).search(
+            "brain_busy 503", lexical_query="brain_busy 503", since=None, until=None, limit=10,
+        )
+        diagnostics = response["diagnostics"]
+        self.assertEqual(diagnostics["passage_lexical_status"], "ok-recent-first")
+        self.assertEqual(diagnostics["sparse_status"], "ok-recent-first")
+        self.assertEqual(diagnostics["dense_status"], "ok")
+        self.assertEqual(diagnostics["arms_truncated"], ["passage_lexical", "sparse_exact"])
+
+        class EverythingTimesOut(self._Store):
+            def _execute_bounded(self, connection, sql, values, deadline_at):
+                if "sum(projected.passage_count)" in sql:
+                    return super()._execute_bounded(connection, sql, values, deadline_at)
+                raise SearchDeadlineExceeded()
+
+        passage_retrieval.reset_scope_count_cache()
+        response = self._retrieval(EverythingTimesOut(scope_count=10)).search(
+            "brain_busy 503", lexical_query="brain_busy 503", since=None, until=None, limit=10,
+        )
+        self.assertTrue(response["diagnostics"]["deadline_exceeded"])
+        self.assertEqual(
+            response["diagnostics"]["arms_truncated"], ["dense", "passage_lexical", "sparse_exact"],
+        )
 
     def test_search_limit_fifty_keeps_candidate_limit_bounded(self) -> None:
         """Depth 50 issues the same bounded scans as depth 20: candidate_limit is already capped at 400."""

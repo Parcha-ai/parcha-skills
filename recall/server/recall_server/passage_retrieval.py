@@ -23,12 +23,15 @@ MAX_EXACT_DENSE_SCOPE_PASSAGES = 20_000
 # gone from an oversampled top-K instead of probing canonical_chunks per hit.
 LIVENESS_OVERSAMPLE = 2
 # The sparse-exact arm phrase-matches identifier tokens against the same
-# canonical_passages GIN index as the passage-lexical arm. It exists to
-# require the exact identifiers to be present (adjacent lexemes, every
-# token), not to rank prose a second time; for prose it would score most
-# of the corpus while dense and passage-lexical already cover the words.
-# Run it only when the query carries identifier-shaped tokens, and never
-# let it hold the rest of the search past its own share of the budget.
+# canonical_passages GIN index as the passage-lexical arm. A passage
+# qualifies when any identifier appears intact (adjacent lexemes); the
+# ranked phase then puts passages that also contain every informative
+# query term first, so an identifier alone (weak evidence, common in
+# logs) does not outrank a full match through the arm's fusion weight.
+# For prose it would score most of the corpus while dense and
+# passage-lexical already cover the words, so it runs only when the query
+# carries identifier-shaped tokens, and never holds the rest of the
+# search past its own share of the budget.
 # Known loss: identifiers that occur only inside tool output are no longer
 # matched by search; they stay reachable through recall_scan records.
 IDENTIFIER_TOKEN_RE = re.compile(
@@ -42,6 +45,8 @@ IDENTIFIER_TOKEN_RE = re.compile(
 # Acronyms such as MCP, API, or SQL are ordinary vocabulary here, not exact
 # identifiers; they stay with the passage-lexical arm.
 SPARSE_ARM_BUDGET_FRACTION = 0.5
+# Statuses that mean an arm hit its budget before finishing its full work.
+TRUNCATED_ARM_STATUSES = frozenset({"deadline-exceeded", "ok-recent-first"})
 # Ranking every full-text match by ts_rank_cd is proportional to the size of
 # the match set. Common words match most of the corpus. Each text arm first
 # tries the full ranking under a short share of the budget, then falls back
@@ -552,7 +557,7 @@ class PassageHintRetrieval:
         }
         try:
             return self._sparse_query(
-                tokens, order="rank",
+                tokens, lexical_query=lexical_query, order="rank",
                 deadline_at=_phase_deadline(arm_deadline, RANKED_PHASE_BUDGET_FRACTION),
                 **arguments,
             ), "ok"
@@ -560,7 +565,8 @@ class PassageHintRetrieval:
             pass
         try:
             return self._sparse_query(
-                tokens, order="recent", deadline_at=arm_deadline, **arguments,
+                tokens, lexical_query=lexical_query, order="recent",
+                deadline_at=arm_deadline, **arguments,
             ), "ok-recent-first"
         except SearchDeadlineExceeded:
             return [], "deadline-exceeded"
@@ -569,6 +575,7 @@ class PassageHintRetrieval:
         self,
         tokens: list[str],
         *,
+        lexical_query: str,
         order: str,
         since: str | None,
         until: str | None,
@@ -580,24 +587,31 @@ class PassageHintRetrieval:
         """One bounded exact-identifier scan over canonical_passages.
 
         Every identifier token becomes a phrase query (adjacent lexemes in
-        order) and the phrases are AND-ed, so a passage qualifies only when
-        each identifier appears intact. `matched` touches only the passage
-        table through its GIN index with the same tenant, source, policy,
-        actor, and time scope as the lexical arm; the projection, evidence,
-        and chunk-liveness joins run on the bounded pool afterwards.
+        order) and the phrases are OR-ed, so a passage qualifies when any
+        identifier appears intact. The ranked phase orders by the cover
+        density of the whole informative query first (zero unless every
+        term is present), then by identifier density, then recency; the
+        recent phase orders by recency alone. `matched` touches only the
+        passage table through its GIN index with the same tenant, source,
+        policy, actor, and time scope as the lexical arm; the projection,
+        evidence, and chunk-liveness joins run on the bounded pool.
         """
         if not tokens:
             raise ValueError("sparse query needs identifier tokens")
-        query_sql = " && ".join("phraseto_tsquery('simple',%s)" for _ in tokens)
+        query_sql = "(" + " || ".join("phraseto_tsquery('simple',%s)" for _ in tokens) + ")"
         query_values: tuple[str, ...] = tuple(tokens)
         if order == "rank":
             pool_order = (
+                "ts_rank_cd(passage.search_vector,plainto_tsquery('simple',%s),32) DESC,"
                 f"ts_rank_cd(passage.search_vector,{query_sql},32) DESC,"
                 "passage.last_occurred_at DESC,passage.passage_id"
             )
-            order_values: tuple[str, ...] = query_values
-            score_sql = f"ts_rank_cd(top.search_vector,{query_sql},32)"
-            score_values: tuple[str, ...] = query_values
+            order_values: tuple[str, ...] = (lexical_query, *query_values)
+            score_sql = (
+                "ts_rank_cd(top.search_vector,plainto_tsquery('simple',%s),32)"
+                f"+ts_rank_cd(top.search_vector,{query_sql},32)"
+            )
+            score_values: tuple[str, ...] = (lexical_query, *query_values)
         elif order == "recent":
             pool_order = "passage.last_occurred_at DESC,passage.passage_id"
             order_values = ()
@@ -641,7 +655,7 @@ class PassageHintRetrieval:
                                      )
                               )
                           )
-                          AND passage.search_vector @@ ({query_sql})
+                          AND passage.search_vector @@ {query_sql}
                           AND (%s::timestamptz IS NULL
                                OR passage.last_occurred_at>=%s)
                           AND (%s::timestamptz IS NULL
@@ -1087,6 +1101,18 @@ class PassageHintRetrieval:
             ("sparse-exact", 0.55, sparse),
         )
         results = collapse_document_candidates(legs, limit=limit)
+        # Arms that ran out of budget: either they returned nothing or the
+        # text arms fell back from full ranking to a recency window. Lets a
+        # card tell IO pressure (many truncated arms) from a ranking change.
+        arms_truncated = [
+            name
+            for name, status in (
+                ("dense", dense_status),
+                ("passage_lexical", lexical_status),
+                ("sparse_exact", sparse_status),
+            )
+            if status in TRUNCATED_ARM_STATUSES
+        ]
         response = {
             "results": results,
             "diagnostics": {
@@ -1095,6 +1121,7 @@ class PassageHintRetrieval:
                 "candidate_depth": candidate_limit,
                 "result_limit": limit,
                 "sparse_source": "passages",
+                "arms_truncated": arms_truncated,
                 "dense_candidates": len(dense),
                 "passage_lexical_candidates": len(lexical),
                 "sparse_candidates": len(sparse),
