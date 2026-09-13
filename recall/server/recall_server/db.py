@@ -32,6 +32,7 @@ from .capture import (
     parse_capture_receipt,
 )
 from .federation import SOURCE_FAMILIES, SourceProfile, freshness_score, normalized_evidence
+from .fusion import fusion_alphas_from_env, fusion_mode_from_env
 from .identity_cache import invalidate_tenant as invalidate_registration_cache
 from .projectors import KIND_RE, SOURCE_ID_RE, advisory_lock_key, canonical_json, effective_session_id, event_receipt, legacy_engine, partial_lexical_probes, phrase_query_spec, preferred_phrase_probes, project, redact_text, validate_envelope
 from .ranking import DEFAULT_SEARCH_DEADLINE_MS, evidence_rank_components, should_run_partial
@@ -213,6 +214,10 @@ class BrainStore:
         # the app/cli entry points; None when RECALL_RERANK_PROTOCOL=off.
         # Nothing consumes it until the search() integration lands.
         self.rerank_runtime = rerank_runtime
+        # H2-b: arm fusion policy for passage search. Validated at startup so
+        # a malformed RECALL_SEARCH_FUSION{,_ALPHAS} is a deployment error.
+        self.fusion_mode = fusion_mode_from_env()
+        self.fusion_alphas = fusion_alphas_from_env()
 
     def connect(self):
         if self._pool is None:

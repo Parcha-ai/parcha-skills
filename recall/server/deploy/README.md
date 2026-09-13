@@ -935,6 +935,17 @@ Searches have a 300ms database-work budget by default. Override it only within t
 10–30000ms range with `RECALL_SEARCH_DEADLINE_MS`; the response and service log expose only
 content-free per-leg timings, result counts, and the deadline outcome.
 
+Passage search fuses its dense, passage-lexical, and sparse-exact arms with convex min-max
+fusion by default: each arm's best score per document is min-max normalised inside the arm and
+the arms are combined as `Σ alpha × normalised` (`RECALL_SEARCH_FUSION_ALPHAS`, default
+`dense:0.15,lexical:0.30,sparse:0.55`, must sum to 1). Arms with fewer than three documents, or
+a recent-first fallback whose scores are all `0.0`, contribute rank scores instead. Set
+`RECALL_SEARCH_FUSION=rrf` to restore reciprocal-rank fusion. Both values are validated at
+startup; a malformed value stops the service. `diagnostics.fusion` reports the mode, alphas, and
+per-arm candidate counts on every search, and each result carries content-free `arm_scores`
+(raw best score, arm rank, normalised value per arm) so the offline tuner in
+`recall/evals/fusion_tuning.py` can replay fusion without re-querying.
+
 Semantic retrieval requires PostgreSQL with pgvector and one explicitly selected embedding
 profile. Cosine score distributions vary by model, so
 `RECALL_SEMANTIC_MINIMUM_SIMILARITY` is an explicit validated deployment setting in the

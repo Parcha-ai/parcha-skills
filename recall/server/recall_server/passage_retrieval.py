@@ -14,6 +14,13 @@ from psycopg import sql
 
 from .actor_attribution import ACTOR_ID_RE, ACTOR_RELATIONS
 from .db import SearchDeadlineExceeded, bounded_search_text
+from .fusion import (
+    ARM_NAMES,
+    DEFAULT_FUSION_ALPHAS,
+    DEFAULT_FUSION_MODE,
+    RRF_LEG_WEIGHTS,
+    leg_document_scores,
+)
 from .passage_representations import FINGERPRINT_RE, VECTOR_COLUMNS
 
 
@@ -112,11 +119,34 @@ def collapse_document_candidates(
     legs: tuple[tuple[str, float, list[dict[str, Any]]], ...],
     *,
     limit: int,
+    fusion: str = "rrf",
+    alphas: dict[str, float] | None = None,
+    fusion_report: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Fuse mechanical hints while keeping their strongest exact ranges."""
+    """Fuse mechanical hints while keeping their strongest exact ranges.
+
+    ``fusion="rrf"`` adds ``weight / (60 + rank)`` per leg (the leg weight
+    travels in ``legs``). ``fusion="convex"`` min-max normalises each leg's
+    best document score and adds ``alphas[leg] × normalised`` (falling back
+    to the leg weight when ``alphas`` lacks the leg); see ``fusion.py`` for
+    the small-leg and recent-first fallbacks. ``fusion_report`` receives
+    per-leg ``{"candidates", "documents", "normalized"}`` when given.
+    """
 
     documents: dict[str, dict[str, Any]] = {}
     for leg_name, weight, rows in legs:
+        leg_scores, normalized = leg_document_scores(rows, mode=fusion)
+        leg_weight = (
+            float(alphas.get(leg_name, weight))
+            if fusion == "convex" and alphas is not None
+            else weight
+        )
+        if fusion_report is not None:
+            fusion_report[leg_name] = {
+                "candidates": len(rows),
+                "documents": len(leg_scores),
+                "normalized": normalized,
+            }
         seen_documents: set[str] = set()
         for rank, row in enumerate(rows, start=1):
             document_id = row["logical_document_id"]
@@ -136,10 +166,17 @@ def collapse_document_candidates(
                     "_score": 0.0,
                     "_reasons": set(),
                     "_ranges": {},
+                    "_arm_scores": {},
                 },
             )
             if document_id not in seen_documents:
-                value["_score"] += weight / (60 + rank)
+                leg_entry = leg_scores[document_id]
+                value["_score"] += leg_weight * float(leg_entry["normalized"])
+                value["_arm_scores"][leg_name] = {
+                    "score": round(float(leg_entry["score"]), 8),
+                    "rank": int(leg_entry["rank"]),
+                    "normalized": round(float(leg_entry["normalized"]), 8),
+                }
                 seen_documents.add(document_id)
             value["_reasons"].add(leg_name)
             range_key = (
@@ -214,11 +251,16 @@ def collapse_document_candidates(
                 ranges.append(item)
         reasons = sorted(value.pop("_reasons"))
         score = value.pop("_score")
+        arm_scores = value.pop("_arm_scores")
         results.append({
             **value,
             "rank": round(score, 8),
             "reasons": reasons,
             "matching_ranges": ranges,
+            # Content-free per-arm evidence (raw best score, arm rank, and
+            # the normalised value the fused score used) so the systems-card
+            # probe can save candidates for offline alpha tuning.
+            "arm_scores": arm_scores,
         })
     return results
 
@@ -1075,15 +1117,35 @@ class PassageHintRetrieval:
         # fallback for paraphrases, but it must not bury an exact hit merely
         # because each arm returned candidates.
         legs = (
-            ("dense", 0.15, dense),
-            ("passage-lexical", 0.30, lexical),
-            ("sparse-exact", 0.55, sparse),
+            ("dense", RRF_LEG_WEIGHTS["dense"], dense),
+            ("passage-lexical", RRF_LEG_WEIGHTS["passage-lexical"], lexical),
+            ("sparse-exact", RRF_LEG_WEIGHTS["sparse-exact"], sparse),
         )
-        results = collapse_document_candidates(legs, limit=limit)
+        fusion_mode = getattr(self.store, "fusion_mode", DEFAULT_FUSION_MODE)
+        fusion_alphas = dict(
+            getattr(self.store, "fusion_alphas", None) or DEFAULT_FUSION_ALPHAS
+        )
+        fusion_legs: dict[str, Any] = {}
+        results = collapse_document_candidates(
+            legs,
+            limit=limit,
+            fusion=fusion_mode,
+            alphas=fusion_alphas,
+            fusion_report=fusion_legs,
+        )
         response = {
             "results": results,
             "diagnostics": {
                 "engine": "lossless-passages-v1",
+                "fusion": {
+                    "mode": fusion_mode,
+                    "alphas": (
+                        {arm: fusion_alphas[arm] for arm in ARM_NAMES}
+                        if fusion_mode == "convex"
+                        else dict(RRF_LEG_WEIGHTS)
+                    ),
+                    "legs": fusion_legs,
+                },
                 "policy_fingerprint": self.policy_fingerprint,
                 "dense_candidates": len(dense),
                 "passage_lexical_candidates": len(lexical),
