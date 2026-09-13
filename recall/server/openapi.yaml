@@ -135,7 +135,7 @@ paths:
               properties:
                 query: {type: string, minLength: 1}
                 filters: {type: object}
-                limit: {type: integer, minimum: 1, maximum: 50, default: 10}
+                limit: {type: integer, minimum: 1, maximum: 20, default: 10}
       responses:
         '410':
           description: Legacy v1 plane retired (default); set RECALL_LEGACY_READS=1 to restore

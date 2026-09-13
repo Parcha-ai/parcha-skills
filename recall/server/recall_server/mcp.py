@@ -140,9 +140,7 @@ ALL_READ_TOOLS = (
             "Use natural language, identifiers, people, source, and time filters as "
             "the question warrants; reformulate or split the question when useful. "
             "Results include logical_document_id values for recall_exec and stable "
-            "recall:// receipts for exact follow-up. Hits are hints, not proof. "
-            "Search covers visible user and assistant text; identifiers that "
-            "appear only inside tool output are reachable through recall_scan."
+            "recall:// receipts for exact follow-up. Hits are hints, not proof."
         ),
         "inputSchema": {
             "type": "object",
@@ -180,7 +178,7 @@ ALL_READ_TOOLS = (
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
-                    "maximum": 50,
+                    "maximum": 20,
                     "default": 10,
                 },
             },
@@ -826,9 +824,9 @@ def _call_tool(
             "limit",
             default=10,
             minimum=1,
-            maximum=50,
+            maximum=20,
         )
-        return fit_search_result(store.search(query, filters, limit, authorized_source))
+        return store.search(query, filters, limit, authorized_source)
     if name == "recall_exec":
         _reject_extra(arguments, frozenset({"targets", "program", "timeout_seconds"}))
         logical_document_ids, document_aliases = _exec_targets(
@@ -1031,55 +1029,6 @@ def _call_tool(
             return store.forget_capture(principal, receipt)
         raise McpProtocolError(-32602, "unknown tool")
     raise McpProtocolError(-32602, "unknown tool")
-
-
-# A search result is serialized twice (text content plus structuredContent),
-# so 50 documents with three 4 KiB snippets each would exceed the response
-# cap and turn a good ranking into a protocol error. Halve the snippets of
-# an oversized result until it fits; the receipts still resolve in full.
-SEARCH_RESULT_BUDGET_BYTES = MAX_MCP_RESPONSE_BYTES - 64 * 1024
-MIN_SEARCH_SNIPPET_CHARS = 256
-
-
-def _encoded_result_size(value: dict) -> int:
-    return len(json.dumps(_tool_result(value), default=str, sort_keys=True).encode())
-
-
-def fit_search_result(value: Any) -> Any:
-    """Shrink range snippets until a search result fits the response cap."""
-
-    if not isinstance(value, dict) or not isinstance(value.get("results"), list):
-        return value
-    if _encoded_result_size(value) <= SEARCH_RESULT_BUDGET_BYTES:
-        return value
-    results = [dict(document) for document in value["results"] if isinstance(document, dict)]
-    ranges_by_document = [
-        [dict(item) for item in document.get("matching_ranges", ()) if isinstance(item, dict)]
-        for document in results
-    ]
-    for document, ranges in zip(results, ranges_by_document, strict=True):
-        document["matching_ranges"] = ranges
-    fitted = {**value, "results": results}
-    snippet_chars = max(
-        (len(item.get("text", "")) for ranges in ranges_by_document for item in ranges),
-        default=0,
-    )
-    while snippet_chars > MIN_SEARCH_SNIPPET_CHARS:
-        snippet_chars = max(MIN_SEARCH_SNIPPET_CHARS, snippet_chars // 2)
-        for ranges in ranges_by_document:
-            for item in ranges:
-                text = item.get("text")
-                if isinstance(text, str) and len(text) > snippet_chars:
-                    item["text"] = text[:snippet_chars]
-                    item["text_clipped"] = True
-        if _encoded_result_size(fitted) <= SEARCH_RESULT_BUDGET_BYTES:
-            break
-    diagnostics = fitted.get("diagnostics")
-    fitted["diagnostics"] = {
-        **(diagnostics if isinstance(diagnostics, dict) else {}),
-        "snippet_chars": snippet_chars,
-    }
-    return fitted
 
 
 def _tool_result(value: dict) -> dict:
