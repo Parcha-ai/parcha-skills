@@ -963,6 +963,34 @@ indices, dimensions, and finite values, and fingerprints the protocol, model ver
 and query/document transformation. A profile change therefore makes old vectors stale until the
 online backfill converges.
 
+### Optional reranker (`RECALL_RERANK_*`)
+
+Recall can rerank the top fused passage candidates with a hosted cross-encoder before
+collapsing them into documents. It is off by default and fail-open: any failure (network,
+timeout, HTTP status, malformed body, out-of-range index, unreadable key) raises
+`RerankUnavailable` and search keeps the fused ranking it already has. The runtime never
+retries on the query path and never logs query text, passage text, or the bearer.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `RECALL_RERANK_PROTOCOL` | `off` | `voyage`, `cohere`, or `off`. |
+| `RECALL_RERANK_MODEL` | `rerank-2.5` (voyage) / `rerank-v3.5` (cohere) | Provider model label. |
+| `RECALL_RERANK_URL` | provider endpoint | `https://api.voyageai.com/v1/rerank` or `https://api.cohere.com/v2/rerank`. |
+| `RECALL_RERANK_APPROVED_URL` | unset | Required when `RECALL_RERANK_URL` is not the provider default; must match exactly. |
+| `RECALL_RERANK_KEY_FILE` | unset | Owner-only (`0600`), non-symlink bearer file. Mutually exclusive with the variable below. |
+| `RECALL_RERANK_KEY_ENV` | unset | Name of the secret-manager variable holding the bearer. |
+| `RECALL_RERANK_TIMEOUT_SECONDS` | `2.5` | Per-request timeout (0.1–30). Search may pass a shorter remaining budget. |
+| `RECALL_RERANK_MAX_CANDIDATES` | `50` | Passages sent per query; extra candidates are dropped, not reranked. |
+| `RECALL_RERANK_MAX_DOC_CHARS` | `2000` | Each passage is truncated to this many characters before sending. |
+
+Every non-loopback endpoint must use HTTPS. The provider's canonical endpoint is approved by
+construction; any other host needs `RECALL_RERANK_APPROVED_URL` set to the exact same value, the
+same pattern as `RECALL_EMBEDDING_APPROVED_URL`. Exactly one key source is required. Redirects are
+refused, response bodies above 2 MiB are refused, and every returned index must be unique and
+inside the submitted batch. The `fingerprint` (protocol, model, truncation width) is reported in
+search diagnostics so eval runs can attribute a ranking change to a reranker change. Enabling a
+hosted reranker sends redacted passage text to that provider; make the privacy choice deliberately.
+
 The optional packaged self-hosted unit pins TEI 1.9 and Qwen3-Embedding-0.6B, binds only
 `127.0.0.1:8089`, and never exposes an embedding route through Tailscale Serve. Keep
 `RECALL_EMBEDDING_BATCH_SIZE=1`: the derivation

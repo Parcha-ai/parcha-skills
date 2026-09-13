@@ -59,6 +59,7 @@ from .mcp_conformance import (
     McpConformanceConfig,
     run_conformance,
 )
+from .rerank import build_rerank_runtime
 from .semantic import SemanticRuntime
 
 
@@ -2003,6 +2004,7 @@ def main() -> None:
     store = BrainStore(
         args.dsn,
         semantic_runtime=SemanticRuntime.from_env(),
+        rerank_runtime=build_rerank_runtime(),
         pool_max_size=pool_max_size,
     )
     if args.command == "migrate":

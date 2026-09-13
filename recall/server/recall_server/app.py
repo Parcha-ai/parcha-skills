@@ -72,6 +72,7 @@ from .mcp import (
 from .mcp import (
     error_response as mcp_error_response,
 )
+from .rerank import build_rerank_runtime
 from .semantic import SemanticRuntime
 from .webhooks import WEBHOOK_PATH, WebhookError, build_webhook_event
 from connectors.slack_events import slack_event_to_webhook
@@ -1933,7 +1934,11 @@ def validate_http_profile() -> None:
 
 
 def configure_runtime(dsn: str) -> None:
-    Handler.store = BrainStore(dsn, semantic_runtime=SemanticRuntime.from_env())
+    Handler.store = BrainStore(
+        dsn,
+        semantic_runtime=SemanticRuntime.from_env(),
+        rerank_runtime=build_rerank_runtime(),
+    )
     Handler.external_identity_verifier = OidcJwtVerifier.from_env()
     Handler.control_plane = (
         ControlPlane.from_env(Handler.store)
