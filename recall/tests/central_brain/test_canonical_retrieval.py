@@ -1548,10 +1548,210 @@ class SearchArmCostTests(unittest.TestCase):
                       actor_relations=None, deadline_at=time.monotonic() + 5)
         rows, status = retrieval._sparse_candidates("deploy fail", **common)
         self.assertEqual((rows, status), ([], "skipped-prose-query"))
-        self.assertFalse(any("FROM canonical_chunks chunk" in s for s in store.sql))
+        self.assertFalse(any("phraseto_tsquery" in s for s in store.sql))
         rows, status = retrieval._sparse_candidates("frontalcortextool replacement", original_query="FrontalCortexTool replacement", **common)
         self.assertEqual(status, "ok")
-        self.assertTrue(any("FROM canonical_chunks chunk" in s for s in store.sql))
+        sparse = [s for s in store.sql if "phraseto_tsquery" in s]
+        self.assertEqual(len(sparse), 1)
+        self.assertIn("FROM canonical_passages passage", sparse[0])
+        self.assertNotIn("FROM canonical_chunks chunk", sparse[0])
+        # the casefolded and CamelCase forms are one phrase query
+        tokens = [v for v in store.values[-1] if isinstance(v, str) and v.casefold() == "frontalcortextool"]
+        self.assertEqual(tokens, ["frontalcortextool"] * tokens.count("frontalcortextool"))
+        self.assertNotIn("FrontalCortexTool", store.values[-1])
+        self.assertNotIn("replacement", store.values[-1])
+
+    def test_sparse_arm_never_reads_canonical_chunks(self) -> None:
+        """Every sparse SQL statement scans canonical_passages; chunks appear only in the bounded liveness join."""
+
+        from recall_server.passage_retrieval import identifier_tokens
+
+        self.assertEqual(
+            identifier_tokens("brain_busy 503 in parcha-backend", "PoolTimeout brain_busy"),
+            ["brain_busy", "503", "parcha-backend", "pooltimeout"],
+        )
+        self.assertEqual(len(identifier_tokens(" ".join(f"id_{n}" for n in range(40)))), 8)
+
+        store = self._Store(scope_count=10)
+        retrieval = self._retrieval(store)
+        for order in ("rank", "recent"):
+            store.sql.clear()
+            store.values.clear()
+            retrieval._sparse_query(
+                ["brain_busy", "503"], lexical_query="brain_busy 503 deploy", order=order,
+                since="2026-09-01T00:00:00Z", until=None,
+                candidate_limit=80, actor_ids=["actor_" + "0" * 32], actor_relations=["author"],
+                deadline_at=time.monotonic() + 5,
+            )
+            self.assertEqual(len(store.sql), 1)
+            sql = store.sql[0]
+            pool, _, outer = sql.partition("SELECT top.source_id")
+            self.assertIn("WITH matched AS MATERIALIZED", pool)
+            self.assertIn("FROM canonical_passages passage", pool)
+            self.assertNotIn("canonical_chunks", pool)
+            self.assertNotIn("canonical_documents", sql)
+            self.assertNotIn("canonical_events", sql)
+            # any identifier phrase qualifies a passage
+            self.assertIn(
+                "passage.search_vector @@ (phraseto_tsquery('simple',%s) || phraseto_tsquery('simple',%s))",
+                pool,
+            )
+            self.assertNotIn("&&", sql)
+            # scoped exactly like the passage-lexical arm
+            self.assertIn("passage.policy_fingerprint=%s", pool)
+            self.assertIn("FROM canonical_passage_actors actor", pool)
+            self.assertIn("passage.last_occurred_at>=%s", pool)
+            self.assertIn("passage.first_occurred_at<=%s", pool)
+            # liveness runs once, on the bounded pool, never per match
+            self.assertEqual(outer.count("LEFT JOIN canonical_chunks live_chunk"), 1)
+            self.assertIn("JOIN canonical_passage_documents projected", outer)
+            self.assertIn("top.passage_id,top.passage_ordinal", outer)
+            values = store.values[0]
+            self.assertEqual(values[:3], ("tenant:test", ["codex:linux:test"], "fp-policy"))
+            self.assertIn("brain_busy", values)
+            self.assertIn("503", values)
+            self.assertIn(160, values)
+            self.assertIn(80, values)
+            if order == "rank":
+                # full-query matches first, then identifier density, then recency
+                self.assertIn(
+                    "ORDER BY ts_rank_cd(passage.search_vector,plainto_tsquery('simple',%s),32) DESC,"
+                    "ts_rank_cd(passage.search_vector,(phraseto_tsquery('simple',%s) || phraseto_tsquery('simple',%s)),32) DESC,"
+                    "passage.last_occurred_at DESC,passage.passage_id",
+                    pool,
+                )
+                self.assertIn("brain_busy 503 deploy", values)
+                self.assertLess(values.index("brain_busy 503 deploy"), values.index(160))
+            else:
+                self.assertNotIn("brain_busy 503 deploy", values)
+                self.assertNotIn("ts_rank_cd", sql)
+                self.assertIn("0.0::real AS score", sql)
+        with self.assertRaises(ValueError):
+            retrieval._sparse_query(
+                [], lexical_query="x", order="rank", since=None, until=None, candidate_limit=80,
+                actor_ids=None, actor_relations=None, deadline_at=time.monotonic() + 5,
+            )
+
+    def test_prose_query_fusion_is_byte_identical_without_the_sparse_arm(self) -> None:
+        """A query without identifiers never reaches the sparse arm; fusion sees the same two legs as before."""
+
+        from recall_server import passage_retrieval
+        from recall_server.passage_retrieval import collapse_document_candidates
+
+        def row(document, passage, score, when):
+            return {
+                "source_id": "codex:linux:test", "logical_document_id": document, "revision": 1,
+                "native_parent_id": document + "-parent", "first_occurred_at": when, "last_occurred_at": when,
+                "manifest_object_key": "k/" + document, "manifest_content_sha256": "c" * 64,
+                "passage_id": passage, "passage_ordinal": 0, "spans": [], "receipts": [f"recall://codex:linux:test/{document}?rev=1#item=0"],
+                "text_redacted": f"text of {passage}", "passage_first_occurred_at": when, "passage_last_occurred_at": when, "score": score,
+            }
+
+        dense_rows = [row("ldoc_a", "psg_a1", 0.9, "2026-09-02"), row("ldoc_b", "psg_b1", 0.8, "2026-09-01")]
+        lexical_rows = [row("ldoc_b", "psg_b2", 0.7, "2026-09-01"), row("ldoc_c", "psg_c1", 0.6, "2026-09-03")]
+
+        class Legs(self._Store):
+            def _execute_bounded(self, connection, sql, values, deadline_at):
+                if "phraseto_tsquery" in sql:
+                    raise AssertionError("sparse arm ran for a prose query")
+                if "FROM canonical_passages passage" in sql:
+                    self.sql.append(" ".join(sql.split()))
+                    self.values.append(tuple(values))
+                    return Rows(lexical_rows)
+                if "WITH eligible AS MATERIALIZED" in sql or "WITH nearest AS MATERIALIZED" in sql:
+                    self.sql.append(" ".join(sql.split()))
+                    self.values.append(tuple(values))
+                    return Rows(dense_rows)
+                return super()._execute_bounded(connection, sql, values, deadline_at)
+
+        passage_retrieval.reset_scope_count_cache()
+        store = Legs(scope_count=10)
+        response = self._retrieval(store).search(
+            "why did the deploy fail", lexical_query="deploy fail", since=None, until=None, limit=20,
+        )
+        self.assertEqual(response["diagnostics"]["sparse_status"], "skipped-prose-query")
+        self.assertEqual(response["diagnostics"]["sparse_candidates"], 0)
+        expected = collapse_document_candidates(
+            (("dense", 0.15, dense_rows), ("passage-lexical", 0.30, lexical_rows), ("sparse-exact", 0.55, [])),
+            limit=20,
+        )
+        self.assertEqual(
+            json.dumps(response["results"], sort_keys=True, default=str),
+            json.dumps(expected, sort_keys=True, default=str),
+        )
+        self.assertEqual([r["logical_document_id"] for r in expected], ["ldoc_b", "ldoc_c", "ldoc_a"])
+
+    def test_search_diagnostics_report_candidate_depth(self) -> None:
+        store = self._Store(scope_count=10)
+        for limit, depth in ((1, 80), (10, 200), (20, 400), (50, 400)):
+            response = self._retrieval(store).search(
+                "brain_busy 503", lexical_query="brain_busy 503", since=None, until=None, limit=limit,
+            )
+            diagnostics = response["diagnostics"]
+            self.assertEqual(diagnostics["candidate_depth"], depth)
+            self.assertEqual(diagnostics["result_limit"], limit)
+            self.assertEqual(diagnostics["sparse_source"], "passages")
+
+    def test_search_diagnostics_report_which_arms_were_truncated(self) -> None:
+        from recall_server import passage_retrieval
+
+        passage_retrieval.reset_scope_count_cache()
+        store = self._Store(scope_count=10)
+        response = self._retrieval(store).search(
+            "brain_busy 503", lexical_query="brain_busy 503", since=None, until=None, limit=10,
+        )
+        self.assertEqual(response["diagnostics"]["arms_truncated"], [])
+
+        class RankedPhasesTimeOut(self._Store):
+            def _execute_bounded(self, connection, sql, values, deadline_at):
+                if "ts_rank_cd(passage.search_vector" in sql:
+                    raise SearchDeadlineExceeded()
+                return super()._execute_bounded(connection, sql, values, deadline_at)
+
+        passage_retrieval.reset_scope_count_cache()
+        response = self._retrieval(RankedPhasesTimeOut(scope_count=10)).search(
+            "brain_busy 503", lexical_query="brain_busy 503", since=None, until=None, limit=10,
+        )
+        diagnostics = response["diagnostics"]
+        self.assertEqual(diagnostics["passage_lexical_status"], "ok-recent-first")
+        self.assertEqual(diagnostics["sparse_status"], "ok-recent-first")
+        self.assertEqual(diagnostics["dense_status"], "ok")
+        self.assertEqual(diagnostics["arms_truncated"], ["passage_lexical", "sparse_exact"])
+
+        class EverythingTimesOut(self._Store):
+            def _execute_bounded(self, connection, sql, values, deadline_at):
+                if "sum(projected.passage_count)" in sql:
+                    return super()._execute_bounded(connection, sql, values, deadline_at)
+                raise SearchDeadlineExceeded()
+
+        passage_retrieval.reset_scope_count_cache()
+        response = self._retrieval(EverythingTimesOut(scope_count=10)).search(
+            "brain_busy 503", lexical_query="brain_busy 503", since=None, until=None, limit=10,
+        )
+        self.assertTrue(response["diagnostics"]["deadline_exceeded"])
+        self.assertEqual(
+            response["diagnostics"]["arms_truncated"], ["dense", "passage_lexical", "sparse_exact"],
+        )
+
+    def test_search_limit_fifty_keeps_candidate_limit_bounded(self) -> None:
+        """Depth 50 issues the same bounded scans as depth 20: candidate_limit is already capped at 400."""
+
+        from recall_server import passage_retrieval
+
+        def issued(limit):
+            passage_retrieval.reset_scope_count_cache()
+            store = self._Store(scope_count=10)
+            self._retrieval(store).search(
+                "brain_busy 503", lexical_query="brain_busy 503", since=None, until=None, limit=limit,
+            )
+            return sorted(
+                (sql, tuple(v for v in values if isinstance(v, int) and not isinstance(v, bool)))
+                for sql, values in zip(store.sql, store.values, strict=True)
+            )
+
+        twenty, fifty = issued(20), issued(50)
+        self.assertEqual(twenty, fifty)
+        self.assertTrue(any(400 in ints and 800 in ints for _sql, ints in fifty))
 
     def test_sparse_arm_gets_half_the_remaining_budget(self) -> None:
         store = self._Store(scope_count=10)
@@ -1570,13 +1770,13 @@ class SearchArmCostTests(unittest.TestCase):
 
         class SlowRanking(self._Store):
             def _execute_bounded(self, connection, sql, values, deadline_at):
-                if "FROM canonical_passages passage" in sql or "FROM canonical_chunks chunk" in sql:
+                if "FROM canonical_passages passage" in sql:
                     self.sql.append(" ".join(sql.split()))
                     self.values.append(tuple(values))
                     self.deadlines = getattr(self, "deadlines", [])
                     self.deadlines.append(deadline_at)
                     # the ranked pool times out; the recency pool succeeds
-                    if "ts_rank_cd(passage.search_vector" in sql or "ts_rank_cd(chunk.search_vector" in sql:
+                    if "ts_rank_cd(passage.search_vector" in sql:
                         raise SearchDeadlineExceeded()
                     return Rows([])
                 return super()._execute_bounded(connection, sql, values, deadline_at)

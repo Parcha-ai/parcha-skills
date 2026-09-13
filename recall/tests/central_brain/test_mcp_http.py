@@ -325,6 +325,12 @@ def request(method: str, request_id: int = 1, params: dict | None = None) -> dic
     }
 
 
+def _tool_result_for_test(value):
+    from recall_server.mcp import _tool_result
+
+    return _tool_result(value)
+
+
 class RemoteMcpContractTest(unittest.TestCase):
     def setUp(self) -> None:
         self.store = FakeStore()
@@ -690,7 +696,7 @@ class RemoteMcpContractTest(unittest.TestCase):
         )
         self.assertEqual(
             tools["recall_search"]["properties"]["limit"]["maximum"],
-            20,
+            50,
         )
         self.assertEqual(
             tools["recall_search"]["properties"]["filters"]["properties"]["since"],
@@ -1136,7 +1142,12 @@ class RemoteMcpContractTest(unittest.TestCase):
         cases = (
             (
                 "recall_search",
-                {"query": "synthetic", "limit": 21},
+                {"query": "synthetic", "limit": 51},
+                "search",
+            ),
+            (
+                "recall_search",
+                {"query": "synthetic", "limit": 0},
                 "search",
             ),
             (
@@ -1171,6 +1182,71 @@ class RemoteMcpContractTest(unittest.TestCase):
                     store_call,
                     {call[0] for call in self.store.calls},
                 )
+
+    def test_search_accepts_depth_fifty_and_forwards_it_to_the_store(self) -> None:
+        self.store.calls.clear()
+        with McpHttpServer(self.store) as server:
+            status, _, raw = server.request(
+                "POST",
+                request(
+                    "tools/call",
+                    params={
+                        "name": "recall_search",
+                        "arguments": {"query": "synthetic", "limit": 50},
+                    },
+                ),
+                protocol="2025-11-25",
+            )
+        self.assertEqual(status, 200)
+        self.assertNotIn("error", json.loads(raw))
+        searches = [call for call in self.store.calls if call[0] == "search"]
+        self.assertEqual(len(searches), 1)
+        self.assertIn(50, searches[0][1:])
+
+    def test_search_results_at_depth_fifty_are_fitted_under_the_response_cap(self) -> None:
+        from recall_server.mcp import (
+            MAX_MCP_RESPONSE_BYTES, MIN_SEARCH_SNIPPET_CHARS, bound_response, fit_search_result,
+        )
+
+        def value(documents, snippet):
+            return {
+                "results": [
+                    {
+                        "source_id": "codex:linux:host", "logical_document_id": f"ldoc_{i:032x}", "revision": 3,
+                        "native_parent_id": "p" * 40, "first_occurred_at": "2026-09-01 10:00:00+00",
+                        "last_occurred_at": "2026-09-01 12:00:00+00", "manifest_object_key": "k" * 96,
+                        "manifest_content_sha256": "b" * 64, "score": 0.01, "reasons": ["dense"],
+                        "matching_ranges": [
+                            {
+                                "kind": kind, "score": 0.5, "text": "x" * snippet, "text_clipped": False,
+                                "receipts": [f"recall://codex:linux:host/s-{i}?rev=3#item={k}" for k in range(4)],
+                                "passage_id": "psg_" + "c" * 32, "passage_ordinal": 7,
+                                "spans": [{"receipt": "r" * 60, "start": 0, "end": 900, "role": "assistant"} for _ in range(8)],
+                            }
+                            for kind in ("dense", "passage-lexical", "sparse-exact")
+                        ],
+                    }
+                    for i in range(documents)
+                ],
+                "diagnostics": {"engine": "lossless-passages-v1"},
+            }
+
+        small = value(20, 4096)
+        self.assertIs(fit_search_result(small), small)
+        large = value(50, 4096)
+        fitted = fit_search_result(large)
+        self.assertEqual(large["results"][0]["matching_ranges"][0]["text"], "x" * 4096)  # input untouched
+        response = bound_response({"jsonrpc": "2.0", "id": 1, "result": _tool_result_for_test(fitted)}, 1)
+        self.assertNotIn("error", response)
+        self.assertLessEqual(len(json.dumps(response, sort_keys=True).encode()), MAX_MCP_RESPONSE_BYTES)
+        self.assertEqual(len(fitted["results"]), 50)
+        texts = {len(r["text"]) for d in fitted["results"] for r in d["matching_ranges"]}
+        self.assertEqual(len(texts), 1)
+        self.assertGreaterEqual(texts.pop(), MIN_SEARCH_SNIPPET_CHARS)
+        self.assertTrue(all(r["text_clipped"] for d in fitted["results"] for r in d["matching_ranges"]))
+        self.assertEqual(fitted["diagnostics"]["engine"], "lossless-passages-v1")
+        self.assertEqual(fitted["diagnostics"]["snippet_chars"], len(fitted["results"][0]["matching_ranges"][0]["text"]))
+        self.assertEqual(fit_search_result({"results": "nope"}), {"results": "nope"})
 
     def test_public_profile_hides_every_non_mcp_route_before_store_io(self) -> None:
         self.environment.stop()
