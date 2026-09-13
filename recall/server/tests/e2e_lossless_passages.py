@@ -243,7 +243,7 @@ def main() -> None:
             assert row["embed_sha256"] != row["text_sha256"]
         headers_before = {row["passage_id"]: row["header_redacted"] for row in headed}
 
-        # Rows projected before schema 063 (header NULL) are backfilled from
+        # Rows projected before schema 064 (header NULL) are backfilled from
         # the catalog only, and the SQL-side hash equals the Python helper.
         with store.connect() as connection:
             connection.execute(

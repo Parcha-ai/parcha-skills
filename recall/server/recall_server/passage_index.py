@@ -1151,7 +1151,7 @@ class CanonicalPassageProjector:
         batch_size: int = 500,
         max_batches: int = 10,
     ) -> dict[str, int | str]:
-        """Render headers for passages projected before schema 063.
+        """Render headers for passages projected before schema 064.
 
         Reads catalog rows only (never the archive): the header is a pure
         function of the document's catalog context and the passage's own
@@ -1599,7 +1599,7 @@ class CanonicalPassageProjector:
         tenant_scope = tenant_id or ""
         headers_backfilled = 0
         if headed:
-            # Rows projected before schema 063 get their header from the
+            # Rows projected before schema 064 get their header from the
             # catalog first, so the v2 key exists for every candidate.
             headers_backfilled = int(self.backfill_headers(
                 tenant_id=tenant_id,
