@@ -1090,7 +1090,7 @@ class PassageProjectionTests(unittest.TestCase):
         )[1].split("), nearest AS MATERIALIZED", 1)[0]
 
         self.assertIn(
-            "dense_oversample = 50 if temporal_scope else 5",
+            "dense_oversample = 50 if temporal_scope else DENSE_PROSE_OVERSAMPLE",
             source,
         )
         self.assertIn("canonical_passages", eligible)
