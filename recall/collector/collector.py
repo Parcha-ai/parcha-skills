@@ -739,7 +739,7 @@ class Collector:
         if self.archive is None:
             return None
         try:
-            return self.archive.put_raw(
+            reference = self.archive.put_raw(
                 tenant_id=self.tenant_id,
                 source_id=self.source_id,
                 native_id=native_id,
@@ -749,6 +749,18 @@ class Collector:
             )
         except Exception:
             raise CollectorRuntimeError("archive_unavailable") from None
+        # Every envelope declares facts about these exact bytes (the oversized
+        # pointer declares their gzip size, the manifest their digest), so a
+        # reference to any other object would be committed as truth and only
+        # fail days later inside the logical projector. Refuse it here.
+        if (
+            not isinstance(reference, dict)
+            or reference.get("content_sha256") != hashlib.sha256(payload).hexdigest()
+            or reference.get("size_bytes") != len(payload)
+            or reference.get("media_type") != media_type
+        ):
+            raise CollectorRuntimeError("archive_reference_mismatch")
+        return reference
 
     def _archive_manifest(
         self,

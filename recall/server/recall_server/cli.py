@@ -54,6 +54,7 @@ from .managed_apply import (
     reconcile_infrastructure,
 )
 from .managed_worker import run_managed_worker
+from .oversized_repair import repair_oversized_records
 from .mcp_conformance import (
     ConformanceError,
     McpConformanceConfig,
@@ -1512,6 +1513,11 @@ def main() -> None:
     sub.add_parser("storage-finish-event-compaction")
     sub.add_parser("storage-cancel-stale-event-compaction")
     sub.add_parser("storage-recompact-oversized-events")
+    repair_oversized = sub.add_parser("repair-oversized-records")
+    repair_oversized.add_argument("--tenant", required=True)
+    repair_oversized.add_argument("--source", required=True)
+    repair_oversized.add_argument("--native-parent-id", required=True)
+    repair_oversized.add_argument("--dry-run", action="store_true")
     sub.add_parser("storage-recompact-raw-s3-event-bodies")
     recompact_s3_events = sub.add_parser("storage-recompact-s3-event-bodies")
     recompact_s3_events.add_argument("--batch-size", type=int, default=10_000)
@@ -2024,6 +2030,20 @@ def main() -> None:
         print(json.dumps(_cancel_stale_event_compaction(store), sort_keys=True))
     elif args.command == "storage-recompact-oversized-events":
         print(json.dumps(_recompact_oversized_event_pointers(store), sort_keys=True))
+    elif args.command == "repair-oversized-records":
+        print(
+            json.dumps(
+                repair_oversized_records(
+                    store,
+                    build_archive_store(),
+                    tenant_id=args.tenant,
+                    source_id=args.source,
+                    native_parent_id=args.native_parent_id,
+                    dry_run=args.dry_run,
+                ),
+                sort_keys=True,
+            )
+        )
     elif args.command == "storage-recompact-raw-s3-event-bodies":
         print(json.dumps(_recompact_raw_s3_event_bodies(store), sort_keys=True))
     elif args.command == "storage-recompact-s3-event-bodies":

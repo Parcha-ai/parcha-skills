@@ -17,11 +17,16 @@ from .canonical_text import (
     MAX_CANONICAL_TEXT_BYTES,
     canonical_text_chunks,
 )
-from .logical_evidence_projection import mark_logical_evidence_dirty
+from .logical_evidence_projection import (
+    OVERSIZED_MEDIA_TYPE,
+    mark_logical_evidence_dirty,
+)
 from .projectors import item_receipt, validate_envelope
 
 MAX_LINKED_IDENTITIES = 10_000
 MAX_CANONICAL_BATCH_EVENTS = 1_000
+OVERSIZED_CONTRACT = "recall.oversized-projection.v1"
+_SHA256_HEX = 64
 
 
 class CanonicalLifecycleError(RuntimeError):
@@ -45,6 +50,47 @@ class ArchiveLifecycle(Protocol):
     ) -> dict[str, Any]: ...
 
     def delete_raw(self, reference: dict[str, Any]) -> bool: ...
+
+
+def _validate_oversized_pointer(event: dict[str, Any], artifact: dict[str, Any]) -> None:
+    """Refuse an oversized pointer whose declared archive facts contradict its artifact.
+
+    The pointer is the only description of the archived full record that the
+    logical projector ever sees, and nothing downstream can repair a pointer
+    that never matched. The artifact reference in the same envelope is
+    content-addressed and already verified by the archive gateway, so any
+    disagreement between the two is a producer fault and is rejected here,
+    where the collector receives the error, instead of poisoning the logical
+    projection queue days later.
+    """
+    content = event.get("content")
+    if event.get("kind") == "tombstone" or not isinstance(content, dict):
+        return
+    if content.get("contract") != OVERSIZED_CONTRACT:
+        return
+    full_size = content.get("full_size_bytes")
+    digest = content.get("full_content_sha256")
+    archive_size = content.get("archive_size_bytes")
+    if (
+        artifact.get("media_type") != OVERSIZED_MEDIA_TYPE
+        or content.get("full_record_available") is not True
+        or content.get("archive_encoding") != "gzip"
+        or isinstance(full_size, bool)
+        or not isinstance(full_size, int)
+        or full_size < 1
+        or not isinstance(digest, str)
+        or len(digest) != _SHA256_HEX
+        or any(character not in "0123456789abcdef" for character in digest)
+        or (
+            archive_size is not None
+            and (
+                isinstance(archive_size, bool)
+                or not isinstance(archive_size, int)
+                or archive_size != artifact.get("size_bytes")
+            )
+        )
+    ):
+        raise CanonicalLifecycleError("canonical_oversized_pointer_invalid")
 
 
 def _identity_sha256(tenant_id: str, source_id: str, native_id: str) -> str:
@@ -407,6 +453,7 @@ class CanonicalPlane:
             or event.get("provenance", {}).get("artifact_ref") != artifact
         ):
             raise CanonicalLifecycleError("canonical_lineage_invalid")
+        _validate_oversized_pointer(event, artifact)
         raw_sha256 = artifact["content_sha256"]
         event_sha256 = event["content_sha256"]
         identity_sha256 = _identity_sha256(tenant_id, source_id, native_id)
@@ -959,6 +1006,7 @@ class CanonicalPlane:
                 or event.get("provenance", {}).get("artifact_ref") != artifact
             ):
                 raise CanonicalLifecycleError("canonical_lineage_invalid")
+            _validate_oversized_pointer(event, artifact)
             text_redacted = (
                 ""
                 if is_tombstone
