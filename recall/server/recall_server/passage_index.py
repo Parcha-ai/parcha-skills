@@ -15,16 +15,25 @@ from .logical_evidence import (
     LogicalEvidenceProjectionStore,
 )
 from .passage_projection import (
+    MAX_PASSAGE_HEADER_BYTES,
+    PASSAGE_EMBEDDING_SEPARATOR,
     LosslessPassage,
     PassagePolicy,
     build_passages,
     canonical_spans_json,
     decode_logical_record,
+    passage_embed_sha256,
+    passage_embedding_input,
+    render_passage_header,
     visible_messages,
 )
+from .passage_representations import ActorContext, DocumentContext
 
 MAX_PASSAGE_PROJECTION_BATCH = 1_000
 MAX_PASSAGE_EMBEDDING_BATCH = 5_000
+MAX_PASSAGE_HEADER_BACKFILL_BATCH = 5_000
+# Content-free token estimate for the embed plan: UTF-8 bytes per token.
+PASSAGE_PLAN_BYTES_PER_TOKEN = 4
 PASSAGE_POOL_WARM_SIZE = 4
 PASSAGE_COMMIT_WORKERS = 8
 # Retained passages whose ordinal moved are parked above every real ordinal
@@ -135,6 +144,241 @@ def classify_passages(
     )
 
 
+DOCUMENT_CONTEXT_SQL = """
+    SELECT profile.family AS source_family,
+           coalesce(aliases.values,ARRAY[]::text[]) AS source_aliases,
+           session.harness,session.metadata,
+           coalesce(attributed.actors,'[]'::jsonb) AS actors
+      FROM canonical_evidence_documents evidence
+      LEFT JOIN sessions session
+        ON session.source_id=evidence.source_id
+       AND session.native_id=evidence.native_parent_id
+      LEFT JOIN source_profiles profile
+        ON profile.source_id=evidence.source_id
+      LEFT JOIN LATERAL (
+          SELECT array_agg(alias ORDER BY alias) AS values
+            FROM source_aliases
+           WHERE source_id=evidence.source_id
+      ) aliases ON true
+      LEFT JOIN LATERAL (
+          SELECT jsonb_agg(
+                     jsonb_build_object(
+                         'actor_id',person.actor_id,
+                         'display_name',person.display_name,
+                         'relations',person.relations,
+                         'aliases',person.aliases
+                     )
+                     ORDER BY lower(person.display_name),person.actor_id
+                 ) AS actors
+            FROM (
+                  SELECT actor.actor_id,actor.display_name,
+                         array_agg(DISTINCT link.relation
+                                   ORDER BY link.relation) AS relations,
+                         coalesce(
+                             array_agg(DISTINCT alias.alias
+                                       ORDER BY alias.alias)
+                             FILTER (WHERE alias.searchable),
+                             ARRAY[]::text[]
+                         ) AS aliases
+                    FROM canonical_evidence_document_actors link
+                    JOIN brain_actors actor
+                      ON actor.tenant_id=link.tenant_id
+                     AND actor.actor_id=link.actor_id
+                     AND actor.active
+                    LEFT JOIN brain_actor_aliases alias
+                      ON alias.tenant_id=actor.tenant_id
+                     AND alias.actor_id=actor.actor_id
+                   WHERE link.tenant_id=evidence.tenant_id
+                     AND link.source_id=evidence.source_id
+                     AND link.logical_document_id=evidence.logical_document_id
+                     AND link.revision=evidence.revision
+                   GROUP BY actor.actor_id,actor.display_name
+            ) person
+      ) attributed ON true
+     WHERE evidence.tenant_id=%s AND evidence.source_id=%s
+       AND evidence.logical_document_id=%s
+"""
+
+
+def document_context_from_row(row: dict[str, Any] | None) -> DocumentContext:
+    """Header inputs for one logical document from its catalog row."""
+
+    if row is None:
+        return DocumentContext()
+    session_metadata = row.get("metadata") or {}
+    if not isinstance(session_metadata, dict):
+        session_metadata = {}
+    return DocumentContext(
+        source_family=row.get("source_family"),
+        source_aliases=tuple(row.get("source_aliases") or ()),
+        harness=row.get("harness") or session_metadata.get("harness"),
+        workspace=session_metadata.get("cwd"),
+        branch=session_metadata.get("branch"),
+        actors=tuple(
+            ActorContext(
+                actor_id=value["actor_id"],
+                display_name=value["display_name"],
+                relations=tuple(value.get("relations") or ()),
+                aliases=tuple(value.get("aliases") or ()),
+            )
+            for value in row.get("actors") or ()
+        ),
+    )
+
+
+def document_context(
+    connection: Any,
+    *,
+    tenant_id: str,
+    source_id: str,
+    logical_document_id: str,
+) -> DocumentContext:
+    row = connection.execute(
+        DOCUMENT_CONTEXT_SQL,
+        (tenant_id, source_id, logical_document_id),
+    ).fetchone()
+    return document_context_from_row(row)
+
+
+def passage_contract_coverage(
+    connection: Any,
+    *,
+    fingerprint: str,
+    tenant_id: str | None = None,
+) -> dict[str, Any]:
+    """Share of live passages whose vector carries ``fingerprint`` (v2 key).
+
+    A passage is covered when its embedding row has the given runtime
+    fingerprint and its content hash equals the passage's ``embed_sha256``.
+    An empty table counts as fully covered: nothing would be lost by reading
+    the new contract.
+    """
+
+    row = connection.execute(
+        """SELECT count(*) AS total,
+                  count(*) FILTER (
+                      WHERE embedding.runtime_fingerprint=%s
+                        AND embedding.content_sha256=passage.embed_sha256
+                  ) AS covered
+             FROM canonical_passages passage
+             JOIN canonical_passage_documents document
+               USING(
+                   tenant_id,source_id,logical_document_id,
+                   policy_fingerprint
+               )
+             LEFT JOIN canonical_passage_embeddings embedding
+               USING(tenant_id,source_id,passage_id)
+            WHERE (%s::text IS NULL OR passage.tenant_id=%s)""",
+        (fingerprint, tenant_id, tenant_id),
+    ).fetchone()
+    total = int(row["total"])
+    covered = int(row["covered"])
+    return {
+        "total": total,
+        "covered": covered,
+        "coverage": 1.0 if total == 0 else covered / total,
+    }
+
+
+def passage_embed_plan(
+    connection: Any,
+    *,
+    tenant_id: str,
+    runtime: Any,
+    price_per_mtoken: float = 0.0,
+) -> dict[str, Any]:
+    """Content-free, read-only report of the v2 re-embed for one tenant.
+
+    Counts live passages, headers present/missing, vectors already under the
+    v2 and v1 fingerprints, the rows a v2 pass would embed, and a byte-based
+    token estimate (headers still missing are budgeted at the header cap).
+    Nothing is written and no passage text leaves the database.
+    """
+
+    if (
+        not isinstance(tenant_id, str)
+        or not tenant_id
+        or isinstance(price_per_mtoken, bool)
+        or not isinstance(price_per_mtoken, (int, float))
+        or not 0 <= price_per_mtoken <= 1_000
+    ):
+        raise ValueError("passage embed plan scope is invalid")
+    fingerprint_v2 = getattr(runtime, "passage_fingerprint_v2", None)
+    fingerprint_v1 = getattr(runtime, "passage_fingerprint_v1", None)
+    if runtime is not None and (fingerprint_v2 is None or fingerprint_v1 is None):
+        fingerprint_v2 = fingerprint_v1 = getattr(
+            runtime, "passage_fingerprint", None
+        )
+    row = connection.execute(
+        """SELECT count(*) AS passages,
+                  count(passage.header_redacted) AS headers_present,
+                  count(*) FILTER (
+                      WHERE %s::text IS NOT NULL
+                        AND embedding.runtime_fingerprint=%s
+                        AND embedding.content_sha256=passage.embed_sha256
+                  ) AS embedded_v2,
+                  count(*) FILTER (
+                      WHERE %s::text IS NOT NULL
+                        AND embedding.runtime_fingerprint=%s
+                        AND embedding.content_sha256=passage.text_sha256
+                  ) AS embedded_v1,
+                  coalesce(sum(
+                      octet_length(passage.text_redacted)
+                      +coalesce(octet_length(passage.header_redacted),%s)
+                      +2
+                  ) FILTER (
+                      WHERE %s::text IS NULL
+                         OR embedding.runtime_fingerprint IS DISTINCT FROM %s
+                         OR embedding.content_sha256
+                            IS DISTINCT FROM passage.embed_sha256
+                  ),0) AS pending_bytes
+             FROM canonical_passages passage
+             JOIN canonical_passage_documents document
+               USING(
+                   tenant_id,source_id,logical_document_id,
+                   policy_fingerprint
+               )
+             LEFT JOIN canonical_passage_embeddings embedding
+               USING(tenant_id,source_id,passage_id)
+            WHERE passage.tenant_id=%s""",
+        (
+            fingerprint_v2,
+            fingerprint_v2,
+            fingerprint_v1,
+            fingerprint_v1,
+            MAX_PASSAGE_HEADER_BYTES,
+            fingerprint_v2,
+            fingerprint_v2,
+            tenant_id,
+        ),
+    ).fetchone()
+    passages = int(row["passages"])
+    embedded_v2 = int(row["embedded_v2"])
+    pending_bytes = int(row["pending_bytes"])
+    estimated_tokens = -(-pending_bytes // PASSAGE_PLAN_BYTES_PER_TOKEN)
+    return {
+        "status": "ok",
+        "read_only": True,
+        "tenant_id": tenant_id,
+        "contract": "v2",
+        "runtime_configured": runtime is not None,
+        "passages": passages,
+        "headers_present": int(row["headers_present"]),
+        "headers_missing": passages - int(row["headers_present"]),
+        "embedded_v2": embedded_v2,
+        "embedded_v1": int(row["embedded_v1"]),
+        "needs_embedding": passages - embedded_v2,
+        "coverage_v2": 1.0 if passages == 0 else round(embedded_v2 / passages, 6),
+        "estimated_tokens": estimated_tokens,
+        "bytes_per_token": PASSAGE_PLAN_BYTES_PER_TOKEN,
+        "price_per_mtoken": float(price_per_mtoken),
+        "estimated_cost": round(
+            estimated_tokens / 1_000_000 * float(price_per_mtoken),
+            4,
+        ),
+    }
+
+
 class CanonicalPassageProjector:
     """Build one disposable pointer index from authoritative logical documents."""
 
@@ -158,6 +402,42 @@ class CanonicalPassageProjector:
         self.logical_projection = logical_projection
         self.policy = policy
         self.bound_tenant_id = bound_tenant_id
+        runtime = getattr(store, "semantic_runtime", None)
+        bind = getattr(runtime, "bind_passage_coverage_probe", None)
+        if callable(bind) and not getattr(
+            runtime, "has_passage_coverage_probe", True
+        ):
+            bind(self._coverage_probe)
+
+    def _coverage_probe(self) -> float | None:
+        runtime = getattr(self.store, "semantic_runtime", None)
+        fingerprint = getattr(runtime, "passage_fingerprint_v2", None)
+        if not isinstance(fingerprint, str) or not fingerprint:
+            return None
+        with self.store.connect() as connection:
+            return passage_contract_coverage(
+                connection,
+                fingerprint=fingerprint,
+            )["coverage"]
+
+    def contract_coverage(
+        self,
+        *,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Read-only v2 coverage for the rollout flip (see ``semantic``)."""
+
+        tenant_id = self._tenant(tenant_id)
+        runtime = self.store.semantic_runtime
+        fingerprint = getattr(runtime, "passage_fingerprint_v2", None)
+        if not isinstance(fingerprint, str) or not fingerprint:
+            fingerprint = getattr(runtime, "passage_fingerprint", "")
+        with self.store.connect() as connection:
+            return passage_contract_coverage(
+                connection,
+                fingerprint=fingerprint,
+                tenant_id=tenant_id,
+            )
 
     def _tenant(self, tenant_id: str | None) -> str | None:
         if self.bound_tenant_id is None:
@@ -483,7 +763,9 @@ class CanonicalPassageProjector:
                 ):
                     return {"status": "stale"}
                 existing = connection.execute(
-                    """SELECT passage_id,ordinal,revision
+                    """SELECT passage_id,ordinal,revision,
+                              first_occurred_at,last_occurred_at,
+                              header_redacted IS NULL AS header_missing
                          FROM canonical_passages
                         WHERE tenant_id=%s AND source_id=%s
                           AND logical_document_id=%s
@@ -499,6 +781,40 @@ class CanonicalPassageProjector:
                     prepared.passages,
                     revision=candidate.revision,
                 )
+                # H2-a: one catalog read per document renders the contextual
+                # header of every inserted passage and of retained rows that
+                # predate headers. The header is embedding input only.
+                retained_unheaded = [
+                    row
+                    for row in existing
+                    if row["passage_id"] in set(diff.retained)
+                    and bool(row.get("header_missing"))
+                ]
+                context = (
+                    document_context(
+                        connection,
+                        tenant_id=candidate.tenant_id,
+                        source_id=candidate.source_id,
+                        logical_document_id=candidate.logical_document_id,
+                    )
+                    if diff.to_insert or retained_unheaded
+                    else None
+                )
+                headers = {
+                    passage.passage_id: render_passage_header(
+                        context,
+                        first_occurred_at=passage.first_occurred_at,
+                        last_occurred_at=passage.last_occurred_at,
+                    )
+                    for passage in diff.to_insert
+                }
+                embed_hashes = {
+                    passage.passage_id: passage_embed_sha256(
+                        headers[passage.passage_id],
+                        passage.text,
+                    )
+                    for passage in diff.to_insert
+                }
                 # Write order (the (document, policy, ordinal) unique index
                 # is not deferrable):
                 #   1. capture reusable embeddings for the texts about to be
@@ -530,11 +846,15 @@ class CanonicalPassageProjector:
                             WHERE passage.tenant_id=%s
                               AND passage.source_id=%s
                               AND passage.logical_document_id=%s
-                              AND passage.text_sha256=ANY(%s::text[])""",
+                              AND (
+                                  passage.embed_sha256=ANY(%s::text[])
+                                  OR passage.text_sha256=ANY(%s::text[])
+                              )""",
                         (
                             candidate.tenant_id,
                             candidate.source_id,
                             candidate.logical_document_id,
+                            sorted(set(embed_hashes.values())),
                             sorted({
                                 passage.text_sha256
                                 for passage in diff.to_insert
@@ -635,6 +955,17 @@ class CanonicalPassageProjector:
                             revision_stale,
                         ),
                     )
+                if retained_unheaded:
+                    self._write_headers(
+                        connection,
+                        tenant_id=candidate.tenant_id,
+                        source_id=candidate.source_id,
+                        rows=retained_unheaded,
+                        contexts={
+                            row["passage_id"]: context
+                            for row in retained_unheaded
+                        },
+                    )
                 if diff.to_insert:
                     with connection.cursor() as cursor:
                         with cursor.copy(
@@ -645,7 +976,7 @@ class CanonicalPassageProjector:
                                    overlap_tokens,token_count,
                                    first_occurred_at,last_occurred_at,
                                    roles,receipts,spans,text_redacted,
-                                   text_sha256
+                                   text_sha256,header_redacted,embed_sha256
                                ) FROM STDIN"""
                         ) as copy:
                             for passage in diff.to_insert:
@@ -667,6 +998,8 @@ class CanonicalPassageProjector:
                                     canonical_spans_json(passage.spans),
                                     passage.text,
                                     passage.text_sha256,
+                                    headers[passage.passage_id],
+                                    embed_hashes[passage.passage_id],
                                 ))
                         with cursor.copy(
                             """COPY canonical_passage_actors(
@@ -705,8 +1038,13 @@ class CanonicalPassageProjector:
                                           recall_reusable_passage_embeddings
                                           cached
                                     WHERE cached.content_sha256=
+                                          passage.embed_sha256
+                                       OR cached.content_sha256=
                                           passage.text_sha256
-                                    ORDER BY cached.runtime_fingerprint
+                                    ORDER BY (
+                                        cached.content_sha256=
+                                        passage.embed_sha256
+                                    ) DESC,cached.runtime_fingerprint
                                     LIMIT 1
                              ) reusable ON true
                             WHERE passage.tenant_id=%s
@@ -760,6 +1098,145 @@ class CanonicalPassageProjector:
                     ),
                 )
         return {"status": "committed", **diff.counters}
+
+    @staticmethod
+    def _write_headers(
+        connection: Any,
+        *,
+        tenant_id: str,
+        source_id: str,
+        rows: list[dict[str, Any]],
+        contexts: dict[str, DocumentContext],
+    ) -> int:
+        """Fill header_redacted/embed_sha256 on rows that still lack them.
+
+        Only NULL headers are written: an existing header is never rewritten
+        here, so a retained passage keeps its embedding reuse key.
+        """
+
+        if not rows:
+            return 0
+        ids: list[str] = []
+        rendered: list[str] = []
+        for row in rows:
+            ids.append(row["passage_id"])
+            rendered.append(render_passage_header(
+                contexts[row["passage_id"]],
+                first_occurred_at=row["first_occurred_at"],
+                last_occurred_at=row["last_occurred_at"],
+            ))
+        # embed_sha256 = sha256(header || "\n\n" || text_redacted), hashed in
+        # the database so passage text never round-trips for a header fill.
+        # Byte-identical to ``passage_embed_sha256``.
+        result = connection.execute(
+            """UPDATE canonical_passages passage
+                  SET header_redacted=headed.header_redacted,
+                      embed_sha256=encode(sha256(convert_to(
+                          headed.header_redacted||%s||passage.text_redacted,
+                          'UTF8'
+                      )),'hex')
+                 FROM unnest(%s::text[],%s::text[])
+                      AS headed(passage_id,header_redacted)
+                WHERE passage.tenant_id=%s AND passage.source_id=%s
+                  AND passage.passage_id=headed.passage_id
+                  AND passage.header_redacted IS NULL""",
+            (PASSAGE_EMBEDDING_SEPARATOR, ids, rendered, tenant_id, source_id),
+        )
+        return max(0, result.rowcount)
+
+    def backfill_headers(
+        self,
+        *,
+        tenant_id: str | None = None,
+        batch_size: int = 500,
+        max_batches: int = 10,
+    ) -> dict[str, int | str]:
+        """Render headers for passages projected before schema 063.
+
+        Reads catalog rows only (never the archive): the header is a pure
+        function of the document's catalog context and the passage's own
+        times. Runs ahead of ``embed_pending`` under contract v2 so every
+        passage has an ``embed_sha256`` before it is embedded.
+        """
+
+        tenant_id = self._tenant(tenant_id)
+        if (
+            isinstance(batch_size, bool)
+            or not isinstance(batch_size, int)
+            or not 1 <= batch_size <= MAX_PASSAGE_HEADER_BACKFILL_BATCH
+            or isinstance(max_batches, bool)
+            or not isinstance(max_batches, int)
+            or not 1 <= max_batches <= 100
+        ):
+            raise ValueError("passage header backfill budget is invalid")
+        updated = batches = 0
+        tenant_scope = tenant_id or ""
+        with self.store.connect() as connection:
+            while batches < max_batches:
+                rows = connection.execute(
+                    """SELECT passage.tenant_id,passage.source_id,
+                              passage.logical_document_id,passage.passage_id,
+                              passage.first_occurred_at,
+                              passage.last_occurred_at
+                         FROM canonical_passages passage
+                        WHERE passage.header_redacted IS NULL
+                          AND (%s::text='' OR passage.tenant_id=%s)
+                        ORDER BY passage.tenant_id,passage.source_id,
+                                 passage.logical_document_id,passage.ordinal
+                        LIMIT %s""",
+                    (tenant_scope, tenant_scope, batch_size),
+                ).fetchall()
+                if not rows:
+                    break
+                grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+                for row in rows:
+                    grouped.setdefault(
+                        (
+                            row["tenant_id"],
+                            row["source_id"],
+                            row["logical_document_id"],
+                        ),
+                        [],
+                    ).append(row)
+                written = 0
+                with connection.transaction():
+                    for (scope_tenant, scope_source, document_id), values in (
+                        grouped.items()
+                    ):
+                        context = document_context(
+                            connection,
+                            tenant_id=scope_tenant,
+                            source_id=scope_source,
+                            logical_document_id=document_id,
+                        )
+                        written += self._write_headers(
+                            connection,
+                            tenant_id=scope_tenant,
+                            source_id=scope_source,
+                            rows=values,
+                            contexts={
+                                row["passage_id"]: context for row in values
+                            },
+                        )
+                updated += written
+                batches += 1
+                if written == 0:
+                    # A concurrent writer filled these rows; do not spin.
+                    break
+            remaining = connection.execute(
+                """SELECT EXISTS(
+                       SELECT 1 FROM canonical_passages
+                        WHERE header_redacted IS NULL
+                          AND (%s::text='' OR tenant_id=%s)
+                   ) AS value""",
+                (tenant_scope, tenant_scope),
+            ).fetchone()["value"]
+            connection.commit()
+        return {
+            "status": "pending" if remaining else "complete",
+            "updated": updated,
+            "batches": batches,
+        }
 
     def shadow_diff(
         self,
@@ -1107,8 +1584,28 @@ class CanonicalPassageProjector:
             or not 0 <= shard_index < shard_count
         ):
             raise ValueError("passage embedding budget is invalid")
+        # H2-a: the worker writes the contract the runtime declares (v2 =
+        # header + text keyed by embed_sha256; v1 = text keyed by
+        # text_sha256). Runtimes without the v2 surface (synthetic test
+        # runtimes) behave as v2 under their single fingerprint.
+        write_contract = getattr(runtime, "passage_write_contract", "v2")
+        write_fingerprint = getattr(
+            runtime,
+            "passage_write_fingerprint",
+            runtime.passage_fingerprint,
+        )
+        headed = write_contract == "v2"
         processed = batches = 0
         tenant_scope = tenant_id or ""
+        headers_backfilled = 0
+        if headed:
+            # Rows projected before schema 063 get their header from the
+            # catalog first, so the v2 key exists for every candidate.
+            headers_backfilled = int(self.backfill_headers(
+                tenant_id=tenant_id,
+                batch_size=min(MAX_PASSAGE_HEADER_BACKFILL_BATCH, batch_size * 5),
+                max_batches=max_batches,
+            )["updated"])
         lock_name = f"recall:lossless-passage-embeddings:{tenant_scope}"
         if shard_count > 1:
             lock_name += f":shard:{shard_index}:{shard_count}"
@@ -1123,9 +1620,10 @@ class CanonicalPassageProjector:
             try:
                 while batches < max_batches:
                     rows = connection.execute(
-                        """SELECT passage.tenant_id,passage.source_id,
+                        f"""SELECT passage.tenant_id,passage.source_id,
                                   passage.passage_id,passage.text_redacted,
-                                  passage.text_sha256
+                                  passage.text_sha256,passage.header_redacted,
+                                  passage.embed_sha256
                              FROM canonical_passages passage
                              JOIN canonical_passage_documents document
                                USING(
@@ -1137,7 +1635,9 @@ class CanonicalPassageProjector:
                               AND embedding.source_id=passage.source_id
                               AND embedding.passage_id=passage.passage_id
                               AND embedding.runtime_fingerprint=%s
-                              AND embedding.content_sha256=passage.text_sha256
+                              AND embedding.content_sha256=passage.{
+                                  "embed_sha256" if headed else "text_sha256"
+                              }
                             WHERE document.policy_fingerprint=%s
                               AND (%s::text='' OR passage.tenant_id=%s)
                               AND (
@@ -1147,11 +1647,15 @@ class CanonicalPassageProjector:
                                   ) %% %s
                               )=%s
                               AND embedding.passage_id IS NULL
+                              {
+                                  "AND passage.header_redacted IS NOT NULL"
+                                  if headed else ""
+                              }
                             ORDER BY passage.tenant_id,passage.source_id,
                                      passage.passage_id
                             LIMIT %s""",
                         (
-                            runtime.passage_fingerprint,
+                            write_fingerprint,
                             self.policy.fingerprint,
                             tenant_scope,
                             tenant_scope,
@@ -1164,7 +1668,13 @@ class CanonicalPassageProjector:
                     if not rows:
                         break
                     vectors = runtime.embed_passages(
-                        [row["text_redacted"] for row in rows]
+                        [
+                            passage_embedding_input(
+                                row["header_redacted"] if headed else None,
+                                row["text_redacted"],
+                            )
+                            for row in rows
+                        ]
                     )
                     with connection.transaction():
                         with connection.cursor() as cursor:
@@ -1191,8 +1701,10 @@ class CanonicalPassageProjector:
                                         row["source_id"],
                                         row["passage_id"],
                                         runtime.model,
-                                        row["text_sha256"],
-                                        runtime.passage_fingerprint,
+                                        row["embed_sha256"]
+                                        if headed
+                                        else row["text_sha256"],
+                                        write_fingerprint,
                                         vector,
                                     )
                                     for row, vector in zip(
@@ -1205,7 +1717,7 @@ class CanonicalPassageProjector:
                     processed += len(rows)
                     batches += 1
                 pending = connection.execute(
-                    """SELECT EXISTS(
+                    f"""SELECT EXISTS(
                            SELECT 1
                              FROM canonical_passages passage
                              JOIN canonical_passage_documents document
@@ -1218,7 +1730,9 @@ class CanonicalPassageProjector:
                               AND embedding.source_id=passage.source_id
                               AND embedding.passage_id=passage.passage_id
                               AND embedding.runtime_fingerprint=%s
-                              AND embedding.content_sha256=passage.text_sha256
+                              AND embedding.content_sha256=passage.{
+                                  "embed_sha256" if headed else "text_sha256"
+                              }
                             WHERE document.policy_fingerprint=%s
                               AND (%s::text='' OR passage.tenant_id=%s)
                               AND (
@@ -1230,7 +1744,7 @@ class CanonicalPassageProjector:
                               AND embedding.passage_id IS NULL
                        ) AS value""",
                     (
-                        runtime.passage_fingerprint,
+                        write_fingerprint,
                         self.policy.fingerprint,
                         tenant_scope,
                         tenant_scope,
@@ -1243,6 +1757,8 @@ class CanonicalPassageProjector:
                     "status": "pending" if pending else "complete",
                     "processed": processed,
                     "batches": batches,
+                    "contract": write_contract,
+                    "headers_backfilled": headers_backfilled,
                 }
             finally:
                 connection.execute(

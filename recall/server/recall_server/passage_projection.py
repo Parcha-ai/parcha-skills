@@ -5,8 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import asdict, dataclass
-from datetime import datetime
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timezone
 from itertools import islice
 from typing import Iterable, Iterator
 
@@ -14,10 +14,43 @@ import orjson
 
 from .actor_attribution import ActorLink, actor_links
 from .logical_evidence import LogicalEvidenceError, LogicalEvidenceRecord
+from .passage_representations import DocumentContext, _metadata_lines
+from .semantic import PASSAGE_HEADER_CONTRACT
+
+__all__ = [
+    "PASSAGE_HEADER_CONTRACT",
+]
 
 
 PASSAGE_CONTRACT = "recall.lossless-message-passage.v4:actor-aware"
 PASSAGE_SEPARATOR = "\n"
+# H2-a contextual header: embedding input only, never part of the passage
+# text, spans, receipts, text_sha256, or passage id.
+MAX_PASSAGE_HEADER_BYTES = 512
+PASSAGE_HEADER_OPEN = "[context]"
+PASSAGE_HEADER_CLOSE = "[passage]"
+PASSAGE_EMBEDDING_SEPARATOR = "\n\n"
+# Template order. ``_metadata_lines`` renders document start/end; the header
+# reports the passage's own first/last time (turn-level signal).
+PASSAGE_HEADER_FIELDS = (
+    ("source family", "source family"),
+    ("source aliases", "source aliases"),
+    ("harness", "harness"),
+    ("workspace", "workspace"),
+    ("branch", "branch"),
+    ("people", "people"),
+    ("document start", "passage start"),
+    ("document end", "passage end"),
+)
+# When the byte budget is exceeded after people were trimmed, drop lines in
+# this order; source family and the passage times are kept to the end.
+PASSAGE_HEADER_DROP_ORDER = (
+    "source aliases",
+    "people",
+    "branch",
+    "workspace",
+    "harness",
+)
 MAX_PASSAGE_TOKEN_BYTES = 64
 VISIBLE_DENSE_ROLES = frozenset({"user", "assistant"})
 IDENTITY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._/@+=-]{0,511}\Z")
@@ -315,6 +348,110 @@ def reconstruct_passage(
         ):
             raise ValueError("passage output span is invalid")
     return value
+
+
+def _header_time(value: object) -> str | None:
+    """Canonical UTC second-precision timestamp for header lines."""
+
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        rendered = str(value).strip()
+        if not rendered:
+            return None
+        try:
+            parsed = datetime.fromisoformat(rendered.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _header_lines(context: DocumentContext, actor_count: int) -> dict[str, str]:
+    actors = tuple(
+        sorted(
+            context.actors,
+            key=lambda value: (value.display_name.casefold(), value.actor_id),
+        )[:actor_count]
+    )
+    rendered: dict[str, str] = {}
+    for line in _metadata_lines(replace(context, actors=actors)):
+        label, _, value = line.partition(": ")
+        rendered[label] = value
+    return {
+        header_label: rendered[source_label]
+        for source_label, header_label in PASSAGE_HEADER_FIELDS
+        if source_label in rendered
+    }
+
+
+def _render_header(lines: dict[str, str]) -> str:
+    body = [f"{label}: {value}" for label, value in lines.items()]
+    return "\n".join((PASSAGE_HEADER_OPEN, *body, PASSAGE_HEADER_CLOSE))
+
+
+def render_passage_header(
+    context: DocumentContext,
+    *,
+    first_occurred_at: object,
+    last_occurred_at: object,
+) -> str:
+    """Deterministic contextual header for one passage, at most 512 bytes.
+
+    Rendered from catalog fields only (``_metadata_lines``: bounded source
+    family, aliases, harness, workspace basename, branch, people with
+    relations) plus the passage's own first/last time. Stable ordering; the
+    same inputs always give the same bytes. To fit the budget the people
+    list is shortened first, then whole lines are dropped in
+    ``PASSAGE_HEADER_DROP_ORDER``; the result is finally cut on a UTF-8
+    boundary as a hard guarantee.
+    """
+
+    if not isinstance(context, DocumentContext):
+        raise ValueError("passage header context is invalid")
+    timed = replace(
+        context,
+        first_occurred_at=_header_time(first_occurred_at),
+        last_occurred_at=_header_time(last_occurred_at),
+    )
+    actor_count = len(timed.actors)
+    lines = _header_lines(timed, actor_count)
+    header = _render_header(lines)
+    while len(header.encode()) > MAX_PASSAGE_HEADER_BYTES and actor_count > 0:
+        actor_count -= 1
+        lines = _header_lines(timed, actor_count)
+        header = _render_header(lines)
+    for label in PASSAGE_HEADER_DROP_ORDER:
+        if len(header.encode()) <= MAX_PASSAGE_HEADER_BYTES:
+            break
+        if label in lines:
+            del lines[label]
+            header = _render_header(lines)
+    encoded = header.encode()
+    if len(encoded) > MAX_PASSAGE_HEADER_BYTES:
+        header = encoded[:MAX_PASSAGE_HEADER_BYTES].decode(errors="ignore")
+    return header
+
+
+def passage_embedding_input(header: str | None, text: str) -> str:
+    """The exact string embedded under contract v2 (v1 when header is None)."""
+
+    if header is None:
+        return text
+    return header + PASSAGE_EMBEDDING_SEPARATOR + text
+
+
+def passage_embed_sha256(header: str, text: str) -> str:
+    """sha256 of the v2 embedding input: the embedding reuse key."""
+
+    if not isinstance(header, str) or not header:
+        raise ValueError("passage header is required for embed_sha256")
+    return hashlib.sha256(
+        passage_embedding_input(header, text).encode()
+    ).hexdigest()
 
 
 def canonical_spans_json(spans: tuple[PassageSpan, ...]) -> str:

@@ -29,8 +29,15 @@ from recall_server.logical_evidence_projection import (  # noqa: E402
     CanonicalLogicalEvidenceProjector,
     mark_logical_evidence_dirty,
 )
-from recall_server.passage_index import CanonicalPassageProjector  # noqa: E402
-from recall_server.passage_projection import PassagePolicy  # noqa: E402
+from recall_server.passage_index import (  # noqa: E402
+    CanonicalPassageProjector,
+    passage_contract_coverage,
+    passage_embed_plan,
+)
+from recall_server.passage_projection import (  # noqa: E402
+    PassagePolicy,
+    passage_embed_sha256,
+)
 from recall_server.passage_representations import (  # noqa: E402
     CanonicalPassageRepresentationIndex,
     PassageContextPolicy,
@@ -78,6 +85,41 @@ def main() -> None:
     actor_alias = f"alice-e2e-{nonce}"
     with store.connect() as connection:
         insert_source(connection, tenant, principal, source)
+        # Catalog rows the H2-a header is rendered from: source family,
+        # alias, and the session's harness/cwd/branch.
+        connection.execute(
+            """INSERT INTO sources(id,principal_id) VALUES (%s,%s)
+               ON CONFLICT(id) DO NOTHING""",
+            (source, principal),
+        )
+        connection.execute(
+            """INSERT INTO source_profiles(
+                   source_id,family,quality,freshness_half_life_days
+               ) VALUES (%s,'coding_history','trusted',30)
+               ON CONFLICT(source_id) DO UPDATE SET family=excluded.family""",
+            (source,),
+        )
+        connection.execute(
+            """INSERT INTO source_aliases(alias,source_id) VALUES (%s,%s)
+               ON CONFLICT(alias) DO UPDATE SET source_id=excluded.source_id""",
+            (f"passage-e2e-{nonce}", source),
+        )
+        connection.execute(
+            """INSERT INTO sessions(
+                   source_id,native_id,principal_id,harness,metadata,
+                   projector_version
+               ) VALUES (%s,%s,%s,'codex',%s::jsonb,1)
+               ON CONFLICT(source_id,native_id) DO NOTHING""",
+            (
+                source,
+                parent,
+                principal,
+                json.dumps({
+                    "cwd": "/home/synthetic/secret-parent/worktrees/recall",
+                    "branch": "feat/h2-a",
+                }),
+            ),
+        )
         connection.execute(
             """INSERT INTO brain_actors(
                    tenant_id,actor_id,actor_kind,display_name
@@ -161,6 +203,76 @@ def main() -> None:
         )
         assert passage_result["documents"] == 1
         assert passage_result["passages"] >= 2
+
+        # H2-a: every projected passage carries a contextual header rendered
+        # from the catalog, and embed_sha256 = sha256(header + "\n\n" + text).
+        # The header is embedding input only.
+        def header_rows(connection) -> list[dict]:
+            return [
+                dict(row)
+                for row in connection.execute(
+                    """SELECT passage_id,header_redacted,embed_sha256,
+                              text_redacted,text_sha256,
+                              first_occurred_at,last_occurred_at
+                         FROM canonical_passages
+                        WHERE tenant_id=%s AND source_id=%s
+                        ORDER BY ordinal""",
+                    (tenant, source),
+                ).fetchall()
+            ]
+
+        with store.connect() as connection:
+            headed = header_rows(connection)
+        assert len(headed) == passage_result["passages"]
+        for row in headed:
+            assert row["header_redacted"] is not None, row["passage_id"]
+            assert len(row["header_redacted"].encode()) <= 512
+            assert row["header_redacted"].startswith("[context]\n")
+            assert "source family: coding_history" in row["header_redacted"]
+            assert f"source aliases: passage-e2e-{nonce}" in row["header_redacted"]
+            assert "harness: codex" in row["header_redacted"]
+            assert "workspace: recall" in row["header_redacted"]
+            assert "secret-parent" not in row["header_redacted"]
+            assert "branch: feat/h2-a" in row["header_redacted"]
+            assert "people: Alice Example [contributor]" in row["header_redacted"]
+            assert "passage start: " in row["header_redacted"]
+            assert "[context]" not in row["text_redacted"]
+            assert row["embed_sha256"] == passage_embed_sha256(
+                row["header_redacted"], row["text_redacted"]
+            )
+            assert row["embed_sha256"] != row["text_sha256"]
+        headers_before = {row["passage_id"]: row["header_redacted"] for row in headed}
+
+        # Rows projected before schema 063 (header NULL) are backfilled from
+        # the catalog only, and the SQL-side hash equals the Python helper.
+        with store.connect() as connection:
+            connection.execute(
+                """UPDATE canonical_passages
+                      SET header_redacted=NULL,embed_sha256=NULL
+                    WHERE tenant_id=%s AND source_id=%s""",
+                (tenant, source),
+            )
+            connection.commit()
+        plan_before = None
+        with store.connect() as connection:
+            plan_before = passage_embed_plan(
+                connection, tenant_id=tenant, runtime=runtime,
+            )
+        assert plan_before["headers_missing"] == passage_result["passages"], plan_before
+        assert plan_before["needs_embedding"] == passage_result["passages"], plan_before
+        assert plan_before["estimated_tokens"] > 0, plan_before
+        assert plan_before["estimated_cost"] == 0.0, plan_before
+        backfilled = passages.backfill_headers(tenant_id=tenant, batch_size=2)
+        assert backfilled["status"] == "complete", backfilled
+        assert backfilled["updated"] == passage_result["passages"], backfilled
+        with store.connect() as connection:
+            reheaded = header_rows(connection)
+        for row in reheaded:
+            assert row["header_redacted"] == headers_before[row["passage_id"]]
+            assert row["embed_sha256"] == passage_embed_sha256(
+                row["header_redacted"], row["text_redacted"]
+            )
+
         embedding_result = passages.embed_pending(
             tenant_id=tenant,
             batch_size=100,
@@ -168,7 +280,35 @@ def main() -> None:
         )
         assert embedding_result["status"] == "complete"
         assert embedding_result["processed"] == passage_result["passages"]
+        assert embedding_result["contract"] == "v2", embedding_result
         assert runtime.document_calls == 1
+        with store.connect() as connection:
+            plan_after = passage_embed_plan(
+                connection, tenant_id=tenant, runtime=runtime,
+                price_per_mtoken=0.06,
+            )
+            coverage = passage_contract_coverage(
+                connection,
+                fingerprint=runtime.passage_fingerprint,
+                tenant_id=tenant,
+            )
+            embedded_keys = connection.execute(
+                """SELECT count(*) AS n
+                     FROM canonical_passage_embeddings embedding
+                     JOIN canonical_passages passage
+                       USING(tenant_id,source_id,passage_id)
+                    WHERE passage.tenant_id=%s
+                      AND embedding.content_sha256=passage.embed_sha256""",
+                (tenant,),
+            ).fetchone()["n"]
+        assert plan_after["passages"] == passage_result["passages"], plan_after
+        assert plan_after["headers_missing"] == 0, plan_after
+        assert plan_after["embedded_v2"] == passage_result["passages"], plan_after
+        assert plan_after["needs_embedding"] == 0, plan_after
+        assert plan_after["estimated_tokens"] == 0, plan_after
+        assert plan_after["coverage_v2"] == 1.0, plan_after
+        assert coverage["coverage"] == 1.0, coverage
+        assert embedded_keys == passage_result["passages"]
         with store.connect() as connection:
             connection.execute(
                 """INSERT INTO canonical_passage_projection_queue(
@@ -505,6 +645,16 @@ def main() -> None:
                      WHERE tenant_id=%s) AS embeddings,
                    (SELECT count(*) FROM canonical_passage_projection_queue
                      WHERE tenant_id=%s) AS queued,
+                   (SELECT count(*) FROM canonical_passages
+                     WHERE tenant_id=%s AND header_redacted IS NOT NULL
+                       AND embed_sha256 IS NOT NULL) AS headers,
+                   (SELECT count(*)
+                      FROM canonical_passage_embeddings embedding
+                      JOIN canonical_passages passage
+                        USING(tenant_id,source_id,passage_id)
+                     WHERE passage.tenant_id=%s
+                       AND embedding.content_sha256=passage.embed_sha256)
+                       AS headed_embeddings,
                    (SELECT count(*)
                       FROM canonical_evidence_document_actors
                      WHERE tenant_id=%s AND actor_id=%s
@@ -531,6 +681,8 @@ def main() -> None:
                 tenant,
                 tenant,
                 tenant,
+                tenant,
+                tenant,
                 actor,
                 tenant,
                 actor,
@@ -541,6 +693,8 @@ def main() -> None:
         ).fetchone()
     assert counts["documents"] == 1
     assert counts["passages"] == counts["embeddings"]
+    assert counts["headers"] == counts["passages"]
+    assert counts["headed_embeddings"] == counts["passages"]
     assert counts["queued"] == 0
     assert counts["document_actor_links"] == 1
     assert counts["passage_actor_links"] == counts["passages"]
@@ -579,6 +733,15 @@ def main() -> None:
                 "actor_hint_documents": len(actor_hints["results"]),
                 "wrong_relation_documents": len(authored_hints["results"]),
                 "actor_contexts": counts["actor_contexts"],
+                "passage_headers": counts["headers"],
+                "embed_plan_before_backfill": {
+                    key: plan_before[key]
+                    for key in ("headers_missing", "needs_embedding")
+                },
+                "embed_plan_after": {
+                    key: plan_after[key]
+                    for key in ("headers_missing", "needs_embedding", "coverage_v2")
+                },
             },
             sort_keys=True,
         )

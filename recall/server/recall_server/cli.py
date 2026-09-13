@@ -37,7 +37,7 @@ from .evidence_worker import (
 )
 from .logical_evidence import LogicalEvidenceProjectionStore
 from .logical_evidence_projection import CanonicalLogicalEvidenceProjector
-from .passage_index import CanonicalPassageProjector
+from .passage_index import CanonicalPassageProjector, passage_embed_plan
 from .passage_projection import PassagePolicy
 from .parquet_scan import CanonicalParquetScanProjector
 from .passage_worker import run_passage_worker
@@ -1668,6 +1668,23 @@ def main() -> None:
     passage_shadow.add_argument("--tenant", required=True)
     passage_shadow.add_argument("--source", required=True)
     passage_shadow.add_argument("--limit", type=int, default=50)
+    passage_plan = sub.add_parser(
+        "passage-embed-plan",
+        help=(
+            "read-only, content-free: passages of one tenant that a "
+            "contract-v2 (header + text) embedding pass would embed, with "
+            "a token and cost estimate"
+        ),
+    )
+    passage_plan.add_argument("--tenant", required=True)
+    passage_plan.add_argument(
+        "--price-per-mtoken",
+        type=float,
+        default=float(
+            os.environ.get("RECALL_EMBEDDING_PRICE_PER_MTOKEN", "0") or "0"
+        ),
+        help="USD per million input tokens; 0 reports tokens only",
+    )
     passage_worker = sub.add_parser("lossless-passage-worker")
     passage_worker.add_argument("--tenant", required=True)
     passage_worker.add_argument("--target-tokens", type=int, default=1024)
@@ -2249,6 +2266,15 @@ def main() -> None:
             source_id=args.source,
             limit=args.limit,
         )
+        print(json.dumps(result, sort_keys=True))
+    elif args.command == "passage-embed-plan":
+        with store.connect() as connection:
+            result = passage_embed_plan(
+                connection,
+                tenant_id=args.tenant,
+                runtime=store.semantic_runtime,
+                price_per_mtoken=args.price_per_mtoken,
+            )
         print(json.dumps(result, sort_keys=True))
     elif args.command in {
         "backfill-lossless-passages",

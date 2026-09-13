@@ -26,7 +26,20 @@ QUERY_INSTRUCTION = (
     "Query: "
 )
 DOCUMENT_EMBEDDING_CONTRACT = "recall.document-embedding.v5:head-tail-4096"
-PASSAGE_EMBEDDING_CONTRACT = "recall.passage-embedding.v1:full-text"
+PASSAGE_EMBEDDING_CONTRACT_V1 = "recall.passage-embedding.v1:full-text"
+PASSAGE_EMBEDDING_CONTRACT_V2 = "recall.passage-embedding.v2:header+full-text"
+# The write contract: every new passage vector carries the contextual header.
+PASSAGE_EMBEDDING_CONTRACT = PASSAGE_EMBEDDING_CONTRACT_V2
+PASSAGE_HEADER_CONTRACT = "recall.passage-header.v1:catalog-fields"
+PASSAGE_EMBEDDING_CONTRACTS = {
+    "v1": PASSAGE_EMBEDDING_CONTRACT_V1,
+    "v2": PASSAGE_EMBEDDING_CONTRACT_V2,
+}
+PASSAGE_CONTRACT_MODES = frozenset({"v1", "v2", "auto"})
+# H2-a rollout: the server reads v2 vectors only once this share of live
+# passages carries a v2 vector; until then it keeps reading v1.
+PASSAGE_CONTRACT_COVERAGE_THRESHOLD = 0.99
+PASSAGE_CONTRACT_COVERAGE_TTL_SECONDS = 60.0
 DEFAULT_EMBEDDING_REVISION = "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3"
 MAX_SEMANTIC_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_DOCUMENT_CHARS = 4096
@@ -77,6 +90,10 @@ class SemanticRuntime:
         embedding_batch_size: int = 1,
         embedding_workers: int = 1,
         planner_samples: int = 2,
+        passage_contract_mode: str = "auto",
+        passage_coverage_ttl_seconds: float = (
+            PASSAGE_CONTRACT_COVERAGE_TTL_SECONDS
+        ),
         cache_size: int = 256,
         cache_ttl_seconds: float = 900.0,
     ):
@@ -153,6 +170,16 @@ class SemanticRuntime:
             raise ValueError("TEI embedding workers must be one")
         if not 1 <= planner_samples <= 3:
             raise ValueError("planner samples must be between 1 and 3")
+        if passage_contract_mode not in PASSAGE_CONTRACT_MODES:
+            raise ValueError(
+                "passage embedding contract must be v1, v2, or auto"
+            )
+        if (
+            isinstance(passage_coverage_ttl_seconds, bool)
+            or not isinstance(passage_coverage_ttl_seconds, (int, float))
+            or not 0 < passage_coverage_ttl_seconds <= 3600
+        ):
+            raise ValueError("passage coverage cache ttl is invalid")
         planner_values = (
             planner_url,
             planner_approved_url,
@@ -198,6 +225,11 @@ class SemanticRuntime:
         self.embedding_batch_size = embedding_batch_size
         self.embedding_workers = embedding_workers
         self.planner_samples = planner_samples
+        self.passage_contract_mode = passage_contract_mode
+        self.passage_coverage_ttl_seconds = float(passage_coverage_ttl_seconds)
+        self._passage_coverage_probe = None
+        self._passage_coverage_lock = threading.Lock()
+        self._passage_coverage_cache: tuple[float, float | None] | None = None
         self.cache_size = max(0, cache_size)
         self.cache_ttl_seconds = max(0.0, cache_ttl_seconds)
         self._cache_lock = threading.RLock()
@@ -287,6 +319,9 @@ class SemanticRuntime:
                 os.environ.get("RECALL_EMBEDDING_WORKERS", "1")
             ),
             planner_samples=int(os.environ.get("RECALL_PLANNER_SAMPLES", "2")),
+            passage_contract_mode=os.environ.get(
+                "RECALL_PASSAGE_EMBEDDING_CONTRACT", "auto"
+            ).strip().lower() or "auto",
             cache_size=int(os.environ.get("RECALL_SEMANTIC_CACHE_SIZE", "256")),
             cache_ttl_seconds=float(
                 os.environ.get("RECALL_SEMANTIC_CACHE_TTL_SECONDS", "900")
@@ -308,20 +343,142 @@ class SemanticRuntime:
         )
         return hashlib.sha256(value.encode()).hexdigest()
 
+    def passage_fingerprint_for(self, contract: str) -> str:
+        """Fingerprint of one passage-embedding contract (``v1`` or ``v2``).
+
+        v2 folds the header contract in: a header template change is a new
+        vector space exactly like a model or prefix change.
+        """
+
+        try:
+            contract_name = PASSAGE_EMBEDDING_CONTRACTS[contract]
+        except KeyError:
+            raise ValueError("passage embedding contract must be v1 or v2") from None
+        parts = [
+            contract_name,
+            self.embedding_protocol,
+            self.model,
+            self.revision,
+            str(self.dimensions),
+            self.document_prefix,
+            self.query_prefix,
+        ]
+        if contract == "v2":
+            parts.append(PASSAGE_HEADER_CONTRACT)
+        return hashlib.sha256("\0".join(parts).encode()).hexdigest()
+
+    @property
+    def passage_fingerprint_v1(self) -> str:
+        return self.passage_fingerprint_for("v1")
+
+    @property
+    def passage_fingerprint_v2(self) -> str:
+        return self.passage_fingerprint_for("v2")
+
+    @property
+    def passage_write_contract(self) -> str:
+        """The contract new passage vectors are written under.
+
+        ``v1`` is an explicit rollback; ``v2`` and ``auto`` both write headed
+        vectors so coverage can only grow toward the read flip.
+        """
+
+        return "v1" if self.passage_contract_mode == "v1" else "v2"
+
+    @property
+    def passage_write_fingerprint(self) -> str:
+        return self.passage_fingerprint_for(self.passage_write_contract)
+
+    def bind_passage_coverage_probe(self, probe) -> None:
+        """Install the callable that reports the v2 coverage ratio (0..1).
+
+        The probe runs at most once per ``passage_coverage_ttl_seconds`` and
+        must return a float or ``None`` (unknown). Projectors bind a
+        store-backed probe; without one, ``auto`` falls back to a direct
+        ``RECALL_DATABASE_URL`` query.
+        """
+
+        if probe is not None and not callable(probe):
+            raise ValueError("passage coverage probe must be callable")
+        with self._passage_coverage_lock:
+            self._passage_coverage_probe = probe
+            self._passage_coverage_cache = None
+
+    @property
+    def has_passage_coverage_probe(self) -> bool:
+        return self._passage_coverage_probe is not None
+
+    def _probe_passage_coverage(self) -> float | None:
+        probe = self._passage_coverage_probe
+        if probe is None:
+            dsn = os.environ.get("RECALL_DATABASE_URL", "").strip()
+            if not dsn:
+                return None
+            from .passage_index import passage_contract_coverage
+
+            try:
+                import psycopg
+                from psycopg.rows import dict_row
+
+                with psycopg.connect(
+                    dsn,
+                    row_factory=dict_row,
+                    connect_timeout=5,
+                ) as connection:
+                    return passage_contract_coverage(
+                        connection,
+                        fingerprint=self.passage_fingerprint_v2,
+                    )["coverage"]
+            except Exception:
+                return None
+        try:
+            value = probe()
+        except Exception:
+            return None
+        if value is None:
+            return None
+        return min(1.0, max(0.0, float(value)))
+
+    def passage_contract_coverage(self) -> float | None:
+        """Share of live passages with a v2 vector, cached for the ttl."""
+
+        now = time.monotonic()
+        with self._passage_coverage_lock:
+            cached = self._passage_coverage_cache
+            if (
+                cached is not None
+                and now - cached[0] < self.passage_coverage_ttl_seconds
+            ):
+                return cached[1]
+        value = self._probe_passage_coverage()
+        with self._passage_coverage_lock:
+            self._passage_coverage_cache = (time.monotonic(), value)
+        return value
+
+    @property
+    def passage_read_contract(self) -> str:
+        """The contract retrieval filters on: pinned by env, or by coverage.
+
+        ``auto`` reads v2 only once coverage reaches the threshold; an unknown
+        coverage (no probe, no database) keeps the existing v1 vectors.
+        """
+
+        mode = self.passage_contract_mode
+        if mode in PASSAGE_EMBEDDING_CONTRACTS:
+            return mode
+        coverage = self.passage_contract_coverage()
+        if (
+            coverage is not None
+            and coverage >= PASSAGE_CONTRACT_COVERAGE_THRESHOLD
+        ):
+            return "v2"
+        return "v1"
+
     @property
     def passage_fingerprint(self) -> str:
-        value = "\0".join(
-            (
-                PASSAGE_EMBEDDING_CONTRACT,
-                self.embedding_protocol,
-                self.model,
-                self.revision,
-                str(self.dimensions),
-                self.document_prefix,
-                self.query_prefix,
-            )
-        )
-        return hashlib.sha256(value.encode()).hexdigest()
+        """The fingerprint the dense arm reads (see ``passage_read_contract``)."""
+
+        return self.passage_fingerprint_for(self.passage_read_contract)
 
     @staticmethod
     def _cache_key(value: str) -> str:
