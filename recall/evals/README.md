@@ -170,6 +170,33 @@ Candidate-generation evaluation accepts owner-private, exact-coverage query
 bundles and can report `dense`, `passage-lexical`, `sparse-exact`, and `fused`
 arms independently. The public MCP hint limit is unchanged.
 
+## Tuning the fusion alphas offline
+
+`recall_search` fuses its arms with convex min-max fusion (`RECALL_SEARCH_FUSION=convex`,
+alphas from `RECALL_SEARCH_FUSION_ALPHAS`, default `dense:0.15,lexical:0.30,sparse:0.55`).
+The systems-card accuracy probe saves each case's ranked candidates privately as
+`systems-card-boundaries-<split>-<stamp>.jsonl` together with every candidate's per-arm
+`arm_scores`. The tuner replays fusion over those saved rows for every alpha on a simplex
+grid (step 0.05), picks the alpha that maximises MRR on the `optimize` split without lowering
+recall@20 below the recorded ordering, and reports the `validation` split for that alpha.
+Only documents that reached the saved candidate list can move, so capture with the deepest
+`CANDIDATE_LIMIT` the MCP allows. Run the probe once per split you need
+(`--truth-split optimize`, `--truth-split validation`), then:
+
+```bash
+PYTHONPATH=recall:recall/server python -m evals.fusion_tuning \
+  --truth ~/.recall/eval/agentic-truth.jsonl \
+  --results ~/.recall/systems-card/systems-card-boundaries-optimize-<stamp>.jsonl \
+            ~/.recall/systems-card/systems-card-boundaries-validation-<stamp>.jsonl \
+  --output ~/.recall/systems-card/fusion-tuning-<stamp>.json
+```
+
+Inputs and the output must live outside the repository under an owner-only directory; the
+report is content-free (alphas, aggregate metrics per split, digests) and prints the
+`RECALL_SEARCH_FUSION_ALPHAS` value to deploy. `--baseline-alphas` names the alphas the rows
+were captured with when the recorded ordering should not be the recall floor; `--step`,
+`--k`, `--tune-split`, and `--report-split` override the defaults.
+
 When a Recall@50 miss could be either retrieval absence or fusion loss, freeze
 one depth-100 matrix before changing either subsystem. Live matrix generation
 does not read truth and writes no query text or source content:

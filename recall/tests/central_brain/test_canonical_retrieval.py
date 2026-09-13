@@ -1532,6 +1532,32 @@ class SearchArmCostTests(unittest.TestCase):
         self.assertEqual(set(arms), {"dense", "passage_lexical", "sparse_exact"})
         self.assertTrue(all(isinstance(v, float) and v >= 0 for v in arms.values()))
 
+    def test_fusion_diagnostics_reported(self) -> None:
+        from recall_server.fusion import DEFAULT_FUSION_ALPHAS
+
+        store = self._Store(scope_count=10)
+        response = self._retrieval(store).search(
+            "deploy failed", lexical_query="deploy failed", since=None, until=None, limit=10,
+        )
+        fusion = response["diagnostics"]["fusion"]
+        self.assertEqual(fusion["mode"], "convex")
+        self.assertEqual(fusion["alphas"], DEFAULT_FUSION_ALPHAS)
+        self.assertEqual(set(fusion["legs"]), {"dense", "passage-lexical", "sparse-exact"})
+        for value in fusion["legs"].values():
+            self.assertEqual(set(value), {"candidates", "documents", "normalized"})
+            self.assertIsInstance(value["candidates"], int)
+            self.assertIsInstance(value["normalized"], bool)
+        store.fusion_mode = "rrf"
+        store.fusion_alphas = {"dense": 0.2, "passage-lexical": 0.3, "sparse-exact": 0.5}
+        response = self._retrieval(store).search(
+            "deploy failed", lexical_query="deploy failed", since=None, until=None, limit=10,
+        )
+        self.assertEqual(response["diagnostics"]["fusion"]["mode"], "rrf")
+        self.assertEqual(
+            response["diagnostics"]["fusion"]["alphas"],
+            {"dense": 0.15, "passage-lexical": 0.30, "sparse-exact": 0.55},
+        )
+
     def test_sparse_arm_runs_only_for_identifier_shaped_queries(self) -> None:
         from recall_server.passage_retrieval import sparse_arm_applies
 

@@ -734,6 +734,13 @@ def score_boundary_files(
         )
     cases, truth_payload = _load_jsonl(truth)
     result_rows, result_payload = _load_jsonl(results)
+    # Accuracy-probe rows also carry per-arm evidence for evals.fusion_tuning;
+    # boundary scoring keys on the exact result schema, so drop it here.
+    result_rows = [
+        {key: value for key, value in row.items() if key != "arm_scores"}
+        if isinstance(row, dict) else row
+        for row in result_rows
+    ]
     report = score_boundary_candidates(cases, result_rows, split=split)
     report["run_id"] = run_id
     report["pins"] = {

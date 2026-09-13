@@ -28,6 +28,45 @@ def _revision(hit: dict[str, Any]) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 1 else 1
 
 
+def arm_scores_from_search(result: dict[str, Any]) -> list[dict[str, Any] | None]:
+    """Per-candidate arm evidence, aligned with ``candidates_from_search``.
+
+    Each entry is the server's content-free ``arm_scores`` map (raw best
+    score, arm rank, normalised value per arm) or ``None`` when the server
+    did not expose it. ``evals.fusion_tuning`` replays fusion offline from
+    these values; nothing here carries question text or receipts.
+    """
+
+    seen: set[tuple[str, str]] = set()
+    scores: list[dict[str, Any] | None] = []
+    for hit in result.get("results", []):
+        ldoc = hit.get("logical_document_id")
+        source = hit.get("source_id")
+        if not isinstance(ldoc, str) or not isinstance(source, str) or not source:
+            continue
+        identity = (source, ldoc)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        arms = hit.get("arm_scores")
+        scores.append(
+            {
+                str(arm): {
+                    key: value for key, value in entry.items()
+                    if key in ("score", "rank", "normalized")
+                    and isinstance(value, (int, float)) and not isinstance(value, bool)
+                }
+                for arm, entry in arms.items()
+                if isinstance(entry, dict)
+            }
+            if isinstance(arms, dict)
+            else None
+        )
+        if len(scores) >= 100:
+            break
+    return scores
+
+
 def candidates_from_search(result: dict[str, Any]) -> list[dict[str, Any]]:
     seen: set[tuple[str, str]] = set()
     candidates: list[dict[str, Any]] = []
@@ -85,6 +124,8 @@ class TruthBoundaryProbe:
         pointer_checks = int(context.options.get("accuracy_pointer_checks", 5))
 
         rows: list[dict[str, Any]] = []
+        arm_scores: dict[str, list[dict[str, Any] | None]] = {}
+        fusion_diagnostics: dict[str, Any] | None = None
         resolution_ok = 0
         resolution_checked = 0
         for case in selected:
@@ -95,6 +136,13 @@ class TruthBoundaryProbe:
             latency = (time.monotonic() - started) * 1000.0
             if outcome.ok and outcome.result:
                 candidates = candidates_from_search(outcome.result)
+                arm_scores[case["id"]] = arm_scores_from_search(outcome.result)
+                fusion = outcome.result.get("diagnostics", {}).get("fusion")
+                if fusion_diagnostics is None and isinstance(fusion, dict):
+                    fusion_diagnostics = {
+                        "mode": fusion.get("mode"),
+                        "alphas": fusion.get("alphas"),
+                    }
                 error = ""
                 receipt = first_receipt(outcome.result)
                 if receipt and resolution_checked < pointer_checks:
@@ -123,6 +171,9 @@ class TruthBoundaryProbe:
             "receipt_resolution_rate": (resolution_ok / resolution_checked) if resolution_checked else None,
             "receipt_resolution_checks": resolution_checked,
         }
+        if fusion_diagnostics is not None:
+            metrics["fusion.mode"] = fusion_diagnostics["mode"]
+            metrics["fusion.alphas"] = fusion_diagnostics["alphas"]
         for stratum, values in report.get("strata", {}).items():
             for key in ("boundary_recall@20", "boundary_mrr", "negative_false_hit_rate", "case_hit_rate@50"):
                 if key in values and values[key] is not None:
@@ -150,7 +201,10 @@ class TruthBoundaryProbe:
             fd = os.open(results_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "w") as handle:
                 for row in rows:
-                    handle.write(json.dumps(row, sort_keys=True) + "\n")
+                    # Rows keep the scorer's exact result schema plus the
+                    # per-arm evidence the offline fusion tuner replays.
+                    saved = {**row, "arm_scores": arm_scores.get(row["id"], [])}
+                    handle.write(json.dumps(saved, sort_keys=True) + "\n")
             result.notes.append(f"per-case rankings saved privately ({results_path.name})")
         return result
 
