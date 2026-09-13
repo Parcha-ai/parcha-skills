@@ -1101,7 +1101,9 @@ class PassageProjectionTests(unittest.TestCase):
         self.assertIn("passage.logical_document_id", source)
 
     def test_hybrid_search_arms_run_concurrently_under_one_deadline(self) -> None:
-        source = inspect.getsource(PassageHintRetrieval.search)
+        source = inspect.getsource(PassageHintRetrieval.search) + inspect.getsource(
+            PassageHintRetrieval._search_admitted
+        )
 
         self.assertIn("ThreadPoolExecutor(max_workers=3", source)
         self.assertIn("self._lexical_candidates", source)

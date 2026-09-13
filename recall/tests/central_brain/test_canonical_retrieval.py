@@ -1607,7 +1607,7 @@ class SearchArmCostTests(unittest.TestCase):
             store.sql.clear()
             store.values.clear()
             retrieval._sparse_query(
-                ["brain_busy", "503"], lexical_query="brain_busy 503 deploy", order=order,
+                store, ["brain_busy", "503"], lexical_query="brain_busy 503 deploy", order=order,
                 since="2026-09-01T00:00:00Z", until=None,
                 candidate_limit=80, actor_ids=["actor_" + "0" * 32], actor_relations=["author"],
                 deadline_at=time.monotonic() + 5,
@@ -1620,12 +1620,12 @@ class SearchArmCostTests(unittest.TestCase):
             self.assertNotIn("canonical_chunks", pool)
             self.assertNotIn("canonical_documents", sql)
             self.assertNotIn("canonical_events", sql)
-            # any identifier phrase qualifies a passage
+            # every informative term (the lexical predicate) and any identifier phrase
             self.assertIn(
-                "passage.search_vector @@ (phraseto_tsquery('simple',%s) || phraseto_tsquery('simple',%s))",
+                "passage.search_vector @@ (plainto_tsquery('simple',%s) && "
+                "(phraseto_tsquery('simple',%s) || phraseto_tsquery('simple',%s)))",
                 pool,
             )
-            self.assertNotIn("&&", sql)
             # scoped exactly like the passage-lexical arm
             self.assertIn("passage.policy_fingerprint=%s", pool)
             self.assertIn("FROM canonical_passage_actors actor", pool)
@@ -1649,15 +1649,14 @@ class SearchArmCostTests(unittest.TestCase):
                     "passage.last_occurred_at DESC,passage.passage_id",
                     pool,
                 )
-                self.assertIn("brain_busy 503 deploy", values)
-                self.assertLess(values.index("brain_busy 503 deploy"), values.index(160))
+                self.assertEqual(values.count("brain_busy 503 deploy"), 5)  # match, pool/top/final order, score
             else:
-                self.assertNotIn("brain_busy 503 deploy", values)
+                self.assertEqual(values.count("brain_busy 503 deploy"), 1)  # match only
                 self.assertNotIn("ts_rank_cd", sql)
                 self.assertIn("0.0::real AS score", sql)
         with self.assertRaises(ValueError):
             retrieval._sparse_query(
-                [], lexical_query="x", order="rank", since=None, until=None, candidate_limit=80,
+                store, [], lexical_query="x", order="rank", since=None, until=None, candidate_limit=80,
                 actor_ids=None, actor_relations=None, deadline_at=time.monotonic() + 5,
             )
 
@@ -1700,15 +1699,26 @@ class SearchArmCostTests(unittest.TestCase):
         )
         self.assertEqual(response["diagnostics"]["sparse_status"], "skipped-prose-query")
         self.assertEqual(response["diagnostics"]["sparse_candidates"], 0)
-        expected = collapse_document_candidates(
-            (("dense", 0.15, dense_rows), ("passage-lexical", 0.30, lexical_rows), ("sparse-exact", 0.55, [])),
-            limit=20,
+        legs = tuple(
+            (name, passage_retrieval.RRF_LEG_WEIGHTS[name], rows)
+            for name, rows in (("dense", dense_rows), ("passage-lexical", lexical_rows), ("sparse-exact", []))
         )
-        self.assertEqual(
-            json.dumps(response["results"], sort_keys=True, default=str),
-            json.dumps(expected, sort_keys=True, default=str),
-        )
-        self.assertEqual([r["logical_document_id"] for r in expected], ["ldoc_b", "ldoc_c", "ldoc_a"])
+        for mode in ("rrf", "convex"):
+            store.fusion_mode = mode
+            store.fusion_alphas = dict(passage_retrieval.DEFAULT_FUSION_ALPHAS)
+            response = self._retrieval(store).search(
+                "why did the deploy fail", lexical_query="deploy fail", since=None, until=None, limit=20,
+            )
+            self.assertEqual(response["diagnostics"]["fusion"]["mode"], mode)
+            expected = collapse_document_candidates(
+                legs, limit=20, fusion=mode, alphas=dict(passage_retrieval.DEFAULT_FUSION_ALPHAS),
+            )
+            self.assertEqual(
+                json.dumps(response["results"], sort_keys=True, default=str),
+                json.dumps(expected, sort_keys=True, default=str),
+                mode,
+            )
+            self.assertEqual(len(expected), 3)
 
     def test_search_diagnostics_report_candidate_depth(self) -> None:
         store = self._Store(scope_count=10)
@@ -1761,6 +1771,307 @@ class SearchArmCostTests(unittest.TestCase):
         self.assertEqual(
             response["diagnostics"]["arms_truncated"], ["dense", "passage_lexical", "sparse_exact"],
         )
+
+    def test_sparse_arm_skips_itself_when_the_lexical_bitmap_is_too_wide(self) -> None:
+        from recall_server import passage_retrieval
+
+        class Probe(self._Store):
+            def __init__(self, *, matches, **kwargs):
+                super().__init__(**kwargs)
+                self.matches = matches
+
+            def _execute_bounded(self, connection, sql, values, deadline_at):
+                if "SELECT count(*) AS n FROM ( SELECT 1 FROM canonical_passages passage" in " ".join(sql.split()):
+                    self.sql.append(" ".join(sql.split()))
+                    self.values.append(tuple(values))
+                    return Rows([{"n": self.matches}])
+                return super()._execute_bounded(connection, sql, values, deadline_at)
+
+        common = dict(since="2026-09-01T00:00:00Z", until=None, candidate_limit=80,
+                      actor_ids=["actor_" + "0" * 32], actor_relations=["author"],
+                      deadline_at=time.monotonic() + 5)
+        cap = passage_retrieval.SPARSE_MAX_LEXICAL_MATCHES
+
+        # exactly at the cap: the arm runs; the probe precedes the ranked phase on one connection
+        store = Probe(matches=cap, scope_count=10)
+        rows, status = self._retrieval(store)._sparse_candidates("brain_busy 503", **common)
+        self.assertEqual(status, "ok")
+        probe_sql, probe_values = store.sql[0], store.values[0]
+        self.assertIn("passage.search_vector @@ plainto_tsquery('simple',%s)", probe_sql)
+        self.assertNotIn("phraseto_tsquery", probe_sql)
+        self.assertNotIn("ts_rank_cd", probe_sql)
+        self.assertNotIn("canonical_chunks", probe_sql)
+        self.assertIn("LIMIT %s ) probe", probe_sql)
+        self.assertEqual(probe_values[-1], cap + 1)
+        # scoped exactly like the arm it protects
+        self.assertIn("passage.policy_fingerprint=%s", probe_sql)
+        self.assertIn("FROM canonical_passage_actors actor", probe_sql)
+        self.assertIn("passage.last_occurred_at>=%s", probe_sql)
+        self.assertIn("brain_busy 503", probe_values)
+        self.assertTrue(any("phraseto_tsquery" in q for q in store.sql[1:]))
+
+        # one above the cap: skipped before any phrase recheck
+        store = Probe(matches=cap + 1, scope_count=10)
+        rows, status = self._retrieval(store)._sparse_candidates("brain_busy 503", **common)
+        self.assertEqual((rows, status), ([], "skipped-selectivity"))
+        self.assertEqual(len(store.sql), 1)
+        self.assertFalse(any("phraseto_tsquery" in q for q in store.sql))
+
+        # the probe itself is deadline-bounded
+        class SlowProbe(Probe):
+            def _execute_bounded(self, connection, sql, values, deadline_at):
+                if "AS n FROM" in " ".join(sql.split()):
+                    raise SearchDeadlineExceeded()
+                return super()._execute_bounded(connection, sql, values, deadline_at)
+
+        rows, status = self._retrieval(SlowProbe(matches=0, scope_count=10))._sparse_candidates("brain_busy 503", **common)
+        self.assertEqual((rows, status), ([], "deadline-exceeded"))
+
+        passage_retrieval.reset_scope_count_cache()
+        response = self._retrieval(Probe(matches=cap + 1, scope_count=10)).search(
+            "brain_busy 503", lexical_query="brain_busy 503", since=None, until=None, limit=10,
+        )
+        self.assertEqual(response["diagnostics"]["sparse_status"], "skipped-selectivity")
+        self.assertEqual(response["diagnostics"]["arms_truncated"], [])
+
+    def test_text_arms_hold_one_pooled_connection_even_when_the_ranked_phase_times_out(self) -> None:
+        from recall_server import passage_retrieval
+
+        class Counting(self._Store):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.connects = 0
+                self.open = 0
+                self.max_open = 0
+
+            @contextmanager
+            def connect(self):
+                self.connects += 1
+                self.open += 1
+                self.max_open = max(self.max_open, self.open)
+                try:
+                    yield self
+                finally:
+                    self.open -= 1
+
+            def _execute_bounded(self, connection, sql, values, deadline_at):
+                if "ts_rank_cd(passage.search_vector" in sql:
+                    raise SearchDeadlineExceeded()
+                return super()._execute_bounded(connection, sql, values, deadline_at)
+
+        passage_retrieval.reset_scope_count_cache()
+        store = Counting(scope_count=10)
+        retrieval = self._retrieval(store)
+        common = dict(since=None, until=None, candidate_limit=80, actor_ids=None,
+                      actor_relations=None, deadline_at=time.monotonic() + 5)
+        rows, status = retrieval._lexical_candidates("brain_busy 503", **common)
+        self.assertEqual((rows, status), ([], "ok-recent-first"))
+        self.assertEqual(store.connects, 1)
+        rows, status = retrieval._sparse_candidates("brain_busy 503", **common)
+        self.assertEqual((rows, status), ([], "ok-recent-first"))
+        self.assertEqual(store.connects, 2)
+        self.assertEqual(store.open, 0)
+
+        store.connects = 0
+        response = retrieval.search(
+            "brain_busy 503", lexical_query="brain_busy 503", since=None, until=None, limit=10,
+        )
+        self.assertEqual(response["diagnostics"]["arms_truncated"], ["passage_lexical", "sparse_exact"])
+        # scope count + three arms, never more than three connections at once
+        self.assertLessEqual(store.connects, 4)
+        self.assertLessEqual(store.max_open, 3)
+        self.assertEqual(store.open, 0)
+
+    def test_pool_timeout_inside_an_arm_is_a_status_not_an_error(self) -> None:
+        from psycopg_pool import PoolTimeout
+
+        from recall_server import passage_retrieval
+
+        class Exhausted(self._Store):
+            @contextmanager
+            def connect(self):
+                raise PoolTimeout("pool exhausted")
+                yield self  # pragma: no cover
+
+        passage_retrieval.reset_scope_count_cache()
+        response = self._retrieval(Exhausted(scope_count=10)).search(
+            "brain_busy 503", lexical_query="brain_busy 503", since=None, until=None, limit=10,
+        )
+        diagnostics = response["diagnostics"]
+        self.assertEqual(response["results"], [])
+        self.assertEqual(diagnostics["passage_lexical_status"], "pool-exhausted")
+        self.assertEqual(diagnostics["sparse_status"], "pool-exhausted")
+        self.assertEqual(diagnostics["dense_status"], "pool-exhausted")
+        self.assertEqual(diagnostics["arms_truncated"], ["dense", "passage_lexical", "sparse_exact"])
+        self.assertFalse(diagnostics["deadline_exceeded"])
+
+    def test_search_admission_bounds_concurrent_searches_and_leaves_pool_headroom(self) -> None:
+        from recall_server import passage_retrieval
+
+        class RecordingSemaphore:
+            def __init__(self, slots):
+                self.inner = threading.BoundedSemaphore(slots)
+                self.lock = threading.Lock()
+                self.held = 0
+                self.max_held = 0
+                self.waits = []
+
+            def acquire(self, timeout=None):
+                self.waits.append(timeout)
+                if not self.inner.acquire(timeout=timeout):
+                    return False
+                with self.lock:
+                    self.held += 1
+                    self.max_held = max(self.max_held, self.held)
+                return True
+
+            def release(self):
+                with self.lock:
+                    self.held -= 1
+                self.inner.release()
+
+        class Slow(self._Store):
+            search_admission = RecordingSemaphore(1)
+
+            def _execute_bounded(self, connection, sql, values, deadline_at):
+                if "sum(projected.passage_count)" not in sql:
+                    time.sleep(0.05)
+                return super()._execute_bounded(connection, sql, values, deadline_at)
+
+        passage_retrieval.reset_scope_count_cache()
+        store = Slow(scope_count=10)
+        retrieval = self._retrieval(store)
+        outcomes = []
+
+        def one():
+            outcomes.append(retrieval.search(
+                "brain_busy 503", lexical_query="brain_busy 503", since=None, until=None, limit=10,
+                deadline_at=time.monotonic() + 5,
+            ))
+
+        threads = [threading.Thread(target=one) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(len(outcomes), 4)
+        self.assertTrue(all("reason" not in o["diagnostics"] for o in outcomes))
+        self.assertEqual(store.search_admission.max_held, 1)
+        self.assertEqual(store.search_admission.held, 0)
+        self.assertTrue(all(0 < wait <= 20 for wait in store.search_admission.waits))
+
+        # No slot inside the budget: an explicit reason, no exception, no pool use.
+        store.search_admission.inner.acquire()
+        try:
+            store.sql.clear()
+            response = retrieval.search(
+                "brain_busy 503", lexical_query="brain_busy 503", since=None, until=None,
+                limit=10, deadline_at=time.monotonic() + 0.05,
+            )
+        finally:
+            store.search_admission.inner.release()
+        self.assertEqual(response["results"], [])
+        self.assertEqual(response["diagnostics"]["reason"], "search-admission-timeout")
+        self.assertEqual(response["diagnostics"]["arms_truncated"], ["dense", "passage_lexical", "sparse_exact"])
+        self.assertEqual(store.sql, [])
+
+    def test_search_admission_is_released_on_every_exit_path(self) -> None:
+        from recall_server import passage_retrieval
+
+        class Guarded(self._Store):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.search_admission = threading.BoundedSemaphore(1)
+                self.fail_arms = False
+
+            def _execute_bounded(self, connection, sql, values, deadline_at):
+                if self.fail_arms and "sum(projected.passage_count)" not in sql:
+                    raise RuntimeError("synthetic arm failure")
+                if deadline_at < time.monotonic():
+                    raise SearchDeadlineExceeded()
+                return super()._execute_bounded(connection, sql, values, deadline_at)
+
+        def slot_is_free(store):
+            acquired = store.search_admission.acquire(timeout=0)
+            if acquired:
+                store.search_admission.release()
+            return acquired
+
+        passage_retrieval.reset_scope_count_cache()
+        store = Guarded(scope_count=10)
+        retrieval = self._retrieval(store)
+        search = dict(lexical_query="brain_busy 503", since=None, until=None, limit=10)
+
+        # normal completion
+        retrieval.search("brain_busy 503", **search)
+        self.assertTrue(slot_is_free(store))
+
+        # an unexpected exception inside an arm propagates, the slot is still released
+        store.fail_arms = True
+        with self.assertRaises(RuntimeError):
+            retrieval.search("brain_busy 503", **search)
+        self.assertTrue(slot_is_free(store))
+        store.fail_arms = False
+
+        # a deadline that already passed: every arm reports deadline-exceeded, slot released
+        response = retrieval.search("brain_busy 503", deadline_at=time.monotonic() - 1, **search)
+        self.assertEqual(response["diagnostics"]["arms_truncated"], ["dense", "passage_lexical", "sparse_exact"])
+        self.assertTrue(slot_is_free(store))
+
+        # admission timeout never acquired, so it must not release (BoundedSemaphore would raise)
+        store.search_admission.acquire()
+        try:
+            response = retrieval.search("brain_busy 503", deadline_at=time.monotonic() + 0.01, **search)
+            self.assertEqual(response["diagnostics"]["reason"], "search-admission-timeout")
+        finally:
+            store.search_admission.release()
+        self.assertTrue(slot_is_free(store))
+
+        # the same holds for a prose query (sparse arm skipped) and for include_arms
+        retrieval.search("why did the deploy fail", lexical_query="deploy fail", since=None, until=None, limit=10, include_arms=True)
+        self.assertTrue(slot_is_free(store))
+
+    def test_store_search_slots_leave_reserved_connections(self) -> None:
+        from recall_server.db import BrainStore
+
+        for pool, slots in ((4, 1), (8, 2), (16, 4), (32, 10)):
+            store = BrainStore("postgresql://synthetic/unused", pool_max_size=pool)
+            self.assertEqual(store.search_slots, slots, pool)
+            self.assertEqual(store.search_admission._value, slots)
+
+    def test_execute_bounded_rolls_back_a_cancelled_statement(self) -> None:
+        import psycopg
+
+        from recall_server.db import BrainStore
+
+        class Connection:
+            def __init__(self):
+                self.calls = []
+
+            def execute(self, sql, values=None):
+                self.calls.append(sql)
+                if "set_config" not in sql:
+                    raise psycopg.errors.QueryCanceled("canceling statement due to statement timeout")
+
+            def rollback(self):
+                self.calls.append("ROLLBACK")
+
+        connection = Connection()
+        with self.assertRaises(SearchDeadlineExceeded):
+            BrainStore._execute_bounded(connection, "SELECT 1", (), time.monotonic() + 1)
+        self.assertEqual(connection.calls[-1], "ROLLBACK")
+
+        class InsideTransactionBlock(Connection):
+            def rollback(self):
+                self.calls.append("ROLLBACK-REFUSED")
+                raise psycopg.ProgrammingError(
+                    "Explicit rollback() forbidden within a Transaction context."
+                )
+
+        connection = InsideTransactionBlock()
+        with self.assertRaises(SearchDeadlineExceeded):
+            BrainStore._execute_bounded(connection, "SELECT 1", (), time.monotonic() + 1)
+        self.assertEqual(connection.calls[-1], "ROLLBACK-REFUSED")
 
     def test_search_limit_fifty_keeps_candidate_limit_bounded(self) -> None:
         """Depth 50 issues the same bounded scans as depth 20: candidate_limit is already capped at 400."""
