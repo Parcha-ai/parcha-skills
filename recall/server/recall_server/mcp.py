@@ -140,7 +140,9 @@ ALL_READ_TOOLS = (
             "Use natural language, identifiers, people, source, and time filters as "
             "the question warrants; reformulate or split the question when useful. "
             "Results include logical_document_id values for recall_exec and stable "
-            "recall:// receipts for exact follow-up. Hits are hints, not proof."
+            "recall:// receipts for exact follow-up. Hits are hints, not proof. "
+            "Search covers visible user and assistant text; identifiers that "
+            "appear only inside tool output are reachable through recall_scan."
         ),
         "inputSchema": {
             "type": "object",
@@ -178,7 +180,7 @@ ALL_READ_TOOLS = (
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
-                    "maximum": 20,
+                    "maximum": 50,
                     "default": 10,
                 },
             },
@@ -824,7 +826,7 @@ def _call_tool(
             "limit",
             default=10,
             minimum=1,
-            maximum=20,
+            maximum=50,
         )
         return store.search(query, filters, limit, authorized_source)
     if name == "recall_exec":

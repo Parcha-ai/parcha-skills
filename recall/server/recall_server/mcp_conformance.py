@@ -42,6 +42,7 @@ LIFECYCLE_PATHS = (
     "ping",
     "tool_discovery",
     "private_search",
+    "search_depth_fifty",
     "receipt_resolution",
     "show_around",
     "show_tail",
@@ -64,6 +65,7 @@ ABUSE_CELLS = (
     "unresolved_receipt",
     "capture_origin_spoof",
     "oversized_query",
+    "oversized_search_limit",
     "conflicting_show_window",
     "closed_rest_route",
 )
@@ -769,6 +771,17 @@ def run_conformance(config: McpConformanceConfig) -> dict[str, Any]:
                 raise ConformanceError("search returned an invalid receipt")
             receipts.add(receipt)
     executed.add("lifecycle:private_search")
+
+    deep, _response = _tool(
+        client,
+        config.owner_token,
+        latest,
+        "recall_search",
+        {"query": config.private_queries[0], "filters": {}, "limit": 50},
+    )
+    if not isinstance(deep.get("results"), list):
+        raise ConformanceError("search at depth 50 failed")
+    executed.add("lifecycle:search_depth_fifty")
     _mark_tool(executed, "recall_search")
     executed.update({"method:tools/call"})
 
@@ -1009,6 +1022,11 @@ def run_conformance(config: McpConformanceConfig) -> dict[str, Any]:
             {"query": "x" * 8193},
         ),
         (
+            "oversized_search_limit",
+            "recall_search",
+            {"query": config.private_queries[0], "limit": 51},
+        ),
+        (
             "conflicting_show_window",
             "recall_show",
             {"target": first_receipt, "around": now, "tail": 1},
@@ -1054,7 +1072,7 @@ def run_conformance(config: McpConformanceConfig) -> dict[str, Any]:
             "with_evidence": len(config.private_queries),
         },
         "assertions": {
-            "expected_tool_errors": 6,
+            "expected_tool_errors": 7,
             "tool_errors_observed": tool_errors,
             "receipts_found": len(receipts),
             "receipts_resolved": len(receipts),
