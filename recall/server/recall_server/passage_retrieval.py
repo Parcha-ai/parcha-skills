@@ -69,7 +69,10 @@ SPARSE_ARM_BUDGET_FRACTION = 0.5
 # and the recheck would have run to the arm's budget while pinning a pool
 # connection. 2000 rows is ~6000 random TOAST reads on the managed
 # instance, inside the arm's ranked-phase share of the budget.
-SPARSE_MAX_LEXICAL_MATCHES = 2000
+# Per identifier token: a real identifier is rare. Measured 2026-09-14: '6076'
+# matches 110 passages, a date fragment like '2-4' 1,041 and 'p2' 8,029; ranking
+# 1,151 phrase-matched rows read their TOASTed tsvectors for 10 s.
+SPARSE_MAX_LEXICAL_MATCHES = 300
 # Statuses that mean an arm hit its budget before finishing its full work,
 # or never got a pooled connection inside it.
 TRUNCATED_ARM_STATUSES = frozenset({"deadline-exceeded", "ok-recent-first", "pool-exhausted"})
@@ -728,14 +731,23 @@ class PassageHintRetrieval:
         }
         try:
             with self.store.connect() as connection:
-                try:
-                    matches = self._sparse_lexical_matches(
-                        connection, tokens, deadline_at=arm_deadline, **arguments,
-                    )
-                except SearchDeadlineExceeded:
-                    return [], "deadline-exceeded"
-                if matches > SPARSE_MAX_LEXICAL_MATCHES:
+                # Probe each identifier on its own with a GIN-only lexeme
+                # query (no phrase recheck) and keep only the rare ones; a
+                # common token such as a version or a date fragment must not
+                # drag thousands of rows into the ranked scan.
+                kept: list[str] = []
+                for token in tokens:
+                    try:
+                        matches = self._sparse_lexical_matches(
+                            connection, (token,), deadline_at=arm_deadline, **arguments,
+                        )
+                    except SearchDeadlineExceeded:
+                        return [], "deadline-exceeded"
+                    if matches <= SPARSE_MAX_LEXICAL_MATCHES:
+                        kept.append(token)
+                if not kept:
                     return [], "skipped-selectivity"
+                tokens = tuple(kept)
                 try:
                     return self._sparse_query(
                         connection, tokens, lexical_query=lexical_query, order="rank",
@@ -766,7 +778,7 @@ class PassageHintRetrieval:
         actor_relations: list[str] | None,
         deadline_at: float,
     ) -> int:
-        """Size of the identifier bitmap the sparse arm would recheck, capped.
+        """Size of one identifier's lexeme bitmap, capped (GIN only, no recheck).
 
         Same scope predicates as the sparse and lexical arms, the OR of the
         identifier phrases only (no rank), and a LIMIT one above the cap: the
@@ -777,7 +789,10 @@ class PassageHintRetrieval:
         predicate never allowed for a natural-language question.
         """
         del candidate_limit
-        phrase_sql = "(" + " || ".join("phraseto_tsquery('simple',%s)" for _ in tokens) + ")"
+        # plainto_tsquery over one identifier is an AND of its lexemes and is
+        # answered from the GIN index alone; the phrase recheck is paid only
+        # in the scan, and only for tokens that passed this probe.
+        phrase_sql = "(" + " || ".join("plainto_tsquery('simple',%s)" for _ in tokens) + ")"
         rows = self.store._execute_bounded(
             connection,
             f"""SELECT count(*) AS n
