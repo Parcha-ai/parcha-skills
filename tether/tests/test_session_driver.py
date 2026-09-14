@@ -210,3 +210,32 @@ class SessionDriverTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CodexBusyThreadTests(SessionDriverTests):
+    def test_busy_codex_thread_defers_the_turn_and_answers_when_free(self):
+        from runtime.plugin_next.session_driver import SessionDriver
+        busy = Path(self.temp.name) / "tui-open"
+        busy.write_text("")
+        os.environ["FAKE_CODEX_BUSY_FILE"] = str(busy)
+        SessionDriver.DEFER_RETRY_SECONDS = 0
+        try:
+            self.bind_codex()
+            self.slice.claim(self.codex_fields("500.2"), "first question")
+            self.assertEqual(self.slice.run_once(), 1)
+            self.assertEqual(self.sent, [("C1", "500.1", "<@U12345678> This thread is attached to a Codex session that is open in a terminal right now, and Codex lets one writer at a time. I have your messages; I answer them as soon as that terminal lets go of the thread. If that is not soon, `tether rebind` from the session you want.")])
+            self.assertEqual(self.store.counts()["ready_turns"], 1, "the message is still queued")
+            # second message while still busy: no second notice
+            self.slice.claim(self.codex_fields("500.3"), "second question")
+            self.assertEqual(self.slice.run_once(), 1)
+            self.assertEqual(len(self.sent), 1)
+            self.assertEqual(self.store.counts()["ready_turns"], 2)
+            # the terminal lets go: both messages are answered in one turn
+            busy.unlink()
+            self.assertEqual(self.slice.run_once(), 1)
+            self.assertEqual(len(self.sent), 2)
+            self.assertIn("codex turn 1 of pid", self.sent[1][2])
+            self.assertEqual(self.store.counts()["ready_turns"], 0)
+        finally:
+            SessionDriver.DEFER_RETRY_SECONDS = 120
+            os.environ.pop("FAKE_CODEX_BUSY_FILE", None)

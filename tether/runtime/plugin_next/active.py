@@ -578,6 +578,13 @@ class ActiveSlice:
                 self._react(context["channel_id"], ts, self.settings.fail_emoji)
             return
         state = result.get("state")
+        if state == "deferred":
+            # The session is busy elsewhere (a Codex thread open in a terminal). The messages stay
+            # queued and keep their :eyes:; the thread hears it once, not once per message.
+            code = str(result.get("error_code") or "deferred")
+            if self.runtime.deferral_count(attempt["binding_id"], code) <= 1:
+                self._post_deferral_notice(context, code)
+            return
         marker = self.settings.done_emoji if state in {"completed_with_response", "no_reply"} else self.settings.fail_emoji
         for ts in self._turn_message_ids(context):
             self._unreact(context["channel_id"], ts, self.settings.ack_emoji)
@@ -596,6 +603,25 @@ class ActiveSlice:
             logger.error("tether: egress failed for %s", attempt["attempt_id"], exc_info=True)
             for ts in self._turn_message_ids(context):
                 self._react(context["channel_id"], ts, self.settings.fail_emoji)
+
+    _DEFERRAL_NOTICES = {
+        "codex_thread_busy": (
+            "This thread is attached to a Codex session that is open in a terminal right now, and Codex "
+            "lets one writer at a time. I have your messages; I answer them as soon as that terminal "
+            "lets go of the thread. If that is not soon, `tether rebind` from the session you want."
+        ),
+    }
+
+    def _post_deferral_notice(self, context: dict[str, Any], code: str) -> None:
+        text = self._DEFERRAL_NOTICES.get(code) or (
+            "I have your messages but cannot take the turn right now (%s); I retry on my own." % code)
+        owner = str(context.get("owner_user_id") or "")
+        if owner and owner.startswith("U"):
+            text = f"<@{owner}> {text}"
+        try:
+            self.egress(context["channel_id"], context["thread_ts"], text)
+        except Exception:
+            logger.error("tether: deferral notice failed for %s", context.get("thread_ts"), exc_info=True)
 
     def _post_failure_notice(self, context: dict[str, Any], attempt: dict[str, Any], result: dict[str, Any]) -> None:
         """A failed turn says so, in one line, with the harness's own words.

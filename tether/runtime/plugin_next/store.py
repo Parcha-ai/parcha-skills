@@ -59,7 +59,8 @@ CREATE TABLE IF NOT EXISTS turns(
   attempt_id TEXT,
   error_code TEXT,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  not_before TEXT                   -- a deferred turn waits until this UTC time before it is scheduled again
 );
 CREATE INDEX IF NOT EXISTS turns_binding_state ON turns(binding_id, state, ordered_at);
 CREATE TABLE IF NOT EXISTS attempts(
@@ -121,11 +122,18 @@ class Store:
         self._db.execute("PRAGMA synchronous=NORMAL")
         self._db.execute("PRAGMA foreign_keys=ON")
         self._db.executescript(_SCHEMA)
+        self._migrate()
         self._db.commit()
         try:
             self.path.chmod(0o600)
         except OSError:
             pass
+
+    def _migrate(self) -> None:
+        """Columns added after the first release; CREATE TABLE IF NOT EXISTS never adds them."""
+        columns = {row["name"] for row in self._db.execute("PRAGMA table_info(turns)")}
+        if "not_before" not in columns:
+            self._db.execute("ALTER TABLE turns ADD COLUMN not_before TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -366,8 +374,9 @@ class Store:
         with self._lock:
             rows = self._db.execute(
                 "SELECT DISTINCT b.endpoint_id FROM turns t JOIN bindings b ON b.binding_id=t.binding_id "
-                "WHERE t.state='ready' AND b.state='active' AND b.endpoint_id NOT IN "
-                "(SELECT endpoint_id FROM attempts WHERE state='accepted') ORDER BY t.ordered_at").fetchall()
+                "WHERE t.state='ready' AND b.state='active' AND (t.not_before IS NULL OR t.not_before<=?) "
+                "AND b.endpoint_id NOT IN (SELECT endpoint_id FROM attempts WHERE state='accepted') "
+                "ORDER BY t.ordered_at", (_now(),)).fetchall()
         return [row["endpoint_id"] for row in rows]
 
     def schedule_next(self, endpoint_id: str, **_: Any) -> dict[str, Any] | None:
@@ -381,7 +390,8 @@ class Store:
             turn = self._db.execute(
                 "SELECT t.* FROM turns t JOIN bindings b ON b.binding_id=t.binding_id "
                 "WHERE b.endpoint_id=? AND t.state='ready' AND b.state='active' "
-                "ORDER BY t.ordered_at LIMIT 1", (endpoint_id,)).fetchone()
+                "AND (t.not_before IS NULL OR t.not_before<=?) ORDER BY t.ordered_at LIMIT 1",
+                (endpoint_id, _now())).fetchone()
             if turn is None:
                 return None
             attempt_id = _id("att")
@@ -419,21 +429,43 @@ class Store:
 
     def finish_attempt(
         self, attempt_id: str, *, state: str, response_ref: str | None = None, error_code: str | None = None,
+        retry_after_seconds: int = 0,
     ) -> dict[str, Any]:
-        """Terminal transition. Turns complete on a reply or NO_REPLY; cancel on failure."""
-        if state not in {"completed_with_response", "no_reply", "failed"}:
+        """Terminal transition. Turns complete on a reply or NO_REPLY; cancel on failure.
+
+        ``deferred``: the session could not take the turn *right now* (a Codex thread open in a
+        terminal, 2026-09-14). The turns go back to ``ready`` with ``not_before`` set, so the
+        messages are answered together once the session is free instead of being cancelled one
+        by one with a notice each.
+        """
+        if state not in {"completed_with_response", "no_reply", "failed", "deferred"}:
             raise StoreError("attempt_state_invalid", state)
         with self._lock:
             now = _now()
             self._db.execute(
                 "UPDATE attempts SET state=?, response_ref=?, error_code=?, terminal_at=? WHERE attempt_id=?",
                 (state, response_ref, error_code, now, attempt_id))
-            turn_state = "completed" if state != "failed" else "cancelled"
-            self._db.execute(
-                "UPDATE turns SET state=?, error_code=?, updated_at=? WHERE attempt_id=?",
-                (turn_state, error_code if state == "failed" else None, now, attempt_id))
+            if state == "deferred":
+                not_before = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() + max(0, retry_after_seconds)))
+                self._db.execute(
+                    "UPDATE turns SET state='ready', attempt_id=NULL, error_code=?, not_before=?, updated_at=? "
+                    "WHERE attempt_id=?", (error_code, not_before, now, attempt_id))
+            else:
+                turn_state = "completed" if state != "failed" else "cancelled"
+                self._db.execute(
+                    "UPDATE turns SET state=?, error_code=?, updated_at=? WHERE attempt_id=?",
+                    (turn_state, error_code if state == "failed" else None, now, attempt_id))
             self._db.commit()
         return {"attempt_id": attempt_id, "state": state, "error_code": error_code}
+
+    def deferral_count(self, binding_id: str, error_code: str, within_seconds: int = 86400) -> int:
+        """How many times this binding was deferred for ``error_code`` recently (one notice, not one per message)."""
+        since = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - within_seconds))
+        with self._lock:
+            row = self._db.execute(
+                "SELECT COUNT(*) AS n FROM attempts WHERE binding_id=? AND state='deferred' AND error_code=? "
+                "AND terminal_at>=?", (binding_id, error_code, since)).fetchone()
+        return int(row["n"])
 
     def uncertain_attempts(self) -> list[dict[str, Any]]:
         """Accepted attempts nobody is driving: only possible after a crash. Failed on sight."""

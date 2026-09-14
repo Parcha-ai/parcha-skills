@@ -259,6 +259,9 @@ class CodexAppServer:
 class SessionDriver:
     """``run_turn`` drives one attempt to a terminal state and records it in the Store."""
 
+    #: A deferred turn (session busy elsewhere) is retried this often.
+    DEFER_RETRY_SECONDS = 120
+
     def __init__(
         self,
         store: Store,
@@ -413,7 +416,17 @@ class SessionDriver:
         with server.lock:
             try:
                 result = server.turn(session_id, prompt, cwd, sandbox=sandbox, approval="never", timeout=timeout_seconds)
-            except (OSError, RuntimeError, TimeoutError) as exc:
+            except RuntimeError as exc:
+                if "active writer" in str(exc):
+                    # The Codex thread is open in someone's terminal (codex resume): Codex allows one
+                    # writer. Not a failure of ours; the turn waits for the terminal to let go.
+                    server._resumed.discard(session_id)
+                    return self._finish(attempt_id, "deferred", str(exc)[:200], error_code="codex_thread_busy")
+                with self._lock:
+                    self._codex = None
+                server.terminate()
+                return self._finish(attempt_id, "failed", str(exc)[:200], error_code="codex_app_server_error")
+            except (OSError, TimeoutError) as exc:
                 with self._lock:
                     self._codex = None
                 server.terminate()
@@ -465,11 +478,12 @@ class SessionDriver:
             path.write_text(text, encoding="utf-8")
             os.chmod(path, 0o600)
             response_ref = str(path)
-        elif state == "failed" and text:
+        elif state in {"failed", "deferred"} and text:
             path = self.blob_root / f"{attempt_id}.stderr"
             path.write_text(text, encoding="utf-8")
             os.chmod(path, 0o600)
-        self.store.finish_attempt(attempt_id, state=state, response_ref=response_ref, error_code=error_code)
+        self.store.finish_attempt(attempt_id, state=state, response_ref=response_ref, error_code=error_code,
+                                  retry_after_seconds=self.DEFER_RETRY_SECONDS if state == "deferred" else 0)
         return {"state": state, "text": text, "error_code": error_code, "session_id": session_id,
                 "response_ref": response_ref}
 

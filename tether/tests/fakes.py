@@ -64,7 +64,8 @@ def direct_launch(command, cwd, env, settings):
 
 
 def child_env(passthrough=()):
-    keys = ("PATH", "FAKE_LOG", "FAKE_PROMPTS", "FAKE_REPLY", "FAKE_CODEX_REPLY", "FAKE_CODEX_FAIL", "FAKE_CODEX_NO_COMPLETE", *passthrough)
+    keys = ("PATH", "FAKE_LOG", "FAKE_PROMPTS", "FAKE_REPLY", "FAKE_CODEX_REPLY", "FAKE_CODEX_FAIL", "FAKE_CODEX_NO_COMPLETE",
+            "FAKE_CODEX_BUSY_FILE", *passthrough)
     return {k: os.environ[k] for k in keys if k in os.environ}
 
 
@@ -97,6 +98,8 @@ FAKE_CODEX = textwrap.dedent(
         method, rid, params = req.get("method"), req.get("id"), req.get("params") or {}
         if method == "initialize":
             out({"id": rid, "result": {"userAgent": "fake-codex"}})
+        elif method == "thread/resume" and os.environ.get("FAKE_CODEX_BUSY_FILE") and os.path.exists(os.environ["FAKE_CODEX_BUSY_FILE"]):
+            out({"id": rid, "error": {"code": -32000, "message": f"thread {params.get('threadId')} already has an active writer"}})
         elif method == "thread/resume":
             out({"id": rid, "result": {"thread": {"id": params["threadId"]}}})
         elif method == "turn/start":

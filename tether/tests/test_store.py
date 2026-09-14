@@ -214,3 +214,45 @@ class StoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeferredTurnTests(StoreTests):
+    def test_deferred_attempt_requeues_turns_with_a_wait(self):
+        binding = self.bind()
+        self.store.admit_turn(binding_id=binding["binding_id"], event_key="d1", ordered_at="1",
+                              payload_inline=_payload("U1", "first", "1"))
+        self.store.admit_turn(binding_id=binding["binding_id"], event_key="d2", ordered_at="2",
+                              payload_inline=_payload("U1", "second", "2"))
+        attempt = self.store.schedule_next(binding["endpoint_id"])
+        self.store.finish_attempt(attempt["attempt_id"], state="deferred", error_code="codex_thread_busy",
+                                  retry_after_seconds=3600)
+        self.assertEqual(self.store.counts()["ready_turns"], 2, "both turns are ready again, nothing cancelled")
+        self.assertEqual(self.store.endpoints_with_ready_turns(), [], "but not before the retry time")
+        self.assertIsNone(self.store.schedule_next(binding["endpoint_id"]))
+        self.assertEqual(self.store.deferral_count(binding["binding_id"], "codex_thread_busy"), 1)
+        # a second deferral with no wait: schedulable at once, counted twice
+        self.store.admit_turn(binding_id=binding["binding_id"], event_key="d3", ordered_at="3",
+                              payload_inline=_payload("U1", "third", "3"))
+        with self.store._lock:
+            self.store._db.execute("UPDATE turns SET not_before=NULL")
+            self.store._db.commit()
+        again = self.store.schedule_next(binding["endpoint_id"])
+        self.assertEqual(len(self.store.attempt_context(again["attempt_id"])["turns"]), 3, "all three coalesce")
+        self.store.finish_attempt(again["attempt_id"], state="deferred", error_code="codex_thread_busy")
+        self.assertEqual(self.store.deferral_count(binding["binding_id"], "codex_thread_busy"), 2)
+        self.assertEqual(self.store.endpoints_with_ready_turns(), [binding["endpoint_id"]])
+
+    def test_not_before_column_is_added_to_an_old_database(self):
+        import sqlite3 as _sq
+        old = Path(self.temp.name) / "old.db"
+        db = _sq.connect(old)
+        db.executescript(
+            "CREATE TABLE turns(event_key TEXT PRIMARY KEY, binding_id TEXT NOT NULL, binding_generation INTEGER NOT NULL, "
+            "ordered_at TEXT NOT NULL, payload_inline TEXT, state TEXT NOT NULL, attempt_id TEXT, error_code TEXT, "
+            "created_at TEXT NOT NULL, updated_at TEXT NOT NULL);")
+        db.commit()
+        db.close()
+        store = Store(old)
+        cols = {r[1] for r in store._db.execute("PRAGMA table_info(turns)")}
+        self.assertIn("not_before", cols)
+        store.close()
