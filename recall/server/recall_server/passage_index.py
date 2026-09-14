@@ -1560,8 +1560,14 @@ class CanonicalPassageProjector:
         max_batches: int = 10,
         shard_count: int = 1,
         shard_index: int = 0,
+        max_passages: int | None = None,
     ) -> dict[str, int | str]:
-        """Embed only lossless passages missing the selected runtime fingerprint."""
+        """Embed only lossless passages missing the selected runtime fingerprint.
+
+        ``max_passages`` (H5-3) is the caller's remaining daily budget: the call
+        never sends more passages than that to the provider, shrinking the last
+        batch as needed.
+        """
 
         tenant_id = self._tenant(tenant_id)
         runtime = self.store.semantic_runtime
@@ -1569,6 +1575,12 @@ class CanonicalPassageProjector:
             return {"status": "disabled", "processed": 0, "batches": 0}
         if runtime.dimensions != 512:
             raise ValueError("passage embeddings require 512 dimensions")
+        if max_passages is not None and (
+            isinstance(max_passages, bool)
+            or not isinstance(max_passages, int)
+            or max_passages < 1
+        ):
+            raise ValueError("passage embedding budget is invalid")
         if (
             isinstance(batch_size, bool)
             or not isinstance(batch_size, int)
@@ -1619,6 +1631,15 @@ class CanonicalPassageProjector:
                 return {"status": "busy", "processed": 0, "batches": 0}
             try:
                 while batches < max_batches:
+                    # H5-3 budget: the last batch shrinks to what the daily cap
+                    # still allows; when nothing is allowed the loop stops.
+                    batch_limit = (
+                        batch_size
+                        if max_passages is None
+                        else min(batch_size, max_passages - processed)
+                    )
+                    if batch_limit <= 0:
+                        break
                     rows = connection.execute(
                         f"""SELECT passage.tenant_id,passage.source_id,
                                   passage.passage_id,passage.text_redacted,
@@ -1661,7 +1682,7 @@ class CanonicalPassageProjector:
                             tenant_scope,
                             shard_count,
                             shard_index,
-                            batch_size,
+                            batch_limit,
                         ),
                     ).fetchall()
                     connection.commit()

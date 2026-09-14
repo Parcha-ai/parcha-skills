@@ -26,6 +26,7 @@ from .capabilities import CapabilityError, probe_database
 from .control import ControlPlane, SecretBox
 from .db import BrainStore
 from .deployment import DeploymentManifestError, load_manifest, preview
+from .embedding_ledger import daily_cap_from_env
 from .embedding_worker import run_canonical_embedding_worker
 from .evidence_projection import (
     CanonicalEvidenceProjector,
@@ -41,7 +42,7 @@ from .passage_index import CanonicalPassageProjector, passage_embed_plan
 from .passage_projection import PassagePolicy
 from .parquet_scan import CanonicalParquetScanProjector
 from .passage_worker import run_passage_worker
-from .projection_worker import run_projection_worker
+from .projection_worker import run_embedding_worker, run_projection_worker
 from .federation import QUALITY_SCORES, SOURCE_FAMILIES
 from .live_providers import (
     LiveProviderError,
@@ -117,6 +118,10 @@ def _worker_pool_max_size(args: argparse.Namespace) -> int | None:
             args.passage_concurrency,
             args.upload_concurrency,
         )
+    if args.command == "embedding-worker":
+        # One connection holds the embedding advisory lock and reads batches;
+        # the ledger and lag reads take a second one between batches.
+        return 4
     return None
 
 
@@ -1759,7 +1764,30 @@ def main() -> None:
         "--thin-busy-batch-size", type=int, default=100,
         help="canonical bodies thinned per cycle while logical or passage work is queued",
     )
+    projection_worker.add_argument(
+        "--skip-embedding", action="store_true",
+        help="leave passage embedding to a dedicated embedding-worker process (H5-2)",
+    )
     projection_worker.add_argument("--once", action="store_true")
+    embedding_worker = sub.add_parser(
+        "embedding-worker",
+        help="embed pending lossless passages in a process of its own, under a daily cap",
+    )
+    embedding_worker.add_argument("--tenant", required=True)
+    embedding_worker.add_argument(
+        "--target-tokens", type=int, default=1024,
+        help="passage policy of the projection worker whose passages are embedded",
+    )
+    embedding_worker.add_argument("--overlap-tokens", type=int, default=128)
+    embedding_worker.add_argument("--batch-size", type=int, default=128)
+    embedding_worker.add_argument("--max-batches-per-cycle", type=int, default=10)
+    embedding_worker.add_argument("--interval-seconds", type=float, default=5)
+    embedding_worker.add_argument(
+        "--daily-cap", type=int, default=None,
+        help="passages embedded per rolling day before the worker stops "
+             "(default RECALL_EMBEDDING_DAILY_CAP or 200000)",
+    )
+    embedding_worker.add_argument("--once", action="store_true")
     sub.add_parser("export")
     conformance = sub.add_parser("mcp-conformance")
     conformance.add_argument("--config", type=Path, required=True)
@@ -2399,6 +2427,7 @@ def main() -> None:
                     max_wait_seconds=args.max_wait_seconds,
                     parquet_every_cycles=args.parquet_every_cycles,
                     cleanup_concurrency=args.cleanup_concurrency,
+                    skip_embedding=args.skip_embedding,
                     body_thinner=lambda busy: thin_canonical_bodies(
                         store,
                         tenant_id=args.tenant,
@@ -2409,6 +2438,38 @@ def main() -> None:
                         ),
                         max_batches=1,
                     ),
+                ),
+                sort_keys=True,
+            )
+        )
+    elif args.command == "embedding-worker":
+        # embed_pending only touches the database and the embedding runtime:
+        # this worker needs no evidence-archive credentials, so the projector
+        # is built without a logical projection store.
+        passages = CanonicalPassageProjector(
+            store,
+            None,  # type: ignore[arg-type]
+            policy=PassagePolicy(
+                target_tokens=args.target_tokens,
+                overlap_tokens=args.overlap_tokens,
+            ),
+            bound_tenant_id=args.tenant,
+        )
+        print(
+            json.dumps(
+                run_embedding_worker(
+                    passages,
+                    store,
+                    tenant_id=args.tenant,
+                    batch_size=args.batch_size,
+                    max_batches_per_cycle=args.max_batches_per_cycle,
+                    interval_seconds=args.interval_seconds,
+                    daily_cap=(
+                        daily_cap_from_env()
+                        if args.daily_cap is None
+                        else args.daily_cap
+                    ),
+                    once=args.once,
                 ),
                 sort_keys=True,
             )

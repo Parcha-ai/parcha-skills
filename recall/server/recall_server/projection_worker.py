@@ -10,6 +10,12 @@ from collections.abc import Callable
 from http.client import RemoteDisconnected
 from typing import Any
 
+from .embedding_ledger import (
+    count_unembedded_passages,
+    record_embedded,
+    validate_daily_cap,
+    window_total,
+)
 from .logical_evidence_projection import CanonicalLogicalEvidenceProjector
 from .passage_index import CanonicalPassageProjector
 from .parquet_scan import CanonicalParquetScanProjector
@@ -90,8 +96,15 @@ def run_projection_worker(
     parquet_every_cycles: int = 3,
     cleanup_concurrency: int = 8,
     max_cycles: int | None = None,
+    skip_embedding: bool = False,
 ) -> dict[str, int | str]:
-    """Service every projection stage without upstream backfill starvation."""
+    """Service every projection stage without upstream backfill starvation.
+
+    With ``skip_embedding`` (H5-2) the embedding phase is left to the
+    dedicated ``embedding-worker`` process: the cycle reports
+    ``embedded=0 embed_elapsed_ms=0``, the idle check ignores embedding, and
+    every other phase is unchanged.
+    """
 
     if not 0.1 <= interval_seconds <= 300:
         raise ValueError("projection worker interval is invalid")
@@ -121,10 +134,14 @@ def run_projection_worker(
             embedding_error = 0
             phase_started = clock()
             try:
-                embedded = passages.embed_pending(
-                    tenant_id=tenant_id,
-                    batch_size=embedding_batch_size,
-                    max_batches=max_batches_per_cycle,
+                embedded = (
+                    {"status": "skipped", "processed": 0}
+                    if skip_embedding
+                    else passages.embed_pending(
+                        tenant_id=tenant_id,
+                        batch_size=embedding_batch_size,
+                        max_batches=max_batches_per_cycle,
+                    )
                 )
             except (
                 ConnectionError,
@@ -141,7 +158,7 @@ def run_projection_worker(
                     "projection embedding unavailable type=%s",
                     type(error).__name__,
                 )
-            embed_elapsed_ms = elapsed_ms(phase_started)
+            embed_elapsed_ms = 0 if skip_embedding else elapsed_ms(phase_started)
             phase_started = clock()
             projected = passages.project_pending(
                 tenant_id=tenant_id,
@@ -226,7 +243,7 @@ def run_projection_worker(
                     "complete"
                     if documents["status"] == "complete"
                     and projected["status"] == "complete"
-                    and embedded["status"] in {"complete", "disabled"}
+                    and embedded["status"] in {"complete", "disabled", "skipped"}
                     and scanned["status"] == "complete"
                     and int(documents["documents"]) == 0
                     and int(projected["passages"]) == 0
@@ -380,4 +397,179 @@ def run_projection_worker(
                 "pruned",
             )
         ):
+            sleep(interval_seconds)
+
+
+EMBEDDING_PROVIDER_ERRORS = (
+    ConnectionError,
+    RemoteDisconnected,
+    TimeoutError,
+    urllib.error.URLError,
+)
+# Anti-join rows examined per cycle before the lag field stops counting; the
+# probe gate is 5000, so anything above this reads as "more than the gate".
+EMBEDDING_LAG_SAMPLE_LIMIT = 10_000
+
+
+def run_embedding_worker(
+    passages: CanonicalPassageProjector,
+    store: Any,
+    *,
+    tenant_id: str,
+    batch_size: int,
+    max_batches_per_cycle: int,
+    interval_seconds: float,
+    daily_cap: int,
+    once: bool = False,
+    sleep: Callable[[float], Any] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+    max_cycles: int | None = None,
+    lag_sample_limit: int = EMBEDDING_LAG_SAMPLE_LIMIT,
+) -> dict[str, int | str]:
+    """Embed pending passages in a process of its own, under a daily cap (H5-2/H5-3).
+
+    Every cycle reads the tenant's ledger total for the last 24 hours, hands
+    ``embed_pending`` the remaining budget as ``max_passages``, and upserts
+    what was embedded back into the ledger. At the cap the worker logs
+    ``embedding cap reached`` and idles until the window rolls; it never
+    calls the provider with a zero budget.
+    """
+
+    if not isinstance(tenant_id, str) or not tenant_id:
+        raise ValueError("embedding worker tenant is invalid")
+    if not 0.1 <= interval_seconds <= 300:
+        raise ValueError("embedding worker interval is invalid")
+    if (
+        isinstance(batch_size, bool)
+        or not isinstance(batch_size, int)
+        or batch_size < 1
+        or isinstance(max_batches_per_cycle, bool)
+        or not isinstance(max_batches_per_cycle, int)
+        or not 1 <= max_batches_per_cycle <= 100
+        or isinstance(lag_sample_limit, bool)
+        or not isinstance(lag_sample_limit, int)
+        or lag_sample_limit < 1
+    ):
+        raise ValueError("embedding worker budget is invalid")
+    validate_daily_cap(daily_cap)
+
+    def elapsed_ms(started: float) -> int:
+        return max(0, int(round((clock() - started) * 1000)))
+
+    def lag_sample(connection: Any) -> int:
+        runtime = getattr(store, "semantic_runtime", None)
+        fingerprint = getattr(runtime, "passage_fingerprint", None)
+        if not isinstance(fingerprint, str) or not fingerprint:
+            return -1
+        return count_unembedded_passages(
+            connection,
+            passage_fingerprint=fingerprint,
+            limit=lag_sample_limit,
+            tenant_id=tenant_id,
+        )
+
+    cycles = 0
+    while True:
+        cycles += 1
+        try:
+            cycle_started = clock()
+            with store.connect() as connection:
+                embedded_window = window_total(connection, tenant_id=tenant_id)
+                connection.commit()
+            cap_remaining = max(0, daily_cap - embedded_window)
+            embedding_error = 0
+            processed = 0
+            if cap_remaining == 0:
+                status = "capped"
+                LOG.warning(
+                    "embedding cap reached tenant=%s embedded_24h=%s cap=%s",
+                    tenant_id,
+                    embedded_window,
+                    daily_cap,
+                )
+            else:
+                try:
+                    result = passages.embed_pending(
+                        tenant_id=tenant_id,
+                        batch_size=batch_size,
+                        max_batches=max_batches_per_cycle,
+                        max_passages=cap_remaining,
+                    )
+                except EMBEDDING_PROVIDER_ERRORS as error:
+                    # The provider is an external dependency: keep the durable
+                    # loop and retry next cycle instead of crashing the service.
+                    embedding_error = 1
+                    result = {"status": "unavailable", "processed": 0}
+                    LOG.warning(
+                        "embedding unavailable type=%s", type(error).__name__
+                    )
+                status = str(result["status"])
+                processed = int(result["processed"])
+                if processed:
+                    with store.connect() as connection:
+                        record_embedded(
+                            connection, tenant_id=tenant_id, embedded=processed
+                        )
+                        connection.commit()
+                    embedded_window += processed
+                    cap_remaining = max(0, daily_cap - embedded_window)
+                    if cap_remaining == 0:
+                        status = "capped"
+                        LOG.warning(
+                            "embedding cap reached tenant=%s embedded_24h=%s cap=%s",
+                            tenant_id,
+                            embedded_window,
+                            daily_cap,
+                        )
+            # A completed drain means nothing is pending: no count needed.
+            # Otherwise sample a bounded anti-join so the log carries the lag.
+            if status == "complete":
+                lag = 0
+            else:
+                with store.connect() as connection:
+                    lag = lag_sample(connection)
+                    connection.commit()
+            cycle: dict[str, int | str] = {
+                "status": status,
+                "embedded": processed,
+                "pending": 1 if status in {"pending", "capped", "busy", "unavailable"} else 0,
+                "lag": lag,
+                "embedded_24h": embedded_window,
+                "cap": daily_cap,
+                "cap_remaining": cap_remaining,
+                "embedding_error": embedding_error,
+                "elapsed_ms": elapsed_ms(cycle_started),
+            }
+            record_cycle({"embedded": processed, "embed_elapsed_ms": cycle["elapsed_ms"]})
+            LOG.info(
+                "embedding cycle status=%s embedded=%s pending=%s lag=%s "
+                "embedded_24h=%s cap=%s cap_remaining=%s embedding_error=%s "
+                "elapsed_ms=%s",
+                *(
+                    cycle[key]
+                    for key in (
+                        "status",
+                        "embedded",
+                        "pending",
+                        "lag",
+                        "embedded_24h",
+                        "cap",
+                        "cap_remaining",
+                        "embedding_error",
+                        "elapsed_ms",
+                    )
+                ),
+            )
+        except Exception as error:  # noqa: BLE001 - one bad cycle must not stop the service
+            LOG.exception("embedding cycle failed type=%s", type(error).__name__)
+            if once or (max_cycles is not None and cycles >= max_cycles):
+                raise
+            sleep(interval_seconds)
+            continue
+        if once or (max_cycles is not None and cycles >= max_cycles):
+            return cycle
+        if cycle["status"] != "pending" or processed == 0:
+            # Idle, capped, busy, or provider-unavailable: wait before polling
+            # again. Only a cycle that embedded work and left more behind loops
+            # straight into the next batch.
             sleep(interval_seconds)

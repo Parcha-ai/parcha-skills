@@ -49,6 +49,7 @@ from .evidence_projection import (
     EvidenceProjectionStore,
 )
 from .invitation_email import onboarding_page
+from .embedding_ledger import daily_cap_from_env
 from .projection_worker import projection_totals
 from .legacy_plane import (
     LEGACY_READ_ROUTES,
@@ -674,6 +675,12 @@ class Handler(BaseHTTPRequestHandler):
             "# HELP recall_passage_documents_projected_24h Canonical passage documents created in the last 24 hours.",
             "# TYPE recall_passage_documents_projected_24h gauge",
             f"recall_passage_documents_projected_24h {db.get('passage_documents_projected_24h', 0)}",
+            "# HELP recall_embedding_daily_total Passages sent to the embedding provider in the UTC day buckets covering the last 24 hours (ledger, all tenants).",
+            "# TYPE recall_embedding_daily_total gauge",
+            f"recall_embedding_daily_total {int(db.get('embedding_daily_total', 0))}",
+            "# HELP recall_embedding_daily_cap Daily embedding cap (RECALL_EMBEDDING_DAILY_CAP) the embedding worker stops at.",
+            "# TYPE recall_embedding_daily_cap gauge",
+            f"recall_embedding_daily_cap {daily_cap_from_env()}",
         ]
         for key, value in projection_totals().items():
             lines.extend(

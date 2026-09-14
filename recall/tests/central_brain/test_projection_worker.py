@@ -802,3 +802,88 @@ class CycleResilienceTests(unittest.TestCase):
             )
         self.assertEqual((result["logical_failed"], result["logical_backoff"], result["logical_quarantined"]), (1, 2, 3))
         self.assertTrue(any("logical_failed=1 logical_backoff=2 logical_quarantined=3" in line for line in logs.output))
+
+
+class SkipEmbeddingTests(unittest.TestCase):
+    """H5-2: ``--skip-embedding`` hands the embed phase to a dedicated process."""
+
+    def _run(self, calls: list[str], *, work: int, clock: _FakeClock, **kwargs):
+        logical = _TimedLogical(calls, work=work)
+        logical.clock = clock
+        passages = _TimedPassages(calls, work=work)
+        passages.clock = clock
+        return run_projection_worker(
+            logical,  # type: ignore[arg-type]
+            passages,  # type: ignore[arg-type]
+            tenant_id="tenant:company:test",
+            logical_batch_size=25,
+            passage_batch_size=100,
+            embedding_batch_size=128,
+            max_batches_per_cycle=10,
+            upload_concurrency=2,
+            passage_concurrency=4,
+            interval_seconds=3,
+            clock=clock,
+            skip_embedding=True,
+            **kwargs,
+        )
+
+    def test_default_still_embeds(self):
+        calls: list[str] = []
+        clock = _FakeClock()
+        logical = _TimedLogical(calls, work=1)
+        logical.clock = clock
+        passages = _TimedPassages(calls, work=1)
+        passages.clock = clock
+        result = run_projection_worker(
+            logical,  # type: ignore[arg-type]
+            passages,  # type: ignore[arg-type]
+            tenant_id="tenant:company:test",
+            logical_batch_size=25,
+            passage_batch_size=100,
+            embedding_batch_size=128,
+            max_batches_per_cycle=10,
+            upload_concurrency=2,
+            passage_concurrency=4,
+            interval_seconds=3,
+            once=True,
+            clock=clock,
+        )
+        self.assertEqual(calls, ["embeddings", "passages", "logical"])
+        self.assertEqual(result["embedded"], 4)
+        self.assertEqual(result["embed_elapsed_ms"], 200)
+
+    def test_skip_flag_never_calls_embed_pending_and_reports_zero(self):
+        calls: list[str] = []
+        with self.assertLogs("recall_server.projection_worker", level="INFO") as logs:
+            result = self._run(calls, work=1, clock=_FakeClock(), once=True)
+
+        self.assertEqual(calls, ["passages", "logical"])
+        self.assertEqual(result["embedded"], 0)
+        self.assertEqual(result["embed_elapsed_ms"], 0)
+        self.assertEqual(result["embedding_error"], 0)
+        # The other phases still run and are still timed.
+        self.assertEqual(result["passage_elapsed_ms"], 300)
+        self.assertEqual(result["logical_elapsed_ms"], 1500)
+        self.assertEqual(result["cycle_elapsed_ms"], 1800)
+        line = next(m for m in logs.output if "projection cycle status=" in m)
+        self.assertIn(" embedded=0 ", line)
+        self.assertIn(" embed_elapsed_ms=0 ", line)
+
+    def test_skip_flag_keeps_an_empty_cycle_truthfully_complete(self):
+        result = self._run([], work=0, clock=_FakeClock(), once=True)
+        self.assertEqual(result["status"], "complete")
+
+    def test_skip_flag_idle_check_ignores_embedding(self):
+        calls: list[str] = []
+
+        class Stopped(RuntimeError):
+            pass
+
+        def stop(seconds: float) -> None:
+            self.assertEqual(seconds, 3)
+            raise Stopped
+
+        with self.assertRaises(Stopped):
+            self._run(calls, work=0, clock=_FakeClock(), sleep=stop)
+        self.assertEqual(calls, ["passages", "logical"])

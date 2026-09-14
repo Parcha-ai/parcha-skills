@@ -14,6 +14,7 @@ from typing import Any
 from .accuracy import SyntheticSuiteProbe, TruthBoundaryProbe
 from .availability import AvailabilityProbe
 from .churn import ProjectionChurnProbe
+from .embedding import EmbeddingLagProbe
 from .corpus import AuthorizationProbe, FreshnessProbe, ScanConsistencyProbe, SecretScanProbe
 from .cost import PlanetScaleCostProbe, StorageProbe
 from .forget import ForgetLatencyProbe
@@ -27,7 +28,7 @@ PROBES: dict[str, Any] = {
     "availability": [AvailabilityProbe],
     "latency": [ToolLatencyProbe, SearchStageProbe, ArchilPhaseProbe],
     "accuracy": [TruthBoundaryProbe, SyntheticSuiteProbe],
-    "freshness": [FreshnessProbe, ProjectionChurnProbe],
+    "freshness": [FreshnessProbe, ProjectionChurnProbe, EmbeddingLagProbe],
     "integrity": [ScanConsistencyProbe, ForgetLatencyProbe],
     "authorization": [AuthorizationProbe],
     "privacy": [SecretScanProbe],
@@ -108,6 +109,7 @@ def history_row(card: dict[str, Any]) -> dict[str, Any]:
         "accuracy.truth_boundary": ["boundary_recall@20", "boundary_mrr", "negative_false_hit_rate"],
         "freshness.source_age": ["newest_age_hours_min", "newest_age_hours_median", "projection_pending"],
         "freshness.projection_churn": ["passages_written_24h", "documents_projected_24h", "passages_unembedded", "embedding_lag_ratio"],
+        "freshness.embedding_lag": ["passages_unembedded", "embedded_today", "cap_remaining"],
         "integrity.scan_consistency": ["scope_scan_agreement", "objects_unavailable"],
         "integrity.forget_latency": ["forgotten_after_s", "capture_visible_after_s"],
         "authorization.negative_scope": ["leaks"],
