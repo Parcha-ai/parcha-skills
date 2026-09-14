@@ -12,6 +12,6 @@ CREATE TABLE IF NOT EXISTS canonical_embedding_ledger (
     PRIMARY KEY (tenant_id, day)
 );
 
-INSERT INTO schema_migrations(version) VALUES (64) ON CONFLICT DO NOTHING;
+INSERT INTO schema_migrations(version) VALUES (65) ON CONFLICT DO NOTHING;
 
 COMMIT;

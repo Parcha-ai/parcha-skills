@@ -115,7 +115,7 @@ Gaps in `shard_index` are normal.
   month is a no-op (`mode=reuse`) and keeps its objects.
 
 The production database gate requires a standard PostgreSQL URL with
-`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 64,
+`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 65,
 pgvector 0.8.0 or newer, and a runtime role without superuser, database/role creation,
 replication, or RLS-bypass privilege:
 
@@ -861,7 +861,7 @@ python -m recall_server.cli embedding-worker \
 - `--daily-cap` (or `RECALL_EMBEDDING_DAILY_CAP`, default `200000`) is the
   number of passages sent to the provider per rolling day, read every cycle
   from `canonical_embedding_ledger (tenant_id, day date, embedded int)`
-  (schema 064). The window is the UTC day buckets that intersect the last
+  (schema 065). The window is the UTC day buckets that intersect the last
   24 hours, so it never under-counts. The ledger is upserted after every
   cycle, so the cap survives restarts and covers every replica. When the
   budget is exhausted the worker logs `embedding cap reached ...`, stops

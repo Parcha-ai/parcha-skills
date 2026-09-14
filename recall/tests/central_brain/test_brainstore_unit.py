@@ -1063,7 +1063,7 @@ class HttpBoundaryContractTest(unittest.TestCase):
         self.assertEqual(len(window), 2)
         for sql in window:
             self.assertNotIn("tenant_id", sql)
-        # Without schema 064 the ledger total is 0, never an error.
+        # Without schema 065 the ledger total is 0, never an error.
         self.assertEqual(metrics["embedding_daily_total"], 0)
 
     def test_service_metrics_reports_the_embedding_ledger_window(self) -> None:
