@@ -24,6 +24,7 @@ from .fusion import (
 )
 from .passage_representations import FINGERPRINT_RE, VECTOR_COLUMNS
 from .rerank import (
+    DEFAULT_RERANK_BLEND,
     DEFAULT_RERANK_MIN_BUDGET_SECONDS,
     RerankUnavailable,
 )
@@ -410,9 +411,18 @@ def select_rerank_candidates(
     return selected
 
 
+def _min_max(values: list[float]) -> list[float]:
+    low, high = min(values), max(values)
+    if high - low <= 1e-12:
+        return [1.0 for _ in values]
+    return [(value - low) / (high - low) for value in values]
+
+
 def apply_rerank_scores(
     results: list[dict[str, Any]],
     scores: dict[str, float],
+    *,
+    blend: float = 1.0,
 ) -> list[dict[str, Any]]:
     """Re-order fused documents by their best reranked passage.
 
@@ -446,6 +456,18 @@ def apply_rerank_scores(
         reranked.append(
             (best, document_index, {**row, "matching_ranges": ranges, "rerank_score": round(best, 8)})
         )
+    if reranked and 0.0 <= blend < 1.0:
+        # Blend the reranker with the fused arm score (both min-max scaled
+        # over the reranked set) so a document every arm agreed on is not
+        # thrown away by one cross-encoder judgement.
+        rerank_norm = _min_max([entry[0] for entry in reranked])
+        fused_norm = _min_max([float(entry[2].get("rank") or 0.0) for entry in reranked])
+        blended = []
+        for (best, document_index, row), r_norm, f_norm in zip(reranked, rerank_norm, fused_norm, strict=True):
+            final = blend * r_norm + (1.0 - blend) * f_norm
+            blended.append((final, document_index, {**row, "blended_score": round(final, 8)}))
+        blended.sort(key=lambda entry: (-entry[0], entry[1]))
+        return [row for _score, _index, row in blended] + unscored
     reranked.sort(key=lambda entry: (-entry[0], entry[1]))
     return [row for _score, _index, row in reranked] + unscored
 
@@ -1601,7 +1623,9 @@ class PassageHintRetrieval:
             if 0 <= index < len(documents)
             for key in keys_by_document[index]
         }
-        return apply_rerank_scores(results, scores), diagnostics
+        blend = float(getattr(self.store, "rerank_blend", DEFAULT_RERANK_BLEND))
+        diagnostics["rerank_blend"] = blend
+        return apply_rerank_scores(results, scores, blend=blend), diagnostics
 
     def search_bundle(
         self,
