@@ -1581,8 +1581,8 @@ class SearchArmCostTests(unittest.TestCase):
         rows, status = retrieval._sparse_candidates("frontalcortextool replacement", original_query="FrontalCortexTool replacement", **common)
         self.assertEqual(status, "ok")
         sparse = [s for s in store.sql if "phraseto_tsquery" in s]
-        # the selectivity probe and the ranked scan both carry the identifier phrases
-        self.assertEqual(len(sparse), 2)
+        # only the ranked scan carries the identifier phrases; probes are lexeme queries
+        self.assertEqual(len(sparse), 1)
         self.assertIn("FROM canonical_passages passage", sparse[0])
         self.assertNotIn("FROM canonical_chunks chunk", sparse[0])
         # the casefolded and CamelCase forms are one phrase query
@@ -1800,8 +1800,9 @@ class SearchArmCostTests(unittest.TestCase):
         rows, status = self._retrieval(store)._sparse_candidates("brain_busy 503", **common)
         self.assertEqual(status, "ok")
         probe_sql, probe_values = store.sql[0], store.values[0]
-        self.assertIn("passage.search_vector @@ (phraseto_tsquery('simple',%s)", probe_sql)
-        self.assertNotIn("plainto_tsquery", probe_sql)
+        # the probe is a GIN-only lexeme query per identifier (no phrase recheck)
+        self.assertIn("passage.search_vector @@ (plainto_tsquery('simple',%s))", probe_sql)
+        self.assertNotIn("phraseto_tsquery", probe_sql)
         self.assertNotIn("ts_rank_cd", probe_sql)
         self.assertNotIn("canonical_chunks", probe_sql)
         self.assertIn("LIMIT %s ) probe", probe_sql)
@@ -1817,7 +1818,9 @@ class SearchArmCostTests(unittest.TestCase):
         store = Probe(matches=cap + 1, scope_count=10)
         rows, status = self._retrieval(store)._sparse_candidates("brain_busy 503", **common)
         self.assertEqual((rows, status), ([], "skipped-selectivity"))
-        self.assertEqual(len(store.sql), 1)  # only the probe ran
+        # one probe per identifier token ran; every token was too wide, no scan
+        self.assertEqual(len(store.sql), 2)
+        self.assertTrue(all("probe" in q for q in store.sql))
 
         # the probe itself is deadline-bounded
         class SlowProbe(Probe):
