@@ -23,6 +23,10 @@ from .fusion import (
     leg_document_scores,
 )
 from .passage_representations import FINGERPRINT_RE, VECTOR_COLUMNS
+from .rerank import (
+    DEFAULT_RERANK_MIN_BUDGET_SECONDS,
+    RerankUnavailable,
+)
 
 
 MAX_BUNDLE_SEARCH_WORKERS = 4
@@ -85,8 +89,6 @@ DENSE_PROSE_OVERSAMPLE = 20
 # hnsw.ef_search for the dense pool; must be >= DENSE_NEAREST_LIMIT or the
 # index scan silently returns fewer rows than the LIMIT asks for.
 DENSE_EF_SEARCH = 400
-
-
 def _phase_deadline(deadline_at: float, fraction: float) -> float:
     now = time.monotonic()
     return min(deadline_at, now + max(0.0, deadline_at - now) * fraction)
@@ -368,6 +370,84 @@ def fuse_document_rankings(
             "matching_ranges": ranges,
         })
     return results
+
+
+def _range_key(item: dict[str, Any]) -> str | None:
+    """The key ``collapse_document_candidates`` used for this hint."""
+
+    receipts = item.get("receipts") or ()
+    return item.get("passage_id") or (receipts[0] if receipts else None)
+
+
+def select_rerank_candidates(
+    results: list[dict[str, Any]],
+    *,
+    max_candidates: int,
+) -> list[tuple[int, str]]:
+    """Pick up to ``max_candidates`` passages from the fused document order.
+
+    Round-robin over documents (each document's strongest hint first, then
+    its second, ...) so the reranker sees the widest set of documents rather
+    than three passages each from the top seventeen. Returns
+    ``(document_index, range_key)`` pairs in send order.
+    """
+
+    selected: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    depth = max((len(row.get("matching_ranges") or ()) for row in results), default=0)
+    for position in range(depth):
+        for document_index, row in enumerate(results):
+            ranges = row.get("matching_ranges") or ()
+            if position >= len(ranges):
+                continue
+            key = _range_key(ranges[position])
+            if key is None or key in seen:
+                continue
+            seen.add(key)
+            selected.append((document_index, key))
+            if len(selected) >= max_candidates:
+                return selected
+    return selected
+
+
+def apply_rerank_scores(
+    results: list[dict[str, Any]],
+    scores: dict[str, float],
+) -> list[dict[str, Any]]:
+    """Re-order fused documents by their best reranked passage.
+
+    A document's ``rerank_score`` is the maximum over its scored ranges; its
+    ranges are re-ordered so scored ones lead (best first) and unscored ones
+    keep their fused order behind them. Documents with no scored range keep
+    the fused order after every reranked document, so a provider that
+    returns fewer rows than it was sent never drops a candidate. ``rank``
+    (the fused score) is left untouched for the diagnostics trail.
+    """
+
+    reranked: list[tuple[float, int, dict[str, Any]]] = []
+    unscored: list[dict[str, Any]] = []
+    for document_index, row in enumerate(results):
+        best: float | None = None
+        ranges = []
+        for item in row.get("matching_ranges") or ():
+            score = scores.get(_range_key(item) or "")
+            if score is None:
+                ranges.append(item)
+                continue
+            ranges.append({**item, "rerank_score": round(score, 8)})
+            best = score if best is None else max(best, score)
+        if best is None:
+            unscored.append(row)
+            continue
+        ranges.sort(
+            key=lambda item: ("rerank_score" in item, item.get("rerank_score", 0.0)),
+            reverse=True,
+        )
+        reranked.append(
+            (best, document_index, {**row, "matching_ranges": ranges, "rerank_score": round(best, 8)})
+        )
+    reranked.sort(key=lambda entry: (-entry[0], entry[1]))
+    return [row for _score, _index, row in reranked] + unscored
 
 
 class PassageHintRetrieval:
@@ -1339,9 +1419,19 @@ class PassageHintRetrieval:
             getattr(self.store, "fusion_alphas", None) or DEFAULT_FUSION_ALPHAS
         )
         fusion_legs: dict[str, Any] = {}
+        rerank_runtime = getattr(self.store, "rerank_runtime", None)
+        # H2-c: with a reranker the fused pool must reach past ``limit`` so a
+        # document the arms placed at position 40 can still be promoted. The
+        # first ``limit`` rows of the wider collapse are exactly the rows the
+        # narrow collapse returns, so the disabled path stays byte-identical.
+        collapse_limit = (
+            max(limit, int(rerank_runtime.max_candidates))
+            if rerank_runtime is not None
+            else limit
+        )
         results = collapse_document_candidates(
             legs,
-            limit=limit,
+            limit=collapse_limit,
             fusion=fusion_mode,
             alphas=fusion_alphas,
             fusion_report=fusion_legs,
@@ -1358,6 +1448,17 @@ class PassageHintRetrieval:
             )
             if status in TRUNCATED_ARM_STATUSES
         ]
+        rerank_diagnostics: dict[str, Any] = {"rerank_status": "skipped-disabled"}
+        if rerank_runtime is not None:
+            results, rerank_diagnostics = self._rerank_fused(
+                query,
+                results,
+                legs,
+                runtime=rerank_runtime,
+                deadline_at=deadline_at,
+                arm_elapsed_ms=arm_elapsed_ms,
+            )
+        results = results[:limit]
         response = {
             "results": results,
             "diagnostics": {
@@ -1385,6 +1486,7 @@ class PassageHintRetrieval:
                 "passage_lexical_status": lexical_status,
                 "sparse_status": sparse_status,
                 "arm_elapsed_ms": arm_elapsed_ms,
+                **rerank_diagnostics,
                 "elapsed_ms": round(
                     (time.monotonic() - started_at) * 1000,
                     3,
@@ -1411,6 +1513,95 @@ class PassageHintRetrieval:
                 for name in ("dense", "passage-lexical", "sparse-exact")
             }
         return response
+
+    def _rerank_fused(
+        self,
+        query: str,
+        results: list[dict[str, Any]],
+        legs: tuple[tuple[str, float, list[dict[str, Any]]], ...],
+        *,
+        runtime: Any,
+        deadline_at: float,
+        arm_elapsed_ms: dict[str, float],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Rerank the fused passage pool; on any shortfall keep the fused order.
+
+        Contract: the provider receives the query plus the redacted text of at
+        most ``runtime.max_candidates`` passages (the runtime truncates each to
+        its configured width). Statuses: ``ok`` (scores applied, or nothing to
+        send), ``skipped-budget`` (less than the minimum budget remained after
+        the arms), ``unavailable`` (``RerankUnavailable``; fused order kept).
+        ``arm_elapsed_ms["rerank"]`` is set only when the provider was called
+        so latency percentiles measure real round trips.
+        """
+
+        diagnostics: dict[str, Any] = {
+            "rerank_status": "ok",
+            "rerank_elapsed_ms": 0.0,
+            "rerank_candidates": 0,
+            "rerank_model": runtime.fingerprint,
+        }
+        remaining = deadline_at - time.monotonic()
+        min_budget = getattr(
+            self.store, "rerank_min_budget_seconds", DEFAULT_RERANK_MIN_BUDGET_SECONDS
+        )
+        if remaining < min_budget:
+            diagnostics["rerank_status"] = "skipped-budget"
+            return results, diagnostics
+        texts: dict[str, str] = {}
+        for _leg_name, _weight, rows in legs:
+            for row in rows:
+                key = row.get("passage_id") or row.get("receipt")
+                if key and key not in texts:
+                    texts[key] = row["text_redacted"]
+        # The same passage can reach the pool under two keys (a passage id
+        # from one arm, a receipt from another); send its text once and let
+        # both keys share the score.
+        documents: list[str] = []
+        keys_by_document: list[list[str]] = []
+        document_by_text: dict[str, int] = {}
+        for _document_index, key in select_rerank_candidates(
+            results, max_candidates=int(runtime.max_candidates)
+        ):
+            text = texts.get(key)
+            if text is None:
+                continue
+            position = document_by_text.get(text)
+            if position is None:
+                position = len(documents)
+                document_by_text[text] = position
+                documents.append(text)
+                keys_by_document.append([])
+            keys_by_document[position].append(key)
+        diagnostics["rerank_candidates"] = len(documents)
+        if not documents:
+            return results, diagnostics
+        started = time.monotonic()
+        try:
+            scored = runtime.rerank(
+                query,
+                documents,
+                deadline_seconds=deadline_at - started,
+            )
+        except RerankUnavailable as error:
+            elapsed = round((time.monotonic() - started) * 1000, 3)
+            arm_elapsed_ms["rerank"] = elapsed
+            diagnostics.update({
+                "rerank_status": "unavailable",
+                "rerank_elapsed_ms": elapsed,
+                "rerank_error": error.code,
+            })
+            return results, diagnostics
+        elapsed = round((time.monotonic() - started) * 1000, 3)
+        arm_elapsed_ms["rerank"] = elapsed
+        diagnostics["rerank_elapsed_ms"] = elapsed
+        scores = {
+            key: float(score)
+            for index, score in scored
+            if 0 <= index < len(documents)
+            for key in keys_by_document[index]
+        }
+        return apply_rerank_scores(results, scores), diagnostics
 
     def search_bundle(
         self,

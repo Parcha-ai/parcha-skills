@@ -36,7 +36,7 @@ from .fusion import fusion_alphas_from_env, fusion_mode_from_env
 from .identity_cache import invalidate_tenant as invalidate_registration_cache
 from .projectors import KIND_RE, SOURCE_ID_RE, advisory_lock_key, canonical_json, effective_session_id, event_receipt, legacy_engine, partial_lexical_probes, phrase_query_spec, preferred_phrase_probes, project, redact_text, validate_envelope
 from .ranking import DEFAULT_SEARCH_DEADLINE_MS, evidence_rank_components, should_run_partial
-from .rerank import RerankRuntime
+from .rerank import RerankRuntime, rerank_min_budget_seconds_from_env
 from .semantic import SemanticRuntime
 
 MAX_SEARCH_RESULT_TEXT_CHARS = 4096
@@ -224,8 +224,10 @@ class BrainStore:
         self.semantic_runtime = semantic_runtime
         # H2-c: optional cross-encoder reranker. Built from RECALL_RERANK_* by
         # the app/cli entry points; None when RECALL_RERANK_PROTOCOL=off.
-        # Nothing consumes it until the search() integration lands.
+        # passage_retrieval.search() reranks the fused passage pool with it
+        # when at least rerank_min_budget_seconds of the deadline remain.
         self.rerank_runtime = rerank_runtime
+        self.rerank_min_budget_seconds = rerank_min_budget_seconds_from_env()
         # H2-b: arm fusion policy for passage search. Validated at startup so
         # a malformed RECALL_SEARCH_FUSION{,_ALPHAS} is a deployment error.
         self.fusion_mode = fusion_mode_from_env()

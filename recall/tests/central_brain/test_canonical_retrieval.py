@@ -2271,3 +2271,212 @@ class DensePoolShapeTests(unittest.TestCase):
         self.assertIn("FROM distinct_texts nearest", source)
         self.assertIn("set_config('hnsw.ef_search'", source)
         self.assertGreaterEqual(passage_retrieval.DENSE_EF_SEARCH, passage_retrieval.DENSE_NEAREST_LIMIT)
+
+
+class RerankWiringTests(unittest.TestCase):
+    """H2-c: the fused passage pool is reranked before the per-document collapse."""
+
+    class _FakeRerank:
+        max_candidates = 50
+        fingerprint = "fake-rerank-fingerprint"
+
+        def __init__(self, scores=None, *, error=None, sleep=0.0) -> None:
+            self.scores = scores or {}
+            self.error = error
+            self.sleep = sleep
+            self.calls: list[dict] = []
+
+        def rerank(self, query, documents, *, top_k=None, deadline_seconds=None):
+            from recall_server.rerank import RerankUnavailable
+
+            self.calls.append({
+                "query": query, "documents": list(documents), "deadline_seconds": deadline_seconds,
+            })
+            if self.sleep:
+                time.sleep(self.sleep)
+            if self.error:
+                raise RerankUnavailable(self.error)
+            scored = [(index, self.scores.get(doc, 0.0)) for index, doc in enumerate(documents)]
+            scored.sort(key=lambda item: (-item[1], item[0]))
+            return scored
+
+    class _Store(ActorRecordingStore):
+        search_deadline_ms = 20000
+        rerank_runtime = None
+        rerank_min_budget_seconds = 1.0
+
+    @staticmethod
+    def _rows(kind: str, pairs: list[tuple[str, float]]) -> list[dict]:
+        from tests.central_brain.test_passage_fusion import candidate
+
+        return [candidate(document, kind, score) for document, score in pairs]
+
+    def _retrieval(self, store):
+        retrieval = PassageHintRetrieval(
+            store,
+            tenant_id="tenant:test",
+            sources=["codex:linux:test"],
+            policy_fingerprint="fp-policy",
+        )
+        dense = self._rows("dense", [("a", 0.91), ("b", 0.88), ("c", 0.87), ("d", 0.80)])
+        lexical = self._rows("passage-lexical", [("c", 0.42), ("e", 0.40), ("a", 0.31)])
+        retrieval._dense_candidates = lambda query, **kwargs: (dense, "ok", "prose-pool", 10)
+        retrieval._lexical_candidates = lambda query, **kwargs: (lexical, "ok")
+        retrieval._sparse_candidates = lambda query, original_query=None, **kwargs: ([], "skipped-prose-query")
+        return retrieval
+
+    @staticmethod
+    def _order(results: list[dict]) -> list[str]:
+        return [row["logical_document_id"][5:].rstrip("0") for row in results]
+
+    def _search(self, retrieval, **kwargs):
+        return retrieval.search(
+            "why did the deploy fail", lexical_query="deploy fail", since=None, until=None,
+            **{"limit": 10, **kwargs},
+        )
+
+    def test_search_is_identical_when_rerank_runtime_is_disabled(self) -> None:
+        store = self._Store()
+        baseline = self._search(self._retrieval(store))
+        store.rerank_runtime = None
+        again = self._search(self._retrieval(store))
+        for response in (baseline, again):
+            response["diagnostics"].pop("elapsed_ms")
+            response["diagnostics"]["arm_elapsed_ms"] = {
+                key: 0.0 for key in response["diagnostics"]["arm_elapsed_ms"]
+            }
+        self.assertEqual(baseline, again)
+        self.assertEqual(baseline["diagnostics"]["rerank_status"], "skipped-disabled")
+        self.assertEqual(
+            set(baseline["diagnostics"]["arm_elapsed_ms"]),
+            {"dense", "passage_lexical", "sparse_exact"},
+        )
+        for key in ("rerank_elapsed_ms", "rerank_candidates", "rerank_model"):
+            self.assertNotIn(key, baseline["diagnostics"])
+        self.assertTrue(all("rerank_score" not in row for row in baseline["results"]))
+        self.assertEqual(self._order(baseline["results"]), ["c", "e", "a", "b", "d"])
+
+    def test_rerank_reorders_top_passages_before_collapse(self) -> None:
+        store = self._Store()
+        store.rerank_runtime = self._FakeRerank({"d": 0.99, "e": 0.9, "a": 0.5, "b": 0.2, "c": 0.1})
+        response = self._search(self._retrieval(store))
+        self.assertEqual(self._order(response["results"]), ["d", "e", "a", "b", "c"])
+        call = store.rerank_runtime.calls[0]
+        self.assertEqual(call["query"], "why did the deploy fail")
+        # One passage per document in fused order; raw text_redacted, not the
+        # bounded snippet. ``c`` and ``a`` reach the pool under a passage id
+        # (dense) and a receipt (lexical) with the same text: sent once.
+        self.assertEqual(call["documents"], ["c", "e", "a", "b", "d"])
+        self.assertGreater(call["deadline_seconds"], 1.0)
+        top = response["results"][0]
+        self.assertEqual(top["rerank_score"], 0.99)
+        self.assertEqual(top["matching_ranges"][0]["rerank_score"], 0.99)
+        self.assertIn("arm_scores", top)
+        self.assertNotIn("rerank", top["matching_ranges"][0]["text"])
+        diagnostics = response["diagnostics"]
+        self.assertEqual(diagnostics["rerank_status"], "ok")
+        self.assertEqual(diagnostics["rerank_candidates"], 5)
+        self.assertEqual(diagnostics["rerank_model"], "fake-rerank-fingerprint")
+
+    def test_rerank_scores_reorder_ranges_within_a_document(self) -> None:
+        from recall_server.passage_retrieval import apply_rerank_scores
+
+        results = [{
+            "logical_document_id": "ldoc_a",
+            "rank": 0.5,
+            "matching_ranges": [
+                {"kind": "dense", "passage_id": "p1", "score": 0.9, "receipts": ["r1"]},
+                {"kind": "passage-lexical", "passage_id": "p2", "score": 0.4, "receipts": ["r2"]},
+                {"kind": "sparse-exact", "receipts": ["r3"], "score": 0.3},
+            ],
+        }]
+        reranked = apply_rerank_scores(results, {"p2": 0.8, "p1": 0.1})
+        self.assertEqual(
+            [item.get("passage_id") or item["receipts"][0] for item in reranked[0]["matching_ranges"]],
+            ["p2", "p1", "r3"],
+        )
+        self.assertEqual(reranked[0]["rerank_score"], 0.8)
+        self.assertEqual(reranked[0]["rank"], 0.5)
+        self.assertNotIn("rerank_score", reranked[0]["matching_ranges"][2])
+
+    def test_rerank_skipped_when_remaining_budget_below_minimum(self) -> None:
+        store = self._Store()
+        store.rerank_runtime = self._FakeRerank({"d": 0.99})
+        retrieval = self._retrieval(store)
+        response = retrieval.search(
+            "why did the deploy fail", lexical_query="deploy fail", since=None, until=None,
+            limit=10, deadline_at=time.monotonic() + 0.5,
+        )
+        self.assertEqual(store.rerank_runtime.calls, [])
+        self.assertEqual(self._order(response["results"]), ["c", "e", "a", "b", "d"])
+        diagnostics = response["diagnostics"]
+        self.assertEqual(diagnostics["rerank_status"], "skipped-budget")
+        self.assertEqual(diagnostics["rerank_elapsed_ms"], 0.0)
+        self.assertEqual(diagnostics["rerank_candidates"], 0)
+        self.assertEqual(diagnostics["rerank_model"], "fake-rerank-fingerprint")
+        self.assertNotIn("rerank", diagnostics["arm_elapsed_ms"])
+        self.assertTrue(all("rerank_score" not in row for row in response["results"]))
+        # The threshold is the store's configured minimum budget.
+        store.rerank_min_budget_seconds = 0.1
+        response = retrieval.search(
+            "why did the deploy fail", lexical_query="deploy fail", since=None, until=None,
+            limit=10, deadline_at=time.monotonic() + 0.5,
+        )
+        self.assertEqual(response["diagnostics"]["rerank_status"], "ok")
+        self.assertEqual(len(store.rerank_runtime.calls), 1)
+
+    def test_rerank_failure_preserves_fused_results(self) -> None:
+        store = self._Store()
+        store.rerank_runtime = self._FakeRerank(error="rerank_transport_error")
+        response = self._search(self._retrieval(store))
+        store.rerank_runtime = None
+        fused = self._search(self._retrieval(store))
+        self.assertEqual(response["results"], fused["results"])
+        diagnostics = response["diagnostics"]
+        self.assertEqual(diagnostics["rerank_status"], "unavailable")
+        self.assertEqual(diagnostics["rerank_error"], "rerank_transport_error")
+        self.assertEqual(diagnostics["rerank_candidates"], 5)
+        self.assertIn("rerank", diagnostics["arm_elapsed_ms"])
+        self.assertFalse(diagnostics["deadline_exceeded"])
+        self.assertTrue(diagnostics["partial_results_preserved"])
+
+    def test_rerank_elapsed_reported_in_arm_elapsed_ms(self) -> None:
+        store = self._Store()
+        store.rerank_runtime = self._FakeRerank({"a": 1.0}, sleep=0.02)
+        response = self._search(self._retrieval(store))
+        diagnostics = response["diagnostics"]
+        self.assertEqual(diagnostics["rerank_status"], "ok")
+        self.assertGreaterEqual(diagnostics["rerank_elapsed_ms"], 20.0)
+        self.assertEqual(diagnostics["arm_elapsed_ms"]["rerank"], diagnostics["rerank_elapsed_ms"])
+        self.assertEqual(
+            set(diagnostics["arm_elapsed_ms"]),
+            {"dense", "passage_lexical", "sparse_exact", "rerank"},
+        )
+        self.assertGreaterEqual(diagnostics["elapsed_ms"], diagnostics["rerank_elapsed_ms"])
+
+    def test_rerank_pool_reaches_past_the_result_limit(self) -> None:
+        store = self._Store()
+        store.rerank_runtime = self._FakeRerank({"e": 1.0})
+        response = self._search(self._retrieval(store), limit=2)
+        # ``e`` is fused fifth; with limit=2 it is still in the reranked pool
+        # and wins, while the response is trimmed to the requested limit.
+        self.assertEqual(self._order(response["results"]), ["e", "c"])
+        self.assertEqual(response["diagnostics"]["rerank_candidates"], 5)
+
+    def test_rerank_candidate_selection_round_robins_documents(self) -> None:
+        from recall_server.passage_retrieval import select_rerank_candidates
+
+        results = [
+            {"matching_ranges": [{"passage_id": "a1"}, {"passage_id": "a2"}, {"passage_id": "a3"}]},
+            {"matching_ranges": [{"passage_id": "b1"}, {"receipts": ["b2"]}]},
+            {"matching_ranges": [{"passage_id": "c1"}]},
+        ]
+        self.assertEqual(
+            select_rerank_candidates(results, max_candidates=50),
+            [(0, "a1"), (1, "b1"), (2, "c1"), (0, "a2"), (1, "b2"), (0, "a3")],
+        )
+        self.assertEqual(
+            select_rerank_candidates(results, max_candidates=4),
+            [(0, "a1"), (1, "b1"), (2, "c1"), (0, "a2")],
+        )
+        self.assertEqual(select_rerank_candidates([], max_candidates=4), [])
