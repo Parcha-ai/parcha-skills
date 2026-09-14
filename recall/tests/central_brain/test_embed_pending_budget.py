@@ -12,6 +12,10 @@ class _Runtime:
     dimensions = 512
     model = "synthetic-model"
     passage_fingerprint = "synthetic-runtime"
+    # These tests exercise the budget plumbing only; pin the v1 contract so
+    # the H2-a header backfill (which needs catalog rows) stays out of the way.
+    passage_write_contract = "v1"
+    passage_write_fingerprint = "synthetic-runtime"
 
     def __init__(self) -> None:
         self.calls: list[int] = []
@@ -129,7 +133,7 @@ class EmbedPendingBudgetTests(unittest.TestCase):
     def test_without_a_budget_behaviour_is_unchanged(self):
         store = _Store(_queue(25))
         result = self._projector(store).embed_pending(batch_size=10, max_batches=10)
-        self.assertEqual(result, {"status": "complete", "processed": 25, "batches": 3})
+        self.assertEqual(result, {"status": "complete", "processed": 25, "batches": 3, "contract": "v1", "headers_backfilled": 0})
         self.assertEqual(store.semantic_runtime.calls, [10, 10, 5])
         self.assertEqual(store.connection.limits, [10, 10, 10, 10])  # last fetch is empty
 
@@ -157,7 +161,7 @@ class EmbedPendingBudgetTests(unittest.TestCase):
         result = self._projector(store).embed_pending(
             batch_size=10, max_batches=10, max_passages=1_000
         )
-        self.assertEqual(result, {"status": "complete", "processed": 7, "batches": 1})
+        self.assertEqual(result, {"status": "complete", "processed": 7, "batches": 1, "contract": "v1", "headers_backfilled": 0})
 
     def test_invalid_budget_is_rejected_before_any_lock(self):
         store = _Store(_queue(1))
