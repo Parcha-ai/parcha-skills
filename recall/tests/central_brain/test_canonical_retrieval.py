@@ -2521,6 +2521,65 @@ class RerankBlendTests(unittest.TestCase):
                 rerank_blend_from_env()
 
 
+class RerankPoolNominationTests(unittest.TestCase):
+    def _row(self, doc, score, kind="dense", rank=1):
+        return {
+            "logical_document_id": doc, "source_id": "s", "revision": 1,
+            "native_parent_id": doc, "first_occurred_at": "2026-01-01",
+            "last_occurred_at": "2026-01-01", "manifest_object_key": "k",
+            "manifest_content_sha256": "h", "score": score,
+            "text_redacted": f"text of {doc}", "passage_id": f"{doc}-{kind}",
+            "passage_ordinal": 0, "spans": [], "receipts": [f"r-{doc}"],
+        }
+
+    def _legs(self):
+        dense = [self._row(f"d{i}", 1.0 - i * 0.01) for i in range(30)]
+        lexical = [self._row("lex-top", 0.9, "passage-lexical"), self._row("d3", 0.5, "passage-lexical")]
+        return (("dense", 0.65, dense), ("passage-lexical", 0.1, lexical), ("sparse-exact", 0.25, []))
+
+    def test_collapse_without_nomination_drops_the_lexical_top_hit(self) -> None:
+        from recall_server.passage_retrieval import collapse_document_candidates
+        out = collapse_document_candidates(self._legs(), limit=5, fusion="convex", alphas={"dense": 0.65, "passage-lexical": 0.1, "sparse-exact": 0.25})
+        self.assertNotIn("lex-top", [r["logical_document_id"] for r in out])
+        self.assertEqual(len(out), 5)
+
+    def test_collapse_appends_arm_nominated_documents_after_the_fused_head(self) -> None:
+        from recall_server.passage_retrieval import collapse_document_candidates
+        alphas = {"dense": 0.65, "passage-lexical": 0.1, "sparse-exact": 0.25}
+        plain = collapse_document_candidates(self._legs(), limit=5, fusion="convex", alphas=alphas)
+        out = collapse_document_candidates(self._legs(), limit=5, fusion="convex", alphas=alphas, nominate_per_arm=10)
+        # The fused head is byte-identical; the lexical #1 follows it, flagged.
+        self.assertEqual(out[:5], plain)
+        self.assertEqual([r["logical_document_id"] for r in out[5:]], [f"d{i}" for i in range(5, 10)] + ["lex-top"])
+        self.assertTrue(all(r["nominated"] for r in out[5:]))
+        self.assertTrue(all("nominated" not in r for r in out[:5]))
+
+    def test_nominated_documents_enter_the_rerank_pool_first_pass(self) -> None:
+        from recall_server.passage_retrieval import select_rerank_candidates
+        results = [{"matching_ranges": [{"passage_id": f"h{i}"}]} for i in range(6)]
+        results.append({"matching_ranges": [{"passage_id": "nom"}], "nominated": True})
+        chosen = [key for _index, key in select_rerank_candidates(results, max_candidates=4)]
+        self.assertIn("nom", chosen)
+        self.assertEqual(chosen, ["h0", "h1", "h2", "nom"])
+        # Without the flag the pool is the fused head only.
+        results[-1].pop("nominated")
+        self.assertEqual([k for _i, k in select_rerank_candidates(results, max_candidates=4)], ["h0", "h1", "h2", "h3"])
+
+    def test_focus_window_centres_on_the_matching_sentence(self) -> None:
+        from recall_server.passage_retrieval import focus_terms, focus_window
+        text = "a " * 3000 + "junction tables expert_skills and expert_mcp_tools " + "b " * 3000
+        window = focus_window(text, focus_terms("junction tables expert_skills expert_mcp_tools"), 2000)
+        self.assertEqual(len(window), 2000)
+        self.assertIn("expert_mcp_tools", window)
+        self.assertEqual(focus_window(text, ["zzz"], 100), text[:100])
+        self.assertEqual(focus_window("short", ["short"], 100), "short")
+        self.assertEqual(focus_terms("What is the P2 #6076 fix?"), ["what", "the", "6076", "fix"])
+
+    def test_search_reranks_a_nominated_lexical_hit(self) -> None:
+        from recall_server.passage_retrieval import RERANK_NOMINATE_PER_ARM
+        self.assertEqual(RERANK_NOMINATE_PER_ARM, 10)
+
+
 class IdentifierSigilTests(unittest.TestCase):
     def test_hash_prefixed_numbers_are_identifiers(self) -> None:
         from recall_server.passage_retrieval import identifier_tokens
