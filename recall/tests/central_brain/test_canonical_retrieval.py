@@ -2573,11 +2573,14 @@ class RerankPoolNominationTests(unittest.TestCase):
         self.assertIn("expert_mcp_tools", window)
         self.assertEqual(focus_window(text, ["zzz"], 100), text[:100])
         self.assertEqual(focus_window("short", ["short"], 100), "short")
-        self.assertEqual(focus_terms("What is the P2 #6076 fix?"), ["what", "the", "6076", "fix"])
+        self.assertEqual(focus_terms("What is the P2 #6076 greptile fix?"), ["6076", "greptile"])
+        # The head wins unless the window covers clearly more terms.
+        head = "junction tables expert_skills " + "c " * 3000 + "expert_mcp_tools " + "d " * 3000
+        self.assertEqual(focus_window(head, focus_terms("junction tables expert_skills expert_mcp_tools"), 2000), head[:2000])
 
     def test_search_reranks_a_nominated_lexical_hit(self) -> None:
         from recall_server.passage_retrieval import RERANK_NOMINATE_PER_ARM
-        self.assertEqual(RERANK_NOMINATE_PER_ARM, 10)
+        self.assertEqual(RERANK_NOMINATE_PER_ARM, 5)
 
 
 class IdentifierSigilTests(unittest.TestCase):

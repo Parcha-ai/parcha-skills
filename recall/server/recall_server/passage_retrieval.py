@@ -408,7 +408,11 @@ def _range_key(item: dict[str, Any]) -> str | None:
 
 # Documents an arm ranked this high are sent to the reranker even when the
 # fused order (dominated by the dense alpha) placed them past the pool.
-RERANK_NOMINATE_PER_ARM = 10
+RERANK_NOMINATE_PER_ARM = 5
+# The query-densest window replaces the passage head only when it covers
+# this many more distinct query terms; the head carries the record's own
+# framing (role, first lines) that the cross-encoder also needs.
+FOCUS_WINDOW_MIN_GAIN = 2
 
 
 def arm_nominated(arm_scores: dict[str, Any], nominate_per_arm: int) -> bool:
@@ -421,18 +425,38 @@ def arm_nominated(arm_scores: dict[str, Any], nominate_per_arm: int) -> bool:
 
 
 def focus_terms(*queries: str) -> list[str]:
-    """Casefolded query words of three or more characters, first-seen order."""
+    """Casefolded query words of four or more characters, first-seen order.
+
+    Callers pass the informative-term query (stopwords already removed);
+    the length floor drops the function words a raw question would add,
+    so the window is chosen by content terms rather than "the"/"did".
+    """
 
     terms: list[str] = []
     seen: set[str] = set()
     for query in queries:
         for token in query.split():
             word = token.strip("\"'`()[]{},;:.!?#@$").casefold()
-            if len(word) < 3 or word in seen:
+            if len(word) < 4 or word in seen or word in FOCUS_STOPWORDS:
                 continue
             seen.add(word)
             terms.append(word)
     return terms
+
+
+FOCUS_STOPWORDS = frozenset({
+    "what", "when", "where", "which", "while", "with", "without", "were",
+    "that", "this", "these", "those", "there", "their", "they", "them",
+    "then", "than", "from", "into", "onto", "about", "around", "after",
+    "before", "during", "does", "did", "done", "have", "has", "had",
+    "will", "would", "should", "could", "still", "just", "also", "only",
+    "some", "such", "very", "more", "most", "much", "many", "each",
+    "every", "both", "over", "under", "again", "ever", "never", "being",
+    "been", "actually", "really", "turned", "ended", "make", "made",
+    "work", "worked", "working", "thing", "things", "issue", "issues",
+    "change", "changes", "changed", "problem", "problems", "cause",
+    "caused", "real", "root", "happen", "happened", "know", "like",
+})
 
 
 def focus_window(text: str, terms: list[str], width: int) -> str:
@@ -478,6 +502,9 @@ def focus_window(text: str, terms: list[str], width: int) -> str:
                 del counts[prior]
         if len(counts) > best_count:
             best_start, best_count = at, len(counts)
+    head_count = len({index for hit_at, index in hits if hit_at < width})
+    if best_count < head_count + FOCUS_WINDOW_MIN_GAIN:
+        return text[:width]
     # Back the window up a little so the first hit is not flush at the edge.
     best_start = max(0, min(best_start - width // 8, len(text) - width))
     return text[best_start:best_start + width]
@@ -1711,7 +1738,7 @@ class PassageHintRetrieval:
             return results, diagnostics
         # The provider reads at most ``max_doc_chars`` of each passage; send
         # the window that covers the most query terms rather than the prefix.
-        terms = focus_terms(lexical_query, query)
+        terms = focus_terms(lexical_query or query)
         width = int(getattr(runtime, "max_doc_chars", 0) or 0)
         texts: dict[str, str] = {}
         for _leg_name, _weight, rows in legs:
