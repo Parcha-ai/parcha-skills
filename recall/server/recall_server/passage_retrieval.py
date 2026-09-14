@@ -35,28 +35,6 @@ MAX_EXACT_DENSE_SCOPE_PASSAGES = 20_000
 # Forgotten passages are rare: rank first, then drop the few whose chunks are
 # gone from an oversampled top-K instead of probing canonical_chunks per hit.
 LIVENESS_OVERSAMPLE = 2
-# A strict (all terms) lexical match that yields fewer rows than this falls
-# back to an OR of the informative terms ranked by cover density. Natural
-# language questions almost never contain every one of their words in one
-# passage: on the validation set the strict arm returned 0 candidates for
-# every multi-clause question, leaving the dense arm alone.
-LEXICAL_RELAX_THRESHOLD = 5
-LEXICAL_RELAX_MAX_TERMS = 12
-_RELAX_TOKEN_RE = re.compile(r"[a-z0-9]+")
-
-
-def relaxed_tsquery_text(lexical_query: str) -> str:
-    """`term1 | term2 | ...` for to_tsquery('simple'); empty when < 2 terms."""
-
-    seen: list[str] = []
-    for token in _RELAX_TOKEN_RE.findall(lexical_query.lower()):
-        if len(token) < 2 or token in seen:
-            continue
-        seen.append(token)
-        if len(seen) >= LEXICAL_RELAX_MAX_TERMS:
-            break
-    return " | ".join(seen) if len(seen) >= 2 else ""
-
 # The sparse-exact arm reads the same canonical_passages GIN index as the
 # passage-lexical arm. A passage qualifies when it contains every
 # informative query term (the lexical arm's own predicate, which the GIN
@@ -558,29 +536,11 @@ class PassageHintRetrieval:
         try:
             with self.store.connect() as connection:
                 try:
-                    rows = self._lexical_query(
+                    return self._lexical_query(
                         connection, lexical_query, order="rank",
                         deadline_at=_phase_deadline(deadline_at, RANKED_PHASE_BUDGET_FRACTION),
                         **arguments,
-                    )
-                    if (
-                        len(rows) >= LEXICAL_RELAX_THRESHOLD
-                        or not relaxed_tsquery_text(lexical_query)
-                    ):
-                        return rows, "ok"
-                    try:
-                        relaxed_rows = self._lexical_query(
-                            connection, lexical_query, order="rank", relaxed=True,
-                            deadline_at=_phase_deadline(deadline_at, RANKED_PHASE_BUDGET_FRACTION),
-                            **arguments,
-                        )
-                    except SearchDeadlineExceeded:
-                        return rows, "ok"
-                    seen = {row.get("passage_id") for row in rows}
-                    merged = rows + [
-                        row for row in relaxed_rows if row.get("passage_id") not in seen
-                    ]
-                    return merged, "ok-relaxed"
+                    ), "ok"
                 except SearchDeadlineExceeded:
                     pass
                 try:
@@ -605,7 +565,6 @@ class PassageHintRetrieval:
         actor_ids: list[str] | None,
         actor_relations: list[str] | None,
         deadline_at: float,
-        relaxed: bool = False,
     ) -> list[dict[str, Any]]:
         """One bounded lexical scan.
 
@@ -618,23 +577,15 @@ class PassageHintRetrieval:
         # Fusion consumes rank position, not score magnitude. Recency order is
         # therefore a complete ranking on its own and never reads the TOASTed
         # search_vector; the score column is reported for the rank mode only.
-        if relaxed:
-            match_fn = "to_tsquery('simple',%s)"
-            match_value = relaxed_tsquery_text(lexical_query)
-            if not match_value:
-                raise ValueError("relaxed lexical query needs at least two terms")
-        else:
-            match_fn = "plainto_tsquery('simple',%s)"
-            match_value = lexical_query
         if order == "rank":
             pool_order = (
-                f"ts_rank_cd(passage.search_vector,{match_fn},32) DESC,"
+                "ts_rank_cd(passage.search_vector,plainto_tsquery('simple',%s),32) DESC,"
                 "passage.last_occurred_at DESC,passage.passage_id"
             )
             pool_limit = candidate_limit * LIVENESS_OVERSAMPLE
-            order_values: tuple[str, ...] = (match_value,)
-            score_sql = f"ts_rank_cd(top.search_vector,{match_fn},32)"
-            score_values: tuple[str, ...] = (match_value,)
+            order_values: tuple[str, ...] = (lexical_query,)
+            score_sql = "ts_rank_cd(top.search_vector,plainto_tsquery('simple',%s),32)"
+            score_values: tuple[str, ...] = (lexical_query,)
         elif order == "recent":
             pool_order = "passage.last_occurred_at DESC,passage.passage_id"
             pool_limit = candidate_limit * LIVENESS_OVERSAMPLE
@@ -678,7 +629,7 @@ class PassageHintRetrieval:
                               )
                           )
                           AND passage.search_vector @@
-                              {match_fn}
+                              plainto_tsquery('simple',%s)
                           AND (%s::timestamptz IS NULL
                                OR passage.last_occurred_at>=%s)
                           AND (%s::timestamptz IS NULL
@@ -731,7 +682,7 @@ class PassageHintRetrieval:
                         actor_ids,
                         actor_relations,
                         actor_relations,
-                        match_value,
+                        lexical_query,
                         since,
                         since,
                         until,
