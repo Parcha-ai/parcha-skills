@@ -30,6 +30,15 @@ MAX_CANONICAL_TOMBSTONE_BATCH_EVENTS = 10
 DEFAULT_MAX_SCAN_RECORDS = 1_000
 DEFAULT_MAX_SCAN_SECONDS = 20.0
 OVERSIZED_PROJECTION_TEXT_CHARS = 250_000
+# T12: a harness stuck in a loop writes the same message thousands of times
+# with fresh uuids and timestamps (one session produced 1.5M records, 55k of
+# them distinct). Identical content is queued at most this many times per
+# transcript file; later copies are counted in the spool, never shipped.
+MAX_IDENTICAL_RECORDS_PER_FILE = 3
+# Per-line identity that the harness rewrites on every replay of the same
+# content. Everything else in the record participates in the repeat key.
+VOLATILE_RECORD_KEYS = frozenset({"uuid", "parentUuid", "timestamp", "requestId"})
+VOLATILE_MESSAGE_KEYS = frozenset({"id", "usage"})
 SENSITIVE_KEY = re.compile(r"(?:litellm.*master.*key|api[_-]?key|password|secret|authorization|bearer|access[_-]?token|refresh[_-]?token|token)$", re.I)
 SENSITIVE_LINE = re.compile(
     r"(?i)\b(LITELLM_MASTER_KEY|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|password|secret|authorization|bearer|access[_-]?token|refresh[_-]?token|token|key)"
@@ -72,6 +81,21 @@ def fingerprint(path: Path, size: int | None = None) -> str:
         source.seek(max(0, size - 4096))
         last = source.read(min(4096, size))
     return hashlib.sha256(first + last + str(size).encode()).hexdigest()
+
+
+def record_repeat_key(content: dict[str, Any]) -> str:
+    """Content hash of a transcript record minus per-line identity fields."""
+    stripped = {
+        key: value for key, value in content.items()
+        if key not in VOLATILE_RECORD_KEYS
+    }
+    message = stripped.get("message")
+    if isinstance(message, dict):
+        stripped["message"] = {
+            key: value for key, value in message.items()
+            if key not in VOLATILE_MESSAGE_KEYS
+        }
+    return hashlib.sha256(canonical_json(stripped)).hexdigest()
 
 
 def iso_now() -> str:
@@ -223,6 +247,10 @@ class Collector:
           error_code TEXT NOT NULL, error_summary TEXT NOT NULL, created_at REAL NOT NULL,
           UNIQUE(path,byte_offset,error_code));
         CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS record_repeats(
+          path TEXT NOT NULL, repeat_key TEXT NOT NULL,
+          seen INTEGER NOT NULL, collapsed INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY(path,repeat_key));
         """)
         columns = {row["name"] for row in self.db.execute("PRAGMA table_info(outbox)")}
         if "start_offset" not in columns:
@@ -1024,6 +1052,7 @@ class Collector:
         summary = {
             "files_seen": 0,
             "records_queued": 0,
+            "records_collapsed": 0,
             "restored_records_queued": 0,
             "tombstones_queued": 0,
             "parse_errors": 0,
@@ -1092,6 +1121,7 @@ class Collector:
                     file_scan_id = scan_id
                     if mode != "append":
                         self.db.execute("DELETE FROM scan_members WHERE path=?", (path_text,))
+                        self.db.execute("DELETE FROM record_repeats WHERE path=?", (path_text,))
                     if restoring_tombstone:
                         self.db.execute(
                             "UPDATE files SET committed_offset=0 WHERE path=?",
@@ -1103,6 +1133,28 @@ class Collector:
                 seen_native: set[str] = set(old_active) if append else {item["native_id"] for item in self.db.execute("SELECT native_id FROM scan_members WHERE path=?", (path_text,))}
                 complete_end = start_offset
                 complete_records = 0
+                repeats: dict[str, list[int]] = {
+                    item["repeat_key"]: [item["seen"], item["collapsed"]]
+                    for item in self.db.execute(
+                        "SELECT repeat_key,seen,collapsed FROM record_repeats WHERE path=?",
+                        (path_text,),
+                    )
+                }
+                dirty_repeats: set[str] = set()
+
+                def save_repeats() -> None:
+                    if not dirty_repeats:
+                        return
+                    self.db.executemany(
+                        "INSERT INTO record_repeats(path,repeat_key,seen,collapsed) VALUES (?,?,?,?) "
+                        "ON CONFLICT(path,repeat_key) DO UPDATE SET seen=excluded.seen,collapsed=excluded.collapsed",
+                        [
+                            (path_text, key, repeats[key][0], repeats[key][1])
+                            for key in dirty_repeats
+                        ],
+                    )
+                    dirty_repeats.clear()
+
                 pending: list[tuple[
                     str, dict[str, Any], str, int, int,
                     Future[dict[str, Any] | None] | None,
@@ -1214,6 +1266,17 @@ class Collector:
                             )
                             continue
                         occurred_at = normalized_timestamp(content.get("timestamp"), stat.st_mtime)
+                        repeat_key = record_repeat_key(content)
+                        counts = repeats.setdefault(repeat_key, [0, 0])
+                        counts[0] += 1
+                        dirty_repeats.add(repeat_key)
+                        if counts[0] > MAX_IDENTICAL_RECORDS_PER_FILE:
+                            counts[1] += 1
+                            summary["records_collapsed"] += 1
+                            seen_native.add(native_id)
+                            if not append:
+                                self.db.execute("INSERT OR IGNORE INTO scan_members(path,native_id) VALUES (?,?)", (path_text, native_id))
+                            continue
                         privacy = self.privacy.apply(content)
                         privacy_receipts.append(privacy.receipt())
                         if privacy.action == "drop":
@@ -1267,6 +1330,7 @@ class Collector:
                             else:
                                 while pending:
                                     commit_pending()
+                            save_repeats()
                             self._save_file_progress(path_text, stat, current_fingerprint, complete_end, "scanning-" + mode, file_scan_id)
                             self.db.commit()
                             if (
@@ -1279,6 +1343,7 @@ class Collector:
                 else:
                     while pending:
                         commit_pending()
+                save_repeats()
                 if bounded and complete_end < stat.st_size:
                     self._save_file_progress(
                         path_text,
@@ -1788,6 +1853,7 @@ class Collector:
             "ledger_files": len(ledger),
             "coverage_percent": 100.0 if not disk else 100.0 * len(disk & ledger) / len(disk),
             "records": total_lines,
+            "collapsed_records": self.db.execute("SELECT COALESCE(sum(collapsed),0) AS n FROM record_repeats").fetchone()["n"],
             "parse_errors": parse_errors,
             "parse_error_percent": 100.0 * parse_errors / max(1, total_lines + parse_errors),
             "pending": self.db.execute("SELECT count(*) AS n FROM outbox WHERE state='pending'").fetchone()["n"],

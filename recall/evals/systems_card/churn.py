@@ -25,6 +25,11 @@ GAUGES = {
     "passages_written_24h": "recall_passages_written_24h",
     "documents_projected_24h": "recall_passage_documents_projected_24h",
 }
+# T12 gauges; a server that predates them leaves the ratio unmeasured.
+OPTIONAL_GAUGES = {
+    "passage_duplicate_rows": "recall_passage_duplicate_rows",
+    "records_per_document_p99": "recall_document_records_p99",
+}
 PROCESS_TOTALS = {
     "passages_written_total": "recall_projection_passages_written_total",
     "documents_projected_total": "recall_projection_documents_projected_total",
@@ -36,6 +41,9 @@ PROCESS_TOTALS = {
 # gate states the target, so it fails on that baseline by design.
 MAX_PASSAGES_WRITTEN_24H = 20_000.0
 MAX_EMBEDDING_LAG_RATIO = 0.02
+# T12 baseline 2026-09-14: 102,203 rows in 12,845 repeated-text groups on one
+# tenant, mostly replayed subagent transcripts and one runaway session.
+MAX_PASSAGE_DUPLICATE_RATIO = 0.10
 
 
 def _metrics_get(url: str, headers: dict[str, str], timeout: float) -> tuple[int, bytes]:
@@ -107,6 +115,9 @@ class ProjectionChurnProbe:
         for key, name in PROCESS_TOTALS.items():
             if name in samples:
                 metrics[key] = int(samples[name])
+        for key, name in OPTIONAL_GAUGES.items():
+            if name in samples:
+                metrics[key] = int(samples[name])
         unembedded = metrics["passages_unembedded"]
         total = metrics["passages_total"]
         lag_ratio: float | None = None
@@ -115,11 +126,19 @@ class ProjectionChurnProbe:
         elif unembedded == -1:
             result.notes.append("semantic runtime not configured on the server; embedding lag unknown")
         metrics["embedding_lag_ratio"] = lag_ratio
+        duplicate_rows = metrics.get("passage_duplicate_rows")
+        duplicate_ratio: float | None = None
+        if isinstance(duplicate_rows, int) and isinstance(total, int) and total > 0:
+            duplicate_ratio = round(duplicate_rows / total, 4)
+        elif duplicate_rows is None:
+            result.notes.append("server predates the T12 duplicate gauges; passage duplicate ratio unknown")
+        metrics["passage_duplicate_ratio"] = duplicate_ratio
         result.metrics = metrics
         result.samples = len(samples)
         result.gates = [
             Gate("passages_written_24h", "<=", MAX_PASSAGES_WRITTEN_24H, note="baseline ~150k/day; target after H0 rewrite").evaluate(float(metrics["passages_written_24h"])),
             Gate("embedding_lag_ratio", "<=", MAX_EMBEDDING_LAG_RATIO, note="unembedded / total passages").evaluate(lag_ratio),
+            Gate("passage_duplicate_ratio", "<=", MAX_PASSAGE_DUPLICATE_RATIO, note="repeated-text passage rows / total passages (T12)").evaluate(duplicate_ratio),
         ]
         if any(g.passed is False for g in result.gates):
             result.status = "degraded"

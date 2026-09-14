@@ -60,6 +60,17 @@ worker and cannot deadlock its projection rows. A bounded backfill scanner may u
 workers instead of serially between source files. The steady-state watcher retains the safer
 default and remains a single worker.
 
+A harness stuck in a loop can rewrite the same exchange for days with fresh
+`uuid`/`timestamp` fields (one session produced 1.5M lines, 55k of them distinct).
+The scanner hashes each record minus those per-line identity fields and queues
+identical content at most three times per transcript file
+(`MAX_IDENTICAL_RECORDS_PER_FILE`). Later copies are counted, never shipped:
+`scan` reports `records_collapsed` and `doctor` reports `collapsed_records`. Counts
+persist per file in the spool, continue across append scans and bounded resumes,
+and reset when a file is rewritten. The trade-off is that the Brain keeps the first
+three timestamps of a replayed record, not every one; the raw transcript on disk
+still holds them all.
+
 Structured values whose keys name credentials—including `LITELLM_MASTER_KEY`—are replaced before
 spooling. Non-JSONL files and paths outside the configured root are never discovered.
 

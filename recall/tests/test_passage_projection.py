@@ -217,6 +217,46 @@ class PassageProjectionTests(unittest.TestCase):
             passage_actor_table,
         )
 
+    def test_collector_collapse_bounds_passages_for_a_replayed_session(
+        self,
+    ) -> None:
+        """T12 before/after: the passages a runaway session projects to."""
+
+        def exchange(index: int) -> tuple[PassageMessage, PassageMessage]:
+            return (
+                PassageMessage(
+                    record_ordinal=2 * index,
+                    occurred_at=f"2026-07-03T15:{index % 60:02d}:00Z",
+                    roles=("user",),
+                    receipts=(f"recall://source:test/u{index}?rev=1#item=0",),
+                    text="please continue",
+                ),
+                PassageMessage(
+                    record_ordinal=2 * index + 1,
+                    occurred_at=f"2026-07-03T15:{index % 60:02d}:01Z",
+                    roles=("assistant",),
+                    receipts=(f"recall://source:test/a{index}?rev=1#item=0",),
+                    text="I am unable to proceed.",
+                ),
+            )
+
+        def build(messages: tuple[PassageMessage, ...]) -> int:
+            return len(build_passages(
+                tenant_id="tenant:company:test",
+                source_id="source:test",
+                logical_document_id="ldoc_0123456789abcdef0123456789abcdef",
+                revision=1,
+                messages=messages,
+                policy=PassagePolicy(target_tokens=32, overlap_tokens=4),
+            ))
+
+        # What the collector shipped before T12: 400 replays of one exchange.
+        before = build(tuple(m for i in range(400) for m in exchange(i)))
+        # After: three copies per distinct record (MAX_IDENTICAL_RECORDS_PER_FILE).
+        after = build(tuple(m for i in range(3) for m in exchange(i)))
+        self.assertGreaterEqual(before, 100)
+        self.assertEqual(after, 1)
+
     def test_builds_lossless_overlapping_passages_without_crossing_documents(
         self,
     ) -> None:
