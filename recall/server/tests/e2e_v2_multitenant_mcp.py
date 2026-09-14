@@ -752,9 +752,13 @@ def main() -> None:
                 "lossless-passages-v1"
             )
             assert conversational["diagnostics"]["dense_candidates"] >= 1
-            assert conversational["diagnostics"][
-                "passage_lexical_candidates"
-            ] == 0
+            # A conversational query no longer has to match every term in one
+            # passage: the lexical arm relaxes to an OR of its informative terms
+            # when the strict match is empty (fusion weights keep it a hint).
+            assert conversational["diagnostics"]["passage_lexical_status"] in (
+                "ok",
+                "ok-relaxed",
+            )
 
             unrelated = rpc(
                 server,
@@ -776,11 +780,14 @@ def main() -> None:
                 "recall_search",
                 {"query": "shared launch marker semantic unavailable"},
             )["result"]["structuredContent"]
-            assert degraded["results"] == []
+            # Without the embedding provider the search degrades to the text
+            # arms instead of going dark: the relaxed lexical fallback may
+            # still surface hints for the query's informative terms.
             assert degraded["diagnostics"]["dense_status"] == "unavailable"
-            assert degraded["diagnostics"][
-                "passage_lexical_candidates"
-            ] == 0
+            assert degraded["diagnostics"]["passage_lexical_status"] in (
+                "ok",
+                "ok-relaxed",
+            )
             assert degraded["diagnostics"]["sparse_candidates"] == 0
 
             family_routed = rpc(
