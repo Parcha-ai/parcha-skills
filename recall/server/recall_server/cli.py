@@ -62,6 +62,7 @@ from .mcp_conformance import (
     run_conformance,
 )
 from .rerank import build_rerank_runtime
+from .search_outbox import search_outbox_pending, seed_search_outbox
 from .semantic import SemanticRuntime
 
 
@@ -1728,6 +1729,9 @@ def main() -> None:
     parquet_backfill.add_argument("--source")
     parquet_backfill.add_argument("--batch-size", type=int, default=4)
     parquet_backfill.add_argument("--max-batches", type=int, default=10)
+    search_outbox_seed = sub.add_parser("search-outbox-seed")
+    search_outbox_seed.add_argument("--tenant", required=True)
+    search_outbox_seed.add_argument("--source")
     projection_worker = sub.add_parser("projection-worker")
     projection_worker.add_argument("--tenant", required=True)
     projection_worker.add_argument("--target-tokens", type=int, default=1024)
@@ -2384,6 +2388,18 @@ def main() -> None:
                 sort_keys=True,
             )
         )
+    elif args.command == "search-outbox-seed":
+        # H3-a: one 'backfill' row per existing parquet shard month, read
+        # from the shard catalog only; a repeat run touches nothing.
+        with store.connect() as connection:
+            with connection.transaction():
+                seeded = seed_search_outbox(
+                    connection,
+                    tenant_id=args.tenant,
+                    source_id=args.source,
+                )
+            pending = search_outbox_pending(connection, tenant_id=args.tenant)
+        print(json.dumps({"seeded": seeded, "pending": pending}, sort_keys=True))
     elif args.command == "projection-worker":
         logical = CanonicalLogicalEvidenceProjector(
             store,

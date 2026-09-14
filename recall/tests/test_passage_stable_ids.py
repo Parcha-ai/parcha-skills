@@ -305,6 +305,15 @@ def candidate_for(revision: int) -> PassageCandidate:
     )
 
 
+def times(passage) -> dict[str, str]:
+    """The time columns the commit's FOR UPDATE read returns (H3-a reads them)."""
+
+    return {
+        "first_occurred_at": passage.first_occurred_at,
+        "last_occurred_at": passage.last_occurred_at,
+    }
+
+
 def prepared_for(passages, revision: int) -> PreparedPassageDocument:
     return PreparedPassageDocument(
         candidate=candidate_for(revision),
@@ -349,7 +358,7 @@ class DifferentialCommitTests(unittest.TestCase):
         before = build(3, revision=1)
         after = build(6, revision=2)
         existing = [
-            {"passage_id": p.passage_id, "ordinal": p.ordinal, "revision": 1}
+            {"passage_id": p.passage_id, "ordinal": p.ordinal, "revision": 1, **times(p)}
             for p in before
         ]
         connection = FakeConnection(candidate=candidate_for(2), existing=existing)
@@ -389,9 +398,13 @@ class DifferentialCommitTests(unittest.TestCase):
         # Stored ordinals are rotated by one (every retained row moves) and a
         # stale row sits on ordinal 0, which retained row 3 must take over.
         existing = [
-            {"passage_id": p.passage_id, "ordinal": p.ordinal + 1, "revision": 2}
+            {"passage_id": p.passage_id, "ordinal": p.ordinal + 1, "revision": 2, **times(p)}
             for p in passages[:-1]
-        ] + [{"passage_id": "psg_" + "f" * 32, "ordinal": 0, "revision": 2}]
+        ] + [{
+            "passage_id": "psg_" + "f" * 32, "ordinal": 0, "revision": 2,
+            "first_occurred_at": "2026-09-01T00:00:00Z",
+            "last_occurred_at": "2026-09-01T00:00:00Z",
+        }]
         connection = FakeConnection(candidate=candidate_for(3), existing=existing)
 
         result = self.projector(connection)._commit(prepared_for(passages, 3))
@@ -427,7 +440,7 @@ class DifferentialCommitTests(unittest.TestCase):
     def test_unchanged_document_touches_nothing_but_the_pointer(self) -> None:
         passages = build(4, revision=2)
         existing = [
-            {"passage_id": p.passage_id, "ordinal": p.ordinal, "revision": 2}
+            {"passage_id": p.passage_id, "ordinal": p.ordinal, "revision": 2, **times(p)}
             for p in passages
         ]
         connection = FakeConnection(candidate=candidate_for(2), existing=existing)

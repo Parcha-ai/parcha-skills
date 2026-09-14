@@ -114,8 +114,27 @@ Gaps in `shard_index` are normal.
   [--source S]` queues every month of the scope with the `*` sentinel; a content-identical
   month is a no-op (`mode=reuse`) and keeps its objects.
 
+### Search projection outbox (H3-a)
+
+`search_projection_outbox` is the queue for the Lance-on-S3 search plane (H3-b), separate
+from the parquet queue so the two cadences never couple. Every passage-plane write leaves
+its rows in the same transaction: the differential passage commit queues the months of
+the passages it inserted or deleted (`logical-update`) and tombstones the deleted ids in
+`search_projection_tombstones`; forget tombstones every passage of the forgotten group
+and queues its months (`forget`); a header fill queues the months whose header actually
+changed (`header-change`). `generation` increments on every re-enqueue, `backfill` is
+sticky, `first_queued_at` never moves. `search_projection_shards` is the catalog the
+Lance writer fills; it stays empty until H3-b ships.
+
+- **Seed**: `python -m recall_server.cli search-outbox-seed --tenant T [--source S]`
+  queues one `backfill` row per existing parquet shard month. Idempotent: a repeat run
+  prints `{"pending": N, "seeded": 0}`. Run it once per tenant when the Lance writer is
+  deployed; nothing drains the outbox before then.
+- **Cycle log**: `search_outbox_pending` on the `projection-worker` line is the number of
+  queued source-months for the tenant.
+
 The production database gate requires a standard PostgreSQL URL with
-`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 65,
+`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 66,
 pgvector 0.8.0 or newer, and a runtime role without superuser, database/role creation,
 replication, or RLS-bypass privilege:
 

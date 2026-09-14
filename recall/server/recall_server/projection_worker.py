@@ -17,6 +17,7 @@ from .embedding_ledger import (
     window_total,
 )
 from .logical_evidence_projection import CanonicalLogicalEvidenceProjector
+from .search_outbox import search_outbox_pending
 from .passage_index import CanonicalPassageProjector
 from .parquet_scan import CanonicalParquetScanProjector
 
@@ -238,6 +239,15 @@ def run_projection_worker(
                 }
             )
             thin_elapsed_ms = elapsed_ms(phase_started)
+            # H3-a: source-months waiting for the Lance writer, one cheap
+            # count per cycle (a projector double without a store reports 0).
+            search_outbox_queued = 0
+            store = getattr(passages, "store", None)
+            if store is not None:
+                with store.connect() as connection:
+                    search_outbox_queued = search_outbox_pending(
+                        connection, tenant_id=tenant_id or None,
+                    )
             result: dict[str, int | str] = {
                 "status": (
                     "complete"
@@ -297,6 +307,7 @@ def run_projection_worker(
             "logical_backoff": int(documents.get("backoff", 0)),
             "logical_quarantined": int(documents.get("quarantined", 0)),
                 "old_objects_deleted": int(documents.get("old_objects_deleted", 0)),
+                "search_outbox_pending": search_outbox_queued,
                 "cycle_elapsed_ms": elapsed_ms(cycle_started),
                 "embed_elapsed_ms": embed_elapsed_ms,
                 "passage_elapsed_ms": passage_elapsed_ms,
@@ -325,7 +336,7 @@ def run_projection_worker(
                 "cleanup_failures=%s "
                 "logical_cleanup_completed=%s logical_cleanup_pending=%s "
             "logical_failed=%s logical_backoff=%s logical_quarantined=%s "
-                "old_objects_deleted=%s "
+                "old_objects_deleted=%s search_outbox_pending=%s "
                 "cycle_elapsed_ms=%s embed_elapsed_ms=%s passage_elapsed_ms=%s "
                 "logical_elapsed_ms=%s parquet_elapsed_ms=%s thin_elapsed_ms=%s",
                 *(
@@ -368,6 +379,7 @@ def run_projection_worker(
                         "logical_backoff",
                         "logical_quarantined",
                         "old_objects_deleted",
+                        "search_outbox_pending",
                         *PHASE_ELAPSED_KEYS,
                     )
                 ),

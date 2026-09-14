@@ -28,6 +28,11 @@ from .passage_projection import (
     visible_messages,
 )
 from .passage_representations import ActorContext, DocumentContext
+from .search_outbox import (
+    enqueue_search_outbox,
+    outbox_months,
+    write_search_tombstones,
+)
 
 MAX_PASSAGE_PROJECTION_BATCH = 1_000
 MAX_PASSAGE_EMBEDDING_BATCH = 5_000
@@ -965,6 +970,7 @@ class CanonicalPassageProjector:
                             row["passage_id"]: context
                             for row in retained_unheaded
                         },
+                        enqueue=False,
                     )
                 if diff.to_insert:
                     with connection.cursor() as cursor:
@@ -1097,6 +1103,36 @@ class CanonicalPassageProjector:
                         candidate.logical_document_id,
                     ),
                 )
+                # H3-a: the search outbox sees only what this commit changed.
+                # Deleted rows become tombstones; every month an inserted or
+                # deleted passage touched is queued for the Lance writer.
+                deleted_ids = set(diff.to_delete)
+                deleted_rows = [
+                    row for row in existing if row["passage_id"] in deleted_ids
+                ]
+                if deleted_rows:
+                    write_search_tombstones(
+                        connection,
+                        tenant_id=candidate.tenant_id,
+                        source_id=candidate.source_id,
+                        passages=deleted_rows,
+                    )
+                enqueue_search_outbox(
+                    connection,
+                    tenant_id=candidate.tenant_id,
+                    source_id=candidate.source_id,
+                    months=outbox_months(
+                        [
+                            (passage.first_occurred_at, passage.last_occurred_at)
+                            for passage in diff.to_insert
+                        ]
+                        + [
+                            (row["first_occurred_at"], row["last_occurred_at"])
+                            for row in (*deleted_rows, *retained_unheaded)
+                        ]
+                    ),
+                    reason="logical-update",
+                )
         return {"status": "committed", **diff.counters}
 
     @staticmethod
@@ -1107,11 +1143,16 @@ class CanonicalPassageProjector:
         source_id: str,
         rows: list[dict[str, Any]],
         contexts: dict[str, DocumentContext],
+        enqueue: bool = True,
     ) -> int:
         """Fill header_redacted/embed_sha256 on rows that still lack them.
 
         Only NULL headers are written: an existing header is never rewritten
-        here, so a retained passage keeps its embedding reuse key.
+        here, so a retained passage keeps its embedding reuse key. With
+        ``enqueue`` (H3-a) the months of the rows whose header actually
+        changed are queued in the search outbox as ``header-change``; the
+        differential commit passes ``False`` because it queues those months
+        as ``logical-update`` itself.
         """
 
         if not rows:
@@ -1139,10 +1180,23 @@ class CanonicalPassageProjector:
                       AS headed(passage_id,header_redacted)
                 WHERE passage.tenant_id=%s AND passage.source_id=%s
                   AND passage.passage_id=headed.passage_id
-                  AND passage.header_redacted IS NULL""",
+                  AND passage.header_redacted IS NULL
+            RETURNING passage.first_occurred_at,passage.last_occurred_at""",
             (PASSAGE_EMBEDDING_SEPARATOR, ids, rendered, tenant_id, source_id),
         )
-        return max(0, result.rowcount)
+        changed = result.fetchall()
+        if enqueue and changed:
+            enqueue_search_outbox(
+                connection,
+                tenant_id=tenant_id,
+                source_id=source_id,
+                months=outbox_months(
+                    (row["first_occurred_at"], row["last_occurred_at"])
+                    for row in changed
+                ),
+                reason="header-change",
+            )
+        return len(changed)
 
     def backfill_headers(
         self,

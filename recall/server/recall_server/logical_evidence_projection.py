@@ -23,6 +23,7 @@ from .logical_evidence import (
     logical_document_id,
 )
 from .projectors import SOURCE_ID_RE
+from .search_outbox import record_passage_deletions
 
 OVERSIZED_MEDIA_TYPE = "application/vnd.recall.oversized-record+gzip"
 MAX_RESTORED_RECORD_BYTES = 256 * 1024 * 1024
@@ -2087,6 +2088,30 @@ class CanonicalLogicalEvidenceProjector:
                     reason="forget",
                 )
                 self._enqueue_cleanup(connection, tuple(references))
+                # H3-a: the passages about to cascade away with their evidence
+                # documents become search tombstones, and every month they
+                # spanned is queued for the Lance writer as ``forget``.
+                doomed_passages = connection.execute(
+                    """SELECT passage.passage_id,passage.first_occurred_at,
+                              passage.last_occurred_at
+                         FROM canonical_passages passage
+                         JOIN canonical_evidence_documents document
+                           USING(tenant_id,source_id,logical_document_id)
+                        WHERE document.tenant_id=%s AND document.source_id=%s
+                          AND document.native_parent_id=ANY(%s)""",
+                    (
+                        tenant_id,
+                        source_id,
+                        [row["native_parent_id"] for row in parents],
+                    ),
+                ).fetchall()
+                record_passage_deletions(
+                    connection,
+                    tenant_id=tenant_id,
+                    source_id=source_id,
+                    passages=doomed_passages,
+                    reason="forget",
+                )
                 connection.execute(
                     """DELETE FROM canonical_evidence_documents
                         WHERE tenant_id=%s AND source_id=%s
