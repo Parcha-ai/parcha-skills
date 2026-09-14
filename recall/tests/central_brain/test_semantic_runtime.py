@@ -22,6 +22,10 @@ from recall_server.semantic import (  # noqa: E402
     DEFAULT_EMBEDDING_REVISION,
     DOCUMENT_CLIP_MARKER,
     MAX_DOCUMENT_CHARS,
+    PASSAGE_CONTRACT_COVERAGE_THRESHOLD,
+    PASSAGE_EMBEDDING_CONTRACT,
+    PASSAGE_EMBEDDING_CONTRACT_V2,
+    PASSAGE_HEADER_CONTRACT,
     QUERY_INSTRUCTION,
     SearchPlan,
     SemanticRuntime,
@@ -247,6 +251,98 @@ class SemanticRuntimeContractTest(unittest.TestCase):
 
             self.assertEqual(post.call_args.args[1]["input"], [passage])
             self.assertNotEqual(runtime.passage_fingerprint, runtime.fingerprint)
+
+    def test_passage_fingerprint_includes_header_contract(self) -> None:
+        runtime = self.runtime()
+
+        self.assertEqual(PASSAGE_EMBEDDING_CONTRACT, PASSAGE_EMBEDDING_CONTRACT_V2)
+        self.assertNotEqual(runtime.passage_fingerprint_v1, runtime.passage_fingerprint_v2)
+        self.assertNotEqual(runtime.passage_fingerprint_v2, runtime.fingerprint)
+        before_v1 = runtime.passage_fingerprint_v1
+        before_v2 = runtime.passage_fingerprint_v2
+        with mock.patch(
+            "recall_server.semantic.PASSAGE_HEADER_CONTRACT",
+            PASSAGE_HEADER_CONTRACT + ":changed",
+        ):
+            # A header template change is a new v2 vector space; v1 is
+            # untouched.
+            self.assertNotEqual(runtime.passage_fingerprint_v2, before_v2)
+            self.assertEqual(runtime.passage_fingerprint_v1, before_v1)
+        with self.assertRaises(ValueError):
+            runtime.passage_fingerprint_for("v3")
+        with self.assertRaisesRegex(ValueError, "v1, v2, or auto"):
+            SemanticRuntime(
+                embedding_url="http://127.0.0.1:8081",
+                model="synthetic-embedding",
+                revision=DEFAULT_EMBEDDING_REVISION,
+                dimensions=512,
+                passage_contract_mode="none",
+            )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "RECALL_EMBEDDING_URL": "http://127.0.0.1:8081",
+                "RECALL_PASSAGE_EMBEDDING_CONTRACT": "V1 ",
+            },
+        ):
+            self.assertEqual(SemanticRuntime.from_env().passage_contract_mode, "v1")
+
+    def test_passage_read_contract_flips_on_coverage(self) -> None:
+        runtime = self.runtime()
+        self.assertEqual(runtime.passage_contract_mode, "auto")
+        self.assertEqual(runtime.passage_write_contract, "v2")
+        self.assertEqual(runtime.passage_write_fingerprint, runtime.passage_fingerprint_v2)
+
+        # Unknown coverage (no probe, no database) keeps the existing v1 vectors.
+        with mock.patch.dict(os.environ, {"RECALL_DATABASE_URL": ""}):
+            self.assertEqual(runtime.passage_read_contract, "v1")
+            self.assertEqual(runtime.passage_fingerprint, runtime.passage_fingerprint_v1)
+
+        coverage = {"value": 0.5}
+        calls = {"count": 0}
+
+        def probe():
+            calls["count"] += 1
+            return coverage["value"]
+
+        runtime.bind_passage_coverage_probe(probe)
+        self.assertEqual(runtime.passage_read_contract, "v1")
+        self.assertEqual(runtime.passage_fingerprint, runtime.passage_fingerprint_v1)
+        # Cached for the ttl: no second probe call inside the window.
+        coverage["value"] = 1.0
+        self.assertEqual(runtime.passage_read_contract, "v1")
+        self.assertEqual(calls["count"], 1)
+        runtime._passage_coverage_cache = None
+        self.assertEqual(runtime.passage_read_contract, "v2")
+        self.assertEqual(runtime.passage_fingerprint, runtime.passage_fingerprint_v2)
+        self.assertEqual(calls["count"], 2)
+        runtime._passage_coverage_cache = None
+        coverage["value"] = PASSAGE_CONTRACT_COVERAGE_THRESHOLD - 0.001
+        self.assertEqual(runtime.passage_read_contract, "v1")
+        # A failing probe is unknown coverage, never a crash in the search path.
+        runtime.bind_passage_coverage_probe(lambda: 1 / 0)
+        self.assertEqual(runtime.passage_read_contract, "v1")
+
+        pinned_v2 = SemanticRuntime(
+            embedding_url="http://127.0.0.1:8081",
+            model="synthetic-embedding",
+            revision=DEFAULT_EMBEDDING_REVISION,
+            dimensions=512,
+            passage_contract_mode="v2",
+        )
+        pinned_v2.bind_passage_coverage_probe(lambda: 0.0)
+        self.assertEqual(pinned_v2.passage_read_contract, "v2")
+        pinned_v1 = SemanticRuntime(
+            embedding_url="http://127.0.0.1:8081",
+            model="synthetic-embedding",
+            revision=DEFAULT_EMBEDDING_REVISION,
+            dimensions=512,
+            passage_contract_mode="v1",
+        )
+        pinned_v1.bind_passage_coverage_probe(lambda: 1.0)
+        self.assertEqual(pinned_v1.passage_read_contract, "v1")
+        self.assertEqual(pinned_v1.passage_write_contract, "v1")
+        self.assertEqual(pinned_v1.passage_write_fingerprint, pinned_v1.passage_fingerprint_v1)
 
     def test_managed_embedding_retries_one_malformed_json_response(self) -> None:
         runtime = SemanticRuntime(
