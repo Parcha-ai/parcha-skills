@@ -8,6 +8,7 @@ import threading
 import time
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from itertools import combinations
 from typing import Any
 
@@ -28,6 +29,13 @@ from .rerank import (
     DEFAULT_RERANK_BLEND,
     DEFAULT_RERANK_MIN_BUDGET_SECONDS,
     RerankUnavailable,
+)
+from .temporal_hints import (
+    TemporalHint,
+    TemporalHintSettings,
+    parse_temporal_hint,
+    temporal_settings_from_env,
+    window_intersects,
 )
 
 
@@ -237,6 +245,7 @@ def collapse_document_candidates(
     alphas: dict[str, float] | None = None,
     fusion_report: dict[str, Any] | None = None,
     nominate_per_arm: int = 0,
+    window_boost: tuple[str, str, float] | None = None,
 ) -> list[dict[str, Any]]:
     """Fuse mechanical hints while keeping their strongest exact ranges.
 
@@ -249,6 +258,12 @@ def collapse_document_candidates(
     ``nominate_per_arm`` > 0 appends, after the first ``limit`` rows, every
     document some arm ranked within its top ``nominate_per_arm`` (see
     ``arm_nominated``); the rows carry ``"nominated": True``.
+    ``window_boost=(since, until, factor)`` (H2-h) multiplies the fused
+    score of every document whose ``[first_occurred_at, last_occurred_at]``
+    intersects the window by ``factor`` (after flooring it at the pool's
+    smallest positive fused score) before ranking and the fused cut, so a
+    document the arms placed past ``limit`` can still enter the head; those
+    rows carry ``temporal_boost``. Nominations follow the boosted head.
     """
 
     documents: dict[str, dict[str, Any]] = {}
@@ -330,6 +345,21 @@ def collapse_document_candidates(
                         str(row["passage_last_occurred_at"]),
                     ]
                 value["_ranges"][range_key] = hint
+    if window_boost is not None:
+        since, until, factor = window_boost
+        # Convex min-max gives an arm's weakest document 0.0, and a document
+        # the windowed dense pass added is usually exactly that minimum. A
+        # multiply alone would leave it at 0.0, so a boosted document is
+        # first floored at the smallest positive fused score in the pool: it
+        # enters just above the weakest rows and the reranker gets to see it.
+        positive = [value["_score"] for value in documents.values() if value["_score"] > 0.0]
+        floor = min(positive) if positive else 0.0
+        for value in documents.values():
+            if window_intersects(
+                value["first_occurred_at"], value["last_occurred_at"], since, until
+            ):
+                value["_score"] = max(value["_score"], floor) * factor
+                value["_temporal_boost"] = factor
     ordered = sorted(
         documents.values(),
         key=lambda value: (
@@ -381,6 +411,7 @@ def collapse_document_candidates(
         reasons = sorted(value.pop("_reasons"))
         score = value.pop("_score")
         arm_scores = value.pop("_arm_scores")
+        temporal_boost = value.pop("_temporal_boost", None)
         results.append({
             **value,
             "rank": round(score, 8),
@@ -396,8 +427,32 @@ def collapse_document_candidates(
             # the normalised value the fused score used) so the systems-card
             # probe can save candidates for offline alpha tuning.
             "arm_scores": arm_scores,
+            **({"temporal_boost": temporal_boost} if temporal_boost is not None else {}),
         })
     return results
+
+
+def merge_dense_pools(
+    primary: list[dict[str, Any]],
+    windowed: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Union the global dense pool with the windowed pass (H2-h).
+
+    Both pools hold one row per logical document. Documents the global pass
+    already returned keep their row; new documents from the window join the
+    pool, and the union is re-ordered by dense score (stable, so ties keep
+    the arms' recency order). Returns the pool and how many rows the window
+    added.
+    """
+
+    if not windowed:
+        return primary, 0
+    seen = {row["logical_document_id"] for row in primary}
+    added = [row for row in windowed if row["logical_document_id"] not in seen]
+    if not added:
+        return primary, 0
+    merged = sorted(primary + added, key=lambda row: -float(row["score"]))
+    return merged, len(added)
 
 
 def fuse_document_rankings(
@@ -1400,6 +1455,28 @@ class PassageHintRetrieval:
             return None
         return int(row["count"]) if row is not None else None
 
+    @staticmethod
+    def _embed_query_raw(runtime: Any, query: str) -> Any:
+        bounded = getattr(runtime, "embed_query_bounded", None)
+        return bounded(query) if bounded is not None else runtime.embed_query(query)
+
+    def _embed_query(self, query: str) -> Any:
+        """Embed once for every dense pass; ``None`` lets the arm report the failure."""
+
+        runtime = getattr(self.store, "semantic_runtime", None)
+        if runtime is None:
+            return None
+        try:
+            return self._embed_query_raw(runtime, query)
+        except (
+            json.JSONDecodeError,
+            PoolTimeout,
+            SearchDeadlineExceeded,
+            TimeoutError,
+            urllib.error.URLError,
+        ):
+            return None
+
     def _dense_candidates(
         self,
         query: str,
@@ -1410,17 +1487,14 @@ class PassageHintRetrieval:
         actor_ids: list[str] | None,
         actor_relations: list[str] | None,
         deadline_at: float,
+        vector: Any = None,
     ) -> tuple[list[dict[str, Any]], str, str, int | None]:
         runtime = self.store.semantic_runtime
         if runtime is None:
             return [], "disabled", "disabled", None
         try:
-            bounded = getattr(runtime, "embed_query_bounded", None)
-            vector = (
-                bounded(query)
-                if bounded is not None
-                else runtime.embed_query(query)
-            )
+            if vector is None:
+                vector = self._embed_query_raw(runtime, query)
             temporal_scope = since is not None or until is not None
             # A non-temporal query used to pull only candidate_limit x 5 = 100
             # nearest passages; one 5,000-passage session on a related topic
@@ -1658,13 +1732,31 @@ class PassageHintRetrieval:
         limit: int,
         include_arms: bool = False,
         deadline_at: float | None = None,
+        now: datetime | None = None,
     ) -> dict[str, Any]:
-        """Run independent hint arms concurrently and retain partial success."""
+        """Run independent hint arms concurrently and retain partial success.
+
+        H2-h: when the caller supplied neither ``since`` nor ``until`` and
+        the question names a date ("around May 2-4", "last week", "Q2"),
+        the parsed window is applied as a soft boost (never a filter), and
+        a day-level window also gets one extra windowed dense pass; see
+        ``temporal_hints``. ``now`` resolves relative phrases in tests.
+        """
 
         started_at = time.monotonic()
         if deadline_at is None:
             deadline_at = started_at + self.store.search_deadline_ms / 1000
         candidate_limit = min(400, max(80, limit * 20))
+        temporal_hint: TemporalHint | None = None
+        temporal_settings: TemporalHintSettings | None = None
+        if since is None and until is None:
+            temporal_settings = getattr(self.store, "temporal_hints", None)
+            if temporal_settings is None:
+                temporal_settings = temporal_settings_from_env()
+            if temporal_settings.enabled:
+                temporal_hint = parse_temporal_hint(
+                    query, now=now or datetime.now(timezone.utc)
+                )
         actor_ids = list(self.actor_ids) if self.actor_ids is not None else None
         actor_relations = (
             list(self.actor_relations)
@@ -1708,6 +1800,7 @@ class PassageHintRetrieval:
                 query, lexical_query=lexical_query, limit=limit, include_arms=include_arms,
                 started_at=started_at, deadline_at=deadline_at, candidate_limit=candidate_limit,
                 common=common, arm_elapsed_ms=arm_elapsed_ms,
+                temporal_hint=temporal_hint, temporal_settings=temporal_settings,
             )
         finally:
             if admission is not None:
@@ -1725,15 +1818,66 @@ class PassageHintRetrieval:
         candidate_limit: int,
         common: dict[str, Any],
         arm_elapsed_ms: dict[str, float],
+        temporal_hint: TemporalHint | None = None,
+        temporal_settings: TemporalHintSettings | None = None,
     ) -> dict[str, Any]:
-        def timed_arm(name: str, method: Any, *args: Any) -> Any:
+        def timed_arm(name: str, method: Any, *args: Any, **overrides: Any) -> Any:
             arm_started = time.monotonic()
             try:
-                return method(*args, **common)
+                return method(*args, **{**common, **overrides})
             finally:
                 arm_elapsed_ms[name] = round(
                     (time.monotonic() - arm_started) * 1000, 3
                 )
+
+        window_diagnostics: dict[str, Any] = {}
+
+        def dense_arms(text: str) -> tuple[list[dict[str, Any]], str, str, int | None]:
+            # The query is embedded once (inside the dense arm's timing, as
+            # before); the windowed pass reuses the vector.
+            arm_started = time.monotonic()
+            try:
+                vector = self._embed_query(text)
+                outcome = self._dense_candidates(text, vector=vector, **common)
+            finally:
+                arm_elapsed_ms["dense"] = round(
+                    (time.monotonic() - arm_started) * 1000, 3
+                )
+            rows, status, strategy, scope_passages = outcome
+            if (
+                temporal_hint is None
+                or not temporal_hint.day_level
+                or temporal_settings is None
+                or status != "ok"
+            ):
+                return outcome
+            # H2-h: a day-level hint (hedged or not) also runs the dense arm
+            # inside the window (the arms take since/until; a small scope is
+            # an exact scan) and unions the pools, so a short session inside
+            # the window reaches the collapse even when it sits at the bottom
+            # of the global pool. Sequential on this worker: no fourth pooled
+            # connection, bounded by its own short budget.
+            window_deadline = min(
+                deadline_at,
+                time.monotonic() + temporal_settings.window_budget_ms / 1000,
+            )
+            windowed, window_status, window_strategy, _ = timed_arm(
+                "dense_window",
+                self._dense_candidates,
+                text,
+                vector=vector,
+                since=temporal_hint.since,
+                until=temporal_hint.until,
+                deadline_at=window_deadline,
+            )
+            merged, added = merge_dense_pools(rows, windowed)
+            window_diagnostics.update({
+                "dense_window_status": window_status,
+                "dense_window_strategy": window_strategy,
+                "dense_window_candidates": len(windowed),
+                "dense_window_added": added,
+            })
+            return merged, status, strategy, scope_passages
 
         with ThreadPoolExecutor(max_workers=3) as executor:
             lexical_future = executor.submit(
@@ -1746,9 +1890,7 @@ class PassageHintRetrieval:
                 ),
                 lexical_query,
             )
-            dense_future = executor.submit(
-                timed_arm, "dense", self._dense_candidates, query,
-            )
+            dense_future = executor.submit(dense_arms, query)
             lexical, lexical_status = lexical_future.result()
             sparse, sparse_status = sparse_future.result()
             (
@@ -1757,6 +1899,12 @@ class PassageHintRetrieval:
                 dense_strategy,
                 dense_scope_passages,
             ) = dense_future.result()
+        window_boost: tuple[str, str, float] | None = None
+        temporal_diagnostics: dict[str, Any] = {}
+        if temporal_hint is not None and temporal_settings is not None:
+            factor = 1.0 + temporal_settings.boost_for(temporal_hint.confidence)
+            window_boost = (temporal_hint.since, temporal_hint.until, factor)
+            temporal_diagnostics["temporal_hint"] = temporal_hint.as_diagnostics(factor)
         # A document containing every informative query term is stronger
         # evidence than a semantic neighbor. Dense retrieval remains the
         # fallback for paraphrases, but it must not bury an exact hit merely
@@ -1790,7 +1938,12 @@ class PassageHintRetrieval:
             nominate_per_arm=(
                 RERANK_NOMINATE_PER_ARM if rerank_runtime is not None else 0
             ),
+            window_boost=window_boost,
         )
+        if window_boost is not None:
+            temporal_diagnostics["temporal_boosted"] = sum(
+                1 for row in results if "temporal_boost" in row
+            )
         # Arms that ran out of budget: either they returned nothing or the
         # text arms fell back from full ranking to a recency window. Lets a
         # card tell IO pressure (many truncated arms) from a ranking change.
@@ -1846,6 +1999,8 @@ class PassageHintRetrieval:
                 "passage_lexical_status": lexical_status,
                 "sparse_status": sparse_status,
                 "arm_elapsed_ms": arm_elapsed_ms,
+                **window_diagnostics,
+                **temporal_diagnostics,
                 **rerank_diagnostics,
                 "elapsed_ms": round(
                     (time.monotonic() - started_at) * 1000,
