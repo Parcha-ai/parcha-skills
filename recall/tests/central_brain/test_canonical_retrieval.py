@@ -2304,6 +2304,7 @@ class RerankWiringTests(unittest.TestCase):
         search_deadline_ms = 20000
         rerank_runtime = None
         rerank_min_budget_seconds = 1.0
+        rerank_blend = 1.0  # these tests exercise the pure rerank order
 
     @staticmethod
     def _rows(kind: str, pairs: list[tuple[str, float]]) -> list[dict]:
@@ -2480,3 +2481,36 @@ class RerankWiringTests(unittest.TestCase):
             [(0, "a1"), (1, "b1"), (2, "c1"), (0, "a2")],
         )
         self.assertEqual(select_rerank_candidates([], max_candidates=4), [])
+
+
+class RerankBlendTests(unittest.TestCase):
+    def _rows(self):
+        return [
+            {"logical_document_id": "ldoc_a", "rank": 0.90, "matching_ranges": [{"kind": "dense", "passage_id": "a1", "score": 0.9, "receipts": ["ra"]}]},
+            {"logical_document_id": "ldoc_b", "rank": 0.10, "matching_ranges": [{"kind": "dense", "passage_id": "b1", "score": 0.1, "receipts": ["rb"]}]},
+            {"logical_document_id": "ldoc_c", "rank": 0.50, "matching_ranges": [{"kind": "dense", "passage_id": "c1", "score": 0.5, "receipts": ["rc"]}]},
+        ]
+
+    def test_pure_rerank_orders_by_rerank_score(self) -> None:
+        from recall_server.passage_retrieval import apply_rerank_scores
+        out = apply_rerank_scores(self._rows(), {"a1": 0.2, "b1": 0.9, "c1": 0.5}, blend=1.0)
+        self.assertEqual([r["logical_document_id"] for r in out], ["ldoc_b", "ldoc_c", "ldoc_a"])
+        self.assertNotIn("blended_score", out[0])
+
+    def test_blend_keeps_a_strongly_fused_document_ahead(self) -> None:
+        from recall_server.passage_retrieval import apply_rerank_scores
+        out = apply_rerank_scores(self._rows(), {"a1": 0.2, "b1": 0.9, "c1": 0.5}, blend=0.5)
+        # a: rerank_norm 0, fused_norm 1 -> 0.5; b: 1, 0 -> 0.5 (tie broken by fused order: a first); c: 0.43, 0.5 -> 0.46
+        self.assertEqual([r["logical_document_id"] for r in out], ["ldoc_a", "ldoc_b", "ldoc_c"])
+        self.assertIn("blended_score", out[0])
+        self.assertEqual(out[0]["rank"], 0.90)
+
+    def test_blend_env_parsing(self) -> None:
+        from recall_server.rerank import rerank_blend_from_env, DEFAULT_RERANK_BLEND
+        with mock.patch.dict("os.environ", {"RECALL_RERANK_BLEND": ""}):
+            self.assertEqual(rerank_blend_from_env(), DEFAULT_RERANK_BLEND)
+        with mock.patch.dict("os.environ", {"RECALL_RERANK_BLEND": "0.25"}):
+            self.assertEqual(rerank_blend_from_env(), 0.25)
+        for bad in ("1.5", "-0.1", "x"):
+            with mock.patch.dict("os.environ", {"RECALL_RERANK_BLEND": bad}), self.assertRaises(ValueError):
+                rerank_blend_from_env()
