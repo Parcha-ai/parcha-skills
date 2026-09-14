@@ -114,7 +114,9 @@ def identifier_tokens(*queries: str) -> list[str]:
     seen: set[str] = set()
     for query in queries:
         for token in query.split():
-            stripped = token.strip("\"'`()[]{},;")
+            # "#6076", "@handle", "$VAR": the sigil is punctuation to the text
+            # search parser, so strip it before the identifier test as well.
+            stripped = token.strip("\"'`()[]{},;:.!?#@$")
             if len(stripped) < 3 or not IDENTIFIER_TOKEN_RE.fullmatch(stripped):
                 continue
             folded = stripped.casefold()

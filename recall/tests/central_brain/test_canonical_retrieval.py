@@ -2519,3 +2519,13 @@ class RerankBlendTests(unittest.TestCase):
         for bad in ("1.5", "-0.1", "x"):
             with mock.patch.dict("os.environ", {"RECALL_RERANK_BLEND": bad}), self.assertRaises(ValueError):
                 rerank_blend_from_env()
+
+
+class IdentifierSigilTests(unittest.TestCase):
+    def test_hash_prefixed_numbers_are_identifiers(self) -> None:
+        from recall_server.passage_retrieval import identifier_tokens
+        tokens = identifier_tokens("what did Greptile flag on PR #6076 around May 2-4?")
+        self.assertIn("6076", tokens)
+        self.assertIn("2-4", tokens)
+        self.assertNotIn("#6076", tokens)
+        self.assertEqual(identifier_tokens("@alice's $HOME_DIR."), ["home_dir"])
