@@ -575,6 +575,49 @@ def focus_window(text: str, terms: list[str], width: int) -> str:
     return text[best_start:best_start + width]
 
 
+def rerank_context(row: dict[str, Any]) -> str:
+    """The passage's stored contextual header, or a minimal source/time line.
+
+    Several questions name the harness ("in the Codex work") or a date; the
+    passage text alone carries neither, so the cross-encoder gets the same
+    catalog context the embedding header (H2-a) renders. Rows projected
+    before the header backfill fall back to the source id and the passage's
+    first day.
+    """
+
+    header = row.get("header_redacted")
+    if isinstance(header, str) and header.strip():
+        return header.strip()
+    source = str(row.get("source_id") or "").strip()
+    when = str(row.get("passage_first_occurred_at") or row.get("first_occurred_at") or "")
+    lines = []
+    if source:
+        lines.append(f"source: {source}")
+    if when[:10]:
+        lines.append(f"when: {when[:10]}")
+    return "\n".join(lines)
+
+
+def rerank_document(row: dict[str, Any], terms: list[str], width: int) -> str:
+    """Context line plus the query-densest window, fitted to ``width``."""
+
+    context = rerank_context(row)
+    text = row.get("text_redacted") or ""
+
+    def body(budget: int) -> str:
+        # The runtime trims the tail to its width; the head is kept unless
+        # the focus window is enabled (see RERANK_FOCUS_WINDOW).
+        return focus_window(text, terms, budget) if RERANK_FOCUS_WINDOW else text
+
+    if not context:
+        return body(width)
+    budget = width - len(context) - 2 if width > 0 else 0
+    if width > 0 and budget < 64:
+        # A pathological header: keep the text, the runtime trims the tail.
+        return body(width)
+    return f"{context}\n\n{body(budget)}"
+
+
 def select_rerank_candidates(
     results: list[dict[str, Any]],
     *,
@@ -836,6 +879,7 @@ class PassageHintRetrieval:
                               passage.ordinal AS passage_ordinal,
                               passage.spans,passage.receipts,
                               passage.text_redacted,
+                              passage.header_redacted,
                               passage.first_occurred_at,
                               passage.last_occurred_at,
                               passage.search_vector
@@ -880,6 +924,7 @@ class PassageHintRetrieval:
                               top.passage_id,top.passage_ordinal,
                               top.spans,top.receipts,
                               top.text_redacted,
+                              top.header_redacted,
                               top.first_occurred_at AS passage_first_occurred_at,
                               top.last_occurred_at AS passage_last_occurred_at,
                               {score_sql} AS score
@@ -1172,6 +1217,7 @@ class PassageHintRetrieval:
                               passage.ordinal AS passage_ordinal,
                               passage.spans,passage.receipts,
                               passage.text_redacted,
+                              passage.header_redacted,
                               passage.first_occurred_at,
                               passage.last_occurred_at,
                               passage.search_vector
@@ -1215,6 +1261,7 @@ class PassageHintRetrieval:
                               top.passage_id,top.passage_ordinal,
                               top.spans,top.receipts,
                               top.text_redacted,
+                              top.header_redacted,
                               top.first_occurred_at AS passage_first_occurred_at,
                               top.last_occurred_at AS passage_last_occurred_at,
                               {score_sql} AS score
@@ -1517,6 +1564,7 @@ class PassageHintRetrieval:
                                   passage.ordinal AS passage_ordinal,
                                   passage.spans,passage.receipts,
                                   passage.text_redacted,
+                                  passage.header_redacted,
                                   passage.first_occurred_at
                                       AS passage_first_occurred_at,
                                   passage.last_occurred_at
@@ -1862,7 +1910,8 @@ class PassageHintRetrieval:
             diagnostics["rerank_status"] = "skipped-budget"
             return results, diagnostics
         # The provider reads at most ``max_doc_chars`` of each passage; send
-        # the window that covers the most query terms rather than the prefix.
+        # the passage's context line (source, time, people) followed by the
+        # text (the query-densest window when RERANK_FOCUS_WINDOW is on).
         terms = focus_terms(lexical_query or query)
         width = int(getattr(runtime, "max_doc_chars", 0) or 0)
         texts: dict[str, str] = {}
@@ -1870,11 +1919,7 @@ class PassageHintRetrieval:
             for row in rows:
                 key = row.get("passage_id") or row.get("receipt")
                 if key and key not in texts:
-                    texts[key] = (
-                        focus_window(row["text_redacted"], terms, width)
-                        if RERANK_FOCUS_WINDOW
-                        else row["text_redacted"]
-                    )
+                    texts[key] = rerank_document(row, terms, width)
         # The same passage can reach the pool under two keys (a passage id
         # from one arm, a receipt from another); send its text once and let
         # both keys share the score.
@@ -2109,6 +2154,7 @@ class PassageHintRetrieval:
                                   passage.ordinal AS passage_ordinal,
                                   passage.spans,passage.receipts,
                                   passage.text_redacted,
+                                  passage.header_redacted,
                                   passage.first_occurred_at
                                       AS passage_first_occurred_at,
                                   passage.last_occurred_at
@@ -2203,6 +2249,7 @@ class PassageHintRetrieval:
                                   passage.ordinal AS passage_ordinal,
                                   passage.spans,passage.receipts,
                                   passage.text_redacted,
+                                  passage.header_redacted,
                                   ts_rank_cd(
                                       context.search_vector,
                                       plainto_tsquery('simple',%s),
