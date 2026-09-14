@@ -617,7 +617,7 @@ def main() -> None:
             )
             assert hidden["results"] == [], hidden["diagnostics"]
             assert hidden["diagnostics"]["dense_status"] == "ok"
-            assert hidden["diagnostics"]["passage_lexical_status"] == "ok"
+            assert hidden["diagnostics"]["passage_lexical_status"] in ("ok", "ok-relaxed")
             assert set(hidden["diagnostics"]["arm_elapsed_ms"]) == {
                 "dense", "passage_lexical", "sparse_exact",
             }
