@@ -730,7 +730,7 @@ class PassageHintRetrieval:
             with self.store.connect() as connection:
                 try:
                     matches = self._sparse_lexical_matches(
-                        connection, lexical_query, deadline_at=arm_deadline, **arguments,
+                        connection, tokens, deadline_at=arm_deadline, **arguments,
                     )
                 except SearchDeadlineExceeded:
                     return [], "deadline-exceeded"
@@ -757,7 +757,7 @@ class PassageHintRetrieval:
     def _sparse_lexical_matches(
         self,
         connection: Any,
-        lexical_query: str,
+        tokens: tuple[str, ...],
         *,
         since: str | None,
         until: str | None,
@@ -766,17 +766,21 @@ class PassageHintRetrieval:
         actor_relations: list[str] | None,
         deadline_at: float,
     ) -> int:
-        """Size of the lexical bitmap the sparse arm would recheck, capped.
+        """Size of the identifier bitmap the sparse arm would recheck, capped.
 
-        Same scope predicates as the sparse and lexical arms, a plain AND
-        tsquery only (no phrase, no rank), and a LIMIT one above the cap:
-        the answer is exact up to the cap and the probe never reads more
-        than cap + 1 index entries.
+        Same scope predicates as the sparse and lexical arms, the OR of the
+        identifier phrases only (no rank), and a LIMIT one above the cap: the
+        answer is exact up to the cap and the probe never reads more than
+        cap + 1 index entries. An identifier that is common enough to blow
+        the cap ("503", "v2") makes the arm skip itself; a rare one ("6076")
+        qualifies on its own, which the previous AND-with-every-term
+        predicate never allowed for a natural-language question.
         """
         del candidate_limit
+        phrase_sql = "(" + " || ".join("phraseto_tsquery('simple',%s)" for _ in tokens) + ")"
         rows = self.store._execute_bounded(
             connection,
-            """SELECT count(*) AS n
+            f"""SELECT count(*) AS n
                  FROM (
                    SELECT 1
                      FROM canonical_passages passage
@@ -799,7 +803,7 @@ class PassageHintRetrieval:
                           )
                       )
                       AND passage.search_vector @@
-                          plainto_tsquery('simple',%s)
+                          {phrase_sql}
                       AND (%s::timestamptz IS NULL
                            OR passage.last_occurred_at>=%s)
                       AND (%s::timestamptz IS NULL
@@ -814,7 +818,7 @@ class PassageHintRetrieval:
                 actor_ids,
                 actor_relations,
                 actor_relations,
-                lexical_query,
+                *tokens,
                 since,
                 since,
                 until,
@@ -856,8 +860,11 @@ class PassageHintRetrieval:
             raise ValueError("sparse query needs identifier tokens")
         phrase_sql = "(" + " || ".join("phraseto_tsquery('simple',%s)" for _ in tokens) + ")"
         phrase_values: tuple[str, ...] = tuple(tokens)
-        query_sql = f"(plainto_tsquery('simple',%s) && {phrase_sql})"
-        query_values: tuple[str, ...] = (lexical_query, *phrase_values)
+        # Match on the identifier phrases alone; the whole-query cover density
+        # still leads the ranking so a passage that also carries the other
+        # terms outranks one that only mentions the identifier.
+        query_sql = f"({phrase_sql})"
+        query_values: tuple[str, ...] = tuple(phrase_values)
         if order == "rank":
             pool_order = (
                 "ts_rank_cd(passage.search_vector,plainto_tsquery('simple',%s),32) DESC,"

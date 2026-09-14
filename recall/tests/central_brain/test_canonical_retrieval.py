@@ -1581,7 +1581,8 @@ class SearchArmCostTests(unittest.TestCase):
         rows, status = retrieval._sparse_candidates("frontalcortextool replacement", original_query="FrontalCortexTool replacement", **common)
         self.assertEqual(status, "ok")
         sparse = [s for s in store.sql if "phraseto_tsquery" in s]
-        self.assertEqual(len(sparse), 1)
+        # the selectivity probe and the ranked scan both carry the identifier phrases
+        self.assertEqual(len(sparse), 2)
         self.assertIn("FROM canonical_passages passage", sparse[0])
         self.assertNotIn("FROM canonical_chunks chunk", sparse[0])
         # the casefolded and CamelCase forms are one phrase query
@@ -1620,12 +1621,14 @@ class SearchArmCostTests(unittest.TestCase):
             self.assertNotIn("canonical_chunks", pool)
             self.assertNotIn("canonical_documents", sql)
             self.assertNotIn("canonical_events", sql)
-            # every informative term (the lexical predicate) and any identifier phrase
+            # any identifier phrase qualifies on its own; the whole-query cover
+            # density only orders the pool
             self.assertIn(
-                "passage.search_vector @@ (plainto_tsquery('simple',%s) && "
-                "(phraseto_tsquery('simple',%s) || phraseto_tsquery('simple',%s)))",
+                "passage.search_vector @@ "
+                "((phraseto_tsquery('simple',%s) || phraseto_tsquery('simple',%s)))",
                 pool,
             )
+            self.assertNotIn("plainto_tsquery('simple',%s) && ", pool)
             # scoped exactly like the passage-lexical arm
             self.assertIn("passage.policy_fingerprint=%s", pool)
             self.assertIn("FROM canonical_passage_actors actor", pool)
@@ -1649,9 +1652,9 @@ class SearchArmCostTests(unittest.TestCase):
                     "passage.last_occurred_at DESC,passage.passage_id",
                     pool,
                 )
-                self.assertEqual(values.count("brain_busy 503 deploy"), 5)  # match, pool/top/final order, score
+                self.assertEqual(values.count("brain_busy 503 deploy"), 4)  # pool/top/final order, score (match is phrase-only)
             else:
-                self.assertEqual(values.count("brain_busy 503 deploy"), 1)  # match only
+                self.assertEqual(values.count("brain_busy 503 deploy"), 0)  # recent phase: phrase match only
                 self.assertNotIn("ts_rank_cd", sql)
                 self.assertIn("0.0::real AS score", sql)
         with self.assertRaises(ValueError):
@@ -1797,8 +1800,8 @@ class SearchArmCostTests(unittest.TestCase):
         rows, status = self._retrieval(store)._sparse_candidates("brain_busy 503", **common)
         self.assertEqual(status, "ok")
         probe_sql, probe_values = store.sql[0], store.values[0]
-        self.assertIn("passage.search_vector @@ plainto_tsquery('simple',%s)", probe_sql)
-        self.assertNotIn("phraseto_tsquery", probe_sql)
+        self.assertIn("passage.search_vector @@ (phraseto_tsquery('simple',%s)", probe_sql)
+        self.assertNotIn("plainto_tsquery", probe_sql)
         self.assertNotIn("ts_rank_cd", probe_sql)
         self.assertNotIn("canonical_chunks", probe_sql)
         self.assertIn("LIMIT %s ) probe", probe_sql)
@@ -1807,15 +1810,14 @@ class SearchArmCostTests(unittest.TestCase):
         self.assertIn("passage.policy_fingerprint=%s", probe_sql)
         self.assertIn("FROM canonical_passage_actors actor", probe_sql)
         self.assertIn("passage.last_occurred_at>=%s", probe_sql)
-        self.assertIn("brain_busy 503", probe_values)
+        self.assertTrue(any(value in ("brain_busy", "503") for value in probe_values))
         self.assertTrue(any("phraseto_tsquery" in q for q in store.sql[1:]))
 
         # one above the cap: skipped before any phrase recheck
         store = Probe(matches=cap + 1, scope_count=10)
         rows, status = self._retrieval(store)._sparse_candidates("brain_busy 503", **common)
         self.assertEqual((rows, status), ([], "skipped-selectivity"))
-        self.assertEqual(len(store.sql), 1)
-        self.assertFalse(any("phraseto_tsquery" in q for q in store.sql))
+        self.assertEqual(len(store.sql), 1)  # only the probe ran
 
         # the probe itself is deadline-bounded
         class SlowProbe(Probe):
