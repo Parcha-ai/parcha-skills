@@ -25,6 +25,7 @@ class SessionDriverTests(unittest.TestCase):
         self.fake = write_fake_claude(root)
         self.log = root / "turns.log"
         os.environ["FAKE_LOG"] = str(self.log)
+        os.environ["CODEX_HOME"] = str(root / "no-codex")  # never the machine's real daemon
         self.store = Store(root / "tether.db")
         self.fake_codex = write_fake_codex(root)
         self.settings = active.ActiveSettings(
@@ -53,6 +54,7 @@ class SessionDriverTests(unittest.TestCase):
         self.driver.shutdown()
         self.store.close()
         os.environ.pop("FAKE_LOG", None)
+        os.environ.pop("CODEX_HOME", None)
         self.temp.cleanup()
 
     def fields(self, ts: str, actor: str = "U12345678") -> dict:
@@ -210,3 +212,46 @@ class SessionDriverTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CodexDaemonTests(SessionDriverTests):
+    def test_codex_turns_prefer_the_machine_daemon(self):
+        from tests.fakes import FakeCodexDaemon
+        home = Path(self.temp.name) / "codex-home"
+        daemon = FakeCodexDaemon(home)
+        os.environ["CODEX_HOME"] = str(home)
+        try:
+            self.bind_codex()
+            self.slice.claim(self.codex_fields("500.2"), "first")
+            self.assertEqual(self.slice.run_once(), 1)
+            self.slice.claim(self.codex_fields("500.3"), "second")
+            self.assertEqual(self.slice.run_once(), 1)
+            self.assertEqual(len(daemon.turns), 2)
+            self.assertIn("first", daemon.turns[0][1], "the Slack text is in the turn's input")
+            self.assertIn("second", daemon.turns[1][1])
+            self.assertEqual(daemon.turns[0][0], "thread-abc")
+            self.assertEqual(self.sent[0][2], "daemon turn 1")
+            self.assertEqual(self.sent[1][2], "daemon turn 2")
+            self.assertEqual(daemon.clients, 1, "one connection per gateway, reused across turns")
+            self.assertFalse(self.log.exists(), "no child app-server was started")
+            self.assertEqual(self.driver.codex_pids(), set())
+        finally:
+            daemon.close()
+
+    def test_dead_daemon_socket_falls_back_to_a_child(self):
+        import socket
+        home = Path(self.temp.name) / "codex-home"
+        control = home / "app-server-control"
+        control.mkdir(parents=True)
+        dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        dead.bind(str(control / "app-server-control.sock"))
+        dead.close()  # a socket file nobody listens on: the daemon died
+        os.environ["CODEX_HOME"] = str(home)
+        try:
+            self.bind_codex()
+            self.slice.claim(self.codex_fields("500.2"), "go")
+            self.assertEqual(self.slice.run_once(), 1)
+            self.assertIn("codex turn 1 of pid", self.sent[0][2])
+            self.assertTrue(self.driver.codex_pids())
+        finally:
+            pass

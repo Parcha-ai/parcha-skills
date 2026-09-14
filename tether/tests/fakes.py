@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import textwrap
@@ -124,3 +125,77 @@ def write_fake_codex(directory: Path) -> Path:
     path.write_text(FAKE_CODEX, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IEXEC)
     return path
+
+
+class FakeCodexDaemon:
+    """A stand-in for the machine's ``codex app-server`` daemon: WebSocket JSON-RPC on a
+    Unix control socket. Records every turn it ran; answers like FAKE_CODEX."""
+
+    def __init__(self, codex_home: Path):
+        import base64
+        import hashlib
+        import socket
+        import threading
+        from runtime.plugin_next.session_driver import ws_frame, ws_read_frame
+
+        control = Path(codex_home) / "app-server-control"
+        control.mkdir(parents=True, exist_ok=True)
+        self.path = control / "app-server-control.sock"
+        self.turns: list[tuple[str, str]] = []
+        self.clients = 0
+        self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._server.bind(str(self.path))
+        self._server.listen(4)
+
+        def serve(conn):
+            self.clients += 1
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                buf += conn.recv(4096)
+            key = [line.split(b":", 1)[1].strip() for line in buf.split(b"\r\n") if line.lower().startswith(b"sec-websocket-key")][0]
+            accept = base64.b64encode(hashlib.sha1(key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
+            conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                         b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n")
+
+            def out(o):
+                conn.sendall(ws_frame(json.dumps(o).encode(), mask=False))
+            n = 0
+            while True:
+                frame = ws_read_frame(conn)
+                if frame is None or frame[0] == 0x8:
+                    break
+                if frame[0] != 0x1:
+                    continue
+                req = json.loads(frame[1])
+                method, rid, params = req.get("method"), req.get("id"), req.get("params") or {}
+                if method == "initialize":
+                    out({"id": rid, "result": {"userAgent": "fake-codex-daemon"}})
+                elif method == "thread/resume":
+                    out({"id": rid, "result": {"thread": {"id": params["threadId"]}}})
+                elif method == "turn/start":
+                    n += 1
+                    tid = params["threadId"]
+                    text = params["input"][0]["text"]
+                    self.turns.append((tid, text))
+                    out({"id": rid, "result": {"turn": {"id": f"turn-{n}"}}})
+                    out({"method": "turn/started", "params": {"threadId": tid, "turn": {"id": f"turn-{n}", "status": "inProgress"}}})
+                    item = {"type": "agentMessage", "id": f"msg-{n}", "text": f"daemon turn {n}", "phase": "final_answer"}
+                    out({"method": "item/completed", "params": {"threadId": tid, "turnId": f"turn-{n}", "item": item}})
+                    out({"method": "turn/completed", "params": {"threadId": tid, "turn": {"id": f"turn-{n}", "items": [item], "status": "completed", "error": None}}})
+            conn.close()
+
+        def accept_loop():
+            while True:
+                try:
+                    conn, _ = self._server.accept()
+                except OSError:
+                    return
+                threading.Thread(target=serve, args=(conn,), daemon=True).start()
+
+        threading.Thread(target=accept_loop, daemon=True).start()
+
+    def close(self):
+        try:
+            self._server.close()
+        except OSError:
+            pass

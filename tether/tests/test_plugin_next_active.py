@@ -377,10 +377,10 @@ class ActiveSliceTest(unittest.TestCase):
             from runtime.plugin_next.store import Store
             Store(home / "plugin-data" / "tether" / "tether.db").record_origin(team_id="T12345678", channel_id="C1", thread_ts="400.1",
                                          source_kind="codex_session", session_id="01a08eb2-x",
-                                         cwd=self.temp.name, transcript=None, handoff_key="qa-1")
+                                         cwd=self.temp.name, transcript=None)
             first = hook(event=FakeEvent("status?", thread="400.1"))
             self.assertEqual(first["action"], "rewrite")
-            self.assertTrue(first["text"].startswith("[Tether] This thread was opened from a Codex session"))
+            self.assertTrue(first["text"].startswith("[Tether] This thread belongs to a Codex session"))
             self.assertIn("01a08eb2-x", first["text"])
             self.assertTrue(first["text"].endswith("\n\nstatus?"))
             self.assertIsNone(hook(event=FakeEvent("and now?", thread="400.1")))

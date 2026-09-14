@@ -80,11 +80,80 @@ def find_transcript(kind: str, session_id: str) -> str | None:
     return str(matches[-1]) if matches else None
 
 
+def _codex_daemon_pid(home: Path) -> int | None:
+    """PID of the process listening on the daemon control socket, via /proc (no root)."""
+    sock = home / "app-server-control" / "app-server-control.sock"
+    try:
+        inode = None
+        for line in (Path("/proc/net/unix").read_text().splitlines()[1:]):
+            parts = line.split()
+            if len(parts) >= 8 and parts[7] == str(sock):
+                inode = parts[6]
+                break
+        if inode is None:
+            return None
+        return _pid_with_fd(f"socket:[{inode}]")
+    except OSError:
+        return None
+
+
+def _pid_with_fd(target: str) -> int | None:
+    """First process (other than this one) with an fd pointing at ``target``."""
+    try:
+        for proc in Path("/proc").iterdir():
+            if not proc.name.isdigit() or int(proc.name) == os.getpid():
+                continue
+            try:
+                for fd in (proc / "fd").iterdir():
+                    if os.readlink(fd) == target:
+                        return int(proc.name)
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return None
+
+
+def codex_writer_holder(session_id: str, own_pids: set[int] | frozenset[int] = frozenset()) -> tuple[str, int | None]:
+    """Who holds a Codex thread's writer lock: ("free"|"daemon"|"ours"|"held", pid).
+
+    Codex keeps one writer per thread as a flock on ~/.codex/thread-writer-locks/<id>.lock.
+    The daemon (what the ChatGPT app drives) and Tether's own child are drivable; a
+    terminal ``codex resume`` is not, and that thread must be handed to the gateway's agent.
+    """
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    lock = home / "thread-writer-locks" / f"{session_id}.lock"
+    if not lock.exists():
+        return "free", None
+    try:
+        import fcntl
+        fd = os.open(lock, os.O_RDWR)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                return "free", None
+            except OSError:
+                pass
+        finally:
+            os.close(fd)
+    except OSError:
+        return "free", None
+    holder = _pid_with_fd(str(lock))
+    if holder is None:
+        return "held", None
+    if holder in own_pids:
+        return "ours", holder
+    if holder == _codex_daemon_pid(home):
+        return "daemon", holder
+    return "held", holder
+
+
 def origin_note(origin: dict[str, Any]) -> str:
     """What the gateway's agent is told on the first human message of a handed-off thread."""
     lines = [
-        "[Tether] This thread was opened from a Codex session on this machine that you cannot drive "
-        f"(thread {origin.get('session_id')}). You are the colleague who answers here.",
+        "[Tether] This thread belongs to a Codex session on this machine that is open in a terminal, "
+        f"so it cannot be driven from here (thread {origin.get('session_id')}). You are the colleague who answers.",
     ]
     if origin.get("cwd"):
         lines.append(f"Work in {origin['cwd']}.")
@@ -508,6 +577,8 @@ class ActiveSlice:
         )
         if binding is None:
             return None
+        if self._hand_off_if_held(binding):
+            return None
         if peer and self.settings.peer_chain_limit > 0:
             recent = self.runtime.recent_turn_actors(binding["binding_id"], self.settings.peer_chain_limit)
             if (len(recent) >= self.settings.peer_chain_limit and actor in peers
@@ -538,6 +609,23 @@ class ActiveSlice:
             # colleague reacts before they go and do the thing.
             self._react(binding["channel_id"], message_id, self.settings.ack_emoji)
         return {"binding_id": binding["binding_id"], "event_key": event_key}
+
+    def _hand_off_if_held(self, binding: dict[str, Any]) -> bool:
+        """A Codex thread open in a terminal on this box goes to the gateway's agent, now."""
+        endpoint = self.runtime.endpoint(binding["endpoint_id"])
+        if not endpoint or endpoint.get("source_kind") != "codex_session":
+            return False
+        source = endpoint.get("source") or {}
+        session_id = str(source.get("session_id") or "")
+        own = getattr(self.driver, "codex_pids", lambda: set())()
+        state, pid = codex_writer_holder(session_id, own)
+        if state != "held":
+            return False
+        self.runtime.hand_off_binding(binding["binding_id"], source_kind="codex_session", session_id=session_id,
+                                      cwd=source.get("cwd"))
+        logger.warning("tether: codex thread %s is held by pid %s; thread %s/%s handed to the gateway's agent",
+                       session_id, pid, binding["channel_id"], binding["thread_ts"])
+        return True
 
     def _react(self, channel_id: str, message_ts: str, emoji: str) -> None:
         if not self.settings.presence or not message_ts or not emoji:
@@ -798,9 +886,6 @@ class ActiveSlice:
         key = str(request.get("idempotency_key") or "")
         if not key:
             raise BrokerRefused("idempotency_key_required")
-        if kind == "codex_session":
-            return self._notify_handoff(request, team_id=team_id, channel_id=channel_id, key=key,
-                                        text=text, file=file, kind=kind, session_id=session_id, cwd=cwd)
         source = {"session_id": session_id, "cwd": cwd}
         endpoint = self.runtime.register_endpoint(
             endpoint_key=endpoint_key_for(kind, session_id),
@@ -824,22 +909,6 @@ class ActiveSlice:
         binding = self.runtime.activate_binding(binding["binding_id"], ts)
         return {"status": "posted", "state": "posted", "team_id": team_id, "channel_id": channel_id,
                 "thread_ts": ts, "message_ts": ts, "bridge_id": binding["binding_id"]}
-
-    def _notify_handoff(self, request: dict[str, Any], *, team_id: str, channel_id: str, key: str, text: str,
-                        file: str | None, kind: str, session_id: str, cwd: str) -> dict[str, Any]:
-        """Post the root and record where it came from; the gateway's agent owns the thread."""
-        marker = f"handoff:{team_id}:{channel_id}:{key}"
-        existing = self.runtime.find_handoff(marker)
-        if existing:
-            return {"status": "duplicate", "state": "handed_off", "team_id": team_id, "channel_id": channel_id,
-                    "thread_ts": existing, "message_ts": existing, "bridge_id": "", "owner": "gateway"}
-        ts = self._post(channel_id, text, None, file=file)
-        self.runtime.record_origin(
-            team_id=team_id, channel_id=channel_id, thread_ts=ts, source_kind=kind, session_id=session_id,
-            cwd=cwd, transcript=find_transcript(kind, session_id), handoff_key=marker,
-        )
-        return {"status": "posted", "state": "handed_off", "team_id": team_id, "channel_id": channel_id,
-                "thread_ts": ts, "message_ts": ts, "bridge_id": "", "owner": "gateway"}
 
     def op_spawn(self, request: dict[str, Any]) -> dict[str, Any]:
         """Start a fresh harness session for a task and bind it to a thread.
