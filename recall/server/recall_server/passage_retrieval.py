@@ -175,6 +175,7 @@ def collapse_document_candidates(
     fusion: str = "rrf",
     alphas: dict[str, float] | None = None,
     fusion_report: dict[str, Any] | None = None,
+    nominate_per_arm: int = 0,
 ) -> list[dict[str, Any]]:
     """Fuse mechanical hints while keeping their strongest exact ranges.
 
@@ -184,6 +185,9 @@ def collapse_document_candidates(
     to the leg weight when ``alphas`` lacks the leg); see ``fusion.py`` for
     the small-leg and recent-first fallbacks. ``fusion_report`` receives
     per-leg ``{"candidates", "documents", "normalized"}`` when given.
+    ``nominate_per_arm`` > 0 appends, after the first ``limit`` rows, every
+    document some arm ranked within its top ``nominate_per_arm`` (see
+    ``arm_nominated``); the rows carry ``"nominated": True``.
     """
 
     documents: dict[str, dict[str, Any]] = {}
@@ -265,7 +269,7 @@ def collapse_document_candidates(
                         str(row["passage_last_occurred_at"]),
                     ]
                 value["_ranges"][range_key] = hint
-    ranked = sorted(
+    ordered = sorted(
         documents.values(),
         key=lambda value: (
             value["_score"],
@@ -273,7 +277,18 @@ def collapse_document_candidates(
             value["logical_document_id"],
         ),
         reverse=True,
-    )[:limit]
+    )
+    ranked = ordered[:limit]
+    if nominate_per_arm > 0:
+        # Each arm nominates its own top documents past the fused cut so a
+        # small-alpha arm's best evidence still reaches the reranker; the
+        # first ``limit`` rows are untouched, the nominations follow them in
+        # fused order.
+        ranked.extend(
+            value
+            for value in ordered[limit:]
+            if arm_nominated(value["_arm_scores"], nominate_per_arm)
+        )
     results = []
     for value in ranked:
         ordered_ranges = sorted(
@@ -310,6 +325,12 @@ def collapse_document_candidates(
             "rank": round(score, 8),
             "reasons": reasons,
             "matching_ranges": ranges,
+            **(
+                {"nominated": True}
+                if nominate_per_arm > 0
+                and len(results) >= limit
+                else {}
+            ),
             # Content-free per-arm evidence (raw best score, arm rank, and
             # the normalised value the fused score used) so the systems-card
             # probe can save candidates for offline alpha tuning.
@@ -385,6 +406,83 @@ def _range_key(item: dict[str, Any]) -> str | None:
     return item.get("passage_id") or (receipts[0] if receipts else None)
 
 
+# Documents an arm ranked this high are sent to the reranker even when the
+# fused order (dominated by the dense alpha) placed them past the pool.
+RERANK_NOMINATE_PER_ARM = 10
+
+
+def arm_nominated(arm_scores: dict[str, Any], nominate_per_arm: int) -> bool:
+    """True when any arm ranked the document within its top ``nominate_per_arm``."""
+
+    return any(
+        0 < int(entry.get("rank") or 0) <= nominate_per_arm
+        for entry in (arm_scores or {}).values()
+    )
+
+
+def focus_terms(*queries: str) -> list[str]:
+    """Casefolded query words of three or more characters, first-seen order."""
+
+    terms: list[str] = []
+    seen: set[str] = set()
+    for query in queries:
+        for token in query.split():
+            word = token.strip("\"'`()[]{},;:.!?#@$").casefold()
+            if len(word) < 3 or word in seen:
+                continue
+            seen.add(word)
+            terms.append(word)
+    return terms
+
+
+def focus_window(text: str, terms: list[str], width: int) -> str:
+    """The ``width``-character window of ``text`` covering the most query terms.
+
+    A passage can run to several thousand characters while the reranker
+    reads a bounded prefix; when the matching sentence sits past that prefix
+    the cross-encoder never sees it. Candidate windows start at each term
+    occurrence (and at 0); the winner covers the most distinct terms, ties
+    going to the earliest start. Without any term hit the prefix is kept.
+    """
+
+    if width <= 0 or len(text) <= width:
+        return text
+    folded = text.casefold()
+    hits: list[tuple[int, int]] = []
+    for index, term in enumerate(terms):
+        start = 0
+        while True:
+            at = folded.find(term, start)
+            if at < 0:
+                break
+            hits.append((at, index))
+            start = at + max(len(term), 1)
+            if len(hits) > 4096:
+                break
+    if not hits:
+        return text[:width]
+    hits.sort()
+    # Sliding window over the sorted hits: the window that starts at a hit
+    # and covers the most distinct terms wins, ties to the earliest.
+    best_start, best_count = 0, 0
+    counts: dict[int, int] = {}
+    right = 0
+    for left, (at, _index) in enumerate(hits):
+        while right < len(hits) and hits[right][0] < at + width:
+            counts[hits[right][1]] = counts.get(hits[right][1], 0) + 1
+            right += 1
+        if left > 0:
+            prior = hits[left - 1][1]
+            counts[prior] -= 1
+            if counts[prior] == 0:
+                del counts[prior]
+        if len(counts) > best_count:
+            best_start, best_count = at, len(counts)
+    # Back the window up a little so the first hit is not flush at the edge.
+    best_start = max(0, min(best_start - width // 8, len(text) - width))
+    return text[best_start:best_start + width]
+
+
 def select_rerank_candidates(
     results: list[dict[str, Any]],
     *,
@@ -394,15 +492,24 @@ def select_rerank_candidates(
 
     Round-robin over documents (each document's strongest hint first, then
     its second, ...) so the reranker sees the widest set of documents rather
-    than three passages each from the top seventeen. Returns
+    than three passages each from the top seventeen. Nominated documents
+    (``"nominated": True``, appended past the fused cut by the collapse) are
+    visited in the first pass right after the fused head so the pool cannot
+    fill up before an arm's own top hit is reached. Returns
     ``(document_index, range_key)`` pairs in send order.
     """
 
     selected: list[tuple[int, str]] = []
     seen: set[str] = set()
     depth = max((len(row.get("matching_ranges") or ()) for row in results), default=0)
+    nominated = [index for index, row in enumerate(results) if row.get("nominated")]
+    head = [index for index, row in enumerate(results) if not row.get("nominated")]
+    # Reserve room for the nominations: the fused head fills what is left.
+    head_budget = max(max_candidates - len(nominated), max_candidates // 2)
+    order = head[:head_budget] + nominated + head[head_budget:]
     for position in range(depth):
-        for document_index, row in enumerate(results):
+        for document_index in order:
+            row = results[document_index]
             ranges = row.get("matching_ranges") or ()
             if position >= len(ranges):
                 continue
@@ -1481,6 +1588,9 @@ class PassageHintRetrieval:
             fusion=fusion_mode,
             alphas=fusion_alphas,
             fusion_report=fusion_legs,
+            nominate_per_arm=(
+                RERANK_NOMINATE_PER_ARM if rerank_runtime is not None else 0
+            ),
         )
         # Arms that ran out of budget: either they returned nothing or the
         # text arms fell back from full ranking to a recency window. Lets a
@@ -1503,8 +1613,12 @@ class PassageHintRetrieval:
                 runtime=rerank_runtime,
                 deadline_at=deadline_at,
                 arm_elapsed_ms=arm_elapsed_ms,
+                lexical_query=lexical_query,
             )
-        results = results[:limit]
+        results = [
+            {key: value for key, value in row.items() if key != "nominated"}
+            for row in results[:limit]
+        ]
         response = {
             "results": results,
             "diagnostics": {
@@ -1569,6 +1683,7 @@ class PassageHintRetrieval:
         runtime: Any,
         deadline_at: float,
         arm_elapsed_ms: dict[str, float],
+        lexical_query: str = "",
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Rerank the fused passage pool; on any shortfall keep the fused order.
 
@@ -1594,12 +1709,16 @@ class PassageHintRetrieval:
         if remaining < min_budget:
             diagnostics["rerank_status"] = "skipped-budget"
             return results, diagnostics
+        # The provider reads at most ``max_doc_chars`` of each passage; send
+        # the window that covers the most query terms rather than the prefix.
+        terms = focus_terms(lexical_query, query)
+        width = int(getattr(runtime, "max_doc_chars", 0) or 0)
         texts: dict[str, str] = {}
         for _leg_name, _weight, rows in legs:
             for row in rows:
                 key = row.get("passage_id") or row.get("receipt")
                 if key and key not in texts:
-                    texts[key] = row["text_redacted"]
+                    texts[key] = focus_window(row["text_redacted"], terms, width)
         # The same passage can reach the pool under two keys (a passage id
         # from one arm, a receipt from another); send its text once and let
         # both keys share the score.
