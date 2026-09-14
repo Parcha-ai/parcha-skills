@@ -40,6 +40,10 @@ from .rerank import RerankRuntime
 from .semantic import SemanticRuntime
 
 MAX_SEARCH_RESULT_TEXT_CHARS = 4096
+# Pooled connections one search may hold at once (its three arms), and the
+# connections kept free for single-statement tools while searches run.
+SEARCH_ARM_CONNECTIONS = 3
+SEARCH_RESERVED_CONNECTIONS = 2
 CONCURRENT_MIGRATION_SUFFIX = "_concurrent.sql"
 
 
@@ -181,6 +185,14 @@ class BrainStore:
         if not 4 <= configured_pool_size <= 32:
             raise ValueError("database pool size must be between 4 and 32")
         self.pool_max_size = configured_pool_size
+        # A search runs up to SEARCH_ARM_CONNECTIONS pooled statements at
+        # once. Admit only as many concurrent searches as leave
+        # SEARCH_RESERVED_CONNECTIONS for the single-connection tools.
+        self.search_slots = max(
+            1,
+            (configured_pool_size - SEARCH_RESERVED_CONNECTIONS) // SEARCH_ARM_CONNECTIONS,
+        )
+        self.search_admission = threading.BoundedSemaphore(self.search_slots)
         configured = search_deadline_ms if search_deadline_ms is not None else int(os.environ.get("RECALL_SEARCH_DEADLINE_MS", str(DEFAULT_SEARCH_DEADLINE_MS)))
         if not 10 <= configured <= 30_000:
             raise ValueError(
@@ -2968,6 +2980,15 @@ class BrainStore:
         try:
             return conn.execute(sql, values)
         except psycopg.errors.QueryCanceled as exc:
+            # The cancelled statement aborted the transaction; roll it back so
+            # the caller can reuse this connection for its fallback phase.
+            # Inside a `with connection.transaction()` block an explicit
+            # rollback is forbidden; there the block itself rolls back to its
+            # savepoint when SearchDeadlineExceeded propagates out of it.
+            try:
+                conn.rollback()
+            except psycopg.ProgrammingError:
+                pass
             raise SearchDeadlineExceeded("search deadline exceeded") from exc
 
     def _entity_leg(self, conn, values: list[str], filters: dict,

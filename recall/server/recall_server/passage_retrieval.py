@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from psycopg import sql
+from psycopg_pool import PoolTimeout
 
 from .actor_attribution import ACTOR_ID_RE, ACTOR_RELATIONS
 from .db import SearchDeadlineExceeded, bounded_search_text
@@ -29,12 +30,19 @@ MAX_EXACT_DENSE_SCOPE_PASSAGES = 20_000
 # Forgotten passages are rare: rank first, then drop the few whose chunks are
 # gone from an oversampled top-K instead of probing canonical_chunks per hit.
 LIVENESS_OVERSAMPLE = 2
-# The sparse-exact arm scans canonical_chunks (every record, tool output
-# included) through one global GIN index. It exists to match identifiers
-# exactly; for prose it scores millions of chunks by rank and runs to the
-# deadline while dense and passage-lexical already cover the same words.
-# Run it only when the query carries identifier-shaped tokens, and never
-# let it hold the rest of the search past its own share of the budget.
+# The sparse-exact arm reads the same canonical_passages GIN index as the
+# passage-lexical arm. A passage qualifies when it contains every
+# informative query term (the lexical arm's own predicate, which the GIN
+# index answers with a small bitmap) and at least one identifier token as
+# an intact phrase (adjacent lexemes). Matching identifier phrases alone
+# is not an option: a phrase predicate needs the TOASTed tsvector of every
+# candidate, so on a common token ("503", a date) the arm reads a large
+# share of the corpus, runs to its budget on every query, and pins a pool
+# connection for that long while the disk pressure slows the other arms.
+# That starved the whole pool in production. For prose the arm is
+# skipped: dense and passage-lexical already cover the words.
+# Known loss: identifiers that occur only inside tool output are no longer
+# matched by search; they stay reachable through recall_scan records.
 IDENTIFIER_TOKEN_RE = re.compile(
     r"(?:"
     r"[A-Za-z0-9_-]*\d[A-Za-z0-9_-]*"          # anything with a digit: ids, versions, ports
@@ -46,6 +54,20 @@ IDENTIFIER_TOKEN_RE = re.compile(
 # Acronyms such as MCP, API, or SQL are ordinary vocabulary here, not exact
 # identifiers; they stay with the passage-lexical arm.
 SPARSE_ARM_BUDGET_FRACTION = 0.5
+# The sparse arm's phrase recheck reads the TOASTed tsvector of every row in
+# the lexical bitmap (every informative term present, in scope). Before the
+# ranked phase, the arm counts that bitmap with an index-only probe capped
+# at this many rows plus one: a plain AND tsquery needs no recheck, so the
+# probe touches the GIN index and heap visibility only, never TOAST. When
+# the bitmap is larger than this, the arm is skipped (status
+# `skipped-selectivity`): dense and passage-lexical still cover the query,
+# and the recheck would have run to the arm's budget while pinning a pool
+# connection. 2000 rows is ~6000 random TOAST reads on the managed
+# instance, inside the arm's ranked-phase share of the budget.
+SPARSE_MAX_LEXICAL_MATCHES = 2000
+# Statuses that mean an arm hit its budget before finishing its full work,
+# or never got a pooled connection inside it.
+TRUNCATED_ARM_STATUSES = frozenset({"deadline-exceeded", "ok-recent-first", "pool-exhausted"})
 # Ranking every full-text match by ts_rank_cd is proportional to the size of
 # the match set. Common words match most of the corpus. Each text arm first
 # tries the full ranking under a short share of the budget, then falls back
@@ -70,16 +92,39 @@ def _phase_deadline(deadline_at: float, fraction: float) -> float:
     return min(deadline_at, now + max(0.0, deadline_at - now) * fraction)
 
 
+# Bound the AND-ed phrase query so a pasted log line cannot turn into an
+# arbitrarily wide tsquery; the first identifiers carry the question.
+MAX_SPARSE_IDENTIFIER_TOKENS = 8
+
+
+def identifier_tokens(*queries: str) -> list[str]:
+    """Distinct identifier-shaped tokens, casefolded, in first-seen order.
+
+    The 'simple' text search configuration lowercases lexemes, so a
+    CamelCase symbol and its casefolded form are one phrase query.
+    """
+
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for query in queries:
+        for token in query.split():
+            stripped = token.strip("\"'`()[]{},;")
+            if len(stripped) < 3 or not IDENTIFIER_TOKEN_RE.fullmatch(stripped):
+                continue
+            folded = stripped.casefold()
+            if folded in seen:
+                continue
+            seen.add(folded)
+            tokens.append(folded)
+            if len(tokens) >= MAX_SPARSE_IDENTIFIER_TOKENS:
+                return tokens
+    return tokens
+
+
 def sparse_arm_applies(lexical_query: str) -> bool:
     """True when the query has at least one token that looks like an identifier."""
 
-    for token in lexical_query.split():
-        stripped = token.strip("\"'`()[]{},;")
-        if len(stripped) < 3:
-            continue
-        if IDENTIFIER_TOKEN_RE.fullmatch(stripped):
-            return True
-    return False
+    return bool(identifier_tokens(lexical_query))
 # The exact-vs-ANN decision only needs an approximate scope size; reuse it for
 # a short window so the count query does not run before every search.
 SCOPE_COUNT_TTL_SECONDS = 60.0
@@ -383,23 +428,32 @@ class PassageHintRetrieval:
             "actor_ids": actor_ids,
             "actor_relations": actor_relations,
         }
+        # One pooled connection per arm: the recency fallback reuses the
+        # connection of the cancelled ranked phase instead of queueing for
+        # another one while the pool is under load.
         try:
-            return self._lexical_query(
-                lexical_query, order="rank",
-                deadline_at=_phase_deadline(deadline_at, RANKED_PHASE_BUDGET_FRACTION),
-                **arguments,
-            ), "ok"
-        except SearchDeadlineExceeded:
-            pass
-        try:
-            return self._lexical_query(
-                lexical_query, order="recent", deadline_at=deadline_at, **arguments,
-            ), "ok-recent-first"
-        except SearchDeadlineExceeded:
-            return [], "deadline-exceeded"
+            with self.store.connect() as connection:
+                try:
+                    return self._lexical_query(
+                        connection, lexical_query, order="rank",
+                        deadline_at=_phase_deadline(deadline_at, RANKED_PHASE_BUDGET_FRACTION),
+                        **arguments,
+                    ), "ok"
+                except SearchDeadlineExceeded:
+                    pass
+                try:
+                    return self._lexical_query(
+                        connection, lexical_query, order="recent",
+                        deadline_at=deadline_at, **arguments,
+                    ), "ok-recent-first"
+                except SearchDeadlineExceeded:
+                    return [], "deadline-exceeded"
+        except PoolTimeout:
+            return [], "pool-exhausted"
 
     def _lexical_query(
         self,
+        connection: Any,
         lexical_query: str,
         *,
         order: str,
@@ -438,8 +492,7 @@ class PassageHintRetrieval:
             score_values = ()
         else:
             raise ValueError("unsupported lexical order")
-        with self.store.connect() as connection:
-            return self.store._execute_bounded(
+        return self.store._execute_bounded(
                     connection,
                     f"""WITH matched AS MATERIALIZED (
                        SELECT passage.tenant_id,
@@ -556,12 +609,12 @@ class PassageHintRetrieval:
     ) -> tuple[list[dict[str, Any]], str]:
         if self.actor_scope:
             return [], "skipped-actor-scope"
-        # The informative-term query is casefolded; check the original text
+        # The informative-term query is casefolded; read the original text
         # too so CamelCase symbols and ALL_CAPS codes still qualify.
-        if not (
-            sparse_arm_applies(lexical_query)
-            or (original_query is not None and sparse_arm_applies(original_query))
-        ):
+        tokens = identifier_tokens(
+            lexical_query, *(() if original_query is None else (original_query,))
+        )
+        if not tokens:
             return [], "skipped-prose-query"
         arm_deadline = _phase_deadline(deadline_at, SPARSE_ARM_BUDGET_FRACTION)
         arguments = {
@@ -572,24 +625,110 @@ class PassageHintRetrieval:
             "actor_relations": actor_relations,
         }
         try:
-            return self._sparse_query(
-                lexical_query, order="rank",
-                deadline_at=_phase_deadline(arm_deadline, RANKED_PHASE_BUDGET_FRACTION),
-                **arguments,
-            ), "ok"
-        except SearchDeadlineExceeded:
-            pass
-        try:
-            return self._sparse_query(
-                lexical_query, order="recent", deadline_at=arm_deadline, **arguments,
-            ), "ok-recent-first"
-        except SearchDeadlineExceeded:
-            return [], "deadline-exceeded"
+            with self.store.connect() as connection:
+                try:
+                    matches = self._sparse_lexical_matches(
+                        connection, lexical_query, deadline_at=arm_deadline, **arguments,
+                    )
+                except SearchDeadlineExceeded:
+                    return [], "deadline-exceeded"
+                if matches > SPARSE_MAX_LEXICAL_MATCHES:
+                    return [], "skipped-selectivity"
+                try:
+                    return self._sparse_query(
+                        connection, tokens, lexical_query=lexical_query, order="rank",
+                        deadline_at=_phase_deadline(arm_deadline, RANKED_PHASE_BUDGET_FRACTION),
+                        **arguments,
+                    ), "ok"
+                except SearchDeadlineExceeded:
+                    pass
+                try:
+                    return self._sparse_query(
+                        connection, tokens, lexical_query=lexical_query, order="recent",
+                        deadline_at=arm_deadline, **arguments,
+                    ), "ok-recent-first"
+                except SearchDeadlineExceeded:
+                    return [], "deadline-exceeded"
+        except PoolTimeout:
+            return [], "pool-exhausted"
+
+    def _sparse_lexical_matches(
+        self,
+        connection: Any,
+        lexical_query: str,
+        *,
+        since: str | None,
+        until: str | None,
+        candidate_limit: int,
+        actor_ids: list[str] | None,
+        actor_relations: list[str] | None,
+        deadline_at: float,
+    ) -> int:
+        """Size of the lexical bitmap the sparse arm would recheck, capped.
+
+        Same scope predicates as the sparse and lexical arms, a plain AND
+        tsquery only (no phrase, no rank), and a LIMIT one above the cap:
+        the answer is exact up to the cap and the probe never reads more
+        than cap + 1 index entries.
+        """
+        del candidate_limit
+        rows = self.store._execute_bounded(
+            connection,
+            """SELECT count(*) AS n
+                 FROM (
+                   SELECT 1
+                     FROM canonical_passages passage
+                    WHERE passage.tenant_id=%s
+                      AND passage.source_id=ANY(%s)
+                      AND passage.policy_fingerprint=%s
+                      AND (
+                          %s::text[] IS NULL
+                          OR EXISTS (
+                              SELECT 1
+                                FROM canonical_passage_actors actor
+                               WHERE actor.tenant_id=passage.tenant_id
+                                 AND actor.source_id=passage.source_id
+                                 AND actor.passage_id=passage.passage_id
+                                 AND actor.actor_id=ANY(%s)
+                                 AND (
+                                     %s::text[] IS NULL
+                                     OR actor.relation=ANY(%s)
+                                 )
+                          )
+                      )
+                      AND passage.search_vector @@
+                          plainto_tsquery('simple',%s)
+                      AND (%s::timestamptz IS NULL
+                           OR passage.last_occurred_at>=%s)
+                      AND (%s::timestamptz IS NULL
+                           OR passage.first_occurred_at<=%s)
+                    LIMIT %s
+                 ) probe""",
+            (
+                self.tenant_id,
+                self.sources,
+                self.policy_fingerprint,
+                actor_ids,
+                actor_ids,
+                actor_relations,
+                actor_relations,
+                lexical_query,
+                since,
+                since,
+                until,
+                until,
+                SPARSE_MAX_LEXICAL_MATCHES + 1,
+            ),
+            deadline_at,
+        ).fetchall()
+        return int(rows[0]["n"]) if rows else 0
 
     def _sparse_query(
         self,
-        lexical_query: str,
+        connection: Any,
+        tokens: list[str],
         *,
+        lexical_query: str,
         order: str,
         since: str | None,
         until: str | None,
@@ -598,84 +737,72 @@ class PassageHintRetrieval:
         actor_relations: list[str] | None,
         deadline_at: float,
     ) -> list[dict[str, Any]]:
-        """One bounded exact-identifier scan over canonical_chunks.
+        """One bounded exact-identifier scan over canonical_passages.
 
-        `matched` touches only the chunk table through its GIN index; the
-        document, event, evidence, actor, and time joins run on the bounded
-        pool. Recency uses chunk.created_at (inline) so no TOASTed
-        search_vector is read before the LIMIT.
+        The match predicate is the lexical arm's `plainto_tsquery` over every
+        informative term AND-ed with the OR of one `phraseto_tsquery` per
+        identifier token, so the GIN index narrows the candidates to the
+        lexical match set before any phrase recheck reads a tsvector. The
+        ranked phase orders by the cover density of the whole query, then
+        identifier density, then recency; the recent phase by recency
+        alone. `matched` touches only the passage table with the same
+        tenant, source, policy, actor, and time scope as the lexical arm;
+        the projection, evidence, and chunk-liveness joins run on the
+        bounded pool.
         """
+        if not tokens:
+            raise ValueError("sparse query needs identifier tokens")
+        phrase_sql = "(" + " || ".join("phraseto_tsquery('simple',%s)" for _ in tokens) + ")"
+        phrase_values: tuple[str, ...] = tuple(tokens)
+        query_sql = f"(plainto_tsquery('simple',%s) && {phrase_sql})"
+        query_values: tuple[str, ...] = (lexical_query, *phrase_values)
         if order == "rank":
             pool_order = (
-                "ts_rank_cd(chunk.search_vector,plainto_tsquery('simple',%s),32) DESC,"
-                "chunk.created_at DESC,chunk.chunk_id"
+                "ts_rank_cd(passage.search_vector,plainto_tsquery('simple',%s),32) DESC,"
+                f"ts_rank_cd(passage.search_vector,{phrase_sql},32) DESC,"
+                "passage.last_occurred_at DESC,passage.passage_id"
             )
-            order_values: tuple[str, ...] = (lexical_query,)
-            score_sql = "ts_rank_cd(top.search_vector,plainto_tsquery('simple',%s),32)"
-            score_values: tuple[str, ...] = (lexical_query,)
+            order_values: tuple[str, ...] = (lexical_query, *phrase_values)
+            score_sql = (
+                "ts_rank_cd(top.search_vector,plainto_tsquery('simple',%s),32)"
+                f"+ts_rank_cd(top.search_vector,{phrase_sql},32)"
+            )
+            score_values: tuple[str, ...] = (lexical_query, *phrase_values)
         elif order == "recent":
-            pool_order = "chunk.created_at DESC,chunk.chunk_id"
+            pool_order = "passage.last_occurred_at DESC,passage.passage_id"
             order_values = ()
             score_sql = "0.0::real"
             score_values = ()
         else:
             raise ValueError("unsupported sparse order")
         pool_limit = candidate_limit * LIVENESS_OVERSAMPLE
-        with self.store.connect() as connection:
-            return self.store._execute_bounded(
+        return self.store._execute_bounded(
                     connection,
                     f"""WITH matched AS MATERIALIZED (
-                       SELECT chunk.tenant_id,chunk.source_id,
-                              chunk.document_id,chunk.chunk_id,
-                              chunk.ordinal,chunk.receipt,
-                              chunk.text_redacted,chunk.created_at,
-                              chunk.search_vector
-                         FROM canonical_chunks chunk
-                        WHERE chunk.tenant_id=%s
-                          AND chunk.source_id=ANY(%s)
-                          AND chunk.deleted_at IS NULL
-                          AND chunk.search_vector @@
-                              plainto_tsquery('simple',%s)
-                        ORDER BY {pool_order}
-                        LIMIT %s
-                       ), top AS MATERIALIZED (
-                       SELECT * FROM matched
-                        ORDER BY {pool_order.replace("chunk.", "matched.")}
-                        LIMIT %s
-                       )
-                       SELECT event.source_id,
-                              evidence.logical_document_id,
-                              evidence.revision,evidence.native_parent_id,
-                              evidence.first_occurred_at,
-                              evidence.last_occurred_at,
-                              evidence.manifest_object_key,
-                              evidence.manifest_content_sha256,
-                              top.receipt,top.text_redacted,
-                              event.occurred_at AS passage_first_occurred_at,
-                              event.occurred_at AS passage_last_occurred_at,
-                              {score_sql} AS score
-                         FROM top
-                         JOIN canonical_documents document
-                           USING(tenant_id,source_id,document_id)
-                         JOIN canonical_events event
-                           USING(tenant_id,source_id,event_id)
-                         JOIN canonical_evidence_documents evidence
-                           ON evidence.tenant_id=event.tenant_id
-                          AND evidence.source_id=event.source_id
-                          AND evidence.native_parent_id=COALESCE(
-                              event.native_parent_id,event.native_id
-                          )
-                        WHERE document.is_current
-                          AND document.deleted_at IS NULL
+                       SELECT passage.tenant_id,
+                              passage.source_id,
+                              passage.logical_document_id,
+                              passage.revision,
+                              passage.policy_fingerprint,
+                              passage.passage_id,
+                              passage.ordinal AS passage_ordinal,
+                              passage.spans,passage.receipts,
+                              passage.text_redacted,
+                              passage.first_occurred_at,
+                              passage.last_occurred_at,
+                              passage.search_vector
+                         FROM canonical_passages passage
+                        WHERE passage.tenant_id=%s
+                          AND passage.source_id=ANY(%s)
+                          AND passage.policy_fingerprint=%s
                           AND (
                               %s::text[] IS NULL
                               OR EXISTS (
                                   SELECT 1
-                                    FROM canonical_evidence_document_actors actor
-                                   WHERE actor.tenant_id=evidence.tenant_id
-                                     AND actor.source_id=evidence.source_id
-                                     AND actor.logical_document_id=
-                                         evidence.logical_document_id
+                                    FROM canonical_passage_actors actor
+                                   WHERE actor.tenant_id=passage.tenant_id
+                                     AND actor.source_id=passage.source_id
+                                     AND actor.passage_id=passage.passage_id
                                      AND actor.actor_id=ANY(%s)
                                      AND (
                                          %s::text[] IS NULL
@@ -683,29 +810,70 @@ class PassageHintRetrieval:
                                      )
                               )
                           )
+                          AND passage.search_vector @@ {query_sql}
                           AND (%s::timestamptz IS NULL
-                               OR event.occurred_at>=%s)
+                               OR passage.last_occurred_at>=%s)
                           AND (%s::timestamptz IS NULL
-                               OR event.occurred_at<=%s)
-                        ORDER BY score DESC,event.occurred_at DESC,
-                                 top.chunk_id""",
+                               OR passage.first_occurred_at<=%s)
+                        ORDER BY {pool_order}
+                        LIMIT %s
+                       )
+                       , top AS MATERIALIZED (
+                       SELECT * FROM matched
+                        ORDER BY {pool_order.replace("passage.", "matched.")}
+                        LIMIT %s
+                       )
+                       SELECT top.source_id,top.logical_document_id,
+                              evidence.revision,evidence.native_parent_id,
+                              evidence.first_occurred_at,evidence.last_occurred_at,
+                              evidence.manifest_object_key,
+                              evidence.manifest_content_sha256,
+                              top.passage_id,top.passage_ordinal,
+                              top.spans,top.receipts,
+                              top.text_redacted,
+                              top.first_occurred_at AS passage_first_occurred_at,
+                              top.last_occurred_at AS passage_last_occurred_at,
+                              {score_sql} AS score
+                         FROM top
+                         JOIN canonical_passage_documents projected
+                           USING(
+                               tenant_id,source_id,logical_document_id,
+                               policy_fingerprint
+                           )
+                         JOIN canonical_evidence_documents evidence
+                           USING(tenant_id,source_id,logical_document_id)
+                        WHERE NOT EXISTS (
+                              SELECT 1
+                                FROM unnest(top.receipts)
+                                     AS passage_receipt(receipt)
+                                LEFT JOIN canonical_chunks live_chunk
+                                  ON live_chunk.tenant_id=top.tenant_id
+                                 AND live_chunk.source_id=top.source_id
+                                 AND live_chunk.receipt=
+                                     passage_receipt.receipt
+                                 AND live_chunk.deleted_at IS NULL
+                               WHERE live_chunk.receipt IS NULL
+                          )
+                        ORDER BY {pool_order.replace("passage.", "top.")}""",
                     (
                         self.tenant_id,
                         self.sources,
-                        lexical_query,
+                        self.policy_fingerprint,
+                        actor_ids,
+                        actor_ids,
+                        actor_relations,
+                        actor_relations,
+                        *query_values,
+                        since,
+                        since,
+                        until,
+                        until,
                         *order_values,
                         pool_limit,
                         *order_values,
                         candidate_limit,
                         *score_values,
-                        actor_ids,
-                        actor_ids,
-                        actor_relations,
-                        actor_relations,
-                        since,
-                        since,
-                        until,
-                        until,
+                        *order_values,
                     ),
                     deadline_at,
                 ).fetchall()
@@ -797,7 +965,7 @@ class PassageHintRetrieval:
                     ),
                     deadline_at,
                 ).fetchone()
-        except SearchDeadlineExceeded:
+        except (PoolTimeout, SearchDeadlineExceeded):
             return None
         return int(row["count"]) if row is not None else None
 
@@ -1034,18 +1202,18 @@ class PassageHintRetrieval:
                 ).fetchall()
         except (
             json.JSONDecodeError,
+            PoolTimeout,
             SearchDeadlineExceeded,
             TimeoutError,
             urllib.error.URLError,
         ) as error:
-            return (
-                [],
-                "deadline-exceeded"
-                if isinstance(error, SearchDeadlineExceeded)
-                else "unavailable",
-                "unavailable",
-                None,
-            )
+            if isinstance(error, SearchDeadlineExceeded):
+                status = "deadline-exceeded"
+            elif isinstance(error, PoolTimeout):
+                status = "pool-exhausted"
+            else:
+                status = "unavailable"
+            return [], status, "unavailable", None
         return rows, "ok", dense_strategy, scope_passages
 
     def search(
@@ -1080,7 +1248,52 @@ class PassageHintRetrieval:
             "deadline_at": deadline_at,
         }
         arm_elapsed_ms: dict[str, float] = {}
+        # Searches take up to three pooled connections each. The store
+        # admits only as many concurrent searches as leave headroom for the
+        # single-connection tools, so a slow arm can never starve show or
+        # scope of a connection. Waiting counts against the search budget.
+        admission = getattr(self.store, "search_admission", None)
+        if admission is not None and not admission.acquire(
+            timeout=max(0.0, deadline_at - time.monotonic())
+        ):
+            return {
+                "results": [],
+                "diagnostics": {
+                    "engine": "lossless-passages-v1",
+                    "policy_fingerprint": self.policy_fingerprint,
+                    "reason": "search-admission-timeout",
+                    "candidate_depth": candidate_limit,
+                    "result_limit": limit,
+                    "arms_truncated": ["dense", "passage_lexical", "sparse_exact"],
+                    "elapsed_ms": round((time.monotonic() - started_at) * 1000, 3),
+                    "deadline_ms": self.store.search_deadline_ms,
+                    "deadline_exceeded": True,
+                    "partial_results_preserved": False,
+                },
+            }
+        try:
+            return self._search_admitted(
+                query, lexical_query=lexical_query, limit=limit, include_arms=include_arms,
+                started_at=started_at, deadline_at=deadline_at, candidate_limit=candidate_limit,
+                common=common, arm_elapsed_ms=arm_elapsed_ms,
+            )
+        finally:
+            if admission is not None:
+                admission.release()
 
+    def _search_admitted(
+        self,
+        query: str,
+        *,
+        lexical_query: str,
+        limit: int,
+        include_arms: bool,
+        started_at: float,
+        deadline_at: float,
+        candidate_limit: int,
+        common: dict[str, Any],
+        arm_elapsed_ms: dict[str, float],
+    ) -> dict[str, Any]:
         def timed_arm(name: str, method: Any, *args: Any) -> Any:
             arm_started = time.monotonic()
             try:
@@ -1133,6 +1346,18 @@ class PassageHintRetrieval:
             alphas=fusion_alphas,
             fusion_report=fusion_legs,
         )
+        # Arms that ran out of budget: either they returned nothing or the
+        # text arms fell back from full ranking to a recency window. Lets a
+        # card tell IO pressure (many truncated arms) from a ranking change.
+        arms_truncated = [
+            name
+            for name, status in (
+                ("dense", dense_status),
+                ("passage_lexical", lexical_status),
+                ("sparse_exact", sparse_status),
+            )
+            if status in TRUNCATED_ARM_STATUSES
+        ]
         response = {
             "results": results,
             "diagnostics": {
@@ -1147,6 +1372,10 @@ class PassageHintRetrieval:
                     "legs": fusion_legs,
                 },
                 "policy_fingerprint": self.policy_fingerprint,
+                "candidate_depth": candidate_limit,
+                "result_limit": limit,
+                "sparse_source": "passages",
+                "arms_truncated": arms_truncated,
                 "dense_candidates": len(dense),
                 "passage_lexical_candidates": len(lexical),
                 "sparse_candidates": len(sparse),

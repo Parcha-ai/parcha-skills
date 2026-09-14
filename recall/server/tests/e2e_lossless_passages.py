@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import uuid
 from pathlib import Path
 
@@ -634,6 +635,66 @@ def main() -> None:
         )
         assert len(restored["results"]) == 1
 
+        # Concurrent searches must never exhaust the pool: with the smallest
+        # allowed pool (4) and eight identifier searches at depth 50, every
+        # search completes, no arm reports a pool timeout, and every
+        # connection is back in the pool afterwards.
+        small = BrainStore(
+            os.environ["RECALL_DATABASE_URL"],
+            semantic_runtime=runtime,  # type: ignore[arg-type]
+            pool_max_size=4,
+        )
+        assert small.search_slots == 1
+        small_bound = BoundCanonicalRetrieval(
+            small,
+            tenant_id=tenant,
+            principal_id=principal,
+            authorized_sources=(source,),
+            passage_policy=PassagePolicy(
+                target_tokens=4,
+                overlap_tokens=1,
+            ),
+        )
+        outcomes: list[dict] = []
+        failures: list[BaseException] = []
+
+        def one_search() -> None:
+            try:
+                outcomes.append(small_bound.passage_hints(
+                    "gateway tenant boundaries gateway_tenant-1 v2.3", limit=50,
+                ))
+            except BaseException as error:  # noqa: BLE001 - any failure fails the check
+                failures.append(error)
+
+        workers = [threading.Thread(target=one_search) for _ in range(8)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        assert not failures, failures
+        assert len(outcomes) == 8
+        for outcome in outcomes:
+            diagnostics = outcome["diagnostics"]
+            assert "reason" not in diagnostics, diagnostics
+            assert "pool-exhausted" not in {
+                diagnostics["dense_status"],
+                diagnostics["passage_lexical_status"],
+                diagnostics["sparse_status"],
+            }, diagnostics
+            assert diagnostics["sparse_status"] == "ok", diagnostics
+            assert diagnostics["result_limit"] == 50
+        stats = small._pool.get_stats()
+        assert stats["pool_available"] == stats["pool_size"], stats
+        assert stats.get("requests_errors", 0) == 0, stats
+        assert stats.get("requests_waiting", 0) == 0, stats
+        small.close()
+        concurrent_pool_stats = {
+            "searches": len(outcomes),
+            "pool_size": stats["pool_size"],
+            "requests_num": stats.get("requests_num"),
+            "requests_wait_ms": stats.get("requests_wait_ms"),
+        }
+
     with store.connect() as connection:
         counts = connection.execute(
             """SELECT
@@ -725,6 +786,7 @@ def main() -> None:
                 "append_embedding_calls": embed_after_append["processed"],
                 "append_reused_embeddings": reused_embeddings,
                 "shadow_diff_totals": shadow["totals"],
+                "concurrent_pool": concurrent_pool_stats,
                 "dense_tool_hits": counts["dense_tool_hits"],
                 "sparse_tool_hits": counts["sparse_tool_hits"],
                 "completion_model_calls": 0,
