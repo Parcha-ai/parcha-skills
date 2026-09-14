@@ -507,10 +507,7 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
             if "canonical_passage_actors" in value
             or "canonical_evidence_document_actors" in value
         )
-        # The lexical arm may issue a strict and a relaxed statement; each
-        # statement carries the actor filter exactly once.
-        self.assertGreaterEqual(arm_sql.count("actor.actor_id=ANY(%s)"), 1)
-        self.assertEqual(arm_sql.count("actor.actor_id=ANY(%s)"), arm_sql.count("WITH matched AS MATERIALIZED"))
+        self.assertEqual(arm_sql.count("actor.actor_id=ANY(%s)"), 1)
         retrieval_source = "\n".join(
             inspect.getsource(method)
             for method in (
@@ -2517,55 +2514,3 @@ class RerankBlendTests(unittest.TestCase):
         for bad in ("1.5", "-0.1", "x"):
             with mock.patch.dict("os.environ", {"RECALL_RERANK_BLEND": bad}), self.assertRaises(ValueError):
                 rerank_blend_from_env()
-
-
-class RelaxedLexicalFallbackTests(unittest.TestCase):
-    def test_relaxed_text_ors_distinct_terms(self) -> None:
-        from recall_server.passage_retrieval import relaxed_tsquery_text
-        self.assertEqual(relaxed_tsquery_text("greptile flagged PR 6076 greptile"), "greptile | flagged | pr | 6076")
-        self.assertEqual(relaxed_tsquery_text("x"), "")
-        self.assertEqual(relaxed_tsquery_text("only"), "")
-
-    def test_strict_miss_falls_back_to_relaxed_or_query(self) -> None:
-        from recall_server.passage_retrieval import PassageHintRetrieval
-
-        class Store(ActorRecordingStore):
-            def __init__(self):
-                super().__init__()
-                self.calls = 0
-
-        store = Store()
-        retrieval = PassageHintRetrieval(store, tenant_id="tenant:company:test", sources=["s"], policy_fingerprint="f" * 64)
-        seen: list[str] = []
-
-        def fake_query(connection, lexical_query, *, order, relaxed=False, **_kw):
-            seen.append(("relaxed" if relaxed else "strict") + ":" + order)
-            if relaxed:
-                return [{"passage_id": "p2"}, {"passage_id": "p3"}]
-            return [{"passage_id": "p2"}]
-
-        retrieval._lexical_query = fake_query  # type: ignore[method-assign]
-        rows, status = retrieval._lexical_candidates(
-            "greptile flagged pr 6076", since=None, until=None, candidate_limit=20,
-            actor_ids=None, actor_relations=None, deadline_at=time.monotonic() + 5,
-        )
-        self.assertEqual(status, "ok-relaxed")
-        self.assertEqual([r["passage_id"] for r in rows], ["p2", "p3"])
-        self.assertEqual(seen, ["strict:rank", "relaxed:rank"])
-
-    def test_enough_strict_rows_skip_the_relaxed_phase(self) -> None:
-        from recall_server.passage_retrieval import PassageHintRetrieval, LEXICAL_RELAX_THRESHOLD
-        store = ActorRecordingStore()
-        retrieval = PassageHintRetrieval(store, tenant_id="tenant:company:test", sources=["s"], policy_fingerprint="f" * 64)
-        seen: list[bool] = []
-
-        def fake_query(connection, lexical_query, *, order, relaxed=False, **_kw):
-            seen.append(relaxed)
-            return [{"passage_id": f"p{i}"} for i in range(LEXICAL_RELAX_THRESHOLD)]
-
-        retrieval._lexical_query = fake_query  # type: ignore[method-assign]
-        rows, status = retrieval._lexical_candidates(
-            "greptile flagged pr 6076", since=None, until=None, candidate_limit=20,
-            actor_ids=None, actor_relations=None, deadline_at=time.monotonic() + 5,
-        )
-        self.assertEqual((status, len(rows), seen), ("ok", LEXICAL_RELAX_THRESHOLD, [False]))
