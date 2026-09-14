@@ -276,6 +276,41 @@ def main() -> None:
             assert offline_marker in json.dumps(memory.resolve(recovered_receipt))
             assert online.flush()["acked"] == 0
             online.close()
+
+            # T12: a harness loop that rewrites one exchange with fresh uuids
+            # ships three copies per distinct record; the rest stay local.
+            runaway_marker = "t12-runaway-loop-marker-7f3a"
+            runaway_source = mac_root / "runaway.jsonl"
+            runaway_lines = []
+            for index in range(300):
+                runaway_lines.append(json.dumps({
+                    "type": "user", "uuid": f"u-{index}", "parentUuid": f"a-{index - 1}",
+                    "timestamp": f"2026-07-03T15:{index % 60:02d}:00Z",
+                    "message": {"role": "user", "content": f"please continue {runaway_marker}"},
+                }))
+                runaway_lines.append(json.dumps({
+                    "type": "assistant", "uuid": f"a-{index}", "parentUuid": f"u-{index}",
+                    "timestamp": f"2026-07-03T15:{index % 60:02d}:01Z",
+                    "message": {"role": "assistant", "id": f"msg-{index}", "usage": {"input_tokens": index},
+                                "content": [{"type": "text", "text": "I am unable to proceed."}]},
+                }))
+            runaway_source.write_text("\n".join(runaway_lines) + "\n")
+            runaway = Collector(
+                root=mac_root, harness="claude", source_id="claude:mac:e2e",
+                spool_path=mac_spool, endpoint=base, token="development-only",
+            )
+            runaway_scan = runaway.scan()
+            assert runaway_scan["records_queued"] == 6, runaway_scan
+            assert runaway_scan["records_collapsed"] == 594, runaway_scan
+            assert runaway.flush()["acked"] == 6
+            assert runaway.doctor()["collapsed_records"] == 594
+            runaway.close()
+            runaway_hits = memory.search(runaway_marker)["results"]
+            assert runaway_hits and all(runaway_marker in json.dumps(memory.resolve(hit["receipt"])) for hit in runaway_hits[:1])
+            with urllib.request.urlopen(base + "/metrics", timeout=5) as metrics_response:
+                metrics_text = metrics_response.read().decode()
+            assert "\nrecall_passage_duplicate_rows " in metrics_text, metrics_text[:400]
+            assert "\nrecall_document_records_p99 " in metrics_text, metrics_text[:400]
             assert diagnostics["legs"] and all(set(leg) == {"leg", "elapsed_ms", "n_results", "timed_out"} for leg in diagnostics["legs"])
             assert "quartz" not in json.dumps(diagnostics).lower()
             assert request(base, "GET", "/v1/receipts/resolve?" + urllib.parse.urlencode({"receipt": first_hit["receipt"]}))[0] == 200
@@ -741,6 +776,8 @@ def main() -> None:
                     "supported_export_idempotent_with_provenance": True,
                     "mac_core_offline_recovery_seconds": round(recovery_seconds, 3),
                     "mac_core_ack_before_cursor": True,
+                    "runaway_records_collapsed": 594,
+                    "runaway_records_shipped": 6,
                 }
             assert summary["projection_lag"] == 0
             result = {"status": "pass", "runtime": {"python": sys.version.split()[0], "postgres": "17-alpine", "psycopg": psycopg.__version__}, "summary": summary}

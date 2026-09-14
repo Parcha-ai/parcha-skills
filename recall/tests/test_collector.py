@@ -15,8 +15,10 @@ from pathlib import Path
 from collector.collector import (
     MAX_CANONICAL_BATCH_EVENTS,
     MAX_CANONICAL_TOMBSTONE_BATCH_EVENTS,
+    MAX_IDENTICAL_RECORDS_PER_FILE,
     Collector,
     CollectorRuntimeError,
+    record_repeat_key,
 )
 from privacy.policy import PrivacyPolicy
 
@@ -368,6 +370,84 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(collector.flush()["acked"], 1)
         collector.close()
 
+    @staticmethod
+    def replayed_lines(pairs: int, *, start: int = 0) -> str:
+        """A harness loop: the same user/assistant exchange with fresh identity."""
+        lines = []
+        for index in range(start, start + pairs):
+            lines.append(json.dumps({
+                "type": "user", "uuid": f"u-{index}", "parentUuid": f"a-{index - 1}",
+                "timestamp": f"2026-07-03T15:{index % 60:02d}:00Z", "requestId": f"req-{index}",
+                "message": {"role": "user", "content": "please continue"},
+            }) + "\n")
+            lines.append(json.dumps({
+                "type": "assistant", "uuid": f"a-{index}", "parentUuid": f"u-{index}",
+                "timestamp": f"2026-07-03T15:{index % 60:02d}:01Z", "requestId": f"req-{index}",
+                "message": {"role": "assistant", "id": f"msg-{index}", "usage": {"input_tokens": index},
+                            "content": [{"type": "text", "text": "I am unable to proceed."}]},
+            }) + "\n")
+        return "".join(lines)
+
+    def test_repeat_key_ignores_per_line_identity_only(self) -> None:
+        first, second = self.replayed_lines(2).splitlines()[0::2]
+        self.assertEqual(record_repeat_key(json.loads(first)), record_repeat_key(json.loads(second)))
+        changed = json.loads(first)
+        changed["message"]["content"] = "please continue now"
+        self.assertNotEqual(record_repeat_key(json.loads(first)), record_repeat_key(changed))
+
+    def test_replayed_transcript_collapses_to_bounded_records(self) -> None:
+        transcript = self.root / "runaway.jsonl"
+        transcript.write_text(claude_line("distinct opener") + self.replayed_lines(400) + claude_line("distinct closer"))
+        collector = self.collector()
+        scan = collector.scan()
+        # 802 lines: two distinct records plus 400 replays of two identical ones.
+        expected = 2 + 2 * MAX_IDENTICAL_RECORDS_PER_FILE
+        self.assertEqual(scan["records_queued"], expected)
+        self.assertEqual(scan["records_collapsed"], 802 - expected)
+        self.assertEqual(scan["scan_complete"], True)
+        self.assertEqual(collector.flush()["acked"], expected)
+        doctor = collector.doctor()
+        self.assertEqual(doctor["records"], expected)
+        self.assertEqual(doctor["collapsed_records"], 802 - expected)
+        self.assertEqual(doctor["committed_files"], 1)
+        # The loop keeps going: an append scan continues the per-file counts.
+        with transcript.open("a") as output:
+            output.write(self.replayed_lines(100, start=400))
+            output.write(claude_line("distinct after append"))
+        scan = collector.scan()
+        self.assertEqual(scan["records_queued"], 1)
+        self.assertEqual(scan["records_collapsed"], 200)
+        self.assertEqual(collector.flush()["acked"], 1)
+        # A rewritten file starts the counts over and never tombstones the
+        # collapsed lines, which were never shipped.
+        transcript.write_text(self.replayed_lines(4))
+        scan = collector.scan()
+        self.assertEqual(scan["records_queued"], 2 * MAX_IDENTICAL_RECORDS_PER_FILE)
+        self.assertEqual(scan["records_collapsed"], 2)
+        # Every shipped record is tombstoned except the one at byte 0, whose
+        # native id the rewritten first line reuses as a content revision.
+        self.assertEqual(scan["tombstones_queued"], expected)
+        collector.close()
+
+    def test_repeat_counts_survive_a_bounded_scan_resume(self) -> None:
+        transcript = self.root / "runaway.jsonl"
+        transcript.write_text(self.replayed_lines(30))
+        collector = Collector(
+            root=self.root, harness="claude", source_id="claude:linux:test",
+            spool_path=self.spool, endpoint=self.endpoint, token="test-token-not-a-secret",
+            max_scan_records=10,
+        )
+        queued = collapsed = 0
+        for _ in range(6):
+            scan = collector.scan()
+            queued += scan["records_queued"]
+            collapsed += scan["records_collapsed"]
+            if scan["scan_complete"]:
+                break
+        self.assertEqual(queued, 2 * MAX_IDENTICAL_RECORDS_PER_FILE)
+        self.assertEqual(collapsed, 60 - queued)
+        collector.close()
+
     def test_truncation_queues_tombstone_for_removed_record(self) -> None:
         transcript = self.root / "session.jsonl"
         transcript.write_text(claude_line("first") + claude_line("removed"))
@@ -704,7 +784,8 @@ class CollectorTest(unittest.TestCase):
 
     def test_canonical_writer_byte_budget_splits_base64_wrapped_batches(self) -> None:
         (self.root / "session.jsonl").write_text(
-            "".join(claude_line("x" * 1_000) for _ in range(6))
+            # Distinct bodies: identical lines collapse after three copies (T12).
+            "".join(claude_line("x" * 1_000 + str(index)) for index in range(6))
         )
         ingested_batches = []
 

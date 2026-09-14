@@ -267,7 +267,11 @@ class ProbeTest(unittest.TestCase):
         self.assertIn("regexp_matches(text", program)
         self.assertNotIn("\n", program)
 
-    def _metrics_text(self, written: int = 150000, unembedded: int = 1234) -> bytes:
+    def _metrics_text(self, written: int = 150000, unembedded: int = 1234, duplicate_rows: int | None = 4000) -> bytes:
+        t12 = (
+            f"recall_passage_duplicate_rows {duplicate_rows}\n"
+            "recall_document_records_p99 64000\n"
+        ) if duplicate_rows is not None else ""
         return (
             "# HELP recall_http_requests_total HTTP requests handled.\n"
             "# TYPE recall_http_requests_total counter\n"
@@ -277,6 +281,7 @@ class ProbeTest(unittest.TestCase):
             f"recall_passages_unembedded {unembedded}\n"
             f"recall_passages_written_24h {written}\n"
             "recall_passage_documents_projected_24h 320\n"
+            + t12 +
             "recall_projection_passages_written_total 77\n"
             "recall_projection_passages_embedded_total 8\n"
             'labeled_metric{path="/x"} 1\n'
@@ -294,7 +299,7 @@ class ProbeTest(unittest.TestCase):
 
         def getter(url, headers, timeout):
             seen.append((url, headers))
-            return 200, self._metrics_text()
+            return 200, self._metrics_text(duplicate_rows=89358)
 
         with tempfile.TemporaryDirectory() as directory:
             context = make_context(FakeBrain(default_tools()), metrics_token_file=self._token_file(directory), _metrics_get=getter)
@@ -313,6 +318,25 @@ class ProbeTest(unittest.TestCase):
         self.assertFalse(gates["passages_written_24h"].passed)  # baseline churn fails by design
         self.assertTrue(gates["embedding_lag_ratio"].passed)
         self.assertNotIn("labeled_metric", result.metrics)
+        # T12: 89,358 repeated-text rows over 400k passages is 22%, over the gate.
+        self.assertEqual(result.metrics["passage_duplicate_rows"], 89358)
+        self.assertEqual(result.metrics["records_per_document_p99"], 64000)
+        self.assertAlmostEqual(result.metrics["passage_duplicate_ratio"], 89358 / 400000, places=4)
+        self.assertFalse(gates["passage_duplicate_ratio"].passed)
+
+    def test_projection_churn_probe_duplicate_gate_passes_and_tolerates_old_gauges(self):
+        with tempfile.TemporaryDirectory() as directory:
+            token = self._token_file(directory)
+            clean = churn.ProjectionChurnProbe().run(make_context(FakeBrain(default_tools()), metrics_token_file=token, _metrics_get=lambda u, h, t: (200, self._metrics_text(written=500))))
+            old = churn.ProjectionChurnProbe().run(make_context(FakeBrain(default_tools()), metrics_token_file=token, _metrics_get=lambda u, h, t: (200, self._metrics_text(written=500, duplicate_rows=None))))
+        self.assertEqual(clean.status, "ok")
+        self.assertAlmostEqual(clean.metrics["passage_duplicate_ratio"], 0.01, places=4)
+        self.assertTrue({g.metric: g for g in clean.gates}["passage_duplicate_ratio"].passed)
+        self.assertEqual(old.status, "ok")
+        self.assertIsNone(old.metrics["passage_duplicate_ratio"])
+        self.assertNotIn("records_per_document_p99", old.metrics)
+        self.assertIsNone({g.metric: g for g in old.gates}["passage_duplicate_ratio"].passed)
+        self.assertTrue(any("T12" in note for note in old.notes))
 
     def test_projection_churn_probe_passes_under_target_and_handles_missing_runtime(self):
         with tempfile.TemporaryDirectory() as directory:

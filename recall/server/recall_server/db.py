@@ -1865,11 +1865,33 @@ class BrainStore:
             "passages_unembedded": -1,
             "passages_written_24h": 0,
             "passage_documents_projected_24h": 0,
+            "passage_duplicate_rows": 0,
+            "document_records_p99": 0,
         }
+        if conn.execute(
+            "SELECT to_regclass('public.canonical_evidence_documents') AS value"
+        ).fetchone()["value"]:
+            # T12: one runaway session held 1.5M records; the p99 says whether
+            # the collector's repeat collapse keeps documents bounded.
+            churn["document_records_p99"] = int(
+                conn.execute(
+                    """SELECT COALESCE(percentile_cont(0.99)
+                              WITHIN GROUP (ORDER BY record_count),0)::bigint AS n
+                       FROM canonical_evidence_documents"""
+                ).fetchone()["n"]
+            )
         if not conn.execute(
             "SELECT to_regclass('public.canonical_passages') AS value"
         ).fetchone()["value"]:
             return churn
+        # T12: passage rows beyond the first copy of each text within a
+        # tenant. Content-free: only hashes are grouped.
+        churn["passage_duplicate_rows"] = int(
+            conn.execute(
+                """SELECT count(*) - count(DISTINCT (tenant_id,text_sha256)) AS n
+                   FROM canonical_passages"""
+            ).fetchone()["n"]
+        )
         churn["passages_total"] = int(
             conn.execute(
                 """SELECT GREATEST(0, reltuples)::bigint AS n FROM pg_class

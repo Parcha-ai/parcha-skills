@@ -1011,12 +1011,17 @@ class HttpBoundaryContractTest(unittest.TestCase):
                 row = {
                     "value": (
                         "canonical_passages" if "canonical_passages" in folded
+                        else "canonical_evidence_documents" if "canonical_evidence_documents" in folded
                         else "canonical_embedding_ledger" if ledger and "canonical_embedding_ledger" in folded
                         else None
                     )
                 }
             elif "reltuples" in folded:
                 row = {"n": 400000}
+            elif "percentile_cont" in folded:
+                row = {"n": 64000}
+            elif "count(distinct (tenant_id,text_sha256))" in folded:
+                row = {"n": 89358}
             elif "not exists" in folded:
                 row = {"n": 1234}
             elif "from canonical_embedding_ledger" in folded:
@@ -1065,6 +1070,15 @@ class HttpBoundaryContractTest(unittest.TestCase):
             self.assertNotIn("tenant_id", sql)
         # Without schema 065 the ledger total is 0, never an error.
         self.assertEqual(metrics["embedding_daily_total"], 0)
+        # T12 gauges: repeated-text passage rows and records per document.
+        self.assertEqual(metrics["passage_duplicate_rows"], 89358)
+        self.assertEqual(metrics["document_records_p99"], 64000)
+        duplicate = [
+            call.args[0] for call in connection.execute.call_args_list
+            if "count(DISTINCT (tenant_id,text_sha256))" in call.args[0]
+        ]
+        self.assertEqual(len(duplicate), 1)
+        self.assertNotIn("passage_text", duplicate[0])
 
     def test_service_metrics_reports_the_embedding_ledger_window(self) -> None:
         store, connection = self._churn_store(runtime=True, ledger=True)
@@ -1096,6 +1110,7 @@ class HttpBoundaryContractTest(unittest.TestCase):
             "passages_total": 400000, "passages_unembedded": 1234,
             "passages_written_24h": 150000, "passage_documents_projected_24h": 320,
             "embedding_daily_total": 15000,
+            "passage_duplicate_rows": 89358, "document_records_p99": 64000,
         }
         with mock.patch.dict(projection_worker.PROJECTION_TOTALS, {"passages_written": 77}), \
                 mock.patch.dict(os.environ, {"RECALL_EMBEDDING_DAILY_CAP": "123456"}):
@@ -1108,6 +1123,9 @@ class HttpBoundaryContractTest(unittest.TestCase):
         self.assertIn("recall_passages_unembedded 1234\n", body)
         self.assertIn("recall_passages_total 400000\n", body)
         self.assertIn("recall_projection_passages_written_total 77\n", body)
+        self.assertIn("# TYPE recall_passage_duplicate_rows gauge\n", body)
+        self.assertIn("recall_passage_duplicate_rows 89358\n", body)
+        self.assertIn("recall_document_records_p99 64000\n", body)
         self.assertIn("# TYPE recall_projection_bodies_thinned_total counter\n", body)
         for phase in ("cycle", "embed", "passage", "logical", "parquet", "thin"):
             self.assertIn(f"# TYPE recall_projection_{phase}_elapsed_ms_total counter\n", body)
