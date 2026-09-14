@@ -336,3 +336,71 @@ class BrokerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CodexHandoffTest(BrokerTest):
+    def test_codex_notify_hands_the_thread_to_the_gateway(self):
+        codex = {"source_kind": "codex_session", "source": {"session_id": "01a08eb2-thread", "cwd": self.temp.name}}
+        first = self.call(op="notify", text="QA ready", idempotency_key="qa-1", **codex)
+        again = self.call(op="notify", text="QA ready", idempotency_key="qa-1", **codex)
+        self.assertTrue(first["ok"])
+        self.assertEqual((first["status"], first["state"], first["owner"]), ("posted", "handed_off", "gateway"))
+        self.assertEqual(again["status"], "duplicate")
+        self.assertEqual(again["thread_ts"], first["thread_ts"])
+        self.assertEqual(len(self.slack.posts), 1, "a retried notify never posts twice")
+        # No binding: the gateway's own agent owns the thread, no Codex writer lock can bite.
+        self.assertIsNone(self.slice.runtime.find_active_binding(team_id="T12345678", channel_id="C1",
+                                                                  thread_ts=first["thread_ts"]))
+        origin = self.slice.runtime.pending_origin("C1", first["thread_ts"])
+        self.assertEqual((origin["source_kind"], origin["session_id"], origin["cwd"]),
+                         ("codex_session", "01a08eb2-thread", self.temp.name))
+        # A reply in that thread is not a Tether turn.
+        fields = {"workspace": "T12345678", "channel": "C1", "thread": first["thread_ts"],
+                  "actor": "U12345678", "message_id": "1700000000.000002"}
+        self.assertIsNone(self.slice.claim(fields, "status?"))
+        self.assertEqual(self.slice.run_once(), 0)
+        # The origin note tells the agent where the work lives, once.
+        from runtime.plugin_next.active import origin_note
+        note = origin_note(origin)
+        self.assertIn("01a08eb2-thread", note)
+        self.assertIn(f"Work in {self.temp.name}", note)
+        self.slice.runtime.mark_origin_delivered("C1", first["thread_ts"])
+        self.assertIsNone(self.slice.runtime.pending_origin("C1", first["thread_ts"]))
+
+    def test_find_transcript_locates_a_codex_rollout(self):
+        from runtime.plugin_next.active import find_transcript
+        home = pathlib.Path(self.temp.name) / "codex-home"
+        day = home / "sessions" / "2026" / "09" / "11"
+        day.mkdir(parents=True)
+        (day / "rollout-2026-09-11T04-21-05-01a08eb2-9c73.jsonl").write_text("{}\n")
+        os.environ["CODEX_HOME"] = str(home)
+        try:
+            self.assertTrue(find_transcript("codex_session", "01a08eb2-9c73").endswith("01a08eb2-9c73.jsonl"))
+            self.assertIsNone(find_transcript("codex_session", "nope"))
+            self.assertIsNone(find_transcript("claude_session", "01a08eb2-9c73"))
+        finally:
+            os.environ.pop("CODEX_HOME", None)
+
+    def test_upgrade_retires_terminal_held_codex_bindings(self):
+        # Before this release a Codex notify bound the thread. Those bindings can never be driven
+        # (the terminal holds the writer), so a gateway start hands them over; spawned Codex
+        # sessions and Claude sessions keep theirs.
+        held = self.slice.bind(source_kind="codex_session", session_id="01a0-held", cwd=self.temp.name,
+                               team_id="T12345678", channel_id="C1", thread_ts="500.1", owner_user_id="U12345678")
+        owned = self.slice.bind(source_kind="codex_session", session_id="01a0-owned", cwd=self.temp.name,
+                                team_id="T12345678", channel_id="C1", thread_ts="500.2", owner_user_id="U12345678",
+                                spawned=True)
+        claude = self.slice.bind(source_kind="claude_session", session_id="c-1", cwd=self.temp.name,
+                                 team_id="T12345678", channel_id="C1", thread_ts="500.3", owner_user_id="U12345678")
+        fields = {"workspace": "T12345678", "channel": "C1", "thread": "500.1",
+                  "actor": "U12345678", "message_id": "1700000000.000009"}
+        self.assertIsNotNone(self.slice.claim(fields, "still there?"))
+        retired = self.slice.runtime.retire_codex_bindings()
+        self.assertEqual([r["thread_ts"] for r in retired], ["500.1"])
+        self.assertEqual(self.slice.runtime.binding_thread(held["binding_id"])["state"], "closed")
+        self.assertEqual(self.slice.runtime.binding_thread(owned["binding_id"])["state"], "active")
+        self.assertEqual(self.slice.runtime.binding_thread(claude["binding_id"])["state"], "active")
+        origin = self.slice.runtime.pending_origin("C1", "500.1")
+        self.assertEqual((origin["session_id"], origin["cwd"]), ("01a0-held", self.temp.name))
+        self.assertEqual(self.slice.run_once(), 0, "the queued turn is cancelled, not run against Codex")
+        self.assertEqual(self.slice.runtime.retire_codex_bindings(), [], "idempotent")

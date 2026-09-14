@@ -366,6 +366,16 @@ def register(ctx: Any) -> None:
                 # (a status notice, a denied actor, a capped peer chain) is not for the
                 # gateway's own agent either: it would answer on top of the session.
                 return {"action": "skip", "reason": "tether-bound-thread"}
+            if slice_ is not None and fields["thread"] and not fields["actor_is_bot"]:
+                origin = slice_.runtime.pending_origin(fields["channel"], fields["thread"])
+                if origin:
+                    # A thread handed off by a Codex session: the gateway's agent takes it, and the
+                    # first human message carries where the work lives.
+                    slice_.runtime.mark_origin_delivered(fields["channel"], fields["thread"])
+                    if not origin.get("transcript"):
+                        origin["transcript"] = active_module.find_transcript(origin["source_kind"], origin["session_id"])
+                    note = active_module.origin_note(origin)
+                    return {"action": "rewrite", "text": f"{note}\n\n{getattr(event, 'text', '') or ''}"}
         except Exception:  # pragma: no cover - the gateway must never break
             logger.exception("tether: observation failed; event untouched")
         return None
@@ -556,6 +566,9 @@ def _build_session_slice(
     root = home / "plugin-data" / "tether"
     root.mkdir(parents=True, exist_ok=True)
     store = store_module.Store(root / "tether.db")
+    for retired in store.retire_codex_bindings():
+        logger.warning("tether: handed Codex-bound thread %s/%s (session %s) to the gateway's agent",
+                       retired["channel_id"], retired["thread_ts"], retired["session_id"])
     imported = store.import_legacy_bindings(root / "domain.db")
     if imported:
         logger.warning("tether: imported %d active binding(s) from the legacy domain.db", imported)

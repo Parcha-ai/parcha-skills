@@ -37,6 +37,13 @@ after the process exits. The notifier rejects `--run-id` when it detects an
 rebind that exact session. Do not retry as headless, because that silently
 changes who receives the thread.
 
+A Codex session is never bound. Its writer lock belongs to the terminal or ChatGPT app
+that holds it, so Slack could never drive it. A `notify` from Codex posts the root and hands
+the thread to the gateway's own agent (`state: handed_off`, `owner: gateway`), which is told
+the Codex cwd and transcript path on the first human reply and continues the work itself.
+Claude Code and headless sessions bind as before; `tether spawn --harness codex` still binds,
+because Tether owns that Codex process.
+
 Use `--file /absolute/path` for one attachment. By default every explicitly allowlisted Hermes operator may continue the thread; pass `--owner U…` to restrict one bridge to a single Slack member.
 
 Completion criterion: the command returns a Slack thread timestamp. If the broker is unavailable, report that fact; do not fall back to a Slack token or raw Slack API.

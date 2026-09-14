@@ -68,6 +68,32 @@ def child_env(
     return env
 
 
+def find_transcript(kind: str, session_id: str) -> str | None:
+    """The posting session's transcript on this box, if it can be found (Codex rollouts by thread id)."""
+    if kind != "codex_session" or not session_id:
+        return None
+    root = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "sessions"
+    try:
+        matches = sorted(root.glob(f"**/rollout-*-{session_id}.jsonl"))
+    except OSError:
+        return None
+    return str(matches[-1]) if matches else None
+
+
+def origin_note(origin: dict[str, Any]) -> str:
+    """What the gateway's agent is told on the first human message of a handed-off thread."""
+    lines = [
+        "[Tether] This thread was opened from a Codex session on this machine that you cannot drive "
+        f"(thread {origin.get('session_id')}). You are the colleague who answers here.",
+    ]
+    if origin.get("cwd"):
+        lines.append(f"Work in {origin['cwd']}.")
+    if origin.get("transcript"):
+        lines.append(f"Its transcript is at {origin['transcript']}; read it if you need the history behind the root message.")
+    lines.append("Answer the messages below as yourself, with evidence.")
+    return " ".join(lines)
+
+
 def reply_body(text: str) -> str:
     """Drop narration that precedes the addressed reply.
 
@@ -435,8 +461,11 @@ class ActiveSlice:
         channel_id: str,
         thread_ts: str,
         owner_user_id: str,
+        spawned: bool = False,
     ) -> dict[str, Any]:
         source = {"session_id": session_id, "cwd": cwd}
+        if spawned:
+            source["spawned"] = True  # Tether owns this process: no other writer can hold it
         endpoint = self.runtime.register_endpoint(
             endpoint_key=endpoint_key_for(source_kind, session_id),
             endpoint_kind="detached_native",
@@ -749,7 +778,14 @@ class ActiveSlice:
         return {"performed": []}
 
     def op_notify(self, request: dict[str, Any]) -> dict[str, Any]:
-        """Post a root message and bind the calling session to its thread."""
+        """Post a root message and bind the calling session to its thread.
+
+        A Codex session is never bound: Codex allows one writer per thread and the
+        session that posted is open in a terminal or the ChatGPT app, so a Slack reply
+        could never reach it (2026-09-14: seven failures in five hours). The thread is
+        handed to the gateway's own agent instead, with a note saying where it came from
+        (cwd, transcript on this box) so it can continue the work as the colleague it is.
+        """
         text = str(request.get("text") or "").strip()
         file = self._file(request)
         if not text and not file:
@@ -762,6 +798,9 @@ class ActiveSlice:
         key = str(request.get("idempotency_key") or "")
         if not key:
             raise BrokerRefused("idempotency_key_required")
+        if kind == "codex_session":
+            return self._notify_handoff(request, team_id=team_id, channel_id=channel_id, key=key,
+                                        text=text, file=file, kind=kind, session_id=session_id, cwd=cwd)
         source = {"session_id": session_id, "cwd": cwd}
         endpoint = self.runtime.register_endpoint(
             endpoint_key=endpoint_key_for(kind, session_id),
@@ -785,6 +824,22 @@ class ActiveSlice:
         binding = self.runtime.activate_binding(binding["binding_id"], ts)
         return {"status": "posted", "state": "posted", "team_id": team_id, "channel_id": channel_id,
                 "thread_ts": ts, "message_ts": ts, "bridge_id": binding["binding_id"]}
+
+    def _notify_handoff(self, request: dict[str, Any], *, team_id: str, channel_id: str, key: str, text: str,
+                        file: str | None, kind: str, session_id: str, cwd: str) -> dict[str, Any]:
+        """Post the root and record where it came from; the gateway's agent owns the thread."""
+        marker = f"handoff:{team_id}:{channel_id}:{key}"
+        existing = self.runtime.find_handoff(marker)
+        if existing:
+            return {"status": "duplicate", "state": "handed_off", "team_id": team_id, "channel_id": channel_id,
+                    "thread_ts": existing, "message_ts": existing, "bridge_id": "", "owner": "gateway"}
+        ts = self._post(channel_id, text, None, file=file)
+        self.runtime.record_origin(
+            team_id=team_id, channel_id=channel_id, thread_ts=ts, source_kind=kind, session_id=session_id,
+            cwd=cwd, transcript=find_transcript(kind, session_id), handoff_key=marker,
+        )
+        return {"status": "posted", "state": "handed_off", "team_id": team_id, "channel_id": channel_id,
+                "thread_ts": ts, "message_ts": ts, "bridge_id": "", "owner": "gateway"}
 
     def op_spawn(self, request: dict[str, Any]) -> dict[str, Any]:
         """Start a fresh harness session for a task and bind it to a thread.
@@ -825,7 +880,7 @@ class ActiveSlice:
             root = str(request.get("root_text") or "").strip() or f"On it: {task[:200]}"
             thread_ts = self._post(channel_id, root, None)
         binding = self.bind(
-            source_kind=source_kind, session_id=session_id, cwd=str(cwd), team_id=team_id,
+            source_kind=source_kind, session_id=session_id, cwd=str(cwd), team_id=team_id, spawned=True,
             channel_id=channel_id, thread_ts=thread_ts, owner_user_id=self._owner(request),
         )
         first_turn = (
