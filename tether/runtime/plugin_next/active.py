@@ -68,6 +68,101 @@ def child_env(
     return env
 
 
+def find_transcript(kind: str, session_id: str) -> str | None:
+    """The posting session's transcript on this box, if it can be found (Codex rollouts by thread id)."""
+    if kind != "codex_session" or not session_id:
+        return None
+    root = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "sessions"
+    try:
+        matches = sorted(root.glob(f"**/rollout-*-{session_id}.jsonl"))
+    except OSError:
+        return None
+    return str(matches[-1]) if matches else None
+
+
+def _codex_daemon_pid(home: Path) -> int | None:
+    """PID of the process listening on the daemon control socket, via /proc (no root)."""
+    sock = home / "app-server-control" / "app-server-control.sock"
+    try:
+        inode = None
+        for line in (Path("/proc/net/unix").read_text().splitlines()[1:]):
+            parts = line.split()
+            if len(parts) >= 8 and parts[7] == str(sock):
+                inode = parts[6]
+                break
+        if inode is None:
+            return None
+        return _pid_with_fd(f"socket:[{inode}]")
+    except OSError:
+        return None
+
+
+def _pid_with_fd(target: str) -> int | None:
+    """First process (other than this one) with an fd pointing at ``target``."""
+    try:
+        for proc in Path("/proc").iterdir():
+            if not proc.name.isdigit() or int(proc.name) == os.getpid():
+                continue
+            try:
+                for fd in (proc / "fd").iterdir():
+                    if os.readlink(fd) == target:
+                        return int(proc.name)
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return None
+
+
+def codex_writer_holder(session_id: str, own_pids: set[int] | frozenset[int] = frozenset()) -> tuple[str, int | None]:
+    """Who holds a Codex thread's writer lock: ("free"|"daemon"|"ours"|"held", pid).
+
+    Codex keeps one writer per thread as a flock on ~/.codex/thread-writer-locks/<id>.lock.
+    The daemon (what the ChatGPT app drives) and Tether's own child are drivable; a
+    terminal ``codex resume`` is not, and that thread must be handed to the gateway's agent.
+    """
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    lock = home / "thread-writer-locks" / f"{session_id}.lock"
+    if not lock.exists():
+        return "free", None
+    try:
+        import fcntl
+        fd = os.open(lock, os.O_RDWR)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                return "free", None
+            except OSError:
+                pass
+        finally:
+            os.close(fd)
+    except OSError:
+        return "free", None
+    holder = _pid_with_fd(str(lock))
+    if holder is None:
+        return "held", None
+    if holder in own_pids:
+        return "ours", holder
+    if holder == _codex_daemon_pid(home):
+        return "daemon", holder
+    return "held", holder
+
+
+def origin_note(origin: dict[str, Any]) -> str:
+    """What the gateway's agent is told on the first human message of a handed-off thread."""
+    lines = [
+        "[Tether] This thread belongs to a Codex session on this machine that is open in a terminal, "
+        f"so it cannot be driven from here (thread {origin.get('session_id')}). You are the colleague who answers.",
+    ]
+    if origin.get("cwd"):
+        lines.append(f"Work in {origin['cwd']}.")
+    if origin.get("transcript"):
+        lines.append(f"Its transcript is at {origin['transcript']}; read it if you need the history behind the root message.")
+    lines.append("Answer the messages below as yourself, with evidence.")
+    return " ".join(lines)
+
+
 def reply_body(text: str) -> str:
     """Drop narration that precedes the addressed reply.
 
@@ -435,8 +530,11 @@ class ActiveSlice:
         channel_id: str,
         thread_ts: str,
         owner_user_id: str,
+        spawned: bool = False,
     ) -> dict[str, Any]:
         source = {"session_id": session_id, "cwd": cwd}
+        if spawned:
+            source["spawned"] = True  # Tether owns this process: no other writer can hold it
         endpoint = self.runtime.register_endpoint(
             endpoint_key=endpoint_key_for(source_kind, session_id),
             endpoint_kind="detached_native",
@@ -479,6 +577,8 @@ class ActiveSlice:
         )
         if binding is None:
             return None
+        if self._hand_off_if_held(binding):
+            return None
         if peer and self.settings.peer_chain_limit > 0:
             recent = self.runtime.recent_turn_actors(binding["binding_id"], self.settings.peer_chain_limit)
             if (len(recent) >= self.settings.peer_chain_limit and actor in peers
@@ -509,6 +609,23 @@ class ActiveSlice:
             # colleague reacts before they go and do the thing.
             self._react(binding["channel_id"], message_id, self.settings.ack_emoji)
         return {"binding_id": binding["binding_id"], "event_key": event_key}
+
+    def _hand_off_if_held(self, binding: dict[str, Any]) -> bool:
+        """A Codex thread open in a terminal on this box goes to the gateway's agent, now."""
+        endpoint = self.runtime.endpoint(binding["endpoint_id"])
+        if not endpoint or endpoint.get("source_kind") != "codex_session":
+            return False
+        source = endpoint.get("source") or {}
+        session_id = str(source.get("session_id") or "")
+        own = getattr(self.driver, "codex_pids", lambda: set())()
+        state, pid = codex_writer_holder(session_id, own)
+        if state != "held":
+            return False
+        self.runtime.hand_off_binding(binding["binding_id"], source_kind="codex_session", session_id=session_id,
+                                      cwd=source.get("cwd"))
+        logger.warning("tether: codex thread %s is held by pid %s; thread %s/%s handed to the gateway's agent",
+                       session_id, pid, binding["channel_id"], binding["thread_ts"])
+        return True
 
     def _react(self, channel_id: str, message_ts: str, emoji: str) -> None:
         if not self.settings.presence or not message_ts or not emoji:
@@ -749,7 +866,12 @@ class ActiveSlice:
         return {"performed": []}
 
     def op_notify(self, request: dict[str, Any]) -> dict[str, Any]:
-        """Post a root message and bind the calling session to its thread."""
+        """Post a root message and bind the calling session to its thread.
+
+        Codex turns run on the machine's app-server daemon (the session the ChatGPT app
+        shows); a thread open in a terminal is handed to the gateway's agent at claim time
+        (see codex_writer_holder), never left failing (2026-09-14: seven failures in five hours).
+        """
         text = str(request.get("text") or "").strip()
         file = self._file(request)
         if not text and not file:
@@ -825,7 +947,7 @@ class ActiveSlice:
             root = str(request.get("root_text") or "").strip() or f"On it: {task[:200]}"
             thread_ts = self._post(channel_id, root, None)
         binding = self.bind(
-            source_kind=source_kind, session_id=session_id, cwd=str(cwd), team_id=team_id,
+            source_kind=source_kind, session_id=session_id, cwd=str(cwd), team_id=team_id, spawned=True,
             channel_id=channel_id, thread_ts=thread_ts, owner_user_id=self._owner(request),
         )
         first_turn = (

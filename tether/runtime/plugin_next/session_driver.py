@@ -17,11 +17,14 @@ Store keeps the absolute path as ``response_ref``.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
 import queue
 import shutil
+import socket
+import struct
 import subprocess  # nosec B404 - fixed argv, no shell
 import threading
 import time
@@ -121,58 +124,287 @@ class SessionProcess:
                 self.process.kill()
 
 
-class CodexAppServer:
-    """One ``codex app-server`` child per gateway, JSON-RPC over stdio.
+def codex_daemon_socket() -> Path | None:
+    """The local ``codex app-server`` daemon's control socket, if one is running here.
 
-    Probe on greppy3 (2026-09-08): with ``-c mcp_servers={}`` a turn completes in
-    ~7 s; the reply is the ``agentMessage`` items on ``turn/completed``. Threads
-    are resumed once per binding with ``thread/resume`` and then driven with
-    ``turn/start``. MCP servers from ~/.codex/config.toml are disabled for Tether
-    turns because their start-up stalled turns in the probe.
+    The ChatGPT desktop app and ``codex app-server proxy`` talk to this daemon, and it
+    holds the writer lock of every thread it has loaded. Driving a thread through it
+    is driving the same session the human sees in the app.
+    """
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    path = home / "app-server-control" / "app-server-control.sock"
+    return path if path.is_socket() else None
+
+
+def ws_frame(data: bytes, *, mask: bool, opcode: int = 0x1) -> bytes:
+    n = len(data)
+    head = bytes([0x80 | opcode])
+    flag = 0x80 if mask else 0
+    if n < 126:
+        head += bytes([flag | n])
+    elif n < 65536:
+        head += bytes([flag | 126]) + struct.pack(">H", n)
+    else:
+        head += bytes([flag | 127]) + struct.pack(">Q", n)
+    if not mask:
+        return head + data
+    key = os.urandom(4)
+    return head + key + bytes(b ^ key[i % 4] for i, b in enumerate(data))
+
+
+def ws_read_frame(sock: socket.socket) -> tuple[int, bytes] | None:
+    """One frame as (opcode, payload); None when the peer closed. See ws_read_message for fragments."""
+    def exact(n: int) -> bytes:
+        buf = b""
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("closed")
+            buf += chunk
+        return buf
+    try:
+        head = exact(2)
+        opcode, n = head[0] & 0x0F, head[1] & 0x7F
+        masked = bool(head[1] & 0x80)
+        if n == 126:
+            n = struct.unpack(">H", exact(2))[0]
+        elif n == 127:
+            n = struct.unpack(">Q", exact(8))[0]
+        key = exact(4) if masked else b""
+        payload = exact(n)
+        if masked:
+            payload = bytes(b ^ key[i % 4] for i, b in enumerate(payload))
+        return opcode, payload
+    except (OSError, ConnectionError):
+        return None
+
+
+class WsReader:
+    """Reassembles one WebSocket message at a time (FIN=0 ... opcode 0 FIN=1).
+
+    Control frames (ping/pong/close) may interleave with fragments; they are returned on
+    their own and the partial message survives across calls.
     """
 
-    QUIET_AFTER = 10.0  # seconds of silence after an agentMessage that end a turn without turn/completed
+    def __init__(self, sock: socket.socket):
+        self.sock = sock
+        self._opcode: int | None = None
+        self._parts: list[bytes] = []
+
+    def read(self) -> tuple[int, bytes] | None:
+        """One complete message or control frame as (opcode, payload); None when closed."""
+        while True:
+            frame = _ws_read_frame_fin(self.sock)
+            if frame is None:
+                return None
+            fin, op, payload = frame
+            if op >= 0x8:
+                return op, payload
+            if op != 0x0:
+                self._opcode, self._parts = op, [payload]
+            else:
+                self._parts.append(payload)
+            if fin:
+                opcode, parts = (self._opcode if self._opcode is not None else 0x1), self._parts
+                self._opcode, self._parts = None, []
+                return opcode, b"".join(parts)
+
+
+def ws_read_message(sock: socket.socket) -> tuple[int, bytes] | None:
+    """One complete message from a fresh reader (tests and one-off probes)."""
+    return WsReader(sock).read()
+
+
+def _ws_read_frame_fin(sock: socket.socket) -> tuple[bool, int, bytes] | None:
+    def exact(n: int) -> bytes:
+        buf = b""
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("closed")
+            buf += chunk
+        return buf
+    try:
+        head = exact(2)
+        fin, opcode, n = bool(head[0] & 0x80), head[0] & 0x0F, head[1] & 0x7F
+        masked = bool(head[1] & 0x80)
+        if n == 126:
+            n = struct.unpack(">H", exact(2))[0]
+        elif n == 127:
+            n = struct.unpack(">Q", exact(8))[0]
+        key = exact(4) if masked else b""
+        payload = exact(n)
+        if masked:
+            payload = bytes(b ^ key[i % 4] for i, b in enumerate(payload))
+        return fin, opcode, payload
+    except (OSError, ConnectionError):
+        return None
+
+
+class _StdioTransport:
+    """JSON lines over a child process's pipes (Tether's own ``codex app-server``)."""
 
     def __init__(self, argv: list[str], cwd: Path, env: dict[str, str], popen: Callable[..., subprocess.Popen]):
         self.process = popen(  # nosec B603 - fixed argv, no shell
             argv, cwd=str(cwd), env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, bufsize=1, start_new_session=True,
         )
+        self.kind = "child"
+
+    def lines(self):
+        stdout = self.process.stdout
+        if stdout is None:  # pragma: no cover
+            return
+        try:
+            yield from stdout
+        except (OSError, ValueError):
+            return
+
+    def send(self, line: str) -> None:
+        if self.process.stdin is None:  # pragma: no cover
+            raise OSError("app-server has no stdin")
+        self.process.stdin.write(line + "\n")
+        self.process.stdin.flush()
+
+    def alive(self) -> bool:
+        return self.process.poll() is None
+
+    def pids(self) -> set[int]:
+        return {self.process.pid}
+
+    def close(self) -> None:
+        try:
+            if self.process.stdin is not None:
+                self.process.stdin.close()
+        except (OSError, ValueError):
+            pass
+        try:
+            self.process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+
+
+class _DaemonTransport:
+    """JSON-RPC over a WebSocket on the daemon's Unix control socket (RFC 6455, text frames)."""
+
+    def __init__(self, path: Path, timeout: float = 10.0):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(timeout)
+        self.sock.connect(str(path))
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall(
+            ("GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+             f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+        reply = b""
+        while b"\r\n\r\n" not in reply:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise OSError("codex daemon closed the handshake")
+            reply += chunk
+        if b" 101 " not in reply.split(b"\r\n", 1)[0]:
+            raise OSError("codex daemon refused the websocket: " + reply.split(b"\r\n", 1)[0].decode(errors="replace"))
+        self.sock.settimeout(None)
+        self._open = True
+        self._wlock = threading.Lock()
+        self.kind = "daemon"
+
+    def lines(self):
+        reader = WsReader(self.sock)
+        while self._open:
+            frame = reader.read()
+            if frame is None:
+                break
+            opcode, payload = frame
+            if opcode == 0x8:
+                break
+            if opcode == 0x9:
+                with self._wlock:
+                    try:
+                        self.sock.sendall(ws_frame(payload, mask=True, opcode=0xA))
+                    except OSError:
+                        break
+                continue
+            if opcode in (0x1, 0x2):
+                yield payload.decode("utf-8", errors="replace")
+        self._open = False
+
+    def send(self, line: str) -> None:
+        with self._wlock:
+            self.sock.sendall(ws_frame(line.encode("utf-8"), mask=True))
+
+    def alive(self) -> bool:
+        return self._open
+
+    def pids(self) -> set[int]:
+        return set()
+
+    def close(self) -> None:
+        self._open = False
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+class CodexAppServer:
+    """One Codex app-server per gateway, JSON-RPC over a transport.
+
+    Preferred transport: the machine's ``codex app-server`` daemon (the one the ChatGPT
+    desktop app drives), so a Slack turn runs inside the very session the human has
+    open and shows up there. Fallback: Tether's own child app-server over stdio.
+
+    Probe on greppy3 (2026-09-08): with ``-c mcp_servers={}`` a child turn completes in
+    ~7 s; the reply is the ``agentMessage`` items on ``turn/completed``. Threads are
+    resumed once per binding with ``thread/resume`` and then driven with ``turn/start``.
+    """
+
+    QUIET_AFTER = 10.0  # seconds of silence after an agentMessage that end a turn without turn/completed
+
+    def __init__(self, transport: Any):
+        self.transport = transport
+        self.kind = getattr(transport, "kind", "child")
         self._events: queue.Queue[dict[str, Any] | None] = queue.Queue()
         self._next_id = 1
         self._resumed: set[str] = set()
         self.lock = threading.Lock()
         self.last_used = time.monotonic()
         threading.Thread(target=self._pump, name="tether-codex-app-server", daemon=True).start()
-        self._call("initialize", {"clientInfo": {"name": "tether", "version": "0.4.0"}, "capabilities": {}}, 30)
+        self._call("initialize", {"clientInfo": {"name": "tether", "title": "Tether", "version": "0.4.0"},
+                                  "capabilities": {}}, 30)
         self._notify("initialized", {})
 
+    @classmethod
+    def spawn(cls, argv: list[str], cwd: Path, env: dict[str, str], popen: Callable[..., subprocess.Popen]) -> "CodexAppServer":
+        return cls(_StdioTransport(argv, cwd, env, popen))
+
+    @classmethod
+    def connect(cls, path: Path) -> "CodexAppServer":
+        return cls(_DaemonTransport(path))
+
     def _pump(self) -> None:
-        stdout = self.process.stdout
-        if stdout is None:  # pragma: no cover
-            self._events.put(None)
-            return
         try:
-            for line in stdout:
+            for line in self.transport.lines():
                 try:
                     event = json.loads(line)
                 except ValueError:
                     continue
                 if isinstance(event, dict):
                     self._events.put(event)
-        except (OSError, ValueError):
-            pass
         finally:
             self._events.put(None)
 
+    def pids(self) -> set[int]:
+        return set(self.transport.pids())
+
     def alive(self) -> bool:
-        return self.process.poll() is None
+        return bool(self.transport.alive())
 
     def _send(self, payload: dict[str, Any]) -> None:
-        if self.process.stdin is None:  # pragma: no cover
-            raise OSError("app-server has no stdin")
-        self.process.stdin.write(json.dumps(payload) + "\n")
-        self.process.stdin.flush()
+        self.transport.send(json.dumps(payload))
 
     def _notify(self, method: str, params: dict[str, Any]) -> None:
         self._send({"jsonrpc": "2.0", "method": method, "params": params})
@@ -206,15 +438,17 @@ class CodexAppServer:
         self._call("turn/start", {"threadId": thread_id, "cwd": str(cwd), "approvalPolicy": approval,
                                   "input": [{"type": "text", "text": text}]}, 30)
         deadline = time.monotonic() + timeout
-        messages: list[str] = []          # agentMessage texts as items complete
-        last_message_at: float | None = None
+        messages: list[str] = []          # final-phase agentMessage texts as items complete
+        last_event_at = time.monotonic()  # any event on this thread: the turn is alive
         quiet_after = self.QUIET_AFTER
         while True:
             now = time.monotonic()
             if now >= deadline:
                 return {"text": "\n".join(messages), "status": "timeout", "error": "turn timed out"}
-            if messages and last_message_at is not None and now - last_message_at > quiet_after:
-                # Some providers never send turn/completed; the last agentMessage is the reply.
+            if messages and now - last_event_at > quiet_after:
+                # Some providers never send turn/completed: a final answer followed by silence
+                # is the reply. A preamble ("I'll read the thread...") is commentary, never
+                # counted, and any event (a command running, a delta) keeps the turn alive.
                 return {"text": "\n".join(messages), "status": "completed", "error": None}
             try:
                 event = self._events.get(timeout=min(deadline - now, 1.0))
@@ -226,11 +460,12 @@ class CodexAppServer:
             params = event.get("params") or {}
             if params.get("threadId") not in (None, thread_id):
                 continue
+            last_event_at = time.monotonic()
             if method == "item/completed":
                 item = params.get("item") or {}
-                if item.get("type") == "agentMessage" and (item.get("text") or "").strip():
+                if (item.get("type") == "agentMessage" and (item.get("text") or "").strip()
+                        and item.get("phase") in (None, "", "final_answer")):
                     messages.append(str(item["text"]))
-                    last_message_at = time.monotonic()
             elif method == "turn/completed":
                 turn = params.get("turn") or {}
                 items = [i for i in turn.get("items") or [] if i.get("type") == "agentMessage" and (i.get("text") or "").strip()]
@@ -241,19 +476,7 @@ class CodexAppServer:
                         "error": (error.get("message") if isinstance(error, dict) else error) if error else None}
 
     def terminate(self) -> None:
-        try:
-            if self.process.stdin is not None:
-                self.process.stdin.close()
-        except (OSError, ValueError):
-            pass
-        try:
-            self.process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
+        self.transport.close()
 
 
 class SessionDriver:
@@ -393,13 +616,26 @@ class SessionDriver:
         with self._lock:
             if self._codex is not None and self._codex.alive():
                 return self._codex
+            daemon = codex_daemon_socket()
+            if daemon is not None:
+                try:
+                    self._codex = CodexAppServer.connect(daemon)
+                    logger.info("tether: codex turns run on the machine daemon at %s", daemon)
+                    return self._codex
+                except (OSError, RuntimeError, TimeoutError) as exc:
+                    logger.warning("tether: codex daemon at %s unusable (%s); starting a child app-server", daemon, exc)
             binary = shutil.which(self.settings.codex_binary) or self.settings.codex_binary
             command = [binary, "app-server", "-c", "mcp_servers={}"]
             env = self._child_env(passthrough=self.settings.harness_env)
             argv, popen_env, launcher = self._launch_plan(command, cwd, env, self.settings)
             logger.info("tether: codex app-server launcher=%s", launcher)
-            self._codex = CodexAppServer(argv, cwd, popen_env, self._popen)
+            self._codex = CodexAppServer.spawn(argv, cwd, popen_env, self._popen)
             return self._codex
+
+    def codex_pids(self) -> set[int]:
+        """PIDs of Tether's own Codex app-server child, if one is running (none for the daemon)."""
+        with self._lock:
+            return self._codex.pids() if self._codex is not None and self._codex.alive() else set()
 
     def _run_codex_app_server_turn(
         self, attempt_id: str, session_id: str, prompt: str, cwd: Path, timeout_seconds: float,

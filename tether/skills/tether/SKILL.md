@@ -37,6 +37,13 @@ after the process exits. The notifier rejects `--run-id` when it detects an
 rebind that exact session. Do not retry as headless, because that silently
 changes who receives the thread.
 
+Codex turns run on the machine's `codex app-server` daemon when one is running (the one
+the ChatGPT desktop app drives), so a Slack reply acts inside the very session the human
+has open and shows up there. Without a daemon Tether starts its own app-server. A Codex
+thread open in a terminal (`codex resume`) holds its writer lock and cannot be driven from
+anywhere else: Tether hands that thread to the gateway's own agent, which is told the
+Codex cwd and transcript path on the first human reply and continues the work itself.
+
 Use `--file /absolute/path` for one attachment. By default every explicitly allowlisted Hermes operator may continue the thread; pass `--owner U…` to restrict one bridge to a single Slack member.
 
 Completion criterion: the command returns a Slack thread timestamp. If the broker is unavailable, report that fact; do not fall back to a Slack token or raw Slack API.

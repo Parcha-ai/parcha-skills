@@ -372,6 +372,21 @@ class ActiveSliceTest(unittest.TestCase):
             # or a status notice: the thread belongs to its session.
             self.assertEqual(hook(event=FakeEvent("hi", user_id="U_STRANGER")),
                              {"action": "skip", "reason": "tether-bound-thread"})
+            # A thread handed off by a Codex session is the gateway agent's own: the first human
+            # message is rewritten with where the work lives, later ones pass untouched.
+            from runtime.plugin_next.store import Store
+            Store(home / "plugin-data" / "tether" / "tether.db").record_origin(team_id="T12345678", channel_id="C1", thread_ts="400.1",
+                                         source_kind="codex_session", session_id="01a08eb2-x",
+                                         cwd=self.temp.name, transcript=None)
+            first = hook(event=FakeEvent("status?", thread="400.1"))
+            self.assertEqual(first["action"], "rewrite")
+            self.assertTrue(first["text"].startswith("[Tether] This thread belongs to a Codex session"))
+            self.assertIn("01a08eb2-x", first["text"])
+            self.assertTrue(first["text"].endswith("\n\nstatus?"))
+            self.assertIsNone(hook(event=FakeEvent("and now?", thread="400.1")))
+            bot = FakeEvent("housekeeping", thread="400.1")
+            bot.source.is_bot = True
+            self.assertIsNone(hook(event=bot))
             for callback in ctx.unload:
                 callback()
         finally:

@@ -361,6 +361,16 @@ def register(ctx: Any) -> None:
                 # fallback) is a message for nobody; answering it is how a thread fills with bots
                 # narrating each other's status. Bound or not, the agent never sees it.
                 return {"action": "skip", "reason": "peer-status-notice"}
+            if slice_ is not None and fields["thread"] and not fields["actor_is_bot"]:
+                origin = slice_.runtime.pending_origin(fields["channel"], fields["thread"])
+                if origin:
+                    # A Codex thread held by a terminal was handed off (just now in claim, or earlier): the
+                    # gateway's agent takes it, and the first human message carries where the work lives.
+                    slice_.runtime.mark_origin_delivered(fields["channel"], fields["thread"])
+                    if not origin.get("transcript"):
+                        origin["transcript"] = active_module.find_transcript(origin["source_kind"], origin["session_id"])
+                    note = active_module.origin_note(origin)
+                    return {"action": "rewrite", "text": f"{note}\n\n{getattr(event, 'text', '') or ''}"}
             if slice_ is not None and fields["thread"] and (fields["channel"], fields["thread"]) in bound_threads_now:
                 # A bound thread belongs to its session. Whatever was not admitted here
                 # (a status notice, a denied actor, a capped peer chain) is not for the

@@ -62,6 +62,18 @@ CREATE TABLE IF NOT EXISTS turns(
   updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS turns_binding_state ON turns(binding_id, state, ordered_at);
+CREATE TABLE IF NOT EXISTS thread_origins(
+  team_id TEXT NOT NULL,
+  channel_id TEXT NOT NULL,
+  thread_ts TEXT NOT NULL,
+  source_kind TEXT NOT NULL,        -- the session that posted the root (codex_session)
+  session_id TEXT NOT NULL,
+  cwd TEXT,
+  transcript TEXT,                  -- the session's transcript on this box, if found
+  delivered_at TEXT,                -- when the origin note reached the gateway's agent
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(team_id, channel_id, thread_ts)
+);
 CREATE TABLE IF NOT EXISTS attempts(
   attempt_id TEXT PRIMARY KEY,
   endpoint_id TEXT NOT NULL,
@@ -170,6 +182,11 @@ class Store:
             self._db.commit()
             return self._endpoint_view(self._db.execute(
                 "SELECT * FROM endpoints WHERE endpoint_id=?", (endpoint_id,)).fetchone())
+
+    def endpoint(self, endpoint_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM endpoints WHERE endpoint_id=?", (endpoint_id,)).fetchone()
+        return self._endpoint_view(row) if row else None
 
     def _endpoint_view(self, row: sqlite3.Row) -> dict[str, Any]:
         return {
@@ -361,6 +378,58 @@ class Store:
         return actors
 
     # -- scheduling -----------------------------------------------------------------
+
+    # -- thread origins: a thread handed to the gateway's own agent, with where it came from.
+    # Codex threads live in a process Tether may not own; see active.codex_writer_holder.
+
+    def record_origin(self, *, team_id: str, channel_id: str, thread_ts: str, source_kind: str, session_id: str,
+                      cwd: str | None, transcript: str | None) -> dict[str, Any]:
+        with self._lock:
+            self._db.execute(
+                "INSERT OR REPLACE INTO thread_origins(team_id,channel_id,thread_ts,source_kind,session_id,cwd,"
+                "transcript,delivered_at,created_at) VALUES(?,?,?,?,?,?,?,NULL,?)",
+                (team_id, channel_id, thread_ts, source_kind, session_id, cwd, transcript, _now()))
+            self._db.commit()
+        return self.pending_origin(channel_id, thread_ts) or {}
+
+    def hand_off_binding(self, binding_id: str, *, source_kind: str, session_id: str, cwd: str | None) -> dict[str, Any]:
+        """Close a binding whose session cannot be driven and make the thread an origin.
+
+        Used when a Codex thread's writer lock is held by a terminal or another process on
+        this box. Ready turns are cancelled (codex_handoff); the gateway's own agent takes
+        the thread from the next human message, note included.
+        """
+        with self._lock:
+            row = self._db.execute("SELECT * FROM bindings WHERE binding_id=?", (binding_id,)).fetchone()
+            if row is None:
+                raise StoreError("binding_unknown")
+            now = _now()
+            self._db.execute(
+                "UPDATE turns SET state='cancelled', error_code='codex_handoff', updated_at=? "
+                "WHERE binding_id=? AND state='ready'", (now, binding_id))
+            self._db.execute(
+                "UPDATE bindings SET state='closed', generation=generation+1, updated_at=? WHERE binding_id=?",
+                (now, binding_id))
+            self._db.execute(
+                "INSERT OR REPLACE INTO thread_origins(team_id,channel_id,thread_ts,source_kind,session_id,cwd,"
+                "transcript,delivered_at,created_at) VALUES(?,?,?,?,?,?,NULL,NULL,?)",
+                (row["team_id"], row["channel_id"], row["thread_ts"], source_kind, session_id, cwd, now))
+            self._db.commit()
+        return {"binding_id": binding_id, "channel_id": row["channel_id"], "thread_ts": row["thread_ts"]}
+
+    def pending_origin(self, channel_id: str, thread_ts: str) -> dict[str, Any] | None:
+        """The origin of a handed-off thread whose note has not reached the agent yet."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM thread_origins WHERE channel_id=? AND thread_ts=? AND delivered_at IS NULL",
+                (channel_id, thread_ts)).fetchone()
+        return dict(row) if row else None
+
+    def mark_origin_delivered(self, channel_id: str, thread_ts: str) -> None:
+        with self._lock:
+            self._db.execute("UPDATE thread_origins SET delivered_at=? WHERE channel_id=? AND thread_ts=?",
+                             (_now(), channel_id, thread_ts))
+            self._db.commit()
 
     def endpoints_with_ready_turns(self) -> list[str]:
         with self._lock:

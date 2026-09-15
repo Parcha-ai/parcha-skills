@@ -336,3 +336,95 @@ class BrokerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CodexHandoffTest(BrokerTest):
+    def bind_codex(self, thread, session_id, spawned=False):
+        return self.slice.bind(source_kind="codex_session", session_id=session_id, cwd=self.temp.name,
+                               team_id="T12345678", channel_id="C1", thread_ts=thread, owner_user_id="U12345678",
+                               spawned=spawned)
+
+    def fields(self, thread, ts):
+        return {"workspace": "T12345678", "channel": "C1", "thread": thread, "actor": "U12345678", "message_id": ts}
+
+    def test_codex_notify_binds_and_a_drivable_thread_is_claimed(self):
+        from unittest import mock
+        codex = {"source_kind": "codex_session", "source": {"session_id": "01a08eb2-thread", "cwd": self.temp.name}}
+        first = self.call(op="notify", text="QA ready", idempotency_key="qa-1", **codex)
+        self.assertTrue(first["ok"])
+        self.assertEqual(first["status"], "posted")
+        self.assertIsNotNone(self.slice.runtime.find_active_binding(team_id="T12345678", channel_id="C1",
+                                                                     thread_ts=first["thread_ts"]))
+        for state in ("free", "daemon", "ours"):
+            with mock.patch.object(sys.modules[type(self.slice).__module__], "codex_writer_holder", return_value=(state, 7)):
+                claimed = self.slice.claim(self.fields(first["thread_ts"], f"1700000000.0000{len(state)}"), "status?")
+            self.assertIsNotNone(claimed, f"a {state} writer is drivable")
+        self.assertIsNone(self.slice.runtime.pending_origin("C1", first["thread_ts"]))
+
+    def test_terminal_held_codex_thread_hands_off_at_claim(self):
+        from unittest import mock
+        held = self.bind_codex("500.1", "01a0-held")
+        claude = self.slice.bind(source_kind="claude_session", session_id="c-1", cwd=self.temp.name,
+                                 team_id="T12345678", channel_id="C1", thread_ts="500.3", owner_user_id="U12345678")
+        with mock.patch.object(sys.modules[type(self.slice).__module__], "codex_writer_holder", return_value=("held", 4242)) as holder:
+            self.assertIsNone(self.slice.claim(self.fields("500.1", "1700000000.000009"), "still there?"))
+            self.assertIsNotNone(self.slice.claim(self.fields("500.3", "1700000000.000010"), "claude is fine"))
+        holder.assert_called_once_with("01a0-held", set())
+        self.assertEqual(self.slice.runtime.binding_thread(held["binding_id"])["state"], "closed")
+        self.assertEqual(self.slice.runtime.binding_thread(claude["binding_id"])["state"], "active")
+        origin = self.slice.runtime.pending_origin("C1", "500.1")
+        self.assertEqual((origin["source_kind"], origin["session_id"], origin["cwd"]),
+                         ("codex_session", "01a0-held", self.temp.name))
+        # The note tells the gateway's agent where the work lives, once.
+        from runtime.plugin_next.active import origin_note
+        note = origin_note(origin)
+        self.assertIn("01a0-held", note)
+        self.assertIn(f"Work in {self.temp.name}", note)
+        self.slice.runtime.mark_origin_delivered("C1", "500.1")
+        self.assertIsNone(self.slice.runtime.pending_origin("C1", "500.1"))
+        # Nothing was queued against the terminal-held thread; only the Claude turn runs.
+        self.assertEqual(self.slice.run_once(), 1)
+        self.assertEqual(self.slice.run_once(), 0)
+
+    def test_codex_writer_holder_reads_the_flock(self):
+        import subprocess
+        import sys
+        import time
+        from runtime.plugin_next.active import codex_writer_holder
+        home = pathlib.Path(self.temp.name) / "codex-home"
+        locks = home / "thread-writer-locks"
+        locks.mkdir(parents=True)
+        os.environ["CODEX_HOME"] = str(home)
+        try:
+            self.assertEqual(codex_writer_holder("nolock"), ("free", None))
+            (locks / "free.lock").write_text("")
+            self.assertEqual(codex_writer_holder("free"), ("free", None))
+            (locks / "held.lock").write_text("")
+            holder = subprocess.Popen([sys.executable, "-c",
+                                       "import fcntl,os,sys,time; fd=os.open(sys.argv[1], os.O_RDWR); "
+                                       "fcntl.flock(fd, fcntl.LOCK_EX); print('locked', flush=True); time.sleep(30)",
+                                       str(locks / "held.lock")], stdout=subprocess.PIPE, text=True)
+            try:
+                self.assertEqual(holder.stdout.readline().strip(), "locked")
+                time.sleep(0.1)
+                self.assertEqual(codex_writer_holder("held"), ("held", holder.pid))
+                self.assertEqual(codex_writer_holder("held", {holder.pid}), ("ours", holder.pid))
+            finally:
+                holder.kill()
+                holder.wait()
+        finally:
+            os.environ.pop("CODEX_HOME", None)
+
+    def test_find_transcript_locates_a_codex_rollout(self):
+        from runtime.plugin_next.active import find_transcript
+        home = pathlib.Path(self.temp.name) / "codex-home"
+        day = home / "sessions" / "2026" / "09" / "11"
+        day.mkdir(parents=True)
+        (day / "rollout-2026-09-11T04-21-05-01a08eb2-9c73.jsonl").write_text("{}\n")
+        os.environ["CODEX_HOME"] = str(home)
+        try:
+            self.assertTrue(find_transcript("codex_session", "01a08eb2-9c73").endswith("01a08eb2-9c73.jsonl"))
+            self.assertIsNone(find_transcript("codex_session", "nope"))
+            self.assertIsNone(find_transcript("claude_session", "01a08eb2-9c73"))
+        finally:
+            os.environ.pop("CODEX_HOME", None)

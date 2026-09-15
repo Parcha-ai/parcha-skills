@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import struct
 import sys
 import tempfile
 import unittest
@@ -25,6 +26,7 @@ class SessionDriverTests(unittest.TestCase):
         self.fake = write_fake_claude(root)
         self.log = root / "turns.log"
         os.environ["FAKE_LOG"] = str(self.log)
+        os.environ["CODEX_HOME"] = str(root / "no-codex")  # never the machine's real daemon
         self.store = Store(root / "tether.db")
         self.fake_codex = write_fake_codex(root)
         self.settings = active.ActiveSettings(
@@ -53,6 +55,7 @@ class SessionDriverTests(unittest.TestCase):
         self.driver.shutdown()
         self.store.close()
         os.environ.pop("FAKE_LOG", None)
+        os.environ.pop("CODEX_HOME", None)
         self.temp.cleanup()
 
     def fields(self, ts: str, actor: str = "U12345678") -> dict:
@@ -192,6 +195,24 @@ class SessionDriverTests(unittest.TestCase):
             CodexAppServer.QUIET_AFTER = previous
             os.environ.pop("FAKE_CODEX_NO_COMPLETE", None)
 
+    def test_codex_preamble_and_a_long_tool_call_do_not_end_the_turn(self):
+        # 2026-09-15 C09NKJDMV7C: Codex said "I'll read the thread" then ran exec for minutes;
+        # the preamble was posted as the reply and the real answer never reached Slack.
+        from runtime.plugin_next.session_driver import CodexAppServer
+        os.environ["FAKE_CODEX_PREAMBLE"] = "1.5"
+        previous = CodexAppServer.QUIET_AFTER
+        CodexAppServer.QUIET_AFTER = 0.5
+        try:
+            self.bind_codex()
+            self.slice.claim(self.codex_fields("500.2"), "ptal")
+            self.assertEqual(self.slice.run_once(), 1)
+            self.assertEqual(len(self.sent), 1)
+            self.assertIn("codex turn 1 of pid", self.sent[0][2], "the final answer is the reply")
+            self.assertNotIn("read the thread", self.sent[0][2])
+        finally:
+            CodexAppServer.QUIET_AFTER = previous
+            os.environ.pop("FAKE_CODEX_PREAMBLE", None)
+
     def test_codex_no_reply_is_silence(self):
         os.environ["FAKE_CODEX_REPLY"] = "NO_REPLY"
         try:
@@ -210,3 +231,70 @@ class SessionDriverTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CodexDaemonTests(SessionDriverTests):
+    def test_codex_turns_prefer_the_machine_daemon(self):
+        from tests.fakes import FakeCodexDaemon
+        home = Path(self.temp.name) / "codex-home"
+        daemon = FakeCodexDaemon(home)
+        os.environ["CODEX_HOME"] = str(home)
+        try:
+            self.bind_codex()
+            self.slice.claim(self.codex_fields("500.2"), "first")
+            self.assertEqual(self.slice.run_once(), 1)
+            self.slice.claim(self.codex_fields("500.3"), "second")
+            self.assertEqual(self.slice.run_once(), 1)
+            self.assertEqual(len(daemon.turns), 2)
+            self.assertIn("first", daemon.turns[0][1], "the Slack text is in the turn's input")
+            self.assertIn("second", daemon.turns[1][1])
+            self.assertEqual(daemon.turns[0][0], "thread-abc")
+            self.assertEqual(self.sent[0][2], "daemon turn 1")
+            self.assertEqual(self.sent[1][2], "daemon turn 2")
+            self.assertEqual(daemon.clients, 1, "one connection per gateway, reused across turns")
+            self.assertFalse(self.log.exists(), "no child app-server was started")
+            self.assertEqual(self.driver.codex_pids(), set())
+        finally:
+            daemon.close()
+
+    def test_dead_daemon_socket_falls_back_to_a_child(self):
+        import socket
+        home = Path(self.temp.name) / "codex-home"
+        control = home / "app-server-control"
+        control.mkdir(parents=True)
+        dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        dead.bind(str(control / "app-server-control.sock"))
+        dead.close()  # a socket file nobody listens on: the daemon died
+        os.environ["CODEX_HOME"] = str(home)
+        try:
+            self.bind_codex()
+            self.slice.claim(self.codex_fields("500.2"), "go")
+            self.assertEqual(self.slice.run_once(), 1)
+            self.assertIn("codex turn 1 of pid", self.sent[0][2])
+            self.assertTrue(self.driver.codex_pids())
+        finally:
+            pass
+
+
+class WebSocketFramingTests(unittest.TestCase):
+    def test_fragmented_text_message_is_reassembled(self):
+        import socket
+        from runtime.plugin_next.session_driver import WsReader
+        a, b = socket.socketpair()
+        reader = WsReader(b)
+        try:
+            body = b'{"jsonrpc":"2.0","method":"turn/completed","params":{"x":"' + b"y" * 70000 + b'"}}'
+            first, rest = body[:1000], body[1000:]
+            # FIN=0 text frame, then FIN=0 continuation, then FIN=1 continuation, with a ping in between.
+            a.sendall(bytes([0x01, 126]) + struct.pack(">H", len(first)) + first)
+            a.sendall(bytes([0x89, 0]))  # ping
+            a.sendall(bytes([0x00, 126]) + struct.pack(">H", 100) + rest[:100])
+            a.sendall(bytes([0x80, 127]) + struct.pack(">Q", len(rest) - 100) + rest[100:])
+            self.assertEqual(reader.read(), (0x9, b""))
+            got = reader.read()
+            self.assertEqual(got[0], 0x1)
+            self.assertTrue(got[1] == body, f"reassembled {len(got[1])} bytes, expected {len(body)}")
+            a.close()
+            self.assertIsNone(reader.read())
+        finally:
+            b.close()
