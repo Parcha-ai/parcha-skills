@@ -233,8 +233,9 @@ def launch_plan(
     systemd-user: ``systemd-run --user --pipe --wait`` asks the operator's user
     manager to run the harness in the user's own slice -- full groups, sudo,
     docker, a writable filesystem -- instead of inside the gateway's hardened
-    unit. Exit status propagates; RuntimeMaxSec bounds the service the way
-    the driver bounds the client.
+    unit. Exit status propagates. No RuntimeMaxSec: the driver ends a turn on
+    silence (idle ``native_timeout_seconds``) and kills the process itself; a
+    service clock killed hour-long work and the shared Codex app-server child.
     """
     launcher = resolve_launcher(settings)
     if launcher != "systemd-user":
@@ -242,7 +243,6 @@ def launch_plan(
     argv = [
         shutil.which("systemd-run") or "systemd-run", "--user", "--quiet", "--pipe", "--wait",
         "--collect", f"--property=WorkingDirectory={cwd}",
-        f"--property=RuntimeMaxSec={settings.native_timeout_seconds + 30}",
         "--property=KillMode=control-group",
     ]
     argv += [f"--setenv={key}={value}" for key, value in sorted(env.items())]
@@ -261,7 +261,7 @@ class ActiveSettings:
     claude_resume_args: tuple[str, ...] = ()
     codex_binary: str = "codex"
     codex_resume_args: tuple[str, ...] = ()
-    native_timeout_seconds: int = 1800
+    native_timeout_seconds: int = 1800  # idle seconds: a silent harness is wedged; working ones run as long as it takes
     max_reply_sentences: int = 3
     poll_interval_seconds: float = 2.0
     persona_id: str = "primary"
@@ -752,10 +752,15 @@ class ActiveSlice:
                 pass
         mention = f"<@{who}> " if who and who != "operator" else ""
         detail = f": {reason}" if reason else ""
-        text = (
-            f"{mention}I could not take this turn ({code}{detail}). "
-            "Reply here again later to retry, or ping my operator if it is urgent."
-        )
+        if code == "timeout":
+            minutes = max(1, int(self.settings.native_timeout_seconds // 60))
+            text = (f"{mention}I stopped this turn: my session produced nothing for {minutes} minutes. "
+                    "Reply here again to retry, or ping my operator if it is urgent.")
+        else:
+            text = (
+                f"{mention}I could not take this turn ({code}{detail}). "
+                "Reply here again later to retry, or ping my operator if it is urgent."
+            )
         try:
             self.egress(context["channel_id"], context["thread_ts"], text)
         except Exception:

@@ -38,6 +38,10 @@ FAKE_CLAUDE = textwrap.dedent(
         else:
             if "SLEEP" in text:
                 time.sleep(5)
+            for _ in range(int(os.environ.get("FAKE_TICKS") or 0)):
+                # a working session: stream events keep coming while the job runs
+                print(json.dumps({"type": "stream_event", "session_id": sid})); sys.stdout.flush()
+                time.sleep(0.4)
             if "CRASH" in text:
                 sys.stderr.write("You've hit your session limit\\n"); sys.exit(1)
             if "SILENT" in text:
@@ -66,7 +70,7 @@ def direct_launch(command, cwd, env, settings):
 
 def child_env(passthrough=()):
     keys = ("PATH", "FAKE_LOG", "FAKE_PROMPTS", "FAKE_REPLY", "FAKE_CODEX_REPLY", "FAKE_CODEX_FAIL", "FAKE_CODEX_NO_COMPLETE",
-            "FAKE_CODEX_PREAMBLE", *passthrough)
+            "FAKE_CODEX_PREAMBLE", "FAKE_TICKS", *passthrough)
     return {k: os.environ[k] for k in keys if k in os.environ}
 
 

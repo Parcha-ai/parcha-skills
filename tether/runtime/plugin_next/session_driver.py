@@ -84,7 +84,12 @@ class SessionProcess:
         self.process.stdin.flush()
 
     def read_result(self, timeout: float) -> dict[str, Any] | None:
-        """Consume events until a ``result``; None on timeout or process exit."""
+        """Consume events until a ``result``; None when the process exits or goes silent.
+
+        ``timeout`` is idle time: every stream event (a delta, a tool call, a tool result)
+        restarts it. A turn that keeps producing events is work, however long; only a
+        process that has said nothing for ``timeout`` seconds is wedged.
+        """
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
@@ -96,6 +101,7 @@ class SessionProcess:
                 continue
             if event is None:
                 return None
+            deadline = time.monotonic() + timeout
             if event.get("type") == "result":
                 return event
 
@@ -362,7 +368,9 @@ class CodexAppServer:
     resumed once per binding with ``thread/resume`` and then driven with ``turn/start``.
     """
 
-    QUIET_AFTER = 10.0  # seconds of silence after an agentMessage that end a turn without turn/completed
+    QUIET_AFTER = 10.0  # seconds of silence after a final answer that end a turn without turn/completed
+    LEAK_GUARD = 12 * 3600.0  # a turn never ends on a clock; this only frees a wedged waiter
+
 
     def __init__(self, transport: Any):
         self.transport = transport
@@ -429,15 +437,22 @@ class CodexAppServer:
                     raise RuntimeError(str(event["error"].get("message") or event["error"])[:200])
                 return event.get("result") or {}
 
-    def turn(self, thread_id: str, text: str, cwd: Path, *, sandbox: str, approval: str, timeout: float) -> dict[str, Any]:
-        """Run one turn on ``thread_id``; returns {"text", "status", "error"}."""
+    def turn(self, thread_id: str, text: str, cwd: Path, *, sandbox: str, approval: str,
+             timeout: float | None = None) -> dict[str, Any]:
+        """Run one turn on ``thread_id``; returns {"text", "status", "error"}.
+
+        A turn ends when Codex ends it (``turn/completed``), however long the work takes:
+        an agent fixing a planner for an hour is the job, not a hang. ``timeout`` is only
+        a leak guard (default LEAK_GUARD); the old 30-minute cap came from the days of one
+        child process per turn and posted "could not take this turn" over live work.
+        """
         if thread_id not in self._resumed:
             self._call("thread/resume", {"threadId": thread_id, "cwd": str(cwd), "approvalPolicy": approval,
                                          "sandbox": sandbox}, 60)
             self._resumed.add(thread_id)
         self._call("turn/start", {"threadId": thread_id, "cwd": str(cwd), "approvalPolicy": approval,
                                   "input": [{"type": "text", "text": text}]}, 30)
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + (timeout or self.LEAK_GUARD)
         messages: list[str] = []          # final-phase agentMessage texts as items complete
         last_event_at = time.monotonic()  # any event on this thread: the turn is alive
         quiet_after = self.QUIET_AFTER
@@ -648,7 +663,8 @@ class SessionDriver:
             return self._finish(attempt_id, "failed", str(exc)[:200], error_code="codex_app_server_unavailable")
         with server.lock:
             try:
-                result = server.turn(session_id, prompt, cwd, sandbox=sandbox, approval="never", timeout=timeout_seconds)
+                # No clock on the turn: Codex decides when it is done (see CodexAppServer.turn).
+                result = server.turn(session_id, prompt, cwd, sandbox=sandbox, approval="never")
             except (OSError, RuntimeError, TimeoutError) as exc:
                 with self._lock:
                     self._codex = None
