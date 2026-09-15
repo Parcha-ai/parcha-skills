@@ -230,8 +230,11 @@ class TruthBoundaryProbe:
         result.notes.append("negative_false_hit_rate is reported, not gated: recall_search is a hint engine and abstention belongs to the calling agent")
         result.notes.append("boundary_recall@50 is reported at candidate_depth 50, not gated; boundary_recall@20 stays the gate")
         result.gates = [
-            Gate("boundary_recall@20", ">=", 0.6).evaluate(aggregate.get("boundary_recall@20")),
-            Gate("boundary_mrr", ">=", 0.3).evaluate(aggregate.get("boundary_mrr")),
+            # H2-e: raised to the levels the validation split reached on
+            # 2026-09-15 (0.7083 / 0.5674) minus one boundary of noise; the
+            # H2 targets (0.75 / 0.50) stay the goal for recall.
+            Gate("boundary_recall@20", ">=", 0.66).evaluate(aggregate.get("boundary_recall@20")),
+            Gate("boundary_mrr", ">=", 0.5).evaluate(aggregate.get("boundary_mrr")),
             Gate("authorization_violation_rate", "==", 0.0).evaluate(aggregate.get("authorization_violation_rate")),
             Gate("backend_error_rate", "<=", 0.02).evaluate(aggregate.get("backend_error_rate")),
             Gate("latency_p95_ms", "<=", 5000.0).evaluate(aggregate.get("latency_p95_ms")),
