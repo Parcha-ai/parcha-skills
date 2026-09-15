@@ -1803,7 +1803,12 @@ class BoundCanonicalRetrieval:
             )
         ):
             passage_actor_ids = None
-        response = PassageHintRetrieval(
+        retrieval_class: Any = PassageHintRetrieval
+        if getattr(self.store, "search_plane", "postgres") == "turbopuffer":
+            from .turbopuffer_retrieval import TurbopufferHintRetrieval
+
+            retrieval_class = TurbopufferHintRetrieval
+        response = retrieval_class(
             self.store,
             tenant_id=self.tenant_id,
             sources=sources,

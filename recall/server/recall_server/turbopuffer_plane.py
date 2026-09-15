@@ -113,8 +113,21 @@ def turbopuffer_settings_from_env(*, required: bool = False) -> TurbopufferSetti
 
 
 def build_client(settings: TurbopufferSettings) -> Any:
-    """The turbopuffer SDK client (imported lazily so the server runs without it)."""
+    """The turbopuffer SDK client (imported lazily so the server runs without it).
 
+    ``RECALL_TPUF_CLIENT_FACTORY=module:callable`` swaps in another client
+    (the e2e suites use the in-process fake, file-backed across the server
+    and worker processes); the callable receives the settings.
+    """
+
+    factory = os.environ.get("RECALL_TPUF_CLIENT_FACTORY", "").strip()
+    if factory:
+        module_name, _sep, attribute = factory.partition(":")
+        if not module_name or not attribute:
+            raise TurbopufferConfigError("RECALL_TPUF_CLIENT_FACTORY must be module:callable")
+        import importlib
+
+        return getattr(importlib.import_module(module_name), attribute)(settings)
     try:
         import turbopuffer  # type: ignore[import-not-found]
     except ImportError as error:  # pragma: no cover - dependency present in prod
