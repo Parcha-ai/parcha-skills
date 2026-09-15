@@ -6,7 +6,7 @@ Recall arms use (And/Or/Not, Eq/NotEq, In/NotIn, Gt/Gte/Lt/Lte on ISO
 datetimes, Contains/NotContains/ContainsAny/ContainsAll, ContainsAllTokens,
 Glob) and returns ``FakeRow`` objects (dict-style and attribute access) ranked
 by term overlap: BM25 → count of query tokens
-present in the attribute (``$score``); ANN with ``["Embed", text]`` → the
+present in the attribute (reported under ``$dist`` like the service); ANN with ``["Embed", text]`` → the
 same overlap turned into a distance (``$dist`` = 1 − overlap ratio) so a
 passage sharing more words with the query is "nearer". Good enough to prove
 plumbing, never a relevance model.
@@ -151,7 +151,7 @@ class FakeNamespace:
             if mode == "ANN":
                 projected["$dist"] = key
             elif mode == "BM25":
-                projected["$score"] = -key
+                projected["$dist"] = -key  # the service reports BM25 under $dist too
             out.append(FakeRow(projected))
         return out
 
