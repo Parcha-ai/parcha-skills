@@ -442,6 +442,17 @@ class AccuracyTest(unittest.TestCase):
         result = accuracy.TruthBoundaryProbe().run(make_context(FakeBrain(default_tools())))
         self.assertEqual(result.status, "skipped")
 
+    def test_rerank_evidence_aligns_with_candidates(self):
+        hits = [
+            {"logical_document_id": "ldoc_a", "source_id": "s", "rank": 0.65, "rerank_score": 0.9, "blended_score": 0.8},
+            {"logical_document_id": "ldoc_a", "source_id": "s", "rank": 0.1},
+            {"logical_document_id": "ldoc_b", "source_id": "s", "rank": 0.2},
+            {"logical_document_id": "ldoc_c", "source_id": "s"},
+        ]
+        evidence = accuracy.rerank_evidence_from_search({"results": hits})
+        self.assertEqual(len(evidence), len(accuracy.candidates_from_search({"results": hits})))
+        self.assertEqual(evidence, [{"fused": 0.65, "rerank": 0.9, "blended": 0.8}, {"fused": 0.2}, None])
+
     def test_candidates_dedupe_and_cap(self):
         hits = [{"logical_document_id": "ldoc_" + "a" * 32, "source_id": "s", "revision": 3}] * 3
         self.assertEqual(len(accuracy.candidates_from_search({"results": hits})), 1)
