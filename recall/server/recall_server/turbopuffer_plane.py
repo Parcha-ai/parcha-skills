@@ -44,8 +44,9 @@ class TurbopufferSettings:
     namespace_prefix: str = DEFAULT_NAMESPACE_PREFIX
     embed_model: str = DEFAULT_EMBED_MODEL
     embed_dims: int = DEFAULT_EMBED_DIMS
-    write_batch_rows: int = 200
+    write_batch_rows: int = 32
     query_timeout_seconds: float = 8.0
+    tokens_per_minute: int = 1_000_000
 
     def namespace(self, tenant_id: str) -> str:
         digest = hashlib.sha256(tenant_id.encode()).hexdigest()[:20]
@@ -93,11 +94,12 @@ def turbopuffer_settings_from_env(*, required: bool = False) -> TurbopufferSetti
         return None
     try:
         dims = int(os.environ.get("RECALL_TPUF_EMBED_DIMS", str(DEFAULT_EMBED_DIMS)))
-        batch = int(os.environ.get("RECALL_TPUF_WRITE_BATCH_ROWS", "200"))
+        batch = int(os.environ.get("RECALL_TPUF_WRITE_BATCH_ROWS", "32"))
         timeout = float(os.environ.get("RECALL_TPUF_QUERY_TIMEOUT_SECONDS", "8"))
+        tokens_per_minute = int(os.environ.get("RECALL_TPUF_TOKENS_PER_MINUTE", "1000000"))
     except ValueError as error:
         raise TurbopufferConfigError("turbopuffer numeric settings are invalid") from error
-    if not 64 <= dims <= 4096 or not 1 <= batch <= 5000 or not 0.5 <= timeout <= 60:
+    if not 64 <= dims <= 4096 or not 1 <= batch <= 5000 or not 0.5 <= timeout <= 60 or not 0 <= tokens_per_minute <= 100_000_000:
         raise TurbopufferConfigError("turbopuffer numeric settings are out of range")
     settings = TurbopufferSettings(
         api_key=key,
@@ -107,6 +109,7 @@ def turbopuffer_settings_from_env(*, required: bool = False) -> TurbopufferSetti
         embed_dims=dims,
         write_batch_rows=batch,
         query_timeout_seconds=timeout,
+        tokens_per_minute=tokens_per_minute,
     )
     settings.namespace("tenant:probe")  # validates the prefix
     return settings

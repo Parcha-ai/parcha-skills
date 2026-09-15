@@ -3,19 +3,23 @@
 from __future__ import annotations
 
 import logging
+import sys
 import unittest
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
-from recall_server.projection_worker import run_projection_worker
-from recall_server.turbopuffer_plane import (
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "server"))
+
+from recall_server.projection_worker import run_projection_worker  # noqa: E402
+from recall_server.turbopuffer_plane import (  # noqa: E402
     EMBED_TEXT_ATTRIBUTE,
     TEXT_ATTRIBUTE,
     TurbopufferSettings,
     namespace_schema,
 )
-from recall_server.turbopuffer_projection import (
+from recall_server.turbopuffer_projection import (  # noqa: E402
     INCREMENTAL_REASONS,
     RATE_LIMIT_BACKOFF_CAP_SECONDS,
     TurbopufferProjector,
@@ -24,7 +28,7 @@ from recall_server.turbopuffer_projection import (
     is_rate_limit,
 )
 
-from .fake_turbopuffer import FakeNamespace, FakeTurbopuffer, NotFoundError
+from .fake_turbopuffer import FakeNamespace, FakeTurbopuffer, NotFoundError  # noqa: E402
 
 
 def _upserts(write: dict) -> list[str]:
@@ -603,3 +607,47 @@ class WorkerPhaseTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PacingAndTransientTests(unittest.TestCase):
+    def test_token_pacer_sleeps_when_the_window_is_full(self) -> None:
+        from recall_server.turbopuffer_projection import TokenPacer, estimated_tokens
+
+        now = [100.0]
+        slept: list[float] = []
+
+        def sleep(seconds: float) -> None:
+            slept.append(seconds)
+            now[0] += seconds
+
+        pacer = TokenPacer(1000, clock=lambda: now[0], sleep=sleep)
+        pacer.wait_for(600)
+        pacer.wait_for(300)
+        self.assertEqual(slept, [])
+        pacer.wait_for(300)  # 1200 > 1000: wait until the first entry leaves the window
+        self.assertEqual(len(slept), 1)
+        self.assertGreaterEqual(now[0], 160.0)
+        self.assertEqual(estimated_tokens([{"embed_text": "a" * 400}, {"embed_text": ""}]), 102)
+        TokenPacer(0).wait_for(10**9)  # disabled
+
+    def test_transient_errors_are_retried_and_others_raise(self) -> None:
+        from recall_server.turbopuffer_projection import is_transient
+
+        class InternalServerError(Exception):
+            status_code = 502
+
+        class APIConnectionError(Exception):
+            pass
+
+        class RateLimitError(Exception):
+            pass
+
+        class BadRequestError(Exception):
+            status_code = 400
+
+        self.assertTrue(is_transient(InternalServerError()))
+        self.assertTrue(is_transient(APIConnectionError()))
+        self.assertTrue(is_transient(RateLimitError()))
+        self.assertFalse(is_transient(BadRequestError()))
+        self.assertFalse(is_transient(ValueError("x")))
+
