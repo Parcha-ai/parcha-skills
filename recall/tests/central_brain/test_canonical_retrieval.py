@@ -2781,6 +2781,59 @@ class RankAlignedUnionTests(unittest.TestCase):
         self.assertEqual((added, merged[0]["score"]), (4, 0.41))
 
 
+class SourceHintTests(unittest.TestCase):
+    def test_parser_names_the_harness_family(self) -> None:
+        from recall_server.passage_retrieval import parse_source_hint
+        self.assertEqual(parse_source_hint("In the Codex work, what was the root cause?"), ("codex:",))
+        self.assertEqual(parse_source_hint("which Claude Code session fixed the deploy"), ("claude:",))
+        self.assertEqual(parse_source_hint("what did we decide in slack about retries"), ("slack:",))
+        self.assertEqual(parse_source_hint("across codex and claude sessions"), ("codex:", "claude:"))
+        # Bare product mentions are not a scope.
+        self.assertEqual(parse_source_hint("why did the codex collector crash"), ())
+        self.assertEqual(parse_source_hint("what changed in the retry policy"), ())
+
+    def test_collapse_boosts_named_family_with_the_floor(self) -> None:
+        from recall_server.passage_retrieval import collapse_document_candidates
+        from tests.central_brain.test_passage_fusion import candidate
+        dense = [candidate("a", "dense", 0.9), candidate("b", "dense", 0.8), candidate("c", "dense", 0.7)]
+        for row in dense:
+            row["source_id"] = "claude:linux:test"
+        dense[2]["source_id"] = "codex:linux:test"
+        legs = (("dense", 0.65, dense), ("passage-lexical", 0.1, []), ("sparse-exact", 0.25, []))
+        alphas = {"dense": 0.65, "passage-lexical": 0.1, "sparse-exact": 0.25}
+        plain = collapse_document_candidates(legs, limit=10, fusion="convex", alphas=alphas)
+        self.assertEqual([r["logical_document_id"][5:6] for r in plain], ["a", "b", "c"])
+        boosted = collapse_document_candidates(legs, limit=10, fusion="convex", alphas=alphas, source_boost=(("codex:",), 1.5))
+        # c was the weakest (normalised 0.0): floored at the smallest positive score, then x1.5.
+        order = [r["logical_document_id"][5:6] for r in boosted]
+        self.assertEqual(order[0], "a")
+        self.assertIn("c", order[:2])
+        self.assertEqual(next(r for r in boosted if r["logical_document_id"].startswith("ldoc_c"))["source_boost"], 1.5)
+        self.assertNotIn("source_boost", boosted[0])
+
+    def test_search_reports_the_source_hint(self) -> None:
+        store = RerankWiringTests._Store()
+        store.source_hints = True
+        store.query_clauses = False
+        retrieval = PassageHintRetrieval(store, tenant_id="tenant:test", sources=["codex:linux:test"], policy_fingerprint="fp-policy")
+        from tests.central_brain.test_passage_fusion import candidate
+        dense = [candidate("a", "dense", 0.9), candidate("b", "dense", 0.8)]
+        dense[0]["source_id"] = "claude:linux:test"
+        dense[1]["source_id"] = "codex:linux:test"
+        retrieval._dense_candidates = lambda query, vector=None, **kwargs: (dense, "ok", "prose-pool", 10)
+        retrieval._embed_query = lambda text: [0.0]
+        retrieval._lexical_candidates = lambda query, **kwargs: ([], "ok")
+        retrieval._sparse_candidates = lambda query, original_query=None, **kwargs: ([], "skipped-prose-query")
+        response = retrieval.search("In the Codex work, what fixed the deploy?", lexical_query="fixed deploy", since=None, until=None, limit=10)
+        self.assertEqual(response["diagnostics"]["source_hint"], {"families": ["codex"], "boost": 1.5})
+        self.assertEqual(response["diagnostics"]["source_boosted"], 1)
+        self.assertEqual(response["results"][0]["logical_document_id"][5:6], "b")
+        store.source_hints = False
+        response = retrieval.search("In the Codex work, what fixed the deploy?", lexical_query="fixed deploy", since=None, until=None, limit=10)
+        self.assertNotIn("source_hint", response["diagnostics"])
+        self.assertEqual(response["results"][0]["logical_document_id"][5:6], "a")
+
+
 class IdentifierSigilTests(unittest.TestCase):
     def test_hash_prefixed_numbers_are_identifiers(self) -> None:
         from recall_server.passage_retrieval import identifier_tokens
