@@ -212,10 +212,11 @@ largest remaining tsvector; `canonical_chunks.search_vector` stays because `show
 the legacy paths still read it). Migration `067_retire_postgres_vector_plane.sql` drops
 them. It is destructive, so `migrate` never applies it on its own:
 
-- `python -m recall_server.cli migrate` applies every pending version through 066 and
-  reports `"deferred": [67]` on either plane. Versions already recorded in
-  `schema_migrations` are skipped (a migration that ran is never re-run against objects a
-  later one dropped); `*_concurrent.sql` companions still run every time.
+- `python -m recall_server.cli migrate` runs every file through 066 as before (all
+  idempotent) and reports `"deferred": [67]` on either plane. Once 067 is recorded the
+  files below it are skipped (041 and 063 reference the dropped objects), so the
+  delete-a-version-row-to-replay-a-repair trick ends with the retirement;
+  `*_concurrent.sql` companions still run every time.
 - `python -m recall_server.cli migrate --retire-postgres-plane` applies 067, and only from
   a process with `RECALL_SEARCH_PLANE=turbopuffer` in its environment. From a postgres-plane
   process it exits 2 with `refusing to apply migration 067 ...` and changes nothing.

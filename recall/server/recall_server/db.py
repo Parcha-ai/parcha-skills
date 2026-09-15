@@ -347,14 +347,15 @@ class BrainStore:
                 self._pool.close()
 
     def migrate(self, *, retire_postgres_plane: bool = False) -> dict[str, Any]:
-        """Apply every pending numbered migration in order.
+        """Apply the numbered migrations in order; every file is idempotent.
 
-        A version already recorded in ``schema_migrations`` is skipped (a
-        migration that ran cannot be re-run against objects a later one
-        dropped); ``*_concurrent.sql`` companions always run, every statement
-        of theirs is idempotent. Migration 067 (H3-e') is destructive and
-        applies only with ``retire_postgres_plane`` from a process on the
-        turbopuffer search plane; otherwise it is reported as deferred.
+        Versions below 067 re-run on every call, as they always did (the
+        e2e suites delete a version row to replay a data repair), until
+        migration 067 (H3-e') is recorded: after that they are skipped, since
+        041 and 063 reference the objects 067 dropped. 067 itself is
+        destructive and applies only with ``retire_postgres_plane`` from a
+        process on the turbopuffer search plane; otherwise it is reported as
+        deferred. ``*_concurrent.sql`` companions always run.
         """
 
         schema_dir = Path(__file__).resolve().parents[1] / "schema"
@@ -363,22 +364,27 @@ class BrainStore:
         deferred: list[int] = []
         with self.connect() as conn:
             recorded = applied_migration_versions(conn)
+            retired = RETIRE_POSTGRES_PLANE_VERSION in recorded
             for schema in sorted(schema_dir.glob("*.sql")):
                 version = migration_version(schema)
                 if version is None:
                     self._migrate_concurrently(conn, schema.read_text())
                     continue
-                if version in recorded:
+                if version < RETIRE_POSTGRES_PLANE_VERSION:
+                    if retired:
+                        skipped.append(version)
+                        continue
+                elif version in recorded:
                     skipped.append(version)
                     continue
-                if version >= RETIRE_POSTGRES_PLANE_VERSION:
-                    if not retire_postgres_plane:
-                        deferred.append(version)
-                        continue
-                    if self.search_plane != "turbopuffer":
-                        raise SearchPlaneSchemaError(RETIRE_POSTGRES_PLANE_REFUSED)
+                elif not retire_postgres_plane:
+                    deferred.append(version)
+                    continue
+                elif self.search_plane != "turbopuffer":
+                    raise SearchPlaneSchemaError(RETIRE_POSTGRES_PLANE_REFUSED)
                 conn.execute(schema.read_text())
-                applied.append(version)
+                if version not in recorded:
+                    applied.append(version)
         current = max(recorded | set(applied), default=0)
         return {
             "status": "ok",

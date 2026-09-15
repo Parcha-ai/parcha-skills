@@ -161,16 +161,18 @@ class MigrateRunnerTest(unittest.TestCase):
         store.connect = mock.MagicMock(return_value=connection)
         return store.migrate(**kwargs)
 
-    def test_recorded_versions_are_skipped_and_067_is_deferred_by_default(self) -> None:
+    def test_mandatory_versions_rerun_idempotently_and_067_is_deferred_by_default(self) -> None:
+        # Before retirement every file below 067 runs on every call, as it
+        # always did (suites delete a version row to replay a repair).
         connection = _RecordingConnection(set(range(1, 66)))
         result = self._migrate(_store("postgres"), connection)
-        self.assertEqual(_migration_files_applied(connection), [66])
+        self.assertEqual(_migration_files_applied(connection), list(range(1, 67)))
         self.assertEqual(result["applied"], [66])
         self.assertEqual(result["deferred"], [67])
-        self.assertEqual(result["skipped"], 65)
+        self.assertEqual(result["skipped"], 0)
         self.assertEqual(result["schema_version"], 66)
         self.assertEqual(result["postgres_vector_plane"], "present")
-        self.assertFalse(any("canonical_passage_embeddings_hnsw_idx" in sql for sql in connection.executed))
+        self.assertFalse(any("DROP TABLE IF EXISTS canonical_passage_embeddings" in sql for sql in connection.executed))
         # The turbopuffer plane defers it too: retirement is an explicit act.
         connection = _RecordingConnection(set(range(1, 67)))
         result = self._migrate(_store("turbopuffer"), connection)
@@ -190,20 +192,26 @@ class MigrateRunnerTest(unittest.TestCase):
             self._migrate(_store("postgres"), connection, retire_postgres_plane=True)
         self.assertEqual(str(raised.exception), RETIRE_POSTGRES_PLANE_REFUSED)
         self.assertIn("RECALL_SEARCH_PLANE=turbopuffer", str(raised.exception))
-        self.assertEqual(_migration_files_applied(connection), [])
+        self.assertNotIn(67, _migration_files_applied(connection))
+        self.assertFalse(any("DROP TABLE IF EXISTS canonical_passage_embeddings" in sql for sql in connection.executed))
 
     def test_retirement_applies_once_on_the_turbopuffer_plane(self) -> None:
         connection = _RecordingConnection(set(range(1, 67)))
         store = _store("turbopuffer")
         result = self._migrate(store, connection, retire_postgres_plane=True)
-        self.assertEqual(_migration_files_applied(connection), [67])
+        self.assertEqual(_migration_files_applied(connection)[-1], 67)
+        connection.executed.clear()
         self.assertEqual(result["applied"], [67])
         self.assertEqual(result["deferred"], [])
         self.assertEqual(result["postgres_vector_plane"], "retired")
+        # Once retired, the files below 067 (041 recreates the table, 063
+        # alters it) are skipped and 067 itself is not replayed.
         again = self._migrate(store, connection, retire_postgres_plane=True)
         self.assertEqual(again["applied"], [])
         self.assertEqual(again["skipped"], 67)
-        self.assertEqual(_migration_files_applied(connection), [67])
+        self.assertEqual(_migration_files_applied(connection), [])
+        plain = self._migrate(store, connection)
+        self.assertEqual((plain["applied"], plain["skipped"], plain["deferred"]), ([], 67, []))
 
     def test_companions_always_run(self) -> None:
         connection = _RecordingConnection(set(range(1, 68)))
