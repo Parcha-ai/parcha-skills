@@ -620,13 +620,14 @@ class PacingAndTransientTests(unittest.TestCase):
             slept.append(seconds)
             now[0] += seconds
 
-        pacer = TokenPacer(1000, clock=lambda: now[0], sleep=sleep)
+        pacer = TokenPacer(12000, clock=lambda: now[0], sleep=sleep, window_seconds=5.0)  # 1000 per 5 s
         pacer.wait_for(600)
         pacer.wait_for(300)
         self.assertEqual(slept, [])
-        pacer.wait_for(300)  # 1200 > 1000: wait until the first entry leaves the window
+        pacer.wait_for(300)  # 1200 > 1000: wait until the first entry leaves the 5 s window
         self.assertEqual(len(slept), 1)
-        self.assertGreaterEqual(now[0], 160.0)
+        self.assertGreaterEqual(now[0], 105.0)
+        self.assertEqual(TokenPacer(1_800_000).limit, 150_000)
         self.assertEqual(estimated_tokens([{"embed_text": "a" * 400}, {"embed_text": ""}]), 102)
         TokenPacer(0).wait_for(10**9)  # disabled
 
