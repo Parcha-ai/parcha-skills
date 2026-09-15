@@ -72,7 +72,7 @@ def search_result(query_seed: int = 0) -> dict:
         })
     return {
         "results": hits,
-        "diagnostics": {"elapsed_ms": 120.0, "deadline_exceeded": False, "dense_status": "ok", "dense_strategy": "exact-scoped",
+        "diagnostics": {"elapsed_ms": 120.0, "deadline_exceeded": False, "dense_status": "ok", "dense_strategy": "exact-scoped", "search_plane": "postgres",
                         "dense_candidates": 5, "passage_lexical_candidates": 8, "sparse_candidates": 2},
     }
 
