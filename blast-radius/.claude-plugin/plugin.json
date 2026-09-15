@@ -1,0 +1,9 @@
+{
+  "name": "blast-radius",
+  "version": "0.1.0",
+  "description": "Find what a diff breaks beyond the diff and prove the one safety fact by running real code instead of writing it up.",
+  "author": {
+    "name": "Lauren Tan",
+    "url": "https://github.com/cursor/plugins/tree/main/pstack/skills/blast-radius"
+  }
+}

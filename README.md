@@ -2,7 +2,7 @@
 
 Our collection of portable Agent Skills for Claude Code, Codex, and pi.
 
-[![skills.sh](https://skills.sh/b/miguelrios/unc-skills)](https://skills.sh/miguelrios/unc-skills)
+[![skills.sh](https://skills.sh/b/Parcha-ai/parcha-skills)](https://skills.sh/Parcha-ai/parcha-skills)
 
 | Skill | What it does | Cross-harness note |
 |---|---|---|
@@ -13,11 +13,53 @@ Our collection of portable Agent Skills for Claude Code, Codex, and pi.
 | [`recap`](recap/) | Reconstructs everything observable that happened in one exact coding-agent session. | Uses Recall's Claude/Codex evidence; pi can run it but is not yet an indexed source. |
 | [`tether`](tether/) | Keeps Slack threads attached to the exact agents that created them. | Codex and Claude Code resume natively; stock pi publishes as a headless run. End-to-end routing also installs an external Hermes plugin/runtime. |
 | [`desloppify`](desloppify/) | Turns whole-codebase slop into evidence-backed cleanup with Peter O'Malley's official engine. | One canonical workflow selects honest native or prepared-packet review routes per harness. |
-| [`autoqa`](autoqa/) | Points at any repo, discovers how it runs, and QAs the live app end-to-end with a witnessed report. | Uses whatever browser tooling the harness has; API/CLI checks work everywhere. |
+| [`autoqa`](autoqa/) | Points at any repo, discovers how it runs, QAs the live app end-to-end with a witnessed report, and pairs its UI witnesses with base-instance captures as the PR's Before / After. | Uses whatever browser tooling the harness has; API/CLI checks work everywhere. |
 | [`precap`](precap/) | Recaps a task before doing it: a grounded, past-tense account of the finished work that long-running agents check themselves against for drift. | Pure markdown plus a stdlib Python checker; identical in all three harnesses. |
+| [`tdd`](tdd/) | Red before green at pre-agreed seams, one vertical slice per cycle, regression-first bug fixes. | Pure markdown; identical in all three harnesses. |
+| [`blast-radius`](blast-radius/) | Finds what a diff breaks beyond the diff and proves the one safety fact by running real code. | Invocation only (`disable-model-invocation: true`); parallel reviewer subagents are used where the harness has them. |
+| [`review-loop`](review-loop/) | Drives every reviewer thread on a GitHub PR (Greptile, Devin, humans) to zero unresolved in bounded iterations. | GitHub only, through the caller's authenticated `gh`; identical in all three harnesses. |
+| [`verify-release`](verify-release/) | Confirms the intended candidate is live in the target environment and the changed path works there, with live evidence. | Uses whatever deployment tooling and observability the repo already has; calls `autoqa` for matrix coverage. |
+| [`blast-radius`](blast-radius/) | [cursor/plugins, `pstack/skills/blast-radius`](https://github.com/cursor/plugins/tree/main/pstack/skills/blast-radius) | Lauren Tan | MIT |
+| [`tdd`](tdd/) | [cursor/plugins, `pstack/skills/tdd`](https://github.com/cursor/plugins/tree/main/pstack/skills/tdd), adapted from a bug-fix-only workflow into a general red-green reference | Lauren Tan | MIT |
+| [`unslop`](unslop/) | Cuts AI tells from anything a human will read. | Pure markdown; identical in all three harnesses. |
 
 The skill payloads are canonical `skills/<name>/SKILL.md` directories. Harness-specific
 manifests package those same files; there are no Claude/Codex/pi forks to drift apart.
+
+## Skill roles in the PR lifecycle
+
+Each shared skill has one job in the lifecycle of a pull request. A repo-specific orchestrator
+calls the skill by name and never copies its body.
+
+| Stage | Skill | Job, in one line |
+|---|---|---|
+| Start | `precap` | Write the finished-task recap first; detect drift against it. |
+| Build | `tdd` | Red-green at pre-agreed seams. |
+| Prove | `blast-radius` | Find what the diff breaks beyond the diff; prove the one safety fact by running code. |
+| Prove | `autoqa` | Does the running app behave? Witnessed feature-by-modality matrix, baseline plus diff cases. |
+| Describe | `autoqa` | The same run's UI witnesses, paired with base-instance captures, become the PR's Before / After section. |
+| Review | `review-loop` | Drive every reviewer thread (bots and humans) to zero, bounded. |
+| Release | `verify-release` | Is the intended candidate live in the target environment and does the changed path work there? |
+| Everywhere | `unslop` | Cut AI tells from anything a human reads. |
+
+`evidence` is a rule, not a skill. It stays the always-on [`snippets/evidence`](snippets/evidence/)
+block, and `autoqa` owns the witness contract (no witness, no verdict; `PASS`, `FAIL`, `UNTESTED`
+with reason, `SKIPPED`, `BLOCKED`). `blast-radius` proves a single fact by running code; `autoqa`
+exercises the app through its entry points and, from the same browser session, produces the
+paired before/after captures the PR body shows. The two do not overlap: analysis and execution.
+
+## Sources and credits
+
+Some skills in this collection are vendored or adapted from other people's work. Each such
+package keeps the upstream license file in its directory and a Provenance section in its README
+listing every change made here.
+
+| Skill | Source | Author | License |
+|---|---|---|---|
+| [`unslop`](unslop/) | [cursor/plugins, `pstack/skills/unslop`](https://github.com/cursor/plugins/tree/main/pstack/skills/unslop), by way of [michaelshimeles/skills](https://github.com/michaelshimeles/skills) | Lauren Tan | MIT |
+| [`review-loop`](review-loop/) | [greptileai/skills](https://github.com/greptileai/skills) (`greploop`, `greploop-apps`), by way of [michaelshimeles/skills](https://github.com/michaelshimeles/skills) | Greptile AI | MIT |
+
+`verify-release` was written for this collection and carries the repository's MIT license.
 
 ## Instruction snippets
 
@@ -39,25 +81,30 @@ The install commands below cover skills only. To install a snippet, paste its
 
 ## Install with skills.sh
 
-Browse all nine skills at [skills.sh/miguelrios/unc-skills](https://skills.sh/miguelrios/unc-skills),
+Browse all fifteen skills at [skills.sh/Parcha-ai/parcha-skills](https://skills.sh/Parcha-ai/parcha-skills),
 or install interactively:
 
 ```bash
-npx skills add miguelrios/unc-skills
+npx skills add Parcha-ai/parcha-skills
 ```
 
 Install one directly with `--skill`:
 
 ```bash
-npx skills add miguelrios/unc-skills --skill hands-free
-npx skills add miguelrios/unc-skills --skill parable
-npx skills add miguelrios/unc-skills --skill cascade
-npx skills add miguelrios/unc-skills --skill recall
-npx skills add miguelrios/unc-skills --skill recap
-npx skills add miguelrios/unc-skills --skill tether
-npx skills add miguelrios/unc-skills --skill desloppify
-npx skills add miguelrios/unc-skills --skill autoqa
-npx skills add miguelrios/unc-skills --skill precap
+npx skills add Parcha-ai/parcha-skills --skill hands-free
+npx skills add Parcha-ai/parcha-skills --skill parable
+npx skills add Parcha-ai/parcha-skills --skill cascade
+npx skills add Parcha-ai/parcha-skills --skill recall
+npx skills add Parcha-ai/parcha-skills --skill recap
+npx skills add Parcha-ai/parcha-skills --skill tether
+npx skills add Parcha-ai/parcha-skills --skill desloppify
+npx skills add Parcha-ai/parcha-skills --skill autoqa
+npx skills add Parcha-ai/parcha-skills --skill precap
+npx skills add Parcha-ai/parcha-skills --skill tdd
+npx skills add Parcha-ai/parcha-skills --skill blast-radius
+npx skills add Parcha-ai/parcha-skills --skill review-loop
+npx skills add Parcha-ai/parcha-skills --skill verify-release
+npx skills add Parcha-ai/parcha-skills --skill unslop
 ```
 
 Add `--global` for a user-level install or `--agent claude-code`, `--agent codex`, or
@@ -79,7 +126,7 @@ verified 40-character release commit.
 ## Install for Claude Code
 
 ```bash
-claude plugin marketplace add miguelrios/unc-skills
+claude plugin marketplace add Parcha-ai/parcha-skills
 claude plugin install hands-free@unc-skills
 claude plugin install parable@unc-skills
 claude plugin install cascade@unc-skills
@@ -89,6 +136,11 @@ claude plugin install tether@unc-skills
 claude plugin install desloppify@unc-skills
 claude plugin install autoqa@unc-skills
 claude plugin install precap@unc-skills
+claude plugin install tdd@unc-skills
+claude plugin install blast-radius@unc-skills
+claude plugin install review-loop@unc-skills
+claude plugin install verify-release@unc-skills
+claude plugin install unslop@unc-skills
 ```
 
 Install only the skills you want. Start a new session after installation.
@@ -96,7 +148,7 @@ Install only the skills you want. Start a new session after installation.
 ## Install for Codex
 
 ```bash
-codex plugin marketplace add miguelrios/unc-skills
+codex plugin marketplace add Parcha-ai/parcha-skills
 codex plugin add hands-free@unc-skills
 codex plugin add parable@unc-skills
 codex plugin add cascade@unc-skills
@@ -106,6 +158,11 @@ codex plugin add tether@unc-skills
 codex plugin add desloppify@unc-skills
 codex plugin add autoqa@unc-skills
 codex plugin add precap@unc-skills
+codex plugin add tdd@unc-skills
+codex plugin add blast-radius@unc-skills
+codex plugin add review-loop@unc-skills
+codex plugin add verify-release@unc-skills
+codex plugin add unslop@unc-skills
 ```
 
 Codex uses the native `.agents/plugins/marketplace.json` and package
@@ -114,22 +171,21 @@ Codex uses the native `.agents/plugins/marketplace.json` and package
 ## Install for pi
 
 ```bash
-pi install git:github.com/miguelrios/unc-skills
+pi install git:github.com/Parcha-ai/parcha-skills
 ```
 
-The repository is one pi package that exposes all seven skills. In pi, invoke one explicitly
-with `/skill:hands-free`, `/skill:parable`, `/skill:cascade`, `/skill:recall`, `/skill:recap`,
-`/skill:tether`, or `/skill:desloppify`.
+The repository is one pi package that exposes all fifteen skills. In pi, invoke one explicitly
+with `/skill:<name>`, for example `/skill:hands-free`, `/skill:autoqa`, or `/skill:review-loop`.
 
 ## Compatibility checks
 
-The local gate runs all seven skills across the three harnesses for native installation,
+The local gate runs all fifteen skills across the three harnesses for native installation,
 discovery, and credential-free smoke checks. Raw test output stays local and is not committed.
 
 Run the local gate with:
 
 ```bash
 npm test
-for package in hands-free parable cascade recall recap tether desloppify; do (cd "$package" && npm test); done
+for package in hands-free parable cascade recall recap tether desloppify autoqa precap tdd blast-radius review-loop verify-release unslop; do (cd "$package" && npm test); done
 python3 scripts/prove_portability.py --output /tmp/unc-skills-portability
 ```

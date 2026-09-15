@@ -1,0 +1,35 @@
+{
+  "name": "review-loop",
+  "version": "0.1.0",
+  "description": "Drive every reviewer thread on a GitHub PR (Greptile, Devin, humans) to zero unresolved in bounded iterations, with a fixed-format final report.",
+  "author": {
+    "name": "Greptile AI",
+    "url": "https://github.com/greptileai/skills"
+  },
+  "homepage": "https://github.com/Parcha-ai/parcha-skills/tree/main/review-loop",
+  "repository": "https://github.com/Parcha-ai/parcha-skills/tree/main/review-loop",
+  "license": "MIT",
+  "keywords": [
+    "review-loop",
+    "code-review",
+    "greptile",
+    "devin",
+    "pull-request"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Review loop",
+    "shortDescription": "Drive PR review threads to zero unresolved",
+    "longDescription": "Drive every reviewer thread on a GitHub PR (Greptile, Devin, humans) to zero unresolved in bounded iterations, with a fixed-format final report.",
+    "developerName": "Greptile AI",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/Parcha-ai/parcha-skills/tree/main/review-loop",
+    "defaultPrompt": [
+      "Use $review-loop on the task at hand."
+    ]
+  }
+}

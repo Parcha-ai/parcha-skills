@@ -1,0 +1,41 @@
+{
+  "name": "@parcha/verify-release",
+  "version": "0.1.0",
+  "description": "Verify a specific release in its target environment with live evidence: VERIFIED, FAILED, or INCOMPLETE",
+  "files": [
+    ".claude-plugin/",
+    ".codex-plugin/",
+    "skills/",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "python3 -m unittest discover -s tests -v && python3 -m json.tool .claude-plugin/plugin.json >/dev/null && python3 -m json.tool .codex-plugin/plugin.json >/dev/null",
+    "pack:check": "npm pack --dry-run"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Parcha-ai/parcha-skills.git",
+    "directory": "verify-release"
+  },
+  "keywords": [
+    "agent-skills",
+    "claude-code",
+    "codex",
+    "pi-package",
+    "verify-release",
+    "deployment",
+    "staging",
+    "release-verification"
+  ],
+  "pi": {
+    "skills": [
+      "./skills"
+    ]
+  },
+  "author": "Parcha Labs (https://parcha.com)",
+  "license": "MIT"
+}

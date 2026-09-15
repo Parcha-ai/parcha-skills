@@ -1,0 +1,9 @@
+{
+  "name": "unslop",
+  "version": "0.1.0",
+  "description": "Cut AI tells from text written or edited for a human reader before committing, posting, or sending it.",
+  "author": {
+    "name": "Lauren Tan",
+    "url": "https://github.com/cursor/plugins/tree/main/pstack/skills/unslop"
+  }
+}

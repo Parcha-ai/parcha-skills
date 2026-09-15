@@ -1,0 +1,41 @@
+{
+  "name": "@parcha/blast-radius",
+  "version": "0.1.0",
+  "description": "Find what a change breaks beyond the diff and prove the one fact it is safe because of by running code",
+  "files": [
+    ".claude-plugin/",
+    ".codex-plugin/",
+    "skills/",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "python3 -m unittest discover -s tests -v && python3 -m json.tool .claude-plugin/plugin.json >/dev/null && python3 -m json.tool .codex-plugin/plugin.json >/dev/null",
+    "pack:check": "npm pack --dry-run"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Parcha-ai/parcha-skills.git",
+    "directory": "blast-radius"
+  },
+  "keywords": [
+    "agent-skills",
+    "claude-code",
+    "codex",
+    "pi-package",
+    "blast-radius",
+    "code-review",
+    "risk",
+    "verification"
+  ],
+  "pi": {
+    "skills": [
+      "./skills"
+    ]
+  },
+  "author": "Lauren Tan",
+  "license": "MIT"
+}

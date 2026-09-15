@@ -1,0 +1,34 @@
+{
+  "name": "verify-release",
+  "version": "0.1.0",
+  "description": "Verify that the intended release candidate is live in its target environment and that the changed path works there, with live evidence.",
+  "author": {
+    "name": "Parcha Labs",
+    "url": "https://github.com/Parcha-ai/parcha-skills"
+  },
+  "homepage": "https://github.com/Parcha-ai/parcha-skills/tree/main/verify-release",
+  "repository": "https://github.com/Parcha-ai/parcha-skills/tree/main/verify-release",
+  "license": "MIT",
+  "keywords": [
+    "verify-release",
+    "deployment",
+    "staging",
+    "release-verification"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Verify release",
+    "shortDescription": "Verify a deployed change against live evidence",
+    "longDescription": "Verify that the intended release candidate is live in its target environment and that the changed path works there, with live evidence.",
+    "developerName": "Miguel Rios",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/Parcha-ai/parcha-skills/tree/main/verify-release",
+    "defaultPrompt": [
+      "Use $verify-release on the task at hand."
+    ]
+  }
+}
