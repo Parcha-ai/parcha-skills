@@ -413,6 +413,10 @@ RERANK_NOMINATE_PER_ARM = 5
 # this many more distinct query terms; the head carries the record's own
 # framing (role, first lines) that the cross-encoder also needs.
 FOCUS_WINDOW_MIN_GAIN = 2
+# Off until the card shows the window beats the head: #534 (window on)
+# lost recall@20 0.79 → 0.63 and #537 (head unless +2 terms) only partly
+# recovered it (0.71, MRR 0.35). The reranker keeps reading the head.
+RERANK_FOCUS_WINDOW = False
 
 
 def arm_nominated(arm_scores: dict[str, Any], nominate_per_arm: int) -> bool:
@@ -1745,7 +1749,11 @@ class PassageHintRetrieval:
             for row in rows:
                 key = row.get("passage_id") or row.get("receipt")
                 if key and key not in texts:
-                    texts[key] = focus_window(row["text_redacted"], terms, width)
+                    texts[key] = (
+                        focus_window(row["text_redacted"], terms, width)
+                        if RERANK_FOCUS_WINDOW
+                        else row["text_redacted"]
+                    )
         # The same passage can reach the pool under two keys (a passage id
         # from one arm, a receipt from another); send its text once and let
         # both keys share the score.
