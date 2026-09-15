@@ -651,3 +651,24 @@ class PacingAndTransientTests(unittest.TestCase):
         self.assertFalse(is_transient(BadRequestError()))
         self.assertFalse(is_transient(ValueError("x")))
 
+
+class WriteConcurrencyTests(unittest.TestCase):
+    def test_pacer_is_thread_safe_and_concurrency_is_validated(self) -> None:
+        import threading
+
+        from recall_server.turbopuffer_plane import TurbopufferSettings
+        from recall_server.turbopuffer_projection import TokenPacer, TurbopufferProjector
+
+        pacer = TokenPacer(10**9)
+        threads = [threading.Thread(target=lambda: [pacer.wait_for(10) for _ in range(200)]) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sum(count for _at, count in pacer.sent), 16000)
+        settings = TurbopufferSettings(api_key="k", write_concurrency=3)
+        projector = TurbopufferProjector(object(), settings, client=object())
+        self.assertEqual((projector.write_concurrency, projector.page_rows), (3, settings.write_batch_rows * 3))
+        with self.assertRaises(ValueError):
+            TurbopufferProjector(object(), settings, client=object(), write_concurrency=0)
+

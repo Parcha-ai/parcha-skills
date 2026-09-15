@@ -1828,6 +1828,7 @@ def main() -> None:
     )
     search_plane_project.add_argument("--tenant", required=True)
     search_plane_project.add_argument("--once", action="store_true")
+    search_plane_project.add_argument("--write-concurrency", type=int, default=None, help="concurrent batch writes per month (default RECALL_TPUF_WRITE_CONCURRENCY or 4)")
     search_plane_project.add_argument(
         "--max-months", type=int, default=DEFAULT_MONTHS_PER_CYCLE,
         help="source-months per drain cycle",
@@ -2567,6 +2568,7 @@ def main() -> None:
             sys.exit(2)
         search_projector = TurbopufferProjector(
             store, search_settings, client=_search_plane_client(search_settings),
+            write_concurrency=args.write_concurrency,
         )
         totals = {"cycles": 0, "months": 0, "rows": 0, "deleted": 0, "failed": 0, "requeued": 0, "rate_limited": 0}
         while True:

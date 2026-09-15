@@ -31,7 +31,9 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
 from datetime import date, datetime, timezone
 from typing import Any
@@ -170,6 +172,10 @@ def is_transient(error: BaseException) -> bool:
 # org). Writes are paced under this estimate (chars / 4) so the drain never
 # trips the limit and leaves headroom for query-time embeddings.
 DEFAULT_TOKENS_PER_MINUTE = 1_000_000
+# Batches of one page are written concurrently: one write is an embedding
+# round trip of a few seconds, and sequential writes used under half of the
+# token budget live.
+DEFAULT_WRITE_CONCURRENCY = 4
 TOKEN_CHARS = 4
 
 
@@ -183,20 +189,25 @@ class TokenPacer:
         self.sleep = sleep
         self.sent: list[tuple[float, int]] = []
         self.slept_seconds = 0.0
+        self._lock = threading.Lock()
 
     def wait_for(self, tokens: int) -> None:
+        """Shared by the concurrent batch writers: the window is reserved
+        under a lock, the sleep happens outside it."""
+
         if self.limit <= 0:
             return
         while True:
-            now = self.clock()
-            self.sent = [(at, count) for at, count in self.sent if now - at < 60.0]
-            used = sum(count for _at, count in self.sent)
-            if used + tokens <= self.limit or not self.sent:
-                self.sent.append((now, tokens))
-                return
-            oldest_at = self.sent[0][0]
-            delay = max(0.05, 60.0 - (now - oldest_at))
-            self.slept_seconds += delay
+            with self._lock:
+                now = self.clock()
+                self.sent = [(at, count) for at, count in self.sent if now - at < 60.0]
+                used = sum(count for _at, count in self.sent)
+                if used + tokens <= self.limit or not self.sent:
+                    self.sent.append((now, tokens))
+                    return
+                oldest_at = self.sent[0][0]
+                delay = max(0.05, 60.0 - (now - oldest_at))
+                self.slept_seconds += delay
             self.sleep(delay)
 
 
@@ -219,6 +230,7 @@ class TurbopufferProjector:
         sleep: Callable[[float], Any] = time.sleep,
         rate_limit_budget_seconds: float = RATE_LIMIT_BUDGET_SECONDS,
         tokens_per_minute: int | None = None,
+        write_concurrency: int | None = None,
     ) -> None:
         batch = settings.write_batch_rows if batch_rows is None else batch_rows
         if isinstance(batch, bool) or not isinstance(batch, int) or not 1 <= batch <= 5000:
@@ -239,6 +251,15 @@ class TurbopufferProjector:
         )
         # Wall clock on purpose: the injected clock serves deadlines in tests.
         self.pacer = TokenPacer(int(limit), clock=time.monotonic, sleep=sleep)
+        concurrency = (
+            getattr(settings, "write_concurrency", DEFAULT_WRITE_CONCURRENCY)
+            if write_concurrency is None
+            else write_concurrency
+        )
+        if isinstance(concurrency, bool) or not isinstance(concurrency, int) or not 1 <= concurrency <= 16:
+            raise ValueError("search plane write concurrency is invalid")
+        self.write_concurrency = concurrency
+        self.page_rows = self.batch_rows * concurrency
         self._client = client
 
     @property
@@ -304,7 +325,7 @@ class TurbopufferProjector:
                 _PASSAGE_PAGE_SQL,
                 (
                     claim["tenant_id"], claim["source_id"], start, end,
-                    since, since, cursor_time, cursor_id, self.batch_rows,
+                    since, since, cursor_time, cursor_id, self.page_rows,
                 ),
             ).fetchall()
         ]
@@ -443,13 +464,25 @@ class TurbopufferProjector:
                 passage_row({**passage, "actors": [tuple(actor) for actor in passage["actors"]]})
                 for passage in page
             ]
-            for batch in byte_bounded_batches(rows, max_rows=self.batch_rows, max_bytes=self.max_batch_bytes):
+            batches = byte_bounded_batches(rows, max_rows=self.batch_rows, max_bytes=self.max_batch_bytes)
+
+            def write_batch(batch: list[dict[str, Any]]) -> int:
                 self.pacer.wait_for(estimated_tokens(batch))
                 self._write(namespace, budget, upsert_rows=batch)
-                written += len(batch)
+                return len(batch)
+
+            if self.write_concurrency > 1 and len(batches) > 1:
+                with ThreadPoolExecutor(
+                    max_workers=min(self.write_concurrency, len(batches)),
+                    thread_name_prefix="recall-search-plane",
+                ) as executor:
+                    written += sum(executor.map(write_batch, batches))
+            else:
+                for batch in batches:
+                    written += write_batch(batch)
             last = page[-1]
             after = (last["first_occurred_at"], last["passage_id"])
-            if len(page) < self.batch_rows:
+            if len(page) < self.page_rows:
                 break
         with self.store.connect() as connection:
             retired = self.finish_month(
