@@ -1,0 +1,34 @@
+{
+  "name": "unslop",
+  "version": "0.1.0",
+  "description": "Cut AI tells from text written or edited for a human reader before committing, posting, or sending it.",
+  "author": {
+    "name": "Lauren Tan",
+    "url": "https://github.com/cursor/plugins/tree/main/pstack/skills/unslop"
+  },
+  "homepage": "https://github.com/miguelrios/unc-skills/tree/main/unslop",
+  "repository": "https://github.com/miguelrios/unc-skills/tree/main/unslop",
+  "license": "MIT",
+  "keywords": [
+    "unslop",
+    "writing",
+    "editing",
+    "ai-tells"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Unslop",
+    "shortDescription": "Cut AI tells from writing",
+    "longDescription": "Cut AI tells from text written or edited for a human reader before committing, posting, or sending it.",
+    "developerName": "Lauren Tan",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/miguelrios/unc-skills/tree/main/unslop",
+    "defaultPrompt": [
+      "Use $unslop on the task at hand."
+    ]
+  }
+}

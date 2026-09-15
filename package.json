@@ -25,7 +25,13 @@
       "./tether/skills",
       "./desloppify/skills",
       "./autoqa/skills",
-      "./precap/skills"
+      "./precap/skills",
+      "./blast-radius/skills",
+      "./verify-release/skills",
+      "./tdd/skills",
+      "./unslop/skills",
+      "./before-after/skills",
+      "./review-loop/skills"
     ]
   },
   "license": "MIT"

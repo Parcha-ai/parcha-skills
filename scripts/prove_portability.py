@@ -24,6 +24,12 @@ SKILLS = (
     "desloppify",
     "autoqa",
     "precap",
+    "blast-radius",
+    "verify-release",
+    "tdd",
+    "unslop",
+    "before-after",
+    "review-loop",
 )
 
 

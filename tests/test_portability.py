@@ -6,7 +6,23 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SKILLS = ("hands-free", "parable", "cascade", "recall", "recap", "tether", "desloppify", "autoqa", "precap")
+SKILLS = (
+    "hands-free",
+    "parable",
+    "cascade",
+    "recall",
+    "recap",
+    "tether",
+    "desloppify",
+    "autoqa",
+    "precap",
+    "blast-radius",
+    "verify-release",
+    "tdd",
+    "unslop",
+    "before-after",
+    "review-loop",
+)
 
 
 def load_json(path: Path):

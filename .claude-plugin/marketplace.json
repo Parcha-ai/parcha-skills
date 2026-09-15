@@ -61,6 +61,42 @@
       "source": "./precap",
       "version": "0.1.0",
       "description": "Recap a task before doing it — a grounded, past-tense account of the finished work that long-running agents check themselves against for drift."
+    },
+    {
+      "name": "blast-radius",
+      "source": "./blast-radius",
+      "version": "0.1.0",
+      "description": "Find what a diff breaks beyond the diff and prove the one safety fact by running real code instead of writing it up."
+    },
+    {
+      "name": "verify-release",
+      "source": "./verify-release",
+      "version": "0.1.0",
+      "description": "Verify that the intended release candidate is live in its target environment and that the changed path works there, with live evidence."
+    },
+    {
+      "name": "tdd",
+      "source": "./tdd",
+      "version": "0.1.0",
+      "description": "Test-driven development at pre-agreed seams: red before green, one vertical slice per cycle, regression-first bug fixes."
+    },
+    {
+      "name": "unslop",
+      "source": "./unslop",
+      "version": "0.1.0",
+      "description": "Cut AI tells from text written or edited for a human reader before committing, posting, or sending it."
+    },
+    {
+      "name": "before-after",
+      "source": "./before-after",
+      "version": "0.1.0",
+      "description": "Paired base-versus-branch screenshot captures for a PR body, published to a pr-assets branch in the same repository; never judges pass or fail."
+    },
+    {
+      "name": "review-loop",
+      "source": "./review-loop",
+      "version": "0.1.0",
+      "description": "Drive every reviewer thread on a GitHub PR (Greptile, Devin, humans) to zero unresolved in bounded iterations, with a fixed-format final report."
     }
   ]
 }

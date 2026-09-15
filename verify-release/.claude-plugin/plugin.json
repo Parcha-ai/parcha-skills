@@ -1,0 +1,9 @@
+{
+  "name": "verify-release",
+  "version": "0.1.0",
+  "description": "Verify that the intended release candidate is live in its target environment and that the changed path works there, with live evidence.",
+  "author": {
+    "name": "Miguel Rios",
+    "url": "https://github.com/miguelrios"
+  }
+}

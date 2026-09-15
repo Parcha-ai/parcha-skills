@@ -1,0 +1,34 @@
+{
+  "name": "before-after",
+  "version": "0.1.0",
+  "description": "Paired base-versus-branch screenshot captures for a PR body, published to a pr-assets branch in the same repository; never judges pass or fail.",
+  "author": {
+    "name": "James Clements",
+    "url": "https://github.com/vercel-labs/before-and-after"
+  },
+  "homepage": "https://github.com/miguelrios/unc-skills/tree/main/before-after",
+  "repository": "https://github.com/miguelrios/unc-skills/tree/main/before-after",
+  "license": "PolyForm-Shield-1.0.0",
+  "keywords": [
+    "before-after",
+    "screenshots",
+    "pull-request",
+    "visual-evidence"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Before / after",
+    "shortDescription": "Paired base-versus-branch captures for a PR body",
+    "longDescription": "Paired base-versus-branch screenshot captures for a PR body, published to a pr-assets branch in the same repository; never judges pass or fail.",
+    "developerName": "James Clements",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/miguelrios/unc-skills/tree/main/before-after",
+    "defaultPrompt": [
+      "Use $before-after on the task at hand."
+    ]
+  }
+}

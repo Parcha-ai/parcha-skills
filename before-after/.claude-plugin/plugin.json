@@ -1,0 +1,9 @@
+{
+  "name": "before-after",
+  "version": "0.1.0",
+  "description": "Paired base-versus-branch screenshot captures for a PR body, published to a pr-assets branch in the same repository; never judges pass or fail.",
+  "author": {
+    "name": "James Clements",
+    "url": "https://github.com/vercel-labs/before-and-after"
+  }
+}

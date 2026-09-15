@@ -1,0 +1,4 @@
+interface:
+  display_name: "Verify release"
+  short_description: "Verify a deployed change against live evidence"
+  default_prompt: "Use $verify-release to verify this deployment and continue the agreed checks."
