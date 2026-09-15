@@ -183,8 +183,14 @@ class TokenPacer:
     """Sliding one-minute window of estimated tokens; ``wait_for(tokens)``
     sleeps until sending ``tokens`` keeps the window under the limit."""
 
-    def __init__(self, tokens_per_minute: int, *, clock: Any = time.monotonic, sleep: Any = time.sleep) -> None:
-        self.limit = int(tokens_per_minute)
+    # The service meters tokens on a finer window than a minute: four
+    # concurrent 32-row batches (~270k tokens at once) drew 429s under a
+    # 1.8M/min budget. The budget is spread over short windows instead.
+    WINDOW_SECONDS = 5.0
+
+    def __init__(self, tokens_per_minute: int, *, clock: Any = time.monotonic, sleep: Any = time.sleep, window_seconds: float | None = None) -> None:
+        self.window = float(window_seconds or self.WINDOW_SECONDS)
+        self.limit = int(tokens_per_minute * self.window / 60.0)
         self.clock = clock
         self.sleep = sleep
         self.sent: list[tuple[float, int]] = []
@@ -200,13 +206,13 @@ class TokenPacer:
         while True:
             with self._lock:
                 now = self.clock()
-                self.sent = [(at, count) for at, count in self.sent if now - at < 60.0]
+                self.sent = [(at, count) for at, count in self.sent if now - at < self.window]
                 used = sum(count for _at, count in self.sent)
                 if used + tokens <= self.limit or not self.sent:
                     self.sent.append((now, tokens))
                     return
                 oldest_at = self.sent[0][0]
-                delay = max(0.05, 60.0 - (now - oldest_at))
+                delay = max(0.05, self.window - (now - oldest_at))
                 self.slept_seconds += delay
             self.sleep(delay)
 
