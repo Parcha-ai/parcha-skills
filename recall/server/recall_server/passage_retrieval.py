@@ -678,6 +678,12 @@ FOCUS_WINDOW_MIN_GAIN = 2
 # lost recall@20 0.79 → 0.63 and #537 (head unless +2 terms) only partly
 # recovered it (0.71, MRR 0.35). The reranker keeps reading the head.
 RERANK_FOCUS_WINDOW = False
+# H2-o: the reranker reads the head (the record's framing) followed by the
+# query-densest window when that window lies past the head; each half gets
+# this share of the budget. The head alone misjudged a dense rank-2 gold
+# (rerank 0.34 vs 0.6–0.7) whose answering sentence sat 6 kB in.
+RERANK_SPLIT_HEAD_SHARE = 0.55
+RERANK_SPLIT_MIN_TERMS = 2
 
 
 def arm_nominated(arm_scores: dict[str, Any], nominate_per_arm: int) -> bool:
@@ -798,6 +804,56 @@ def rerank_context(row: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def head_plus_window(text: str, terms: list[str], width: int) -> str:
+    """Head of ``text`` plus the query-densest later window, within ``width``.
+
+    The head keeps the record's framing (role, opening lines); the window
+    is where the question's terms cluster. When the text fits, or the
+    window would start inside the head, or it covers fewer than
+    ``RERANK_SPLIT_MIN_TERMS`` distinct terms, the head alone is sent.
+    """
+
+    if width <= 0 or len(text) <= width or not terms:
+        return text
+    head_width = int(width * RERANK_SPLIT_HEAD_SHARE)
+    window_width = width - head_width - 5
+    if window_width < 64:
+        return text
+    folded = text.casefold()
+    hits: list[tuple[int, int]] = []
+    for index, term in enumerate(terms):
+        start = head_width
+        while True:
+            at = folded.find(term, start)
+            if at < 0:
+                break
+            hits.append((at, index))
+            start = at + max(len(term), 1)
+            if len(hits) > 4096:
+                break
+    if not hits:
+        return text
+    hits.sort()
+    best_start, best_count = -1, 0
+    counts: dict[int, int] = {}
+    right = 0
+    for left, (at, _index) in enumerate(hits):
+        while right < len(hits) and hits[right][0] < at + window_width:
+            counts[hits[right][1]] = counts.get(hits[right][1], 0) + 1
+            right += 1
+        if left > 0:
+            prior = hits[left - 1][1]
+            counts[prior] -= 1
+            if counts[prior] == 0:
+                del counts[prior]
+        if len(counts) > best_count:
+            best_start, best_count = at, len(counts)
+    if best_count < RERANK_SPLIT_MIN_TERMS:
+        return text
+    best_start = max(head_width, min(best_start - window_width // 8, len(text) - window_width))
+    return text[:head_width] + "\n...\n" + text[best_start:best_start + window_width]
+
+
 def rerank_document(row: dict[str, Any], terms: list[str], width: int) -> str:
     """Context line plus the query-densest window, fitted to ``width``."""
 
@@ -806,8 +862,11 @@ def rerank_document(row: dict[str, Any], terms: list[str], width: int) -> str:
 
     def body(budget: int) -> str:
         # The runtime trims the tail to its width; the head is kept unless
-        # the focus window is enabled (see RERANK_FOCUS_WINDOW).
-        return focus_window(text, terms, budget) if RERANK_FOCUS_WINDOW else text
+        # the focus window is enabled (see RERANK_FOCUS_WINDOW); otherwise
+        # the head is followed by the matching window when one lies past it.
+        if RERANK_FOCUS_WINDOW:
+            return focus_window(text, terms, budget)
+        return head_plus_window(text, terms, budget)
 
     if not context:
         return body(width)
