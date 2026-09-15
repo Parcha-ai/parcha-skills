@@ -247,6 +247,7 @@ def collapse_document_candidates(
     fusion_report: dict[str, Any] | None = None,
     nominate_per_arm: int = 0,
     window_boost: tuple[str, str, float] | None = None,
+    source_boost: tuple[tuple[str, ...], float] | None = None,
 ) -> list[dict[str, Any]]:
     """Fuse mechanical hints while keeping their strongest exact ranges.
 
@@ -361,6 +362,16 @@ def collapse_document_candidates(
             ):
                 value["_score"] = max(value["_score"], floor) * factor
                 value["_temporal_boost"] = factor
+    if source_boost is not None:
+        prefixes, factor = source_boost
+        # Same floor as the window boost: a document only one arm saw sits
+        # at 0.0 and a multiply alone could not move it.
+        positive = [value["_score"] for value in documents.values() if value["_score"] > 0.0]
+        floor = min(positive) if positive else 0.0
+        for value in documents.values():
+            if str(value["source_id"]).startswith(prefixes):
+                value["_score"] = max(value["_score"], floor) * factor
+                value["_source_boost"] = factor
     ordered = sorted(
         documents.values(),
         key=lambda value: (
@@ -413,6 +424,7 @@ def collapse_document_candidates(
         score = value.pop("_score")
         arm_scores = value.pop("_arm_scores")
         temporal_boost = value.pop("_temporal_boost", None)
+        source_boost_factor = value.pop("_source_boost", None)
         results.append({
             **value,
             "rank": round(score, 8),
@@ -429,6 +441,7 @@ def collapse_document_candidates(
             # probe can save candidates for offline alpha tuning.
             "arm_scores": arm_scores,
             **({"temporal_boost": temporal_boost} if temporal_boost is not None else {}),
+            **({"source_boost": source_boost_factor} if source_boost_factor is not None else {}),
         })
     return results
 
@@ -497,6 +510,42 @@ def query_clauses(query: str) -> list[str]:
         if len(unique) >= QUERY_CLAUSE_MAX:
             break
     return unique if len(unique) >= 1 else []
+
+
+# H2-n: a question that names the harness ("in the Codex work", "the Claude
+# session where…") is a soft scope: documents from that source family are
+# boosted the way a temporal hint boosts a window (never a filter). The
+# family is the source id prefix the collectors write (``codex:``,
+# ``claude:``, ``cowork:``, ``slack:``).
+SOURCE_HINT_BOOST = 0.5
+_SOURCE_HINT_RE = re.compile(
+    r"\b(?:in|from|during|within|across)\s+(?:the\s+|our\s+|my\s+)?"
+    r"(?P<family>codex|claude(?:\s+code)?|cowork|slack)\b"
+    r"|\b(?P<family2>codex|claude(?:\s+code)?|cowork|slack)\s+"
+    r"(?:work|session|sessions|thread|threads|transcript|transcripts|run|runs|logs?|channel|channels|history)\b",
+    re.IGNORECASE,
+)
+_SOURCE_FAMILY_PREFIX = {"codex": "codex:", "claude": "claude:", "claude code": "claude:", "cowork": "cowork:", "slack": "slack:"}
+
+
+def parse_source_hint(query: str) -> tuple[str, ...]:
+    """Source id prefixes a question names ("in the Codex work" → ``codex:``)."""
+
+    prefixes: list[str] = []
+    for match in _SOURCE_HINT_RE.finditer(query):
+        family = (match.group("family") or match.group("family2") or "").casefold()
+        family = " ".join(family.split())
+        prefix = _SOURCE_FAMILY_PREFIX.get(family)
+        if prefix and prefix not in prefixes:
+            prefixes.append(prefix)
+    return tuple(prefixes)
+
+
+def source_hints_enabled(store: Any) -> bool:
+    value = getattr(store, "source_hints", None)
+    if value is None:
+        return os.environ.get("RECALL_SOURCE_HINTS", "on").strip().lower() != "off"
+    return bool(value)
 
 
 def query_clauses_enabled(store: Any) -> bool:
@@ -2091,6 +2140,15 @@ class PassageHintRetrieval:
             factor = 1.0 + temporal_settings.boost_for(temporal_hint.confidence)
             window_boost = (temporal_hint.since, temporal_hint.until, factor)
             temporal_diagnostics["temporal_hint"] = temporal_hint.as_diagnostics(factor)
+        source_boost: tuple[tuple[str, ...], float] | None = None
+        if source_hints_enabled(self.store):
+            source_prefixes = parse_source_hint(query)
+            if source_prefixes:
+                source_boost = (source_prefixes, 1.0 + SOURCE_HINT_BOOST)
+                temporal_diagnostics["source_hint"] = {
+                    "families": [prefix.rstrip(":") for prefix in source_prefixes],
+                    "boost": 1.0 + SOURCE_HINT_BOOST,
+                }
         # A document containing every informative query term is stronger
         # evidence than a semantic neighbor. Dense retrieval remains the
         # fallback for paraphrases, but it must not bury an exact hit merely
@@ -2125,10 +2183,15 @@ class PassageHintRetrieval:
                 RERANK_NOMINATE_PER_ARM if rerank_runtime is not None else 0
             ),
             window_boost=window_boost,
+            source_boost=source_boost,
         )
         if window_boost is not None:
             temporal_diagnostics["temporal_boosted"] = sum(
                 1 for row in results if "temporal_boost" in row
+            )
+        if source_boost is not None:
+            temporal_diagnostics["source_boosted"] = sum(
+                1 for row in results if "source_boost" in row
             )
         # Arms that ran out of budget: either they returned nothing or the
         # text arms fell back from full ranking to a recency window. Lets a
