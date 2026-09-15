@@ -2834,6 +2834,73 @@ class SourceHintTests(unittest.TestCase):
         self.assertEqual(response["results"][0]["logical_document_id"][5:6], "a")
 
 
+class AllCommonLexicalTests(unittest.TestCase):
+    def test_all_common_query_takes_the_recency_pool(self) -> None:
+        from recall_server.passage_retrieval import PassageHintRetrieval, _COMMON_LEXEMES_CACHE, lexical_plan_is_all_common, lexical_match_plan
+
+        class _Cursor:
+            def __init__(self, rows): self.rows = rows
+            def fetchall(self): return self.rows
+
+        class _Store:
+            database_url = "postgresql://all-common-test"
+            def __init__(self):
+                self.sql = []
+            def connect(self):
+                import contextlib
+                return contextlib.nullcontext(object())
+            def _execute_bounded(self, connection, sql, values, deadline_at):
+                self.sql.append(sql)
+                if "pg_stats" in sql:
+                    return _Cursor([{"elems": ["proof", "gate", "grep"]}])
+                return _Cursor([])
+
+        _COMMON_LEXEMES_CACHE.pop("postgresql://all-common-test", None)
+        store = _Store()
+        retrieval = PassageHintRetrieval(store, tenant_id="tenant:test", sources=["codex:linux:test"], policy_fingerprint="fp")
+        rows, status = retrieval._lexical_candidates(
+            "proof gate", since=None, until=None, candidate_limit=40, actor_ids=None,
+            actor_relations=None, deadline_at=time.monotonic() + 5,
+        )
+        self.assertEqual((rows, status), ([], "ok-recent-first"))
+        lexical_sql = [item for item in store.sql if "FROM canonical_passages passage" in item]
+        self.assertEqual(len(lexical_sql), 1)
+        self.assertNotIn("ts_rank_cd", lexical_sql[0])
+        # A query with one uncommon term still ranks.
+        rows, status = retrieval._lexical_candidates(
+            "proof gate verdict", since=None, until=None, candidate_limit=40, actor_ids=None,
+            actor_relations=None, deadline_at=time.monotonic() + 5,
+        )
+        self.assertEqual(status, "ok")
+        self.assertIn("ts_rank_cd", store.sql[-1])
+        self.assertTrue(lexical_plan_is_all_common(lexical_match_plan("proof gate", frozenset({"proof", "gate"}))))
+        self.assertFalse(lexical_plan_is_all_common(lexical_match_plan("", frozenset({"proof"}))))
+        self.assertEqual(retrieval._cached_common_lexemes(), frozenset({"proof", "gate", "grep"}))
+
+    def test_all_common_clause_is_skipped(self) -> None:
+        from recall_server.passage_retrieval import PassageHintRetrieval, _COMMON_LEXEMES_CACHE
+        from tests.central_brain.test_passage_fusion import candidate
+        store = RerankWiringTests._Store()
+        store.query_clauses = True
+        store.database_url = "postgresql://clause-common-test"
+        _COMMON_LEXEMES_CACHE["postgresql://clause-common-test"] = (time.monotonic() + 600, frozenset({"proof", "gate", "verdict", "flue", "checks", "fall", "short", "recent", "two", "one"}))
+        retrieval = PassageHintRetrieval(store, tenant_id="tenant:test", sources=["codex:linux:test"], policy_fingerprint="fp-policy")
+        retrieval._dense_candidates = lambda query, vector=None, **kwargs: ([candidate("a", "dense", 0.9)], "ok", "prose-pool", 10)
+        retrieval._embed_query = lambda text: [0.0]
+        lexical_calls: list[str] = []
+        retrieval._lexical_candidates = lambda query, **kwargs: (lexical_calls.append(query), ([], "ok"))[1]
+        retrieval._sparse_candidates = lambda query, original_query=None, **kwargs: ([], "skipped-prose-query")
+        response = retrieval.search(
+            "Why did two recent FLUE checks fall short, one on the verdict and one on the proof gate stage?",
+            lexical_query="two recent flue checks fall short verdict proof gate stage", since=None, until=None, limit=10,
+        )
+        statuses = response["diagnostics"]["lexical_clause_statuses"]
+        self.assertEqual(len(statuses), 2)
+        self.assertIn("skipped-common", statuses)
+        # Only the question and the non-common clause reached the lexical arm.
+        self.assertEqual(len(lexical_calls), 1 + statuses.count("ok"))
+
+
 class IdentifierSigilTests(unittest.TestCase):
     def test_hash_prefixed_numbers_are_identifiers(self) -> None:
         from recall_server.passage_retrieval import identifier_tokens

@@ -199,6 +199,12 @@ def lexical_match_plan(
     }
 
 
+def lexical_plan_is_all_common(plan: dict[str, Any]) -> bool:
+    """True when every query term is a corpus-common lexeme (and there are any)."""
+
+    return bool(plan["terms"]) and not plan["required"] and not plan["relaxed"]
+
+
 def sparse_arm_applies(lexical_query: str) -> bool:
     """True when the query has at least one token that looks like an identifier."""
 
@@ -977,17 +983,37 @@ class PassageHintRetrieval:
         try:
             with self.store.connect() as connection:
                 try:
+                    plan = lexical_match_plan(
+                        lexical_query, self._common_lexemes(connection, deadline_at)
+                    )
+                except SearchDeadlineExceeded:
+                    return [], "deadline-exceeded"
+                if lexical_plan_is_all_common(plan):
+                    # Every term is corpus-common ("proof gate"): the AND
+                    # matches tens of thousands of passages and ranking them
+                    # reads every TOASTed tsvector (7.5 s live). The recency
+                    # pool is inline columns only; fusion treats a
+                    # recent-first leg by rank and the dense arm carries
+                    # relevance.
+                    try:
+                        return self._lexical_query(
+                            connection, lexical_query, order="recent",
+                            deadline_at=deadline_at, plan=plan, **arguments,
+                        ), "ok-recent-first"
+                    except SearchDeadlineExceeded:
+                        return [], "deadline-exceeded"
+                try:
                     return self._lexical_query(
                         connection, lexical_query, order="rank",
                         deadline_at=_phase_deadline(deadline_at, RANKED_PHASE_BUDGET_FRACTION),
-                        **arguments,
+                        plan=plan, **arguments,
                     ), "ok"
                 except SearchDeadlineExceeded:
                     pass
                 try:
                     return self._lexical_query(
                         connection, lexical_query, order="recent",
-                        deadline_at=deadline_at, **arguments,
+                        deadline_at=deadline_at, plan=plan, **arguments,
                     ), "ok-recent-first"
                 except SearchDeadlineExceeded:
                     return [], "deadline-exceeded"
@@ -1006,6 +1032,7 @@ class PassageHintRetrieval:
         actor_ids: list[str] | None,
         actor_relations: list[str] | None,
         deadline_at: float,
+        plan: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """One bounded lexical scan.
 
@@ -1015,9 +1042,10 @@ class PassageHintRetrieval:
         projection, evidence, and chunk liveness run afterwards on the bounded
         pool, never on the whole match set.
         """
-        plan = lexical_match_plan(
-            lexical_query, self._common_lexemes(connection, deadline_at)
-        )
+        if plan is None:
+            plan = lexical_match_plan(
+                lexical_query, self._common_lexemes(connection, deadline_at)
+            )
         self.lexical_plan = {
             "terms": len(plan["terms"]),
             "required": len(plan["required"]),
@@ -1165,6 +1193,14 @@ class PassageHintRetrieval:
                     ),
                     deadline_at,
                 ).fetchall()
+
+    def _cached_common_lexemes(self) -> frozenset[str]:
+        """The cached common-lexeme set (empty when nothing is cached yet)."""
+
+        key = getattr(self.store, "database_url", None) or id(self.store)
+        with _COMMON_LEXEMES_LOCK:
+            entry = _COMMON_LEXEMES_CACHE.get(key)
+        return entry[1] if entry is not None and entry[0] > time.monotonic() else frozenset()
 
     def _common_lexemes(self, connection: Any, deadline_at: float) -> frozenset[str]:
         """Most common ``search_vector`` lexemes from ``pg_stats``, cached 10 min.
@@ -2094,6 +2130,12 @@ class PassageHintRetrieval:
                 clause_query = " ".join(_content_words(clause))
                 if not clause_query or time.monotonic() >= clause_deadline:
                     return [], "skipped-budget"
+                if lexical_plan_is_all_common(
+                    lexical_match_plan(clause_query, self._cached_common_lexemes())
+                ):
+                    # "one on the proof gate" → "proof gate": nothing but
+                    # common terms; the recency pool would add noise.
+                    return [], "skipped-common"
                 return self._lexical_candidates(
                     clause_query, **{**arguments, "deadline_at": clause_deadline},
                 )
