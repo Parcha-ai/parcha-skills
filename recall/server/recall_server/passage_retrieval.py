@@ -509,19 +509,35 @@ def query_clauses_enabled(store: Any) -> bool:
 def merge_dense_pools(
     primary: list[dict[str, Any]],
     windowed: list[dict[str, Any]],
+    *,
+    align_by_rank: bool = False,
 ) -> tuple[list[dict[str, Any]], int]:
-    """Union the global dense pool with the windowed pass (H2-h).
+    """Union the global dense pool with a second pass (H2-h window, H2-m clause).
 
     Both pools hold one row per logical document. Documents the global pass
-    already returned keep their row; new documents from the window join the
-    pool, and the union is re-ordered by dense score (stable, so ties keep
-    the arms' recency order). Returns the pool and how many rows the window
-    added.
+    already returned keep their row; new documents from the second pass join
+    the pool, and the union is re-ordered by dense score (stable, so ties keep
+    the arms' recency order). Returns the pool and how many rows were added.
+
+    ``align_by_rank``: a clause pass scores against a different query vector,
+    so its cosine scores are not comparable with the global pass. Its rows
+    are first given the score the global pool holds at the same rank (the
+    clause's best document is worth the global best), so a document that
+    answers one part of a compound question is not sorted to the tail and
+    cut before the collapse. A window pass reuses the global vector and
+    keeps its scores.
     """
 
     if not windowed:
         return primary, 0
     seen = {row["logical_document_id"] for row in primary}
+    if align_by_rank and primary:
+        ladder = sorted((float(row["score"]) for row in primary), reverse=True)
+        aligned = []
+        for rank, row in enumerate(windowed):
+            score = ladder[min(rank, len(ladder) - 1)]
+            aligned.append({**row, "score": score})
+        windowed = aligned
     added = [row for row in windowed if row["logical_document_id"] not in seen]
     if not added:
         return primary, 0
@@ -1993,7 +2009,7 @@ class PassageHintRetrieval:
                     outcomes = list(clause_executor.map(clause_pass, clauses))
                 for clause_rows, clause_status in outcomes:
                     statuses.append(clause_status)
-                    rows, added = merge_dense_pools(rows, clause_rows)
+                    rows, added = merge_dense_pools(rows, clause_rows, align_by_rank=True)
                     added_total += added
             finally:
                 arm_elapsed_ms["dense_clauses"] = round(

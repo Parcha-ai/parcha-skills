@@ -2726,6 +2726,7 @@ class QueryClauseTests(unittest.TestCase):
                     "tables to letting customers bring their own connections into Grep?")
         response = retrieval.search(question, lexical_query="expert tool evolve", since=None, until=None, limit=10)
         self.assertEqual(len(calls), 3)
+        # z (clause rank 1) takes the global rank-1 score and ties break on document id.
         self.assertEqual([row["logical_document_id"][5:].rstrip("0") for row in response["results"]], ["z", "a", "b"])
         self.assertEqual(response["diagnostics"]["dense_clauses"], 2)
         self.assertEqual(response["diagnostics"]["dense_clause_added"], 1)
@@ -2736,6 +2737,26 @@ class QueryClauseTests(unittest.TestCase):
         response = retrieval.search(question, lexical_query="expert tool evolve", since=None, until=None, limit=10)
         self.assertEqual(len(calls), 1)
         self.assertNotIn("dense_clauses", response["diagnostics"])
+
+
+class RankAlignedUnionTests(unittest.TestCase):
+    def _row(self, doc, score):
+        return {"logical_document_id": doc, "score": score}
+
+    def test_clause_rows_take_the_global_score_at_their_rank(self) -> None:
+        from recall_server.passage_retrieval import merge_dense_pools
+        primary = [self._row("g1", 0.60), self._row("g2", 0.55), self._row("g3", 0.50)]
+        clause = [self._row("c1", 0.41), self._row("g2", 0.40), self._row("c3", 0.39), self._row("c4", 0.38)]
+        merged, added = merge_dense_pools(primary, clause, align_by_rank=True)
+        self.assertEqual(added, 3)
+        self.assertEqual([r["logical_document_id"] for r in merged], ["g1", "c1", "g2", "g3", "c3", "c4"])
+        self.assertEqual([r["score"] for r in merged], [0.60, 0.60, 0.55, 0.50, 0.50, 0.50])
+        # Without alignment the raw scores sort every clause row to the tail.
+        merged, _ = merge_dense_pools(primary, clause)
+        self.assertEqual([r["logical_document_id"] for r in merged], ["g1", "g2", "g3", "c1", "c3", "c4"])
+        # An empty global pool keeps the clause rows as they are.
+        merged, added = merge_dense_pools([], clause, align_by_rank=True)
+        self.assertEqual((added, merged[0]["score"]), (4, 0.41))
 
 
 class IdentifierSigilTests(unittest.TestCase):
