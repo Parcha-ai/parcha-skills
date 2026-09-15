@@ -2,8 +2,10 @@
 
 Shared by the projection and retrieval tests and the search-plane e2e.
 Rows live in a dict per namespace. ``query`` honours the filter subset the
-Recall arms use (And/Or, In, Eq, Gte/Lte on ISO datetimes, ContainsAny,
-ContainsAllTokens) and ranks by term overlap: BM25 → count of query tokens
+Recall arms use (And/Or/Not, Eq/NotEq, In/NotIn, Gt/Gte/Lt/Lte on ISO
+datetimes, Contains/NotContains/ContainsAny/ContainsAll, ContainsAllTokens,
+Glob) and returns ``FakeRow`` objects (dict-style and attribute access) ranked
+by term overlap: BM25 → count of query tokens
 present in the attribute (``$score``); ANN with ``["Embed", text]`` → the
 same overlap turned into a distance (``$dist`` = 1 − overlap ratio) so a
 passage sharing more words with the query is "nearer". Good enough to prove
@@ -15,6 +17,27 @@ import json
 import os
 import re
 from typing import Any
+
+
+class NotFoundError(Exception):
+    """Named like ``turbopuffer.NotFoundError``: a delete-only write to a
+    namespace that never received an upsert (the writer matches by name)."""
+
+
+class FakeRow(dict):
+    """A query row: ``row.id``, ``row["$dist"]``, ``row.text``, ``to_dict()``."""
+
+    def __getattr__(self, key: str) -> Any:
+        try:
+            return self[key]
+        except KeyError as error:
+            raise AttributeError(key) from error
+
+    def to_dict(self) -> dict[str, Any]:
+        return dict(self)
+
+    model_dump = to_dict
+
 
 # word_v4-ish: a token starts with a letter or digit; sigils (#, @, $) and
 # punctuation split, underscores/dots/dashes inside a token survive.
@@ -44,22 +67,37 @@ class FakeNamespace:
         self.writes: list[dict[str, Any]] = []
         self.queries: list[dict[str, Any]] = []
         self.schema: dict[str, Any] | None = None
+        self.deleted: list[str] = []
         self.fail_writes: Exception | None = None
         self.fail_queries: Exception | None = None
+        self._touched = False
+
+    @property
+    def fail_with(self) -> Exception | None:
+        return self.fail_writes
+
+    @fail_with.setter
+    def fail_with(self, error: Exception | None) -> None:
+        self.fail_writes = error
 
     # -- write ---------------------------------------------------------------
     def write(self, **kwargs: Any) -> dict[str, Any]:
         if self.fail_writes is not None:
             raise self.fail_writes
+        upserts = list(kwargs.get("upsert_rows") or ())
+        if not upserts and kwargs.get("deletes") and not self._touched:
+            raise NotFoundError(f"namespace {self.name} was not found")
         self.writes.append(kwargs)
         if kwargs.get("schema"):
             self.schema = dict(kwargs["schema"])
         upserted = 0
-        for row in kwargs.get("upsert_rows") or ():
+        for row in upserts:
             self.rows[str(row["id"])] = dict(row)
             upserted += 1
+        self._touched = self._touched or bool(upserts)
         deleted = 0
         for identifier in kwargs.get("deletes") or ():
+            self.deleted.append(str(identifier))
             deleted += int(self.rows.pop(str(identifier), None) is not None)
         filter_ = kwargs.get("delete_by_filter")
         if filter_ is not None:
@@ -114,7 +152,7 @@ class FakeNamespace:
                 projected["$dist"] = key
             elif mode == "BM25":
                 projected["$score"] = -key
-            out.append(projected)
+            out.append(FakeRow(projected))
         return out
 
 
@@ -178,6 +216,12 @@ def _matches(row: dict[str, Any], filter_: Any) -> bool:
         return value in (actual or ())
     if op == "ContainsAny":
         return bool(set(value) & set(actual or ()))
+    if op == "ContainsAll":
+        return set(value) <= set(actual or ())
+    if op == "NotContains":
+        return value not in (actual or ())
+    if op == "Glob":
+        return re.fullmatch(re.escape(str(value)).replace("\\*", ".*").replace("\\?", "."), str(actual or "")) is not None
     if op == "ContainsAllTokens":
         present = set(tokens(actual))
         return all(token in present for token in tokens(value))
@@ -233,6 +277,7 @@ class _PersistentNamespace(FakeNamespace):
 
     def write(self, **kwargs: Any) -> dict[str, Any]:
         self.rows = self._owner._load(self.name)
+        self._touched = self._touched or bool(self.rows)
         result = super().write(**kwargs)
         self._owner._save(self.name, self.rows)
         return result

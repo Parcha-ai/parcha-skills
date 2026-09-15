@@ -24,7 +24,7 @@ from recall_server.turbopuffer_projection import (
     is_rate_limit,
 )
 
-from .fake_turbopuffer import FakeNamespace, FakeTurbopuffer
+from .fake_turbopuffer import FakeNamespace, FakeTurbopuffer, NotFoundError
 
 
 def _upserts(write: dict) -> list[str]:
@@ -37,10 +37,6 @@ def _deletes(write: dict) -> list[str]:
 
 class RateLimitError(Exception):
     """Named like ``turbopuffer.RateLimitError``; the writer matches by class name."""
-
-
-class NotFoundError(Exception):
-    """Named like ``turbopuffer.NotFoundError``."""
 
 TENANT = "tenant:company:test"
 SOURCE = "source:codex:test"
@@ -305,13 +301,14 @@ class TombstoneTest(unittest.TestCase):
         catalog = _Catalog()
         catalog.tombstones = [{"source_id": SOURCE, "passage_id": "psg_" + "d" * 32, "month": JULY}]
         catalog.enqueue(JULY, reason="forget")
-        client = FakeTurbopuffer()
-        namespace = client.namespace(SETTINGS.namespace(TENANT))
-        namespace.fail_writes = NotFoundError("namespace not found")
-        projector, _client = _projector(catalog, client)
+        # The fake raises NotFoundError itself for a delete-only write to a
+        # namespace that never received an upsert, as the service does.
+        projector, client = _projector(catalog)
 
         result = projector.drain(tenant_id=TENANT, max_months=1)
 
+        self.assertIsInstance(NotFoundError("x"), Exception)
+        self.assertEqual(client.namespace(SETTINGS.namespace(TENANT)).writes, [])
         self.assertEqual((result["failed"], result["deleted"], result["months"]), (0, 1, 1))
         self.assertEqual(catalog.tombstones, [])
         self.assertEqual(catalog.outbox, {})
