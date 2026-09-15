@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
@@ -430,6 +431,77 @@ def collapse_document_candidates(
             **({"temporal_boost": temporal_boost} if temporal_boost is not None else {}),
         })
     return results
+
+
+# H2-m: a compound question ("how did X evolve from A to B", "what caused
+# P and what did we change") embeds to a point between its parts, so a
+# passage that answers one part sits low in the global dense pool. Long
+# questions are split into at most two extra clauses that each run their own
+# dense pass; the pools are unioned like the temporal window pass.
+QUERY_CLAUSE_MIN_WORDS = 12
+QUERY_CLAUSE_MIN_CONTENT = 3
+QUERY_CLAUSE_MAX = 2
+QUERY_CLAUSE_BUDGET_SECONDS = 0.4
+_CLAUSE_STOPWORDS = frozenset({
+    "the", "and", "our", "did", "what", "how", "why", "when", "where", "which",
+    "that", "this", "with", "from", "into", "for", "was", "were", "are", "is",
+    "did", "does", "do", "we", "it", "its", "of", "to", "in", "on", "at", "by",
+    "a", "an", "as", "be", "or", "up", "end", "out", "any", "own", "let",
+    "letting", "turned", "actually", "really", "still", "just", "also",
+})
+_CLAUSE_SPLIT_RE = re.compile(r"\s*(?:;|,\s+and\s+|\s+and\s+(?:what|how|why|did|which|when)\s+|\s+and\s+|\s+versus\s+|\s+vs\.?\s+)\s*", re.IGNORECASE)
+_CLAUSE_FROM_TO_RE = re.compile(r"^(?P<head>.*?)\bfrom\s+(?P<a>.+?)\s+to\s+(?P<b>.+)$", re.IGNORECASE | re.DOTALL)
+
+
+def _content_words(text: str) -> list[str]:
+    return [
+        word for word in (token.strip("\"'`()[]{},;:.!?#@$").casefold() for token in text.split())
+        if len(word) >= 3 and word not in _CLAUSE_STOPWORDS
+    ]
+
+
+def query_clauses(query: str) -> list[str]:
+    """Extra clauses of a compound question, or ``[]`` when it is simple.
+
+    Only questions of ``QUERY_CLAUSE_MIN_WORDS`` words or more qualify. A
+    ``from A to B`` shape yields ``A`` and ``B`` (each prefixed with the
+    question's head so the clause keeps its subject); otherwise the question
+    is cut at ``;``, ``and``, ``versus`` and each side must carry at least
+    ``QUERY_CLAUSE_MIN_CONTENT`` content words. At most ``QUERY_CLAUSE_MAX``
+    clauses, never equal to the whole question.
+    """
+
+    text = " ".join(query.split())
+    if len(text.split()) < QUERY_CLAUSE_MIN_WORDS:
+        return []
+    clauses: list[str] = []
+    match = _CLAUSE_FROM_TO_RE.match(text.rstrip("?.! "))
+    if match:
+        head = match.group("head").strip()
+        parts = [match.group("a").strip(), match.group("b").strip()]
+        if all(len(_content_words(part)) >= QUERY_CLAUSE_MIN_CONTENT for part in parts):
+            clauses = [f"{head} {part}".strip() if head else part for part in parts]
+    if not clauses:
+        pieces = [piece.strip(" ?.!") for piece in _CLAUSE_SPLIT_RE.split(text)]
+        pieces = [piece for piece in pieces if len(_content_words(piece)) >= QUERY_CLAUSE_MIN_CONTENT]
+        if len(pieces) >= 2:
+            clauses = pieces
+    folded = text.casefold().strip(" ?.!")
+    unique: list[str] = []
+    for clause in clauses:
+        key = clause.casefold()
+        if key != folded and key not in {item.casefold() for item in unique}:
+            unique.append(clause)
+        if len(unique) >= QUERY_CLAUSE_MAX:
+            break
+    return unique if len(unique) >= 1 else []
+
+
+def query_clauses_enabled(store: Any) -> bool:
+    value = getattr(store, "query_clauses", None)
+    if value is None:
+        return os.environ.get("RECALL_QUERY_CLAUSES", "on").strip().lower() != "off"
+    return bool(value)
 
 
 def merge_dense_pools(
@@ -1879,6 +1951,49 @@ class PassageHintRetrieval:
             })
             return merged, status, strategy, scope_passages
 
+        def clause_passes(
+            outcome: tuple[list[dict[str, Any]], str, str, int | None], text: str,
+        ) -> tuple[list[dict[str, Any]], str, str, int | None]:
+            # H2-m: each extra clause of a compound question runs its own
+            # dense pass (one embedding each) inside a short budget; the
+            # pools are unioned so a passage answering one part reaches
+            # the collapse. Sequential on this worker, after the global and
+            # window passes.
+            rows, status, strategy, scope_passages = outcome
+            if status != "ok" or not query_clauses_enabled(self.store):
+                return outcome
+            clauses = query_clauses(text)
+            if not clauses:
+                return outcome
+            clause_deadline = min(
+                deadline_at, time.monotonic() + QUERY_CLAUSE_BUDGET_SECONDS,
+            )
+            added_total = 0
+            statuses: list[str] = []
+            clause_started = time.monotonic()
+            try:
+                for clause in clauses:
+                    if time.monotonic() >= clause_deadline:
+                        statuses.append("skipped-budget")
+                        continue
+                    clause_rows, clause_status, _strategy, _scope = self._dense_candidates(
+                        clause, vector=self._embed_query(clause),
+                        **{**common, "deadline_at": clause_deadline},
+                    )
+                    statuses.append(clause_status)
+                    rows, added = merge_dense_pools(rows, clause_rows)
+                    added_total += added
+            finally:
+                arm_elapsed_ms["dense_clauses"] = round(
+                    (time.monotonic() - clause_started) * 1000, 3
+                )
+            window_diagnostics.update({
+                "dense_clauses": len(clauses),
+                "dense_clause_statuses": statuses,
+                "dense_clause_added": added_total,
+            })
+            return rows, status, strategy, scope_passages
+
         with ThreadPoolExecutor(max_workers=3) as executor:
             lexical_future = executor.submit(
                 timed_arm, "passage_lexical", self._lexical_candidates, lexical_query,
@@ -1890,7 +2005,9 @@ class PassageHintRetrieval:
                 ),
                 lexical_query,
             )
-            dense_future = executor.submit(dense_arms, query)
+            dense_future = executor.submit(
+                lambda text: clause_passes(dense_arms(text), text), query,
+            )
             lexical, lexical_status = lexical_future.result()
             sparse, sparse_status = sparse_future.result()
             (

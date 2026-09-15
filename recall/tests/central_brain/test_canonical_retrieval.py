@@ -2686,6 +2686,58 @@ class RerankContextTests(unittest.TestCase):
         self.assertEqual(rerank_document({"header_redacted": "h" * 1990, "text_redacted": "body"}, [], 2000), "body")
 
 
+class QueryClauseTests(unittest.TestCase):
+    def test_from_to_and_conjunction_shapes_split_long_questions_only(self) -> None:
+        from recall_server.passage_retrieval import query_clauses
+        evolve = ("How did our expert/tool system evolve from internal Grep experts and skill "
+                  "tables to letting customers bring their own connections into Grep?")
+        self.assertEqual(query_clauses(evolve), [
+            "How did our expert/tool system evolve internal Grep experts and skill tables",
+            "How did our expert/tool system evolve letting customers bring their own connections into Grep",
+        ])
+        two = "Why did two recent FLUE checks fall short, one on the verdict gate and one on the proof gate stage?"
+        self.assertEqual(len(query_clauses(two)), 2)
+        # Short questions and questions whose second half carries no content stay whole.
+        self.assertEqual(query_clauses("what did we decide about retries"), [])
+        self.assertEqual(query_clauses("What caused ATI tool calls to render incorrectly in the chat transcript, and what did we change to fix it?"), [])
+
+    def test_clause_passes_union_the_dense_pool_and_report(self) -> None:
+        from tests.central_brain.test_passage_fusion import candidate
+        store = RerankWiringTests._Store()
+        store.query_clauses = True
+        retrieval = PassageHintRetrieval(
+            store, tenant_id="tenant:test", sources=["codex:linux:test"], policy_fingerprint="fp-policy",
+        )
+        calls: list[str] = []
+
+        def dense(query, vector=None, **kwargs):
+            calls.append(query)
+            if "letting customers" in query and "skill tables" in query:
+                # the whole question
+                return [candidate("a", "dense", 0.9), candidate("b", "dense", 0.8)], "ok", "prose-pool", 10
+            # a clause: the second part surfaces a document the whole question missed
+            return [candidate("z", "dense", 0.95), candidate("a", "dense", 0.7)], "ok", "prose-pool", 10
+
+        retrieval._dense_candidates = dense
+        retrieval._embed_query = lambda text: [0.0]
+        retrieval._lexical_candidates = lambda query, **kwargs: ([], "ok")
+        retrieval._sparse_candidates = lambda query, original_query=None, **kwargs: ([], "skipped-prose-query")
+        question = ("How did our expert/tool system evolve from internal Grep experts and skill "
+                    "tables to letting customers bring their own connections into Grep?")
+        response = retrieval.search(question, lexical_query="expert tool evolve", since=None, until=None, limit=10)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual([row["logical_document_id"][5:].rstrip("0") for row in response["results"]], ["z", "a", "b"])
+        self.assertEqual(response["diagnostics"]["dense_clauses"], 2)
+        self.assertEqual(response["diagnostics"]["dense_clause_added"], 1)
+        self.assertIn("dense_clauses", response["diagnostics"]["arm_elapsed_ms"])
+        # Disabled: a single global pass, no clause diagnostics.
+        store.query_clauses = False
+        calls.clear()
+        response = retrieval.search(question, lexical_query="expert tool evolve", since=None, until=None, limit=10)
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("dense_clauses", response["diagnostics"])
+
+
 class IdentifierSigilTests(unittest.TestCase):
     def test_hash_prefixed_numbers_are_identifiers(self) -> None:
         from recall_server.passage_retrieval import identifier_tokens
