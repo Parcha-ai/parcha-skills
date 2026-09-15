@@ -7,8 +7,8 @@ of by running real code. It works in Claude Code, Codex, and pi.
 
 One job: analysis of a change's reach, with the single load-bearing safety fact proven by a
 script or test that calls the real code. It does not exercise the running application through
-its entry points (that is `autoqa`) and it does not produce screenshots or presentation
-artifacts for the PR body (that is `before-after`).
+its entry points and it does not produce screenshots or the paired before/after captures for
+the PR body (both are `autoqa`).
 
 1. Read the change, including the part the diff does not spell out.
 2. Find the one fact it is safe because of.

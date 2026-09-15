@@ -24,13 +24,13 @@
       "name": "cascade",
       "source": "./cascade",
       "version": "0.1.0",
-      "description": "Cascading development loops — plan, advance, or take over a chain of bounded, evidence-gated development loops."
+      "description": "Cascading development loops \u2014 plan, advance, or take over a chain of bounded, evidence-gated development loops."
     },
     {
       "name": "recall",
       "source": "./recall",
       "version": "0.1.0",
-      "description": "Indexed search over Claude Code + Codex session history — find, continue, repeat, or skill-ify prior work"
+      "description": "Indexed search over Claude Code + Codex session history \u2014 find, continue, repeat, or skill-ify prior work"
     },
     {
       "name": "recap",
@@ -54,13 +54,13 @@
       "name": "autoqa",
       "source": "./autoqa",
       "version": "0.1.0",
-      "description": "Self-QA a repo's running app end-to-end — discover run/auth/features, build a feature×modality test matrix, execute it live, and produce a witnessed pass/fail report."
+      "description": "Self-QA a repo's running app end-to-end \u2014 discover run/auth/features, build a feature\u00d7modality test matrix, execute it live, and produce a witnessed pass/fail report."
     },
     {
       "name": "precap",
       "source": "./precap",
       "version": "0.1.0",
-      "description": "Recap a task before doing it — a grounded, past-tense account of the finished work that long-running agents check themselves against for drift."
+      "description": "Recap a task before doing it \u2014 a grounded, past-tense account of the finished work that long-running agents check themselves against for drift."
     },
     {
       "name": "blast-radius",
@@ -85,12 +85,6 @@
       "source": "./unslop",
       "version": "0.1.0",
       "description": "Cut AI tells from text written or edited for a human reader before committing, posting, or sending it."
-    },
-    {
-      "name": "before-after",
-      "source": "./before-after",
-      "version": "0.1.0",
-      "description": "Paired base-versus-branch screenshot captures for a PR body, published to a pr-assets branch in the same repository; never judges pass or fail."
     },
     {
       "name": "review-loop",

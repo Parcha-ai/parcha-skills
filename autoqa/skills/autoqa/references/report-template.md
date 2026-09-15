@@ -25,6 +25,17 @@ resolves and shows the asserted result. Record the user's selected execution gro
 coverage arithmetic separately for baseline and diff inventories, then total it; say whether
 this is full-catalog coverage or a scoped pass.
 
+## Before / After
+
+| View | Before | After |
+|:--|:------:|:-----:|
+| <row label> | ![before](evidence/02-<slug>-before.png) | ![after](evidence/02-<slug>-after.png) |
+
+Before: <base instance url> | After: <instance url> at `<after commit sha>`
+
+One row per UI DIFF row. A row with no base instance says `before: none (no base instance)`.
+Image paths are local to the evidence dir; the caller republishes them where the PR renders.
+
 ## Failures — triage
 
 | # | Failure | Severity | Cause |

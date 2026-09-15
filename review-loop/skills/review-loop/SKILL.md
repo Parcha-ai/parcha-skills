@@ -32,7 +32,8 @@ never mints, reads, or stores tokens. If `gh auth status` fails, stop and report
 
 ## Iteration
 
-Repeat at most `--max-iterations` times. Each iteration:
+Repeat at most `--max-iterations` times; the default is 3, and a caller raises it only for a
+stated reason. Each iteration:
 
 1. Sync with the base branch if the caller supplied a sync policy. Run the gate command. A
    red gate stops the iteration; fix the gate before touching review comments.

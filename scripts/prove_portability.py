@@ -28,7 +28,6 @@ SKILLS = (
     "verify-release",
     "tdd",
     "unslop",
-    "before-after",
     "review-loop",
 )
 

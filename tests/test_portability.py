@@ -20,12 +20,11 @@ SKILLS = (
     "verify-release",
     "tdd",
     "unslop",
-    "before-after",
     "review-loop",
 )
 # Packages whose install docs already point at the Parcha-ai/parcha-skills repository.
 PARCHA_SKILLS_SLUG = frozenset(
-    {"recall", "blast-radius", "verify-release", "tdd", "unslop", "before-after", "review-loop"}
+    {"recall", "blast-radius", "verify-release", "tdd", "unslop", "review-loop"}
 )
 
 

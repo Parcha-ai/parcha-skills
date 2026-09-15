@@ -30,7 +30,6 @@
       "./verify-release/skills",
       "./tdd/skills",
       "./unslop/skills",
-      "./before-after/skills",
       "./review-loop/skills"
     ]
   },

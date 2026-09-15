@@ -63,7 +63,13 @@ silently dropped.
 
 ### Confirm execution scope with the user
 
-After drafting the inventories and before executing, use `AskUserQuestion` with multiple
+Scope comes from the first of these that exists: an explicit instruction from the caller
+("smoke only", "full release QA"), a scope the repo's `AUTOQA.md` pre-selects for
+unattended runs, or a question to the user. When either of the first two applies, record it
+in the plan and do not ask; a repo that runs this skill from a pipeline pre-selects its scope
+in `AUTOQA.md` precisely so the run never blocks on a prompt.
+
+Otherwise, after drafting the inventories and before executing, use `AskUserQuestion` with multiple
 choice and `multiSelect: true` to ask what the user wants included. In Codex environments,
 use the equivalent structured user-input tool when available. Populate the choices from the
 actual repo and diff, rather than showing a generic checklist. Offer up to four concise
@@ -132,16 +138,38 @@ against the live instance.
 - Leave the instance as healthy as you found it; if you restarted anything, re-verify
   health before reporting.
 
+### Before / after captures
+
+Every DIFF row with a UI modality already produces a screenshot of the branch as its witness.
+That screenshot is the "after". Pair it with a "before" of the same view when a running base
+instance exists, so the PR body can show the change without a second tool or a second browser
+session:
+
+- The base instance is one the caller names or the repo config lists (a main preview,
+  staging, or production), reached read-only. Never manufacture a "before" by switching
+  branches, stashing, or starting a second server; with no base instance, record
+  `before: none (no base instance)` on the row and move on.
+- Capture the "before" with the same browser tooling the UI rows use, at the same route,
+  viewport, and element, and save it beside the "after" as `<row>-before.png` and
+  `<row>-after.png` under the evidence dir.
+- A pair presents the change; it does not judge it. The row's PASS or FAIL still comes from
+  its own check, never from the two images looking different.
+- Publishing the images somewhere a PR body can render them (an assets branch, a comment
+  attachment, the repo's own upload path) is the caller's job with the repo's tooling; the
+  report lists the local pair and the two instance URLs plus the "after" commit SHA.
+
 Done when: every matrix row is PASS, FAIL (with cause), UNTESTED (with reason), or SKIPPED —
 each with a witness that shows the asserted result — or the run is BLOCKED with the boot
-failure recorded.
+failure recorded, and every UI DIFF row names its before/after pair or the reason it has none.
 
 ## Phase 4 — REPORT
 
 Write the report from the template in
 [references/report-template.md](references/report-template.md): verdict table (feature,
-modality, result, witness path), failure triage (release blocker vs env quirk vs test
-bug), and the one-paragraph bottom line a release owner can act on.
+modality, result, witness path), the Before / After table for UI DIFF rows, failure triage
+(release blocker vs env quirk vs test bug), and the one-paragraph bottom line a release owner
+can act on. The Before / After table is written so a caller can lift it into a PR body once
+the images are published.
 
 Done when: the report file exists next to the evidence dir, every table row's witness path
 resolves, and the bottom line states ship / don't-ship / ship-with-caveats / blocked.
@@ -159,9 +187,9 @@ resolves, and the bottom line states ship / don't-ship / ship-with-caveats / blo
 - **Baseline plus diff, always** — treat `AUTOQA.md` as the reusable floor. Inspect the
   current diff every run and add the cases it implies; never execute a stale static catalog
   as though it covered new behavior.
-- **Scope is an explicit user choice** — use a structured multi-select question after
-  planning unless the user already supplied an unambiguous scope. Record excluded groups
-  as out of scope; do not silently omit them.
+- **Scope is an explicit choice, never a guess** — from the caller, from the repo's
+  `AUTOQA.md`, or from a structured multi-select question after planning, in that order.
+  Record excluded groups as out of scope; do not silently omit them.
 - **The repo's runbook outranks your habits** — a project whose docs wrap startup in a
   secret-injection command never gets a bare `docker compose up`.
 - **Report failures as found** — a QA pass that only reports greens is a failed QA pass;
