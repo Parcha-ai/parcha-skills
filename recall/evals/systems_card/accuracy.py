@@ -164,7 +164,9 @@ class TruthBoundaryProbe:
         for case in selected:
             started = time.monotonic()
             outcome = context.client.call_tool(
-                "recall_search", {"query": case["question"], "limit": CANDIDATE_LIMIT},
+                # Compact snippets: the probe scores ids; full snippets at
+                # limit 50 are ~400 KB per call and dominate its latency.
+                "recall_search", {"query": case["question"], "limit": CANDIDATE_LIMIT, "snippet_chars": 256},
             )
             latency = (time.monotonic() - started) * 1000.0
             if outcome.ok and outcome.result:

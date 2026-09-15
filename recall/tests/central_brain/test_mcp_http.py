@@ -1248,6 +1248,43 @@ class RemoteMcpContractTest(unittest.TestCase):
         self.assertEqual(fitted["diagnostics"]["snippet_chars"], len(fitted["results"][0]["matching_ranges"][0]["text"]))
         self.assertEqual(fit_search_result({"results": "nope"}), {"results": "nope"})
 
+    def test_snippet_chars_clips_every_range_and_reports_it(self) -> None:
+        from recall_server.mcp import clip_search_snippets
+
+        value = {
+            "results": [
+                {"logical_document_id": "ldoc_a", "matching_ranges": [{"text": "x" * 1000}, {"text": "short"}]},
+                "not-a-dict",
+            ],
+            "diagnostics": {"engine": "lossless-passages-v1"},
+        }
+        self.assertIs(clip_search_snippets(value, None), value)
+        clipped = clip_search_snippets(value, 256)
+        ranges = clipped["results"][0]["matching_ranges"]
+        self.assertEqual((len(ranges[0]["text"]), ranges[0]["text_clipped"]), (256, True))
+        self.assertEqual(ranges[1], {"text": "short"})
+        self.assertEqual(clipped["results"][1], "not-a-dict")
+        self.assertEqual(clipped["diagnostics"], {"engine": "lossless-passages-v1", "snippet_chars": 256})
+        # The original is untouched.
+        self.assertEqual(len(value["results"][0]["matching_ranges"][0]["text"]), 1000)
+
+    def test_search_accepts_snippet_chars_and_rejects_out_of_range(self) -> None:
+        with McpHttpServer(self.store) as server:
+            status, _, raw = server.request(
+                "POST",
+                request("tools/call", params={"name": "recall_search", "arguments": {"query": "synthetic", "limit": 5, "snippet_chars": 256}}),
+                protocol="2025-11-25",
+            )
+            self.assertEqual(status, 200)
+            self.assertNotIn("error", json.loads(raw))
+            status, _, raw = server.request(
+                "POST",
+                request("tools/call", request_id=2, params={"name": "recall_search", "arguments": {"query": "synthetic", "snippet_chars": 10}}),
+                protocol="2025-11-25",
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(raw)["error"]["code"], -32602)
+
     def test_public_profile_hides_every_non_mcp_route_before_store_io(self) -> None:
         self.environment.stop()
         self.environment = mock.patch.dict(
