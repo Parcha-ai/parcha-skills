@@ -8,6 +8,7 @@ import threading
 import time
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
+from itertools import combinations
 from typing import Any
 
 from psycopg import sql
@@ -127,6 +128,66 @@ def identifier_tokens(*queries: str) -> list[str]:
             if len(tokens) >= MAX_SPARSE_IDENTIFIER_TOKENS:
                 return tokens
     return tokens
+
+
+# Lexical arm, min-should-match (H2-k). A natural-language question rarely
+# has every informative term inside one passage window, so the AND of all
+# terms returned nothing for most validation questions. Terms the corpus
+# uses in more than about 8% of passages (the ``pg_stats`` most-common
+# lexemes of ``search_vector``) become optional; of the remaining
+# ("required") terms a passage must contain all but one (four to six
+# terms) or all but two (seven or more). Ranking still counts every term.
+LEXICAL_COMMON_TTL_SECONDS = 600.0
+LEXICAL_MAX_REQUIRED_TERMS = 10
+LEXICAL_COMMON_LEXEMES_SQL = (
+    "SELECT most_common_elems::text::text[] AS elems FROM pg_stats "
+    "WHERE tablename='canonical_passages' AND attname='search_vector'"
+)
+_COMMON_LEXEMES_CACHE: dict[Any, tuple[float, frozenset[str]]] = {}
+_COMMON_LEXEMES_LOCK = threading.Lock()
+
+
+def lexical_match_plan(
+    lexical_query: str, common: frozenset[str] | set[str]
+) -> dict[str, Any]:
+    """How the lexical arm matches ``lexical_query`` given the common lexemes.
+
+    Returns ``terms`` (distinct, in order), ``required`` (terms outside
+    ``common``, capped), ``min_match`` (required terms a passage must
+    contain), ``conjunctions`` (one ``plainto_tsquery`` string per allowed
+    combination; the match is their OR) and ``relaxed`` (False when the
+    plan is the plain AND of every term, the pre-H2-k behaviour).
+    """
+
+    terms: list[str] = []
+    seen: set[str] = set()
+    for token in lexical_query.split():
+        folded = token.casefold()
+        if folded and folded not in seen:
+            seen.add(folded)
+            terms.append(token)
+    required = [term for term in terms if term.casefold() not in common]
+    required = required[:LEXICAL_MAX_REQUIRED_TERMS]
+    count = len(required)
+    if count == 0 or (count == len(terms) and count <= 3):
+        return {
+            "terms": terms, "required": required, "min_match": len(terms),
+            "conjunctions": [" ".join(terms)], "relaxed": False,
+        }
+    if count <= 3:
+        min_match = count
+    elif count <= 6:
+        min_match = count - 1
+    else:
+        min_match = count - 2
+    conjunctions = [
+        " ".join(combination)
+        for combination in combinations(required, min_match)
+    ]
+    return {
+        "terms": terms, "required": required, "min_match": min_match,
+        "conjunctions": conjunctions, "relaxed": True,
+    }
 
 
 def sparse_arm_applies(lexical_query: str) -> bool:
@@ -717,18 +778,44 @@ class PassageHintRetrieval:
         projection, evidence, and chunk liveness run afterwards on the bounded
         pool, never on the whole match set.
         """
+        plan = lexical_match_plan(
+            lexical_query, self._common_lexemes(connection, deadline_at)
+        )
+        self.lexical_plan = {
+            "terms": len(plan["terms"]),
+            "required": len(plan["required"]),
+            "min_match": plan["min_match"],
+            "conjunctions": len(plan["conjunctions"]),
+            "relaxed": plan["relaxed"],
+        }
+        if plan["relaxed"]:
+            # OR of the allowed term combinations; the rank counts every
+            # term (an AND query ranks 0 unless every term is present).
+            match_sql = "(" + " || ".join(
+                "plainto_tsquery('simple',%s)" for _ in plan["conjunctions"]
+            ) + ")"
+            match_values: tuple[str, ...] = tuple(plan["conjunctions"])
+            rank_query_sql = "(" + " || ".join(
+                "plainto_tsquery('simple',%s)" for _ in plan["terms"]
+            ) + ")"
+            rank_values: tuple[str, ...] = tuple(plan["terms"])
+        else:
+            match_sql = "plainto_tsquery('simple',%s)"
+            match_values = (lexical_query,)
+            rank_query_sql = "plainto_tsquery('simple',%s)"
+            rank_values = (lexical_query,)
         # Fusion consumes rank position, not score magnitude. Recency order is
         # therefore a complete ranking on its own and never reads the TOASTed
         # search_vector; the score column is reported for the rank mode only.
         if order == "rank":
             pool_order = (
-                "ts_rank_cd(passage.search_vector,plainto_tsquery('simple',%s),32) DESC,"
+                f"ts_rank_cd(passage.search_vector,{rank_query_sql},32) DESC,"
                 "passage.last_occurred_at DESC,passage.passage_id"
             )
             pool_limit = candidate_limit * LIVENESS_OVERSAMPLE
-            order_values: tuple[str, ...] = (lexical_query,)
-            score_sql = "ts_rank_cd(top.search_vector,plainto_tsquery('simple',%s),32)"
-            score_values: tuple[str, ...] = (lexical_query,)
+            order_values: tuple[str, ...] = rank_values
+            score_sql = f"ts_rank_cd(top.search_vector,{rank_query_sql},32)"
+            score_values: tuple[str, ...] = rank_values
         elif order == "recent":
             pool_order = "passage.last_occurred_at DESC,passage.passage_id"
             pool_limit = candidate_limit * LIVENESS_OVERSAMPLE
@@ -772,7 +859,7 @@ class PassageHintRetrieval:
                               )
                           )
                           AND passage.search_vector @@
-                              plainto_tsquery('simple',%s)
+                              {match_sql}
                           AND (%s::timestamptz IS NULL
                                OR passage.last_occurred_at>=%s)
                           AND (%s::timestamptz IS NULL
@@ -825,7 +912,7 @@ class PassageHintRetrieval:
                         actor_ids,
                         actor_relations,
                         actor_relations,
-                        lexical_query,
+                        *match_values,
                         since,
                         since,
                         until,
@@ -839,6 +926,39 @@ class PassageHintRetrieval:
                     ),
                     deadline_at,
                 ).fetchall()
+
+    def _common_lexemes(self, connection: Any, deadline_at: float) -> frozenset[str]:
+        """Most common ``search_vector`` lexemes from ``pg_stats``, cached 10 min.
+
+        Free: the planner statistics already hold the lexemes present in
+        more than the sampling threshold of passages (about 8% here). Empty
+        when statistics are missing, which leaves the plain AND plan.
+        """
+
+        key = getattr(self.store, "database_url", None) or id(self.store)
+        now = time.monotonic()
+        with _COMMON_LEXEMES_LOCK:
+            entry = _COMMON_LEXEMES_CACHE.get(key)
+            if entry is not None and entry[0] > now:
+                return entry[1]
+        try:
+            rows = self.store._execute_bounded(
+                connection, LEXICAL_COMMON_LEXEMES_SQL, (), deadline_at,
+            ).fetchall()
+        except SearchDeadlineExceeded:
+            raise
+        except Exception:  # noqa: BLE001 - statistics are optional
+            rows = []
+        lexemes = frozenset(
+            str(item).casefold()
+            for row in rows or ()
+            for item in (
+                (row.get("elems") if isinstance(row, dict) else None) or ()
+            )
+        )
+        with _COMMON_LEXEMES_LOCK:
+            _COMMON_LEXEMES_CACHE[key] = (now + LEXICAL_COMMON_TTL_SECONDS, lexemes)
+        return lexemes
 
     def _sparse_candidates(
         self,
@@ -1670,6 +1790,7 @@ class PassageHintRetrieval:
                 "arms_truncated": arms_truncated,
                 "dense_candidates": len(dense),
                 "passage_lexical_candidates": len(lexical),
+                "passage_lexical_plan": getattr(self, "lexical_plan", None),
                 "sparse_candidates": len(sparse),
                 "dense_status": dense_status,
                 "dense_strategy": dense_strategy,

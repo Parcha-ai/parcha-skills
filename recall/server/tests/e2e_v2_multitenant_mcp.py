@@ -774,7 +774,11 @@ def main() -> None:
                 server,
                 personal_token["token"],
                 "recall_search",
-                {"query": "shared launch marker semantic unavailable"},
+                # Four terms with no lexical overlap: with min-should-match
+                # (H2-k) "shared launch marker semantic unavailable" would
+                # rightly match three of four, so the degraded case must be
+                # a query the lexical arm cannot satisfy at all.
+                {"query": "underwater zebras semantic unavailable"},
             )["result"]["structuredContent"]
             assert degraded["results"] == []
             assert degraded["diagnostics"]["dense_status"] == "unavailable"

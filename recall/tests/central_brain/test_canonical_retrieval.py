@@ -2583,6 +2583,77 @@ class RerankPoolNominationTests(unittest.TestCase):
         self.assertEqual(RERANK_NOMINATE_PER_ARM, 5)
 
 
+class LexicalMinShouldMatchTests(unittest.TestCase):
+    def test_plan_keeps_the_plain_and_for_short_or_all_common_queries(self) -> None:
+        from recall_server.passage_retrieval import lexical_match_plan
+        common = frozenset({"grep", "tools", "expert"})
+        plan = lexical_match_plan("deploy fail", common)
+        self.assertEqual((plan["min_match"], plan["conjunctions"], plan["relaxed"]), (2, ["deploy fail"], False))
+        plan = lexical_match_plan("grep tools expert", common)
+        self.assertEqual((plan["required"], plan["conjunctions"], plan["relaxed"]), ([], ["grep tools expert"], False))
+
+    def test_plan_makes_common_terms_optional_and_relaxes_long_queries(self) -> None:
+        from recall_server.passage_retrieval import lexical_match_plan
+        common = frozenset({"grep", "tools", "expert"})
+        plan = lexical_match_plan("codex Grep hydration parity", common)
+        self.assertEqual(plan["required"], ["codex", "hydration", "parity"])
+        self.assertEqual((plan["min_match"], plan["conjunctions"], plan["relaxed"]), (3, ["codex hydration parity"], True))
+        plan = lexical_match_plan("a b c d e", frozenset())
+        self.assertEqual(plan["min_match"], 4)
+        self.assertEqual(plan["conjunctions"], ["a b c d", "a b c e", "a b d e", "a c d e", "b c d e"])
+        plan = lexical_match_plan(" ".join("t%d" % i for i in range(13)), frozenset())
+        self.assertEqual((len(plan["required"]), plan["min_match"], len(plan["conjunctions"])), (10, 8, 45))
+        # Duplicates collapse, case is preserved for the query text.
+        self.assertEqual(lexical_match_plan("Alpha alpha beta", frozenset())["terms"], ["Alpha", "beta"])
+
+    def test_lexical_sql_ors_the_conjunctions_and_ranks_every_term(self) -> None:
+        from recall_server.passage_retrieval import PassageHintRetrieval, _COMMON_LEXEMES_CACHE
+
+        class _Cursor:
+            def __init__(self, rows): self.rows = rows
+            def fetchall(self): return self.rows
+
+        class _Store:
+            database_url = "postgresql://stats-test"
+            def __init__(self):
+                self.sql = []; self.values = []
+            def _execute_bounded(self, connection, sql, values, deadline_at):
+                self.sql.append(sql); self.values.append(values)
+                if "pg_stats" in sql:
+                    return _Cursor([{"elems": ["grep", "tools"]}])
+                return _Cursor([])
+
+        _COMMON_LEXEMES_CACHE.pop("postgresql://stats-test", None)
+        store = _Store()
+        retrieval = PassageHintRetrieval(store, tenant_id="tenant:test", sources=["codex:linux:test"], policy_fingerprint="fp")
+        rows = retrieval._lexical_query(
+            object(), "grep triage step schemas workflow tools", order="rank", since=None, until=None,
+            candidate_limit=40, actor_ids=None, actor_relations=None, deadline_at=time.monotonic() + 5,
+        )
+        self.assertEqual(rows, [])
+        sql = store.sql[-1]
+        values = store.values[-1]
+        # required = triage step schemas workflow (4) -> any 3 of 4: four conjunctions OR-ed
+        match_clause = sql.split("search_vector @@", 1)[1].split("AND (%s::timestamptz", 1)[0]
+        self.assertEqual(match_clause.count("plainto_tsquery('simple',%s)"), 4)
+        self.assertEqual(match_clause.count(" || "), 3)
+        self.assertIn("triage step schemas", values)
+        self.assertIn("step schemas workflow", values)
+        # the rank query ORs all six terms
+        # matched ORDER BY, top ORDER BY, final ORDER BY, and the score column
+        self.assertEqual(sql.count(" || ".join(["plainto_tsquery('simple',%s)"] * 6)), 4)
+        self.assertEqual(retrieval.lexical_plan, {"terms": 6, "required": 4, "min_match": 3, "conjunctions": 4, "relaxed": True})
+        # Second call within the TTL does not re-read pg_stats.
+        stats_calls = sum(1 for item in store.sql if "pg_stats" in item)
+        retrieval._lexical_query(
+            object(), "deploy fail", order="rank", since=None, until=None,
+            candidate_limit=40, actor_ids=None, actor_relations=None, deadline_at=time.monotonic() + 5,
+        )
+        self.assertEqual(sum(1 for item in store.sql if "pg_stats" in item), stats_calls)
+        self.assertFalse(retrieval.lexical_plan["relaxed"])
+        self.assertIn("passage.search_vector @@\n                              plainto_tsquery('simple',%s)", store.sql[-1])
+
+
 class IdentifierSigilTests(unittest.TestCase):
     def test_hash_prefixed_numbers_are_identifiers(self) -> None:
         from recall_server.passage_retrieval import identifier_tokens
