@@ -83,7 +83,7 @@ class PassageProjectionTests(unittest.TestCase):
         )
         rendered = " ".join(migration.read_text().split()).casefold()
 
-        self.assertEqual(SCHEMA_VERSION, 66)
+        self.assertEqual(SCHEMA_VERSION, 67)
         self.assertIn(
             "create table if not exists canonical_passage_documents",
             rendered,

@@ -349,6 +349,17 @@ class ProbeTest(unittest.TestCase):
         self.assertIsNone(gates["embedding_lag_ratio"].passed)
         self.assertTrue(any("semantic runtime" in note for note in result.notes))
 
+    def test_projection_churn_probe_stays_green_on_the_turbopuffer_plane(self):
+        # H3-e': after migration 067 the server exports passages_unembedded=0
+        # (nothing pending, no embeddings table); the lag ratio is 0, not an error.
+        with tempfile.TemporaryDirectory() as directory:
+            context = make_context(FakeBrain(default_tools()), metrics_token_file=self._token_file(directory), _metrics_get=lambda u, h, t: (200, self._metrics_text(written=500, unembedded=0)))
+            result = churn.ProjectionChurnProbe().run(context)
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.metrics["passages_unembedded"], 0)
+        self.assertEqual(result.metrics["embedding_lag_ratio"], 0.0)
+        self.assertTrue({g.metric: g for g in result.gates}["embedding_lag_ratio"].passed)
+
     def test_projection_churn_probe_skips_without_metrics_token(self):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("RECALL_METRICS_TOKEN_FILE", None)
@@ -866,6 +877,26 @@ class StorageProbeTest(unittest.TestCase):
         self.assertEqual(result.metrics["source_events"], 5)
         self.assertNotIn("postgres_database_gib", result.metrics)
         self.assertTrue(any("no storage breakdown" in n for n in result.notes))
+
+    def test_storage_breakdown_without_the_embeddings_table_is_measured(self):
+        # H3-e': migration 067 drops canonical_passage_embeddings; the table
+        # simply stops appearing in the breakdown and the probe stays green.
+        text = "\n".join(
+            line for line in PROMETHEUS_TEXT.splitlines()
+            if "canonical_passage_embeddings" not in line
+        ).replace("recall_database_bytes 115964116992", f"recall_database_bytes {int(9 * cost.GIB)}")
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {key: "" for key in STORAGE_ENV}, clear=False):
+            context = make_context(
+                FakeBrain(default_tools()),
+                metrics_token_file=metrics_token_file(directory),
+                _metrics_get=lambda url, headers: (200, text),
+            )
+            result = cost.StorageProbe().run(context)
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.metrics["postgres_database_gib"], 9.0)
+        self.assertNotIn("canonical_passage_embeddings", result.metrics["postgres_table_gib"])
+        self.assertEqual(result.metrics["postgres_tables_reported"], 4)
+        self.assertTrue({g.metric: g for g in result.gates}["postgres_database_gib"].passed)
 
     def test_history_row_picks_storage_metrics(self):
         results = [ProbeResult("cost.storage", "cost", "degraded", metrics={"postgres_database_gib": 108.0, "s3_evidence_gib": 2.5, "postgres_table_gib": {}})]

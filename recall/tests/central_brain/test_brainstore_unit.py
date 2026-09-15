@@ -44,6 +44,7 @@ from recall_server.capture import build_capture_event
 from recall_server.db import (
     CONCURRENT_MIGRATION_SUFFIX,
     concurrent_migration_statements,
+    migration_version,
     BrainStore,
     bounded_search_text,
     enough_session_anchors,
@@ -156,8 +157,11 @@ class SchemaMigrationContractTest(unittest.TestCase):
         )
         self.assertFalse(connection.autocommit)
         migrate = inspect.getsource(BrainStore.migrate)
-        self.assertIn("CONCURRENT_MIGRATION_SUFFIX", migrate)
+        self.assertIn("migration_version(schema)", migrate)
         self.assertIn("_migrate_concurrently", migrate)
+        self.assertIn(
+            "CONCURRENT_MIGRATION_SUFFIX", inspect.getsource(migration_version)
+        )
 
     def test_stable_projection_keys_rekey_children_off_revision(self) -> None:
         migration = SERVER / "schema" / "060_stable_projection_keys.sql"
@@ -2297,14 +2301,22 @@ class SemanticRetrievalContractTest(unittest.TestCase):
     @mock.patch("recall_server.db.ConnectionPool")
     def test_brainstore_reuses_a_bounded_connection_pool(self, pool_type) -> None:
         pool = pool_type.return_value
+        # H3-e': opening the pool spends one connection on the search-plane
+        # schema check (a fresh database has no schema_migrations yet).
+        probe = mock.MagicMock()
+        probe.__enter__.return_value.execute.return_value.fetchone.return_value = {"value": None}
         first = object()
         second = object()
-        pool.connection.side_effect = [first, second]
+        pool.connection.side_effect = [probe, first, second]
         store = BrainStore("postgresql://synthetic.invalid/recall")
 
         self.assertIs(store.connect(), first)
         self.assertIs(store.connect(), second)
         pool_type.assert_called_once()
+        self.assertIn(
+            "schema_migrations",
+            probe.__enter__.return_value.execute.call_args_list[0].args[0],
+        )
         self.assertEqual(pool_type.call_args.kwargs["min_size"], 1)
         self.assertEqual(pool_type.call_args.kwargs["max_size"], 8)
 

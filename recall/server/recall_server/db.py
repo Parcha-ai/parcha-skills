@@ -17,7 +17,11 @@ import psycopg
 from psycopg_pool import ConnectionPool, PoolTimeout
 from psycopg.rows import dict_row
 
-from . import PROJECTOR_VERSION
+from . import (
+    MANDATORY_SCHEMA_VERSION,
+    PROJECTOR_VERSION,
+    RETIRE_POSTGRES_PLANE_VERSION,
+)
 from .actor_attribution import (
     actor_id_for_employee_key,
     actor_id_for_principal,
@@ -48,6 +52,49 @@ MAX_SEARCH_RESULT_TEXT_CHARS = 4096
 SEARCH_ARM_CONNECTIONS = 3
 SEARCH_RESERVED_CONNECTIONS = 2
 CONCURRENT_MIGRATION_SUFFIX = "_concurrent.sql"
+
+
+class SearchPlaneSchemaError(RuntimeError):
+    """The schema and RECALL_SEARCH_PLANE disagree about the Postgres vector plane."""
+
+
+RETIRE_POSTGRES_PLANE_REFUSED = (
+    f"refusing to apply migration {RETIRE_POSTGRES_PLANE_VERSION:03d} "
+    "(retire the Postgres vector plane): it drops canonical_passage_embeddings, "
+    "canonical_embedding_ledger and canonical_passages.search_vector. Set "
+    "RECALL_SEARCH_PLANE=turbopuffer in the environment of the process running "
+    "the migration once the turbopuffer plane is drained (search-plane-status "
+    "drift 0)."
+)
+POSTGRES_PLANE_RETIRED = (
+    f"migration {RETIRE_POSTGRES_PLANE_VERSION:03d} retired the Postgres vector "
+    "plane on this database: RECALL_SEARCH_PLANE=postgres cannot serve passage "
+    "search any more. Set RECALL_SEARCH_PLANE=turbopuffer (there is no rollback "
+    "after 067)."
+)
+
+
+def migration_version(path: Path) -> int | None:
+    """``041`` from ``041_lossless_passage_index.sql``; ``None`` for companions."""
+
+    if path.name.endswith(CONCURRENT_MIGRATION_SUFFIX):
+        return None
+    return int(path.name.split("_", 1)[0])
+
+
+def applied_migration_versions(connection: Any) -> set[int]:
+    """Versions recorded in ``schema_migrations`` (empty before migration 001)."""
+
+    if not connection.execute(
+        "SELECT to_regclass('public.schema_migrations') AS value"
+    ).fetchone()["value"]:
+        return set()
+    return {
+        int(row["version"])
+        for row in connection.execute(
+            "SELECT version FROM schema_migrations"
+        ).fetchall()
+    }
 
 
 def concurrent_migration_statements(text: str) -> list[str]:
@@ -266,6 +313,10 @@ class BrainStore:
                         open=True,
                         name="recall-brain",
                     )
+                    # H3-e': a process on the postgres plane must not start
+                    # against a database whose vector plane 067 dropped.
+                    with self._pool.connection() as probe:
+                        self.verify_search_plane(probe)
         return self._pool.connection()
 
     def prepare_pool(self, minimum_size: int, *, timeout: float = 60.0) -> None:
@@ -295,14 +346,75 @@ class BrainStore:
             if self._pool is not None:
                 self._pool.close()
 
-    def migrate(self) -> None:
+    def migrate(self, *, retire_postgres_plane: bool = False) -> dict[str, Any]:
+        """Apply every pending numbered migration in order.
+
+        A version already recorded in ``schema_migrations`` is skipped (a
+        migration that ran cannot be re-run against objects a later one
+        dropped); ``*_concurrent.sql`` companions always run, every statement
+        of theirs is idempotent. Migration 067 (H3-e') is destructive and
+        applies only with ``retire_postgres_plane`` from a process on the
+        turbopuffer search plane; otherwise it is reported as deferred.
+        """
+
         schema_dir = Path(__file__).resolve().parents[1] / "schema"
+        applied: list[int] = []
+        skipped: list[int] = []
+        deferred: list[int] = []
         with self.connect() as conn:
+            recorded = applied_migration_versions(conn)
             for schema in sorted(schema_dir.glob("*.sql")):
-                if schema.name.endswith(CONCURRENT_MIGRATION_SUFFIX):
+                version = migration_version(schema)
+                if version is None:
                     self._migrate_concurrently(conn, schema.read_text())
                     continue
+                if version in recorded:
+                    skipped.append(version)
+                    continue
+                if version >= RETIRE_POSTGRES_PLANE_VERSION:
+                    if not retire_postgres_plane:
+                        deferred.append(version)
+                        continue
+                    if self.search_plane != "turbopuffer":
+                        raise SearchPlaneSchemaError(RETIRE_POSTGRES_PLANE_REFUSED)
                 conn.execute(schema.read_text())
+                applied.append(version)
+        current = max(recorded | set(applied), default=0)
+        return {
+            "status": "ok",
+            "schema_version": current,
+            "applied": applied,
+            "skipped": len(skipped),
+            "deferred": deferred,
+            "postgres_vector_plane": (
+                "retired" if current >= RETIRE_POSTGRES_PLANE_VERSION else "present"
+            ),
+        }
+
+    def verify_search_plane(self, connection: Any) -> dict[str, Any]:
+        """Refuse the postgres plane once migration 067 retired it (H3-e').
+
+        Runs once when the pool opens. A database without ``schema_migrations``
+        (fresh, before ``migrate``) or below version 067 passes on either
+        plane; a database at or above 067 passes only on the turbopuffer plane.
+        """
+
+        versions = applied_migration_versions(connection)
+        retired = RETIRE_POSTGRES_PLANE_VERSION in versions
+        if retired and self.search_plane != "turbopuffer":
+            raise SearchPlaneSchemaError(POSTGRES_PLANE_RETIRED)
+        return {
+            "search_plane": self.search_plane,
+            "schema_version": max(versions, default=0),
+            "postgres_vector_plane": "retired" if retired else "present",
+            "mandatory_schema_version": MANDATORY_SCHEMA_VERSION,
+        }
+
+    @property
+    def postgres_vector_plane(self) -> bool:
+        """True while this process may read or write the Postgres vector plane."""
+
+        return self.search_plane != "turbopuffer"
 
     @staticmethod
     def _migrate_concurrently(conn: Any, text: str) -> None:
@@ -1929,7 +2041,11 @@ class BrainStore:
             ).fetchone()["n"]
         )
         passage_fingerprint = getattr(self.semantic_runtime, "passage_fingerprint", None)
-        if isinstance(passage_fingerprint, str) and passage_fingerprint:
+        if not self.postgres_vector_plane:
+            # H3-e': turbopuffer embeds natively; nothing is pending here and
+            # the embeddings table may already be gone (migration 067).
+            churn["passages_unembedded"] = 0
+        elif isinstance(passage_fingerprint, str) and passage_fingerprint:
             churn["passages_unembedded"] = count_unembedded_passages(
                 conn,
                 passage_fingerprint=passage_fingerprint,
@@ -1940,7 +2056,9 @@ class BrainStore:
         # itself is process configuration (RECALL_EMBEDDING_DAILY_CAP) and is
         # exported by the web service next to this total.
         churn["embedding_daily_total"] = (
-            window_total(conn) if ledger_exists(conn) else 0
+            window_total(conn)
+            if self.postgres_vector_plane and ledger_exists(conn)
+            else 0
         )
         # H3-b: source-months waiting for the turbopuffer writer and the
         # source-months it has built, across every tenant.
