@@ -87,8 +87,25 @@ def count(store, sql: str, *params) -> int:
         return int(connection.execute(sql, params).fetchone()["n"])
 
 
+def private_database(admin_dsn: str) -> str:
+    """A fresh database of its own: migration 067 retires the vector plane
+    for good, and the CI job runs other suites on the shared database
+    after this one."""
+
+    import psycopg
+    from psycopg import sql
+    from urllib.parse import urlsplit, urlunsplit
+
+    name = "recall_retire_e2e"
+    with psycopg.connect(admin_dsn, autocommit=True) as connection:
+        connection.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(name)))
+        connection.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
+    parsed = urlsplit(admin_dsn)
+    return urlunsplit((parsed.scheme, parsed.netloc, f"/{name}", parsed.query, ""))
+
+
 def main() -> None:
-    dsn = os.environ["RECALL_DATABASE_URL"]
+    dsn = private_database(os.environ["RECALL_DATABASE_URL"])
     for key in PLANE_KEYS:
         os.environ.pop(key, None)
     runtime = SyntheticEmbeddingRuntime()
