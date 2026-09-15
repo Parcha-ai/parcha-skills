@@ -3,7 +3,7 @@
 Drives every reviewer thread on a GitHub pull request, from bots such as Greptile and Devin and
 from humans, to zero unresolved in bounded iterations. It works in Claude Code, Codex, and pi.
 
-[![skills.sh](https://skills.sh/b/miguelrios/unc-skills)](https://skills.sh/miguelrios/unc-skills/review-loop)
+[![skills.sh](https://skills.sh/b/Parcha-ai/parcha-skills)](https://skills.sh/Parcha-ai/parcha-skills/review-loop)
 
 One job: fetch every inline thread, review, and issue comment on the PR; triage by content;
 fix what is actionable; reply on every thread; resolve bot threads through the GraphQL
@@ -32,20 +32,20 @@ Rules the loop keeps:
 skills.sh:
 
 ```bash
-npx skills add miguelrios/unc-skills --skill review-loop
+npx skills add Parcha-ai/parcha-skills --skill review-loop
 ```
 
 Claude Code:
 
 ```bash
-claude plugin marketplace add miguelrios/unc-skills
+claude plugin marketplace add Parcha-ai/parcha-skills
 claude plugin install review-loop@unc-skills
 ```
 
 Codex:
 
 ```bash
-codex plugin marketplace add miguelrios/unc-skills
+codex plugin marketplace add Parcha-ai/parcha-skills
 codex plugin add review-loop@unc-skills
 ```
 

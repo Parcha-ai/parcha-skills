@@ -25,8 +25,8 @@ class UnslopPackageTest(unittest.TestCase):
 
     def test_readme_has_install_lines(self):
         readme = (ROOT / "README.md").read_text()
-        self.assertIn("https://skills.sh/miguelrios/unc-skills/unslop", readme)
-        self.assertIn("npx skills add miguelrios/unc-skills --skill unslop", readme)
+        self.assertIn("https://skills.sh/Parcha-ai/parcha-skills/unslop", readme)
+        self.assertIn("npx skills add Parcha-ai/parcha-skills --skill unslop", readme)
 
     def test_matches_upstream_body_and_carries_license(self):
         text = SKILL.read_text()

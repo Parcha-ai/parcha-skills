@@ -3,7 +3,7 @@
 Cuts AI tells from text written or edited for a human reader: commit messages, PR titles and
 bodies, docs, code comments, replies. It works in Claude Code, Codex, and pi.
 
-[![skills.sh](https://skills.sh/b/miguelrios/unc-skills)](https://skills.sh/miguelrios/unc-skills/unslop)
+[![skills.sh](https://skills.sh/b/Parcha-ai/parcha-skills)](https://skills.sh/Parcha-ai/parcha-skills/unslop)
 
 One job: edit prose so it reads as written by a person. It scans for 31 named patterns (puffery,
 AI vocabulary, em dashes, inline-header lists, chatbot phrases, abstract metaphor nouns, passive
@@ -16,20 +16,20 @@ correct; every other skill in this collection writes its output through `unslop`
 skills.sh:
 
 ```bash
-npx skills add miguelrios/unc-skills --skill unslop
+npx skills add Parcha-ai/parcha-skills --skill unslop
 ```
 
 Claude Code:
 
 ```bash
-claude plugin marketplace add miguelrios/unc-skills
+claude plugin marketplace add Parcha-ai/parcha-skills
 claude plugin install unslop@unc-skills
 ```
 
 Codex:
 
 ```bash
-codex plugin marketplace add miguelrios/unc-skills
+codex plugin marketplace add Parcha-ai/parcha-skills
 codex plugin add unslop@unc-skills
 ```
 

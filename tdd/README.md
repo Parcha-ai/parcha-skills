@@ -3,7 +3,7 @@
 Red before green at pre-agreed seams, one vertical slice per cycle, regression-first bug fixes.
 It works in Claude Code, Codex, and pi.
 
-[![skills.sh](https://skills.sh/b/miguelrios/unc-skills)](https://skills.sh/miguelrios/unc-skills/tdd)
+[![skills.sh](https://skills.sh/b/Parcha-ai/parcha-skills)](https://skills.sh/Parcha-ai/parcha-skills/tdd)
 
 One job: make the red-green loop produce tests worth keeping. Before any test is written the
 seams under test are listed and confirmed with the user. Each cycle is one seam, one failing
@@ -23,20 +23,20 @@ Reference material ships alongside the skill:
 skills.sh:
 
 ```bash
-npx skills add miguelrios/unc-skills --skill tdd
+npx skills add Parcha-ai/parcha-skills --skill tdd
 ```
 
 Claude Code:
 
 ```bash
-claude plugin marketplace add miguelrios/unc-skills
+claude plugin marketplace add Parcha-ai/parcha-skills
 claude plugin install tdd@unc-skills
 ```
 
 Codex:
 
 ```bash
-codex plugin marketplace add miguelrios/unc-skills
+codex plugin marketplace add Parcha-ai/parcha-skills
 codex plugin add tdd@unc-skills
 ```
 

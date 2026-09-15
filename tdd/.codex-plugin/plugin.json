@@ -3,11 +3,11 @@
   "version": "0.1.0",
   "description": "Test-driven development at pre-agreed seams: red before green, one vertical slice per cycle, regression-first bug fixes.",
   "author": {
-    "name": "Miguel Rios",
-    "url": "https://github.com/miguelrios"
+    "name": "Parcha Labs",
+    "url": "https://github.com/Parcha-ai/parcha-skills"
   },
-  "homepage": "https://github.com/miguelrios/unc-skills/tree/main/tdd",
-  "repository": "https://github.com/miguelrios/unc-skills/tree/main/tdd",
+  "homepage": "https://github.com/Parcha-ai/parcha-skills/tree/main/tdd",
+  "repository": "https://github.com/Parcha-ai/parcha-skills/tree/main/tdd",
   "license": "MIT",
   "keywords": [
     "tdd",
@@ -26,7 +26,7 @@
       "Read",
       "Write"
     ],
-    "websiteURL": "https://github.com/miguelrios/unc-skills/tree/main/tdd",
+    "websiteURL": "https://github.com/Parcha-ai/parcha-skills/tree/main/tdd",
     "defaultPrompt": [
       "Use $tdd on the task at hand."
     ]

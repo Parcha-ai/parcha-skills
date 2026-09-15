@@ -25,8 +25,8 @@ class ReviewLoopPackageTest(unittest.TestCase):
 
     def test_readme_has_install_lines(self):
         readme = (ROOT / "README.md").read_text()
-        self.assertIn("https://skills.sh/miguelrios/unc-skills/review-loop", readme)
-        self.assertIn("npx skills add miguelrios/unc-skills --skill review-loop", readme)
+        self.assertIn("https://skills.sh/Parcha-ai/parcha-skills/review-loop", readme)
+        self.assertIn("npx skills add Parcha-ai/parcha-skills --skill review-loop", readme)
 
     def test_github_only_and_every_reviewer(self):
         text = SKILL.read_text()

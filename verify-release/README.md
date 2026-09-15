@@ -3,7 +3,7 @@
 Establishes that the intended release candidate is live in its target environment and that the
 changed path works there, using live evidence. It works in Claude Code, Codex, and pi.
 
-[![skills.sh](https://skills.sh/b/miguelrios/unc-skills)](https://skills.sh/miguelrios/unc-skills/verify-release)
+[![skills.sh](https://skills.sh/b/Parcha-ai/parcha-skills)](https://skills.sh/Parcha-ai/parcha-skills/verify-release)
 
 One job: map the intended change to the running artifact (commit, image digest, build ID),
 follow an in-progress rollout with bounded waits, run the smallest live probe through the
@@ -16,20 +16,20 @@ substantial browser coverage it calls `autoqa` with the candidate identity.
 skills.sh:
 
 ```bash
-npx skills add miguelrios/unc-skills --skill verify-release
+npx skills add Parcha-ai/parcha-skills --skill verify-release
 ```
 
 Claude Code:
 
 ```bash
-claude plugin marketplace add miguelrios/unc-skills
+claude plugin marketplace add Parcha-ai/parcha-skills
 claude plugin install verify-release@unc-skills
 ```
 
 Codex:
 
 ```bash
-codex plugin marketplace add miguelrios/unc-skills
+codex plugin marketplace add Parcha-ai/parcha-skills
 codex plugin add verify-release@unc-skills
 ```
 

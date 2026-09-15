@@ -6,8 +6,8 @@
     "name": "Lauren Tan",
     "url": "https://github.com/cursor/plugins/tree/main/pstack/skills/unslop"
   },
-  "homepage": "https://github.com/miguelrios/unc-skills/tree/main/unslop",
-  "repository": "https://github.com/miguelrios/unc-skills/tree/main/unslop",
+  "homepage": "https://github.com/Parcha-ai/parcha-skills/tree/main/unslop",
+  "repository": "https://github.com/Parcha-ai/parcha-skills/tree/main/unslop",
   "license": "MIT",
   "keywords": [
     "unslop",
@@ -26,7 +26,7 @@
       "Read",
       "Write"
     ],
-    "websiteURL": "https://github.com/miguelrios/unc-skills/tree/main/unslop",
+    "websiteURL": "https://github.com/Parcha-ai/parcha-skills/tree/main/unslop",
     "defaultPrompt": [
       "Use $unslop on the task at hand."
     ]

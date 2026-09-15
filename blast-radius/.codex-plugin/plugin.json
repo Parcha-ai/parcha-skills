@@ -3,11 +3,11 @@
   "version": "0.1.0",
   "description": "Find what a diff breaks beyond the diff and prove the one safety fact by running real code instead of writing it up.",
   "author": {
-    "name": "Miguel Rios",
-    "url": "https://github.com/miguelrios"
+    "name": "Parcha Labs",
+    "url": "https://github.com/Parcha-ai/parcha-skills"
   },
-  "homepage": "https://github.com/miguelrios/unc-skills/tree/main/blast-radius",
-  "repository": "https://github.com/miguelrios/unc-skills/tree/main/blast-radius",
+  "homepage": "https://github.com/Parcha-ai/parcha-skills/tree/main/blast-radius",
+  "repository": "https://github.com/Parcha-ai/parcha-skills/tree/main/blast-radius",
   "license": "MIT",
   "keywords": [
     "blast-radius",
@@ -26,7 +26,7 @@
       "Read",
       "Write"
     ],
-    "websiteURL": "https://github.com/miguelrios/unc-skills/tree/main/blast-radius",
+    "websiteURL": "https://github.com/Parcha-ai/parcha-skills/tree/main/blast-radius",
     "defaultPrompt": [
       "Use $blast-radius on the task at hand."
     ]

@@ -3,7 +3,7 @@
 Paired base-versus-branch screenshot captures for a PR body, committed to a `pr-assets` branch
 in the same repository. It works in Claude Code, Codex, and pi.
 
-[![skills.sh](https://skills.sh/b/miguelrios/unc-skills)](https://skills.sh/miguelrios/unc-skills/before-after)
+[![skills.sh](https://skills.sh/b/Parcha-ai/parcha-skills)](https://skills.sh/Parcha-ai/parcha-skills/before-after)
 
 One job: capture the same page or element from a running base deployment and from the branch,
 publish the PNGs where the PR can show them, and emit a `## Before / After` section with a
@@ -31,20 +31,20 @@ bodies for anyone with repository access. `gist` and `blob` are opt-in through
 skills.sh:
 
 ```bash
-npx skills add miguelrios/unc-skills --skill before-after
+npx skills add Parcha-ai/parcha-skills --skill before-after
 ```
 
 Claude Code:
 
 ```bash
-claude plugin marketplace add miguelrios/unc-skills
+claude plugin marketplace add Parcha-ai/parcha-skills
 claude plugin install before-after@unc-skills
 ```
 
 Codex:
 
 ```bash
-codex plugin marketplace add miguelrios/unc-skills
+codex plugin marketplace add Parcha-ai/parcha-skills
 codex plugin add before-after@unc-skills
 ```
 

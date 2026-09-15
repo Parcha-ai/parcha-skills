@@ -6,8 +6,8 @@
     "name": "James Clements",
     "url": "https://github.com/vercel-labs/before-and-after"
   },
-  "homepage": "https://github.com/miguelrios/unc-skills/tree/main/before-after",
-  "repository": "https://github.com/miguelrios/unc-skills/tree/main/before-after",
+  "homepage": "https://github.com/Parcha-ai/parcha-skills/tree/main/before-after",
+  "repository": "https://github.com/Parcha-ai/parcha-skills/tree/main/before-after",
   "license": "PolyForm-Shield-1.0.0",
   "keywords": [
     "before-after",
@@ -26,7 +26,7 @@
       "Read",
       "Write"
     ],
-    "websiteURL": "https://github.com/miguelrios/unc-skills/tree/main/before-after",
+    "websiteURL": "https://github.com/Parcha-ai/parcha-skills/tree/main/before-after",
     "defaultPrompt": [
       "Use $before-after on the task at hand."
     ]

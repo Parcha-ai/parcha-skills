@@ -25,8 +25,8 @@ class BlastRadiusPackageTest(unittest.TestCase):
 
     def test_readme_has_install_lines(self):
         readme = (ROOT / "README.md").read_text()
-        self.assertIn("https://skills.sh/miguelrios/unc-skills/blast-radius", readme)
-        self.assertIn("npx skills add miguelrios/unc-skills --skill blast-radius", readme)
+        self.assertIn("https://skills.sh/Parcha-ai/parcha-skills/blast-radius", readme)
+        self.assertIn("npx skills add Parcha-ai/parcha-skills --skill blast-radius", readme)
 
     def test_is_invocation_only_and_proves_by_running_code(self):
         text = SKILL.read_text()

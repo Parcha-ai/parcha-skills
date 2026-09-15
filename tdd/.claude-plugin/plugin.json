@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Test-driven development at pre-agreed seams: red before green, one vertical slice per cycle, regression-first bug fixes.",
   "author": {
-    "name": "Miguel Rios",
-    "url": "https://github.com/miguelrios"
+    "name": "Parcha Labs",
+    "url": "https://github.com/Parcha-ai/parcha-skills"
   }
 }

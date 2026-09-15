@@ -25,8 +25,8 @@ class TddPackageTest(unittest.TestCase):
 
     def test_readme_has_install_lines(self):
         readme = (ROOT / "README.md").read_text()
-        self.assertIn("https://skills.sh/miguelrios/unc-skills/tdd", readme)
-        self.assertIn("npx skills add miguelrios/unc-skills --skill tdd", readme)
+        self.assertIn("https://skills.sh/Parcha-ai/parcha-skills/tdd", readme)
+        self.assertIn("npx skills add Parcha-ai/parcha-skills --skill tdd", readme)
 
     def test_references_moved_under_references_dir(self):
         text = SKILL.read_text()

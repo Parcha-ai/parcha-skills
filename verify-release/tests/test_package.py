@@ -25,8 +25,8 @@ class VerifyReleasePackageTest(unittest.TestCase):
 
     def test_readme_has_install_lines(self):
         readme = (ROOT / "README.md").read_text()
-        self.assertIn("https://skills.sh/miguelrios/unc-skills/verify-release", readme)
-        self.assertIn("npx skills add miguelrios/unc-skills --skill verify-release", readme)
+        self.assertIn("https://skills.sh/Parcha-ai/parcha-skills/verify-release", readme)
+        self.assertIn("npx skills add Parcha-ai/parcha-skills --skill verify-release", readme)
 
     def test_verdict_vocabulary_and_agents_manifest(self):
         text = SKILL.read_text()

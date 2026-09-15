@@ -3,7 +3,7 @@
 Finds what a diff breaks beyond the diff, and proves the one fact the change is safe because
 of by running real code. It works in Claude Code, Codex, and pi.
 
-[![skills.sh](https://skills.sh/b/miguelrios/unc-skills)](https://skills.sh/miguelrios/unc-skills/blast-radius)
+[![skills.sh](https://skills.sh/b/Parcha-ai/parcha-skills)](https://skills.sh/Parcha-ai/parcha-skills/blast-radius)
 
 One job: analysis of a change's reach, with the single load-bearing safety fact proven by a
 script or test that calls the real code. It does not exercise the running application through
@@ -24,20 +24,20 @@ The skill carries `disable-model-invocation: true`, so it runs only when invoked
 skills.sh:
 
 ```bash
-npx skills add miguelrios/unc-skills --skill blast-radius
+npx skills add Parcha-ai/parcha-skills --skill blast-radius
 ```
 
 Claude Code:
 
 ```bash
-claude plugin marketplace add miguelrios/unc-skills
+claude plugin marketplace add Parcha-ai/parcha-skills
 claude plugin install blast-radius@unc-skills
 ```
 
 Codex:
 
 ```bash
-codex plugin marketplace add miguelrios/unc-skills
+codex plugin marketplace add Parcha-ai/parcha-skills
 codex plugin add blast-radius@unc-skills
 ```
 

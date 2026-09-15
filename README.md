@@ -2,7 +2,7 @@
 
 Our collection of portable Agent Skills for Claude Code, Codex, and pi.
 
-[![skills.sh](https://skills.sh/b/miguelrios/unc-skills)](https://skills.sh/miguelrios/unc-skills)
+[![skills.sh](https://skills.sh/b/Parcha-ai/parcha-skills)](https://skills.sh/Parcha-ai/parcha-skills)
 
 | Skill | What it does | Cross-harness note |
 |---|---|---|
@@ -47,6 +47,22 @@ with reason, `SKIPPED`, `BLOCKED`). `blast-radius` proves a single fact by runni
 exercises the app through its entry points; `before-after` shows a change visually without judging
 it. The three do not overlap: analysis, execution, and presentation.
 
+## Sources and credits
+
+Some skills in this collection are vendored or adapted from other people's work. Each such
+package keeps the upstream license file in its directory and a Provenance section in its README
+listing every change made here.
+
+| Skill | Source | Author | License |
+|---|---|---|---|
+| [`unslop`](unslop/) | [cursor/plugins, `pstack/skills/unslop`](https://github.com/cursor/plugins/tree/main/pstack/skills/unslop), by way of [michaelshimeles/skills](https://github.com/michaelshimeles/skills) | Lauren Tan | MIT |
+| [`before-after`](before-after/) | [vercel-labs/before-and-after](https://github.com/vercel-labs/before-and-after), by way of [michaelshimeles/skills](https://github.com/michaelshimeles/skills) | James Clements | PolyForm Shield 1.0.0 |
+| [`review-loop`](review-loop/) | [greptileai/skills](https://github.com/greptileai/skills) (`greploop`, `greploop-apps`), by way of [michaelshimeles/skills](https://github.com/michaelshimeles/skills) | Greptile AI | MIT |
+
+`tdd`, `blast-radius`, and `verify-release` were written for this collection and carry the
+repository's MIT license. `before-after` is not MIT; its PolyForm Shield license applies to that
+directory only.
+
 ## Instruction snippets
 
 [`snippets/`](snippets/) contains harness-neutral blocks for always-loaded agent
@@ -67,31 +83,31 @@ The install commands below cover skills only. To install a snippet, paste its
 
 ## Install with skills.sh
 
-Browse all fifteen skills at [skills.sh/miguelrios/unc-skills](https://skills.sh/miguelrios/unc-skills),
+Browse all fifteen skills at [skills.sh/Parcha-ai/parcha-skills](https://skills.sh/Parcha-ai/parcha-skills),
 or install interactively:
 
 ```bash
-npx skills add miguelrios/unc-skills
+npx skills add Parcha-ai/parcha-skills
 ```
 
 Install one directly with `--skill`:
 
 ```bash
-npx skills add miguelrios/unc-skills --skill hands-free
-npx skills add miguelrios/unc-skills --skill parable
-npx skills add miguelrios/unc-skills --skill cascade
-npx skills add miguelrios/unc-skills --skill recall
-npx skills add miguelrios/unc-skills --skill recap
-npx skills add miguelrios/unc-skills --skill tether
-npx skills add miguelrios/unc-skills --skill desloppify
-npx skills add miguelrios/unc-skills --skill autoqa
-npx skills add miguelrios/unc-skills --skill precap
-npx skills add miguelrios/unc-skills --skill tdd
-npx skills add miguelrios/unc-skills --skill blast-radius
-npx skills add miguelrios/unc-skills --skill before-after
-npx skills add miguelrios/unc-skills --skill review-loop
-npx skills add miguelrios/unc-skills --skill verify-release
-npx skills add miguelrios/unc-skills --skill unslop
+npx skills add Parcha-ai/parcha-skills --skill hands-free
+npx skills add Parcha-ai/parcha-skills --skill parable
+npx skills add Parcha-ai/parcha-skills --skill cascade
+npx skills add Parcha-ai/parcha-skills --skill recall
+npx skills add Parcha-ai/parcha-skills --skill recap
+npx skills add Parcha-ai/parcha-skills --skill tether
+npx skills add Parcha-ai/parcha-skills --skill desloppify
+npx skills add Parcha-ai/parcha-skills --skill autoqa
+npx skills add Parcha-ai/parcha-skills --skill precap
+npx skills add Parcha-ai/parcha-skills --skill tdd
+npx skills add Parcha-ai/parcha-skills --skill blast-radius
+npx skills add Parcha-ai/parcha-skills --skill before-after
+npx skills add Parcha-ai/parcha-skills --skill review-loop
+npx skills add Parcha-ai/parcha-skills --skill verify-release
+npx skills add Parcha-ai/parcha-skills --skill unslop
 ```
 
 Add `--global` for a user-level install or `--agent claude-code`, `--agent codex`, or
@@ -113,7 +129,7 @@ verified 40-character release commit.
 ## Install for Claude Code
 
 ```bash
-claude plugin marketplace add miguelrios/unc-skills
+claude plugin marketplace add Parcha-ai/parcha-skills
 claude plugin install hands-free@unc-skills
 claude plugin install parable@unc-skills
 claude plugin install cascade@unc-skills
@@ -136,7 +152,7 @@ Install only the skills you want. Start a new session after installation.
 ## Install for Codex
 
 ```bash
-codex plugin marketplace add miguelrios/unc-skills
+codex plugin marketplace add Parcha-ai/parcha-skills
 codex plugin add hands-free@unc-skills
 codex plugin add parable@unc-skills
 codex plugin add cascade@unc-skills
@@ -160,7 +176,7 @@ Codex uses the native `.agents/plugins/marketplace.json` and package
 ## Install for pi
 
 ```bash
-pi install git:github.com/miguelrios/unc-skills
+pi install git:github.com/Parcha-ai/parcha-skills
 ```
 
 The repository is one pi package that exposes all fifteen skills. In pi, invoke one explicitly

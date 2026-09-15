@@ -25,8 +25,8 @@ class BeforeAfterPackageTest(unittest.TestCase):
 
     def test_readme_has_install_lines(self):
         readme = (ROOT / "README.md").read_text()
-        self.assertIn("https://skills.sh/miguelrios/unc-skills/before-after", readme)
-        self.assertIn("npx skills add miguelrios/unc-skills --skill before-after", readme)
+        self.assertIn("https://skills.sh/Parcha-ai/parcha-skills/before-after", readme)
+        self.assertIn("npx skills add Parcha-ai/parcha-skills --skill before-after", readme)
 
     def test_scripts_are_shell_only_and_public_host_is_gone(self):
         scripts = SKILL.parent / "scripts"

@@ -6,8 +6,8 @@
     "name": "Greptile AI",
     "url": "https://github.com/greptileai/skills"
   },
-  "homepage": "https://github.com/miguelrios/unc-skills/tree/main/review-loop",
-  "repository": "https://github.com/miguelrios/unc-skills/tree/main/review-loop",
+  "homepage": "https://github.com/Parcha-ai/parcha-skills/tree/main/review-loop",
+  "repository": "https://github.com/Parcha-ai/parcha-skills/tree/main/review-loop",
   "license": "MIT",
   "keywords": [
     "review-loop",
@@ -27,7 +27,7 @@
       "Read",
       "Write"
     ],
-    "websiteURL": "https://github.com/miguelrios/unc-skills/tree/main/review-loop",
+    "websiteURL": "https://github.com/Parcha-ai/parcha-skills/tree/main/review-loop",
     "defaultPrompt": [
       "Use $review-loop on the task at hand."
     ]
