@@ -441,7 +441,9 @@ def collapse_document_candidates(
 QUERY_CLAUSE_MIN_WORDS = 12
 QUERY_CLAUSE_MIN_CONTENT = 3
 QUERY_CLAUSE_MAX = 2
-QUERY_CLAUSE_BUDGET_SECONDS = 0.4
+# One clause pass is an embedding round trip (~150 ms) plus an HNSW scan
+# (~200 ms); the clauses run concurrently inside this budget.
+QUERY_CLAUSE_BUDGET_SECONDS = 1.0
 _CLAUSE_STOPWORDS = frozenset({
     "the", "and", "our", "did", "what", "how", "why", "when", "where", "which",
     "that", "this", "with", "from", "into", "for", "was", "were", "are", "is",
@@ -1971,15 +1973,25 @@ class PassageHintRetrieval:
             added_total = 0
             statuses: list[str] = []
             clause_started = time.monotonic()
+
+            def clause_pass(clause: str) -> tuple[list[dict[str, Any]], str]:
+                if time.monotonic() >= clause_deadline:
+                    return [], "skipped-budget"
+                clause_rows, clause_status, _strategy, _scope = self._dense_candidates(
+                    clause, vector=self._embed_query(clause),
+                    **{**common, "deadline_at": clause_deadline},
+                )
+                return clause_rows, clause_status
+
             try:
-                for clause in clauses:
-                    if time.monotonic() >= clause_deadline:
-                        statuses.append("skipped-budget")
-                        continue
-                    clause_rows, clause_status, _strategy, _scope = self._dense_candidates(
-                        clause, vector=self._embed_query(clause),
-                        **{**common, "deadline_at": clause_deadline},
-                    )
+                # Concurrent: each clause embeds and scans on its own pooled
+                # connection; search admission already bounds how many
+                # searches run at once, so the pool stays within budget.
+                with ThreadPoolExecutor(
+                    max_workers=len(clauses), thread_name_prefix="recall-clause",
+                ) as clause_executor:
+                    outcomes = list(clause_executor.map(clause_pass, clauses))
+                for clause_rows, clause_status in outcomes:
                     statuses.append(clause_status)
                     rows, added = merge_dense_pools(rows, clause_rows)
                     added_total += added
