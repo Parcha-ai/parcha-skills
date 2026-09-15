@@ -100,6 +100,11 @@ Every alias in the response must report `isResolved: true`. If one does not, re-
 thread and treat it as still open; do not count it as resolved. Batch up to 20 aliases per
 request. Full queries are in `references/graphql-queries.md`.
 
+Resolving is only the GraphQL `resolveReviewThread` mutation. A REST reply (the
+`pulls/{pr}/comments/{id}/replies` endpoint) answers a thread but never resolves it, and a
+replied-but-unresolved thread still fails the zero-unresolved exit criterion. Always resolve
+through GraphQL, never assume a reply resolved anything.
+
 ## Greptile specifics
 
 - Before posting a trigger comment, check for a run already in progress. Look at
@@ -109,15 +114,23 @@ request. Full queries are in `references/graphql-queries.md`.
   for it.
 - The trigger comment text is configurable; the default is `@greptile-apps review`. Post it at
   most once per push.
-- Poll the check run at 10-second intervals for up to 10 minutes. On large PRs the tagged
-  review may never create a check run for the new head; Greptile instead edits its existing
-  summary comment. If no check run appears after a few attempts, poll the most recently updated
-  Greptile issue comment and stop when its `updated_at` is later than the trigger comment and its
-  body carries a score.
+- Poll the check run at 10-second intervals for up to 10 minutes. A check run that has only
+  just appeared but is still `PENDING` or `IN_PROGRESS` is not a result: wait for a terminal
+  `conclusion` AND for the summary comment's `updated_at` to move past the trigger time before
+  reading a score. A freshly-appeared check run beside an unchanged summary means Greptile has
+  started but not finished, and reading the old summary then records a stale score.
+- On large PRs the tagged review may never create a check run for the new head; Greptile instead
+  edits its existing summary comment. If no check run appears after a few attempts, poll the most
+  recently updated Greptile issue comment and stop when its `updated_at` is later than the trigger
+  comment and its body carries a score.
 - Read the score from three places and use the most recently updated one: the most recently
   updated Greptile-authored issue comment (it edits in place, so sort by `updated_at`), the PR
   body, and the latest review from `greptile-apps[bot]` or `greptile-apps-staging[bot]`. The
   score looks like `3/5`, `5/5`, or `Confidence: 3/5`.
+- Freshness gate: a score counts only for the current head. Resolve the commit it was produced
+  for (the Greptile check run's `head_sha`, or a summary whose `updated_at` post-dates the head
+  commit) and compare it to the PR's current head SHA. A score from an earlier commit is stale:
+  re-trigger, wait, and never record it as the exit criterion.
 - Carry forward the items under "Prompt to fix all with AI" in the Greptile summary comment,
   even when the inline comment endpoint returns zero unresolved comments. They count as open
   until fixed or answered.
@@ -130,6 +143,11 @@ request. Full queries are in `references/graphql-queries.md`.
   say so in the report.
 - Devin posts inline threads and a summary issue comment. Triage them like any other thread;
   reply and resolve through the same GraphQL path.
+- Devin may report more issues than it posts ("N issues, M not posted by your settings"). The
+  flags hidden by GitHub settings are not fetchable through the API and are not review threads:
+  do not count them toward unresolved threads. Record them in the report as "M Devin flags not
+  visible via API (see the Devin dashboard)" for a human, but the exit criterion is over the
+  threads that actually exist on the PR.
 - Re-requesting Devin is a push; there is no trigger comment.
 
 ## Stop on timeout

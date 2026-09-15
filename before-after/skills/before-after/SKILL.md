@@ -15,6 +15,12 @@ switching branches, stashing, or starting a second dev server.
 
 ## Rules
 
+- The visual is required. For any change with a UI surface (a page, a component, or a rendered
+  template), a real image pair is mandatory; a text-only "Before / After" table does not satisfy
+  this skill, and a `## Before / After` section a UI change ships without images is incomplete.
+- Drive the browser through the repo's existing Stagehand-based browser automation (the
+  `agent-browser` integration that `scripts/capture.sh` calls, such as the sandbox `browser-mcp`
+  facade). Do not hand-roll a separate headless browser or a local static server to take the shot.
 - "Before" is a real running deployment of the base branch: the main preview, staging, or
   production. "After" is the branch: its preview deployment or the local run of the current
   checkout. Never switch git branches, stash changes, or start a dev server to manufacture
