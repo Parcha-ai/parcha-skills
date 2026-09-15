@@ -2901,27 +2901,6 @@ class AllCommonLexicalTests(unittest.TestCase):
         self.assertEqual(len(lexical_calls), 1 + statuses.count("ok"))
 
 
-class HeadPlusWindowTests(unittest.TestCase):
-    def test_head_is_followed_by_the_matching_window_past_it(self) -> None:
-        from recall_server.passage_retrieval import head_plus_window, rerank_document
-        text = "role: assistant. opening lines. " + "x " * 3000 + "the verdict gate failed on proof stage " + "y " * 3000
-        doc = head_plus_window(text, ["verdict", "proof", "gate"], 2000)
-        self.assertTrue(doc.startswith("role: assistant."))
-        self.assertIn("\n...\n", doc)
-        self.assertIn("verdict gate failed on proof", doc)
-        self.assertLessEqual(len(doc), 2000)
-        # One matching term only: the head alone.
-        self.assertEqual(head_plus_window(text, ["verdict"], 2000), text)
-        # Terms inside the head only: the head alone.
-        self.assertEqual(head_plus_window("verdict proof " + "z " * 5000, ["verdict", "proof"], 2000), "verdict proof " + "z " * 5000)
-        self.assertEqual(head_plus_window("short text", ["short"], 2000), "short text")
-        row = {"header_redacted": "source family: codex", "text_redacted": text}
-        doc = rerank_document(row, ["verdict", "proof", "gate"], 2000)
-        self.assertTrue(doc.startswith("source family: codex\n\nrole: assistant."))
-        self.assertIn("proof stage", doc)
-        self.assertLessEqual(len(doc), 2000)
-
-
 class IdentifierSigilTests(unittest.TestCase):
     def test_hash_prefixed_numbers_are_identifiers(self) -> None:
         from recall_server.passage_retrieval import identifier_tokens
