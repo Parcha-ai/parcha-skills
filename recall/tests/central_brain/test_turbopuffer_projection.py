@@ -17,11 +17,30 @@ from recall_server.turbopuffer_plane import (
 )
 from recall_server.turbopuffer_projection import (
     INCREMENTAL_REASONS,
+    RATE_LIMIT_BACKOFF_CAP_SECONDS,
     TurbopufferProjector,
+    byte_bounded_batches,
     drain_search_outbox,
+    is_rate_limit,
 )
 
 from .fake_turbopuffer import FakeNamespace, FakeTurbopuffer
+
+
+def _upserts(write: dict) -> list[str]:
+    return [str(row["id"]) for row in (write.get("upsert_rows") or ())]
+
+
+def _deletes(write: dict) -> list[str]:
+    return [str(identifier) for identifier in (write.get("deletes") or ())]
+
+
+class RateLimitError(Exception):
+    """Named like ``turbopuffer.RateLimitError``; the writer matches by class name."""
+
+
+class NotFoundError(Exception):
+    """Named like ``turbopuffer.NotFoundError``."""
 
 TENANT = "tenant:company:test"
 SOURCE = "source:codex:test"
@@ -187,6 +206,7 @@ class _Store:
 
 def _projector(catalog: _Catalog, client: FakeTurbopuffer | None = None, **kwargs) -> tuple[TurbopufferProjector, FakeTurbopuffer]:
     client = client or FakeTurbopuffer()
+    kwargs.setdefault("sleep", lambda _seconds: None)
     return TurbopufferProjector(_Store(catalog), SETTINGS, client=client, **kwargs), client
 
 
@@ -202,7 +222,7 @@ class RowShapeAndBatchingTest(unittest.TestCase):
 
         self.assertEqual(result, {
             "status": "complete", "months": 1, "rows": 2, "deleted": 0,
-            "failed": 0, "requeued": 0, "pending": 0,
+            "failed": 0, "requeued": 0, "rate_limited": 0, "pending": 0,
         })
         namespace = client.namespace(SETTINGS.namespace(TENANT))
         self.assertEqual(sorted(namespace.rows), [_passage(1, 7, 3)["passage_id"], _passage(2, 7, 9)["passage_id"]])
@@ -221,7 +241,6 @@ class RowShapeAndBatchingTest(unittest.TestCase):
         self.assertEqual(len(namespace.writes), 1)
         self.assertEqual(namespace.writes[0]["schema"], namespace_schema(SETTINGS))
         self.assertEqual(namespace.writes[0]["distance_metric"], "cosine_distance")
-        self.assertEqual(namespace.distance_metric, "cosine_distance")
         self.assertEqual(catalog.outbox, {})
         shard = catalog.shards[(SOURCE, JULY)]
         self.assertEqual(shard["generation"], 1)
@@ -239,7 +258,7 @@ class RowShapeAndBatchingTest(unittest.TestCase):
 
         namespace = client.namespace(SETTINGS.namespace(TENANT))
         self.assertEqual(result["rows"], 5)
-        self.assertEqual([len(write["upserts"]) for write in namespace.writes], [2, 2, 1])
+        self.assertEqual([len(_upserts(write)) for write in namespace.writes], [2, 2, 1])
         self.assertEqual(len(namespace.rows), 5)
 
     def test_months_are_claimed_oldest_first_and_bounded(self) -> None:
@@ -275,19 +294,21 @@ class TombstoneTest(unittest.TestCase):
         result = projector.drain(tenant_id=TENANT, max_months=1)
 
         self.assertEqual((result["deleted"], result["rows"]), (2, 1))
-        self.assertEqual(namespace.deleted, ["psg_" + "d" * 32, "psg_" + "e" * 32])
         self.assertNotIn("psg_" + "d" * 32, namespace.rows)
         # Deletes go before upserts, then the July tombstones are gone and
         # August's waits for its own month.
-        self.assertEqual(namespace.writes[1]["deletes"], ["psg_" + "d" * 32, "psg_" + "e" * 32])
-        self.assertEqual(namespace.writes[2]["upserts"], [_passage(1, 7, 3)["passage_id"]])
+        self.assertEqual(_deletes(namespace.writes[1]), ["psg_" + "d" * 32, "psg_" + "e" * 32])
+        self.assertEqual(_upserts(namespace.writes[2]), [_passage(1, 7, 3)["passage_id"]])
         self.assertEqual([row["passage_id"] for row in catalog.tombstones], ["psg_" + "0" * 32])
 
     def test_delete_only_write_to_an_unknown_namespace_is_not_a_failure(self) -> None:
         catalog = _Catalog()
         catalog.tombstones = [{"source_id": SOURCE, "passage_id": "psg_" + "d" * 32, "month": JULY}]
         catalog.enqueue(JULY, reason="forget")
-        projector, _client = _projector(catalog)
+        client = FakeTurbopuffer()
+        namespace = client.namespace(SETTINGS.namespace(TENANT))
+        namespace.fail_writes = NotFoundError("namespace not found")
+        projector, _client = _projector(catalog, client)
 
         result = projector.drain(tenant_id=TENANT, max_months=1)
 
@@ -373,6 +394,92 @@ class IncrementalTest(unittest.TestCase):
         self.assertEqual(projector.drain(tenant_id=TENANT, max_months=1)["rows"], 1)
 
 
+def _client_rows(client: FakeTurbopuffer) -> dict:
+    return client.namespace(SETTINGS.namespace(TENANT)).rows
+
+
+class RateLimitTest(unittest.TestCase):
+    def test_rate_limited_batch_backs_off_and_is_retried(self) -> None:
+        catalog = _Catalog()
+        catalog.passages = [_passage(1, 7, 3), _passage(2, 7, 4), _passage(3, 7, 5)]
+        catalog.enqueue(JULY)
+        client = FakeTurbopuffer()
+        sleeps: list[float] = []
+        remaining = {"failures": 3}
+
+        class ThrottledNamespace(FakeNamespace):
+            def write(self, **kwargs):
+                if remaining["failures"]:
+                    remaining["failures"] -= 1
+                    raise RateLimitError("429")
+                return super().write(**kwargs)
+
+        client.namespaces[SETTINGS.namespace(TENANT)] = ThrottledNamespace(SETTINGS.namespace(TENANT))
+        projector, _ = _projector(catalog, client, sleep=sleeps.append)
+
+        result = projector.drain(tenant_id=TENANT, max_months=1)
+
+        self.assertEqual((result["failed"], result["months"], result["rows"]), (0, 1, 3))
+        self.assertEqual(result["rate_limited"], 3)
+        self.assertEqual(sleeps, [1.0, 2.0, 4.0])
+        self.assertEqual(len(_client_rows(client)), 3)
+        self.assertEqual(catalog.outbox, {})
+        # Only the throttled batch was retried: two batches, three attempts on the first.
+        self.assertEqual([len(_upserts(write)) for write in client.namespace(SETTINGS.namespace(TENANT)).writes], [2, 1])
+
+    def test_backoff_caps_and_an_exhausted_budget_fails_the_month(self) -> None:
+        catalog = _Catalog()
+        catalog.passages = [_passage(1, 7, 3)]
+        catalog.enqueue(JULY)
+        client = FakeTurbopuffer()
+        client.namespace(SETTINGS.namespace(TENANT)).fail_writes = RateLimitError("429")
+        sleeps: list[float] = []
+        projector, _ = _projector(catalog, client, sleep=sleeps.append, rate_limit_budget_seconds=100.0)
+
+        with self.assertLogs("recall_server.turbopuffer_projection", level=logging.WARNING) as logs:
+            result = projector.drain(tenant_id=TENANT, max_months=1)
+
+        self.assertEqual((result["failed"], result["months"]), (1, 0))
+        # 1+2+4+8+16+32 = 63 spent; 64 does not fit in the remaining 37.
+        self.assertEqual(sleeps, [1.0, 2.0, 4.0, 8.0, 16.0, 32.0])
+        self.assertEqual(result["rate_limited"], 0)  # the month failed: its attempts are not summed
+        self.assertEqual(list(catalog.outbox), [(SOURCE, JULY)])
+        self.assertTrue(any("rate limit budget exhausted" in line for line in logs.output))
+        self.assertTrue(all("429" not in line or "type=RateLimitError" in line for line in logs.output))
+        self.assertLessEqual(max(sleeps), RATE_LIMIT_BACKOFF_CAP_SECONDS)
+
+    def test_is_rate_limit_matches_the_sdk_class_by_name(self) -> None:
+        import turbopuffer
+
+        self.assertTrue(is_rate_limit(RateLimitError("x")))
+        self.assertTrue(issubclass(turbopuffer.RateLimitError, Exception))
+        self.assertTrue(any("RateLimit" in klass.__name__ for klass in turbopuffer.RateLimitError.__mro__))
+        self.assertFalse(is_rate_limit(ValueError("x")))
+
+
+class ByteClampTest(unittest.TestCase):
+    def test_batches_are_bounded_by_rows_and_bytes(self) -> None:
+        rows = [{"id": f"psg_{index:032x}", "text": "x" * 1000} for index in range(6)]
+        by_rows = byte_bounded_batches(rows, max_rows=4, max_bytes=10**9)
+        self.assertEqual([len(batch) for batch in by_rows], [4, 2])
+        by_bytes = byte_bounded_batches(rows, max_rows=100, max_bytes=2500)
+        self.assertEqual([len(batch) for batch in by_bytes], [2, 2, 2])
+        oversized = byte_bounded_batches(rows[:2], max_rows=100, max_bytes=100)
+        self.assertEqual([len(batch) for batch in oversized], [1, 1])
+        self.assertEqual(byte_bounded_batches([], max_rows=1, max_bytes=1024), [])
+
+    def test_projector_splits_a_page_by_bytes(self) -> None:
+        catalog = _Catalog()
+        catalog.passages = [_passage(1, 7, 3), _passage(2, 7, 4)]
+        catalog.enqueue(JULY)
+        projector, client = _projector(catalog, max_batch_bytes=1024)
+
+        result = projector.drain(tenant_id=TENANT, max_months=1)
+
+        self.assertEqual(result["rows"], 2)
+        self.assertEqual([len(_upserts(write)) for write in client.namespace(SETTINGS.namespace(TENANT)).writes], [1, 1])
+
+
 class FailureTest(unittest.TestCase):
     def test_failing_write_leaves_the_row_and_counts_the_month(self) -> None:
         catalog = _Catalog()
@@ -382,26 +489,28 @@ class FailureTest(unittest.TestCase):
         projector, client = _projector(catalog)
         namespace = client.namespace(SETTINGS.namespace(TENANT))
 
-        class SyntheticRateLimit(Exception):
+        class SyntheticOutage(Exception):
             pass
 
-        namespace.fail_with = SyntheticRateLimit("429 slow down: secret-text-must-not-leak")
+        namespace.fail_writes = SyntheticOutage("500 boom: secret-text-must-not-leak")
         with self.assertLogs("recall_server.turbopuffer_projection", level=logging.WARNING) as logs:
             result = projector.drain(tenant_id=TENANT, max_months=4)
 
-        self.assertEqual(result["failed"], 1)
-        self.assertEqual(result["months"], 1)
+        # The fake fails every write, so both months fail and both stay queued.
+        self.assertEqual(result["failed"], 2)
+        self.assertEqual(result["months"], 0)
         self.assertEqual(result["status"], "pending")
-        self.assertEqual(list(catalog.outbox), [(SOURCE, JULY)])
-        self.assertNotIn((SOURCE, JULY), catalog.shards)
-        self.assertIn((SOURCE, AUGUST), catalog.shards)
-        self.assertEqual(len(logs.output), 1)
-        self.assertIn("type=SyntheticRateLimit", logs.output[0])
+        self.assertEqual(sorted(catalog.outbox), [(SOURCE, JULY), (SOURCE, AUGUST)])
+        self.assertEqual(catalog.shards, {})
+        self.assertEqual(len(logs.output), 2)
+        self.assertIn("type=SyntheticOutage", logs.output[0])
         self.assertNotIn("secret-text", logs.output[0])
         self.assertNotIn("synthetic-key", logs.output[0])
-        # The failed month is retried on the next drain.
+        # The failed months are retried on the next drain.
+        namespace.fail_writes = None
         retry = projector.drain(tenant_id=TENANT, max_months=4)
-        self.assertEqual((retry["failed"], retry["months"], retry["pending"]), (0, 1, 0))
+        self.assertEqual((retry["failed"], retry["months"], retry["pending"]), (0, 2, 0))
+        self.assertEqual(len(_client_rows(client)), 2)
 
     def test_deadline_stops_claiming_further_months(self) -> None:
         catalog = _Catalog()
@@ -419,6 +528,8 @@ class FailureTest(unittest.TestCase):
         catalog = _Catalog()
         with self.assertRaises(ValueError):
             TurbopufferProjector(_Store(catalog), SETTINGS, client=FakeTurbopuffer(), batch_rows=0)
+        with self.assertRaises(ValueError):
+            TurbopufferProjector(_Store(catalog), SETTINGS, client=FakeTurbopuffer(), max_batch_bytes=1)
         projector, _client = _projector(catalog)
         with self.assertRaises(ValueError):
             projector.drain(tenant_id=TENANT, max_months=0)
@@ -469,7 +580,7 @@ class WorkerPhaseTest(unittest.TestCase):
     def test_phase_is_skipped_without_settings(self) -> None:
         result = self._run(None)
         self.assertEqual(result["status"], "complete")
-        for key in ("search_plane_months", "search_plane_rows", "search_plane_deleted", "search_plane_failed", "search_plane_elapsed_ms"):
+        for key in ("search_plane_months", "search_plane_rows", "search_plane_deleted", "search_plane_failed", "search_plane_rate_limited", "search_plane_elapsed_ms"):
             self.assertEqual(result[key], 0)
 
     def test_phase_counts_reach_the_cycle_result(self) -> None:
@@ -477,7 +588,7 @@ class WorkerPhaseTest(unittest.TestCase):
 
         def drain():
             calls.append(1)
-            return {"status": "pending", "months": 2, "rows": 9, "deleted": 3, "failed": 1, "pending": 5}
+            return {"status": "pending", "months": 2, "rows": 9, "deleted": 3, "failed": 1, "rate_limited": 4, "pending": 5}
 
         with self.assertLogs("recall_server.projection_worker", level=logging.INFO) as logs:
             result = self._run(drain)
@@ -486,9 +597,10 @@ class WorkerPhaseTest(unittest.TestCase):
         self.assertEqual(result["search_plane_rows"], 9)
         self.assertEqual(result["search_plane_deleted"], 3)
         self.assertEqual(result["search_plane_failed"], 1)
+        self.assertEqual(result["search_plane_rate_limited"], 4)
         self.assertEqual(result["status"], "pending")
         line = next(entry for entry in logs.output if "projection cycle" in entry)
-        self.assertIn("search_plane_months=2 search_plane_rows=9 search_plane_deleted=3 search_plane_failed=1", line)
+        self.assertIn("search_plane_months=2 search_plane_rows=9 search_plane_deleted=3 search_plane_failed=1 search_plane_rate_limited=4", line)
         self.assertIn("search_plane_elapsed_ms=", line)
 
 

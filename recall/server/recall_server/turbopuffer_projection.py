@@ -16,12 +16,20 @@ progress when the read started, so a passage-plane transaction that was
 still open during the read (its ``created_at`` predates the read) is picked
 up by the next incremental pass instead of being lost.
 
+Rate limits (turbopuffer's native-embedding limit is 1024 requests and 2M
+tokens per minute per organisation, HTTP 429 ``RateLimitError``) back off
+1 s, 2 s, 4 s ... capped at 60 s and retry the same batch, for at most
+``RATE_LIMIT_BUDGET_SECONDS`` per month; the batch is never dropped. Writes
+are clamped to ``max_batch_bytes`` of row payload as well as ``batch_rows``
+(the per-namespace ingest limit is 32 MB/s).
+
 Nothing here logs passage text or the API key; failures carry the error
 class only.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Callable
@@ -38,6 +46,10 @@ from .turbopuffer_plane import (
 LOG = logging.getLogger(__name__)
 
 DEFAULT_MONTHS_PER_CYCLE = 4
+DEFAULT_MAX_BATCH_BYTES = 32 * 1024 * 1024
+RATE_LIMIT_BACKOFF_SECONDS = 1.0
+RATE_LIMIT_BACKOFF_CAP_SECONDS = 60.0
+RATE_LIMIT_BUDGET_SECONDS = 300.0
 INCREMENTAL_REASONS = frozenset({"logical-update", "forget", "header-change"})
 
 # Copied from passage_retrieval._lexical_query: a passage is live only while
@@ -107,6 +119,39 @@ def _chunks(values: list[Any], size: int) -> list[list[Any]]:
     return [values[index : index + size] for index in range(0, len(values), size)]
 
 
+def _row_bytes(row: dict[str, Any]) -> int:
+    return len(json.dumps(row, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+
+
+def byte_bounded_batches(rows: list[dict[str, Any]], *, max_rows: int, max_bytes: int) -> list[list[dict[str, Any]]]:
+    """Split ``rows`` so no batch exceeds ``max_rows`` or ``max_bytes`` of JSON.
+
+    A single row larger than ``max_bytes`` travels alone (the service, not
+    the writer, decides whether it is too big).
+    """
+
+    batches: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    current_bytes = 0
+    for row in rows:
+        size = _row_bytes(row)
+        if current and (len(current) >= max_rows or current_bytes + size > max_bytes):
+            batches.append(current)
+            current, current_bytes = [], 0
+        current.append(row)
+        current_bytes += size
+    if current:
+        batches.append(current)
+    return batches
+
+
+def is_rate_limit(error: BaseException) -> bool:
+    """``turbopuffer.RateLimitError`` (HTTP 429), matched by class name so the
+    SDK stays an optional import."""
+
+    return any("RateLimit" in klass.__name__ for klass in type(error).__mro__)
+
+
 class TurbopufferProjector:
     """Drains ``search_projection_outbox`` into turbopuffer namespaces."""
 
@@ -117,15 +162,23 @@ class TurbopufferProjector:
         *,
         client: Any = None,
         batch_rows: int | None = None,
+        max_batch_bytes: int = DEFAULT_MAX_BATCH_BYTES,
         clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], Any] = time.sleep,
+        rate_limit_budget_seconds: float = RATE_LIMIT_BUDGET_SECONDS,
     ) -> None:
         batch = settings.write_batch_rows if batch_rows is None else batch_rows
         if isinstance(batch, bool) or not isinstance(batch, int) or not 1 <= batch <= 5000:
             raise ValueError("search plane write batch is invalid")
+        if isinstance(max_batch_bytes, bool) or not isinstance(max_batch_bytes, int) or not 1024 <= max_batch_bytes <= DEFAULT_MAX_BATCH_BYTES:
+            raise ValueError("search plane batch bytes are invalid")
         self.store = store
         self.settings = settings
         self.batch_rows = batch
+        self.max_batch_bytes = max_batch_bytes
         self.clock = clock
+        self.sleep = sleep
+        self.rate_limit_budget_seconds = float(rate_limit_budget_seconds)
         self._client = client
 
     @property
@@ -259,12 +312,38 @@ class TurbopufferProjector:
 
     # -- turbopuffer writes --------------------------------------------------
 
-    def _write(self, namespace: Any, **kwargs: Any) -> None:
-        namespace.write(
-            distance_metric="cosine_distance",
-            schema=namespace_schema(self.settings),
-            **kwargs,
-        )
+    def _write(self, namespace: Any, budget: dict[str, float], **kwargs: Any) -> int:
+        """One write call; a 429 backs off and retries the same batch.
+
+        ``budget`` carries the month's remaining backoff seconds and the
+        number of rate-limited attempts (``rate_limited``); when the budget
+        is spent the error propagates and the month stays queued.
+        """
+
+        delay = RATE_LIMIT_BACKOFF_SECONDS
+        attempts = 0
+        while True:
+            try:
+                namespace.write(
+                    distance_metric="cosine_distance",
+                    schema=namespace_schema(self.settings),
+                    **kwargs,
+                )
+                return attempts
+            except Exception as error:  # noqa: BLE001 - only 429 is retried
+                if not is_rate_limit(error):
+                    raise
+                attempts += 1
+                budget["rate_limited"] = budget.get("rate_limited", 0) + 1
+                if budget["remaining"] < delay:
+                    LOG.warning(
+                        "search plane rate limit budget exhausted attempts=%s type=%s",
+                        attempts, type(error).__name__,
+                    )
+                    raise
+                budget["remaining"] -= delay
+                self.sleep(delay)
+                delay = min(delay * 2, RATE_LIMIT_BACKOFF_CAP_SECONDS)
 
     def project_month(self, claim: dict[str, Any]) -> dict[str, Any]:
         """Project one claimed source-month; raises on a turbopuffer failure."""
@@ -272,6 +351,7 @@ class TurbopufferProjector:
         tenant_id = claim["tenant_id"]
         name = self.settings.namespace(tenant_id)
         namespace = self.client.namespace(name)
+        budget = {"remaining": self.rate_limit_budget_seconds, "rate_limited": 0}
         with self.store.connect() as connection:
             since = (
                 self.shard_watermark(connection, claim)
@@ -286,7 +366,7 @@ class TurbopufferProjector:
         deleted = 0
         for batch in _chunks(tombstones, self.batch_rows):
             try:
-                self._write(namespace, deletes=batch)
+                self._write(namespace, budget, deletes=batch)
             except Exception as error:  # noqa: BLE001 - class checked below
                 if type(error).__name__ != "NotFoundError":
                     raise
@@ -303,8 +383,9 @@ class TurbopufferProjector:
                 passage_row({**passage, "actors": [tuple(actor) for actor in passage["actors"]]})
                 for passage in page
             ]
-            self._write(namespace, upsert_rows=rows)
-            written += len(rows)
+            for batch in byte_bounded_batches(rows, max_rows=self.batch_rows, max_bytes=self.max_batch_bytes):
+                self._write(namespace, budget, upsert_rows=batch)
+                written += len(batch)
             last = page[-1]
             after = (last["first_occurred_at"], last["passage_id"])
             if len(page) < self.batch_rows:
@@ -315,7 +396,10 @@ class TurbopufferProjector:
                 namespace=name, rows_written=written,
                 tombstones=tombstones, watermark=watermark,
             )
-        return {"rows": written, "deleted": deleted, "retired": retired}
+        return {
+            "rows": written, "deleted": deleted, "retired": retired,
+            "rate_limited": int(budget["rate_limited"]),
+        }
 
     def drain(
         self,
@@ -338,6 +422,7 @@ class TurbopufferProjector:
             "deleted": 0,
             "failed": 0,
             "requeued": 0,
+            "rate_limited": 0,
             "pending": 0,
         }
         for claim in claims:
@@ -355,6 +440,7 @@ class TurbopufferProjector:
             result["months"] = int(result["months"]) + 1
             result["rows"] = int(result["rows"]) + int(outcome["rows"])
             result["deleted"] = int(result["deleted"]) + int(outcome["deleted"])
+            result["rate_limited"] = int(result["rate_limited"]) + int(outcome["rate_limited"])
             if not outcome["retired"]:
                 result["requeued"] = int(result["requeued"]) + 1
         with self.store.connect() as connection:
@@ -380,8 +466,9 @@ def drain_search_outbox(
     client: Any = None,
     batch_rows: int | None = None,
     deadline_at: float | None = None,
+    sleep: Callable[[float], Any] = time.sleep,
 ) -> dict[str, int | str]:
     """One drain cycle over the tenant's outbox (see ``TurbopufferProjector``)."""
 
-    projector = TurbopufferProjector(store, settings, client=client, batch_rows=batch_rows)
+    projector = TurbopufferProjector(store, settings, client=client, batch_rows=batch_rows, sleep=sleep)
     return projector.drain(tenant_id=tenant_id, max_months=max_months, deadline_at=deadline_at)

@@ -238,6 +238,7 @@ def run_projection_worker(
                     "rows": 0,
                     "deleted": 0,
                     "failed": 0,
+                    "rate_limited": 0,
                     "pending": 0,
                 }
             )
@@ -323,6 +324,7 @@ def run_projection_worker(
                 "search_plane_rows": int(searched["rows"]),
                 "search_plane_deleted": int(searched["deleted"]),
                 "search_plane_failed": int(searched["failed"]),
+                "search_plane_rate_limited": int(searched.get("rate_limited", 0)),
                 "canonical_bodies_thinned": int(thinned["documents"]),
                 "thin_mode": "busy" if thin_busy else "idle",
                 "canonical_bodies_refused": int(thinned["refused"]),
@@ -365,6 +367,7 @@ def run_projection_worker(
                 "parquet_documents_dirty=%s "
                 "search_plane_months=%s search_plane_rows=%s "
                 "search_plane_deleted=%s search_plane_failed=%s "
+                "search_plane_rate_limited=%s "
                 "canonical_bodies_thinned=%s canonical_bodies_refused=%s "
                 "thin_mode=%s "
                 "canonical_document_bytes_removed=%s "
@@ -407,6 +410,7 @@ def run_projection_worker(
                         "search_plane_rows",
                         "search_plane_deleted",
                         "search_plane_failed",
+                        "search_plane_rate_limited",
                         "canonical_bodies_thinned",
                         "canonical_bodies_refused",
                         "thin_mode",

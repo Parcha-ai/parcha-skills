@@ -137,19 +137,9 @@ def _worker_pool_max_size(args: argparse.Namespace) -> int | None:
 
 
 def _search_plane_client(settings: TurbopufferSettings) -> object:
-    """The turbopuffer client, or the in-memory fake when RECALL_TPUF_FAKE=1.
+    """One turbopuffer client per process (``RECALL_TPUF_CLIENT_FACTORY`` swaps
+    in the file-backed fake for the e2e suites)."""
 
-    The fake (``tests/central_brain/fake_turbopuffer.py``) exists for the E2E
-    scripts only: it never leaves the process and is never a production path.
-    """
-
-    if os.environ.get("RECALL_TPUF_FAKE", "").strip() == "1":
-        root = Path(__file__).resolve().parents[2]
-        if str(root) not in sys.path:
-            sys.path.insert(0, str(root))
-        from tests.central_brain.fake_turbopuffer import FakeTurbopuffer
-
-        return FakeTurbopuffer()
     return build_client(settings)
 
 
@@ -2537,13 +2527,13 @@ def main() -> None:
         search_projector = TurbopufferProjector(
             store, search_settings, client=_search_plane_client(search_settings),
         )
-        totals = {"cycles": 0, "months": 0, "rows": 0, "deleted": 0, "failed": 0, "requeued": 0}
+        totals = {"cycles": 0, "months": 0, "rows": 0, "deleted": 0, "failed": 0, "requeued": 0, "rate_limited": 0}
         while True:
             cycle = search_projector.drain(
                 tenant_id=args.tenant, max_months=args.max_months,
             )
             totals["cycles"] += 1
-            for key in ("months", "rows", "deleted", "failed", "requeued"):
+            for key in ("months", "rows", "deleted", "failed", "requeued", "rate_limited"):
                 totals[key] += int(cycle[key])
             pending = int(cycle["pending"])
             # Stop when nothing is queued, when asked for one cycle, or when a

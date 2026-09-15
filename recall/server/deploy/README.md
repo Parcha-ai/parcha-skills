@@ -150,7 +150,12 @@ claimed `generation` (a month re-queued during the write stays queued) and upser
 `row_count` = rows written by that pass, `built_at` = the read watermark). `backfill`
 sends every live passage of the month; `logical-update`, `forget` and `header-change`
 send only passages created after the shard's `built_at`. A turbopuffer failure on a month
-leaves its outbox row, is counted as failed, and is logged by error class only.
+leaves its outbox row, is counted as failed, and is logged by error class only. A 429
+(`RateLimitError`: 1024 requests and 2M embedding tokens per minute per organisation)
+backs off 1 s, 2 s, 4 s ... capped at 60 s and retries the same batch for up to five
+minutes per month, counted as `rate_limited`; a batch is never dropped. Writes are clamped
+to 32 MB of row payload as well as `RECALL_TPUF_WRITE_BATCH_ROWS` (the per-namespace
+ingest limit is 32 MB/s).
 
 Environment (the worker never logs the key):
 
@@ -162,6 +167,7 @@ Environment (the worker never logs the key):
 | `RECALL_TPUF_NAMESPACE_PREFIX` | Namespace prefix, default `recall`. |
 | `RECALL_TPUF_WRITE_BATCH_ROWS` | Rows per write call, default 200. |
 | `RECALL_SEARCH_PLANE` | `postgres` (default) or `turbopuffer`: which plane the read path queries. The writer runs whenever a key is configured, regardless of this value, so a namespace can be filled before the read path is switched. |
+| `RECALL_TPUF_CLIENT_FACTORY` / `RECALL_TPUF_FAKE_STATE` | Test hooks only: `tests.central_brain.fake_turbopuffer:factory` swaps in the in-process fake, file-backed at the state path so a worker and a server share one fake plane. Never set in production. |
 
 Runbook, first deployment for a tenant:
 
@@ -177,12 +183,14 @@ python -m recall_server.cli projection-worker --tenant tenant:company:example \
 #    or drain it in the foreground until the outbox is empty.
 python -m recall_server.cli search-plane-project --tenant tenant:company:example \
   --max-months 4          # add --once for a single cycle
-# {"cycles": 12, "deleted": 0, "failed": 0, "months": 48, "pending": 0, "requeued": 0, "rows": 812345, "status": "complete"}
+# {"cycles": 12, "deleted": 0, "failed": 0, "months": 48, "pending": 0, "rate_limited": 3, "requeued": 0, "rows": 812345, "status": "complete"}
 ```
 
-- **Cycle log**: `search_plane_months`, `search_plane_rows`, `search_plane_deleted` and
-  `search_plane_failed` on the `projection-worker` line, next to `search_outbox_pending`;
-  `search_plane_elapsed_ms` attributes the phase's wall clock.
+- **Cycle log**: `search_plane_months`, `search_plane_rows`, `search_plane_deleted`,
+  `search_plane_failed` and `search_plane_rate_limited` on the `projection-worker` line,
+  next to `search_outbox_pending`; `search_plane_elapsed_ms` attributes the phase's wall
+  clock. A cycle claims at most `--search-plane-months-per-cycle` months, so the other
+  phases keep running between drains during the hours a backfill takes.
 - **Metrics**: `recall_search_plane_pending` (outbox rows, all tenants) and
   `recall_search_plane_shards` (built source-months) on `/metrics`;
   `recall_projection_search_plane_rows_written_total` counts rows since process start.
