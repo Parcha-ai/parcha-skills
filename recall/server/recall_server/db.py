@@ -38,6 +38,7 @@ from .identity_cache import invalidate_tenant as invalidate_registration_cache
 from .projectors import KIND_RE, SOURCE_ID_RE, advisory_lock_key, canonical_json, effective_session_id, event_receipt, legacy_engine, partial_lexical_probes, phrase_query_spec, preferred_phrase_probes, project, redact_text, validate_envelope
 from .ranking import DEFAULT_SEARCH_DEADLINE_MS, evidence_rank_components, should_run_partial
 from .rerank import RerankRuntime, rerank_blend_from_env, rerank_min_budget_seconds_from_env
+from .temporal_hints import temporal_settings_from_env
 from .semantic import SemanticRuntime
 
 MAX_SEARCH_RESULT_TEXT_CHARS = 4096
@@ -234,6 +235,9 @@ class BrainStore:
         # a malformed RECALL_SEARCH_FUSION{,_ALPHAS} is a deployment error.
         self.fusion_mode = fusion_mode_from_env()
         self.fusion_alphas = fusion_alphas_from_env()
+        # H2-h: query-time temporal hints (RECALL_TEMPORAL_HINTS, _BOOST,
+        # _BOOST_LOOSE, _WINDOW_BUDGET_MS). Validated at startup.
+        self.temporal_hints = temporal_settings_from_env()
 
     def connect(self):
         if self._pool is None:

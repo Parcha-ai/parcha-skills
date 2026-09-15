@@ -1025,6 +1025,26 @@ per-arm candidate counts on every search, and each result carries content-free `
 (raw best score, arm rank, normalised value per arm) so the offline tuner in
 `recall/evals/fusion_tuning.py` can replay fusion without re-querying.
 
+A date phrase in the question is a soft temporal hint (H2-h), consulted only when the caller
+supplied neither `since` nor `until`. `recall_server/temporal_hints.py` recognises explicit
+dates and day ranges (`2026-05-03`, `May 2-4`, `5/3`), month names with an optional year and
+part (`in May`, `early May 2026`), relative phrases (`yesterday`, `last week`, `two weeks
+ago`), quarters (`Q2`, `second quarter of 2025`) and years with a preposition. Day-level
+hints are `exact`; everything wider, or hedged with `around`/`about`/`roughly`, is `loose`
+(a hedge also pads the window by three days). Documents whose
+`[first_occurred_at, last_occurred_at]` intersects the window have their fused score
+multiplied by `1 + RECALL_TEMPORAL_BOOST` (`exact`, default 0.5) or
+`1 + RECALL_TEMPORAL_BOOST_LOOSE` (default 0.25) before the reranker and before the collapse
+truncation, floored first at the pool's smallest positive fused score so a document at an
+arm's min-max floor still moves. A day-level hint (hedged or not) additionally runs the dense
+arm once more inside the window (`RECALL_TEMPORAL_WINDOW_BUDGET_MS`, default 150, sequential
+on the dense worker so no fourth pooled connection) and unions the pools, so a document at
+the bottom of the global dense pool is still guaranteed into the collapse. `RECALL_TEMPORAL_HINTS=off`
+disables all of it; queries without a hint are unchanged. Diagnostics:
+`temporal_hint={since,until,confidence,boost}`, `temporal_boosted`, `dense_window_status`,
+`dense_window_strategy`, `dense_window_candidates`, `dense_window_added`,
+`arm_elapsed_ms.dense_window`; boosted results carry `temporal_boost`.
+
 Semantic retrieval requires PostgreSQL with pgvector and one explicitly selected embedding
 profile. Cosine score distributions vary by model, so
 `RECALL_SEMANTIC_MINIMUM_SIMILARITY` is an explicit validated deployment setting in the

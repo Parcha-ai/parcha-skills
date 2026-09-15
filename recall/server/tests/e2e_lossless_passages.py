@@ -574,6 +574,34 @@ def main() -> None:
         assert hints["results"][0]["source_id"] == source
         assert hints["results"][0]["logical_document_id"].startswith("ldoc_")
         assert hints["results"][0]["matching_ranges"]
+        # H2-h: a date in the question is a soft boost plus, for an exact
+        # day, a windowed dense pass over the real SQL path; no filter.
+        hit_day = str(hints["results"][0]["first_occurred_at"])[:10]
+        dated = bound.passage_hints(
+            f"why did the gateway preserve tenant boundaries on {hit_day}?",
+            limit=5,
+        )
+        dated_diagnostics = dated["diagnostics"]
+        assert dated_diagnostics["temporal_hint"]["confidence"] == "exact", dated_diagnostics
+        assert dated_diagnostics["temporal_hint"]["since"].startswith(hit_day)
+        assert dated_diagnostics["temporal_hint"]["boost"] == 1.5
+        assert dated_diagnostics["dense_window_status"] == "ok", dated_diagnostics
+        assert dated_diagnostics["dense_window_strategy"] == "exact-scoped", dated_diagnostics
+        assert dated_diagnostics["dense_window_candidates"] >= 1, dated_diagnostics
+        assert "dense_window" in dated_diagnostics["arm_elapsed_ms"], dated_diagnostics
+        assert dated_diagnostics["temporal_boosted"] == 1, dated_diagnostics
+        assert len(dated["results"]) == 1
+        assert dated["results"][0]["logical_document_id"] == hints["results"][0]["logical_document_id"]
+        assert dated["results"][0]["temporal_boost"] == 1.5
+        elsewhere = bound.passage_hints(
+            "why did the gateway preserve tenant boundaries on 2001-01-01?",
+            limit=5,
+        )
+        assert elsewhere["diagnostics"]["temporal_hint"]["confidence"] == "exact"
+        assert elsewhere["diagnostics"]["temporal_boosted"] == 0, elsewhere["diagnostics"]
+        assert len(elsewhere["results"]) == 1  # still a boost, never a filter
+        assert "temporal_boost" not in elsewhere["results"][0]
+        temporal_window_ms = dated_diagnostics["arm_elapsed_ms"]["dense_window"]
         actor_hints = bound.passage_hints(
             "What did Alice work on?",
             filters={"person": actor_alias},
@@ -791,6 +819,9 @@ def main() -> None:
                 "sparse_tool_hits": counts["sparse_tool_hits"],
                 "completion_model_calls": 0,
                 "authorized_hint_documents": len(hints["results"]),
+                "temporal_hint": dated_diagnostics["temporal_hint"],
+                "temporal_window_ms": temporal_window_ms,
+                "temporal_window_added": dated_diagnostics["dense_window_added"],
                 "unauthorized_hint_documents": len(denied["results"]),
                 "actor_hint_documents": len(actor_hints["results"]),
                 "wrong_relation_documents": len(authored_hints["results"]),
