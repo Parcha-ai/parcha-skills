@@ -113,8 +113,21 @@ class SessionDriverTests(unittest.TestCase):
         self.slice.settings = self.settings
         self.slice.claim(self.fields("100.2"), "SLEEP a while")
         self.assertEqual(self.slice.run_once(), 1)
-        self.assertIn("I could not take this turn (timeout", self.sent[0][2])
+        self.assertIn("I stopped this turn: my session produced nothing for 1 minutes", self.sent[0][2])
         self.assertEqual(self.driver.idle_sweep(), 0, "the timed-out process was already dropped")
+
+    def test_a_working_turn_outlives_the_idle_timeout(self):
+        # The clock is idle time: a session that keeps emitting events is working, not wedged.
+        self.settings = active.ActiveSettings(**{**self.settings.__dict__, "native_timeout_seconds": 1})
+        self.slice.settings = self.settings
+        os.environ["FAKE_TICKS"] = "6"  # ~2.4 s of progress events before the result
+        try:
+            self.slice.claim(self.fields("100.2"), "long job")
+            self.assertEqual(self.slice.run_once(), 1)
+            self.assertNotIn("stopped this turn", self.sent[0][2])
+            self.assertIn("turn 1 of pid", self.sent[0][2])
+        finally:
+            os.environ.pop("FAKE_TICKS", None)
 
     def test_close_binding_terminates_the_process(self):
         self.slice.claim(self.fields("100.2"), "hello")
@@ -211,6 +224,20 @@ class SessionDriverTests(unittest.TestCase):
             self.assertNotIn("read the thread", self.sent[0][2])
         finally:
             CodexAppServer.QUIET_AFTER = previous
+            os.environ.pop("FAKE_CODEX_PREAMBLE", None)
+
+    def test_codex_turn_has_no_clock(self):
+        # 2026-09-15 01:18 C09NKJDMV7C: the 30-minute cap posted "could not take this turn"
+        # while Astra was still fixing the planner in the session. Codex ends the turn, not us.
+        self.settings = active.ActiveSettings(**{**self.settings.__dict__, "native_timeout_seconds": 1})
+        self.slice.settings = self.settings
+        os.environ["FAKE_CODEX_PREAMBLE"] = "2.5"  # silent work well past the old clock
+        try:
+            self.bind_codex()
+            self.slice.claim(self.codex_fields("500.2"), "fix it yourself")
+            self.assertEqual(self.slice.run_once(), 1)
+            self.assertIn("codex turn 1 of pid", self.sent[0][2])
+        finally:
             os.environ.pop("FAKE_CODEX_PREAMBLE", None)
 
     def test_codex_no_reply_is_silence(self):

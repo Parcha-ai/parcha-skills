@@ -433,7 +433,7 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(launcher, "systemd-user")
         self.assertEqual(argv[:6], ["/usr/bin/systemd-run", "--user", "--quiet", "--pipe", "--wait", "--collect"])
         self.assertIn("--property=WorkingDirectory=/work", argv)
-        self.assertIn("--property=RuntimeMaxSec=130", argv)
+        self.assertFalse(any("RuntimeMaxSec" in a for a in argv), "no service clock: the driver ends turns on silence")
         self.assertIn("--setenv=HOME=/h", argv)
         self.assertEqual(argv[-4:], ["--", "claude", "--print", "hi"])
         # The systemd-run client needs the bus; the harness gets only the allowlisted env.
