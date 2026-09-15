@@ -276,7 +276,7 @@ class WritersTest(unittest.TestCase):
 
 class MigrationTest(unittest.TestCase):
     def test_schema_066_creates_outbox_tombstones_and_shards(self) -> None:
-        self.assertEqual(SCHEMA_VERSION, 66)
+        self.assertEqual(SCHEMA_VERSION, 67)
         sql = (SCHEMA / "066_search_projection_outbox.sql").read_text()
         self.assertIn("CREATE TABLE IF NOT EXISTS search_projection_outbox", sql)
         self.assertIn("CREATE TABLE IF NOT EXISTS search_projection_tombstones", sql)

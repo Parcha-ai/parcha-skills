@@ -60,6 +60,20 @@ class FakeMultiQueryResponse:
         self.results = results
 
 
+class FakeNamespaceMetadata:
+    def __init__(self, *, approx_row_count: int, schema: dict[str, Any]) -> None:
+        self.approx_row_count = approx_row_count
+        self.approx_logical_bytes = 0
+        self.schema = schema
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "approx_row_count": self.approx_row_count,
+            "approx_logical_bytes": self.approx_logical_bytes,
+            "schema": self.schema,
+        }
+
+
 class FakeNamespace:
     def __init__(self, name: str) -> None:
         self.name = name
@@ -108,6 +122,13 @@ class FakeNamespace:
 
     def delete_all(self) -> None:
         self.rows.clear()
+
+    def metadata(self) -> "FakeNamespaceMetadata":
+        """Like ``turbopuffer.NamespaceMetadata``: ``approx_row_count`` and the schema."""
+
+        if not self._touched:
+            raise NotFoundError(f"namespace {self.name} was not found")
+        return FakeNamespaceMetadata(approx_row_count=len(self.rows), schema=dict(self.schema or {}))
 
     # -- query ---------------------------------------------------------------
     def query(self, **kwargs: Any) -> FakeQueryResponse:
@@ -257,6 +278,13 @@ class FakeTurbopuffer:
             return {}
         return dict(state.get(name) or {})
 
+    def _names(self) -> set[str]:
+        try:
+            with open(self.state_path, encoding="utf-8") as handle:
+                return set(json.load(handle))
+        except (OSError, ValueError):
+            return set()
+
     def _save(self, name: str, rows: dict[str, dict[str, Any]]) -> None:
         try:
             with open(self.state_path, encoding="utf-8") as handle:
@@ -285,6 +313,12 @@ class _PersistentNamespace(FakeNamespace):
     def _run(self, query: dict[str, Any]) -> list[dict[str, Any]]:
         self.rows = self._owner._load(self.name)
         return super()._run(query)
+
+    def metadata(self) -> FakeNamespaceMetadata:
+        if self.name not in self._owner._names():
+            raise NotFoundError(f"namespace {self.name} was not found")
+        self.rows = self._owner._load(self.name)
+        return FakeNamespaceMetadata(approx_row_count=len(self.rows), schema=dict(self.schema or {}))
 
 
 def factory(settings: Any = None) -> FakeTurbopuffer:

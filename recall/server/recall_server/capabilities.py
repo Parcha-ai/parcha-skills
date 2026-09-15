@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from . import SCHEMA_VERSION
+from . import MANDATORY_SCHEMA_VERSION, RETIRE_POSTGRES_PLANE_VERSION, SCHEMA_VERSION
 
 
 MIN_POSTGRES_MAJOR = 16
@@ -33,7 +33,6 @@ WITH expected_tables(name) AS (
         ('canonical_evidence_document_queue'),
         ('canonical_evidence_cleanup_queue'),
         ('canonical_passage_documents'), ('canonical_passages'),
-        ('canonical_passage_embeddings'),
         ('canonical_passage_projection_queue'),
         ('brain_organizations'), ('brain_spaces'), ('brain_memberships'),
         ('brain_access_grants'), ('canonical_source_grants'),
@@ -54,6 +53,8 @@ SELECT
         (SELECT array_agg(version ORDER BY version) FROM public.schema_migrations),
         ARRAY[]::integer[]
     ) AS migration_versions,
+    pg_catalog.to_regclass('public.canonical_passage_embeddings') IS NOT NULL
+        AS postgres_vector_plane_present,
     EXISTS (
         SELECT 1 FROM pg_catalog.pg_stat_ssl
         WHERE pid = pg_catalog.pg_backend_pid() AND ssl
@@ -65,13 +66,13 @@ SELECT
     role.rolbypassrls AS bypass_rls,
     pg_catalog.has_database_privilege(current_database(), 'CONNECT') AS can_connect,
     pg_catalog.has_schema_privilege(current_user, 'public', 'USAGE') AS can_use_schema,
-    (SELECT count(*) = 57 AND COALESCE(bool_and(
+    (SELECT count(*) = 56 AND COALESCE(bool_and(
         pg_catalog.to_regclass(pg_catalog.format('public.%I', name)) IS NOT NULL
         AND pg_catalog.has_table_privilege(
             current_user, pg_catalog.to_regclass(pg_catalog.format('public.%I', name)), 'SELECT'
         )
     ), false) FROM expected_tables) AS can_read_runtime_tables,
-    (SELECT count(*) = 56 AND COALESCE(bool_and(
+    (SELECT count(*) = 55 AND COALESCE(bool_and(
         pg_catalog.to_regclass(pg_catalog.format('public.%I', name)) IS NOT NULL
         AND pg_catalog.has_table_privilege(
             current_user, pg_catalog.to_regclass(pg_catalog.format('public.%I', name)),
@@ -167,7 +168,17 @@ def assess_snapshot(snapshot: dict[str, Any], profile: str = "production") -> di
         raise CapabilityError("extension_missing")
     if _version_tuple(vector_version) < MIN_VECTOR_VERSION:
         raise CapabilityError("extension_unsupported")
-    if list(snapshot.get("migration_versions") or []) != list(range(1, SCHEMA_VERSION + 1)):
+    versions = list(snapshot.get("migration_versions") or [])
+    # H3-e': 067 (retire the Postgres vector plane) is applied by hand once a
+    # tenant's turbopuffer namespace is drained; a database at 066 is current
+    # on the postgres plane, one at 067 is current on the turbopuffer plane.
+    # The embeddings table must agree with the recorded version either way.
+    mandatory = list(range(1, MANDATORY_SCHEMA_VERSION + 1))
+    retired = versions == list(range(1, RETIRE_POSTGRES_PLANE_VERSION + 1))
+    if versions != mandatory and not retired:
+        raise CapabilityError("schema_drift")
+    vector_plane_present = snapshot.get("postgres_vector_plane_present")
+    if vector_plane_present is not None and bool(vector_plane_present) == retired:
         raise CapabilityError("schema_drift")
     if profile == "production" and snapshot.get("ssl_in_use") is not True:
         raise CapabilityError("tls_not_active")
@@ -186,7 +197,8 @@ def assess_snapshot(snapshot: dict[str, Any], profile: str = "production") -> di
         "status": "ready" if profile == "production" else "fixture-ready",
         "profile": profile,
         "postgres_major": postgres_major,
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": SCHEMA_VERSION if retired else MANDATORY_SCHEMA_VERSION,
+        "postgres_vector_plane": "retired" if retired else "present",
         "extensions": {"vector": str(vector_version)},
         "role": "least-privilege-runtime",
         "tls": "verified" if profile == "production" else "fixture-only",
@@ -232,6 +244,7 @@ def probe_database(dsn: str, profile: str = "production") -> dict[str, Any]:
         "server_version_num": row["server_version_num"],
         "vector_version": row["vector_version"],
         "migration_versions": row["migration_versions"],
+        "postgres_vector_plane_present": row["postgres_vector_plane_present"],
         # Managed Postgres proxies can terminate verified client TLS before the
         # backend, so pg_stat_ssl may truthfully report false on the server-side
         # hop. libpq is authoritative for the connection Recall actually opened.

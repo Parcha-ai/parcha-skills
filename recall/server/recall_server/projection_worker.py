@@ -114,11 +114,15 @@ def run_projection_worker(
     With ``skip_embedding`` (H5-2) the embedding phase is left to the
     dedicated ``embedding-worker`` process: the cycle reports
     ``embedded=0 embed_elapsed_ms=0``, the idle check ignores embedding, and
-    every other phase is unchanged.
+    every other phase is unchanged. On the turbopuffer search plane (H3-e')
+    the phase is always skipped: turbopuffer embeds natively and the
+    Postgres embeddings table is retired.
     """
 
     if not 0.1 <= interval_seconds <= 300:
         raise ValueError("projection worker interval is invalid")
+    if getattr(getattr(passages, "store", None), "search_plane", "postgres") == "turbopuffer":
+        skip_embedding = True
     if (
         isinstance(parquet_every_cycles, bool)
         or not isinstance(parquet_every_cycles, int)
@@ -511,6 +515,26 @@ def run_embedding_worker(
     ):
         raise ValueError("embedding worker budget is invalid")
     validate_daily_cap(daily_cap)
+    if getattr(store, "search_plane", "postgres") == "turbopuffer":
+        # H3-e': nothing to embed from this process; the ledger and the
+        # embeddings table are retired by migration 067, so neither is read.
+        LOG.warning(
+            "embedding worker not applicable on the turbopuffer search plane "
+            "tenant=%s; suspend this service",
+            tenant_id,
+        )
+        return {
+            "status": "not-applicable",
+            "embedded": 0,
+            "pending": 0,
+            "lag": 0,
+            "embedded_24h": 0,
+            "cap": daily_cap,
+            "cap_remaining": daily_cap,
+            "embedding_error": 0,
+            "elapsed_ms": 0,
+            "plane": "turbopuffer",
+        }
 
     def elapsed_ms(started: float) -> int:
         return max(0, int(round((clock() - started) * 1000)))

@@ -24,7 +24,7 @@ from .canonical_retrieval import CanonicalRetrieval
 from .canonical_thinning import _compact_event_expression, thin_canonical_bodies
 from .capabilities import CapabilityError, probe_database
 from .control import ControlPlane, SecretBox
-from .db import BrainStore
+from .db import BrainStore, SearchPlaneSchemaError
 from .deployment import DeploymentManifestError, load_manifest, preview
 from .embedding_ledger import daily_cap_from_env
 from .embedding_worker import run_canonical_embedding_worker
@@ -63,6 +63,7 @@ from .mcp_conformance import (
 )
 from .rerank import build_rerank_runtime
 from .search_outbox import search_outbox_pending, seed_search_outbox
+from .search_plane_status import search_plane_status
 from .turbopuffer_plane import (
     TurbopufferConfigError,
     TurbopufferSettings,
@@ -1537,7 +1538,12 @@ def main() -> None:
     ap = argparse.ArgumentParser(prog="recall-server")
     ap.add_argument("--dsn", default=os.environ.get("RECALL_DATABASE_URL"))
     sub = ap.add_subparsers(dest="command", required=True)
-    sub.add_parser("migrate")
+    migrate = sub.add_parser("migrate")
+    migrate.add_argument(
+        "--retire-postgres-plane", action="store_true",
+        help="also apply migration 067 (drops the Postgres vector/tsvector "
+             "plane); refused unless RECALL_SEARCH_PLANE=turbopuffer (H3-e')",
+    )
     sub.add_parser("storage-footprint")
     sub.add_parser("storage-event-shape")
     sub.add_parser("storage-active-work")
@@ -1758,6 +1764,14 @@ def main() -> None:
     search_outbox_seed = sub.add_parser("search-outbox-seed")
     search_outbox_seed.add_argument("--tenant", required=True)
     search_outbox_seed.add_argument("--source")
+    search_plane_status_parser = sub.add_parser(
+        "search-plane-status",
+        help="content-free drain gate: live passages in Postgres vs the tenant "
+             "namespace's approx_row_count, outbox depth, shards, drift (H3-e')",
+    )
+    search_plane_status_parser.add_argument("--tenant", required=True)
+    search_plane_status_parser.add_argument("--target-tokens", type=int, default=1024)
+    search_plane_status_parser.add_argument("--overlap-tokens", type=int, default=128)
     projection_worker = sub.add_parser("projection-worker")
     projection_worker.add_argument("--tenant", required=True)
     projection_worker.add_argument("--target-tokens", type=int, default=1024)
@@ -2108,8 +2122,12 @@ def main() -> None:
         pool_max_size=pool_max_size,
     )
     if args.command == "migrate":
-        store.migrate()
-        print(json.dumps({"status": "ok", "schema_version": SCHEMA_VERSION}))
+        try:
+            result = store.migrate(retire_postgres_plane=args.retire_postgres_plane)
+        except SearchPlaneSchemaError as error:
+            print(json.dumps({"status": "error", "error": str(error)}, sort_keys=True), file=sys.stderr)
+            raise SystemExit(2) from None
+        print(json.dumps({**result, "current_schema_version": SCHEMA_VERSION}, sort_keys=True))
     elif args.command == "storage-footprint":
         print(json.dumps(_storage_footprint(store), sort_keys=True))
     elif args.command == "storage-event-shape":
@@ -2373,6 +2391,7 @@ def main() -> None:
                 tenant_id=args.tenant,
                 runtime=store.semantic_runtime,
                 price_per_mtoken=args.price_per_mtoken,
+                search_plane=store.search_plane,
             )
         print(json.dumps(result, sort_keys=True))
     elif args.command in {
@@ -2430,6 +2449,28 @@ def main() -> None:
                         max_batches=args.max_batches,
                     ),
                 },
+                sort_keys=True,
+            )
+        )
+    elif args.command == "search-plane-status":
+        # H3-e': the drain gate before migration 067. Counts only.
+        try:
+            search_settings = turbopuffer_settings_from_env(required=True)
+        except TurbopufferConfigError as error:
+            print(json.dumps({"status": "error", "error": str(error)}, sort_keys=True))
+            sys.exit(2)
+        print(
+            json.dumps(
+                search_plane_status(
+                    store,
+                    search_settings,
+                    tenant_id=args.tenant,
+                    policy_fingerprint=PassagePolicy(
+                        target_tokens=args.target_tokens,
+                        overlap_tokens=args.overlap_tokens,
+                    ).fingerprint,
+                    client=_search_plane_client(search_settings),
+                ),
                 sort_keys=True,
             )
         )
@@ -2542,6 +2583,23 @@ def main() -> None:
                 break
         print(json.dumps({**totals, "pending": pending, "status": str(cycle["status"])}, sort_keys=True))
     elif args.command == "embedding-worker":
+        if store.search_plane == "turbopuffer":
+            # H3-e': turbopuffer embeds natively; the Postgres embeddings
+            # table and ledger are retired. Exit so the service is suspended
+            # instead of polling tables that no longer exist.
+            print(
+                json.dumps(
+                    {
+                        "status": "not-applicable",
+                        "plane": "turbopuffer",
+                        "error": "embedding-worker is not applicable on the "
+                                 "turbopuffer search plane: suspend this "
+                                 "service (RECALL_SEARCH_PLANE=turbopuffer)",
+                    },
+                    sort_keys=True,
+                )
+            )
+            sys.exit(2)
         # embed_pending only touches the database and the embedding runtime:
         # this worker needs no evidence-archive credentials, so the projector
         # is built without a logical projection store.

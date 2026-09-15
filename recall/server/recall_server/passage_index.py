@@ -245,20 +245,45 @@ def document_context(
     return document_context_from_row(row)
 
 
+def postgres_vector_plane(store: Any) -> bool:
+    """True unless ``store`` reads the turbopuffer search plane (H3-e').
+
+    On the turbopuffer plane no process reads or writes
+    ``canonical_passage_embeddings`` or the embedding ledger: turbopuffer
+    embeds natively, and migration 067 drops the tables. Stores without the
+    attribute (unit-test fakes) are the postgres plane.
+    """
+
+    return getattr(store, "search_plane", "postgres") != "turbopuffer"
+
+
+NOT_APPLICABLE_COVERAGE: dict[str, Any] = {
+    "total": 0,
+    "covered": 0,
+    "coverage": 1.0,
+    "status": "not-applicable",
+    "plane": "turbopuffer",
+}
+
+
 def passage_contract_coverage(
     connection: Any,
     *,
     fingerprint: str,
     tenant_id: str | None = None,
+    search_plane: str = "postgres",
 ) -> dict[str, Any]:
     """Share of live passages whose vector carries ``fingerprint`` (v2 key).
 
     A passage is covered when its embedding row has the given runtime
     fingerprint and its content hash equals the passage's ``embed_sha256``.
     An empty table counts as fully covered: nothing would be lost by reading
-    the new contract.
+    the new contract. On the turbopuffer plane the question does not arise
+    and the embeddings table is never read.
     """
 
+    if search_plane == "turbopuffer":
+        return dict(NOT_APPLICABLE_COVERAGE)
     row = connection.execute(
         """SELECT count(*) AS total,
                   count(*) FILTER (
@@ -291,13 +316,15 @@ def passage_embed_plan(
     tenant_id: str,
     runtime: Any,
     price_per_mtoken: float = 0.0,
+    search_plane: str = "postgres",
 ) -> dict[str, Any]:
     """Content-free, read-only report of the v2 re-embed for one tenant.
 
     Counts live passages, headers present/missing, vectors already under the
     v2 and v1 fingerprints, the rows a v2 pass would embed, and a byte-based
     token estimate (headers still missing are budgeted at the header cap).
-    Nothing is written and no passage text leaves the database.
+    Nothing is written and no passage text leaves the database. On the
+    turbopuffer plane nothing is pending and nothing is read.
     """
 
     if (
@@ -308,6 +335,19 @@ def passage_embed_plan(
         or not 0 <= price_per_mtoken <= 1_000
     ):
         raise ValueError("passage embed plan scope is invalid")
+    if search_plane == "turbopuffer":
+        return {
+            "status": "not-applicable",
+            "read_only": True,
+            "tenant_id": tenant_id,
+            "plane": "turbopuffer",
+            "contract": "v2",
+            "runtime_configured": runtime is not None,
+            "needs_embedding": 0,
+            "estimated_tokens": 0,
+            "price_per_mtoken": float(price_per_mtoken),
+            "estimated_cost": 0.0,
+        }
     fingerprint_v2 = getattr(runtime, "passage_fingerprint_v2", None)
     fingerprint_v1 = getattr(runtime, "passage_fingerprint_v1", None)
     if runtime is not None and (fingerprint_v2 is None or fingerprint_v1 is None):
@@ -414,11 +454,17 @@ class CanonicalPassageProjector:
         ):
             bind(self._coverage_probe)
 
+    @property
+    def search_plane(self) -> str:
+        return "postgres" if postgres_vector_plane(self.store) else "turbopuffer"
+
     def _coverage_probe(self) -> float | None:
         runtime = getattr(self.store, "semantic_runtime", None)
         fingerprint = getattr(runtime, "passage_fingerprint_v2", None)
         if not isinstance(fingerprint, str) or not fingerprint:
             return None
+        if not postgres_vector_plane(self.store):
+            return NOT_APPLICABLE_COVERAGE["coverage"]
         with self.store.connect() as connection:
             return passage_contract_coverage(
                 connection,
@@ -437,6 +483,8 @@ class CanonicalPassageProjector:
         fingerprint = getattr(runtime, "passage_fingerprint_v2", None)
         if not isinstance(fingerprint, str) or not fingerprint:
             fingerprint = getattr(runtime, "passage_fingerprint", "")
+        if not postgres_vector_plane(self.store):
+            return dict(NOT_APPLICABLE_COVERAGE)
         with self.store.connect() as connection:
             return passage_contract_coverage(
                 connection,
@@ -836,7 +884,11 @@ class CanonicalPassageProjector:
                 #   6. COPY to_insert passages + actors into the freed
                 #      ordinals;
                 #   7. re-attach embeddings for to_insert by content hash.
-                if diff.to_insert:
+                # Steps 1 and 7 exist only on the postgres plane (H3-e'):
+                # turbopuffer embeds natively and migration 067 drops the
+                # embeddings table, so the turbopuffer plane never touches it.
+                vector_plane = postgres_vector_plane(self.store)
+                if diff.to_insert and vector_plane:
                     connection.execute(
                         """CREATE TEMP TABLE
                                recall_reusable_passage_embeddings
@@ -1022,6 +1074,7 @@ class CanonicalPassageProjector:
                                         link.actor_id,
                                         link.relation,
                                     ))
+                if diff.to_insert and vector_plane:
                     connection.execute(
                         """INSERT INTO canonical_passage_embeddings(
                                tenant_id,source_id,passage_id,model,
@@ -1624,6 +1677,15 @@ class CanonicalPassageProjector:
         """
 
         tenant_id = self._tenant(tenant_id)
+        if not postgres_vector_plane(self.store):
+            # H3-e': turbopuffer embeds ``embed_text`` natively on write; no
+            # passage is pending here and the embeddings table is not read.
+            return {
+                "status": "not-applicable",
+                "processed": 0,
+                "batches": 0,
+                "plane": "turbopuffer",
+            }
         runtime = self.store.semantic_runtime
         if runtime is None:
             return {"status": "disabled", "processed": 0, "batches": 0}

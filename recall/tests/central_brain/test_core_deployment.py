@@ -16,7 +16,7 @@ RECALL = Path(__file__).resolve().parents[2]
 SERVER = RECALL / "server"
 sys.path.insert(0, str(SERVER))
 
-from recall_server import SCHEMA_VERSION  # noqa: E402
+from recall_server import MANDATORY_SCHEMA_VERSION, SCHEMA_VERSION  # noqa: E402
 from recall_server.capabilities import (  # noqa: E402
     CAPABILITY_SQL,
     CapabilityError,
@@ -37,6 +37,7 @@ def healthy_snapshot() -> dict:
         "server_version_num": 170000,
         "vector_version": "0.8.1",
         "migration_versions": list(range(1, SCHEMA_VERSION + 1)),
+        "postgres_vector_plane_present": False,
         "ssl_in_use": True,
         "role": {
             "superuser": False,
@@ -153,9 +154,35 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
         self.assertEqual(result["role"], "least-privilege-runtime")
         self.assertNotIn("provider", result)
 
+    def test_snapshot_accepts_both_search_planes_and_rejects_a_torn_retirement(self) -> None:
+        # H3-e': 066 with the embeddings table is current on the postgres
+        # plane; 067 without it is current on the turbopuffer plane.
+        snapshot = healthy_snapshot()
+        snapshot["migration_versions"] = list(range(1, MANDATORY_SCHEMA_VERSION + 1))
+        snapshot["postgres_vector_plane_present"] = True
+        result = assess_snapshot(snapshot, profile="production")
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["schema_version"], MANDATORY_SCHEMA_VERSION)
+        self.assertEqual(result["postgres_vector_plane"], "present")
+        retired = assess_snapshot(healthy_snapshot(), profile="production")
+        self.assertEqual(retired["schema_version"], SCHEMA_VERSION)
+        self.assertEqual(retired["postgres_vector_plane"], "retired")
+        # 067 recorded but the table still there, or 066 with the table gone.
+        for versions, present in (
+            (list(range(1, SCHEMA_VERSION + 1)), True),
+            (list(range(1, MANDATORY_SCHEMA_VERSION + 1)), False),
+        ):
+            snapshot = healthy_snapshot()
+            snapshot["migration_versions"] = versions
+            snapshot["postgres_vector_plane_present"] = present
+            with self.subTest(versions=len(versions), present=present):
+                with self.assertRaises(CapabilityError) as raised:
+                    assess_snapshot(snapshot, profile="production")
+                self.assertEqual(raised.exception.code, "schema_drift")
+
     def test_snapshot_fails_closed_on_drift_privilege_extension_and_tls(self) -> None:
         failures = {
-            "schema_drift": ("migration_versions", list(range(1, SCHEMA_VERSION))),
+            "schema_drift": ("migration_versions", list(range(1, MANDATORY_SCHEMA_VERSION))),
             "extension_missing": ("vector_version", None),
             "extension_unsupported": ("vector_version", "0.7.4"),
             "tls_not_active": ("ssl_in_use", False),

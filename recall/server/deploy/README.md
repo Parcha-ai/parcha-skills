@@ -166,7 +166,7 @@ Environment (the worker never logs the key):
 | `RECALL_TPUF_EMBED_MODEL` / `RECALL_TPUF_EMBED_DIMS` | Native embedding model and dimensions, default `voyage/voyage-4` at 512. Changing either needs a full re-seed. |
 | `RECALL_TPUF_NAMESPACE_PREFIX` | Namespace prefix, default `recall`. |
 | `RECALL_TPUF_WRITE_BATCH_ROWS` | Rows per write call, default 200. |
-| `RECALL_SEARCH_PLANE` | `postgres` (default) or `turbopuffer`: which plane the read path queries. The writer runs whenever a key is configured, regardless of this value, so a namespace can be filled before the read path is switched. |
+| `RECALL_SEARCH_PLANE` | `postgres` (default) or `turbopuffer`: which plane the read path queries. The writer runs whenever a key is configured, regardless of this value, so a namespace can be filled before the read path is switched. On `turbopuffer` no process reads or writes the Postgres vector plane (see "Retire the Postgres vector plane"); once migration 067 is applied `postgres` refuses to start. |
 | `RECALL_TPUF_CLIENT_FACTORY` / `RECALL_TPUF_FAKE_STATE` | Test hooks only: `tests.central_brain.fake_turbopuffer:factory` swaps in the in-process fake, file-backed at the state path so a worker and a server share one fake plane. Never set in production. |
 
 Runbook, first deployment for a tenant:
@@ -203,8 +203,78 @@ python -m recall_server.cli search-plane-project --tenant tenant:company:example
   the production corpus takes roughly 8 hours regardless of `--max-months`. Incremental
   drains embed only the passages that changed.
 
+#### Retire the Postgres vector plane (H3-e')
+
+Once the read path runs on turbopuffer, the Postgres vector/tsvector plane is dead
+weight: `canonical_passage_embeddings` (halfvec + HNSW), `canonical_embedding_ledger`,
+and the `canonical_passages.search_vector` generated column with its GIN index (the
+largest remaining tsvector; `canonical_chunks.search_vector` stays because `show` and
+the legacy paths still read it). Migration `067_retire_postgres_vector_plane.sql` drops
+them. It is destructive, so `migrate` never applies it on its own:
+
+- `python -m recall_server.cli migrate` runs every file through 066 as before (all
+  idempotent) and reports `"deferred": [67]` on either plane. Once 067 is recorded the
+  files below it are skipped (041 and 063 reference the dropped objects), so the
+  delete-a-version-row-to-replay-a-repair trick ends with the retirement;
+  `*_concurrent.sql` companions still run every time.
+- `python -m recall_server.cli migrate --retire-postgres-plane` applies 067, and only from
+  a process with `RECALL_SEARCH_PLANE=turbopuffer` in its environment. From a postgres-plane
+  process it exits 2 with `refusing to apply migration 067 ...` and changes nothing.
+- After 067 every process must run with `RECALL_SEARCH_PLANE=turbopuffer`: a store started
+  with `RECALL_SEARCH_PLANE=postgres` (web, workers, `cli migrate`) refuses to open its pool
+  with `migration 067 retired the Postgres vector plane ...`. `capability-check` accepts a
+  database at 066 with the embeddings table (postgres plane) or at 067 without it
+  (turbopuffer plane), and reports `schema_drift` for the torn states in between.
+
+On the turbopuffer plane the writers already leave the retired objects alone, before and
+after 067: the differential passage commit neither captures nor re-attaches embeddings,
+`embed_pending`, `passage-embed-plan` and the contract coverage report
+`not-applicable` with nothing pending, the ledger counters read 0, `projection-worker`
+skips the embedding phase, and `embedding-worker` exits 2 with
+`embedding-worker is not applicable on the turbopuffer search plane: suspend this
+service`. `/metrics` exports `recall_passages_unembedded 0` and
+`recall_embedding_daily_total 0`, so the card's `freshness.projection_churn`,
+`freshness.embedding_lag` and `cost.storage` probes stay green without the table.
+
+Prerequisites, per tenant:
+
+1. The drain is complete. `search-plane-status` compares the live passages under the
+   current policy fingerprint with the namespace's `approx_row_count`; `drift` is the
+   difference and must be about 0 (turbopuffer's count is approximate), with
+   `outbox_pending` 0:
+
+   ```bash
+   RECALL_SEARCH_PLANE=turbopuffer python -m recall_server.cli search-plane-status \
+     --tenant tenant:company:example
+   # {"drift": 0, "namespace": "recall-...", "outbox_pending": 0, "passages": 812345, "policy_fingerprint": "...", "rows": 812345, "search_plane": "turbopuffer", "shards": 48, "status": "ok", "tenant_id": "tenant:company:example"}
+   ```
+
+2. The card is green on the turbopuffer plane for the nightly run (the read path flipped
+   with `RECALL_SEARCH_PLANE=turbopuffer`, accuracy and latency probes passing).
+3. The `embedding-worker` service is suspended (it exits on its own on the turbopuffer
+   plane, but suspend it so the platform stops restarting it).
+
+Then, from a shell with the turbopuffer plane configured:
+
+```bash
+RECALL_SEARCH_PLANE=turbopuffer python -m recall_server.cli migrate --retire-postgres-plane
+# {"applied": [67], "current_schema_version": 67, "deferred": [], "postgres_vector_plane": "retired", "schema_version": 67, "skipped": 66, "status": "ok"}
+```
+
+A second run reports `"applied": []` and `"skipped": 67`. Refresh runtime grants
+afterwards as after every migration.
+
+Rollback boundary: **none after 067**. Before 067, rolling back is one environment flip,
+`RECALL_SEARCH_PLANE=postgres` on every service (the Postgres arms, embeddings and
+ledger are all still there, and the embedding worker resumes where it stopped). After
+067 the vectors are gone; the turbopuffer namespace is the only search plane and is
+rebuilt, if ever needed, with `search-outbox-seed` plus a drain.
+
 The production database gate requires a standard PostgreSQL URL with
-`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 66,
+`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 67
+(migration 67 retires the Postgres vector plane and is applied by hand from the
+turbopuffer plane, see below; a database at 66 with the embeddings table is current on
+the postgres plane, one at 67 without it is current on the turbopuffer plane),
 pgvector 0.8.0 or newer, and a runtime role without superuser, database/role creation,
 replication, or RLS-bypass privilege:
 

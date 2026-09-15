@@ -796,6 +796,28 @@ class CanonicalPlane:
     ) -> dict[str, Any]:
         """Return content-free corpus and projection parity for one source."""
         self._validate_host_identity(tenant_id, principal_id, source_id)
+        # H3-e': the passage-embedding parity columns exist only on the
+        # postgres plane; on turbopuffer the table is retired and both read 0.
+        if getattr(self.store, "search_plane", "postgres") == "turbopuffer":
+            embedding_parity_sql = (
+                "0::bigint AS passage_embeddings,"
+                "0::bigint AS missing_passage_embeddings"
+            )
+            embedding_parity_params: tuple[str, ...] = ()
+        else:
+            embedding_parity_sql = """(SELECT count(*) FROM canonical_passage_embeddings
+                       WHERE tenant_id=%s AND source_id=%s) AS passage_embeddings,
+                     (SELECT count(*)
+                        FROM canonical_passages passage
+                        LEFT JOIN canonical_passage_embeddings embedding
+                          ON embedding.tenant_id=passage.tenant_id
+                         AND embedding.source_id=passage.source_id
+                         AND embedding.passage_id=passage.passage_id
+                         AND embedding.content_sha256=passage.text_sha256
+                       WHERE passage.tenant_id=%s AND passage.source_id=%s
+                         AND embedding.passage_id IS NULL)
+                       AS missing_passage_embeddings"""
+            embedding_parity_params = (tenant_id, source_id, tenant_id, source_id)
         with self.store.connect() as connection:
             owner = connection.execute(
                 """SELECT owner_principal_id
@@ -906,18 +928,7 @@ class CanonicalPlane:
                        AS passage_queue,
                      (SELECT count(*) FROM canonical_passages
                        WHERE tenant_id=%s AND source_id=%s) AS passages,
-                     (SELECT count(*) FROM canonical_passage_embeddings
-                       WHERE tenant_id=%s AND source_id=%s) AS passage_embeddings,
-                     (SELECT count(*)
-                        FROM canonical_passages passage
-                        LEFT JOIN canonical_passage_embeddings embedding
-                          ON embedding.tenant_id=passage.tenant_id
-                         AND embedding.source_id=passage.source_id
-                         AND embedding.passage_id=passage.passage_id
-                         AND embedding.content_sha256=passage.text_sha256
-                       WHERE passage.tenant_id=%s AND passage.source_id=%s
-                         AND embedding.passage_id IS NULL)
-                       AS missing_passage_embeddings""",
+                     """ + embedding_parity_sql + """""",
                 (
                     tenant_id,
                     source_id,
@@ -943,10 +954,7 @@ class CanonicalPlane:
                     source_id,
                     tenant_id,
                     source_id,
-                    tenant_id,
-                    source_id,
-                    tenant_id,
-                    source_id,
+                    *embedding_parity_params,
                 ),
             ).fetchone()
         return {

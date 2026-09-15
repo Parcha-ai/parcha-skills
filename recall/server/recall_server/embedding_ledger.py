@@ -48,9 +48,20 @@ def ledger_exists(connection: Any) -> bool:
     )
 
 
-def window_total(connection: Any, *, tenant_id: str | None = None) -> int:
-    """Passages embedded in the UTC day buckets that intersect the last 24 h."""
+def window_total(
+    connection: Any,
+    *,
+    tenant_id: str | None = None,
+    search_plane: str = "postgres",
+) -> int:
+    """Passages embedded in the UTC day buckets that intersect the last 24 h.
 
+    0 on the turbopuffer plane without a query: nothing embeds from this
+    process and migration 067 drops the ledger (H3-e').
+    """
+
+    if search_plane == "turbopuffer":
+        return 0
     scope = tenant_id or ""
     return int(
         connection.execute(
@@ -63,12 +74,21 @@ def window_total(connection: Any, *, tenant_id: str | None = None) -> int:
     )
 
 
-def record_embedded(connection: Any, *, tenant_id: str, embedded: int) -> None:
-    """Upsert one cycle's count into today's UTC bucket (no-op for zero)."""
+def record_embedded(
+    connection: Any,
+    *,
+    tenant_id: str,
+    embedded: int,
+    search_plane: str = "postgres",
+) -> None:
+    """Upsert one cycle's count into today's UTC bucket (no-op for zero).
+
+    A no-op on the turbopuffer plane: the ledger is gone after migration 067.
+    """
 
     if isinstance(embedded, bool) or not isinstance(embedded, int) or embedded < 0:
         raise ValueError("embedding ledger count is invalid")
-    if not tenant_id or embedded == 0:
+    if not tenant_id or embedded == 0 or search_plane == "turbopuffer":
         return
     connection.execute(
         """INSERT INTO canonical_embedding_ledger(tenant_id,day,embedded)
@@ -86,14 +106,18 @@ def count_unembedded_passages(
     passage_fingerprint: str,
     limit: int = UNEMBEDDED_COUNT_CAP,
     tenant_id: str | None = None,
+    search_plane: str = "postgres",
 ) -> int:
     """Passages without a vector for ``passage_fingerprint``, counted up to ``limit``.
 
     Shared by the ``/metrics`` gauge and the embedding worker's lag field so
     the embedding key (runtime fingerprint plus content hash) is defined in one
-    place. H2-a (contextual headers) changes that key; update it here.
+    place. H2-a (contextual headers) changes that key; update it here. 0 on
+    the turbopuffer plane without a query (H3-e').
     """
 
+    if search_plane == "turbopuffer":
+        return 0
     scope = tenant_id or ""
     return int(
         connection.execute(

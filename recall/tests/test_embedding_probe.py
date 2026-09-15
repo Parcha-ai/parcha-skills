@@ -56,6 +56,17 @@ class EmbeddingLagProbeTests(unittest.TestCase):
         self.assertTrue(gates["passages_unembedded"].passed)
         self.assertTrue(gates["cap_remaining"].passed)
 
+    def test_turbopuffer_plane_zero_gauges_stay_green(self):
+        # H3-e': the ledger is gone; the server exports 0 unembedded and 0
+        # embedded today, so the cap is untouched and both gates pass.
+        result, _ = self._run(_metrics_text(unembedded=0, total=0))
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.metrics["passages_unembedded"], 0)
+        self.assertEqual(result.metrics["cap_remaining"], 200000)
+        gates = {g.metric: g for g in result.gates}
+        self.assertTrue(gates["passages_unembedded"].passed)
+        self.assertTrue(gates["cap_remaining"].passed)
+
     def test_degrades_on_lag_above_the_gate(self):
         result, _ = self._run(_metrics_text(unembedded=5001))
         self.assertEqual(result.status, "degraded")
