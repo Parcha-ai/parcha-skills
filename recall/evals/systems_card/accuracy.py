@@ -67,6 +67,36 @@ def arm_scores_from_search(result: dict[str, Any]) -> list[dict[str, Any] | None
     return scores
 
 
+def rerank_evidence_from_search(result: dict[str, Any]) -> list[dict[str, Any] | None]:
+    """Per-candidate fused/rerank/blended scores, aligned with the candidates.
+
+    Content-free floats: ``fused`` (the convex fusion score the server calls
+    ``rank``), ``rerank`` (the cross-encoder score, absent when the row was
+    not reranked) and ``blended``. Lets the blend be replayed offline.
+    """
+
+    seen: set[tuple[str, str]] = set()
+    evidence: list[dict[str, Any] | None] = []
+    for hit in result.get("results", []):
+        ldoc = hit.get("logical_document_id")
+        source = hit.get("source_id")
+        if not isinstance(ldoc, str) or not isinstance(source, str) or not source:
+            continue
+        identity = (source, ldoc)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        entry = {
+            key: float(hit[name])
+            for key, name in (("fused", "rank"), ("rerank", "rerank_score"), ("blended", "blended_score"))
+            if isinstance(hit.get(name), (int, float)) and not isinstance(hit.get(name), bool)
+        }
+        evidence.append(entry or None)
+        if len(evidence) >= 100:
+            break
+    return evidence
+
+
 def candidates_from_search(result: dict[str, Any]) -> list[dict[str, Any]]:
     seen: set[tuple[str, str]] = set()
     candidates: list[dict[str, Any]] = []
@@ -125,6 +155,7 @@ class TruthBoundaryProbe:
 
         rows: list[dict[str, Any]] = []
         arm_scores: dict[str, list[dict[str, Any] | None]] = {}
+        rerank_evidence: dict[str, list[dict[str, Any] | None]] = {}
         fusion_diagnostics: dict[str, Any] | None = None
         rerank_model: str | None = None
         rerank_statuses: dict[str, int] = {}
@@ -139,6 +170,7 @@ class TruthBoundaryProbe:
             if outcome.ok and outcome.result:
                 candidates = candidates_from_search(outcome.result)
                 arm_scores[case["id"]] = arm_scores_from_search(outcome.result)
+                rerank_evidence[case["id"]] = rerank_evidence_from_search(outcome.result)
                 fusion = outcome.result.get("diagnostics", {}).get("fusion")
                 if fusion_diagnostics is None and isinstance(fusion, dict):
                     fusion_diagnostics = {
@@ -220,7 +252,11 @@ class TruthBoundaryProbe:
                 for row in rows:
                     # Rows keep the scorer's exact result schema plus the
                     # per-arm evidence the offline fusion tuner replays.
-                    saved = {**row, "arm_scores": arm_scores.get(row["id"], [])}
+                    saved = {
+                        **row,
+                        "arm_scores": arm_scores.get(row["id"], []),
+                        "rerank_evidence": rerank_evidence.get(row["id"], []),
+                    }
                     handle.write(json.dumps(saved, sort_keys=True) + "\n")
             result.notes.append(f"per-case rankings saved privately ({results_path.name})")
         return result
