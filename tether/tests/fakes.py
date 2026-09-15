@@ -65,7 +65,8 @@ def direct_launch(command, cwd, env, settings):
 
 
 def child_env(passthrough=()):
-    keys = ("PATH", "FAKE_LOG", "FAKE_PROMPTS", "FAKE_REPLY", "FAKE_CODEX_REPLY", "FAKE_CODEX_FAIL", "FAKE_CODEX_NO_COMPLETE", *passthrough)
+    keys = ("PATH", "FAKE_LOG", "FAKE_PROMPTS", "FAKE_REPLY", "FAKE_CODEX_REPLY", "FAKE_CODEX_FAIL", "FAKE_CODEX_NO_COMPLETE",
+            "FAKE_CODEX_PREAMBLE", *passthrough)
     return {k: os.environ[k] for k in keys if k in os.environ}
 
 
@@ -85,7 +86,7 @@ class Descriptor:
 FAKE_CODEX = textwrap.dedent(
     """\
     #!/usr/bin/env python3
-    import json, os, sys
+    import json, os, sys, time
     n = 0
     log = os.environ.get("FAKE_LOG")
     def out(o):
@@ -110,6 +111,12 @@ FAKE_CODEX = textwrap.dedent(
             if os.environ.get("FAKE_CODEX_FAIL"):
                 out({"method": "turn/completed", "params": {"threadId": tid, "turn": {"id": f"turn-{n}", "items": [], "status": "failed", "error": {"message": "model refused"}}}})
                 continue
+            if os.environ.get("FAKE_CODEX_PREAMBLE"):
+                # Codex narrates before it works: a commentary message, then a long silent tool call.
+                pre = {"type": "agentMessage", "id": f"pre-{n}", "text": "I'll read the thread first.", "phase": "commentary"}
+                out({"method": "item/completed", "params": {"threadId": tid, "turnId": f"turn-{n}", "item": pre}})
+                out({"method": "item/started", "params": {"threadId": tid, "turnId": f"turn-{n}", "item": {"type": "commandExecution", "id": f"cmd-{n}"}}})
+                time.sleep(float(os.environ["FAKE_CODEX_PREAMBLE"]))
             reply = os.environ.get("FAKE_CODEX_REPLY") or f"codex turn {n} of pid {os.getpid()}"
             item = {"type": "agentMessage", "id": f"msg-{n}", "text": reply, "phase": "final_answer"}
             out({"method": "item/completed", "params": {"threadId": tid, "turnId": f"turn-{n}", "item": item}})

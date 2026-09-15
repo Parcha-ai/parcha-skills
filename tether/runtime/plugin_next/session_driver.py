@@ -375,15 +375,17 @@ class CodexAppServer:
         self._call("turn/start", {"threadId": thread_id, "cwd": str(cwd), "approvalPolicy": approval,
                                   "input": [{"type": "text", "text": text}]}, 30)
         deadline = time.monotonic() + timeout
-        messages: list[str] = []          # agentMessage texts as items complete
-        last_message_at: float | None = None
+        messages: list[str] = []          # final-phase agentMessage texts as items complete
+        last_event_at = time.monotonic()  # any event on this thread: the turn is alive
         quiet_after = self.QUIET_AFTER
         while True:
             now = time.monotonic()
             if now >= deadline:
                 return {"text": "\n".join(messages), "status": "timeout", "error": "turn timed out"}
-            if messages and last_message_at is not None and now - last_message_at > quiet_after:
-                # Some providers never send turn/completed; the last agentMessage is the reply.
+            if messages and now - last_event_at > quiet_after:
+                # Some providers never send turn/completed: a final answer followed by silence
+                # is the reply. A preamble ("I'll read the thread...") is commentary, never
+                # counted, and any event (a command running, a delta) keeps the turn alive.
                 return {"text": "\n".join(messages), "status": "completed", "error": None}
             try:
                 event = self._events.get(timeout=min(deadline - now, 1.0))
@@ -395,11 +397,12 @@ class CodexAppServer:
             params = event.get("params") or {}
             if params.get("threadId") not in (None, thread_id):
                 continue
+            last_event_at = time.monotonic()
             if method == "item/completed":
                 item = params.get("item") or {}
-                if item.get("type") == "agentMessage" and (item.get("text") or "").strip():
+                if (item.get("type") == "agentMessage" and (item.get("text") or "").strip()
+                        and item.get("phase") in (None, "", "final_answer")):
                     messages.append(str(item["text"]))
-                    last_message_at = time.monotonic()
             elif method == "turn/completed":
                 turn = params.get("turn") or {}
                 items = [i for i in turn.get("items") or [] if i.get("type") == "agentMessage" and (i.get("text") or "").strip()]
