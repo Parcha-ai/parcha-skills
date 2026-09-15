@@ -2275,6 +2275,7 @@ class PassageHintRetrieval:
             "results": results,
             "diagnostics": {
                 "engine": "lossless-passages-v1",
+                "search_plane": getattr(self, "plane", "postgres"),
                 "fusion": {
                     "mode": fusion_mode,
                     "alphas": (

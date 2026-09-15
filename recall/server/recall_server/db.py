@@ -39,6 +39,7 @@ from .projectors import KIND_RE, SOURCE_ID_RE, advisory_lock_key, canonical_json
 from .ranking import DEFAULT_SEARCH_DEADLINE_MS, evidence_rank_components, should_run_partial
 from .rerank import RerankRuntime, rerank_blend_from_env, rerank_min_budget_seconds_from_env
 from .temporal_hints import temporal_settings_from_env
+from .turbopuffer_plane import build_client, search_plane_from_env, turbopuffer_settings_from_env
 from .semantic import SemanticRuntime
 
 MAX_SEARCH_RESULT_TEXT_CHARS = 4096
@@ -238,6 +239,17 @@ class BrainStore:
         # H2-h: query-time temporal hints (RECALL_TEMPORAL_HINTS, _BOOST,
         # _BOOST_LOOSE, _WINDOW_BUDGET_MS). Validated at startup.
         self.temporal_hints = temporal_settings_from_env()
+        # H3: search plane. ``turbopuffer`` answers the passage arms from one
+        # namespace per tenant (native embeddings, BM25); ``postgres`` is the
+        # halfvec/tsvector plane. The client is built once; tests inject a
+        # fake through ``turbopuffer_client``.
+        self.search_plane = search_plane_from_env()
+        self.turbopuffer = turbopuffer_settings_from_env(required=self.search_plane == "turbopuffer")
+        self.turbopuffer_client = (
+            build_client(self.turbopuffer)
+            if self.search_plane == "turbopuffer" and self.turbopuffer is not None
+            else None
+        )
 
     def connect(self):
         if self._pool is None:
