@@ -177,6 +177,12 @@ ALL_READ_TOOLS = (
                     },
                     "additionalProperties": False,
                 },
+                "snippet_chars": {
+                    "type": "integer",
+                    "minimum": 128,
+                    "maximum": 8192,
+                    "description": "Clip each matching-range snippet to this many characters (compact results for wide scans; omit for full snippets).",
+                },
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
@@ -816,7 +822,7 @@ def _call_tool(
         )
         return store.scope_documents(filters=filters, limit=limit, offset=offset)
     if name == "recall_search":
-        _reject_extra(arguments, frozenset({"query", "filters", "limit"}))
+        _reject_extra(arguments, frozenset({"query", "filters", "limit", "snippet_chars"}))
         query = _string(arguments.get("query"), "query")
         if len(query) > 8192:
             raise McpProtocolError(-32602, "query must be at most 8192 characters")
@@ -828,7 +834,14 @@ def _call_tool(
             minimum=1,
             maximum=50,
         )
-        return fit_search_result(store.search(query, filters, limit, authorized_source))
+        snippet_chars = (
+            _integer(arguments.get("snippet_chars"), "snippet_chars", default=0, minimum=128, maximum=8192)
+            if arguments.get("snippet_chars") is not None
+            else None
+        )
+        return fit_search_result(
+            clip_search_snippets(store.search(query, filters, limit, authorized_source), snippet_chars)
+        )
     if name == "recall_exec":
         _reject_extra(arguments, frozenset({"targets", "program", "timeout_seconds"}))
         logical_document_ids, document_aliases = _exec_targets(
@@ -1043,6 +1056,36 @@ MIN_SEARCH_SNIPPET_CHARS = 256
 
 def _encoded_result_size(value: dict) -> int:
     return len(json.dumps(_tool_result(value), default=str, sort_keys=True).encode())
+
+
+def clip_search_snippets(value: Any, snippet_chars: int | None) -> Any:
+    """Clip every matching-range snippet to ``snippet_chars`` (caller's choice).
+
+    A wide scan (limit 50) carries ~400 KB of snippets the caller may not
+    read; the accuracy probe and agents that only want ids ask for compact
+    results. Diagnostics record the applied ``snippet_chars``.
+    """
+
+    if snippet_chars is None or not isinstance(value, dict) or not isinstance(value.get("results"), list):
+        return value
+    results = []
+    for document in value["results"]:
+        if not isinstance(document, dict):
+            results.append(document)
+            continue
+        ranges = []
+        for item in document.get("matching_ranges", ()):
+            if isinstance(item, dict) and isinstance(item.get("text"), str) and len(item["text"]) > snippet_chars:
+                ranges.append({**item, "text": item["text"][:snippet_chars], "text_clipped": True})
+            else:
+                ranges.append(item)
+        results.append({**document, "matching_ranges": ranges})
+    diagnostics = value.get("diagnostics")
+    return {
+        **value,
+        "results": results,
+        "diagnostics": {**(diagnostics if isinstance(diagnostics, dict) else {}), "snippet_chars": snippet_chars},
+    }
 
 
 def fit_search_result(value: Any) -> Any:
