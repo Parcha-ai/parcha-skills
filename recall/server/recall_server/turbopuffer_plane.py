@@ -180,6 +180,9 @@ def namespace_schema(settings: TurbopufferSettings) -> dict[str, Any]:
                 "max_token_length": 64,
             },
         },
+        # The vector attribute is declared explicitly (f16 halves storage) and
+        # the embed config points at it; the SDK's embed config has no dtype.
+        EMBED_ATTRIBUTE: {"type": f"[{settings.embed_dims}]f16", "ann": True},
         EMBED_TEXT_ATTRIBUTE: {
             "type": "string",
             "filterable": False,
@@ -187,7 +190,6 @@ def namespace_schema(settings: TurbopufferSettings) -> dict[str, Any]:
                 "model": settings.embed_model,
                 "attribute": EMBED_ATTRIBUTE,
                 "dims": settings.embed_dims,
-                "dtype": "float16",
             },
         },
     }

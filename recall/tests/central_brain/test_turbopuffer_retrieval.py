@@ -64,7 +64,8 @@ class SettingsTests(unittest.TestCase):
     def test_schema_and_rows(self) -> None:
         schema = namespace_schema(SETTINGS)
         self.assertEqual(schema["text"]["full_text_search"]["stemming"], False)
-        self.assertEqual(schema["embed_text"]["embed"], {"model": "voyage/voyage-4", "attribute": "vector", "dims": 512, "dtype": "float16"})
+        self.assertEqual(schema["embed_text"]["embed"], {"model": "voyage/voyage-4", "attribute": "vector", "dims": 512})
+        self.assertEqual(schema["vector"], {"type": "[512]f16", "ann": True})
         self.assertFalse(schema["receipts"]["filterable"])
         row = passage_row(catalog_passage(1, "hello world", actors=[("author", "actor_" + "1" * 32)]))
         self.assertEqual(row["id"], "psg_" + "0" * 31 + "1")
@@ -127,6 +128,10 @@ class ArmTests(unittest.TestCase):
         common = dict(since=None, until=None, candidate_limit=40, actor_ids=None, actor_relations=None, deadline_at=time.monotonic() + 5)
         rows, status = retrieval._lexical_candidates("deploy migration lock", **common)
         self.assertEqual(status, "ok")
+        # BM25 scores arrive as $dist (as the live service does); the leg is ranked by them.
+        from recall_server.turbopuffer_retrieval import TurbopufferHintRetrieval as _T
+        scored = _T._scored([{"id": "psg_" + "1" * 32, "text": "x", "$dist": 0.9}, {"id": "psg_" + "2" * 32, "text": "y", "$dist": 2.5}])
+        self.assertEqual([r["score"] for r in scored], [2.5, 0.9])
         self.assertEqual(ns.queries[-1]["rank_by"], ("text", "BM25", "deploy migration lock"))
         self.assertEqual(retrieval.lexical_plan, {"terms": 3, "plane": "turbopuffer"})
         self.assertTrue(rows and rows[0]["score"] >= rows[-1]["score"])

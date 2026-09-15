@@ -283,8 +283,13 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
     def _scored(raw: list[Any]) -> list[dict[str, Any]]:
         rows = []
         for item in raw:
+            # The service reports the BM25 score under ``$dist`` (higher is
+            # better, unlike the ANN distance); older shapes used ``$score``.
+            value = _value(item, "$score")
+            if value is None:
+                value = _value(item, "$dist")
             try:
-                score = float(_value(item, "$score") or 0.0)
+                score = float(value or 0.0)
             except (TypeError, ValueError):
                 score = 0.0
             mapped = arm_row(item, score)
