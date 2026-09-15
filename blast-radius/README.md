@@ -52,3 +52,17 @@ In pi, invoke it with `/skill:blast-radius`.
 ```
 
 In Codex, use `$blast-radius`.
+
+## Provenance
+
+- Upstream: [cursor/plugins, pstack/skills/blast-radius](https://github.com/cursor/plugins/tree/main/pstack/skills/blast-radius),
+  author Lauren Tan, MIT. Vendored on 2026-09-15.
+- License: MIT. The upstream `LICENSE` file is included verbatim in this package directory.
+- Modifications made here:
+  - Added `license: MIT` to the SKILL.md frontmatter.
+  - Dropped the references to the upstream companion skills `how`, `why`, and `arena`, which
+    this collection does not ship. Reading the PR and commits for intent is stated directly,
+    and the wide-change step spawns parallel read-only reviewer subagents where the harness
+    has them instead of running an `arena`.
+  - Light wording edits in the writeup and proof sections. The process, the four-step
+    certainty ladder, and the output rules are unchanged.

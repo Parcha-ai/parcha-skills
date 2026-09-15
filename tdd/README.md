@@ -50,3 +50,22 @@ In pi, invoke it with `/skill:tdd`.
 ```
 
 In Codex, use `$tdd`.
+
+## Provenance
+
+- Upstream: [cursor/plugins, pstack/skills/tdd](https://github.com/cursor/plugins/tree/main/pstack/skills/tdd),
+  author Lauren Tan, MIT. Adapted on 2026-09-15.
+- License: MIT. The upstream `LICENSE` file is included verbatim in this package directory.
+- Modifications made here. The upstream skill is a bug-fix-only workflow (write the failing
+  regression test, fix, rerun) that runs only on explicit invocation. This package widens it
+  into a general red-green reference and keeps the upstream bug-fix path as one of its rules:
+  - The description triggers on any test-first request, and `disable-model-invocation` is
+    dropped so the skill auto-invokes on its own scope.
+  - Added the seams contract: list and confirm the public boundaries under test before writing
+    any test, one seam per cycle, one vertical slice per cycle.
+  - Added `references/tests.md` (good and bad tests, implementation-coupled and tautological
+    anti-patterns) and `references/mocking.md` (mock only at system boundaries).
+  - Added the `CONTEXT.md` and ADR vocabulary rule and the `agents/openai.yaml` Codex manifest.
+  - Kept from upstream: the regression test must fail for the intended reason before the fix,
+    never weaken an assertion to match a wrong implementation, and report the failing-before
+    and passing-after evidence.

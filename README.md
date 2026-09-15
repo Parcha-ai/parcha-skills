@@ -20,6 +20,8 @@ Our collection of portable Agent Skills for Claude Code, Codex, and pi.
 | [`before-after`](before-after/) | Paired base-versus-branch captures for a PR body, committed to a `pr-assets` branch in the same repository. | Shell scripts plus `gh` and git plumbing; capture uses the `@vercel/before-and-after` CLI or `agent-browser`. |
 | [`review-loop`](review-loop/) | Drives every reviewer thread on a GitHub PR (Greptile, Devin, humans) to zero unresolved in bounded iterations. | GitHub only, through the caller's authenticated `gh`; identical in all three harnesses. |
 | [`verify-release`](verify-release/) | Confirms the intended candidate is live in the target environment and the changed path works there, with live evidence. | Uses whatever deployment tooling and observability the repo already has; calls `autoqa` for matrix coverage. |
+| [`blast-radius`](blast-radius/) | [cursor/plugins, `pstack/skills/blast-radius`](https://github.com/cursor/plugins/tree/main/pstack/skills/blast-radius) | Lauren Tan | MIT |
+| [`tdd`](tdd/) | [cursor/plugins, `pstack/skills/tdd`](https://github.com/cursor/plugins/tree/main/pstack/skills/tdd), adapted from a bug-fix-only workflow into a general red-green reference | Lauren Tan | MIT |
 | [`unslop`](unslop/) | Cuts AI tells from anything a human will read. | Pure markdown; identical in all three harnesses. |
 
 The skill payloads are canonical `skills/<name>/SKILL.md` directories. Harness-specific
@@ -59,8 +61,7 @@ listing every change made here.
 | [`before-after`](before-after/) | [vercel-labs/before-and-after](https://github.com/vercel-labs/before-and-after), by way of [michaelshimeles/skills](https://github.com/michaelshimeles/skills) | James Clements | PolyForm Shield 1.0.0 |
 | [`review-loop`](review-loop/) | [greptileai/skills](https://github.com/greptileai/skills) (`greploop`, `greploop-apps`), by way of [michaelshimeles/skills](https://github.com/michaelshimeles/skills) | Greptile AI | MIT |
 
-`tdd`, `blast-radius`, and `verify-release` were written for this collection and carry the
-repository's MIT license. `before-after` is not MIT; its PolyForm Shield license applies to that
+`verify-release` was written for this collection and carries the repository's MIT license. `before-after` is not MIT; its PolyForm Shield license applies to that
 directory only.
 
 ## Instruction snippets

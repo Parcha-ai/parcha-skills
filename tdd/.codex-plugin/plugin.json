@@ -3,8 +3,8 @@
   "version": "0.1.0",
   "description": "Test-driven development at pre-agreed seams: red before green, one vertical slice per cycle, regression-first bug fixes.",
   "author": {
-    "name": "Parcha Labs",
-    "url": "https://github.com/Parcha-ai/parcha-skills"
+    "name": "Lauren Tan",
+    "url": "https://github.com/cursor/plugins/tree/main/pstack/skills/tdd"
   },
   "homepage": "https://github.com/Parcha-ai/parcha-skills/tree/main/tdd",
   "repository": "https://github.com/Parcha-ai/parcha-skills/tree/main/tdd",
