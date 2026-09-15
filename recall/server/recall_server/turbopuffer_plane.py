@@ -47,6 +47,7 @@ class TurbopufferSettings:
     write_batch_rows: int = 32
     query_timeout_seconds: float = 8.0
     tokens_per_minute: int = 1_000_000
+    write_concurrency: int = 4
 
     def namespace(self, tenant_id: str) -> str:
         digest = hashlib.sha256(tenant_id.encode()).hexdigest()[:20]
@@ -97,9 +98,10 @@ def turbopuffer_settings_from_env(*, required: bool = False) -> TurbopufferSetti
         batch = int(os.environ.get("RECALL_TPUF_WRITE_BATCH_ROWS", "32"))
         timeout = float(os.environ.get("RECALL_TPUF_QUERY_TIMEOUT_SECONDS", "8"))
         tokens_per_minute = int(os.environ.get("RECALL_TPUF_TOKENS_PER_MINUTE", "1000000"))
+        write_concurrency = int(os.environ.get("RECALL_TPUF_WRITE_CONCURRENCY", "4"))
     except ValueError as error:
         raise TurbopufferConfigError("turbopuffer numeric settings are invalid") from error
-    if not 64 <= dims <= 4096 or not 1 <= batch <= 5000 or not 0.5 <= timeout <= 60 or not 0 <= tokens_per_minute <= 100_000_000:
+    if not 64 <= dims <= 4096 or not 1 <= batch <= 5000 or not 0.5 <= timeout <= 60 or not 0 <= tokens_per_minute <= 100_000_000 or not 1 <= write_concurrency <= 16:
         raise TurbopufferConfigError("turbopuffer numeric settings are out of range")
     settings = TurbopufferSettings(
         api_key=key,
@@ -110,6 +112,7 @@ def turbopuffer_settings_from_env(*, required: bool = False) -> TurbopufferSetti
         write_batch_rows=batch,
         query_timeout_seconds=timeout,
         tokens_per_minute=tokens_per_minute,
+        write_concurrency=write_concurrency,
     )
     settings.namespace("tenant:probe")  # validates the prefix
     return settings
