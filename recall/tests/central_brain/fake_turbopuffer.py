@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from typing import Any
 
 
@@ -74,6 +75,9 @@ class FakeNamespaceMetadata:
         }
 
 
+_FAKE_LOCK = threading.RLock()
+
+
 class FakeNamespace:
     def __init__(self, name: str) -> None:
         self.name = name
@@ -96,6 +100,11 @@ class FakeNamespace:
 
     # -- write ---------------------------------------------------------------
     def write(self, **kwargs: Any) -> dict[str, Any]:
+        # Concurrent batch writers (H3 drain) hit one namespace from threads.
+        with _FAKE_LOCK:
+            return self._write_locked(**kwargs)
+
+    def _write_locked(self, **kwargs: Any) -> dict[str, Any]:
         if self.fail_writes is not None:
             raise self.fail_writes
         upserts = list(kwargs.get("upsert_rows") or ())
@@ -304,15 +313,17 @@ class _PersistentNamespace(FakeNamespace):
         self._owner = owner
 
     def write(self, **kwargs: Any) -> dict[str, Any]:
-        self.rows = self._owner._load(self.name)
-        self._touched = self._touched or bool(self.rows)
-        result = super().write(**kwargs)
-        self._owner._save(self.name, self.rows)
-        return result
+        with _FAKE_LOCK:
+            self.rows = self._owner._load(self.name)
+            self._touched = self._touched or bool(self.rows)
+            result = self._write_locked(**kwargs)
+            self._owner._save(self.name, self.rows)
+            return result
 
     def _run(self, query: dict[str, Any]) -> list[dict[str, Any]]:
-        self.rows = self._owner._load(self.name)
-        return super()._run(query)
+        with _FAKE_LOCK:
+            self.rows = self._owner._load(self.name)
+            return super()._run(query)
 
     def metadata(self) -> FakeNamespaceMetadata:
         if self.name not in self._owner._names():
