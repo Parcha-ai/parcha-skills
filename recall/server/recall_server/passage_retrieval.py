@@ -2022,9 +2022,50 @@ class PassageHintRetrieval:
             })
             return rows, status, strategy, scope_passages
 
+        def lexical_arms(text: str, **arguments: Any) -> tuple[list[dict[str, Any]], str]:
+            # H2-m: the clauses of a compound question also run the lexical
+            # arm (their content words under the min-should-match plan);
+            # rows join the lexical leg rank-aligned, as the dense clause
+            # rows do, so a passage that answers one part reaches the
+            # collapse through whichever arm can see it.
+            outcome = self._lexical_candidates(text, **arguments)
+            rows, status = outcome
+            if status != "ok" or not query_clauses_enabled(self.store):
+                return outcome
+            clauses = query_clauses(query)
+            if not clauses:
+                return outcome
+            clause_deadline = min(
+                deadline_at, time.monotonic() + QUERY_CLAUSE_BUDGET_SECONDS,
+            )
+            added_total = 0
+            statuses: list[str] = []
+            clause_started = time.monotonic()
+            try:
+                for clause in clauses:
+                    clause_query = " ".join(_content_words(clause))
+                    if not clause_query or time.monotonic() >= clause_deadline:
+                        statuses.append("skipped-budget")
+                        continue
+                    clause_rows, clause_status = self._lexical_candidates(
+                        clause_query, **{**arguments, "deadline_at": clause_deadline},
+                    )
+                    statuses.append(clause_status)
+                    rows, added = merge_dense_pools(rows, clause_rows, align_by_rank=True)
+                    added_total += added
+            finally:
+                arm_elapsed_ms["lexical_clauses"] = round(
+                    (time.monotonic() - clause_started) * 1000, 3
+                )
+            window_diagnostics.update({
+                "lexical_clause_statuses": statuses,
+                "lexical_clause_added": added_total,
+            })
+            return rows, status
+
         with ThreadPoolExecutor(max_workers=3) as executor:
             lexical_future = executor.submit(
-                timed_arm, "passage_lexical", self._lexical_candidates, lexical_query,
+                timed_arm, "passage_lexical", lexical_arms, lexical_query,
             )
             sparse_future = executor.submit(
                 timed_arm, "sparse_exact",

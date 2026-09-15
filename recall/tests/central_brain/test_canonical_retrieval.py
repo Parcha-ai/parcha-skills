@@ -2709,6 +2709,7 @@ class QueryClauseTests(unittest.TestCase):
             store, tenant_id="tenant:test", sources=["codex:linux:test"], policy_fingerprint="fp-policy",
         )
         calls: list[str] = []
+        lexical_calls: list[str] = []
 
         def dense(query, vector=None, **kwargs):
             calls.append(query)
@@ -2718,25 +2719,46 @@ class QueryClauseTests(unittest.TestCase):
             # a clause: the second part surfaces a document the whole question missed
             return [candidate("z", "dense", 0.95), candidate("a", "dense", 0.7)], "ok", "prose-pool", 10
 
+        def lexical(query, **kwargs):
+            lexical_calls.append(query)
+            # only the clause's content-word query finds this document
+            if "customers bring" in query and "internal" not in query:
+                return [candidate("l", "passage-lexical", 0.05)], "ok"
+            return [], "ok"
+
         retrieval._dense_candidates = dense
         retrieval._embed_query = lambda text: [0.0]
-        retrieval._lexical_candidates = lambda query, **kwargs: ([], "ok")
+        retrieval._lexical_candidates = lexical
         retrieval._sparse_candidates = lambda query, original_query=None, **kwargs: ([], "skipped-prose-query")
         question = ("How did our expert/tool system evolve from internal Grep experts and skill "
                     "tables to letting customers bring their own connections into Grep?")
         response = retrieval.search(question, lexical_query="expert tool evolve", since=None, until=None, limit=10)
         self.assertEqual(len(calls), 3)
-        # z (clause rank 1) takes the global rank-1 score and ties break on document id.
-        self.assertEqual([row["logical_document_id"][5:].rstrip("0") for row in response["results"]], ["z", "a", "b"])
-        self.assertEqual(response["diagnostics"]["dense_clauses"], 2)
-        self.assertEqual(response["diagnostics"]["dense_clause_added"], 1)
-        self.assertIn("dense_clauses", response["diagnostics"]["arm_elapsed_ms"])
-        # Disabled: a single global pass, no clause diagnostics.
+        # The lexical arm ran for the question and once per clause (content words only).
+        self.assertEqual(lexical_calls[0], "expert tool evolve")
+        self.assertEqual(len(lexical_calls), 3)
+        self.assertNotIn("how", lexical_calls[1].split())
+        order = [row["logical_document_id"][5:].rstrip("0") for row in response["results"]]
+        # z (clause rank 1) takes the global rank-1 score and ties break on document id;
+        # l arrives through the lexical clause pass (the test store fuses with RRF, where
+        # the lexical leg outweighs dense, so its position is not asserted).
+        self.assertEqual([doc for doc in order if doc != "l"], ["z", "a", "b"])
+        self.assertIn("l", order)
+        diagnostics = response["diagnostics"]
+        self.assertEqual(diagnostics["dense_clauses"], 2)
+        self.assertEqual(diagnostics["dense_clause_added"], 1)
+        self.assertEqual(diagnostics["lexical_clause_added"], 1)
+        self.assertEqual(diagnostics["lexical_clause_statuses"], ["ok", "ok"])
+        self.assertIn("dense_clauses", diagnostics["arm_elapsed_ms"])
+        self.assertIn("lexical_clauses", diagnostics["arm_elapsed_ms"])
+        # Disabled: a single global pass per arm, no clause diagnostics.
         store.query_clauses = False
         calls.clear()
+        lexical_calls.clear()
         response = retrieval.search(question, lexical_query="expert tool evolve", since=None, until=None, limit=10)
-        self.assertEqual(len(calls), 1)
+        self.assertEqual((len(calls), len(lexical_calls)), (1, 1))
         self.assertNotIn("dense_clauses", response["diagnostics"])
+        self.assertNotIn("lexical_clause_added", response["diagnostics"])
 
 
 class RankAlignedUnionTests(unittest.TestCase):
