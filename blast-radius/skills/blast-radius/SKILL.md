@@ -25,7 +25,8 @@ For each fact the change's safety depends on, get it as far down this list as is
 4. You ran it. A script or test that calls the real code and fails loud if you're wrong.
 5. You reproduced it in the running app.
 
-Any safety fact you can't get to step 4, say so out loud. Don't write it up as settled. Step 4 is usually one small script that imports the same library the app ships and calls the exact function you're worried about.
+Any safety fact you can't get to step 4, say so. Existing tests, parity checks, and contract
+checks count when they run the real code and fail if the safety fact is wrong.
 
 ## Steps
 
@@ -33,7 +34,10 @@ Any safety fact you can't get to step 4, say so out loud. Don't write it up as s
 2. Find the one fact it's safe because of. Most changes that look scary are safe because of a single fact, like "this call only drops already-dead cache entries and does nothing else". Find that fact. If it holds, most of the scary cases die at once. Spend your time here, not on a long list of maybes.
 3. Look where grep stops. Read the source of the library you call, and check its pinned version and any local patch. Work out when things run: microtasks, unmount and teardown, Solid versus React. Follow what a symbol search misses: the JSON an API returns, a DB column, a wire format, another language reading the same bytes, a feature flag, code three hops downstream.
 4. Be honest about each risk. Give it a real chance of happening and a real cost if it does. Keep the risks you confirmed; list the ones you checked and cleared separately. Cite a real `file:line`, a search that finds nothing is still an answer, and never make up a caller or an API.
-5. Prove the one fact. Write a script or test that runs the real code, run it, and paste what happened. If you can't prove it cheaply, mark it unproven. Don't round up.
+5. Prove the one fact. Run the smallest existing check that proves it. For move-only work,
+   normalized-body or AST parity plus route or contract proof is enough. Do not add a separate
+   script or long report when those checks already prove the fact. If you can't prove it
+   cheaply, mark it unproven. Don't round up.
 6. For a big or wide change, spawn several parallel read-only reviewer subagents (the way the `interrogate` skill does), ask each the same question, and merge the answers. Independent runs catch different real bugs.
 
 ## What to hand back

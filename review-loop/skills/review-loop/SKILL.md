@@ -22,6 +22,7 @@ does not merge, and it does not mint credentials.
 |---|---|---|
 | Repository (`owner/repo`) | no | The `origin` remote of the current checkout |
 | PR number | no | The PR for the current branch (`gh pr view`) |
+| Target (`open-for-review`, `review-clean`, or `merge-ready`) | no | `review-clean` |
 | Trigger comment text | no | `@greptile-apps review` |
 | `--max-iterations N` | no | 3 |
 | Gate command | no | None. The caller or the repository supplies the command that runs tests and lint (for example the repo's `make check`); the skill only says where in the loop it runs |
@@ -35,23 +36,28 @@ never mints, reads, or stores tokens. If `gh auth status` fails, stop and report
 Repeat at most `--max-iterations` times; the default is 3, and a caller raises it only for a
 stated reason. Each iteration:
 
-1. Sync with the base branch if the caller supplied a sync policy. Run the gate command. A
-   red gate stops the iteration; fix the gate before touching review comments.
+1. Sync with the base branch if the caller supplied a sync policy. Run the gate command when
+   the head changed or no exact-head result exists. Reuse valid exact-head evidence. A red
+   gate stops the iteration; fix the gate before touching review comments.
 2. Fetch every open thread. See "Fetching everything". Do not filter to one reviewer.
 3. Triage by content, not by author. For each thread decide: actionable (a code change is
    needed), informational (no change, reply explains why), or false positive (reply explains
-   why). Record the decision.
+   why). Record the decision. A reply that proves inherited behavior or base parity without
+   a code push keeps prior exact-head evidence valid. Do not rerun gates or restart proof and
+   description work.
 4. Fix every actionable item in one pass. Read the file at the cited line, understand the
    comment in context, make the change.
-5. Run the gate command again. Do not push a red gate.
-6. Commit and push. Commit message names the iteration, for example
+5. If code changed, run the gate command again. Do not push a red gate.
+6. If code changed, commit and push. Commit message names the iteration, for example
    `Address review feedback (review-loop iteration 2)`.
 7. Reply and resolve. See "Human threads" and "Bot threads". A reply goes on the thread that
    raised the point, not in a new top-level comment.
-8. Re-request review once per push. See "Greptile specifics" and "Devin specifics". Wait for
-   the results with a bounded poll.
-9. Check the exit criterion. Zero unresolved threads across every reviewer, and, when Greptile
-   is installed, a 5/5 score in its most recently updated summary. If met, stop and report.
+8. Re-request review once per push. A reply without a push does not require another request.
+   See "Greptile specifics" and "Devin specifics". Wait for the results with a bounded poll.
+9. Check the target. For `review-clean` or `merge-ready`, require zero unresolved threads
+   across every reviewer and, when Greptile is installed, a 5/5 score from its latest summary.
+   For `open-for-review`, require a non-draft PR and focused proof. Automated review may
+   remain pending.
 
 If the cap is reached with threads still open, stop and report them; do not start another
 iteration.
@@ -135,7 +141,8 @@ through GraphQL, never assume a reply resolved anything.
 - Carry forward the items under "Prompt to fix all with AI" in the Greptile summary comment,
   even when the inline comment endpoint returns zero unresolved comments. They count as open
   until fixed or answered.
-- Exit criterion for Greptile: `5/5` and zero unresolved Greptile threads.
+- For `review-clean` or `merge-ready`, Greptile requires `5/5` and zero unresolved
+  Greptile threads.
 
 ## Devin specifics
 
