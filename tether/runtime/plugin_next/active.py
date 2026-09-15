@@ -868,11 +868,9 @@ class ActiveSlice:
     def op_notify(self, request: dict[str, Any]) -> dict[str, Any]:
         """Post a root message and bind the calling session to its thread.
 
-        A Codex session is never bound: Codex allows one writer per thread and the
-        session that posted is open in a terminal or the ChatGPT app, so a Slack reply
-        could never reach it (2026-09-14: seven failures in five hours). The thread is
-        handed to the gateway's own agent instead, with a note saying where it came from
-        (cwd, transcript on this box) so it can continue the work as the colleague it is.
+        Codex turns run on the machine's app-server daemon (the session the ChatGPT app
+        shows); a thread open in a terminal is handed to the gateway's agent at claim time
+        (see codex_writer_holder), never left failing (2026-09-14: seven failures in five hours).
         """
         text = str(request.get("text") or "").strip()
         file = self._file(request)

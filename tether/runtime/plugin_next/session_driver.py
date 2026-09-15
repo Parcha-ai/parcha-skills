@@ -153,7 +153,7 @@ def ws_frame(data: bytes, *, mask: bool, opcode: int = 0x1) -> bytes:
 
 
 def ws_read_frame(sock: socket.socket) -> tuple[int, bytes] | None:
-    """One frame as (opcode, payload); None when the peer closed."""
+    """One frame as (opcode, payload); None when the peer closed. See ws_read_message for fragments."""
     def exact(n: int) -> bytes:
         buf = b""
         while len(buf) < n:
@@ -175,6 +175,68 @@ def ws_read_frame(sock: socket.socket) -> tuple[int, bytes] | None:
         if masked:
             payload = bytes(b ^ key[i % 4] for i, b in enumerate(payload))
         return opcode, payload
+    except (OSError, ConnectionError):
+        return None
+
+
+class WsReader:
+    """Reassembles one WebSocket message at a time (FIN=0 ... opcode 0 FIN=1).
+
+    Control frames (ping/pong/close) may interleave with fragments; they are returned on
+    their own and the partial message survives across calls.
+    """
+
+    def __init__(self, sock: socket.socket):
+        self.sock = sock
+        self._opcode: int | None = None
+        self._parts: list[bytes] = []
+
+    def read(self) -> tuple[int, bytes] | None:
+        """One complete message or control frame as (opcode, payload); None when closed."""
+        while True:
+            frame = _ws_read_frame_fin(self.sock)
+            if frame is None:
+                return None
+            fin, op, payload = frame
+            if op >= 0x8:
+                return op, payload
+            if op != 0x0:
+                self._opcode, self._parts = op, [payload]
+            else:
+                self._parts.append(payload)
+            if fin:
+                opcode, parts = (self._opcode if self._opcode is not None else 0x1), self._parts
+                self._opcode, self._parts = None, []
+                return opcode, b"".join(parts)
+
+
+def ws_read_message(sock: socket.socket) -> tuple[int, bytes] | None:
+    """One complete message from a fresh reader (tests and one-off probes)."""
+    return WsReader(sock).read()
+
+
+def _ws_read_frame_fin(sock: socket.socket) -> tuple[bool, int, bytes] | None:
+    def exact(n: int) -> bytes:
+        buf = b""
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("closed")
+            buf += chunk
+        return buf
+    try:
+        head = exact(2)
+        fin, opcode, n = bool(head[0] & 0x80), head[0] & 0x0F, head[1] & 0x7F
+        masked = bool(head[1] & 0x80)
+        if n == 126:
+            n = struct.unpack(">H", exact(2))[0]
+        elif n == 127:
+            n = struct.unpack(">Q", exact(8))[0]
+        key = exact(4) if masked else b""
+        payload = exact(n)
+        if masked:
+            payload = bytes(b ^ key[i % 4] for i, b in enumerate(payload))
+        return fin, opcode, payload
     except (OSError, ConnectionError):
         return None
 
@@ -251,8 +313,9 @@ class _DaemonTransport:
         self.kind = "daemon"
 
     def lines(self):
+        reader = WsReader(self.sock)
         while self._open:
-            frame = ws_read_frame(self.sock)
+            frame = reader.read()
             if frame is None:
                 break
             opcode, payload = frame

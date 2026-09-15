@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import struct
 import sys
 import tempfile
 import unittest
@@ -273,3 +274,27 @@ class CodexDaemonTests(SessionDriverTests):
             self.assertTrue(self.driver.codex_pids())
         finally:
             pass
+
+
+class WebSocketFramingTests(unittest.TestCase):
+    def test_fragmented_text_message_is_reassembled(self):
+        import socket
+        from runtime.plugin_next.session_driver import WsReader
+        a, b = socket.socketpair()
+        reader = WsReader(b)
+        try:
+            body = b'{"jsonrpc":"2.0","method":"turn/completed","params":{"x":"' + b"y" * 70000 + b'"}}'
+            first, rest = body[:1000], body[1000:]
+            # FIN=0 text frame, then FIN=0 continuation, then FIN=1 continuation, with a ping in between.
+            a.sendall(bytes([0x01, 126]) + struct.pack(">H", len(first)) + first)
+            a.sendall(bytes([0x89, 0]))  # ping
+            a.sendall(bytes([0x00, 126]) + struct.pack(">H", 100) + rest[:100])
+            a.sendall(bytes([0x80, 127]) + struct.pack(">Q", len(rest) - 100) + rest[100:])
+            self.assertEqual(reader.read(), (0x9, b""))
+            got = reader.read()
+            self.assertEqual(got[0], 0x1)
+            self.assertTrue(got[1] == body, f"reassembled {len(got[1])} bytes, expected {len(body)}")
+            a.close()
+            self.assertIsNone(reader.read())
+        finally:
+            b.close()
