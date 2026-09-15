@@ -2095,6 +2095,9 @@ class SearchArmCostTests(unittest.TestCase):
             )
 
         twenty, fifty = issued(20), issued(50)
+        # The lexical arm reads pg_stats once per store (cached); drop it.
+        twenty = [item for item in twenty if "pg_stats" not in item[0]]
+        fifty = [item for item in fifty if "pg_stats" not in item[0]]
         self.assertEqual(twenty, fifty)
         self.assertTrue(any(400 in ints and 800 in ints for _sql, ints in fifty))
 
@@ -2301,7 +2304,11 @@ class RerankWiringTests(unittest.TestCase):
                 time.sleep(self.sleep)
             if self.error:
                 raise RerankUnavailable(self.error)
-            scored = [(index, self.scores.get(doc, 0.0)) for index, doc in enumerate(documents)]
+            # Documents arrive as "<context line>\n\n<text window>"; score by the text.
+            scored = [
+                (index, self.scores.get(doc.rsplit("\n\n", 1)[-1], 0.0))
+                for index, doc in enumerate(documents)
+            ]
             scored.sort(key=lambda item: (-item[1], item[0]))
             return scored
 
@@ -2372,7 +2379,9 @@ class RerankWiringTests(unittest.TestCase):
         # One passage per document in fused order; raw text_redacted, not the
         # bounded snippet. ``c`` and ``a`` reach the pool under a passage id
         # (dense) and a receipt (lexical) with the same text: sent once.
-        self.assertEqual(call["documents"], ["c", "e", "a", "b", "d"])
+        self.assertEqual([doc.rsplit("\n\n", 1)[-1] for doc in call["documents"]], ["c", "e", "a", "b", "d"])
+        # Each document carries its context line (source, first day) ahead of the text.
+        self.assertTrue(all(doc.startswith("source: ") for doc in call["documents"]), call["documents"][0])
         self.assertGreater(call["deadline_seconds"], 1.0)
         top = response["results"][0]
         self.assertEqual(top["rerank_score"], 0.99)
@@ -2652,6 +2661,29 @@ class LexicalMinShouldMatchTests(unittest.TestCase):
         self.assertEqual(sum(1 for item in store.sql if "pg_stats" in item), stats_calls)
         self.assertFalse(retrieval.lexical_plan["relaxed"])
         self.assertIn("passage.search_vector @@\n                              plainto_tsquery('simple',%s)", store.sql[-1])
+
+
+class RerankContextTests(unittest.TestCase):
+    def test_stored_header_leads_the_rerank_document(self) -> None:
+        from recall_server.passage_retrieval import rerank_document
+        from recall_server import passage_retrieval
+        row = {"header_redacted": "source family: codex\nharness: codex\n", "text_redacted": "x " * 3000 + "needle here"}
+        doc = rerank_document(row, ["needle"], 2000)
+        self.assertTrue(doc.startswith("source family: codex\nharness: codex\n\n"))
+        # Focus window off: the head follows the context (the runtime trims the tail).
+        self.assertEqual(doc, "source family: codex\nharness: codex\n\n" + row["text_redacted"])
+        with mock.patch.object(passage_retrieval, "RERANK_FOCUS_WINDOW", True):
+            doc = rerank_document(row, ["needle", "here"], 2000)
+            self.assertIn("needle here", doc)
+            self.assertLessEqual(len(doc), 2000)
+
+    def test_fallback_context_uses_source_and_first_day(self) -> None:
+        from recall_server.passage_retrieval import rerank_context, rerank_document
+        row = {"source_id": "codex:linux:greppy3", "passage_first_occurred_at": "2026-07-08 12:00:00+00", "text_redacted": "body"}
+        self.assertEqual(rerank_context(row), "source: codex:linux:greppy3\nwhen: 2026-07-08")
+        self.assertEqual(rerank_document(row, [], 2000), "source: codex:linux:greppy3\nwhen: 2026-07-08\n\nbody")
+        self.assertEqual(rerank_document({"text_redacted": "body"}, [], 2000), "body")
+        self.assertEqual(rerank_document({"header_redacted": "h" * 1990, "text_redacted": "body"}, [], 2000), "body")
 
 
 class IdentifierSigilTests(unittest.TestCase):
