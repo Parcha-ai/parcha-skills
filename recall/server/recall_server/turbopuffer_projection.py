@@ -41,6 +41,7 @@ from .turbopuffer_plane import (
     build_client,
     namespace_schema,
     passage_row,
+    EMBED_TEXT_ATTRIBUTE,
 )
 
 LOG = logging.getLogger(__name__)
@@ -152,6 +153,57 @@ def is_rate_limit(error: BaseException) -> bool:
     return any("RateLimit" in klass.__name__ for klass in type(error).__mro__)
 
 
+def is_transient(error: BaseException) -> bool:
+    """A write worth retrying with backoff: 429, 5xx (the embedding path
+    answered 502 on large batches live), connection and timeout errors."""
+
+    if is_rate_limit(error):
+        return True
+    names = {klass.__name__ for klass in type(error).__mro__}
+    if names & {"InternalServerError", "APIConnectionError", "APITimeoutError", "ServiceUnavailableError"}:
+        return True
+    status = getattr(error, "status_code", None)
+    return isinstance(status, int) and status >= 500
+
+
+# Native embeddings are billed and rate-limited per token (2M tokens/min per
+# org). Writes are paced under this estimate (chars / 4) so the drain never
+# trips the limit and leaves headroom for query-time embeddings.
+DEFAULT_TOKENS_PER_MINUTE = 1_000_000
+TOKEN_CHARS = 4
+
+
+class TokenPacer:
+    """Sliding one-minute window of estimated tokens; ``wait_for(tokens)``
+    sleeps until sending ``tokens`` keeps the window under the limit."""
+
+    def __init__(self, tokens_per_minute: int, *, clock: Any = time.monotonic, sleep: Any = time.sleep) -> None:
+        self.limit = int(tokens_per_minute)
+        self.clock = clock
+        self.sleep = sleep
+        self.sent: list[tuple[float, int]] = []
+        self.slept_seconds = 0.0
+
+    def wait_for(self, tokens: int) -> None:
+        if self.limit <= 0:
+            return
+        while True:
+            now = self.clock()
+            self.sent = [(at, count) for at, count in self.sent if now - at < 60.0]
+            used = sum(count for _at, count in self.sent)
+            if used + tokens <= self.limit or not self.sent:
+                self.sent.append((now, tokens))
+                return
+            oldest_at = self.sent[0][0]
+            delay = max(0.05, 60.0 - (now - oldest_at))
+            self.slept_seconds += delay
+            self.sleep(delay)
+
+
+def estimated_tokens(rows: list[dict[str, Any]]) -> int:
+    return sum(len(row.get(EMBED_TEXT_ATTRIBUTE) or "") for row in rows) // TOKEN_CHARS + len(rows)
+
+
 class TurbopufferProjector:
     """Drains ``search_projection_outbox`` into turbopuffer namespaces."""
 
@@ -166,6 +218,7 @@ class TurbopufferProjector:
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Any] = time.sleep,
         rate_limit_budget_seconds: float = RATE_LIMIT_BUDGET_SECONDS,
+        tokens_per_minute: int | None = None,
     ) -> None:
         batch = settings.write_batch_rows if batch_rows is None else batch_rows
         if isinstance(batch, bool) or not isinstance(batch, int) or not 1 <= batch <= 5000:
@@ -179,6 +232,13 @@ class TurbopufferProjector:
         self.clock = clock
         self.sleep = sleep
         self.rate_limit_budget_seconds = float(rate_limit_budget_seconds)
+        limit = (
+            getattr(settings, "tokens_per_minute", DEFAULT_TOKENS_PER_MINUTE)
+            if tokens_per_minute is None
+            else tokens_per_minute
+        )
+        # Wall clock on purpose: the injected clock serves deadlines in tests.
+        self.pacer = TokenPacer(int(limit), clock=time.monotonic, sleep=sleep)
         self._client = client
 
     @property
@@ -330,8 +390,8 @@ class TurbopufferProjector:
                     **kwargs,
                 )
                 return attempts
-            except Exception as error:  # noqa: BLE001 - only 429 is retried
-                if not is_rate_limit(error):
+            except Exception as error:  # noqa: BLE001 - transient errors are retried
+                if not is_transient(error):
                     raise
                 attempts += 1
                 budget["rate_limited"] = budget.get("rate_limited", 0) + 1
@@ -384,6 +444,7 @@ class TurbopufferProjector:
                 for passage in page
             ]
             for batch in byte_bounded_batches(rows, max_rows=self.batch_rows, max_bytes=self.max_batch_bytes):
+                self.pacer.wait_for(estimated_tokens(batch))
                 self._write(namespace, budget, upsert_rows=batch)
                 written += len(batch)
             last = page[-1]
