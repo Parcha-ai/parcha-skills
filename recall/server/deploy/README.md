@@ -133,6 +133,68 @@ Lance writer fills; it stays empty until H3-b ships.
 - **Cycle log**: `search_outbox_pending` on the `projection-worker` line is the number of
   queued source-months for the tenant.
 
+### Search plane (turbopuffer)
+
+The search plane is one turbopuffer namespace per tenant (`recall-<sha256(tenant)[:20]>`)
+holding one document per live passage. turbopuffer embeds `embed_text` (contextual header
+plus verbatim text) natively and indexes `text` for BM25, so neither the worker nor the
+web service calls an embedding provider for the plane. Everything in a namespace is a
+projection of the Postgres catalog and can be rebuilt with a seed.
+
+The writer (`recall_server.turbopuffer_projection`) drains `search_projection_outbox`
+oldest-first, one (tenant, source, month) at a time: it applies the month's tombstones as
+deletes, upserts the month's live passages in batches of `RECALL_TPUF_WRITE_BATCH_ROWS`,
+and only after the writes succeed retires the outbox row with a compare-and-delete on the
+claimed `generation` (a month re-queued during the write stays queued) and upserts
+`search_projection_shards` (`dataset_uri` = `turbopuffer://<region>/<namespace>`,
+`row_count` = rows written by that pass, `built_at` = the read watermark). `backfill`
+sends every live passage of the month; `logical-update`, `forget` and `header-change`
+send only passages created after the shard's `built_at`. A turbopuffer failure on a month
+leaves its outbox row, is counted as failed, and is logged by error class only.
+
+Environment (the worker never logs the key):
+
+| Variable | Meaning |
+| --- | --- |
+| `RECALL_TPUF_API_KEY` or `RECALL_TPUF_KEY_FILE` | API key inline, or a 0600 file holding it (set one, not both). Unset: the plane is off. |
+| `RECALL_TPUF_REGION` | turbopuffer region, default `aws-us-west-2`. |
+| `RECALL_TPUF_EMBED_MODEL` / `RECALL_TPUF_EMBED_DIMS` | Native embedding model and dimensions, default `voyage/voyage-4` at 512. Changing either needs a full re-seed. |
+| `RECALL_TPUF_NAMESPACE_PREFIX` | Namespace prefix, default `recall`. |
+| `RECALL_TPUF_WRITE_BATCH_ROWS` | Rows per write call, default 200. |
+| `RECALL_SEARCH_PLANE` | `postgres` (default) or `turbopuffer`: which plane the read path queries. The writer runs whenever a key is configured, regardless of this value, so a namespace can be filled before the read path is switched. |
+
+Runbook, first deployment for a tenant:
+
+```bash
+# 1. Queue one backfill row per existing parquet shard month (idempotent).
+python -m recall_server.cli search-outbox-seed --tenant tenant:company:example
+
+# 2. Either let the projection worker drain it (default on when a key is set;
+#    --search-plane off disables the phase, --search-plane on requires the key)
+python -m recall_server.cli projection-worker --tenant tenant:company:example \
+  --skip-embedding --search-plane auto --search-plane-months-per-cycle 4
+
+#    or drain it in the foreground until the outbox is empty.
+python -m recall_server.cli search-plane-project --tenant tenant:company:example \
+  --max-months 4          # add --once for a single cycle
+# {"cycles": 12, "deleted": 0, "failed": 0, "months": 48, "pending": 0, "requeued": 0, "rows": 812345, "status": "complete"}
+```
+
+- **Cycle log**: `search_plane_months`, `search_plane_rows`, `search_plane_deleted` and
+  `search_plane_failed` on the `projection-worker` line, next to `search_outbox_pending`;
+  `search_plane_elapsed_ms` attributes the phase's wall clock.
+- **Metrics**: `recall_search_plane_pending` (outbox rows, all tenants) and
+  `recall_search_plane_shards` (built source-months) on `/metrics`;
+  `recall_projection_search_plane_rows_written_total` counts rows since process start.
+- **Repair**: a month that keeps failing stays in the outbox with its `generation`; fix the
+  cause and the next cycle retries it. A namespace that must be rebuilt (model or
+  dimension change) is re-seeded with `search-outbox-seed`, which promotes every month to
+  `backfill`.
+- **Cost**: native embeddings bill at about $0.06 per million tokens of `embed_text`; the
+  organisation rate limit is about 2M embedding tokens per minute, so a full backfill of
+  the production corpus takes roughly 8 hours regardless of `--max-months`. Incremental
+  drains embed only the passages that changed.
+
 The production database gate requires a standard PostgreSQL URL with
 `sslmode=verify-full` and an explicit trust root, schema migrations 1 through 66,
 pgvector 0.8.0 or newer, and a runtime role without superuser, database/role creation,

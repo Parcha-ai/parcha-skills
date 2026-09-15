@@ -32,6 +32,7 @@ PROJECTION_TOTALS: dict[str, int] = {
     "documents_projected": 0,
     "passages_embedded": 0,
     "parquet_rows_written": 0,
+    "search_plane_rows_written": 0,
     "bodies_thinned": 0,
     # Wall-clock spent per phase, in milliseconds, so a slow cycle can be
     # attributed to embedding, passages, logical (including S3 cleanup),
@@ -41,6 +42,7 @@ PROJECTION_TOTALS: dict[str, int] = {
     "passage_elapsed_ms": 0,
     "logical_elapsed_ms": 0,
     "parquet_elapsed_ms": 0,
+    "search_plane_elapsed_ms": 0,
     "thin_elapsed_ms": 0,
 }
 PROJECTION_TOTALS_LOCK = threading.Lock()
@@ -49,6 +51,7 @@ _CYCLE_TO_TOTAL = {
     "passage_documents": "documents_projected",
     "embedded": "passages_embedded",
     "parquet_rows": "parquet_rows_written",
+    "search_plane_rows": "search_plane_rows_written",
     "canonical_bodies_thinned": "bodies_thinned",
 }
 PHASE_ELAPSED_KEYS = (
@@ -57,6 +60,7 @@ PHASE_ELAPSED_KEYS = (
     "passage_elapsed_ms",
     "logical_elapsed_ms",
     "parquet_elapsed_ms",
+    "search_plane_elapsed_ms",
     "thin_elapsed_ms",
 )
 _CYCLE_TO_TOTAL.update({key: key for key in PHASE_ELAPSED_KEYS})
@@ -98,8 +102,14 @@ def run_projection_worker(
     cleanup_concurrency: int = 8,
     max_cycles: int | None = None,
     skip_embedding: bool = False,
+    search_plane: Callable[[], dict[str, Any]] | None = None,
 ) -> dict[str, int | str]:
     """Service every projection stage without upstream backfill starvation.
+
+    ``search_plane`` (H3-b) drains the search projection outbox into
+    turbopuffer once per cycle, after the parquet phase; ``None`` (no
+    turbopuffer settings, or ``--search-plane off``) skips the phase and the
+    cycle reports zeros for it.
 
     With ``skip_embedding`` (H5-2) the embedding phase is left to the
     dedicated ``embedding-worker`` process: the cycle reports
@@ -215,6 +225,24 @@ def run_projection_worker(
             )
             parquet_elapsed_ms = elapsed_ms(phase_started)
             phase_started = clock()
+            # H3-b: the search plane drains its own outbox, one bounded batch
+            # of source-months per cycle; a turbopuffer failure on a month is
+            # counted, logged by class inside the projector, and retried next
+            # cycle because the outbox row stays.
+            searched = (
+                search_plane()
+                if search_plane is not None
+                else {
+                    "status": "skipped",
+                    "months": 0,
+                    "rows": 0,
+                    "deleted": 0,
+                    "failed": 0,
+                    "pending": 0,
+                }
+            )
+            search_plane_elapsed_ms = elapsed_ms(phase_started) if search_plane is not None else 0
+            phase_started = clock()
             # The thinner has its own row-level authority gates: live S3 raw data,
             # an S3 logical manifest, retained searchable chunks, and no queued
             # reprojection for that source group. Run one bounded batch every cycle
@@ -261,6 +289,8 @@ def run_projection_worker(
                     and int(scanned["stale"]) == 0
                     and int(scanned["contended"]) == 0
                     and thinned["status"] == "complete"
+                    and int(searched["months"]) == 0
+                    and int(searched["failed"]) == 0
                     else "pending"
                 ),
                 "documents": int(documents["documents"]),
@@ -289,6 +319,10 @@ def run_projection_worker(
                 "parquet_fragments_rewritten": int(scanned.get("fragments_rewritten", 0)),
                 "parquet_fragments_total": int(scanned.get("fragments_total", 0)),
                 "parquet_documents_dirty": int(scanned.get("documents_dirty", 0)),
+                "search_plane_months": int(searched["months"]),
+                "search_plane_rows": int(searched["rows"]),
+                "search_plane_deleted": int(searched["deleted"]),
+                "search_plane_failed": int(searched["failed"]),
                 "canonical_bodies_thinned": int(thinned["documents"]),
                 "thin_mode": "busy" if thin_busy else "idle",
                 "canonical_bodies_refused": int(thinned["refused"]),
@@ -313,6 +347,7 @@ def run_projection_worker(
                 "passage_elapsed_ms": passage_elapsed_ms,
                 "logical_elapsed_ms": logical_elapsed_ms,
                 "parquet_elapsed_ms": parquet_elapsed_ms,
+                "search_plane_elapsed_ms": search_plane_elapsed_ms,
                 "thin_elapsed_ms": thin_elapsed_ms,
             }
             record_cycle(result)
@@ -328,6 +363,8 @@ def run_projection_worker(
                 "parquet_rows=%s parquet_stale=%s parquet_contended=%s "
                 "parquet_fragments_rewritten=%s parquet_fragments_total=%s "
                 "parquet_documents_dirty=%s "
+                "search_plane_months=%s search_plane_rows=%s "
+                "search_plane_deleted=%s search_plane_failed=%s "
                 "canonical_bodies_thinned=%s canonical_bodies_refused=%s "
                 "thin_mode=%s "
                 "canonical_document_bytes_removed=%s "
@@ -338,7 +375,8 @@ def run_projection_worker(
             "logical_failed=%s logical_backoff=%s logical_quarantined=%s "
                 "old_objects_deleted=%s search_outbox_pending=%s "
                 "cycle_elapsed_ms=%s embed_elapsed_ms=%s passage_elapsed_ms=%s "
-                "logical_elapsed_ms=%s parquet_elapsed_ms=%s thin_elapsed_ms=%s",
+                "logical_elapsed_ms=%s parquet_elapsed_ms=%s "
+                "search_plane_elapsed_ms=%s thin_elapsed_ms=%s",
                 *(
                     result[key]
                     for key in (
@@ -365,6 +403,10 @@ def run_projection_worker(
                         "parquet_fragments_rewritten",
                         "parquet_fragments_total",
                         "parquet_documents_dirty",
+                        "search_plane_months",
+                        "search_plane_rows",
+                        "search_plane_deleted",
+                        "search_plane_failed",
                         "canonical_bodies_thinned",
                         "canonical_bodies_refused",
                         "thin_mode",
@@ -404,6 +446,7 @@ def run_projection_worker(
                 "embedded",
                 "parquet_shards",
                 "parquet_stale",
+                "search_plane_months",
                 "canonical_bodies_thinned",
                 "stale",
                 "pruned",
