@@ -1883,6 +1883,8 @@ class BrainStore:
             "passage_documents_projected_24h": 0,
             "passage_duplicate_rows": 0,
             "document_records_p99": 0,
+            "search_plane_pending": 0,
+            "search_plane_shards": 0,
         }
         if conn.execute(
             "SELECT to_regclass('public.canonical_evidence_documents') AS value"
@@ -1940,6 +1942,21 @@ class BrainStore:
         churn["embedding_daily_total"] = (
             window_total(conn) if ledger_exists(conn) else 0
         )
+        # H3-b: source-months waiting for the turbopuffer writer and the
+        # source-months it has built, across every tenant.
+        if conn.execute(
+            "SELECT to_regclass('public.search_projection_outbox') AS value"
+        ).fetchone()["value"]:
+            churn["search_plane_pending"] = int(
+                conn.execute(
+                    "SELECT count(*) AS n FROM search_projection_outbox"
+                ).fetchone()["n"]
+            )
+            churn["search_plane_shards"] = int(
+                conn.execute(
+                    "SELECT count(*) AS n FROM search_projection_shards"
+                ).fetchone()["n"]
+            )
         return churn
 
     def embed_pending(

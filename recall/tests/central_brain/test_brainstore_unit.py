@@ -1013,6 +1013,7 @@ class HttpBoundaryContractTest(unittest.TestCase):
                         "canonical_passages" if "canonical_passages" in folded
                         else "canonical_evidence_documents" if "canonical_evidence_documents" in folded
                         else "canonical_embedding_ledger" if ledger and "canonical_embedding_ledger" in folded
+                        else "search_projection_outbox" if "search_projection_outbox" in folded
                         else None
                     )
                 }
@@ -1028,6 +1029,10 @@ class HttpBoundaryContractTest(unittest.TestCase):
                 row = {"n": 15000}
             elif "from canonical_passage_documents" in folded:
                 row = {"n": 320}
+            elif "from search_projection_outbox" in folded:
+                row = {"n": 12}
+            elif "from search_projection_shards" in folded:
+                row = {"n": 340}
             elif "from canonical_passages" in folded:
                 row = {"n": 150000}
             else:
@@ -1070,6 +1075,9 @@ class HttpBoundaryContractTest(unittest.TestCase):
             self.assertNotIn("tenant_id", sql)
         # Without schema 065 the ledger total is 0, never an error.
         self.assertEqual(metrics["embedding_daily_total"], 0)
+        # H3-b: outbox depth and built source-months, every tenant.
+        self.assertEqual(metrics["search_plane_pending"], 12)
+        self.assertEqual(metrics["search_plane_shards"], 340)
         # T12 gauges: repeated-text passage rows and records per document.
         self.assertEqual(metrics["passage_duplicate_rows"], 89358)
         self.assertEqual(metrics["document_records_p99"], 64000)
@@ -1111,11 +1119,15 @@ class HttpBoundaryContractTest(unittest.TestCase):
             "passages_written_24h": 150000, "passage_documents_projected_24h": 320,
             "embedding_daily_total": 15000,
             "passage_duplicate_rows": 89358, "document_records_p99": 64000,
+            "search_plane_pending": 12, "search_plane_shards": 340,
         }
         with mock.patch.dict(projection_worker.PROJECTION_TOTALS, {"passages_written": 77}), \
                 mock.patch.dict(os.environ, {"RECALL_EMBEDDING_DAILY_CAP": "123456"}):
             body = Handler.metrics(handler).decode()
         self.assertIn("recall_embedding_daily_total 15000\n", body)
+        self.assertIn("recall_search_plane_pending 12\n", body)
+        self.assertIn("recall_search_plane_shards 340\n", body)
+        self.assertIn("# TYPE recall_search_plane_pending gauge\n", body)
         self.assertIn("recall_embedding_daily_cap 123456\n", body)
         self.assertIn("# TYPE recall_embedding_daily_cap gauge\n", body)
         self.assertIn("recall_passages_written_24h 150000\n", body)
@@ -1127,7 +1139,7 @@ class HttpBoundaryContractTest(unittest.TestCase):
         self.assertIn("recall_passage_duplicate_rows 89358\n", body)
         self.assertIn("recall_document_records_p99 64000\n", body)
         self.assertIn("# TYPE recall_projection_bodies_thinned_total counter\n", body)
-        for phase in ("cycle", "embed", "passage", "logical", "parquet", "thin"):
+        for phase in ("cycle", "embed", "passage", "logical", "parquet", "search_plane", "thin"):
             self.assertIn(f"# TYPE recall_projection_{phase}_elapsed_ms_total counter\n", body)
         self.assertTrue(body.endswith("\n"))
 
@@ -1136,12 +1148,12 @@ class HttpBoundaryContractTest(unittest.TestCase):
 
         with mock.patch.dict(projection_worker.PROJECTION_TOTALS, {key: 0 for key in projection_worker.PROJECTION_TOTALS}):
             projection_worker.record_cycle({"passages": 40, "passage_documents": 2, "embedded": 8, "parquet_rows": 100, "canonical_bodies_thinned": 1, "status": "pending", "cycle_elapsed_ms": 1500, "embed_elapsed_ms": 200, "logical_elapsed_ms": 1000})
-            projection_worker.record_cycle({"passages": 2, "passage_documents": 1, "embedded": 0, "parquet_rows": 0, "canonical_bodies_thinned": 0, "cycle_elapsed_ms": 500, "embed_elapsed_ms": 100, "thin_elapsed_ms": 50})
+            projection_worker.record_cycle({"passages": 2, "passage_documents": 1, "embedded": 0, "parquet_rows": 0, "canonical_bodies_thinned": 0, "cycle_elapsed_ms": 500, "embed_elapsed_ms": 100, "thin_elapsed_ms": 50, "search_plane_rows": 7, "search_plane_elapsed_ms": 30})
             self.assertEqual(
                 projection_worker.projection_totals(),
                 {
-                    "passages_written": 42, "documents_projected": 3, "passages_embedded": 8, "parquet_rows_written": 100, "bodies_thinned": 1,
-                    "cycle_elapsed_ms": 2000, "embed_elapsed_ms": 300, "passage_elapsed_ms": 0, "logical_elapsed_ms": 1000, "parquet_elapsed_ms": 0, "thin_elapsed_ms": 50,
+                    "passages_written": 42, "documents_projected": 3, "passages_embedded": 8, "parquet_rows_written": 100, "search_plane_rows_written": 7, "bodies_thinned": 1,
+                    "cycle_elapsed_ms": 2000, "embed_elapsed_ms": 300, "passage_elapsed_ms": 0, "logical_elapsed_ms": 1000, "parquet_elapsed_ms": 0, "search_plane_elapsed_ms": 30, "thin_elapsed_ms": 50,
                 },
             )
 

@@ -63,6 +63,16 @@ from .mcp_conformance import (
 )
 from .rerank import build_rerank_runtime
 from .search_outbox import search_outbox_pending, seed_search_outbox
+from .turbopuffer_plane import (
+    TurbopufferConfigError,
+    TurbopufferSettings,
+    build_client,
+    turbopuffer_settings_from_env,
+)
+from .turbopuffer_projection import (
+    DEFAULT_MONTHS_PER_CYCLE,
+    TurbopufferProjector,
+)
 from .semantic import SemanticRuntime
 
 
@@ -124,6 +134,22 @@ def _worker_pool_max_size(args: argparse.Namespace) -> int | None:
         # the ledger and lag reads take a second one between batches.
         return 4
     return None
+
+
+def _search_plane_client(settings: TurbopufferSettings) -> object:
+    """One turbopuffer client per process (``RECALL_TPUF_CLIENT_FACTORY`` swaps
+    in the file-backed fake for the e2e suites)."""
+
+    return build_client(settings)
+
+
+def _search_plane_settings(mode: str) -> TurbopufferSettings | None:
+    """``--search-plane`` resolution: off, on (settings required), or auto."""
+
+    if mode == "off":
+        return None
+    settings = turbopuffer_settings_from_env(required=mode == "on")
+    return settings
 
 
 def _storage_footprint(store: BrainStore) -> dict[str, object]:
@@ -1772,7 +1798,26 @@ def main() -> None:
         "--skip-embedding", action="store_true",
         help="leave passage embedding to a dedicated embedding-worker process (H5-2)",
     )
+    projection_worker.add_argument(
+        "--search-plane", choices=("auto", "on", "off"), default="auto",
+        help="drain the search projection outbox into turbopuffer each cycle "
+             "(auto: when RECALL_TPUF_API_KEY or RECALL_TPUF_KEY_FILE is set)",
+    )
+    projection_worker.add_argument(
+        "--search-plane-months-per-cycle", type=int, default=DEFAULT_MONTHS_PER_CYCLE,
+        help="source-months projected into turbopuffer per cycle",
+    )
     projection_worker.add_argument("--once", action="store_true")
+    search_plane_project = sub.add_parser(
+        "search-plane-project",
+        help="drain the search projection outbox into turbopuffer until it is empty",
+    )
+    search_plane_project.add_argument("--tenant", required=True)
+    search_plane_project.add_argument("--once", action="store_true")
+    search_plane_project.add_argument(
+        "--max-months", type=int, default=DEFAULT_MONTHS_PER_CYCLE,
+        help="source-months per drain cycle",
+    )
     embedding_worker = sub.add_parser(
         "embedding-worker",
         help="embed pending lossless passages in a process of its own, under a daily cap",
@@ -2424,6 +2469,18 @@ def main() -> None:
             store,
             LogicalEvidenceProjectionStore(build_evidence_archive_store()),
         )
+        # H3-b: one client for the life of the process; the phase is skipped
+        # entirely (search_plane=None) when turbopuffer is not configured.
+        search_settings = _search_plane_settings(args.search_plane)
+        search_plane = None
+        if search_settings is not None:
+            search_projector = TurbopufferProjector(
+                store, search_settings, client=_search_plane_client(search_settings),
+            )
+            search_plane = lambda: search_projector.drain(  # noqa: E731
+                tenant_id=args.tenant,
+                max_months=args.search_plane_months_per_cycle,
+            )
         print(
             json.dumps(
                 run_projection_worker(
@@ -2444,6 +2501,7 @@ def main() -> None:
                     parquet_every_cycles=args.parquet_every_cycles,
                     cleanup_concurrency=args.cleanup_concurrency,
                     skip_embedding=args.skip_embedding,
+                    search_plane=search_plane,
                     body_thinner=lambda busy: thin_canonical_bodies(
                         store,
                         tenant_id=args.tenant,
@@ -2458,6 +2516,31 @@ def main() -> None:
                 sort_keys=True,
             )
         )
+    elif args.command == "search-plane-project":
+        # H3-b: drain the outbox until it is empty (or one cycle with --once).
+        # Counts only; never the key, never passage text.
+        try:
+            search_settings = turbopuffer_settings_from_env(required=True)
+        except TurbopufferConfigError as error:
+            print(json.dumps({"status": "error", "error": str(error)}, sort_keys=True))
+            sys.exit(2)
+        search_projector = TurbopufferProjector(
+            store, search_settings, client=_search_plane_client(search_settings),
+        )
+        totals = {"cycles": 0, "months": 0, "rows": 0, "deleted": 0, "failed": 0, "requeued": 0, "rate_limited": 0}
+        while True:
+            cycle = search_projector.drain(
+                tenant_id=args.tenant, max_months=args.max_months,
+            )
+            totals["cycles"] += 1
+            for key in ("months", "rows", "deleted", "failed", "requeued", "rate_limited"):
+                totals[key] += int(cycle[key])
+            pending = int(cycle["pending"])
+            # Stop when nothing is queued, when asked for one cycle, or when a
+            # cycle made no progress (every remaining month failed).
+            if args.once or pending == 0 or int(cycle["months"]) == 0:
+                break
+        print(json.dumps({**totals, "pending": pending, "status": str(cycle["status"])}, sort_keys=True))
     elif args.command == "embedding-worker":
         # embed_pending only touches the database and the embedding runtime:
         # this worker needs no evidence-archive credentials, so the projector

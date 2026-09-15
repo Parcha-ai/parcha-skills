@@ -687,6 +687,12 @@ class Handler(BaseHTTPRequestHandler):
             "# HELP recall_embedding_daily_cap Daily embedding cap (RECALL_EMBEDDING_DAILY_CAP) the embedding worker stops at.",
             "# TYPE recall_embedding_daily_cap gauge",
             f"recall_embedding_daily_cap {daily_cap_from_env()}",
+            "# HELP recall_search_plane_pending Source-months queued in the search projection outbox for the turbopuffer writer (all tenants).",
+            "# TYPE recall_search_plane_pending gauge",
+            f"recall_search_plane_pending {int(db.get('search_plane_pending', 0))}",
+            "# HELP recall_search_plane_shards Source-months built into turbopuffer (search_projection_shards rows, all tenants).",
+            "# TYPE recall_search_plane_shards gauge",
+            f"recall_search_plane_shards {int(db.get('search_plane_shards', 0))}",
         ]
         for key, value in projection_totals().items():
             lines.extend(
