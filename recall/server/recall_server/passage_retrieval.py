@@ -922,6 +922,14 @@ def apply_rerank_scores(
 class PassageHintRetrieval:
     """Read-only retrieval over one selected lossless passage policy."""
 
+    # The temporal window pass (H2-h) is budgeted per plane: ``None`` takes
+    # the temporal settings (150 ms: an indexed Postgres scan); a plane whose
+    # filtered pass costs more sets its own. A plane whose query embedding is
+    # free (the text travels to the plane) runs the pass concurrently with
+    # the arms instead of after the global dense pass.
+    temporal_window_budget_ms: int | None = None
+    window_pass_concurrent = False
+
     def __init__(
         self,
         store: Any,
@@ -2006,6 +2014,36 @@ class PassageHintRetrieval:
                 )
 
         window_diagnostics: dict[str, Any] = {}
+        window_wanted = (
+            temporal_hint is not None
+            and temporal_hint.day_level
+            and temporal_settings is not None
+        )
+        window_budget_ms = (
+            self.temporal_window_budget_ms
+            if self.temporal_window_budget_ms is not None
+            else (temporal_settings.window_budget_ms if temporal_settings is not None else 0)
+        )
+        window_future: Any = None
+
+        def window_pass(text: str, vector: Any) -> tuple[list[dict[str, Any]], str, str, int | None]:
+            # H2-h: a day-level hint (hedged or not) also runs the dense arm
+            # inside the window (the arms take since/until; a small scope is
+            # an exact scan) and unions the pools, so a short session inside
+            # the window reaches the collapse even when it sits at the bottom
+            # of the global pool. Bounded by its own budget, sized per plane.
+            window_deadline = min(
+                deadline_at, time.monotonic() + window_budget_ms / 1000,
+            )
+            return timed_arm(
+                "dense_window",
+                self._dense_candidates,
+                text,
+                vector=vector,
+                since=temporal_hint.since,
+                until=temporal_hint.until,
+                deadline_at=window_deadline,
+            )
 
         def dense_arms(text: str) -> tuple[list[dict[str, Any]], str, str, int | None]:
             # The query is embedded once (inside the dense arm's timing, as
@@ -2019,32 +2057,16 @@ class PassageHintRetrieval:
                     (time.monotonic() - arm_started) * 1000, 3
                 )
             rows, status, strategy, scope_passages = outcome
-            if (
-                temporal_hint is None
-                or not temporal_hint.day_level
-                or temporal_settings is None
-                or status != "ok"
-            ):
+            if not window_wanted or status != "ok":
                 return outcome
-            # H2-h: a day-level hint (hedged or not) also runs the dense arm
-            # inside the window (the arms take since/until; a small scope is
-            # an exact scan) and unions the pools, so a short session inside
-            # the window reaches the collapse even when it sits at the bottom
-            # of the global pool. Sequential on this worker: no fourth pooled
-            # connection, bounded by its own short budget.
-            window_deadline = min(
-                deadline_at,
-                time.monotonic() + temporal_settings.window_budget_ms / 1000,
-            )
-            windowed, window_status, window_strategy, _ = timed_arm(
-                "dense_window",
-                self._dense_candidates,
-                text,
-                vector=vector,
-                since=temporal_hint.since,
-                until=temporal_hint.until,
-                deadline_at=window_deadline,
-            )
+            if window_future is not None:
+                # Already running beside the arms (the plane embeds the
+                # query itself, so nothing here waited on the vector).
+                windowed, window_status, window_strategy, _ = window_future.result()
+            else:
+                # Sequential on the Postgres plane: no fourth pooled
+                # connection.
+                windowed, window_status, window_strategy, _ = window_pass(text, vector)
             merged, added = merge_dense_pools(rows, windowed)
             window_diagnostics.update({
                 "dense_window_status": window_status,
@@ -2163,7 +2185,11 @@ class PassageHintRetrieval:
             })
             return rows, status
 
-        with ThreadPoolExecutor(max_workers=3) as executor:
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            if window_wanted and self.window_pass_concurrent:
+                window_future = executor.submit(
+                    window_pass, query, self._embed_query(query),
+                )
             lexical_future = executor.submit(
                 timed_arm, "passage_lexical", lexical_arms, lexical_query,
             )

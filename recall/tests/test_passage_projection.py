@@ -1145,7 +1145,11 @@ class PassageProjectionTests(unittest.TestCase):
             PassageHintRetrieval._search_admitted
         )
 
-        self.assertIn("ThreadPoolExecutor(max_workers=3", source)
+        # Three arms plus the window pass slot a plane may run beside them
+        # (the Postgres plane keeps the window pass sequential: three pooled
+        # connections per search).
+        self.assertIn("ThreadPoolExecutor(max_workers=4", source)
+        self.assertIn("window_pass_concurrent", source)
         self.assertIn("self._lexical_candidates", source)
         self.assertIn("self._sparse_candidates", source)
         self.assertIn("self._dense_candidates", source)

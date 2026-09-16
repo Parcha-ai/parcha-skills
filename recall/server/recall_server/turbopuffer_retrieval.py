@@ -12,6 +12,7 @@ already consume, so nothing above the arms changes.
 """
 from __future__ import annotations
 
+import os
 import time
 from typing import Any
 
@@ -144,10 +145,48 @@ def dedupe_texts(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return kept
 
 
+DEFAULT_WINDOW_BUDGET_MS = 1500
+
+
+def window_budget_ms_from_env() -> int:
+    """``RECALL_TPUF_WINDOW_BUDGET_MS``: the temporal window pass budget on this plane."""
+
+    raw = os.environ.get("RECALL_TPUF_WINDOW_BUDGET_MS", "").strip()
+    try:
+        value = int(raw) if raw else DEFAULT_WINDOW_BUDGET_MS
+    except ValueError:
+        return DEFAULT_WINDOW_BUDGET_MS
+    return value if 100 <= value <= 20_000 else DEFAULT_WINDOW_BUDGET_MS
+
+
+def query_client(client: Any) -> Any:
+    """The client the arms query with: no SDK retries inside a search deadline.
+
+    The SDK retries a timed-out attempt four times with backoff, so an arm
+    given a 150 ms budget spent ~4 s failing (live: every dated question
+    paid it, the window pass never returned a row). The arms own their
+    deadlines; a retry is the projector's business.
+    """
+
+    with_options = getattr(client, "with_options", None)
+    if not callable(with_options):
+        return client
+    try:
+        return with_options(max_retries=0)
+    except Exception:  # noqa: BLE001 - a client without the option queries as it is
+        return client
+
+
 class TurbopufferHintRetrieval(PassageHintRetrieval):
     """PassageHintRetrieval whose arms read one turbopuffer namespace."""
 
     plane = "turbopuffer"
+    # A filtered ANN pass over the namespace (one day of passages) costs
+    # hundreds of milliseconds from the service region, not the 150 ms an
+    # indexed Postgres scan gets; and the query text is embedded by the
+    # plane, so the pass runs beside the arms instead of after them.
+    temporal_window_budget_ms = DEFAULT_WINDOW_BUDGET_MS
+    window_pass_concurrent = True
 
     def __init__(self, store: Any, *, settings: TurbopufferSettings | None = None, client: Any = None, **kwargs: Any) -> None:
         super().__init__(store, **kwargs)
@@ -157,7 +196,8 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
         self.client = client if client is not None else getattr(store, "turbopuffer_client", None)
         if self.client is None:
             raise ValueError("turbopuffer client is required for the turbopuffer plane")
-        self.namespace = self.client.namespace(self.settings.namespace(self.tenant_id))
+        self.namespace = query_client(self.client).namespace(self.settings.namespace(self.tenant_id))
+        self.temporal_window_budget_ms = window_budget_ms_from_env()
 
     # The query is embedded by turbopuffer: no provider round trip here, and
     # the clause / window passes reuse the text.

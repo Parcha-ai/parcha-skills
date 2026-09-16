@@ -73,9 +73,12 @@ def _integer(
 ) -> int:
     if value is None:
         return default
-    # JSON has one number type: some MCP clients send 50.0 for 50.
+    # JSON has one number type: some MCP clients send 50.0 for 50, and
+    # some send the digits as a string ("256").
     if isinstance(value, float) and value.is_integer():
         value = int(value)
+    elif isinstance(value, str) and value.strip().lstrip("-").isdigit():
+        value = int(value.strip())
     if isinstance(value, bool) or not isinstance(value, int):
         raise McpProtocolError(-32602, f"{name} must be an integer")
     if not minimum <= value <= maximum:
