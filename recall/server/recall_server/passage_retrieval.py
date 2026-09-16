@@ -434,10 +434,14 @@ def collapse_document_candidates(
         # not displace the lexical or exact passage that carried the
         # document (live: a P2 review answer fell from rank 1 to 11 when a
         # dense rank-338 passage took the lead). Stable: ties keep the arm
-        # order dense, lexical, exact.
+        # order dense, lexical, exact. An exact-identifier range never leads
+        # while a prose arm has one: it is usually tool output the
+        # cross-encoder scores low (live: 0.24 for the identifier passage,
+        # 0.44 for the same document's dense passage).
         ranges.sort(
-            key=lambda item: -float(
-                (arm_scores.get(item["kind"]) or {}).get("normalized", 0.0)
+            key=lambda item: (
+                item["kind"] == "sparse-exact",
+                -float((arm_scores.get(item["kind"]) or {}).get("normalized", 0.0)),
             ),
         )
         reasons = sorted(value.pop("_reasons"))

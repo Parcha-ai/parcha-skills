@@ -1413,6 +1413,22 @@ class PassageProjectionTests(unittest.TestCase):
         # A document dense carried keeps the dense range first (stable tie
         # order: dense, lexical, exact when the arms agree).
         self.assertEqual(by_document["h"]["matching_ranges"][0]["kind"], "dense")
+        # An exact-identifier range on its own passage never leads while a
+        # prose arm has one, however strong the identifier hit.
+        dense = [row("k", "3", "dense prose about the eval evidence", 0.55)] + [
+            row(chr(ord("a") + index), str(index % 10), "filler", 0.90 - index * 0.01) for index in range(5)
+        ]
+        sparse = [row("k", "4", "tool output: run_id=abc123", 5.0)]
+        results = collapse_document_candidates(
+            (("dense", 0.65, dense), ("passage-lexical", 0.10, []), ("sparse-exact", 0.25, sparse)), limit=20,
+        )
+        k_ranges = next(r for r in results if r["logical_document_id"][5] == "k")["matching_ranges"]
+        self.assertEqual([item["kind"] for item in k_ranges], ["dense", "sparse-exact"])
+        only_sparse = collapse_document_candidates(
+            (("dense", 0.65, dense[1:]), ("passage-lexical", 0.10, []), ("sparse-exact", 0.25, sparse)), limit=20,
+        )
+        k_only = next(r for r in only_sparse if r["logical_document_id"][5] == "k")["matching_ranges"]
+        self.assertEqual([item["kind"] for item in k_only], ["sparse-exact"])
 
     def test_hybrid_ranges_preserve_passage_pointer_when_sparse_scores_crowd(
         self,
