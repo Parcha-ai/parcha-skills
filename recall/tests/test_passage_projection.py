@@ -1365,6 +1365,55 @@ class PassageProjectionTests(unittest.TestCase):
         self.assertNotIn("_score", results[0])
         self.assertNotIn("_ranges", results[0])
 
+    def test_matching_ranges_lead_with_the_arm_that_carried_the_document(
+        self,
+    ) -> None:
+        # The reranker judges most documents by their first range. Live: a
+        # document fused at rank 1 (lexical 2, exact 1) fell to 11 once a
+        # dense window pass added a rank-338 passage for it, because the
+        # ranges were listed in a fixed arm order and the weak dense passage
+        # took the lead. The strongest arm (normalized leg score) leads.
+        def row(document: str, passage: str, kind_text: str, score: float) -> dict:
+            return {
+                "source_id": "source:test",
+                "logical_document_id": "ldoc_" + document * 32,
+                "revision": 1,
+                "native_parent_id": "session:test",
+                "first_occurred_at": "2026-07-27T00:00:00Z",
+                "last_occurred_at": "2026-07-27T00:10:00Z",
+                "manifest_object_key": "objects/01/" + "a" * 64,
+                "manifest_content_sha256": "b" * 64,
+                "passage_id": "psg_" + passage * 32,
+                "passage_ordinal": 1,
+                "spans": [{"record_ordinal": 1}],
+                "receipts": [f"recall://source:test/{passage}?rev=1#item=0"],
+                "text_redacted": kind_text,
+                "score": score,
+            }
+
+        # Document "g": dense sees it at the bottom of a deep pool, lexical
+        # and exact at the top. Document "h": dense-only, strong.
+        dense = [row("h", "1", "strong dense neighbour", 0.90)] + [
+            row(chr(ord("a") + index), str(index % 10), "filler", 0.80 - index * 0.01)
+            for index in range(6)
+        ] + [row("g", "7", "weak dense window hit", 0.20)]
+        lexical = [row("g", "8", "greptile flagged the P2 review", 12.0), row("h", "9", "other", 3.0)]
+        sparse = [row("g", "8", "greptile flagged the P2 review", 2.4)]
+
+        results = collapse_document_candidates(
+            (("dense", 0.65, dense), ("passage-lexical", 0.10, lexical), ("sparse-exact", 0.25, sparse)),
+            limit=20,
+        )
+        by_document = {result["logical_document_id"][5]: result for result in results}
+        g_kinds = [item["kind"] for item in by_document["g"]["matching_ranges"]]
+        # Lexical and exact share the passage, so they merge into one range.
+        self.assertIn(g_kinds[0], {"passage-lexical", "sparse-exact"}, g_kinds)
+        self.assertEqual(g_kinds[-1], "dense", g_kinds)
+        self.assertEqual(by_document["g"]["matching_ranges"][0]["text"], "greptile flagged the P2 review")
+        # A document dense carried keeps the dense range first (stable tie
+        # order: dense, lexical, exact when the arms agree).
+        self.assertEqual(by_document["h"]["matching_ranges"][0]["kind"], "dense")
+
     def test_hybrid_ranges_preserve_passage_pointer_when_sparse_scores_crowd(
         self,
     ) -> None:
