@@ -558,6 +558,7 @@ class ActiveSlice:
         self.slack: Any = slack
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._workers: dict[str, threading.Thread] = {}
 
     # -- binding management (CLI) ------------------------------------------------
 
@@ -708,15 +709,29 @@ class ActiveSlice:
 
     # -- scheduling -----------------------------------------------------------------
 
-    def run_once(self) -> int:
-        """Drive every endpoint with ready work through one attempt. Returns count."""
+    def run_once(self, *, concurrent: bool = False) -> int:
+        """Drive every endpoint with ready work through one attempt. Returns count.
+
+        ``concurrent``: each endpoint's attempt runs on its own worker thread, so an hour of
+        work in one thread never holds up a reply in another (2026-09-16: a running turn on
+        one thread kept every other thread's message queued). The store's one-accepted-
+        attempt-per-endpoint gate keeps a single endpoint serial. Synchronous by default for
+        callers that want the receipt before returning (tests, drains).
+        """
         driven = 0
         for endpoint_id in self.runtime.endpoints_with_ready_turns():
+            if concurrent and endpoint_id in self._workers and self._workers[endpoint_id].is_alive():
+                continue
             attempt = self.runtime.schedule_next(endpoint_id)
             if attempt is None:
                 continue
             driven += 1
-            self._drive(attempt)
+            if concurrent:
+                worker = threading.Thread(target=self._drive, args=(attempt,), name=f"tether-turn-{endpoint_id[-6:]}", daemon=True)
+                self._workers[endpoint_id] = worker
+                worker.start()
+            else:
+                self._drive(attempt)
         return driven
 
     def _drive(self, attempt: dict[str, Any]) -> None:
@@ -1071,13 +1086,20 @@ class ActiveSlice:
         harness_args = self.settings.claude_resume_args if kind == "claude" else self.settings.codex_resume_args
         args = tuple(a for a in harness_args if a != "--resume")
         started = herdr.agent_start(name, kind=kind, pane_id=pane_id, args=args)
-        if started["status"] == "blocked":
+        status = started["status"]
+        for _ in range(3):  # startup dialogs come one after another: folder trust, bypass warning
+            if status != "blocked":
+                break
             screen = herdr.agent_read(name)
             if "trust this folder" in screen and self._managed_cwd(cwd):
                 herdr.send_keys(name, "down", "enter")   # Claude's folder-trust dialog on a fresh cwd
-                herdr.agent_wait(name, timeout_ms=30000)
+            elif "Bypass Permissions mode" in screen and "--dangerously-skip-permissions" in args:
+                herdr.send_keys(name, "down", "enter")   # the operator configured the flag; this is its one-time consent
             else:
                 raise BrokerRefused("agent_blocked", screen.strip()[-300:] or "the agent is waiting on a dialog")
+            status = str(herdr.agent_wait(name, timeout_ms=30000).get("agent_status") or "")
+        if status == "blocked":
+            raise BrokerRefused("agent_blocked", herdr.agent_read(name).strip()[-300:])
         session_id = ""
         for attempt in range(12):  # the integration hook reports the id within a second of start
             session_id = herdr.session_id(name)
@@ -1353,7 +1375,7 @@ class ActiveSlice:
         while not self._stop.is_set():
             try:
                 heartbeat.write_text(str(time.time()), encoding="utf-8")
-                self.run_once()
+                self.run_once(concurrent=True)
             except Exception:
                 logger.error("tether: scheduler pass failed", exc_info=True)
             self._stop.wait(self.settings.poll_interval_seconds)

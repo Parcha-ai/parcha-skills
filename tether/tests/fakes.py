@@ -278,7 +278,7 @@ FAKE_HERDR = textwrap.dedent(
         name = argv[2]; kind = opt("--kind"); pane = opt("--pane"); state["n"] += 1
         wid = pane.split(":")[0]
         tab = next((t for t, v in state["tabs"].items() if v["workspace_id"] == wid), f"{wid}:t1")
-        blocked = kind == "claude" and os.environ.get("FAKE_HERDR_TRUST") == "1"
+        blocked = kind == "claude" and (os.environ.get("FAKE_HERDR_TRUST") == "1" or os.environ.get("FAKE_HERDR_BYPASS") == "1")
         session = f"{kind}-sess-{state['n']}" if (kind == "claude" or os.environ.get("FAKE_HERDR_CODEX_SESSION") == "1") else ""
         state["agents"][name] = {"name": name, "kind": kind, "pane_id": pane, "tab_id": tab, "workspace_id": wid,
                                  "cwd": state["tabs"].get(tab, {}).get("cwd", ""), "status": "blocked" if blocked else "idle",
@@ -298,7 +298,11 @@ FAKE_HERDR = textwrap.dedent(
         if a["status"] == "blocked" and a.get("prompts"):
             a["answered"] = True  # a dialog inside a turn: `agent wait` reports what happened next
         elif key == "enter" and a["status"] == "blocked":
-            a["status"] = "idle"; a["session"] = a.get("pending_session", "")
+            # startup dialogs: trust (FAKE_HERDR_TRUST) then bypass consent (FAKE_HERDR_BYPASS), one Enter each
+            a["dialogs_done"] = a.get("dialogs_done", 0) + 1
+            wanted = int(os.environ.get("FAKE_HERDR_TRUST") == "1") + int(os.environ.get("FAKE_HERDR_BYPASS") == "1")
+            if a["dialogs_done"] >= wanted:
+                a["status"] = "idle"; a["session"] = a.get("pending_session", "")
         save(); out({"type": "ok"})
     if group == "agent" and cmd == "prompt":
         a = resolve(argv[2]); text = argv[3]
@@ -333,7 +337,12 @@ FAKE_HERDR = textwrap.dedent(
                 a.setdefault("typed", []).append(argv[3]); a["answered"] = True
         save(); out({"type": "ok"})
     if group == "agent" and cmd == "read":
-        resolve(argv[2]); print(os.environ.get("FAKE_HERDR_SCREEN", "\\u276f")); sys.exit(0)
+        a = resolve(argv[2])
+        bypass_next = os.environ.get("FAKE_HERDR_BYPASS") == "1" and (
+            os.environ.get("FAKE_HERDR_TRUST") != "1" or a.get("dialogs_done", 0) >= 1)
+        if a["status"] == "blocked" and not a.get("prompts") and bypass_next:
+            print("WARNING: Claude Code running in Bypass Permissions mode"); print("  > No, exit"); print("    Yes, I accept"); sys.exit(0)
+        print(os.environ.get("FAKE_HERDR_SCREEN", "\\u276f")); sys.exit(0)
     fail("unknown_command", " ".join(argv))
     """
 )

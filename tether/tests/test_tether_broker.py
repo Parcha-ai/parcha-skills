@@ -324,6 +324,27 @@ class BrokerTest(unittest.TestCase):
         self.assertIn("agent send-keys y enter", self.herdr_calls())
         self.assertEqual(spawned["session_id"], "claude-sess-4")
 
+    def test_spawn_accepts_the_bypass_warning_only_when_the_flag_is_configured(self):
+        client = self.herdr_client()
+        self.slice.herdr_factory = lambda: client
+        os.environ["FAKE_HERDR_BYPASS"] = "1"
+        self.addCleanup(os.environ.pop, "FAKE_HERDR_BYPASS", None)
+        managed = pathlib.Path(self.temp.name) / "worktrees" / "gre-2"
+        managed.mkdir(parents=True)
+        base = self.slice.settings
+        self.slice.settings = type(base)(**{**base.__dict__, "claude_resume_args": ("--model", "x"),
+                                            "extra": {**base.extra, "herdr_trusted_roots": [str(managed.parent)]}})
+        refused = self.call(op="spawn", harness="claude", task="t", cwd=str(managed), channel_id="C1", thread_ts="100.7", tab="a")
+        self.assertEqual(refused["code"], "agent_blocked", "no bypass flag configured: the warning is not ours to accept")
+        self.slice.settings = type(base)(**{**base.__dict__, "claude_resume_args": ("--dangerously-skip-permissions",),
+                                            "extra": {**base.extra, "herdr_trusted_roots": [str(managed.parent)]}})
+        os.environ["FAKE_HERDR_TRUST"] = "1"
+        os.environ["FAKE_HERDR_SCREEN"] = "Is this a project you created or one you trust?\n > No, exit\n   Yes, I trust this folder"
+        spawned = self.call(op="spawn", harness="claude", task="t", cwd=str(managed), channel_id="C1", thread_ts="100.8", tab="b")
+        self.assertTrue(spawned["ok"], spawned)
+        self.assertEqual(self.herdr_calls().count("agent send-keys b enter"), 2, "trust, then the bypass consent")
+        self.assertEqual(spawned["session_id"], "claude-sess-4")
+
     def test_spawn_without_herdr_is_unchanged(self):
         self.slice.herdr_factory = lambda: None
         self.slice._create_session = lambda k, c, t: "sess-plain"
