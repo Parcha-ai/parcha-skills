@@ -395,6 +395,20 @@ class TurbopufferProjector:
                     claim["generation"],
                 ),
             )
+            if max(0, retired.rowcount) != 1 and claim["reason"] == "backfill":
+                # A hot month: live ingest moved the generation while the
+                # full pass ran (live: a September row reached generation
+                # 222 and re-uploaded 86k passages every pass). Everything
+                # up to the watermark is written, so the next pass only
+                # needs the passages created after it: downgrade the row to
+                # an incremental reason instead of redoing the month.
+                connection.execute(
+                    """UPDATE search_projection_outbox
+                          SET reason='logical-update'
+                        WHERE tenant_id=%s AND source_id=%s AND month=%s
+                          AND reason='backfill'""",
+                    (claim["tenant_id"], claim["source_id"], claim["month"]),
+                )
         return max(0, retired.rowcount) == 1
 
     # -- turbopuffer writes --------------------------------------------------
