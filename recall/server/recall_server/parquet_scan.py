@@ -1688,10 +1688,15 @@ class CanonicalParquetScanProjector:
                                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
                                 member_rows,
                             )
+                # Only the dirt this build read: rows queued after the claim
+                # (a document that changed while the month was being built)
+                # stay for the next delta. The whole-month marker a seed
+                # left is consumed here whatever the queue does below.
                 connection.execute(
                     """DELETE FROM canonical_parquet_scan_dirty_documents
-                        WHERE tenant_id=%s AND source_id=%s AND bucket_start=%s""",
-                    scope,
+                        WHERE tenant_id=%s AND source_id=%s AND bucket_start=%s
+                          AND queued_at<=%s""",
+                    (*scope, candidate.changed_at),
                 )
                 deleted = connection.execute(
                     """DELETE FROM canonical_parquet_scan_queue
@@ -1699,9 +1704,13 @@ class CanonicalParquetScanProjector:
                           AND generation=%s""",
                     (*scope, candidate.generation),
                 )
-                if deleted.rowcount != 1:
-                    raise ParquetScanError("parquet_scan_queue_conflict")
-        return "committed"
+        # The generation moved while the month was being built: the parts
+        # committed above are right for what was read, the queue row stays
+        # with its newer generation and dirt, and the next cycle plans a
+        # delta for that dirt. Raising here rolled the marker deletion back
+        # too, so a month that kept ingesting rebuilt in full every cycle
+        # (live 2026-09-16: one month twice in seven minutes).
+        return "committed" if deleted.rowcount == 1 else "requeued"
 
     def _over_fragmented(
         self,
@@ -1815,8 +1824,10 @@ class CanonicalParquetScanProjector:
                 return False
             upload = self._build(candidate)
             status = self._commit(candidate, upload)
-            if status == "committed":
+            if status in ("committed", "requeued"):
                 totals["committed"] += 1
+                if status == "requeued":
+                    totals["requeued"] = totals.get("requeued", 0) + 1
                 totals["rows"] += sum(upload.row_counts.values()) if upload.created else 0
                 totals["fragments_rewritten"] += (
                     len(upload.references) if upload.created else 0

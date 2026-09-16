@@ -1208,6 +1208,43 @@ class ParquetFragmentDeltaTest(unittest.TestCase):
         )
         self.assertEqual(projector._commit(candidate, upload), "stale")
 
+    def test_commit_with_a_moved_generation_keeps_newer_dirt_and_the_queue_row(self):
+        # Live 2026-09-16: a month that kept ingesting during its rebuild
+        # raised on the queue's generation check, the rollback restored the
+        # seed marker, and the month rebuilt in full every cycle.
+        candidate = _candidate()
+        live = [_live_shard(dataset, 0) for dataset in SCAN_DATASETS]
+
+        class _Moved(_CommitConnection):
+            def execute(self, query, parameters=None):
+                if "DELETE FROM canonical_parquet_scan_queue" in query:
+                    self.statements.append((query, parameters))
+                    return _CommitResult(rowcount=0)
+                return super().execute(query, parameters)
+
+        store = _CommitStore(live, candidate)
+        store.connection = _Moved(live, candidate)
+        projector = CanonicalParquetScanProjector(store, _Evidence(None))
+        upload = ScanUpload(
+            "a" * 64,
+            {("records", 1): _live_shard("records", 1)},
+            {("records", 1): 1},
+            None,
+            None,
+            True,
+            removed=(),
+            mode="delta",
+        )
+        self.assertEqual(projector._commit(candidate, upload), "requeued")
+        dirty_deletes = [
+            (query, parameters) for query, parameters in store.connection.statements
+            if "DELETE FROM canonical_parquet_scan_dirty_documents" in query
+        ]
+        self.assertEqual(len(dirty_deletes), 1)
+        self.assertIn("queued_at<=%s", dirty_deletes[0][0])
+        self.assertEqual(dirty_deletes[0][1][-1], candidate.changed_at)
+        self.assertTrue(any("INSERT INTO canonical_parquet_scan_shards" in q for q, _ in store.connection.statements))
+
     def test_compaction_when_fragments_exceed_the_cap(self):
         documents = [_month_document(f"document:{index}") for index in range(4)]
         catalog = _catalog(
