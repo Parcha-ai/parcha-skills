@@ -10,6 +10,7 @@ import urllib.error
 from pathlib import Path
 from unittest import mock
 
+from evals.retrieval import EvaluationInputError
 from evals.systems_card import accuracy, churn, corpus, cost, forget, latency
 from evals.systems_card.availability import AvailabilityProbe
 from evals.systems_card.mcp_client import McpClient, McpClientError, load_profile
@@ -244,6 +245,42 @@ class ProbeTest(unittest.TestCase):
         self.assertEqual(result.metrics["scope_enumerated_documents"], 6)
         self.assertEqual(result.metrics["scan_distinct_documents"], 6)
         self.assertEqual(result.metrics["scope_scan_agreement"], 1.0)
+
+    def test_scan_consistency_applies_the_window_to_the_scan_sql(self):
+        # recall_scan uses the filters only to pick which source-month
+        # buckets to stage; without the same predicate in SQL the program
+        # counts every document in those buckets while recall_scope counts
+        # only the ones overlapping the window. Live 2026-09-16: 2,839 vs
+        # 1,827, agreement 0.64 on a corpus that agreed to within 2.6%.
+        brain = FakeBrain(default_tools())
+        client = McpClient("https://brain.invalid/mcp", "synthetic", opener=brain)
+        context = ProbeContext(
+            client=client, base_url="https://brain.invalid/mcp", options={},
+            since="2026-09-06", until="2026-09-16",
+            http_get=lambda url, t: (200, b'{"status":"ready"}'),
+        )
+        result = corpus.ScanConsistencyProbe().run(context)
+        self.assertEqual(result.status, "ok")
+        program = next(args["program"] for name, args in brain.calls if name == "recall_scan")
+        self.assertIn("last_occurred_at >= TIMESTAMP '2026-09-06 00:00:00'", program)
+        self.assertIn("first_occurred_at <= TIMESTAMP '2026-09-16 23:59:59'", program)
+        # The same window the scope side filtered on.
+        scope_filters = next(args["filters"] for name, args in brain.calls if name == "recall_scope")
+        self.assertEqual(scope_filters, {"since": "2026-09-06", "until": "2026-09-16"})
+
+    def test_scan_consistency_without_a_window_has_no_predicate(self):
+        brain = FakeBrain(default_tools())
+        corpus.ScanConsistencyProbe().run(make_context(brain))
+        program = next(args["program"] for name, args in brain.calls if name == "recall_scan")
+        self.assertNotIn("WHERE", program)
+
+    def test_scan_window_bound_must_be_a_date_or_timestamp(self):
+        self.assertEqual(corpus._sql_timestamp("2026-09-06"), "2026-09-06 00:00:00")
+        self.assertEqual(corpus._sql_timestamp("2026-09-06", end_of_day=True), "2026-09-06 23:59:59")
+        self.assertEqual(corpus._sql_timestamp("2026-09-06T12:30:00Z"), "2026-09-06 12:30:00")
+        for bad in ("2026-09-06'; DROP TABLE x--", "yesterday", "", "2026-13-99x"):
+            with self.assertRaises(EvaluationInputError):
+                corpus._sql_timestamp(bad)
 
     def test_authorization_probe_flags_leaks(self):
         context = make_context(FakeBrain(default_tools()))
