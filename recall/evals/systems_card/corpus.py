@@ -7,13 +7,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import datetime, timezone
 from typing import Any
 
+from ..retrieval import EvaluationInputError
 from .model import Gate, ProbeResult
 from .probes import ProbeContext
 
 PASSAGES = "read_parquet('/datasets/*/*/passages-part-*.parquet', union_by_name=true)"
+_DATE_ONLY_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?")
 
 FRESHNESS_PROGRAM = (
     "duckdb -json -c \"SELECT source_id, count(*) AS passages, count(DISTINCT logical_document_id) AS docs, "
@@ -80,6 +84,21 @@ def _age_hours(newest: str | None, now: datetime) -> float | None:
     if stamp.tzinfo is None:
         stamp = stamp.replace(tzinfo=timezone.utc)
     return max(0.0, (now - stamp).total_seconds() / 3600.0)
+
+
+def _sql_timestamp(value: str, *, end_of_day: bool = False) -> str:
+    """``2026-09-06`` or an ISO instant as a DuckDB timestamp literal.
+
+    Rejects anything else: the value is interpolated into SQL, and the card
+    must never build a program from an unvalidated string.
+    """
+
+    text = str(value).strip().replace("Z", "").replace("T", " ")
+    if _DATE_ONLY_RE.fullmatch(text):
+        return f"{text} 23:59:59" if end_of_day else f"{text} 00:00:00"
+    if _TIMESTAMP_RE.fullmatch(text):
+        return text
+    raise EvaluationInputError(f"scan window bound is not a date or timestamp: {value!r}")
 
 
 def _filters(context: ProbeContext) -> dict[str, Any]:
@@ -185,9 +204,23 @@ class ScanConsistencyProbe:
         enumerated = len(scope_ids)
         if scope_total is None:
             scope_total = enumerated
+        # The window must be applied in SQL too. ``recall_scan`` uses the
+        # filters only to choose which source-month buckets to stage; the
+        # program then sees every document in those buckets, including the
+        # ones whose window falls outside the filter. ``recall_scope``
+        # applies the window per document, so an unfiltered count compares
+        # two different populations (live 2026-09-16: 2,839 staged vs 1,827
+        # enumerated, agreement 0.64 with a corpus that actually agreed).
+        # Same predicate as the scope side: a document overlaps the window.
+        window: list[str] = []
+        if context.since:
+            window.append(f"last_occurred_at >= TIMESTAMP '{_sql_timestamp(context.since)}'")
+        if context.until:
+            window.append(f"first_occurred_at <= TIMESTAMP '{_sql_timestamp(context.until, end_of_day=True)}'")
+        predicate = (" WHERE " + " AND ".join(window)) if window else ""
         program = (
             "duckdb -json -c \"SELECT count(DISTINCT logical_document_id) AS docs "
-            f"FROM {PASSAGES}\""
+            f"FROM {PASSAGES}{predicate}\""
         )
         scan = context.client.call_tool(
             "recall_scan", {"filters": filters, "program": program, "timeout_seconds": 120}, timeout_seconds=200,
