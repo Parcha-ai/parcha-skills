@@ -166,6 +166,14 @@ class _Catalog:
                 if not (row["source_id"] == source and row["passage_id"] in ids)
             ]
             return _Result(rowcount=before - len(self.tombstones))
+        if "FROM canonical_passages passage" in folded and "passage.passage_id=ANY(" in folded:
+            _tenant, ids = params
+            wanted = set(ids)
+            page = sorted(
+                (row for row in self.passages if row["live"] and row["passage_id"] in wanted),
+                key=lambda row: (row["first_occurred_at"], row["passage_id"]),
+            )
+            return _Result([dict(row) for row in page])
         if "FROM canonical_passages passage" in folded:
             _tenant, source, start, end, since, _since, cursor_time, cursor_id, limit = params
             page = sorted(
@@ -282,6 +290,24 @@ class RowShapeAndBatchingTest(unittest.TestCase):
         second = projector.drain(tenant_id=TENANT, max_months=1)
         self.assertEqual((second["months"], second["pending"], second["status"]), (1, 0, "complete"))
         self.assertEqual(len(client.namespace(SETTINGS.namespace(TENANT)).rows), 2)
+
+
+class UpsertByIdTest(unittest.TestCase):
+    def test_reconcile_repair_writes_the_live_passages_among_the_ids_in_batches(self) -> None:
+        catalog = _Catalog()
+        catalog.passages = [_passage(1, 7, 3), _passage(2, 7, 9), _passage(3, 8, 20), _passage(4, 8, 2)]
+        catalog.passages[2]["live"] = False
+        projector, client = _projector(catalog)
+        ids = [row["passage_id"] for row in catalog.passages] + ["psg_" + "f" * 32]
+
+        written = projector.upsert_passages(TENANT, ids)
+
+        self.assertEqual(written, 3)
+        namespace = client.namespace(SETTINGS.namespace(TENANT))
+        self.assertEqual(sorted(namespace.rows), sorted(row["passage_id"] for row in catalog.passages if row["live"]))
+        self.assertEqual(namespace.rows[_passage(4, 8, 2)["passage_id"]]["month"], "2026-08")
+        self.assertEqual(len(namespace.writes), 2)  # write_batch_rows (2): three rows, two writes
+        self.assertEqual(projector.upsert_passages(TENANT, []), 0)
 
 
 class TombstoneTest(unittest.TestCase):

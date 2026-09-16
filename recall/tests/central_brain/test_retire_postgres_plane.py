@@ -652,12 +652,29 @@ class SearchPlaneReconcileTest(unittest.TestCase):
         )
         self.assertEqual(len(ns.rows), 5)
         self.assertFalse(any(isinstance(value, str) and value.startswith("psg_") for value in report.values()))
+        class _Projector:
+            calls: list[tuple[str, list[str]]] = []
+
+            def upsert_passages(self, tenant_id, passage_ids):
+                self.calls.append((tenant_id, list(passage_ids)))
+                ns.write(upsert_rows=[{"id": value, "text": "t", "source_id": "codex:linux:test", "policy_fingerprint": "fp"} for value in passage_ids])
+                return len(passage_ids)
+
         applied = search_plane_reconcile(
             self._store(live), settings, tenant_id="tenant:test", policy_fingerprint="fp", client=client,
-            apply=True, delete_rows=1,
+            apply=True, delete_rows=1, projector=_Projector(),
         )
-        self.assertEqual((applied["stale"], applied["deleted"], applied["applied"]), (2, 2, True))
-        self.assertEqual(set(ns.rows), set(live[:3]))
+        self.assertEqual(
+            (applied["stale"], applied["deleted"], applied["missing"], applied["written"], applied["applied"]),
+            (2, 2, 1, 1, True),
+        )
+        self.assertEqual(_Projector.calls, [("tenant:test", [live[3]])])
+        self.assertEqual(set(ns.rows), set(live))
+        with self.assertRaises(ValueError):
+            search_plane_reconcile(
+                self._store(live + ["psg_" + "9" * 32]), settings, tenant_id="tenant:test", policy_fingerprint="fp",
+                client=client, apply=True,
+            )
 
     def test_a_namespace_never_written_reports_everything_missing(self) -> None:
         settings = TurbopufferSettings(api_key="synthetic-key")
