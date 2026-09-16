@@ -47,7 +47,10 @@ class TurbopufferSettings:
     write_batch_rows: int = 32
     query_timeout_seconds: float = 8.0
     tokens_per_minute: int = 1_000_000
-    write_concurrency: int = 4
+    # One write in flight: the plane limits ~100k embedding tokens per
+    # request and the org per minute; four concurrent 32-row batches were
+    # 429 on every other request (live: 39 retries in 8 min, 7-min cycles).
+    write_concurrency: int = 1
 
     def namespace(self, tenant_id: str) -> str:
         digest = hashlib.sha256(tenant_id.encode()).hexdigest()[:20]
