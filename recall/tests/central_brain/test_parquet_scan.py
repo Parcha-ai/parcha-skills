@@ -12,6 +12,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from recall_server.parquet_scan import (
+    FRAGMENT_TARGET_BYTES,
     SCAN_DATASETS,
     SCAN_DIRTY_ALL,
     CanonicalParquetScanProjector,
@@ -1229,6 +1230,30 @@ class ParquetFragmentDeltaTest(unittest.TestCase):
         self.assertEqual(result.mode, "compaction")
         self.assertEqual(set(result.removed), set(catalog.shards))
         self.assertTrue(result.created)
+
+    def test_full_sized_parts_above_the_cap_are_not_fragmented(self):
+        # Live: a month of 410 parts at the 32 MiB target compacted every
+        # cycle (15-20 min, ~13 GB each) and came back with 410 parts. Parts
+        # already at the target size are not fragmentation.
+        documents = [_month_document(f"document:{index}") for index in range(4)]
+        catalog = _catalog(
+            {index: [document] for index, document in enumerate(documents)},
+            dirty={"document:3"},
+        )
+        for row in catalog.shards.values():
+            row["size_bytes"] = FRAGMENT_TARGET_BYTES
+        self.assertFalse(catalog.fragmented(3))
+        self.assertTrue(_catalog({index: [d] for index, d in enumerate(documents)}).fragmented(3))
+        changed = [*documents[:3], {**documents[3], "document_content_sha256": "e" * 64}]
+        archive = _DocumentArchive({f"document:{index}": 1 for index in range(4)})
+        result = _FragmentProbe(
+            changed, catalog, archive, compaction_fragments=3
+        )._build(_candidate())
+        self.assertEqual(result.mode, "delta")
+        # Half-full parts, twice what the bytes need: fragmented.
+        for row in catalog.shards.values():
+            row["size_bytes"] = FRAGMENT_TARGET_BYTES // 4
+        self.assertTrue(catalog.fragmented(3))
 
     def test_below_the_cap_a_delta_stays_a_delta(self):
         documents = [_month_document(f"document:{index}") for index in range(3)]
