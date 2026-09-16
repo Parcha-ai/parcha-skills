@@ -47,7 +47,7 @@ from recall_server.projection_worker import (  # noqa: E402
     run_embedding_worker,
     run_projection_worker,
 )
-from recall_server.search_plane_status import search_plane_status  # noqa: E402
+from recall_server.search_plane_status import namespace_ids, search_plane_reconcile, search_plane_status  # noqa: E402
 from recall_server.turbopuffer_plane import TurbopufferSettings  # noqa: E402
 from tests.central_brain.fake_turbopuffer import FakeTurbopuffer  # noqa: E402
 from tests.central_brain.test_projection_worker import (  # noqa: E402
@@ -599,3 +599,70 @@ class CliTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SearchPlaneReconcileTest(unittest.TestCase):
+    """Exact drift over ids: stale rows go on --apply, missing ids are the outbox's."""
+
+    def _store(self, live_ids: list[str]) -> mock.MagicMock:
+        store = mock.MagicMock(search_plane="turbopuffer")
+        connection = mock.MagicMock()
+
+        def execute(sql: str, params=()):
+            cursor = mock.MagicMock()
+            if "passage.passage_id AS passage_id" in sql:
+                cursor.fetchall.return_value = [{"passage_id": value} for value in live_ids]
+            else:
+                cursor.fetchall.return_value = []
+            return cursor
+
+        connection.execute.side_effect = execute
+        store.connect.return_value.__enter__.return_value = connection
+        return store
+
+    def _seed(self, client, settings, ids):
+        ns = client.namespace(settings.namespace("tenant:test"))
+        ns.write(upsert_rows=[{"id": value, "text": "t", "source_id": "codex:linux:test", "policy_fingerprint": "fp"} for value in ids])
+        return ns
+
+    def test_pages_every_id_without_attributes(self) -> None:
+        settings = TurbopufferSettings(api_key="synthetic-key")
+        client = FakeTurbopuffer(settings)
+        ids = [f"psg_{index:032d}" for index in range(7)]
+        ns = self._seed(client, settings, ids)
+        self.assertEqual(namespace_ids(ns, page_rows=3), set(ids))
+        pages = [q for q in ns.queries if q["rank_by"] == ("id", "asc")]
+        self.assertEqual(len(pages), 3)
+        self.assertEqual(pages[0]["include_attributes"], [])
+        self.assertNotIn("filters", pages[0])
+        self.assertEqual(pages[1]["filters"], ("id", "Gt", ids[2]))
+
+    def test_reports_stale_and_missing_and_deletes_only_on_apply(self) -> None:
+        settings = TurbopufferSettings(api_key="synthetic-key")
+        client = FakeTurbopuffer(settings)
+        live = [f"psg_{index:032d}" for index in range(4)]
+        stale = ["psg_" + "f" * 32, "psg_" + "e" * 32]
+        ns = self._seed(client, settings, live[:3] + stale)  # live[3] is missing from the plane
+        report = search_plane_reconcile(
+            self._store(live), settings, tenant_id="tenant:test", policy_fingerprint="fp", client=client,
+        )
+        self.assertEqual(
+            {k: report[k] for k in ("live_passages", "namespace_rows", "stale", "missing", "applied", "deleted")},
+            {"live_passages": 4, "namespace_rows": 5, "stale": 2, "missing": 1, "applied": False, "deleted": 0},
+        )
+        self.assertEqual(len(ns.rows), 5)
+        self.assertFalse(any(isinstance(value, str) and value.startswith("psg_") for value in report.values()))
+        applied = search_plane_reconcile(
+            self._store(live), settings, tenant_id="tenant:test", policy_fingerprint="fp", client=client,
+            apply=True, delete_rows=1,
+        )
+        self.assertEqual((applied["stale"], applied["deleted"], applied["applied"]), (2, 2, True))
+        self.assertEqual(set(ns.rows), set(live[:3]))
+
+    def test_a_namespace_never_written_reports_everything_missing(self) -> None:
+        settings = TurbopufferSettings(api_key="synthetic-key")
+        client = FakeTurbopuffer(settings)
+        report = search_plane_reconcile(
+            self._store(["psg_" + "1" * 32]), settings, tenant_id="tenant:test", policy_fingerprint="fp", client=client,
+        )
+        self.assertEqual((report["namespace_rows"], report["stale"], report["missing"]), (0, 0, 1))

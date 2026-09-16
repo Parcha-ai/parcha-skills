@@ -63,7 +63,7 @@ from .mcp_conformance import (
 )
 from .rerank import build_rerank_runtime
 from .search_outbox import search_outbox_pending, seed_search_outbox
-from .search_plane_status import search_plane_status
+from .search_plane_status import search_plane_reconcile, search_plane_status
 from .turbopuffer_plane import (
     TurbopufferConfigError,
     TurbopufferSettings,
@@ -1772,6 +1772,14 @@ def main() -> None:
     search_plane_status_parser.add_argument("--tenant", required=True)
     search_plane_status_parser.add_argument("--target-tokens", type=int, default=1024)
     search_plane_status_parser.add_argument("--overlap-tokens", type=int, default=128)
+    search_plane_reconcile_parser = sub.add_parser(
+        "search-plane-reconcile",
+        help="Exact namespace-vs-catalog drift; --apply deletes stale rows (counts only)",
+    )
+    search_plane_reconcile_parser.add_argument("--tenant", required=True)
+    search_plane_reconcile_parser.add_argument("--apply", action="store_true")
+    search_plane_reconcile_parser.add_argument("--target-tokens", type=int, default=1024)
+    search_plane_reconcile_parser.add_argument("--overlap-tokens", type=int, default=128)
     projection_worker = sub.add_parser("projection-worker")
     projection_worker.add_argument("--tenant", required=True)
     projection_worker.add_argument("--target-tokens", type=int, default=1024)
@@ -2471,6 +2479,29 @@ def main() -> None:
                         overlap_tokens=args.overlap_tokens,
                     ).fingerprint,
                     client=_search_plane_client(search_settings),
+                ),
+                sort_keys=True,
+            )
+        )
+    elif args.command == "search-plane-reconcile":
+        # H3-d' follow-up: exact drift, stale rows deleted on --apply.
+        try:
+            search_settings = turbopuffer_settings_from_env(required=True)
+        except TurbopufferConfigError as error:
+            print(json.dumps({"status": "error", "error": str(error)}, sort_keys=True))
+            sys.exit(2)
+        print(
+            json.dumps(
+                search_plane_reconcile(
+                    store,
+                    search_settings,
+                    tenant_id=args.tenant,
+                    policy_fingerprint=PassagePolicy(
+                        target_tokens=args.target_tokens,
+                        overlap_tokens=args.overlap_tokens,
+                    ).fingerprint,
+                    client=_search_plane_client(search_settings),
+                    apply=bool(args.apply),
                 ),
                 sort_keys=True,
             )
