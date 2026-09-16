@@ -181,6 +181,7 @@ class TetherCliTest(unittest.TestCase):
             plugin / "store.py": 0o600,
             plugin / "session_driver.py": 0o600,
             plugin / "notices.py": 0o600,
+            plugin / "herdr.py": 0o600,
             plugin / "team.md": 0o600,
             plugin / "plugin.yaml": 0o644,
             local_bin / "tether": 0o700,
@@ -380,11 +381,18 @@ class TetherCliTest(unittest.TestCase):
         ) as broker:
             result = self.run_cli(
                 "spawn", "--task-stdin", "--channel", "C07QDVCPWS1", "--thread-ts", "100.1",
+                "--herdr-workspace", "grep.ai", "--tab", "MCP",
                 socket_path=broker.path, input_text=task,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(broker.requests[0]["task"], task)
             self.assertEqual((broker.requests[0]["channel_id"], broker.requests[0]["thread_ts"]), ("C07QDVCPWS1", "100.1"))
+            self.assertEqual((broker.requests[0]["herdr_workspace"], broker.requests[0]["tab"]), ("grep.ai", "MCP"))
+            self.assertNotIn("herdr", broker.requests[0], "herdr placement is automatic unless --no-herdr")
+        with FakeBroker(self.root, lambda _request: self.response({"ok": True, "status": "spawned"})) as broker:
+            plain = self.run_cli("spawn", "--task", "t", "--no-herdr", socket_path=broker.path)
+            self.assertEqual(plain.returncode, 0, plain.stderr)
+            self.assertIs(broker.requests[0]["herdr"], False)
             refused = self.run_cli("spawn", "--task", "t", "--thread-ts", "100.1", socket_path=broker.path)
             self.assertEqual(refused.returncode, 2, refused.stderr)
             self.assertIn("channel_required", refused.stderr + refused.stdout)
@@ -723,7 +731,7 @@ class TetherCliTest(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertIn("ok broker socket is private", payload["checks"])
         self.assertIn(
-            "ok managed install integrity verified (20 files; harness=codex)",
+            "ok managed install integrity verified (21 files; harness=codex)",
             payload["checks"],
         )
         self.assertEqual(payload["status"]["protocol_version"], 6)
@@ -861,7 +869,7 @@ class TetherCliTest(unittest.TestCase):
             result = self.run_cli("doctor", socket_path=broker.path)
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn(
-            "ok managed install integrity verified (27 files; harness=both)",
+            "ok managed install integrity verified (28 files; harness=both)",
             result.stdout,
         )
 

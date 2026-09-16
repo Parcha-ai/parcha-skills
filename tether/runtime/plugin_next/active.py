@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess  # nosec B404 - fixed argv, no shell
 import threading
@@ -26,6 +27,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .broker import BrokerRefused
+from .herdr import Herdr, HerdrError, agent_name_for
 
 
 logger = logging.getLogger("hermes_plugins.tether_next.active")
@@ -66,6 +68,41 @@ def child_env(
                     value = value[:-3]
             env[key] = value
     return env
+
+
+def title_for(task: str) -> str:
+    """A tab label from the ask: first line, mentions and links stripped, 48 chars."""
+    first = next((line.strip() for line in task.splitlines() if line.strip()), "task")
+    first = re.sub(r"<@[A-Z0-9]+>|<https?://[^>]+>|https?://\S+", "", first)
+    first = re.sub(r"\s+([:;,.!?])", r"\1", re.sub(r"\s+", " ", first)).strip(" :-,") or "task"
+    return first[:48].rstrip()
+
+
+def codex_thread_for_cwd(cwd: Path, *, max_age_seconds: float = 900.0) -> str:
+    """The newest Codex thread started in ``cwd`` (rollout metadata), used until Herdr's
+    Codex SessionStart hook is approved and ``agent get`` reports the id itself."""
+    root = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "sessions"
+    now = time.time()
+    best: tuple[float, str] | None = None
+    try:
+        files = list(root.glob("**/rollout-*.jsonl"))
+    except OSError:
+        return ""
+    for path in files:
+        try:
+            age = now - path.stat().st_mtime
+            if age > max_age_seconds:
+                continue
+            with path.open(encoding="utf-8") as handle:
+                head = json.loads(handle.readline() or "{}")
+        except (OSError, ValueError):
+            continue
+        meta = head.get("payload") or {}
+        if str(meta.get("cwd") or "") != str(cwd) or not meta.get("id"):
+            continue
+        if best is None or age < best[0]:
+            best = (age, str(meta["id"]))
+    return best[1] if best else ""
 
 
 def find_transcript(kind: str, session_id: str) -> str | None:
@@ -324,6 +361,9 @@ def load_active_settings(path: Path) -> ActiveSettings:
         codex_driver=str(raw.get("codex_driver") or "app-server"),
         presence=bool(raw.get("presence", True)),
         extra={"default_channel": str(raw.get("default_channel") or ""),
+               "herdr_workspace": str(raw.get("herdr_workspace") or ""),
+               "herdr_session": str(raw.get("herdr_session") or ""),
+               "herdr_trusted_roots": list(raw.get("herdr_trusted_roots") or []),
                "default_cwd": str(raw.get("default_cwd") or "")},
     )
 
@@ -531,10 +571,13 @@ class ActiveSlice:
         thread_ts: str,
         owner_user_id: str,
         spawned: bool = False,
+        herdr: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        source = {"session_id": session_id, "cwd": cwd}
+        source: dict[str, Any] = {"session_id": session_id, "cwd": cwd}
         if spawned:
             source["spawned"] = True  # Tether owns this process: no other writer can hold it
+        if herdr:
+            source["herdr"] = dict(herdr)  # the pane this session lives in; the driver prompts it there
         endpoint = self.runtime.register_endpoint(
             endpoint_key=endpoint_key_for(source_kind, session_id),
             endpoint_kind="detached_native",
@@ -943,24 +986,41 @@ class ActiveSlice:
             raise BrokerRefused("channel_required")
         asked_by = str(request.get("actor") or "").strip()
         who = f"Asked by <@{asked_by}> in Slack. " if asked_by and asked_by != "operator" else ""
-        # Bootstrap only: the session must exist on disk for --resume. The task itself
-        # is admitted as the first turn below, so it runs under the driver with the
-        # normal turn budget and the normal reply path instead of inside this call.
-        bootstrap = (
-            f"Tether bootstrap. {who}This session is being bound to a Slack thread; the task arrives "
-            "as the next message. Reply with exactly: READY"
-        )
-        try:
-            session_id = self._create_session(source_kind, cwd, bootstrap)
-        except Exception as exc:
-            raise BrokerRefused("spawn_failed", str(exc)[:300]) from exc
+        herdr = None if request.get("herdr") is False else self.herdr_factory()
+        placement: dict[str, Any] | None = None
+        if herdr is not None:
+            # The session lives in a Herdr tab: whoever opens Herdr sees it, and the driver
+            # prompts it in that pane. The task is its first turn, like any other.
+            try:
+                placed = self._spawn_in_herdr(herdr, kind=kind, cwd=cwd, task=task, request=request)
+            except HerdrError as exc:
+                raise BrokerRefused("herdr_failed", f"{exc.code}: {exc}"[:300]) from exc
+            session_id, placement = placed["session_id"], placed["herdr"]
+        else:
+            # Bootstrap only: the session must exist on disk for --resume. The task itself
+            # is admitted as the first turn below, so it runs under the driver with the
+            # normal turn budget and the normal reply path instead of inside this call.
+            bootstrap = (
+                f"Tether bootstrap. {who}This session is being bound to a Slack thread; the task arrives "
+                "as the next message. Reply with exactly: READY"
+            )
+            try:
+                session_id = self._create_session(source_kind, cwd, bootstrap)
+            except Exception as exc:
+                raise BrokerRefused("spawn_failed", str(exc)[:300]) from exc
         if not thread_ts:
             root = str(request.get("root_text") or "").strip() or f"On it: {task[:200]}"
             thread_ts = self._post(channel_id, root, None)
         binding = self.bind(
             source_kind=source_kind, session_id=session_id, cwd=str(cwd), team_id=team_id, spawned=True,
-            channel_id=channel_id, thread_ts=thread_ts, owner_user_id=self._owner(request),
+            channel_id=channel_id, thread_ts=thread_ts, owner_user_id=self._owner(request), herdr=placement,
         )
+        if herdr is not None and placement:
+            try:
+                herdr.pane_report_metadata(placement["pane_id"], source="tether",
+                                           tokens={"slack": f"{channel_id}/{thread_ts}"})
+            except HerdrError:
+                logger.warning("tether: could not label pane %s with its thread", placement["pane_id"])
         first_turn = (
             f"{task}\n\n"
             f"{who}Work like the engineer who owns it: investigate, decide, fix, test, open the PR. Do not "
@@ -975,10 +1035,65 @@ class ActiveSlice:
         )
         return {"status": "spawned", "harness": kind, "session_id": session_id, "cwd": str(cwd),
                 "team_id": team_id, "channel_id": channel_id, "thread_ts": thread_ts,
-                "bridge_id": binding["binding_id"], "task_turn": turn["event_key"]}
+                "bridge_id": binding["binding_id"], "task_turn": turn["event_key"],
+                "herdr": placement}
 
     def _create_session(self, source_kind: str, cwd: Path, task: str) -> str:
         return create_session(source_kind, cwd, task, self.settings)
+
+    # -- herdr -------------------------------------------------------------------------
+
+    def herdr_factory(self) -> Herdr | None:
+        """The live Herdr session on this box, or None (then spawn works as before)."""
+        return Herdr.discover(session=str(self.settings.extra.get("herdr_session") or ""))
+
+    def _spawn_in_herdr(self, herdr: Herdr, *, kind: str, cwd: Path, task: str,
+                        request: dict[str, Any]) -> dict[str, Any]:
+        """Open a tab, start the harness in it, learn which native session it became."""
+        label = str(request.get("tab") or "").strip() or title_for(task)
+        wanted = str(request.get("herdr_workspace") or self.settings.extra.get("herdr_workspace") or "").strip()
+        workspace = herdr.find_workspace(wanted) if wanted else herdr.workspace_for_cwd(str(cwd))
+        if workspace is None:
+            created = herdr.workspace_create(cwd=str(cwd), label=wanted or cwd.name)
+            workspace_id, tab_id, pane_id = created["workspace_id"], created["tab_id"], created["pane_id"]
+        else:
+            workspace_id = str(workspace["workspace_id"])
+            tab = herdr.tab_create(workspace_id=workspace_id, cwd=str(cwd), label=label)
+            tab_id, pane_id = tab["tab_id"], tab["pane_id"]
+        name = base = agent_name_for(label)
+        suffix = 2
+        while herdr.find_agent_by_name(name) is not None:
+            name = f"{base[:29]}-{suffix}"
+            suffix += 1
+        harness_args = self.settings.claude_resume_args if kind == "claude" else self.settings.codex_resume_args
+        args = tuple(a for a in harness_args if a != "--resume")
+        started = herdr.agent_start(name, kind=kind, pane_id=pane_id, args=args)
+        if started["status"] == "blocked":
+            screen = herdr.agent_read(name)
+            if "trust this folder" in screen and self._managed_cwd(cwd):
+                herdr.send_keys(name, "down", "enter")   # Claude's folder-trust dialog on a fresh cwd
+                herdr.agent_wait(name, timeout_ms=30000)
+            else:
+                raise BrokerRefused("agent_blocked", screen.strip()[-300:] or "the agent is waiting on a dialog")
+        session_id = ""
+        for attempt in range(12):  # the integration hook reports the id within a second of start
+            session_id = herdr.session_id(name)
+            if session_id or (kind == "codex" and attempt >= 3):
+                break
+            time.sleep(0.25)
+        if not session_id and kind == "codex":
+            session_id = codex_thread_for_cwd(cwd)  # until the Codex SessionStart hook is approved
+        if not session_id:
+            raise BrokerRefused("session_unknown", f"herdr reported no native session for {name} in {pane_id}")
+        return {"session_id": session_id,
+                "herdr": {"session": herdr.session, "workspace_id": workspace_id, "tab_id": tab_id,
+                          "pane_id": pane_id, "agent": name, "kind": kind}}
+
+    def _managed_cwd(self, cwd: Path) -> bool:
+        roots = [Path(r).expanduser() for r in self.settings.extra.get("herdr_trusted_roots") or []]
+        roots += [Path.home() / "worktrees", Path.home() / "parcha"]
+        path = cwd.resolve()
+        return any(path == r.resolve() or r.resolve() in path.parents for r in roots if r.exists())
 
     def _require_thread_root(self, channel_id: str, thread_ts: str) -> None:
         """Refuse a thread that does not exist in that channel.

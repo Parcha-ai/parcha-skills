@@ -189,6 +189,7 @@ function expectedManagedTargetModes(metadata) {
     [path.join(pluginRoot, "store.py"), 0o600],
     [path.join(pluginRoot, "session_driver.py"), 0o600],
     [path.join(pluginRoot, "notices.py"), 0o600],
+    [path.join(pluginRoot, "herdr.py"), 0o600],
     [path.join(pluginRoot, "team.md"), 0o600],
     [path.join(pluginRoot, "plugin.yaml"), 0o644],
     [path.join(localBin, "tether"), 0o700],
@@ -405,7 +406,7 @@ function printHelp(command = "") {
     close: "tether close --bridge-id ID | --channel ID --thread-ts TS [--team ID] [--expected-generation N]",
     unbind: "tether unbind --bridge-id ID | --channel ID --thread-ts TS [--team ID] [--expected-generation N]",
     post: "tether post --channel ID --thread-ts TS (--text-stdin|--text-fd FD|--text TEXT [deprecated]) [--file PATH] --idempotency-key KEY [--team ID]",
-    spawn: "tether spawn (--task-stdin|--task TEXT) [--harness claude|codex] [--cwd DIR] [--channel ID --thread-ts TS] [--root-text TEXT] [--team ID]",
+    spawn: "tether spawn (--task-stdin|--task TEXT) [--harness claude|codex] [--cwd DIR] [--channel ID --thread-ts TS] [--herdr-workspace LABEL] [--tab LABEL] [--no-herdr] [--root-text TEXT] [--team ID]",
     unresolved: "tether unresolved [--team ID] [--json]",
     history: "tether history [--channel ID] [--limit N] [--team ID]",
     thread: "tether thread --channel ID --thread-ts TS [--limit N] [--team ID]",
@@ -1249,6 +1250,9 @@ async function runBrokerCommand(command, argv) {
       definitions = commonRequestOptions({
         task: { type: "value" },
         "task-stdin": { type: "flag" },
+        "herdr-workspace": { type: "value" },
+        tab: { type: "value" },
+        "no-herdr": { type: "flag" },
         harness: { type: "value" },
         cwd: { type: "value" },
         channel: { type: "value" },
@@ -1334,6 +1338,9 @@ async function runBrokerCommand(command, argv) {
       channel_id: stringValue(options.channel),
       thread_ts: stringValue(options["thread-ts"]),
       root_text: stringValue(options["root-text"]),
+      herdr_workspace: stringValue(options["herdr-workspace"]),
+      tab: stringValue(options.tab),
+      herdr: options["no-herdr"] === true ? false : undefined,
       team_id: stringValue(options.team),
     };
   } else if (command === "post") {

@@ -437,6 +437,7 @@ def register(ctx: Any) -> None:
         cwd = str(args.get("cwd") or active_settings.extra.get("default_cwd") or Path.home())
         request = {
             "op": "spawn", "task": task, "harness": str(args.get("harness") or "claude"), "cwd": cwd,
+            "herdr_workspace": str(args.get("workspace") or ""), "tab": str(args.get("tab") or ""),
             "channel_id": where["channel_id"], "thread_ts": where.get("thread_ts") or "",
             "actor": where.get("user_id") or "",
         }
@@ -447,10 +448,15 @@ def register(ctx: Any) -> None:
                 return ("This thread is already tethered to a session; that session will pick the message up. "
                         "Reply that you are on it, nothing else.")
             return f"Could not start a session ({refused.code}): {refused}"
+        where_it_lives = ""
+        if result.get("herdr"):
+            placed = result["herdr"]
+            where_it_lives = (f" It lives in Herdr tab {placed.get('tab_id')} (agent '{placed.get('agent')}', "
+                              f"workspace {placed.get('workspace_id')}).")
         return (
             f"Started a {result['harness']} session {result['session_id']} in {result['cwd']}, bound to "
-            f"thread {result['thread_ts']} in {result['channel_id']}. It has the task and will report in "
-            "this thread with evidence. Reply with one short sentence saying it is running; do not restate the task."
+            f"thread {result['thread_ts']} in {result['channel_id']}.{where_it_lives} It has the task and will "
+            "report in this thread with evidence. Reply with one short sentence saying it is running; do not restate the task."
         )
 
     if hasattr(ctx, "register_tool"):
@@ -471,6 +477,8 @@ def register(ctx: Any) -> None:
                             "task": {"type": "string", "description": "The request, verbatim, with links and context."},
                             "cwd": {"type": "string", "description": "Repository or working directory for the session."},
                             "harness": {"type": "string", "enum": ["claude", "codex"], "description": "Which harness; default claude."},
+                            "workspace": {"type": "string", "description": "Herdr workspace (space) label the person named, e.g. 'grep.ai'; omit to use the repo's."},
+                            "tab": {"type": "string", "description": "Herdr tab label the person named, e.g. 'MCP'; omit to derive one from the task."},
                         },
                         "required": ["task"],
                     },
