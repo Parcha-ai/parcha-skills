@@ -1273,6 +1273,10 @@ class RemoteMcpContractTest(unittest.TestCase):
 
         self.assertEqual(_integer(50.0, "limit", default=10, minimum=1, maximum=50), 50)
         self.assertEqual(_integer(256.0, "snippet_chars", default=0, minimum=128, maximum=8192), 256)
+        # Some clients send the digits as a string.
+        self.assertEqual(_integer("256", "snippet_chars", default=0, minimum=128, maximum=8192), 256)
+        with self.assertRaises(McpProtocolError):
+            _integer("many", "limit", default=10, minimum=1, maximum=50)
         with self.assertRaises(McpProtocolError):
             _integer(50.5, "limit", default=10, minimum=1, maximum=50)
         with self.assertRaises(McpProtocolError):

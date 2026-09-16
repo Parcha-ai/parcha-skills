@@ -282,7 +282,14 @@ class FakeTurbopuffer:
     def __init__(self, settings: Any = None, *, state_path: str | None = None) -> None:
         self.settings = settings
         self.namespaces: dict[str, FakeNamespace] = {}
+        self.options: dict[str, Any] = {}
         self.state_path = state_path or os.environ.get("RECALL_TPUF_FAKE_STATE") or None
+
+    def with_options(self, **options: Any) -> "FakeTurbopuffer":
+        """Mirrors the SDK: a view of the same client with per-request options."""
+
+        self.options = dict(options)
+        return self
 
     def namespace(self, name: str) -> FakeNamespace:
         if name not in self.namespaces:

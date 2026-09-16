@@ -180,6 +180,46 @@ class ArmTests(unittest.TestCase):
         response = retrieval.search("what did greptile flag around May 2-4?", lexical_query="greptile flag", since=None, until=None, limit=10)
         self.assertIn("temporal_hint", response["diagnostics"])
         self.assertEqual(response["diagnostics"]["dense_window_status"], "ok")
+        self.assertGreaterEqual(response["diagnostics"]["dense_window_candidates"], 1)
+
+    def test_window_pass_owns_its_budget_and_runs_beside_the_arms(self) -> None:
+        # Live: the 150 ms Postgres window budget timed out the filtered ANN
+        # pass, the SDK retried four times, and every dated question paid
+        # ~4 s for zero rows. The plane sizes the pass itself and the SDK
+        # retries are off for the arms.
+        client = FakeTurbopuffer()
+        ns = self._seed(client)
+        retrieval, store = self._retrieval(client)
+        self.assertEqual(client.options, {"max_retries": 0})
+        self.assertTrue(retrieval.window_pass_concurrent)
+        self.assertEqual(retrieval.temporal_window_budget_ms, 1500)
+        with mock.patch.dict(os.environ, {"RECALL_TPUF_WINDOW_BUDGET_MS": "800"}):
+            self.assertEqual(self._retrieval(client)[0].temporal_window_budget_ms, 800)
+        with mock.patch.dict(os.environ, {"RECALL_TPUF_WINDOW_BUDGET_MS": "5"}):
+            self.assertEqual(self._retrieval(client)[0].temporal_window_budget_ms, 1500)
+        store.query_clauses = False
+        store.rerank_runtime = None
+        # The window pass is submitted with the arms: its query reaches the
+        # plane before the global dense pass returns, i.e. the plane sees the
+        # windowed filters while the dense query is still outstanding.
+        order: list[str] = []
+        original_query = ns.query
+
+        def recording_query(**kwargs):
+            filters = repr(kwargs.get("filters"))
+            order.append("window" if "last_occurred_at" in filters else "other")
+            if order[-1] == "other" and kwargs.get("rank_by", ("",))[0] == plane.EMBED_TEXT_ATTRIBUTE:
+                time.sleep(0.05)
+            return original_query(**kwargs)
+
+        ns.query = recording_query
+        started = time.monotonic()
+        response = retrieval.search("what did greptile flag on May 3?", lexical_query="greptile flag", since=None, until=None, limit=10)
+        elapsed_ms = response["diagnostics"]["arm_elapsed_ms"]
+        self.assertEqual(response["diagnostics"]["dense_window_status"], "ok")
+        self.assertIn("window", order[:2])
+        self.assertLess(elapsed_ms["dense_window"], 1000)
+        self.assertLess((time.monotonic() - started) * 1000, 5000)
 
 
 class RowValueTests(unittest.TestCase):
