@@ -1199,10 +1199,13 @@ class ParquetFragmentDeltaTest(unittest.TestCase):
             {index: [document] for index, document in enumerate(documents)},
             dirty={"document:3"},
         )
+        # Four parts from four builds: everything past the cap is delta debris.
+        for (dataset, index), row in catalog.shards.items():
+            row["generation_sha256"] = f"{index:x}" * 64
         changed = [*documents[:3], {**documents[3], "document_content_sha256": "e" * 64}]
         archive = _DocumentArchive({f"document:{index}": 1 for index in range(4)})
         result = _FragmentProbe(
-            changed, catalog, archive, compaction_fragments=3
+            changed, catalog, archive, compaction_fragments=2
         )._build(_candidate())
         self.assertEqual(result.mode, "compaction")
         self.assertEqual(set(result.removed), set(catalog.shards))
@@ -1224,17 +1227,20 @@ class ParquetFragmentDeltaTest(unittest.TestCase):
         self.assertEqual(set(result.removed), set(catalog.shards))
 
     def test_compaction_sentinel_rewrites_a_fragmented_month(self):
-        # Many small parts: compaction actually shrinks the month, so the
-        # sentinel is honoured even though no document changed.
+        # Parts from four separate delta builds: compaction actually shrinks
+        # the month, so the sentinel is honoured even though no document
+        # changed.
         documents = [_month_document(f"document:{index}") for index in range(4)]
         catalog = _catalog(
             {index: [document] for index, document in enumerate(documents)},
             dirty={SCAN_DIRTY_ALL},
             compaction=True,
         )
+        for (dataset, index), row in catalog.shards.items():
+            row["generation_sha256"] = f"{index:x}" * 64
         archive = _DocumentArchive({f"document:{index}": 1 for index in range(4)})
         result = _FragmentProbe(
-            documents, catalog, archive, compaction_fragments=3
+            documents, catalog, archive, compaction_fragments=2
         )._build(_candidate())
         self.assertEqual(result.mode, "compaction")
         self.assertEqual(set(result.removed), set(catalog.shards))
@@ -1286,7 +1292,7 @@ class ParquetFragmentDeltaTest(unittest.TestCase):
             row["size_bytes"] = 9 * 1024 * 1024 if index == 0 else 64 * 1024
         many = _catalog({index: [_month_document(f"document:{index}")] for index in range(6)}, dirty={SCAN_DIRTY_ALL}, compaction=True)
         for (dataset, index), row in many.shards.items():
-            row["size_bytes"] = 9 * 1024 * 1024 if index == 0 else 64 * 1024
+            row["generation_sha256"] = ("f" * 64) if index == 0 else (f"{index:x}" * 64)
         six = [_month_document(f"document:{index}") for index in range(6)]
         result = _FragmentProbe(six, many, _DocumentArchive({f"document:{index}": 1 for index in range(6)}), compaction_fragments=3)._build(_candidate(reason="compaction"))
         self.assertEqual(result.mode, "compaction")
@@ -1297,19 +1303,18 @@ class ParquetFragmentDeltaTest(unittest.TestCase):
         result = _FragmentProbe(changed, plain, archive, compaction_fragments=3)._build(_candidate(reason="backfill"))
         self.assertEqual(result.mode, "full")
 
-    def test_full_sized_parts_above_the_cap_are_not_fragmented(self):
-        # Live: a month of 410 parts at the 32 MiB arrow target compacted
-        # every cycle (15-20 min, ~13 GB each) and came back with 410 parts.
-        # Uniform full parts are not fragmentation, whatever their parquet
-        # size; many parts far below the month's largest one are.
+    def test_fragmentation_is_the_parts_outside_the_largest_build(self):
+        # Live: a month of 410 parts from one build compacted every cycle
+        # (15-20 min, ~13 GB) and came back with 410 parts; another with
+        # small parts (documents close parts) "compacted" 205 into 226.
+        # Only what deltas added since the last full rewrite can be
+        # compacted away: parts outside the largest same-fingerprint group.
         documents = [_month_document(f"document:{index}") for index in range(4)]
         catalog = _catalog(
             {index: [document] for index, document in enumerate(documents)},
             dirty={"document:3"},
         )
-        full = 9 * 1024 * 1024  # a compressed full part
-        for row in catalog.shards.values():
-            row["size_bytes"] = full
+        # All four parts from one build (the fixture's shared fingerprint).
         self.assertFalse(catalog.fragmented(3))
         changed = [*documents[:3], {**documents[3], "document_content_sha256": "e" * 64}]
         archive = _DocumentArchive({f"document:{index}": 1 for index in range(4)})
@@ -1317,33 +1322,18 @@ class ParquetFragmentDeltaTest(unittest.TestCase):
             changed, catalog, archive, compaction_fragments=3
         )._build(_candidate())
         self.assertEqual(result.mode, "delta")
-        # One full part and five slivers: six parts where the bytes need
-        # two at the full size (four parts would be exactly twice: not yet).
-        slivers = _catalog({index: [_month_document(f"document:{index}")] for index in range(6)})
-        for (dataset, index), row in slivers.shards.items():
-            row["size_bytes"] = full if index == 0 else 64 * 1024
-        self.assertTrue(slivers.fragmented(3))
-        for (dataset, index), row in catalog.shards.items():
-            row["size_bytes"] = full if index == 0 else 64 * 1024
-        self.assertFalse(catalog.fragmented(3))
-        # All tiny parts above the cap: fragmented too (the 1-byte fixtures
-        # in the cap tests rely on this).
-        for row in catalog.shards.values():
-            row["size_bytes"] = 100 * 1024
-        self.assertTrue(catalog.fragmented(3))
-        self.assertFalse(catalog.fragmented(4))
-        # Only the dominant dataset decides: full records parts with tiny
-        # documents/actors parts alongside (one flush writes one part for
-        # every dataset) are not fragmentation.
-        for (dataset, index), row in catalog.shards.items():
-            row["size_bytes"] = full if dataset == "records" else 8 * 1024
-        self.assertFalse(catalog.fragmented(3))
-        for (dataset, index), row in catalog.shards.items():
-            row["size_bytes"] = (full if index == 0 else 8 * 1024) if dataset == "records" else 8 * 1024
-        six_records = _catalog({index: [_month_document(f"document:{index}")] for index in range(6)})
-        for (dataset, index), row in six_records.shards.items():
-            row["size_bytes"] = (full if index == 0 else 8 * 1024) if dataset == "records" else 8 * 1024
-        self.assertTrue(six_records.fragmented(3))
+        # Six parts: two from the full build, four delta builds since.
+        six = _catalog({index: [_month_document(f"document:{index}")] for index in range(6)})
+        for (dataset, index), row in six.shards.items():
+            row["generation_sha256"] = ("f" * 64) if index < 2 else (f"{index:x}" * 64)
+        self.assertTrue(six.fragmented(3))
+        self.assertFalse(six.fragmented(4))
+        # Only the dominant dataset decides: a fragmented actors dataset
+        # beside a single-build records dataset is not fragmentation.
+        for (dataset, index), row in six.shards.items():
+            row["size_bytes"] = 9 * 1024 * 1024 if dataset == "records" else 8 * 1024
+            row["generation_sha256"] = ("f" * 64) if dataset == "records" else (f"{index:x}" * 64)
+        self.assertFalse(six.fragmented(3))
 
     def test_below_the_cap_a_delta_stays_a_delta(self):
         documents = [_month_document(f"document:{index}") for index in range(3)]
