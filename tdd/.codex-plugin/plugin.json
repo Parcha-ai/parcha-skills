@@ -1,0 +1,34 @@
+{
+  "name": "tdd",
+  "version": "0.1.0",
+  "description": "Test-driven development at pre-agreed seams: red before green, one vertical slice per cycle, regression-first bug fixes.",
+  "author": {
+    "name": "Lauren Tan",
+    "url": "https://github.com/cursor/plugins/tree/main/pstack/skills/tdd"
+  },
+  "homepage": "https://github.com/Parcha-ai/parcha-skills/tree/main/tdd",
+  "repository": "https://github.com/Parcha-ai/parcha-skills/tree/main/tdd",
+  "license": "MIT",
+  "keywords": [
+    "tdd",
+    "testing",
+    "red-green",
+    "regression-tests"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "TDD",
+    "shortDescription": "Red-green at pre-agreed seams",
+    "longDescription": "Test-driven development at pre-agreed seams: red before green, one vertical slice per cycle, regression-first bug fixes.",
+    "developerName": "Miguel Rios",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/Parcha-ai/parcha-skills/tree/main/tdd",
+    "defaultPrompt": [
+      "Use $tdd on the task at hand."
+    ]
+  }
+}

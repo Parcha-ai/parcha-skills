@@ -1,0 +1,34 @@
+{
+  "name": "blast-radius",
+  "version": "0.1.0",
+  "description": "Find what a diff breaks beyond the diff and prove the one safety fact by running real code instead of writing it up.",
+  "author": {
+    "name": "Lauren Tan",
+    "url": "https://github.com/cursor/plugins/tree/main/pstack/skills/blast-radius"
+  },
+  "homepage": "https://github.com/Parcha-ai/parcha-skills/tree/main/blast-radius",
+  "repository": "https://github.com/Parcha-ai/parcha-skills/tree/main/blast-radius",
+  "license": "MIT",
+  "keywords": [
+    "blast-radius",
+    "code-review",
+    "risk",
+    "verification"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Blast radius",
+    "shortDescription": "Prove what a diff could break",
+    "longDescription": "Find what a diff breaks beyond the diff and prove the one safety fact by running real code instead of writing it up.",
+    "developerName": "Miguel Rios",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/Parcha-ai/parcha-skills/tree/main/blast-radius",
+    "defaultPrompt": [
+      "Use $blast-radius on the task at hand."
+    ]
+  }
+}

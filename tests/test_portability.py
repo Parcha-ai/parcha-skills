@@ -6,7 +6,26 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SKILLS = ("hands-free", "parable", "cascade", "recall", "recap", "tether", "desloppify", "autoqa", "precap")
+SKILLS = (
+    "hands-free",
+    "parable",
+    "cascade",
+    "recall",
+    "recap",
+    "tether",
+    "desloppify",
+    "autoqa",
+    "precap",
+    "blast-radius",
+    "verify-release",
+    "tdd",
+    "unslop",
+    "review-loop",
+)
+# Packages whose install docs already point at the Parcha-ai/parcha-skills repository.
+PARCHA_SKILLS_SLUG = frozenset(
+    {"recall", "blast-radius", "verify-release", "tdd", "unslop", "review-loop"}
+)
 
 
 def load_json(path: Path):
@@ -114,8 +133,8 @@ class PortablePackagingTest(unittest.TestCase):
 
     def test_skills_sh_install_docs_cover_every_skill(self):
         root_readme = (ROOT / "README.md").read_text()
-        self.assertIn("https://skills.sh/miguelrios/unc-skills", root_readme)
-        self.assertIn("npx skills add miguelrios/unc-skills", root_readme)
+        self.assertIn("https://skills.sh/Parcha-ai/parcha-skills", root_readme)
+        self.assertIn("npx skills add Parcha-ai/parcha-skills", root_readme)
         self.assertIn(
             "npx --yes --package=@parcha/tether@0.2.0-beta.1",
             root_readme,
@@ -126,7 +145,7 @@ class PortablePackagingTest(unittest.TestCase):
             package_readme = (ROOT / name / "README.md").read_text()
             repository = (
                 "Parcha-ai/parcha-skills"
-                if name == "recall"
+                if name in PARCHA_SKILLS_SLUG
                 else "miguelrios/unc-skills"
             )
             self.assertIn(
