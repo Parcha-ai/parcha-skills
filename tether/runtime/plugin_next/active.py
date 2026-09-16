@@ -558,6 +558,7 @@ class ActiveSlice:
         self.slack: Any = slack
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._workers: dict[str, threading.Thread] = {}
 
     # -- binding management (CLI) ------------------------------------------------
 
@@ -708,15 +709,29 @@ class ActiveSlice:
 
     # -- scheduling -----------------------------------------------------------------
 
-    def run_once(self) -> int:
-        """Drive every endpoint with ready work through one attempt. Returns count."""
+    def run_once(self, *, concurrent: bool = False) -> int:
+        """Drive every endpoint with ready work through one attempt. Returns count.
+
+        ``concurrent``: each endpoint's attempt runs on its own worker thread, so an hour of
+        work in one thread never holds up a reply in another (2026-09-16: a running turn on
+        one thread kept every other thread's message queued). The store's one-accepted-
+        attempt-per-endpoint gate keeps a single endpoint serial. Synchronous by default for
+        callers that want the receipt before returning (tests, drains).
+        """
         driven = 0
         for endpoint_id in self.runtime.endpoints_with_ready_turns():
+            if concurrent and endpoint_id in self._workers and self._workers[endpoint_id].is_alive():
+                continue
             attempt = self.runtime.schedule_next(endpoint_id)
             if attempt is None:
                 continue
             driven += 1
-            self._drive(attempt)
+            if concurrent:
+                worker = threading.Thread(target=self._drive, args=(attempt,), name=f"tether-turn-{endpoint_id[-6:]}", daemon=True)
+                self._workers[endpoint_id] = worker
+                worker.start()
+            else:
+                self._drive(attempt)
         return driven
 
     def _drive(self, attempt: dict[str, Any]) -> None:
@@ -1360,7 +1375,7 @@ class ActiveSlice:
         while not self._stop.is_set():
             try:
                 heartbeat.write_text(str(time.time()), encoding="utf-8")
-                self.run_once()
+                self.run_once(concurrent=True)
             except Exception:
                 logger.error("tether: scheduler pass failed", exc_info=True)
             self._stop.wait(self.settings.poll_interval_seconds)

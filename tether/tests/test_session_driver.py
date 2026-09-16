@@ -450,3 +450,24 @@ class HerdrDialogTests(HerdrPaneTests):
         self.assertEqual(dialog_answer("Escape"), ("keys", ["esc"]))
         self.assertEqual(dialog_answer("y"), ("keys", ["y"]))
         self.assertEqual(dialog_answer("use the blue one"), ("text", ["use the blue one"]))
+
+
+class ConcurrentEndpointsTests(SessionDriverTests):
+    def test_a_slow_turn_on_one_thread_does_not_hold_up_another(self):
+        import time as _time
+        self.slice.bind(source_kind="claude_session", session_id="sess-B", cwd=self.temp.name,
+                        team_id="T1", channel_id="C1", thread_ts="200.1", owner_user_id="U12345678")
+        self.slice.claim(self.fields("100.2"), "SLEEP a while")            # sess-A: the fake sleeps 5 s
+        self.slice.claim({**self.fields("200.2"), "thread": "200.1"}, "quick one")  # sess-B: instant
+        started = _time.monotonic()
+        self.assertEqual(self.slice.run_once(concurrent=True), 2)
+        self.assertLess(_time.monotonic() - started, 2.0, "scheduling returns without waiting on the slow turn")
+        deadline = _time.monotonic() + 4.0
+        while _time.monotonic() < deadline and not any(t == "200.1" for _, t, _ in self.sent):
+            _time.sleep(0.1)
+        self.assertEqual([t for _, t, _ in self.sent], ["200.1"], "the quick thread answered while the slow one still runs")
+        self.assertEqual(self.slice.run_once(concurrent=True), 0, "the busy endpoint is not scheduled twice")
+        deadline = _time.monotonic() + 8.0
+        while _time.monotonic() < deadline and len(self.sent) < 2:
+            _time.sleep(0.2)
+        self.assertEqual(sorted(t for _, t, _ in self.sent), ["100.1", "200.1"])
