@@ -447,6 +447,53 @@ class ParquetScanContractTest(unittest.TestCase):
         self.assertLess(max(encoded_rows), len(rows))
         self.assertEqual(sum(row_count for _, row_count in parts), len(rows))
 
+    def test_a_spanning_document_owns_its_parts_exclusively(self):
+        # Live: one long session spanning many parts shared each of them
+        # with its neighbours, so the delta planner's victim walk reached
+        # every part of the month from any dirty document (2-11 dirty
+        # documents -> "full" every cycle). Parts of a spanning document
+        # hold that document alone.
+        from recall_server.parquet_scan import _StreamingUpload
+
+        class _Archive:
+            def put_raw(self, **kwargs):
+                return {"artifact_id": kwargs["native_id"], "size_bytes": len(kwargs["payload"])}
+
+        class _Projector:
+            archive = _Archive()
+
+        stream = _StreamingUpload(
+            _Projector(), _candidate(), generation="g" * 64,
+            created_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        )
+
+        def member(document):
+            return FragmentMember(document, 1, "m" * 64)
+
+        def rows(document, count):
+            return [{"logical_document_id": document, "ordinal": index, "value": b"x" * 1000} for index in range(count)]
+
+        with mock.patch("recall_server.parquet_scan.PARQUET_RAW_SLICE_BYTES", 5_000), mock.patch(
+            "recall_server.parquet_scan._estimated_row_bytes", lambda row: 1_000,
+        ), mock.patch("recall_server.parquet_scan._parquet_parts", lambda rows_, schema: [(b"p", len(rows_))]):
+            for row in rows("small-a", 2):
+                stream.add("records", row, member=member("small-a"))
+            for row in rows("big", 9):
+                stream.add("records", row, member=member("big"))
+            for row in rows("small-b", 2):
+                stream.add("records", row, member=member("small-b"))
+            stream._flush("records")
+
+        owners = {
+            identity: sorted(m.logical_document_id for m in members)
+            for identity, members in stream.members.items()
+            if identity[0] == "records"
+        }
+        counts = {identity: stream.row_counts[identity] for identity in owners}
+        # small-a alone, then the big document alone in two parts, then small-b alone.
+        self.assertEqual(list(owners.values()), [["small-a"], ["big"], ["big"], ["small-b"]], owners)
+        self.assertEqual(list(counts.values()), [2, 5, 4, 2], counts)
+
     def test_build_streams_month_records_through_bounded_uploads(self):
         archive = _ManyRecordArchive(30)
         projector = _BuildProbe(_document("Employee"), archive)
