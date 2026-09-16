@@ -368,6 +368,29 @@ class TetherCliTest(unittest.TestCase):
         self.assertNotIn("DEPRECATED", result.stderr)
 
     @unittest.skipIf(os.geteuid() == 0, "mutating CLI commands intentionally refuse root")
+    def test_spawn_reads_task_from_stdin_and_needs_a_channel_with_a_thread(self) -> None:
+        # 2026-09-16: the agent hit argv punctuation limits on --task and then spawned with
+        # --thread-ts but no --channel; the broker fell back to #agent-hub and the session's
+        # reports became stray roots. The task comes from stdin, and a thread needs its channel.
+        task = "Debug why experts created via the MCP path are missing their form manifest: it's `expert_apply` (see #8622)."
+        with FakeBroker(
+            self.root,
+            lambda _request: self.response({"ok": True, "harness": "claude", "session_id": "s-1", "cwd": "/w",
+                                            "thread_ts": "100.1", "channel_id": "C07QDVCPWS1", "status": "spawned"}),
+        ) as broker:
+            result = self.run_cli(
+                "spawn", "--task-stdin", "--channel", "C07QDVCPWS1", "--thread-ts", "100.1",
+                socket_path=broker.path, input_text=task,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(broker.requests[0]["task"], task)
+            self.assertEqual((broker.requests[0]["channel_id"], broker.requests[0]["thread_ts"]), ("C07QDVCPWS1", "100.1"))
+            refused = self.run_cli("spawn", "--task", "t", "--thread-ts", "100.1", socket_path=broker.path)
+            self.assertEqual(refused.returncode, 2, refused.stderr)
+            self.assertIn("channel_required", refused.stderr + refused.stdout)
+            self.assertEqual(len(broker.requests), 1, "the refusal never reached the broker")
+
+    @unittest.skipIf(os.geteuid() == 0, "mutating CLI commands intentionally refuse root")
     def test_post_reads_message_from_private_fd(self) -> None:
         message = "private reply from inherited fd"
         read_fd, write_fd = os.pipe()
