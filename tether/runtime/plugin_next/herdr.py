@@ -27,6 +27,24 @@ logger = logging.getLogger(__name__)
 
 AGENT_NAME = re.compile(r"[^a-z0-9_-]+")
 READY_STATES = ("idle", "done")
+DIALOG_KEYS = {"enter", "esc", "escape", "up", "down", "left", "right", "tab", "space", "y", "n"}
+DIALOG_HELP = "Reply here with the option number (1, 2, 3...), `esc` to cancel, or the text it asks for."
+
+
+def dialog_answer(text: str) -> tuple[str, list[str]]:
+    """How a thread reply answers a dialog: ("keys", [...]) or ("text", [text]).
+
+    A bare number picks that option (Claude Code selects on the digit; Enter confirms where
+    needed). A known key name is sent as that key. Anything else is typed as the answer to a
+    question dialog, followed by Enter.
+    """
+    answer = text.strip()
+    lowered = answer.lower().rstrip(".")
+    if lowered.isdigit() and len(lowered) <= 2:
+        return "keys", [lowered, "enter"]
+    if lowered in DIALOG_KEYS:
+        return "keys", ["esc" if lowered == "escape" else lowered]
+    return "text", [answer]
 
 
 class HerdrError(RuntimeError):
@@ -228,6 +246,16 @@ class Herdr:
     def send_keys(self, target: str, *keys: str) -> None:
         for key in keys:
             self._run("agent", "send-keys", target, key)
+
+    def pane_send_text(self, pane_id: str, text: str) -> None:
+        """Literal text into the pane, no Enter (an answer typed into a dialog)."""
+        self._run("pane", "send-text", pane_id, text)
+
+    def pane_clear_tokens(self, pane_id: str, *, source: str, names: tuple[str, ...]) -> None:
+        args = ["pane", "report-metadata", pane_id, "--source", source]
+        for name in names:
+            args += ["--clear-token", name]
+        self._run(*args)
 
 
 def _socket_alive(path: str) -> bool:

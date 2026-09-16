@@ -401,7 +401,7 @@ function printHelp(command = "") {
     maintenance: "tether maintenance [--json] [--socket PATH] [--timeout-ms MS]",
     notify: "tether notify (--text-stdin|--text-fd FD|--text TEXT [deprecated]) [--file PATH] --idempotency-key KEY [--run-id ID|--hermes-session-id ID] [--channel ID] [--team ID]",
     reply: "tether reply --bridge-id ID (--text-stdin|--text-fd FD|--text TEXT [deprecated]) [--file PATH] --reply-key KEY [--team ID]",
-    attach: "tether attach --channel ID --thread-ts TS --idempotency-key KEY [source options]",
+    attach: "tether attach (--herdr AGENT|<session flags>) --channel ID --thread-ts TS --idempotency-key KEY [source options]",
     rebind: "tether rebind --channel ID --thread-ts TS [source options] [--team ID]",
     close: "tether close --bridge-id ID | --channel ID --thread-ts TS [--team ID] [--expected-generation N]",
     unbind: "tether unbind --bridge-id ID | --channel ID --thread-ts TS [--team ID] [--expected-generation N]",
@@ -1227,6 +1227,7 @@ async function runBrokerCommand(command, argv) {
         "thread-ts": { type: "value" },
         owner: { type: "value" },
         "idempotency-key": { type: "value" },
+        herdr: { type: "value" },
         ...source,
       });
       break;
@@ -1322,6 +1323,16 @@ async function runBrokerCommand(command, argv) {
       text: messageText,
       file: attachmentPath(options),
       team_id: stringValue(options.team),
+    };
+  } else if (command === "attach" && stringValue(options.herdr)) {
+    request = {
+      op: "attach",
+      herdr_agent: stringValue(options.herdr),
+      owner_user_id: stringValue(options.owner),
+      channel_id: requireOption(options, "channel"),
+      team_id: stringValue(options.team),
+      thread_ts: requireOption(options, "thread-ts"),
+      idempotency_key: requireOption(options, "idempotency-key"),
     };
   } else if (command === "spawn") {
     if (stringValue(options["thread-ts"]) && !stringValue(options.channel)) {

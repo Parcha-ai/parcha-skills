@@ -401,3 +401,52 @@ class HerdrPaneTests(SessionDriverTests):
         self.slice.claim(self.pane_fields("700.2"), "still there?")
         self.assertEqual(self.slice.run_once(), 1)
         self.assertIn("turn 1 of pid", self.sent[0][2], "the headless path took the turn")
+
+
+class HerdrDialogTests(HerdrPaneTests):
+    def test_the_next_thread_message_answers_the_dialog(self):
+        client = self.herdr_client()
+        self.driver.herdr_factory = lambda session: client
+        self.place_claude_in_pane(client)
+        os.environ["FAKE_HERDR_AFTER"] = "blocked"
+        os.environ["FAKE_HERDR_SCREEN"] = "Bash command\n  rm -rf build/\nDo you want to proceed?\n > 1. Yes\n   2. No"
+        self.slice.claim(self.pane_fields("700.2"), "clean the build dir")
+        self.assertEqual(self.slice.run_once(), 1)
+        self.assertIn("option number", self.sent[0][2])
+        marks = [r for r in self.slice.slack.reactions if r[0] == "add"] if hasattr(self.slice, "slack") and self.slice.slack else []
+        # the thread answers with the option number: keys, not a prompt
+        os.environ.pop("FAKE_HERDR_AFTER", None)
+        os.environ["FAKE_HERDR_REPLY"] = "Build directory removed; 12 files."
+        self.slice.claim(self.pane_fields("700.3"), "1")
+        self.assertEqual(self.slice.run_once(), 1)
+        log = (Path(self.temp.name) / "herdr-calls.log").read_text()
+        self.assertIn("agent send-keys mcp 1\n", log)
+        self.assertIn("agent send-keys mcp enter\n", log)
+        self.assertNotIn("agent prompt mcp 1", log, "an answer is never submitted as a new prompt")
+        self.assertEqual(self.sent[-1][2], "Build directory removed; 12 files.", "the resumed turn's answer lands")
+        del marks
+
+    def test_free_text_answers_a_question_dialog(self):
+        client = self.herdr_client()
+        self.driver.herdr_factory = lambda session: client
+        self.place_claude_in_pane(client)
+        os.environ["FAKE_HERDR_AFTER"] = "blocked"
+        os.environ["FAKE_HERDR_SCREEN"] = "Which environment should this target?\n > staging\n   prod\n   other"
+        self.slice.claim(self.pane_fields("700.2"), "deploy it")
+        self.assertEqual(self.slice.run_once(), 1)
+        os.environ.pop("FAKE_HERDR_AFTER", None)
+        os.environ["FAKE_HERDR_REPLY"] = "Deployed to staging."
+        self.slice.claim(self.pane_fields("700.3"), "staging please")
+        self.assertEqual(self.slice.run_once(), 1)
+        log = (Path(self.temp.name) / "herdr-calls.log").read_text()
+        self.assertIn("pane send-text w1:p2 staging please\n", log)
+        self.assertIn("agent send-keys mcp enter\n", log)
+        self.assertEqual(self.sent[-1][2], "Deployed to staging.")
+
+    def test_esc_cancels(self):
+        from runtime.plugin_next.herdr import dialog_answer
+        self.assertEqual(dialog_answer("2"), ("keys", ["2", "enter"]))
+        self.assertEqual(dialog_answer(" esc "), ("keys", ["esc"]))
+        self.assertEqual(dialog_answer("Escape"), ("keys", ["esc"]))
+        self.assertEqual(dialog_answer("y"), ("keys", ["y"]))
+        self.assertEqual(dialog_answer("use the blue one"), ("text", ["use the blue one"]))

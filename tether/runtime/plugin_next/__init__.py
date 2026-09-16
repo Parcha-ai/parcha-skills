@@ -459,7 +459,49 @@ def register(ctx: Any) -> None:
             "report in this thread with evidence. Reply with one short sentence saying it is running; do not restate the task."
         )
 
+    def tether_attach(args: dict, session_id: str = "", **_kwargs: Any) -> str:
+        """Bind an existing Herdr session (by its agent name) to this thread."""
+        if slice_ is None:
+            return "Tether is not active on this gateway."
+        name = str(args.get("agent") or "").strip()
+        if not name:
+            return "agent is required: the Herdr agent name or pane id (see `herdr agent list`)."
+        where = _session_thread(session_id)
+        if not where.get("channel_id") or not where.get("thread_ts"):
+            return "This tool works from a Slack thread only."
+        request = {"op": "attach", "herdr_agent": name, "channel_id": where["channel_id"],
+                   "thread_ts": where["thread_ts"], "owner_user_id": where.get("user_id") or "",
+                   "idempotency_key": f"attach:{where['channel_id']}:{where['thread_ts']}:{name}"}
+        try:
+            result = slice_.handle(request)
+        except broker_module.BrokerRefused as refused:
+            if refused.code in ("thread_claim_conflict", "idempotency_conflict"):
+                return "This thread is already tethered to a session; that session will pick the message up."
+            return f"Could not attach ({refused.code}): {refused}"
+        placed = result.get("herdr") or {}
+        return (f"Attached Herdr agent '{name}' ({result.get('harness')} session {result.get('session_id')}, pane "
+                f"{placed.get('pane_id')}) to this thread. Messages here now go to that session and its replies land "
+                "here. Reply with one short sentence saying so.")
+
     if hasattr(ctx, "register_tool"):
+        try:
+            ctx.register_tool(
+                name="tether_attach", toolset="tether",
+                schema={
+                    "name": "tether_attach",
+                    "description": (
+                        "Bind an existing Herdr session to the current Slack thread by its Herdr agent name "
+                        "(what `herdr agent list` shows, e.g. 'hvrt' or 'mcp'). Use it when a person says to attach, "
+                        "connect, or tether this thread to a session they already have open in Herdr."
+                    ),
+                    "parameters": {"type": "object",
+                                   "properties": {"agent": {"type": "string", "description": "Herdr agent name or pane id."}},
+                                   "required": ["agent"]},
+                },
+                handler=tether_attach, description="Attach an existing Herdr session to this thread", emoji="🔗",
+            )
+        except Exception:
+            logger.warning("tether: could not register the tether_attach tool", exc_info=True)
         try:
             ctx.register_tool(
                 name="tether_spawn", toolset="tether",

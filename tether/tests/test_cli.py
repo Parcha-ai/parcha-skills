@@ -393,6 +393,12 @@ class TetherCliTest(unittest.TestCase):
             plain = self.run_cli("spawn", "--task", "t", "--no-herdr", socket_path=broker.path)
             self.assertEqual(plain.returncode, 0, plain.stderr)
             self.assertIs(broker.requests[0]["herdr"], False)
+        with FakeBroker(self.root, lambda _request: self.response({"ok": True, "status": "attached"})) as broker:
+            attached = self.run_cli("attach", "--herdr", "hvrt", "--channel", "C1", "--thread-ts", "100.1",
+                                    "--idempotency-key", "a-1", socket_path=broker.path)
+            self.assertEqual(attached.returncode, 0, attached.stderr)
+            self.assertEqual(broker.requests[0]["herdr_agent"], "hvrt")
+            self.assertNotIn("source_kind", broker.requests[0], "attach by Herdr name needs no calling session")
             refused = self.run_cli("spawn", "--task", "t", "--thread-ts", "100.1", socket_path=broker.path)
             self.assertEqual(refused.returncode, 2, refused.stderr)
             self.assertIn("channel_required", refused.stderr + refused.stdout)

@@ -325,6 +325,7 @@ class ActiveSettings:
     ack_emoji: str = "eyes"
     done_emoji: str = "white_check_mark"
     fail_emoji: str = "warning"
+    blocked_emoji: str = "raised_hand"
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -739,6 +740,8 @@ class ActiveSlice:
             return
         state = result.get("state")
         marker = self.settings.done_emoji if state in {"completed_with_response", "no_reply"} else self.settings.fail_emoji
+        if state == "completed_with_response" and result.get("error_code") == "blocked":
+            marker = self.settings.blocked_emoji  # the session is waiting on the thread
         for ts in self._turn_message_ids(context):
             self._unreact(context["channel_id"], ts, self.settings.ack_emoji)
             self._react(context["channel_id"], ts, marker)
@@ -1113,7 +1116,15 @@ class ActiveSlice:
             raise BrokerRefused("thread_unknown", f"no thread {thread_ts} in {channel_id}")
 
     def op_attach(self, request: dict[str, Any]) -> dict[str, Any]:
-        kind, session_id, cwd = self._source(request)
+        placement: dict[str, Any] | None = None
+        herdr = None
+        if request.get("herdr_agent"):
+            herdr = self.herdr_factory()
+            if herdr is None:
+                raise BrokerRefused("herdr_unavailable", "no Herdr session is running on this machine")
+            kind, session_id, cwd, placement = self._resolve_herdr_agent(herdr, str(request["herdr_agent"]))
+        else:
+            kind, session_id, cwd = self._source(request)
         team_id = self._team(request)
         channel_id = str(request.get("channel_id") or "")
         thread_ts = str(request.get("thread_ts") or "")
@@ -1122,10 +1133,36 @@ class ActiveSlice:
         self._require_thread_root(channel_id, thread_ts)
         binding = self.bind(
             source_kind=kind, session_id=session_id, cwd=cwd, team_id=team_id,
-            channel_id=channel_id, thread_ts=thread_ts, owner_user_id=self._owner(request),
+            channel_id=channel_id, thread_ts=thread_ts, owner_user_id=self._owner(request), herdr=placement,
         )
+        if herdr is not None and placement:
+            try:
+                herdr.pane_report_metadata(placement["pane_id"], source="tether", tokens={"slack": f"{channel_id}/{thread_ts}"})
+            except HerdrError:
+                logger.warning("tether: could not label pane %s with its thread", placement["pane_id"])
         return {"status": "attached", "team_id": team_id, "channel_id": channel_id,
-                "thread_ts": thread_ts, "bridge_id": binding["binding_id"]}
+                "thread_ts": thread_ts, "bridge_id": binding["binding_id"], "session_id": session_id,
+                "harness": kind.split("_")[0], "herdr": placement}
+
+    def _resolve_herdr_agent(self, herdr: Herdr, name: str) -> tuple[str, str, str, dict[str, Any]]:
+        """An existing Herdr agent (by live name or pane id) as a bindable session."""
+        agent = herdr.find_agent_by_name(name)
+        if agent is None:
+            raise BrokerRefused("herdr_agent_unknown", f"no live Herdr agent named {name!r}; `herdr agent list` shows them")
+        kind = str(agent.get("agent") or "")
+        source_kind = {"claude": "claude_session", "codex": "codex_session"}.get(kind)
+        if source_kind is None:
+            raise BrokerRefused("harness_unsupported", f"Herdr agent {name!r} runs {kind or 'an unknown agent'}; Tether binds claude or codex")
+        cwd = str(agent.get("cwd") or os.getcwd())
+        session_id = str((agent.get("agent_session") or {}).get("value") or "")
+        if not session_id and kind == "codex":
+            session_id = codex_thread_for_cwd(Path(cwd), max_age_seconds=7 * 24 * 3600)
+        if not session_id:
+            raise BrokerRefused("session_unknown", f"Herdr has no native session id for {name!r} yet (integration hook not reporting)")
+        placement = {"session": herdr.session, "workspace_id": str(agent.get("workspace_id") or ""),
+                     "tab_id": str(agent.get("tab_id") or ""), "pane_id": str(agent.get("pane_id") or ""),
+                     "agent": str(agent.get("name") or ""), "kind": kind}
+        return source_kind, session_id, cwd, placement
 
     def op_rebind(self, request: dict[str, Any]) -> dict[str, Any]:
         kind, session_id, cwd = self._source(request)
@@ -1173,8 +1210,23 @@ class ActiveSlice:
             raise BrokerRefused(getattr(exc, "code", "binding_busy"), str(exc), retryable=True) from exc
         if hasattr(self.driver, "close_binding"):
             self.driver.close_binding(binding_id)
+        self._unlabel_pane(closed.get("endpoint_id"))
         return {"status": "closed", "bridge_id": closed["binding_id"], "team_id": team_id,
                 "channel_id": closed.get("channel_id"), "thread_ts": closed.get("thread_ts")}
+
+    def _unlabel_pane(self, endpoint_id: str | None) -> None:
+        """A closed thread leaves the pane alone but drops its Slack token."""
+        endpoint = self.runtime.endpoint(endpoint_id) if endpoint_id else None
+        placement = ((endpoint or {}).get("source") or {}).get("herdr")
+        if not isinstance(placement, dict) or not placement.get("pane_id"):
+            return
+        herdr = self.herdr_factory()
+        if herdr is None:
+            return
+        try:
+            herdr.pane_clear_tokens(str(placement["pane_id"]), source="tether", names=("slack",))
+        except HerdrError:
+            logger.debug("tether: pane %s token not cleared", placement["pane_id"], exc_info=True)
 
     def op_thread_reply(self, request: dict[str, Any]) -> dict[str, Any]:
         text = str(request.get("text") or "").strip()
