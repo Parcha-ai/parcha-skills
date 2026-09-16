@@ -1257,28 +1257,40 @@ class ParquetFragmentDeltaTest(unittest.TestCase):
         self.assertEqual(archive.reads, [])  # nothing re-read, nothing re-uploaded
 
     def test_full_sized_parts_above_the_cap_are_not_fragmented(self):
-        # Live: a month of 410 parts at the 32 MiB target compacted every
-        # cycle (15-20 min, ~13 GB each) and came back with 410 parts. Parts
-        # already at the target size are not fragmentation.
+        # Live: a month of 410 parts at the 32 MiB arrow target compacted
+        # every cycle (15-20 min, ~13 GB each) and came back with 410 parts.
+        # Uniform full parts are not fragmentation, whatever their parquet
+        # size; many parts far below the month's largest one are.
         documents = [_month_document(f"document:{index}") for index in range(4)]
         catalog = _catalog(
             {index: [document] for index, document in enumerate(documents)},
             dirty={"document:3"},
         )
+        full = 9 * 1024 * 1024  # a compressed full part
         for row in catalog.shards.values():
-            row["size_bytes"] = FRAGMENT_TARGET_BYTES
+            row["size_bytes"] = full
         self.assertFalse(catalog.fragmented(3))
-        self.assertTrue(_catalog({index: [d] for index, d in enumerate(documents)}).fragmented(3))
         changed = [*documents[:3], {**documents[3], "document_content_sha256": "e" * 64}]
         archive = _DocumentArchive({f"document:{index}": 1 for index in range(4)})
         result = _FragmentProbe(
             changed, catalog, archive, compaction_fragments=3
         )._build(_candidate())
         self.assertEqual(result.mode, "delta")
-        # Half-full parts, twice what the bytes need: fragmented.
+        # One full part and five slivers: six parts where the bytes need
+        # two at the full size (four parts would be exactly twice: not yet).
+        slivers = _catalog({index: [_month_document(f"document:{index}")] for index in range(6)})
+        for (dataset, index), row in slivers.shards.items():
+            row["size_bytes"] = full if index == 0 else 64 * 1024
+        self.assertTrue(slivers.fragmented(3))
+        for (dataset, index), row in catalog.shards.items():
+            row["size_bytes"] = full if index == 0 else 64 * 1024
+        self.assertFalse(catalog.fragmented(3))
+        # All tiny parts above the cap: fragmented too (the 1-byte fixtures
+        # in the cap tests rely on this).
         for row in catalog.shards.values():
-            row["size_bytes"] = FRAGMENT_TARGET_BYTES // 4
+            row["size_bytes"] = 100 * 1024
         self.assertTrue(catalog.fragmented(3))
+        self.assertFalse(catalog.fragmented(4))
 
     def test_below_the_cap_a_delta_stays_a_delta(self):
         documents = [_month_document(f"document:{index}") for index in range(3)]
