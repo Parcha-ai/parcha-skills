@@ -31,7 +31,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from .herdr import Herdr, HerdrError
+from .herdr import DIALOG_HELP, Herdr, HerdrError, dialog_answer
 from .store import Store, is_no_reply
 
 logger = logging.getLogger("hermes_plugins.tether_next.session_driver")
@@ -495,6 +495,19 @@ class CodexAppServer:
         self.transport.close()
 
 
+def _last_human_text(context: dict[str, Any]) -> str:
+    """The newest thread message's text in this attempt (what answers a dialog)."""
+    text = ""
+    for turn in context.get("turns") or []:
+        try:
+            payload = json.loads(turn.get("payload_inline") or "{}")
+        except ValueError:
+            continue
+        if isinstance(payload, dict) and payload.get("text"):
+            text = str(payload["text"])
+    return text
+
+
 def claude_transcript(session_id: str) -> Path | None:
     """Claude Code's transcript for a session: ~/.claude/projects/<cwd-slug>/<id>.jsonl."""
     if not session_id:
@@ -615,7 +628,8 @@ class SessionDriver:
         if placement:
             # The session is interactive in a Herdr pane: prompt it there (a headless
             # `claude -p --resume` on the same id would fork the conversation).
-            result = self._run_herdr_turn(attempt_id, session_id, prompt, placement)
+            result = self._run_herdr_turn(attempt_id, session_id, prompt, placement,
+                                          answer=_last_human_text(context))
             if result is not None:
                 return result
             logger.warning("tether: herdr pane %s for %s is gone; resuming headless", placement.get("pane_id"), session_id)
@@ -652,12 +666,13 @@ class SessionDriver:
         return Herdr.discover(session=session)
 
     def _run_herdr_turn(self, attempt_id: str, session_id: str, prompt: str,
-                        placement: dict[str, Any]) -> dict[str, Any] | None:
+                        placement: dict[str, Any], *, answer: str = "") -> dict[str, Any] | None:
         """One turn through Herdr's agent surface; None when the pane is no longer there.
 
         The reply is the transcript's last assistant text written after the prompt, never the
         terminal (a screen scrape) and never narration. A blocked dialog is the reply itself:
-        the thread sees it and answers it.
+        the thread sees it, and the next thread message (``answer``) is delivered into the
+        dialog as keys or typed text instead of as a prompt.
         """
         herdr = self.herdr_factory(str(placement.get("session") or ""))
         if herdr is None:
@@ -673,7 +688,17 @@ class SessionDriver:
         transcript = claude_transcript(session_id)
         offset = transcript.stat().st_size if transcript is not None else 0
         try:
-            settled = herdr.agent_prompt(target, prompt)
+            if agent.get("agent_status") == "blocked" and answer:
+                # The thread is answering the dialog the session is stuck on.
+                mode, values = dialog_answer(answer)
+                if mode == "keys":
+                    herdr.send_keys(target, *values)
+                else:
+                    herdr.pane_send_text(str(agent.get("pane_id")), values[0])
+                    herdr.send_keys(target, "enter")
+                settled = herdr.agent_wait(target)
+            else:
+                settled = herdr.agent_prompt(target, prompt)
         except HerdrError as exc:
             if exc.code == "agent_blocked":
                 settled = {"agent_status": "blocked"}
@@ -685,8 +710,8 @@ class SessionDriver:
             except HerdrError:
                 screen = ""
             tail = "\n".join(screen.splitlines()[-12:]).strip()
-            text = "The session is waiting on a dialog. Reply here to answer it.\n```\n" + tail + "\n```"
-            return self._finish(attempt_id, "completed_with_response", text)
+            text = f"The session is waiting on a dialog. {DIALOG_HELP}\n```\n{tail}\n```"
+            return self._finish(attempt_id, "completed_with_response", text, error_code="blocked")
         transcript = transcript or claude_transcript(session_id)
         text = claude_reply_after(transcript, offset) if transcript is not None else ""
         if not text:

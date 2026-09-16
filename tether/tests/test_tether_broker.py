@@ -529,3 +529,34 @@ class CodexHandoffTest(BrokerTest):
             self.assertIsNone(find_transcript("claude_session", "01a08eb2-9c73"))
         finally:
             os.environ.pop("CODEX_HOME", None)
+
+
+class HerdrAttachTest(BrokerTest):
+    def test_attach_by_herdr_agent_name(self):
+        client = self.herdr_client()
+        self.slice.herdr_factory = lambda: client
+        tab = client.tab_create(workspace_id="w1", cwd=self.temp.name, label="hvrt")
+        client.agent_start("hvrt", kind="claude", pane_id=tab["pane_id"])
+        attached = self.call(op="attach", herdr_agent="hvrt", channel_id="C1", thread_ts="100.7", idempotency_key="a-1")
+        self.assertTrue(attached["ok"], attached)
+        self.assertEqual((attached["harness"], attached["session_id"], attached["herdr"]["pane_id"]),
+                         ("claude", "claude-sess-2", "w1:p2"))
+        binding = self.slice.runtime.find_active_binding(team_id="T12345678", channel_id="C1", thread_ts="100.7")
+        source = self.slice.runtime.endpoint(binding["endpoint_id"])["source"]
+        self.assertEqual((source["session_id"], source["cwd"], source["herdr"]["agent"]), ("claude-sess-2", self.temp.name, "hvrt"))
+        self.assertIn("pane report-metadata w1:p2 --source tether --token slack=C1/100.7", self.herdr_calls())
+        # unknown name, and an agent kind Tether cannot bind
+        self.assertEqual(self.call(op="attach", herdr_agent="ghost", channel_id="C1", thread_ts="100.8",
+                                   idempotency_key="a-2")["code"], "herdr_agent_unknown")
+        client.agent_start("gem", kind="gemini", pane_id=tab["pane_id"])
+        self.assertEqual(self.call(op="attach", herdr_agent="gem", channel_id="C1", thread_ts="100.8",
+                                   idempotency_key="a-3")["code"], "harness_unsupported")
+        # closing the thread leaves the pane but drops its Slack token
+        closed = self.call(op="close", channel_id="C1", thread_ts="100.7")
+        self.assertTrue(closed["ok"], closed)
+        self.assertIn("pane report-metadata w1:p2 --source tether --clear-token slack", self.herdr_calls())
+
+    def test_attach_without_herdr_running_is_refused(self):
+        self.slice.herdr_factory = lambda: None
+        self.assertEqual(self.call(op="attach", herdr_agent="hvrt", channel_id="C1", thread_ts="100.7",
+                                   idempotency_key="a-1")["code"], "herdr_unavailable")

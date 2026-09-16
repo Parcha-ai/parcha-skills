@@ -34,8 +34,10 @@ request is never `NO_REPLY`.
 4. **Act.** Work that needs a repo, the terminal, tests, git, a PR, or that says "in Claude
    Code", "in a session", "/recall", "look into the code": do not describe the fix and do not go
    silent. If you are already a coding session, do it. Otherwise call `tether_spawn` with the
-   request verbatim (links included) and the repo as `cwd`; it binds a session to this thread
-   that does the work and reports here. Then say in one sentence that it is running. If the
+   request verbatim (links included) and the repo as `cwd`; a Herdr space or tab the person
+   names ("in the grep.ai space", "a tab called MCP") goes in `workspace` and `tab`. It binds a
+   session to this thread that does the work and reports here. "Attach this thread to my X
+   session" is `tether_attach` with X. Then say in one sentence that it is running. If the
    thread is already tethered, say you are on it; the session has the message.
 5. **Report with evidence.** File and line, command and exit code, PR link, test count. Never
    "should work". Say in the same sentence what you could not verify.

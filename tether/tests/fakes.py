@@ -271,6 +271,8 @@ FAKE_HERDR = textwrap.dedent(
         for i, a in enumerate(argv):
             if a == "--token":
                 k, _, v = argv[i + 1].partition("="); tokens[k] = v
+            if a == "--clear-token":
+                tokens.pop(argv[i + 1], None)
         save(); out({"type": "ok"})
     if group == "agent" and cmd == "start":
         name = argv[2]; kind = opt("--kind"); pane = opt("--pane"); state["n"] += 1
@@ -293,7 +295,9 @@ FAKE_HERDR = textwrap.dedent(
     if group == "agent" and cmd == "send-keys":
         a = resolve(argv[2]); key = argv[3]
         a.setdefault("keys", []).append(key)
-        if key == "enter" and a["status"] == "blocked":
+        if a["status"] == "blocked" and a.get("prompts"):
+            a["answered"] = True  # a dialog inside a turn: `agent wait` reports what happened next
+        elif key == "enter" and a["status"] == "blocked":
             a["status"] = "idle"; a["session"] = a.get("pending_session", "")
         save(); out({"type": "ok"})
     if group == "agent" and cmd == "prompt":
@@ -311,7 +315,23 @@ FAKE_HERDR = textwrap.dedent(
                 fh.write(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": reply}]}}) + "\\n")
         save(); out({"agent": agent_view(a)})
     if group == "agent" and cmd == "wait":
-        a = resolve(argv[2]); out({"agent": agent_view(a)})
+        a = resolve(argv[2])
+        if a.get("answered"):
+            a["answered"] = False
+            a["status"] = os.environ.get("FAKE_HERDR_AFTER", "idle")
+            transcript = os.environ.get("FAKE_HERDR_TRANSCRIPT")
+            if transcript and a["status"] != "blocked":
+                reply = os.environ.get("FAKE_HERDR_REPLY") or "resumed"
+                with open(transcript, "a") as fh:
+                    fh.write(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": reply}]}}) + "\\n")
+            save()
+        out({"agent": agent_view(a)})
+    if group == "pane" and cmd == "send-text":
+        pane = argv[2]
+        for a in state["agents"].values():
+            if a["pane_id"] == pane:
+                a.setdefault("typed", []).append(argv[3]); a["answered"] = True
+        save(); out({"type": "ok"})
     if group == "agent" and cmd == "read":
         resolve(argv[2]); print(os.environ.get("FAKE_HERDR_SCREEN", "\\u276f")); sys.exit(0)
     fail("unknown_command", " ".join(argv))
