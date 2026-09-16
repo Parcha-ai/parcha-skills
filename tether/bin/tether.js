@@ -189,6 +189,7 @@ function expectedManagedTargetModes(metadata) {
     [path.join(pluginRoot, "store.py"), 0o600],
     [path.join(pluginRoot, "session_driver.py"), 0o600],
     [path.join(pluginRoot, "notices.py"), 0o600],
+    [path.join(pluginRoot, "herdr.py"), 0o600],
     [path.join(pluginRoot, "team.md"), 0o600],
     [path.join(pluginRoot, "plugin.yaml"), 0o644],
     [path.join(localBin, "tether"), 0o700],
