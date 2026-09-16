@@ -19,6 +19,7 @@ import re
 import shutil
 import socket
 import subprocess  # nosec B404 - fixed argv, no shell
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -243,8 +244,12 @@ class Herdr:
             argv += ["--lines", str(lines)]
         return str(self._run(*argv, text_ok=True))
 
-    def send_keys(self, target: str, *keys: str) -> None:
-        for key in keys:
+    def send_keys(self, target: str, *keys: str, pause: float = 0.4) -> None:
+        """Keys one at a time with a short pause: a dialog needs to redraw between a move
+        and its Enter, or the Enter lands on the old selection (seen on greppy-sam)."""
+        for index, key in enumerate(keys):
+            if index:
+                time.sleep(pause)
             self._run("agent", "send-keys", target, key)
 
     def pane_send_text(self, pane_id: str, text: str) -> None:

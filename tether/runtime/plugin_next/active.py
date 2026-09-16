@@ -1071,13 +1071,20 @@ class ActiveSlice:
         harness_args = self.settings.claude_resume_args if kind == "claude" else self.settings.codex_resume_args
         args = tuple(a for a in harness_args if a != "--resume")
         started = herdr.agent_start(name, kind=kind, pane_id=pane_id, args=args)
-        if started["status"] == "blocked":
+        status = started["status"]
+        for _ in range(3):  # startup dialogs come one after another: folder trust, bypass warning
+            if status != "blocked":
+                break
             screen = herdr.agent_read(name)
             if "trust this folder" in screen and self._managed_cwd(cwd):
                 herdr.send_keys(name, "down", "enter")   # Claude's folder-trust dialog on a fresh cwd
-                herdr.agent_wait(name, timeout_ms=30000)
+            elif "Bypass Permissions mode" in screen and "--dangerously-skip-permissions" in args:
+                herdr.send_keys(name, "down", "enter")   # the operator configured the flag; this is its one-time consent
             else:
                 raise BrokerRefused("agent_blocked", screen.strip()[-300:] or "the agent is waiting on a dialog")
+            status = str(herdr.agent_wait(name, timeout_ms=30000).get("agent_status") or "")
+        if status == "blocked":
+            raise BrokerRefused("agent_blocked", herdr.agent_read(name).strip()[-300:])
         session_id = ""
         for attempt in range(12):  # the integration hook reports the id within a second of start
             session_id = herdr.session_id(name)
