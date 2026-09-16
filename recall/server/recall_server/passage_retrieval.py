@@ -693,6 +693,27 @@ FOCUS_WINDOW_MIN_GAIN = 2
 RERANK_FOCUS_WINDOW = False
 
 
+def _composite_ranges_from_env() -> int:
+    """``RECALL_RERANK_COMPOSITE_RANGES`` (1-3): passages per document the reranker reads."""
+
+    raw = os.environ.get("RECALL_RERANK_COMPOSITE_RANGES", "").strip()
+    try:
+        value = int(raw) if raw else 2
+    except ValueError:
+        return 2
+    return value if 1 <= value <= 3 else 2
+
+
+# The reranker judges most documents by one candidate (50 passages over
+# ~80 collapsed documents), so that candidate carries the heads of the
+# document's strongest passages, not one arm's pick: the exact-identifier
+# passage that carried a document through the sparse arm is often tool
+# output the cross-encoder scores low, while the same document's lexical
+# passage answers the question (live: 0.24 vs 0.44 for one document, rank
+# 24 vs 7). One passage keeps the whole width.
+RERANK_COMPOSITE_RANGES = _composite_ranges_from_env()
+
+
 def arm_nominated(arm_scores: dict[str, Any], nominate_per_arm: int) -> bool:
     """True when any arm ranked the document within its top ``nominate_per_arm``."""
 
@@ -829,6 +850,34 @@ def rerank_document(row: dict[str, Any], terms: list[str], width: int) -> str:
         # A pathological header: keep the text, the runtime trims the tail.
         return body(width)
     return f"{context}\n\n{body(budget)}"
+
+
+def rerank_composite(rows: list[dict[str, Any]], terms: list[str], width: int) -> str:
+    """One reranker document for a fused result: context line plus the heads
+    of its strongest passages (``rows``, strongest first), fitted to ``width``.
+
+    A single passage takes the whole width (``rerank_document``); the width
+    is otherwise split evenly, so a document costs the reranker the same
+    tokens whether one passage or two carried it.
+    """
+
+    if len(rows) <= 1:
+        return rerank_document(rows[0], terms, width) if rows else ""
+    context = rerank_context(rows[0])
+    separator = "\n\n"
+    if width > 0:
+        budget = width - (len(context) + 2 if context else 0) - len(separator) * (len(rows) - 1)
+        if budget < 64 * len(rows):
+            return rerank_document(rows[0], terms, width)
+        share = budget // len(rows)
+    else:
+        share = 0
+    parts = []
+    for row in rows:
+        text = row.get("text_redacted") or ""
+        parts.append(text[:share] if share > 0 else text)
+    body = separator.join(parts)
+    return f"{context}\n\n{body}" if context else body
 
 
 def select_rerank_candidates(
@@ -2409,31 +2458,44 @@ class PassageHintRetrieval:
         # text (the query-densest window when RERANK_FOCUS_WINDOW is on).
         terms = focus_terms(lexical_query or query)
         width = int(getattr(runtime, "max_doc_chars", 0) or 0)
-        texts: dict[str, str] = {}
+        rows_by_key: dict[str, dict[str, Any]] = {}
         for _leg_name, _weight, rows in legs:
             for row in rows:
                 key = row.get("passage_id") or row.get("receipt")
-                if key and key not in texts:
-                    texts[key] = rerank_document(row, terms, width)
+                if key and key not in rows_by_key:
+                    rows_by_key[key] = row
         # The same passage can reach the pool under two keys (a passage id
         # from one arm, a receipt from another); send its text once and let
-        # both keys share the score.
+        # both keys share the score. A document's first candidate carries
+        # the heads of its strongest ranges (RERANK_COMPOSITE_RANGES); the
+        # ranges it covers share the score and are not sent again.
+        composite = RERANK_COMPOSITE_RANGES
+        diagnostics["rerank_composite_ranges"] = composite
         documents: list[str] = []
         keys_by_document: list[list[str]] = []
         document_by_text: dict[str, int] = {}
-        for _document_index, key in select_rerank_candidates(
+        covered: set[str] = set()
+        for document_index, key in select_rerank_candidates(
             results, max_candidates=int(runtime.max_candidates)
         ):
-            text = texts.get(key)
-            if text is None:
+            if key in covered or key not in rows_by_key:
                 continue
+            keys = [key]
+            ranges = results[document_index].get("matching_ranges") or ()
+            if composite > 1 and ranges and _range_key(ranges[0]) == key:
+                for item in ranges[1:composite]:
+                    extra = _range_key(item)
+                    if extra and extra not in covered and extra not in keys and extra in rows_by_key:
+                        keys.append(extra)
+            text = rerank_composite([rows_by_key[item] for item in keys], terms, width)
+            covered.update(keys)
             position = document_by_text.get(text)
             if position is None:
                 position = len(documents)
                 document_by_text[text] = position
                 documents.append(text)
                 keys_by_document.append([])
-            keys_by_document[position].append(key)
+            keys_by_document[position].extend(keys)
         diagnostics["rerank_candidates"] = len(documents)
         if not documents:
             return results, diagnostics
