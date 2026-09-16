@@ -1258,11 +1258,18 @@ class CanonicalParquetScanProjector:
             # three times in 90 minutes, because the sentinel was checked
             # first).
             return "reuse", set(), set(), dirty
-        if catalog.compaction:
+        # A sweep hint (the compaction sentinel, or a queue row the sweep
+        # wrote) forces a rewrite only when the month is fragmented now. A
+        # stale hint on an unfragmented month falls through to a delta:
+        # live 2026-09-16 a 3,015-document month with dirty=0 and one
+        # changed document rewrote all 374 parts (20 min) on a hint the
+        # old sweep left behind.
+        sweep_hint = catalog.compaction or candidate.reason == "compaction"
+        if sweep_hint and catalog.fragmented(self.compaction_fragments):
             return "compaction", all_parts, set(current), dirty
         if (
-            candidate.reason == "backfill"
-            or SCAN_DIRTY_ALL in catalog.dirty
+            (candidate.reason == "backfill" and not sweep_hint)
+            or (SCAN_DIRTY_ALL in catalog.dirty and not sweep_hint)
             or not catalog.members
             or not datasets_complete
         ):
@@ -1737,11 +1744,11 @@ class CanonicalParquetScanProjector:
                         """INSERT INTO canonical_parquet_scan_queue(
                                tenant_id,source_id,bucket_start,
                                generation,reason,changed_at
-                           ) VALUES (%s,%s,%s,1,'backfill',clock_timestamp())
+                           ) VALUES (%s,%s,%s,1,'compaction',clock_timestamp())
                            ON CONFLICT(tenant_id,source_id,bucket_start)
                            DO UPDATE SET
                                generation=canonical_parquet_scan_queue.generation+1,
-                               reason='backfill',changed_at=clock_timestamp()
+                               reason='compaction',changed_at=clock_timestamp()
                            RETURNING generation,changed_at""",
                         scope,
                     ).fetchone()

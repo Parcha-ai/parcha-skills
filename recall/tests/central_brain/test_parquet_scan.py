@@ -188,13 +188,14 @@ def _document(display_name: str) -> dict:
     }
 
 
-def _candidate() -> ScanCandidate:
+def _candidate(reason: str = "logical-update") -> ScanCandidate:
     return ScanCandidate(
         tenant_id="tenant:test",
         source_id="source:test",
         bucket_start=date(2026, 8, 1),
         generation=1,
         changed_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        reason=reason,
     )
 
 
@@ -1255,6 +1256,46 @@ class ParquetFragmentDeltaTest(unittest.TestCase):
         self.assertEqual(set(result.removed), set())
         self.assertFalse(result.created)
         self.assertEqual(archive.reads, [])  # nothing re-read, nothing re-uploaded
+
+    def test_a_stale_sweep_hint_on_an_unfragmented_changed_month_is_a_delta(self):
+        # Live 2026-09-16: a 3,015-document month with one changed document
+        # and the old sweep's sentinel rewrote all 374 parts (20 min).
+        documents = [_month_document(f"document:{index}") for index in range(4)]
+        catalog = _catalog(
+            {index: [document] for index, document in enumerate(documents)},
+            dirty={SCAN_DIRTY_ALL, "document:3"}, compaction=True,
+        )
+        for row in catalog.shards.values():
+            row["size_bytes"] = 9 * 1024 * 1024
+        changed = [*documents[:3], {**documents[3], "document_content_sha256": "e" * 64}]
+        archive = _DocumentArchive({f"document:{index}": 1 for index in range(4)})
+        for reason in ("backfill", "compaction", "logical-update"):
+            result = _FragmentProbe(changed, catalog, archive, compaction_fragments=3)._build(
+                _candidate(reason=reason)
+            )
+            self.assertEqual(result.mode, "delta", reason)
+            self.assertEqual({identity[1] for identity in result.removed}, {3}, reason)
+        # The same hint on a fragmented month still compacts.
+        for (dataset, index), row in catalog.shards.items():
+            row["size_bytes"] = 9 * 1024 * 1024 if index == 0 else 64 * 1024
+        fragmented = _catalog(
+            {index: [document] for index, document in enumerate(documents)},
+            dirty={SCAN_DIRTY_ALL, "document:3"}, compaction=True,
+        )
+        for (dataset, index), row in fragmented.shards.items():
+            row["size_bytes"] = 9 * 1024 * 1024 if index == 0 else 64 * 1024
+        many = _catalog({index: [_month_document(f"document:{index}")] for index in range(6)}, dirty={SCAN_DIRTY_ALL}, compaction=True)
+        for (dataset, index), row in many.shards.items():
+            row["size_bytes"] = 9 * 1024 * 1024 if index == 0 else 64 * 1024
+        six = [_month_document(f"document:{index}") for index in range(6)]
+        result = _FragmentProbe(six, many, _DocumentArchive({f"document:{index}": 1 for index in range(6)}), compaction_fragments=3)._build(_candidate(reason="compaction"))
+        self.assertEqual(result.mode, "compaction")
+        # A real backfill without a hint is still a full rebuild.
+        plain = _catalog({index: [document] for index, document in enumerate(documents)}, dirty={"document:3"})
+        for row in plain.shards.values():
+            row["size_bytes"] = 9 * 1024 * 1024
+        result = _FragmentProbe(changed, plain, archive, compaction_fragments=3)._build(_candidate(reason="backfill"))
+        self.assertEqual(result.mode, "full")
 
     def test_full_sized_parts_above_the_cap_are_not_fragmented(self):
         # Live: a month of 410 parts at the 32 MiB arrow target compacted
