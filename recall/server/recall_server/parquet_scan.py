@@ -401,6 +401,18 @@ class PartTimeBound:
     last_occurred_at: datetime
 
 
+def _rows_bounds(dataset: str, rows: list[dict[str, Any]]) -> tuple[datetime | None, datetime | None]:
+    first: datetime | None = None
+    last: datetime | None = None
+    for row in rows:
+        row_first, row_last = _row_bounds(dataset, row)
+        if isinstance(row_first, datetime):
+            first = row_first if first is None else min(first, row_first)
+        if isinstance(row_last, datetime):
+            last = row_last if last is None else max(last, row_last)
+    return first, last
+
+
 def _row_bounds(dataset: str, row: dict[str, Any]) -> tuple[Any, Any]:
     if dataset == "records":
         return row.get("occurred_at"), row.get("occurred_at")
@@ -458,17 +470,24 @@ class _StreamingUpload:
         self.flushes = 0
         self.upload_ms = 0
         self.maximum_buffer_bytes = 0
+        # Where the open document's rows start in the buffer, and whether
+        # that document already spilled into an earlier part.
+        self.document_start = {dataset: 0 for dataset in SCAN_DATASETS}
+        self.spanning = {dataset: False for dataset in SCAN_DATASETS}
 
     def claim(self, dataset: str, member: FragmentMember) -> None:
         """Record document ownership in the fragment currently open."""
 
         if self.current_document[dataset] != member.logical_document_id:
-            if (
-                self.buffers[dataset]
-                and self.buffer_bytes[dataset] >= FRAGMENT_TARGET_BYTES
+            if self.buffers[dataset] and (
+                self.spanning[dataset]
+                or self.buffer_bytes[dataset] >= FRAGMENT_TARGET_BYTES
             ):
+                # A spanning document's tail closes alone.
                 self._flush(dataset)
+            self.spanning[dataset] = False
             self.current_document[dataset] = member.logical_document_id
+            self.document_start[dataset] = len(self.buffers[dataset])
         self.pending_members[dataset][member.logical_document_id] = member
 
     def add(self, dataset: str, row: dict[str, Any], *, member: FragmentMember) -> None:
@@ -477,9 +496,18 @@ class _StreamingUpload:
         if self.buffers[dataset] and (
             self.buffer_bytes[dataset] + row_bytes > PARQUET_RAW_SLICE_BYTES
         ):
-            self._flush(dataset)
-            # The document continues in the next part.
-            self.pending_members[dataset][member.logical_document_id] = member
+            if self.document_start[dataset] > 0:
+                # The documents before this one close as their own part;
+                # this document keeps the buffer to itself from here.
+                self._flush_head(dataset, member)
+            if self.buffers[dataset] and (
+                self.buffer_bytes[dataset] + row_bytes > PARQUET_RAW_SLICE_BYTES
+            ):
+                self._flush(dataset)
+                # The document continues in the next part.
+                self.pending_members[dataset][member.logical_document_id] = member
+                self.current_document[dataset] = member.logical_document_id
+            self.spanning[dataset] = True
         self.buffers[dataset].append(row)
         self.buffer_bytes[dataset] += row_bytes
         first, last = _row_bounds(dataset, row)
@@ -495,6 +523,22 @@ class _StreamingUpload:
         )
         self.rows_seen[dataset] += 1
 
+    def _flush_head(self, dataset: str, member: FragmentMember) -> None:
+        """Close the rows buffered before the open document as one part."""
+
+        start = self.document_start[dataset]
+        head, tail = self.buffers[dataset][:start], self.buffers[dataset][start:]
+        head_members = tuple(
+            value for key, value in self.pending_members[dataset].items()
+            if key != member.logical_document_id
+        )
+        self._emit(dataset, head, head_members, _rows_bounds(dataset, head))
+        self.buffers[dataset] = tail
+        self.buffer_bytes[dataset] = sum(_estimated_row_bytes(row) for row in tail)
+        self.pending_members[dataset] = {member.logical_document_id: member}
+        self.pending_bounds[dataset] = _rows_bounds(dataset, tail)
+        self.document_start[dataset] = 0
+
     def _flush(self, dataset: str, *, allow_empty: bool = False) -> None:
         rows = self.buffers[dataset]
         if not rows and not allow_empty:
@@ -506,6 +550,16 @@ class _StreamingUpload:
         bounds = self.pending_bounds[dataset]
         self.pending_bounds[dataset] = (None, None)
         self.current_document[dataset] = None
+        self.document_start[dataset] = 0
+        self._emit(dataset, rows, members, bounds)
+
+    def _emit(
+        self,
+        dataset: str,
+        rows: list[dict[str, Any]],
+        members: tuple[FragmentMember, ...],
+        bounds: tuple[datetime | None, datetime | None],
+    ) -> None:
         for payload, row_count in _parquet_parts(rows, self.schemas[dataset]):
             shard_index = self.part_indexes[dataset]
             if shard_index > MAX_SHARD_INDEX:
