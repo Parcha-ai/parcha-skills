@@ -143,13 +143,15 @@ def search_plane_reconcile(
     apply: bool = False,
     page_rows: int = RECONCILE_PAGE_ROWS,
     delete_rows: int = RECONCILE_DELETE_ROWS,
+    projector: Any = None,
 ) -> dict[str, Any]:
     """Exact drift: namespace ids against the live passage ids in the catalog.
 
-    ``stale`` rows (in the namespace, not live: a forgotten or replaced
-    passage whose tombstone never landed) are deleted when ``apply`` is
-    set; ``missing`` ids (live, not in the namespace) are counted and left
-    to the outbox, which owns inserts. Counts only, never ids or text.
+    With ``apply``: ``stale`` rows (in the namespace, not live: a forgotten
+    or replaced passage whose tombstone never landed) are deleted, and
+    ``missing`` passages (live, not in the namespace: inserted behind a
+    running backfill's cursor, so no outbox row carries them) are written
+    through ``projector.upsert_passages``. Counts only, never ids or text.
     """
 
     if not isinstance(tenant_id, str) or not tenant_id:
@@ -173,18 +175,24 @@ def search_plane_reconcile(
             raise
         present = set()
     stale = sorted(present - live)
-    missing = len(live - present)
+    missing = sorted(live - present)
     LOG.info(
         "search plane reconcile namespace_rows=%s stale=%s missing=%s apply=%s",
-        len(present), len(stale), missing, apply,
+        len(present), len(stale), len(missing), apply,
     )
     deleted = 0
+    written = 0
     if apply:
         for start in range(0, len(stale), delete_rows):
             batch = stale[start:start + delete_rows]
             namespace.write(deletes=batch)
             deleted += len(batch)
             LOG.info("search plane reconcile deleted=%s/%s", deleted, len(stale))
+        if missing:
+            if projector is None:
+                raise ValueError("search plane reconcile needs a projector to write missing passages")
+            written = int(projector.upsert_passages(tenant_id, missing))
+            LOG.info("search plane reconcile written=%s/%s", written, len(missing))
     return {
         "status": "ok",
         "tenant_id": tenant_id,
@@ -193,7 +201,8 @@ def search_plane_reconcile(
         "live_passages": len(live),
         "namespace_rows": len(present),
         "stale": len(stale),
-        "missing": missing,
+        "missing": len(missing),
         "applied": bool(apply),
         "deleted": deleted,
+        "written": written,
     }

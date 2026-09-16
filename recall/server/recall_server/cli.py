@@ -2490,6 +2490,7 @@ def main() -> None:
         except TurbopufferConfigError as error:
             print(json.dumps({"status": "error", "error": str(error)}, sort_keys=True))
             sys.exit(2)
+        reconcile_client = _search_plane_client(search_settings)
         print(
             json.dumps(
                 search_plane_reconcile(
@@ -2500,8 +2501,9 @@ def main() -> None:
                         target_tokens=args.target_tokens,
                         overlap_tokens=args.overlap_tokens,
                     ).fingerprint,
-                    client=_search_plane_client(search_settings),
+                    client=reconcile_client,
                     apply=bool(args.apply),
+                    projector=TurbopufferProjector(store, search_settings, client=reconcile_client),
                 ),
                 sort_keys=True,
             )

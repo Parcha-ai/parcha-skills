@@ -108,6 +108,14 @@ _PASSAGE_PAGE_SQL = f"""
 """
 
 
+_PASSAGE_BY_ID_SQL = _PASSAGE_PAGE_SQL.split("     WHERE passage.tenant_id=%s")[0] + f"""
+     WHERE passage.tenant_id=%s
+       AND passage.passage_id=ANY(%s::text[])
+       AND {_LIVE_PASSAGE_PREDICATE}
+     ORDER BY passage.first_occurred_at,passage.passage_id
+"""
+
+
 def _month_bounds(month: date) -> tuple[datetime, datetime]:
     start = datetime(month.year, month.month, 1, tzinfo=timezone.utc)
     end = (
@@ -335,6 +343,43 @@ class TurbopufferProjector:
                 ),
             ).fetchall()
         ]
+
+    def passages_by_id(self, connection: Any, tenant_id: str, passage_ids: list[str]) -> list[dict[str, Any]]:
+        """The live passages among ``passage_ids``, in page order."""
+
+        return [
+            dict(row)
+            for row in connection.execute(_PASSAGE_BY_ID_SQL, (tenant_id, list(passage_ids))).fetchall()
+        ]
+
+    def upsert_passages(self, tenant_id: str, passage_ids: list[str]) -> int:
+        """Write the live passages among ``passage_ids`` to the tenant namespace.
+
+        The reconcile's repair path for rows the outbox never carried (a
+        passage inserted behind a running backfill's cursor): the same row
+        builder, byte-bounded batches, and token pacer as a month drain.
+        Returns the rows written.
+        """
+
+        if not passage_ids:
+            return 0
+        namespace = self.client.namespace(self.settings.namespace(tenant_id))
+        budget = {"remaining": self.rate_limit_budget_seconds, "rate_limited": 0}
+        written = 0
+        for start in range(0, len(passage_ids), self.page_rows):
+            chunk = passage_ids[start:start + self.page_rows]
+            with self.store.connect() as connection:
+                page = self.passages_by_id(connection, tenant_id, chunk)
+                connection.commit()
+            rows = [
+                passage_row({**passage, "actors": [tuple(actor) for actor in passage["actors"]]})
+                for passage in page
+            ]
+            for batch in byte_bounded_batches(rows, max_rows=self.batch_rows, max_bytes=self.max_batch_bytes):
+                self.pacer.wait_for(estimated_tokens(batch))
+                self._write(namespace, budget, upsert_rows=batch)
+                written += len(batch)
+        return written
 
     def tombstone_ids(self, connection: Any, claim: dict[str, Any]) -> list[str]:
         return [
