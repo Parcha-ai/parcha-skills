@@ -26,11 +26,22 @@ class NotFoundError(Exception):
 
 
 class FakeRow(dict):
-    """A query row: ``row.id``, ``row["$dist"]``, ``row.text``, ``to_dict()``."""
+    """A query row: ``row.id``, ``row["$dist"]``, ``row.text``, ``to_dict()``.
+
+    Mirrors the SDK's pydantic ``Row``: a key the service did not return
+    raises ``AttributeError`` from ``__getitem__`` too (the first cutover
+    failed on a ``$score`` lookup that only ever saw dict rows in tests).
+    """
+
+    def __getitem__(self, key: str) -> Any:
+        try:
+            return dict.__getitem__(self, key)
+        except KeyError as error:
+            raise AttributeError(f"'Row' object has no attribute {key!r}") from error
 
     def __getattr__(self, key: str) -> Any:
         try:
-            return self[key]
+            return dict.__getitem__(self, key)
         except KeyError as error:
             raise AttributeError(key) from error
 
