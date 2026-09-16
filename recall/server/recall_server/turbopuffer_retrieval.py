@@ -34,17 +34,27 @@ MAX_SPARSE_TOKENS = 8
 
 
 def _value(row: Any, key: str, default: Any = None) -> Any:
-    if isinstance(row, dict):
+    """Attribute ``key`` of a result row, or ``default``.
+
+    The SDK's ``Row`` is a pydantic model whose ``__getitem__`` delegates to
+    ``getattr`` and raises ``AttributeError`` (not ``KeyError``) for a key
+    the service did not return; the first cutover failed on exactly that
+    (BM25 rows carry ``$dist`` and no ``$score``).
+    """
+
+    if type(row) is dict:
         return row.get(key, default)
     try:
         return row[key]
-    except (KeyError, TypeError, IndexError):
+    except (KeyError, TypeError, IndexError, AttributeError):
         pass
+    extra = getattr(row, "__pydantic_extra__", None) or {}
+    if key in extra:
+        return extra[key]
     try:
         return getattr(row, key)
     except AttributeError:
-        extra = getattr(row, "__pydantic_extra__", None) or {}
-        return extra.get(key, default)
+        return default
 
 
 def scope_filters(

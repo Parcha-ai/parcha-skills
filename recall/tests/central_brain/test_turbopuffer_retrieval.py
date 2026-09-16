@@ -182,6 +182,19 @@ class ArmTests(unittest.TestCase):
         self.assertEqual(response["diagnostics"]["dense_window_status"], "ok")
 
 
+class RowValueTests(unittest.TestCase):
+    def test_missing_keys_on_sdk_like_rows_return_the_default(self) -> None:
+        from recall_server.turbopuffer_retrieval import TurbopufferHintRetrieval, _value
+        from tests.central_brain.fake_turbopuffer import FakeRow
+
+        row = FakeRow({"id": "psg_" + "1" * 32, "text": "x", "$dist": 1.5})
+        self.assertEqual(_value(row, "$dist"), 1.5)
+        self.assertIsNone(_value(row, "$score"))
+        self.assertEqual(_value(row, "missing", 7), 7)
+        # BM25 rows (no $score) rank by $dist without raising.
+        self.assertEqual([r["score"] for r in TurbopufferHintRetrieval._scored([row])], [1.5])
+
+
 class PlaneSwitchTests(unittest.TestCase):
     def test_canonical_retrieval_picks_the_plane_class(self) -> None:
         import inspect
