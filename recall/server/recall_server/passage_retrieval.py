@@ -768,31 +768,50 @@ def group_near_duplicates(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Fold documents whose leading passage duplicates a higher-ranked one.
 
-    Order is kept; the first (best-ranked) member of a group stays and
-    carries the others under ``similar_documents``. A document with no
+    A group takes the position of its best-ranked member; the member that
+    continued latest (``last_occurred_at``, ties to the best rank) is the
+    primary and carries the others under ``similar_documents``. Among
+    copies of one piece of history the continuation that ran longest is
+    the most complete one (live: three validation answers were the latest
+    member of their group, never the best-ranked copy). A document with no
     leading text, or too short for a shingle, never groups.
     """
 
-    kept: list[dict[str, Any]] = []
+    groups: list[list[dict[str, Any]]] = []
     signatures: list[frozenset[str]] = []
     folded = 0
     for row in results:
         ranges = row.get("matching_ranges") or ()
         signature = text_shingles((ranges[0].get("text") or "") if ranges else "")
-        primary_index = None
+        group_index = None
         best = 0.0
         if signature:
             for index, other in enumerate(signatures):
                 similarity = shingle_similarity(signature, other)
                 if similarity >= threshold and similarity > best:
-                    primary_index, best = index, similarity
-        if primary_index is None:
-            kept.append(row)
+                    group_index, best = index, similarity
+        if group_index is None:
+            groups.append([row])
             signatures.append(signature)
             continue
-        primary = kept[primary_index]
-        primary.setdefault("similar_documents", []).append(similar_document_record(row, best))
+        groups[group_index].append({**row, "_similarity": best})
         folded += 1
+    kept: list[dict[str, Any]] = []
+    for group in groups:
+        if len(group) == 1:
+            kept.append(group[0])
+            continue
+        primary_index = max(
+            range(len(group)),
+            key=lambda index: (str(group[index].get("last_occurred_at") or ""), -index),
+        )
+        primary = {key: value for key, value in group[primary_index].items() if key != "_similarity"}
+        primary["similar_documents"] = [
+            similar_document_record(member, float(member.get("_similarity") or 1.0))
+            for index, member in enumerate(group)
+            if index != primary_index
+        ]
+        kept.append(primary)
     return kept, {
         "near_duplicates_folded": folded,
         "near_duplicate_groups": sum(1 for row in kept if row.get("similar_documents")),

@@ -67,7 +67,7 @@ class ShingleTests(unittest.TestCase):
 
 
 class GroupTests(unittest.TestCase):
-    def test_copies_fold_into_the_best_ranked_document_in_order(self) -> None:
+    def test_copies_fold_into_one_group_at_the_best_rank_led_by_the_latest_continuation(self) -> None:
         results = [
             _result("a", COPIED, rank=0.9),
             _result("b", "Sure. " + COPIED, rank=0.8),
@@ -76,18 +76,29 @@ class GroupTests(unittest.TestCase):
             _result("e", "", rank=0.5),
         ]
         kept, diagnostics = group_near_duplicates(results)
-        self.assertEqual([row["logical_document_id"][5] for row in kept], ["a", "c", "e"])
+        # The group sits at rank 1; "d" continued latest, so it leads it.
+        self.assertEqual([row["logical_document_id"][5] for row in kept], ["d", "c", "e"])
+        self.assertEqual(kept[0]["rank"], 0.6)
         similar = kept[0]["similar_documents"]
-        self.assertEqual([item["logical_document_id"][5] for item in similar], ["b", "d"])
+        self.assertEqual([item["logical_document_id"][5] for item in similar], ["a", "b"])
         self.assertEqual(similar[0]["source_id"], "codex:linux:m")
         self.assertEqual(len(similar[0]["receipts"]), 4)
-        self.assertGreaterEqual(similar[0]["similarity"], 0.9)
+        self.assertEqual(similar[0]["similarity"], 1.0)
+        self.assertGreaterEqual(similar[1]["similarity"], 0.9)
         self.assertNotIn("text", similar[0])
+        self.assertNotIn("_similarity", kept[0])
         self.assertNotIn("similar_documents", kept[1])
         self.assertEqual(diagnostics["near_duplicates_folded"], 2)
         self.assertEqual(diagnostics["near_duplicate_groups"], 1)
         # Untouched originals: grouping copies nothing into the folded rows.
         self.assertNotIn("similar_documents", results[1])
+        self.assertNotIn("_similarity", results[1])
+
+    def test_ties_on_the_end_time_keep_the_best_ranked_member(self) -> None:
+        results = [_result("a", COPIED, rank=0.9), _result("b", "Sure. " + COPIED, rank=0.8)]
+        kept, _ = group_near_duplicates(results)
+        self.assertEqual([row["logical_document_id"][5] for row in kept], ["a"])
+        self.assertEqual([item["logical_document_id"][5] for item in kept[0]["similar_documents"]], ["b"])
 
     def test_short_or_empty_leading_text_never_groups(self) -> None:
         results = [_result("a", "short text here", rank=0.9), _result("b", "short text here", rank=0.8), _result("c", "", rank=0.7), _result("d", "", rank=0.6)]
