@@ -81,7 +81,7 @@ Herdr session serves the tabs until the human attaches. `tether doctor` reports 
 ## Owners, blockers, next actions
 - Owner: claudio (this session). T1–T3 in PR (feat/tether-herdr-tabs, package manifest updated in f18824d);
   claudio runs 603 since 17:02 UTC; PR 604 (T4–T6, T9) open, installed on claudio pending a restart
-  Next: merge 605 (CI). Remaining: T6 live-state reactions outside turns (deferred), T8 (Miguel: Codex hook), a doctor line for Herdr state.
+  Claudio policy: herdr_workspace=claudio + herdr_required=true (PR 606, config set 19:40 UTC; canary spawn created workspace w9 'claudio'). Remaining: T6 live-state reactions outside turns (deferred), T8 (Miguel: Codex hook), a doctor line for Herdr state.
 - Found in the canaries: the active loop ran attempts serially across endpoints (fixed in 605); Claude's
   bypass-consent dialog on a fresh HOME (fixed in 605).
 - Blocked: T8 on Miguel (Codex hook approval). Everything else proceeds; T2 uses the daemon
