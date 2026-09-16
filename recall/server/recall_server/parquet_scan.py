@@ -1258,11 +1258,19 @@ class CanonicalParquetScanProjector:
             # three times in 90 minutes, because the sentinel was checked
             # first).
             return "reuse", set(), set(), dirty
-        if catalog.compaction:
+        # A sweep hint (the compaction sentinel the sweep writes beside its
+        # 'backfill' queue row) forces a rewrite only when the month is
+        # fragmented now. A
+        # stale hint on an unfragmented month falls through to a delta:
+        # live 2026-09-16 a 3,015-document month with dirty=0 and one
+        # changed document rewrote all 374 parts (20 min) on a hint the
+        # old sweep left behind.
+        sweep_hint = catalog.compaction or candidate.reason == "compaction"
+        if sweep_hint and catalog.fragmented(self.compaction_fragments):
             return "compaction", all_parts, set(current), dirty
         if (
-            candidate.reason == "backfill"
-            or SCAN_DIRTY_ALL in catalog.dirty
+            (candidate.reason == "backfill" and not sweep_hint)
+            or (SCAN_DIRTY_ALL in catalog.dirty and not sweep_hint)
             or not catalog.members
             or not datasets_complete
         ):
