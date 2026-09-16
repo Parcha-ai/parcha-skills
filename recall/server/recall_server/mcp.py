@@ -1055,6 +1055,7 @@ def _call_tool(
 # an oversized result until it fits; the receipts still resolve in full.
 SEARCH_RESULT_BUDGET_BYTES = MAX_MCP_RESPONSE_BYTES - 64 * 1024
 MIN_SEARCH_SNIPPET_CHARS = 256
+MAX_FITTED_RECEIPTS = 8
 
 
 def _encoded_result_size(value: dict) -> int:
@@ -1120,10 +1121,28 @@ def fit_search_result(value: Any) -> Any:
                     item["text_clipped"] = True
         if _encoded_result_size(fitted) <= SEARCH_RESULT_BUDGET_BYTES:
             break
+    trimmed_ranges = False
+    if _encoded_result_size(fitted) > SEARCH_RESULT_BUDGET_BYTES:
+        # Long passages carry dozens of receipts and hundreds of span
+        # offsets each (the turbopuffer plane's BM25 arm favours them): a
+        # limit-50 result was 1.25 MB with 0.6 MB of spans and receipts.
+        # Keep the receipts an agent needs to open the document and drop
+        # the byte offsets; ``recall_show`` returns the full record.
+        for ranges in ranges_by_document:
+            for item in ranges:
+                receipts = item.get("receipts")
+                if isinstance(receipts, list) and len(receipts) > MAX_FITTED_RECEIPTS:
+                    item["receipts"] = receipts[:MAX_FITTED_RECEIPTS]
+                    item["receipts_truncated"] = len(receipts) - MAX_FITTED_RECEIPTS
+                if item.get("spans"):
+                    item["spans"] = []
+                    item["spans_omitted"] = True
+        trimmed_ranges = True
     diagnostics = fitted.get("diagnostics")
     fitted["diagnostics"] = {
         **(diagnostics if isinstance(diagnostics, dict) else {}),
         "snippet_chars": snippet_chars,
+        **({"ranges_trimmed": True} if trimmed_ranges else {}),
     }
     return fitted
 
