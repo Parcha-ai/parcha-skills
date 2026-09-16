@@ -333,14 +333,19 @@ class ScanCatalog:
         return max(counts.values(), default=0)
 
     def fragmented(self, cap: int, *, small_part_bytes: int = SMALL_PART_BYTES) -> bool:
-        """True when a dataset has more parts than the cap and compaction
-        would shrink it: more than twice the parts its bytes need at the
-        size of its own largest part (parts close at an arrow-bytes target,
-        so full parts share one parquet size whatever the compression
-        ratio), or every part is tiny. A big month at the cap (410 parts,
-        all full) is not fragmented, and rewriting it changes nothing
-        (live: 15-20 min and ~13 GB per pass, every cycle, starving the
-        projection)."""
+        """True when the month's dominant dataset (most bytes) has more parts
+        than the cap and compaction would shrink it: more than twice the
+        parts its bytes need at the size of its own largest part (parts
+        close at an arrow-bytes target, so full parts share one parquet
+        size whatever the compression ratio), or every part is tiny.
+
+        Only the dominant dataset counts: one flush writes one part for
+        every dataset, so a big month's documents and actors datasets
+        mirror the records dataset's part count with tiny parts (live: a
+        47-document month, 66 full records parts, compacted on its
+        documents parts). A big month at the cap (410 full parts) is not
+        fragmented, and rewriting it changes nothing (15-20 min and ~13 GB
+        per pass, every cycle, starving the projection)."""
 
         counts: dict[str, int] = {}
         total: dict[str, int] = {}
@@ -350,15 +355,16 @@ class ScanCatalog:
             counts[dataset] = counts.get(dataset, 0) + 1
             total[dataset] = total.get(dataset, 0) + size
             largest[dataset] = max(largest.get(dataset, 0), size)
-        for dataset, count in counts.items():
-            if count <= cap:
-                continue
-            if largest[dataset] < small_part_bytes:
-                return True
-            needed = max(1, -(-total[dataset] // largest[dataset]))
-            if count > 2 * needed:
-                return True
-        return False
+        if not counts:
+            return False
+        dataset = max(counts, key=lambda name: (total[name], counts[name], name))
+        count = counts[dataset]
+        if count <= cap:
+            return False
+        if largest[dataset] < small_part_bytes:
+            return True
+        needed = max(1, -(-total[dataset] // largest[dataset]))
+        return count > 2 * needed
 
 
 @dataclass(frozen=True)
@@ -1718,12 +1724,18 @@ class CanonicalParquetScanProjector:
                                       count(*) AS parts,
                                       max(size_bytes) AS largest,
                                       -- parts the dataset needs at the size of its largest part
-                                      greatest(1,ceil(sum(size_bytes)::numeric / max(size_bytes))) AS needed
+                                      greatest(1,ceil(sum(size_bytes)::numeric / max(size_bytes))) AS needed,
+                                      -- the month's dominant dataset by bytes decides
+                                      row_number() OVER (
+                                          PARTITION BY tenant_id,source_id,bucket_start
+                                          ORDER BY sum(size_bytes) DESC,count(*) DESC,dataset
+                                      ) AS bytes_rank
                                  FROM canonical_parquet_scan_shards
                                 WHERE (%s::text IS NULL OR tenant_id=%s)
                                 GROUP BY tenant_id,source_id,bucket_start,dataset
                          ) fragment
-                        WHERE fragment.parts > %s
+                        WHERE fragment.bytes_rank = 1
+                          AND fragment.parts > %s
                           AND (fragment.parts > 2 * fragment.needed OR fragment.largest < %s)
                           AND NOT EXISTS (
                               SELECT 1 FROM canonical_parquet_scan_queue queue
