@@ -34,6 +34,9 @@ PARQUET_RAW_SLICE_BYTES = 32 * 1024 * 1024
 FRAGMENT_TARGET_BYTES = 32 * 1024 * 1024
 MAX_SHARD_INDEX = 99_999
 DEFAULT_COMPACTION_FRAGMENTS = 16
+# A dataset whose largest part is below this is all small parts: compact it
+# once it passes the cap, whatever the ratio between its parts.
+SMALL_PART_BYTES = 2 * 1024 * 1024
 SCAN_DIRTY_ALL = "*"
 PART_TIME_BOUND_CHECKPOINT = 128
 
@@ -329,21 +332,31 @@ class ScanCatalog:
             counts[dataset] = counts.get(dataset, 0) + 1
         return max(counts.values(), default=0)
 
-    def fragmented(self, cap: int, *, target_bytes: int = FRAGMENT_TARGET_BYTES) -> bool:
-        """True when a dataset has more parts than the cap and more than twice
-        the parts its bytes need at the target size: compaction would shrink
-        it. A big month at the cap (410 parts of 32 MiB) is not fragmented,
-        and rewriting it changes nothing (live: 15-20 min and ~13 GB per
-        pass, every cycle, starving the projection)."""
+    def fragmented(self, cap: int, *, small_part_bytes: int = SMALL_PART_BYTES) -> bool:
+        """True when a dataset has more parts than the cap and compaction
+        would shrink it: more than twice the parts its bytes need at the
+        size of its own largest part (parts close at an arrow-bytes target,
+        so full parts share one parquet size whatever the compression
+        ratio), or every part is tiny. A big month at the cap (410 parts,
+        all full) is not fragmented, and rewriting it changes nothing
+        (live: 15-20 min and ~13 GB per pass, every cycle, starving the
+        projection)."""
 
         counts: dict[str, int] = {}
-        bytes_by_dataset: dict[str, int] = {}
+        total: dict[str, int] = {}
+        largest: dict[str, int] = {}
         for (dataset, _), row in self.shards.items():
+            size = int(row.get("size_bytes") or 0)
             counts[dataset] = counts.get(dataset, 0) + 1
-            bytes_by_dataset[dataset] = bytes_by_dataset.get(dataset, 0) + int(row.get("size_bytes") or 0)
+            total[dataset] = total.get(dataset, 0) + size
+            largest[dataset] = max(largest.get(dataset, 0), size)
         for dataset, count in counts.items():
-            needed = max(1, -(-bytes_by_dataset[dataset] // target_bytes))
-            if count > cap and count > 2 * needed:
+            if count <= cap:
+                continue
+            if largest[dataset] < small_part_bytes:
+                return True
+            needed = max(1, -(-total[dataset] // largest[dataset]))
+            if count > 2 * needed:
                 return True
         return False
 
@@ -1695,14 +1708,15 @@ class CanonicalParquetScanProjector:
                          FROM (
                                SELECT tenant_id,source_id,bucket_start,dataset,
                                       count(*) AS parts,
-                                      -- parts the dataset needs at the target size
-                                      greatest(1,ceil(sum(size_bytes)::numeric / %s)) AS needed
+                                      max(size_bytes) AS largest,
+                                      -- parts the dataset needs at the size of its largest part
+                                      greatest(1,ceil(sum(size_bytes)::numeric / max(size_bytes))) AS needed
                                  FROM canonical_parquet_scan_shards
                                 WHERE (%s::text IS NULL OR tenant_id=%s)
                                 GROUP BY tenant_id,source_id,bucket_start,dataset
                          ) fragment
                         WHERE fragment.parts > %s
-                          AND fragment.parts > 2 * fragment.needed
+                          AND (fragment.parts > 2 * fragment.needed OR fragment.largest < %s)
                           AND NOT EXISTS (
                               SELECT 1 FROM canonical_parquet_scan_queue queue
                                WHERE queue.tenant_id=fragment.tenant_id
@@ -1714,7 +1728,7 @@ class CanonicalParquetScanProjector:
                         ORDER BY max(fragment.parts) DESC,fragment.tenant_id,
                                  fragment.source_id,fragment.bucket_start
                         LIMIT %s""",
-                    (FRAGMENT_TARGET_BYTES, tenant_id, tenant_id, self.compaction_fragments, limit),
+                    (tenant_id, tenant_id, self.compaction_fragments, SMALL_PART_BYTES, limit),
                 ).fetchall()
                 candidates = []
                 for row in rows:
