@@ -345,6 +345,25 @@ class BrokerTest(unittest.TestCase):
         self.assertEqual(self.herdr_calls().count("agent send-keys b enter"), 2, "trust, then the bypass consent")
         self.assertEqual(spawned["session_id"], "claude-sess-4")
 
+    def test_herdr_required_refuses_a_headless_fallback_and_defaults_the_space(self):
+        base = self.slice.settings
+        self.slice.settings = type(base)(**{**base.__dict__, "extra": {**base.extra, "herdr_required": True, "herdr_workspace": "claudio"}})
+        self.slice.herdr_factory = lambda: None
+        self.slice._create_session = lambda k, c, t: "sess-plain"
+        refused = self.call(op="spawn", harness="claude", task="t", cwd=self.temp.name, channel_id="C1", thread_ts="100.7")
+        self.assertEqual(refused["code"], "herdr_unavailable")
+        forced = self.call(op="spawn", harness="claude", task="t", cwd=self.temp.name, channel_id="C1", thread_ts="100.7", herdr=False)
+        self.assertEqual(forced["session_id"], "sess-plain", "--no-herdr is an explicit operator choice and still works")
+        client = self.herdr_client()
+        self.slice.herdr_factory = lambda: client
+        spawned = self.call(op="spawn", harness="claude", task="t", cwd=self.temp.name, channel_id="C1", thread_ts="100.8")
+        self.assertTrue(spawned["ok"], spawned)
+        self.assertIn(f"workspace create --cwd {self.temp.name} --label claudio --no-focus", self.herdr_calls(),
+                      "the configured space is created when missing and used by default")
+        self.assertEqual(spawned["herdr"]["workspace_id"], "w2")
+        named = self.call(op="spawn", harness="claude", task="t", cwd=self.temp.name, channel_id="C1", thread_ts="100.9", herdr_workspace="grep.ai")
+        self.assertEqual(named["herdr"]["workspace_id"], "w1", "a space the person names still wins")
+
     def test_spawn_without_herdr_is_unchanged(self):
         self.slice.herdr_factory = lambda: None
         self.slice._create_session = lambda k, c, t: "sess-plain"

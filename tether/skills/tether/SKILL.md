@@ -62,7 +62,10 @@ picks the workspace the person named (the tool takes `workspace`), `--tab "<labe
 tab (default: a title from the task), and whoever opens Herdr sees the session there with its
 thread on the pane. Slack replies to a Claude Code session in a pane are prompted in that pane;
 a dialog that blocks the pane is posted to the thread and the next reply answers it. Without
-Herdr, or with `--no-herdr`, spawn behaves as before.
+Herdr, or with `--no-herdr`, spawn behaves as before. A gateway whose sessions must always be
+visible sets `herdr_workspace = "<space>"` (its default space, created if missing) and
+`herdr_required = true` in `~/.config/tether/config.toml`: a spawn then refuses when no Herdr
+session is running instead of starting an invisible headless one.
 
 ## Continue
 
