@@ -1232,11 +1232,21 @@ class CanonicalParquetScanProjector:
             if not all_parts:
                 return "reuse", set(), set(), dirty
             return "full", all_parts, set(), dirty
+        if not stale and not uncovered and datasets_complete and not catalog.fragmented(
+            self.compaction_fragments
+        ):
+            # Content-identical and not fragmented: keep every immutable
+            # object, clear the queue. This outranks the compaction sentinel
+            # on purpose. The sentinel is a hint from the sweep, written
+            # before the month was read; if the month turns out to need no
+            # rewrite, honouring it burns a full rebuild for nothing (live
+            # 2026-09-16, after the sweep was made fragmentation-aware: an
+            # 832-document month still rewrote all 410 parts with dirty=0,
+            # three times in 90 minutes, because the sentinel was checked
+            # first).
+            return "reuse", set(), set(), dirty
         if catalog.compaction:
             return "compaction", all_parts, set(current), dirty
-        if not stale and not uncovered and datasets_complete:
-            # Content-identical: keep every immutable object, clear the queue.
-            return "reuse", set(), set(), dirty
         if (
             candidate.reason == "backfill"
             or SCAN_DIRTY_ALL in catalog.dirty

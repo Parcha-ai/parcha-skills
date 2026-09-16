@@ -1222,14 +1222,39 @@ class ParquetFragmentDeltaTest(unittest.TestCase):
         self.assertEqual(result.mode, "compaction")
         self.assertEqual(set(result.removed), set(catalog.shards))
 
-    def test_compaction_sentinel_rewrites_unchanged_month(self):
-        alpha = _month_document("document:alpha")
-        catalog = _catalog({0: [alpha]}, dirty={SCAN_DIRTY_ALL}, compaction=True)
-        archive = _DocumentArchive({"document:alpha": 1})
-        result = _FragmentProbe([alpha], catalog, archive)._build(_candidate())
+    def test_compaction_sentinel_rewrites_a_fragmented_month(self):
+        # Many small parts: compaction actually shrinks the month, so the
+        # sentinel is honoured even though no document changed.
+        documents = [_month_document(f"document:{index}") for index in range(4)]
+        catalog = _catalog(
+            {index: [document] for index, document in enumerate(documents)},
+            dirty={SCAN_DIRTY_ALL},
+            compaction=True,
+        )
+        archive = _DocumentArchive({f"document:{index}": 1 for index in range(4)})
+        result = _FragmentProbe(
+            documents, catalog, archive, compaction_fragments=3
+        )._build(_candidate())
         self.assertEqual(result.mode, "compaction")
         self.assertEqual(set(result.removed), set(catalog.shards))
         self.assertTrue(result.created)
+
+    def test_compaction_sentinel_does_not_rewrite_an_unfragmented_month(self):
+        # Live 2026-09-16, after the sweep became fragmentation-aware: an
+        # 832-document month still rewrote all 410 parts with dirty=0, three
+        # times in 90 minutes, because the sentinel was checked before the
+        # reuse short-circuit. A sentinel is a hint written before the month
+        # was read; a content-identical, unfragmented month reuses.
+        alpha = _month_document("document:alpha")
+        catalog = _catalog({0: [alpha]}, dirty={SCAN_DIRTY_ALL}, compaction=True)
+        for row in catalog.shards.values():
+            row["size_bytes"] = FRAGMENT_TARGET_BYTES
+        archive = _DocumentArchive({"document:alpha": 1})
+        result = _FragmentProbe([alpha], catalog, archive)._build(_candidate())
+        self.assertEqual(result.mode, "reuse")
+        self.assertEqual(set(result.removed), set())
+        self.assertFalse(result.created)
+        self.assertEqual(archive.reads, [])  # nothing re-read, nothing re-uploaded
 
     def test_full_sized_parts_above_the_cap_are_not_fragmented(self):
         # Live: a month of 410 parts at the 32 MiB target compacted every
