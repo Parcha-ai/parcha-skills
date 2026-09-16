@@ -364,6 +364,7 @@ def load_active_settings(path: Path) -> ActiveSettings:
         extra={"default_channel": str(raw.get("default_channel") or ""),
                "herdr_workspace": str(raw.get("herdr_workspace") or ""),
                "herdr_session": str(raw.get("herdr_session") or ""),
+               "herdr_required": bool(raw.get("herdr_required", False)),
                "herdr_trusted_roots": list(raw.get("herdr_trusted_roots") or []),
                "default_cwd": str(raw.get("default_cwd") or "")},
     )
@@ -1006,6 +1007,10 @@ class ActiveSlice:
         who = f"Asked by <@{asked_by}> in Slack. " if asked_by and asked_by != "operator" else ""
         herdr = None if request.get("herdr") is False else self.herdr_factory()
         placement: dict[str, Any] | None = None
+        if herdr is None and self.settings.extra.get("herdr_required") and request.get("herdr") is not False:
+            # This gateway's sessions live in Herdr, always: a missing Herdr is a fault to fix,
+            # not a reason to start an invisible headless session.
+            raise BrokerRefused("herdr_unavailable", "no Herdr session is running on this machine and herdr_required is set")
         if herdr is not None:
             # The session lives in a Herdr tab: whoever opens Herdr sees it, and the driver
             # prompts it in that pane. The task is its first turn, like any other.
