@@ -132,6 +132,13 @@ class _Catalog:
                 del self.outbox[(source, month)]
                 return _Result(rowcount=1)
             return _Result(rowcount=0)
+        if folded.startswith("UPDATE search_projection_outbox SET reason='logical-update'"):
+            _tenant, source, month = params
+            row = self.outbox.get((source, month))
+            if row and row["reason"] == "backfill":
+                row["reason"] = "logical-update"
+                return _Result(rowcount=1)
+            return _Result(rowcount=0)
         if "FROM search_projection_shards" in folded:
             shard = self.shards.get((params[1], params[2]))
             return _Result([shard] if shard else [])
@@ -340,6 +347,28 @@ class GenerationTest(unittest.TestCase):
         self.assertEqual(catalog.outbox[(SOURCE, JULY)]["generation"], 5)
         # The shard row still records what was written so the next pass is incremental.
         self.assertEqual(catalog.shards[(SOURCE, JULY)]["generation"], 4)
+        self.assertEqual(catalog.shards[(SOURCE, JULY)]["built_at"], catalog.watermark)
+
+    def test_hot_month_backfill_downgrades_to_incremental_when_the_generation_moves(self) -> None:
+        # Live: a September row reached generation 222 because ingest bumped it
+        # during every multi-hour full pass; the month was re-uploaded each time.
+        catalog = _Catalog()
+        catalog.passages = [_passage(1, 7, 3)]
+        catalog.enqueue(JULY, generation=4, reason="backfill")
+        client = FakeTurbopuffer()
+
+        class RequeuingNamespace(FakeNamespace):
+            def write(self, **kwargs):
+                catalog.outbox[(SOURCE, JULY)]["generation"] = 5
+                return super().write(**kwargs)
+
+        client.namespaces[SETTINGS.namespace(TENANT)] = RequeuingNamespace(SETTINGS.namespace(TENANT))
+        projector, _ = _projector(catalog, client)
+        result = projector.drain(tenant_id=TENANT, max_months=1)
+        self.assertEqual((result["months"], result["requeued"]), (1, 1))
+        # The row stays queued for the newer generation but as an incremental pass.
+        self.assertEqual(catalog.outbox[(SOURCE, JULY)]["reason"], "logical-update")
+        self.assertEqual(catalog.outbox[(SOURCE, JULY)]["generation"], 5)
         self.assertEqual(catalog.shards[(SOURCE, JULY)]["built_at"], catalog.watermark)
 
 
