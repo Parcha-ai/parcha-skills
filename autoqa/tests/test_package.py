@@ -33,7 +33,7 @@ class AutoqaPackageTest(unittest.TestCase):
     def test_autoqa_config_is_baseline_and_diff_cases_are_additive(self):
         text = SKILL.read_text()
         self.assertIn("reusable **baseline**", text)
-        self.assertIn("**Diff inventory**", text)
+        self.assertIn("**Diff inventory.**", text)
         self.assertIn("committed, staged, unstaged", text)
         self.assertIn("**Diff cases are additive.**", text)
 

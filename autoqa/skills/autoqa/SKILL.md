@@ -119,6 +119,12 @@ multi-choice question in plain text and wait.
 - **Diff cases are additive.** `AUTOQA.md`, a feature tracker, or a prior report can never
   suppress a test implied by the current diff. A prior PASS is context, not a witness for
   the current run.
+- Mark continuation, replay, child-dispatch, and other stateful session checks as
+  `session-sensitive`. Give each row the run ID and require a session created for that run. Its
+  setup witness must show exactly zero turns and zero children before the first action. The
+  first launch appends exactly one turn and one child,
+  a continuation appends exactly one turn and one child after them, and replay appends nothing
+  and returns the same IDs in the same order.
 - Order rows: boot and health first, auth when required, then affected paths and regressions.
 
 Done when: the selected inventories exist, the matrix has at least one row per item, every
@@ -135,6 +141,12 @@ against the live instance.
   cannot be brought up at all (missing secrets, port conflict, boot crash), the whole run
   is `BLOCKED` — report what failed to boot and stop; never force a ship/don't-ship verdict
   on an app you never ran.
+- Before a session-sensitive row, create a fresh run-ID-scoped session through the traced entry
+  point. Query it before the first action and assert exactly zero turns and zero children. After
+  the first launch, assert one turn and one child. After continuation, assert two turns and two children
+  with the original pair first. Replay must leave both counts and the complete ID order unchanged. A non-empty
+  starting session or an approximate count fails the row. Never reuse a session from a prior
+  row or run.
 - Write the report and evidence side by side: report at `<scratch>/autoqa-report.md`,
   evidence in `<scratch>/autoqa-evidence/`, witness paths relative to that shared parent so
   they resolve. Name witness files by row: curl output with status codes, page snapshots or
@@ -156,10 +168,11 @@ against the live instance.
 
 ### Before / after evidence
 
-Compare changed behavior with the clearest observable evidence. UI changes use screenshots.
-Non-UI and behavior-preserving changes use contract output, status and body shape, OpenAPI,
-logs, or an equivalent observable result. Do not require screenshots when behavior must not
-change.
+Capture before/after evidence only when observable behavior changed. Compare that behavior
+with the clearest observable evidence. UI changes use screenshots. Non-UI changes use contract
+output, status and body shape, OpenAPI, logs, or an equivalent observable result.
+Behavior-preserving work needs one contract-equivalence witness, not an artificial pair. Do not
+require screenshots when behavior must not change.
 
 For UI changes, pair the branch screenshot with the same view from a running base instance
 when one exists:
@@ -178,8 +191,9 @@ when one exists:
   report lists the local pair and the two instance URLs plus the "after" commit SHA.
 
 Done when: every matrix row is PASS, FAIL (with cause), UNTESTED (with reason), SKIPPED, or
-BLOCKED_INFRA. Each row has a witness that shows the asserted result. Every changed row names
-its before/after evidence or why a comparison does not apply.
+BLOCKED_INFRA. Each row has a witness that shows the asserted result. Every row with changed
+observable behavior names its before/after evidence or records
+`before: none (no base instance)`. Behavior-preserving rows name their equivalence witness.
 
 ## Phase 4 — REPORT
 

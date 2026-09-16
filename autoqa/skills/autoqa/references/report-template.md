@@ -26,7 +26,13 @@ witness path that resolves and shows the asserted result. Record the user's sele
 execution groups. State coverage arithmetic separately for baseline and diff inventories,
 then total it. Say whether this is full-catalog coverage or a scoped pass.
 
+For each session-sensitive row, record the run ID, fresh session ID, zero-state witness, and
+the exact expected and observed turn/child counts and order after every action.
+
 ## Before / After
+
+Include rows only when observable behavior changed. For behavior-preserving work, record one
+contract-equivalence witness instead. Use `before: none (no base instance)` when applicable.
 
 | Check | Before | After |
 |:--|:------:|:-----:|
