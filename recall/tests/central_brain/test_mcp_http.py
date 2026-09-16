@@ -1268,6 +1268,16 @@ class RemoteMcpContractTest(unittest.TestCase):
         # The original is untouched.
         self.assertEqual(len(value["results"][0]["matching_ranges"][0]["text"]), 1000)
 
+    def test_integral_floats_are_accepted_as_integers(self) -> None:
+        from recall_server.mcp import McpProtocolError, _integer
+
+        self.assertEqual(_integer(50.0, "limit", default=10, minimum=1, maximum=50), 50)
+        self.assertEqual(_integer(256.0, "snippet_chars", default=0, minimum=128, maximum=8192), 256)
+        with self.assertRaises(McpProtocolError):
+            _integer(50.5, "limit", default=10, minimum=1, maximum=50)
+        with self.assertRaises(McpProtocolError):
+            _integer(True, "limit", default=10, minimum=1, maximum=50)
+
     def test_search_accepts_snippet_chars_and_rejects_out_of_range(self) -> None:
         with McpHttpServer(self.store) as server:
             status, _, raw = server.request(
