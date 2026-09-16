@@ -34,9 +34,6 @@ PARQUET_RAW_SLICE_BYTES = 32 * 1024 * 1024
 FRAGMENT_TARGET_BYTES = 32 * 1024 * 1024
 MAX_SHARD_INDEX = 99_999
 DEFAULT_COMPACTION_FRAGMENTS = 16
-# A dataset whose largest part is below this is all small parts: compact it
-# once it passes the cap, whatever the ratio between its parts.
-SMALL_PART_BYTES = 2 * 1024 * 1024
 SCAN_DIRTY_ALL = "*"
 PART_TIME_BOUND_CHECKPOINT = 128
 
@@ -332,39 +329,34 @@ class ScanCatalog:
             counts[dataset] = counts.get(dataset, 0) + 1
         return max(counts.values(), default=0)
 
-    def fragmented(self, cap: int, *, small_part_bytes: int = SMALL_PART_BYTES) -> bool:
-        """True when the month's dominant dataset (most bytes) has more parts
-        than the cap and compaction would shrink it: more than twice the
-        parts its bytes need at the size of its own largest part (parts
-        close at an arrow-bytes target, so full parts share one parquet
-        size whatever the compression ratio), or every part is tiny.
+    def fragmented(self, cap: int) -> bool:
+        """True when the month's dominant dataset (most bytes) carries at
+        least ``cap`` parts outside its largest single build.
 
-        Only the dominant dataset counts: one flush writes one part for
-        every dataset, so a big month's documents and actors datasets
-        mirror the records dataset's part count with tiny parts (live: a
-        47-document month, 66 full records parts, compacted on its
-        documents parts). A big month at the cap (410 full parts) is not
-        fragmented, and rewriting it changes nothing (15-20 min and ~13 GB
-        per pass, every cycle, starving the projection)."""
+        Every part of one build shares the build's generation fingerprint,
+        so the largest same-fingerprint group is the layout the last full
+        rewrite produced and the parts outside it are what deltas added
+        since. That is the only fragmentation a compaction can remove: a
+        part's size says nothing (parts close at document boundaries, so a
+        month of large documents legitimately has many small parts, and a
+        "compaction" of such a month grew 205 parts into 226), and a big
+        month at the cap (410 full parts, one build) is not fragmented.
+        """
 
         counts: dict[str, int] = {}
         total: dict[str, int] = {}
-        largest: dict[str, int] = {}
+        builds: dict[str, dict[str, int]] = {}
         for (dataset, _), row in self.shards.items():
-            size = int(row.get("size_bytes") or 0)
             counts[dataset] = counts.get(dataset, 0) + 1
-            total[dataset] = total.get(dataset, 0) + size
-            largest[dataset] = max(largest.get(dataset, 0), size)
+            total[dataset] = total.get(dataset, 0) + int(row.get("size_bytes") or 0)
+            build = str(row.get("generation_sha256") or "")
+            group = builds.setdefault(dataset, {})
+            group[build] = group.get(build, 0) + 1
         if not counts:
             return False
         dataset = max(counts, key=lambda name: (total[name], counts[name], name))
-        count = counts[dataset]
-        if count <= cap:
-            return False
-        if largest[dataset] < small_part_bytes:
-            return True
-        needed = max(1, -(-total[dataset] // largest[dataset]))
-        return count > 2 * needed
+        largest_build = max(builds[dataset].values(), default=0)
+        return counts[dataset] - largest_build >= cap
 
 
 @dataclass(frozen=True)
@@ -1722,21 +1714,28 @@ class CanonicalParquetScanProjector:
                          FROM (
                                SELECT tenant_id,source_id,bucket_start,dataset,
                                       count(*) AS parts,
-                                      max(size_bytes) AS largest,
-                                      -- parts the dataset needs at the size of its largest part
-                                      greatest(1,ceil(sum(size_bytes)::numeric / max(size_bytes))) AS needed,
+                                      -- parts outside the largest single build: what deltas
+                                      -- added since the last full rewrite
+                                      count(*) - max(build_parts) AS delta_parts,
                                       -- the month's dominant dataset by bytes decides
                                       row_number() OVER (
                                           PARTITION BY tenant_id,source_id,bucket_start
                                           ORDER BY sum(size_bytes) DESC,count(*) DESC,dataset
                                       ) AS bytes_rank
-                                 FROM canonical_parquet_scan_shards
-                                WHERE (%s::text IS NULL OR tenant_id=%s)
+                                 FROM (
+                                       SELECT tenant_id,source_id,bucket_start,dataset,
+                                              size_bytes,
+                                              count(*) OVER (
+                                                  PARTITION BY tenant_id,source_id,bucket_start,
+                                                               dataset,generation_sha256
+                                              ) AS build_parts
+                                         FROM canonical_parquet_scan_shards
+                                        WHERE (%s::text IS NULL OR tenant_id=%s)
+                                 ) shard
                                 GROUP BY tenant_id,source_id,bucket_start,dataset
                          ) fragment
                         WHERE fragment.bytes_rank = 1
-                          AND fragment.parts > %s
-                          AND (fragment.parts > 2 * fragment.needed OR fragment.largest < %s)
+                          AND fragment.delta_parts >= %s
                           AND NOT EXISTS (
                               SELECT 1 FROM canonical_parquet_scan_queue queue
                                WHERE queue.tenant_id=fragment.tenant_id
@@ -1748,7 +1747,7 @@ class CanonicalParquetScanProjector:
                         ORDER BY max(fragment.parts) DESC,fragment.tenant_id,
                                  fragment.source_id,fragment.bucket_start
                         LIMIT %s""",
-                    (tenant_id, tenant_id, self.compaction_fragments, SMALL_PART_BYTES, limit),
+                    (tenant_id, tenant_id, self.compaction_fragments, limit),
                 ).fetchall()
                 candidates = []
                 for row in rows:
