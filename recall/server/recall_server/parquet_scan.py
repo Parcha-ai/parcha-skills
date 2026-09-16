@@ -330,8 +330,8 @@ class ScanCatalog:
         return max(counts.values(), default=0)
 
     def fragmented(self, cap: int) -> bool:
-        """True when the month's dominant dataset (most bytes) carries more
-        than ``cap`` parts outside its largest single build.
+        """True when the month's dominant dataset (most bytes) carries at
+        least ``cap`` parts outside its largest single build.
 
         Every part of one build shares the build's generation fingerprint,
         so the largest same-fingerprint group is the layout the last full
@@ -356,7 +356,7 @@ class ScanCatalog:
             return False
         dataset = max(counts, key=lambda name: (total[name], counts[name], name))
         largest_build = max(builds[dataset].values(), default=0)
-        return counts[dataset] - largest_build > cap
+        return counts[dataset] - largest_build >= cap
 
 
 @dataclass(frozen=True)
@@ -1735,7 +1735,7 @@ class CanonicalParquetScanProjector:
                                 GROUP BY tenant_id,source_id,bucket_start,dataset
                          ) fragment
                         WHERE fragment.bytes_rank = 1
-                          AND fragment.delta_parts > %s
+                          AND fragment.delta_parts >= %s
                           AND NOT EXISTS (
                               SELECT 1 FROM canonical_parquet_scan_queue queue
                                WHERE queue.tenant_id=fragment.tenant_id

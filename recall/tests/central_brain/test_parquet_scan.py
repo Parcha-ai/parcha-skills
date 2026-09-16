@@ -1326,8 +1326,8 @@ class ParquetFragmentDeltaTest(unittest.TestCase):
         six = _catalog({index: [_month_document(f"document:{index}")] for index in range(6)})
         for (dataset, index), row in six.shards.items():
             row["generation_sha256"] = ("f" * 64) if index < 2 else (f"{index:x}" * 64)
-        self.assertTrue(six.fragmented(3))
-        self.assertFalse(six.fragmented(4))
+        self.assertTrue(six.fragmented(4))
+        self.assertFalse(six.fragmented(5))
         # Only the dominant dataset decides: a fragmented actors dataset
         # beside a single-build records dataset is not fragmentation.
         for (dataset, index), row in six.shards.items():
