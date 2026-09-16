@@ -1285,6 +1285,31 @@ class RemoteMcpContractTest(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertEqual(json.loads(raw)["error"]["code"], -32602)
 
+    def test_fit_trims_receipts_and_spans_when_snippets_alone_do_not_fit(self) -> None:
+        from recall_server.mcp import MAX_FITTED_RECEIPTS, SEARCH_RESULT_BUDGET_BYTES, _encoded_result_size, fit_search_result
+
+        def document(i):
+            return {
+                "source_id": "codex:linux:host", "logical_document_id": f"ldoc_{i:032x}", "revision": 1,
+                "matching_ranges": [{
+                    "kind": "dense", "passage_id": f"psg_{i:032x}", "text": "x" * 300,
+                    "receipts": [f"recall://codex:linux:host/{i}-{j}?rev=1#item=0" for j in range(60)],
+                    "spans": [{"message_index": j, "passage_byte_start": j * 10, "passage_byte_end": j * 10 + 9, "record_ordinal": j, "record_count": 1, "source_byte_start": 0, "source_byte_end": 9} for j in range(200)],
+                } for _ in range(3)],
+            }
+
+        value = {"results": [document(i) for i in range(60)], "diagnostics": {"engine": "lossless-passages-v1"}}
+        self.assertGreater(_encoded_result_size(value), SEARCH_RESULT_BUDGET_BYTES)
+        fitted = fit_search_result(value)
+        self.assertLessEqual(_encoded_result_size(fitted), SEARCH_RESULT_BUDGET_BYTES)
+        rng = fitted["results"][0]["matching_ranges"][0]
+        self.assertEqual(len(rng["receipts"]), MAX_FITTED_RECEIPTS)
+        self.assertEqual(rng["receipts_truncated"], 60 - MAX_FITTED_RECEIPTS)
+        self.assertEqual((rng["spans"], rng["spans_omitted"]), ([], True))
+        self.assertTrue(fitted["diagnostics"]["ranges_trimmed"])
+        # The original is untouched.
+        self.assertEqual(len(value["results"][0]["matching_ranges"][0]["receipts"]), 60)
+
     def test_public_profile_hides_every_non_mcp_route_before_store_io(self) -> None:
         self.environment.stop()
         self.environment = mock.patch.dict(
