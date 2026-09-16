@@ -21,6 +21,8 @@ class FakeSlack:
     def __init__(self):
         self.posts: list[tuple[str, str, str | None]] = []
         self.n = 0
+        self.missing_threads: set[tuple[str, str]] = set()
+        self.reactions: list[tuple[str, str, str, str]] = []
 
     def identity(self):
         return {"team_id": "T12345678", "user_id": "UBOT", "user": "bot"}
@@ -29,8 +31,6 @@ class FakeSlack:
         self.n += 1
         self.posts.append((channel_id, text, thread_ts))
         return f"1700000000.{self.n:06d}"
-
-    missing_threads: set[tuple[str, str]] = set()
 
     def thread_replies(self, channel_id, thread_ts, *, limit=50):
         if (channel_id, thread_ts) in self.missing_threads:
@@ -42,8 +42,6 @@ class FakeSlack:
 
     def membership(self, channel_id):
         return "member"
-
-    reactions: list[tuple[str, str, str, str]] = []
 
     def react(self, channel_id, message_ts, emoji):
         self.reactions.append(("add", channel_id, message_ts, emoji))
@@ -246,6 +244,95 @@ class BrokerTest(unittest.TestCase):
         self.slice._create_session = boom
         failed = self.call(op="spawn", harness="claude", task="t", cwd=self.temp.name)
         self.assertEqual(failed["code"], "spawn_failed")
+
+    def herdr_client(self):
+        from tests.fakes import write_fake_herdr
+        fake = write_fake_herdr(pathlib.Path(self.temp.name))
+        os.environ["FAKE_HERDR_STATE"] = str(pathlib.Path(self.temp.name) / "herdr-state.json")
+        os.environ["FAKE_HERDR_LOG"] = str(pathlib.Path(self.temp.name) / "herdr-calls.log")
+        for key in ("FAKE_HERDR_STATE", "FAKE_HERDR_LOG", "FAKE_HERDR_W1_CWD", "FAKE_HERDR_TRUST", "FAKE_HERDR_SCREEN"):
+            self.addCleanup(os.environ.pop, key, None)
+        herdr_module = sys.modules[type(self.slice).__module__.rsplit(".", 1)[0] + ".herdr"]
+        return herdr_module.Herdr(binary=str(fake), session="pilot")
+
+    def herdr_calls(self):
+        return (pathlib.Path(self.temp.name) / "herdr-calls.log").read_text().splitlines()
+
+    def test_spawn_places_the_session_in_a_herdr_tab(self):
+        client = self.herdr_client()
+        self.slice.herdr_factory = lambda: client
+
+        def never(*a, **k):
+            raise AssertionError("a Herdr spawn starts the harness in the pane, never headless")
+
+        self.slice._create_session = never
+        task = "<@U12345678> start a herdr tab called MCP in the grep.ai space debugging the expert creation MCP"
+        spawned = self.call(op="spawn", harness="claude", task=task, cwd=self.temp.name, channel_id="C1",
+                            thread_ts="100.7", herdr_workspace="grep.ai", tab="MCP", actor="U12345678")
+        self.assertTrue(spawned["ok"], spawned)
+        self.assertEqual(spawned["session_id"], "claude-sess-2")
+        self.assertEqual(spawned["herdr"], {"session": "pilot", "workspace_id": "w1", "tab_id": "w1:t2",
+                                            "pane_id": "w1:p2", "agent": "mcp", "kind": "claude"})
+        calls = self.herdr_calls()
+        self.assertIn(f"tab create --workspace w1 --cwd {self.temp.name} --label MCP --no-focus", calls)
+        self.assertTrue(any(c.startswith("agent start mcp --kind claude --pane w1:p2") for c in calls))
+        self.assertIn("pane report-metadata w1:p2 --source tether --token slack=C1/100.7", calls)
+        binding = self.slice.runtime.find_active_binding(team_id="T12345678", channel_id="C1", thread_ts="100.7")
+        source = self.slice.runtime.endpoint(binding["endpoint_id"])["source"]
+        self.assertEqual(source["herdr"]["pane_id"], "w1:p2")
+        self.assertTrue(source["spawned"])
+        # a second tab with the same label gets a distinct agent name
+        again = self.call(op="spawn", harness="claude", task="more", cwd=self.temp.name, channel_id="C1",
+                          thread_ts="100.8", herdr_workspace="grep.ai", tab="MCP")
+        self.assertEqual(again["herdr"]["agent"], "mcp-2")
+
+    def test_spawn_picks_the_repo_workspace_or_makes_one_and_derives_the_tab_label(self):
+        client = self.herdr_client()
+        self.slice.herdr_factory = lambda: client
+        os.environ["FAKE_HERDR_W1_CWD"] = self.temp.name
+        spawned = self.call(op="spawn", harness="claude", cwd=self.temp.name, channel_id="C1", thread_ts="100.7",
+                            task="Fix the flaky test in <https://github.com/x/y/pull/1>: it times out on CI\nmore context")
+        self.assertEqual(spawned["herdr"]["workspace_id"], "w1", "the workspace whose checkout holds cwd")
+        self.assertIn("tab create --workspace w1 --cwd " + self.temp.name + " --label Fix the flaky test in: it times out on CI --no-focus",
+                      self.herdr_calls())
+        inside = pathlib.Path(self.temp.name) / "sub"
+        inside.mkdir()
+        spawned = self.call(op="spawn", harness="claude", cwd=str(inside), channel_id="C1", thread_ts="100.8", task="t")
+        self.assertEqual(spawned["herdr"]["workspace_id"], "w1", "a subdirectory of the checkout is that workspace too")
+        with tempfile.TemporaryDirectory() as elsewhere:
+            os.environ["CODEX_HOME"] = str(pathlib.Path(elsewhere) / "no-codex")
+            self.addCleanup(os.environ.pop, "CODEX_HOME", None)
+            spawned = self.call(op="spawn", harness="codex", cwd=elsewhere, channel_id="C1", thread_ts="100.9", task="t")
+            self.assertEqual(spawned["code"], "session_unknown", "Codex reports no id until the hook is approved and no rollout exists here")
+            self.assertIn(f"workspace create --cwd {elsewhere} --label {pathlib.Path(elsewhere).name} --no-focus", self.herdr_calls())
+
+    def test_spawn_answers_the_folder_trust_dialog_only_under_managed_roots(self):
+        client = self.herdr_client()
+        self.slice.herdr_factory = lambda: client
+        os.environ["FAKE_HERDR_TRUST"] = "1"
+        os.environ["FAKE_HERDR_SCREEN"] = "Quick safety check: Is this a project you created or one you trust?\n > No, exit\n   Yes, I trust this folder"
+        refused = self.call(op="spawn", harness="claude", task="t", cwd=self.temp.name, channel_id="C1", thread_ts="100.7", tab="x")
+        self.assertEqual(refused["code"], "agent_blocked", "a temp dir is not a managed worktree: the dialog is not answered")
+        self.assertNotIn("agent send-keys x enter", self.herdr_calls())
+        managed = pathlib.Path(self.temp.name) / "worktrees" / "gre-1"
+        managed.mkdir(parents=True)
+        self.slice.settings = type(self.slice.settings)(**{**self.slice.settings.__dict__,
+                                                          "extra": {**self.slice.settings.extra, "herdr_trusted_roots": [str(managed.parent)]}})
+        spawned = self.call(op="spawn", harness="claude", task="t", cwd=str(managed), channel_id="C1", thread_ts="100.8", tab="y")
+        self.assertTrue(spawned["ok"], spawned)
+        self.assertIn("agent send-keys y down", self.herdr_calls())
+        self.assertIn("agent send-keys y enter", self.herdr_calls())
+        self.assertEqual(spawned["session_id"], "claude-sess-4")
+
+    def test_spawn_without_herdr_is_unchanged(self):
+        self.slice.herdr_factory = lambda: None
+        self.slice._create_session = lambda k, c, t: "sess-plain"
+        spawned = self.call(op="spawn", harness="claude", task="t", cwd=self.temp.name, channel_id="C1", thread_ts="100.7")
+        self.assertEqual((spawned["session_id"], spawned["herdr"]), ("sess-plain", None))
+        client = self.herdr_client()
+        self.slice.herdr_factory = lambda: client
+        spawned = self.call(op="spawn", harness="claude", task="t", cwd=self.temp.name, channel_id="C1", thread_ts="100.8", herdr=False)
+        self.assertEqual(spawned["session_id"], "sess-plain", "--no-herdr keeps the session out of Herdr")
 
     def test_create_session_parses_both_harnesses(self):
         import subprocess as sp

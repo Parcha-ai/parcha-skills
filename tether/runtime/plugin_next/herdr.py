@@ -62,7 +62,12 @@ class Herdr:
         else the newest live socket under ``~/.config/herdr/sessions/*/herdr.sock`` or the
         default ``~/.config/herdr/herdr.sock``.
         """
+        if os.environ.get("TETHER_HERDR", "").lower() in ("off", "0", "false"):
+            return None  # tests and operators can pin Herdr off without uninstalling it
         found = shutil.which(binary)
+        if not found and "/" not in binary:
+            local = Path.home() / ".local" / "bin" / binary  # the gateway's PATH is systemd's, not the shell's
+            found = str(local) if os.access(local, os.X_OK) else None
         if not found:
             return None
         root = Path(home or os.environ.get("HERDR_CONFIG_HOME") or Path.home() / ".config" / "herdr")

@@ -31,6 +31,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from .herdr import Herdr, HerdrError
 from .store import Store, is_no_reply
 
 logger = logging.getLogger("hermes_plugins.tether_next.session_driver")
@@ -494,6 +495,41 @@ class CodexAppServer:
         self.transport.close()
 
 
+def claude_transcript(session_id: str) -> Path | None:
+    """Claude Code's transcript for a session: ~/.claude/projects/<cwd-slug>/<id>.jsonl."""
+    if not session_id:
+        return None
+    root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
+    try:
+        matches = sorted(root.glob(f"*/{session_id}.jsonl"), key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return None
+    return matches[-1] if matches else None
+
+
+def claude_reply_after(transcript: Path, offset: int) -> str:
+    """The last assistant text block written after ``offset`` bytes of the transcript."""
+    last = ""
+    try:
+        with transcript.open("rb") as handle:
+            handle.seek(offset)
+            for raw in handle:
+                try:
+                    record = json.loads(raw)
+                except ValueError:
+                    continue
+                if record.get("type") != "assistant":
+                    continue
+                content = (record.get("message") or {}).get("content") or []
+                text = "\n".join(str(block.get("text") or "") for block in content
+                                 if isinstance(block, dict) and block.get("type") == "text").strip()
+                if text:
+                    last = text
+    except OSError:
+        return ""
+    return last
+
+
 class SessionDriver:
     """``run_turn`` drives one attempt to a terminal state and records it in the Store."""
 
@@ -575,6 +611,14 @@ class SessionDriver:
             if getattr(self.settings, "codex_driver", "app-server") == "exec":
                 return self._run_codex_turn(attempt_id, session_id, prompt, cwd, timeout_seconds)
             return self._run_codex_app_server_turn(attempt_id, session_id, prompt, cwd, timeout_seconds)
+        placement = source.get("herdr") if isinstance(source.get("herdr"), dict) else None
+        if placement:
+            # The session is interactive in a Herdr pane: prompt it there (a headless
+            # `claude -p --resume` on the same id would fork the conversation).
+            result = self._run_herdr_turn(attempt_id, session_id, prompt, placement)
+            if result is not None:
+                return result
+            logger.warning("tether: herdr pane %s for %s is gone; resuming headless", placement.get("pane_id"), session_id)
         try:
             session = self._session_for(binding_id, session_id, cwd)
         except OSError as exc:
@@ -603,6 +647,54 @@ class SessionDriver:
         if is_no_reply(text):
             return self._finish(attempt_id, "no_reply", text, session_id=event.get("session_id"))
         return self._finish(attempt_id, "completed_with_response", text, session_id=event.get("session_id"))
+
+    def herdr_factory(self, session: str) -> Herdr | None:
+        return Herdr.discover(session=session)
+
+    def _run_herdr_turn(self, attempt_id: str, session_id: str, prompt: str,
+                        placement: dict[str, Any]) -> dict[str, Any] | None:
+        """One turn through Herdr's agent surface; None when the pane is no longer there.
+
+        The reply is the transcript's last assistant text written after the prompt, never the
+        terminal (a screen scrape) and never narration. A blocked dialog is the reply itself:
+        the thread sees it and answers it.
+        """
+        herdr = self.herdr_factory(str(placement.get("session") or ""))
+        if herdr is None:
+            return None
+        try:
+            agent = (herdr.find_agent_by_name(str(placement.get("agent") or "")) if placement.get("agent") else None) \
+                or herdr.find_agent_by_session(session_id)
+        except HerdrError:
+            return None
+        if agent is None:
+            return None
+        target = str(agent.get("name") or agent.get("pane_id"))
+        transcript = claude_transcript(session_id)
+        offset = transcript.stat().st_size if transcript is not None else 0
+        try:
+            settled = herdr.agent_prompt(target, prompt)
+        except HerdrError as exc:
+            if exc.code == "agent_blocked":
+                settled = {"agent_status": "blocked"}
+            else:
+                return self._finish(attempt_id, "failed", str(exc)[:200], error_code=f"herdr_{exc.code}")
+        if settled.get("agent_status") == "blocked":
+            try:
+                screen = herdr.agent_read(target).strip()
+            except HerdrError:
+                screen = ""
+            tail = "\n".join(screen.splitlines()[-12:]).strip()
+            text = "The session is waiting on a dialog. Reply here to answer it.\n```\n" + tail + "\n```"
+            return self._finish(attempt_id, "completed_with_response", text)
+        transcript = transcript or claude_transcript(session_id)
+        text = claude_reply_after(transcript, offset) if transcript is not None else ""
+        if not text:
+            return self._finish(attempt_id, "failed", "no assistant reply found in the session transcript",
+                                error_code="herdr_no_reply")
+        if is_no_reply(text):
+            return self._finish(attempt_id, "no_reply", text)
+        return self._finish(attempt_id, "completed_with_response", text)
 
     def _session_for(self, binding_id: str, session_id: str, cwd: Path) -> SessionProcess:
         with self._lock:

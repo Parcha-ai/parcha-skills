@@ -103,6 +103,8 @@ class HerdrClientTests(unittest.TestCase):
     def test_discover_needs_a_binary_and_a_live_socket(self):
         for key in [k for k in os.environ if k.startswith("HERDR_")]:
             os.environ.pop(key)  # this test may itself run inside a Herdr pane
+        os.environ.pop("TETHER_HERDR", None)  # conftest pins Herdr off for every other test
+        self.addCleanup(os.environ.__setitem__, "TETHER_HERDR", "off")
         home = self.root / "config"
         (home / "sessions" / "pilot").mkdir(parents=True)
         os.environ["PATH"] = f"{self.root}{os.pathsep}{os.environ.get('PATH', '')}"
@@ -126,6 +128,10 @@ class HerdrClientTests(unittest.TestCase):
             self.assertIsNone(Herdr.discover(binary="no-such-herdr-binary", home=home))
         finally:
             server.close()
+
+    def test_tether_herdr_off_pins_discovery_off(self):
+        os.environ["TETHER_HERDR"] = "off"
+        self.assertIsNone(Herdr.discover(binary=str(self.binary)))
 
     def test_agent_names_are_valid_herdr_names(self):
         self.assertEqual(agent_name_for("MCP"), "mcp")

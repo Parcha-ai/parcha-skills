@@ -301,6 +301,14 @@ FAKE_HERDR = textwrap.dedent(
         if a["status"] == "blocked":
             fail("agent_blocked", "agent is blocked")
         a["prompts"].append(text); a["status"] = os.environ.get("FAKE_HERDR_AFTER", "idle")
+        transcript = os.environ.get("FAKE_HERDR_TRANSCRIPT")
+        if transcript and a["status"] != "blocked":
+            # what Claude Code writes to ~/.claude/projects/<slug>/<sid>.jsonl during the turn
+            reply = os.environ.get("FAKE_HERDR_REPLY") or f"herdr reply {len(a['prompts'])}"
+            with open(transcript, "a") as fh:
+                fh.write(json.dumps({"type": "assistant", "message": {"content": [{"type": "thinking", "thinking": "hm"}]}}) + "\\n")
+                fh.write(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "Let me look."}]}}) + "\\n")
+                fh.write(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": reply}]}}) + "\\n")
         save(); out({"agent": agent_view(a)})
     if group == "agent" and cmd == "wait":
         a = resolve(argv[2]); out({"agent": agent_view(a)})

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import struct
 import sys
@@ -325,3 +326,78 @@ class WebSocketFramingTests(unittest.TestCase):
             self.assertIsNone(reader.read())
         finally:
             b.close()
+
+
+class HerdrPaneTests(SessionDriverTests):
+    def herdr_client(self):
+        from tests.fakes import write_fake_herdr
+        from runtime.plugin_next.herdr import Herdr
+        root = Path(self.temp.name)
+        fake = write_fake_herdr(root)
+        os.environ["FAKE_HERDR_STATE"] = str(root / "herdr-state.json")
+        os.environ["FAKE_HERDR_LOG"] = str(root / "herdr-calls.log")
+        os.environ["CLAUDE_CONFIG_DIR"] = str(root / "claude")
+        for key in ("FAKE_HERDR_STATE", "FAKE_HERDR_LOG", "FAKE_HERDR_TRANSCRIPT", "FAKE_HERDR_REPLY",
+                    "FAKE_HERDR_AFTER", "FAKE_HERDR_SCREEN", "CLAUDE_CONFIG_DIR"):
+            self.addCleanup(os.environ.pop, key, None)
+        return Herdr(binary=str(fake), session="pilot")
+
+    def place_claude_in_pane(self, client, name="mcp"):
+        tab = client.tab_create(workspace_id="w1", cwd=self.temp.name, label=name)
+        client.agent_start(name, kind="claude", pane_id=tab["pane_id"])
+        sid = client.session_id(name)
+        project = Path(self.temp.name) / "claude" / "projects" / "-tmp-x"
+        project.mkdir(parents=True)
+        transcript = project / f"{sid}.jsonl"
+        transcript.write_text(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "older answer"}]}}) + "\n")
+        os.environ["FAKE_HERDR_TRANSCRIPT"] = str(transcript)
+        placement = {"session": "pilot", "workspace_id": "w1", "tab_id": tab["tab_id"], "pane_id": tab["pane_id"],
+                     "agent": name, "kind": "claude"}
+        self.slice.bind(source_kind="claude_session", session_id=sid, cwd=self.temp.name, team_id="T1",
+                        channel_id="C1", thread_ts="700.1", owner_user_id="U12345678", spawned=True, herdr=placement)
+        return sid, transcript
+
+    def pane_fields(self, ts):
+        return {"workspace": "T1", "channel": "C1", "thread": "700.1", "actor": "U12345678", "message_id": ts}
+
+    def test_claude_in_a_pane_is_prompted_there_and_replies_from_the_transcript(self):
+        client = self.herdr_client()
+        self.driver.herdr_factory = lambda session: client
+        sid, transcript = self.place_claude_in_pane(client)
+        os.environ["FAKE_HERDR_REPLY"] = "Fixed in PR 8623: the form was never persisted."
+        self.slice.claim(self.pane_fields("700.2"), "why are MCP experts missing forms?")
+        self.assertEqual(self.slice.run_once(), 1)
+        self.assertEqual(self.sent, [("C1", "700.1", "Fixed in PR 8623: the form was never persisted.")],
+                         "the final answer only: not the older transcript text, not the narration")
+        log = (Path(self.temp.name) / "herdr-calls.log").read_text()
+        prompt_call = log[log.index("agent prompt mcp "):]
+        self.assertIn("why are MCP experts missing forms?", prompt_call)
+        self.assertIn("--wait", prompt_call, "a Herdr turn waits with no clock")
+        self.assertFalse(self.log.exists(), "no headless claude process was started for a pane session")
+        # a second turn appends to the same transcript and only its own reply is posted
+        os.environ["FAKE_HERDR_REPLY"] = "379 experts affected; migration drafted."
+        self.slice.claim(self.pane_fields("700.3"), "how many in prod?")
+        self.assertEqual(self.slice.run_once(), 1)
+        self.assertEqual(self.sent[-1][2], "379 experts affected; migration drafted.")
+
+    def test_a_blocked_dialog_is_the_reply(self):
+        client = self.herdr_client()
+        self.driver.herdr_factory = lambda session: client
+        self.place_claude_in_pane(client)
+        os.environ["FAKE_HERDR_AFTER"] = "blocked"
+        os.environ["FAKE_HERDR_SCREEN"] = "Bash command\n  rm -rf build/\nDo you want to proceed?\n > 1. Yes\n   2. No"
+        self.slice.claim(self.pane_fields("700.2"), "clean the build dir")
+        self.assertEqual(self.slice.run_once(), 1)
+        text = self.sent[0][2]
+        self.assertIn("waiting on a dialog", text)
+        self.assertIn("Do you want to proceed?", text)
+
+    def test_a_pane_that_vanished_falls_back_to_headless_resume(self):
+        client = self.herdr_client()
+        self.driver.herdr_factory = lambda session: client
+        placement = {"session": "pilot", "workspace_id": "w1", "tab_id": "w1:t9", "pane_id": "w1:p9", "agent": "ghost", "kind": "claude"}
+        self.slice.bind(source_kind="claude_session", session_id="sess-gone", cwd=self.temp.name, team_id="T1",
+                        channel_id="C1", thread_ts="700.1", owner_user_id="U12345678", spawned=True, herdr=placement)
+        self.slice.claim(self.pane_fields("700.2"), "still there?")
+        self.assertEqual(self.slice.run_once(), 1)
+        self.assertIn("turn 1 of pid", self.sent[0][2], "the headless path took the turn")
