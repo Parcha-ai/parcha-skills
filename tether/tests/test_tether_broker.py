@@ -30,7 +30,11 @@ class FakeSlack:
         self.posts.append((channel_id, text, thread_ts))
         return f"1700000000.{self.n:06d}"
 
+    missing_threads: set[tuple[str, str]] = set()
+
     def thread_replies(self, channel_id, thread_ts, *, limit=50):
+        if (channel_id, thread_ts) in self.missing_threads:
+            return []
         return [{"ts": thread_ts, "text": "root"}]
 
     def history(self, channel_id, *, limit=20):
@@ -225,6 +229,16 @@ class BrokerTest(unittest.TestCase):
         self.assertEqual(self.call(op="spawn", harness="vim", task="t", cwd=self.temp.name)["code"], "harness_unsupported")
         self.assertEqual(self.call(op="spawn", harness="claude", task="", cwd=self.temp.name)["code"], "task_required")
         self.assertEqual(self.call(op="spawn", harness="claude", task="t", cwd="/nonexistent-dir-x")["code"], "cwd_missing")
+        # 2026-09-16: a thread id without its channel bound the session to the default channel and its
+        # reports became stray roots in #agent-hub. Refuse it, and refuse a thread Slack does not have.
+        self.assertEqual(self.call(op="spawn", harness="claude", task="t", cwd=self.temp.name, thread_ts="100.9")["code"],
+                         "channel_required")
+        self.slack.missing_threads.add(("C1", "100.8"))
+        self.assertEqual(self.call(op="spawn", harness="claude", task="t", cwd=self.temp.name, channel_id="C1",
+                                   thread_ts="100.8")["code"], "thread_unknown")
+        self.assertEqual(self.call(op="attach", channel_id="C1", thread_ts="100.8", idempotency_key="a-1",
+                                   **self.source("sess-9"))["code"], "thread_unknown")
+        self.assertEqual(len([p for p in self.slack.posts if p[2] == "100.8"]), 0, "nothing was posted to a thread that does not exist")
 
         def boom(k, c, t):
             raise RuntimeError("claude did not report a session id (exit 1)")

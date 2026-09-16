@@ -931,8 +931,14 @@ class ActiveSlice:
         if not cwd.is_dir():
             raise BrokerRefused("cwd_missing", f"{cwd} is not a directory")
         team_id = self._team(request)
-        channel_id = str(request.get("channel_id") or self.settings.extra.get("default_channel") or "")
         thread_ts = str(request.get("thread_ts") or "")
+        if thread_ts and not request.get("channel_id"):
+            # 2026-09-16: a spawn with --thread-ts and no --channel fell back to the default channel;
+            # the session's reports landed in #agent-hub as new roots instead of the asker's thread.
+            raise BrokerRefused("channel_required", "--thread-ts names nothing without --channel")
+        channel_id = str(request.get("channel_id") or self.settings.extra.get("default_channel") or "")
+        if thread_ts:
+            self._require_thread_root(channel_id, thread_ts)
         if not channel_id:
             raise BrokerRefused("channel_required")
         asked_by = str(request.get("actor") or "").strip()
@@ -974,6 +980,23 @@ class ActiveSlice:
     def _create_session(self, source_kind: str, cwd: Path, task: str) -> str:
         return create_session(source_kind, cwd, task, self.settings)
 
+    def _require_thread_root(self, channel_id: str, thread_ts: str) -> None:
+        """Refuse a thread that does not exist in that channel.
+
+        Slack silently turns a reply to an unknown thread_ts into a new root message, so a
+        binding on the wrong channel is not an error until the session's report shows up as
+        a stray post. Check once, when the binding is made.
+        """
+        slack = getattr(self, "slack", None)
+        if slack is None or not getattr(slack, "configured", True):
+            return
+        try:
+            root = slack.thread_replies(channel_id, thread_ts, limit=1)
+        except Exception as exc:  # Slack said no: not_in_channel, channel_not_found, thread_not_found
+            raise BrokerRefused("thread_unknown", f"no thread {thread_ts} in {channel_id}: {str(exc)[:120]}") from exc
+        if not root:
+            raise BrokerRefused("thread_unknown", f"no thread {thread_ts} in {channel_id}")
+
     def op_attach(self, request: dict[str, Any]) -> dict[str, Any]:
         kind, session_id, cwd = self._source(request)
         team_id = self._team(request)
@@ -981,6 +1004,7 @@ class ActiveSlice:
         thread_ts = str(request.get("thread_ts") or "")
         if not channel_id or not thread_ts:
             raise BrokerRefused("thread_required", "--channel and --thread-ts are required")
+        self._require_thread_root(channel_id, thread_ts)
         binding = self.bind(
             source_kind=kind, session_id=session_id, cwd=cwd, team_id=team_id,
             channel_id=channel_id, thread_ts=thread_ts, owner_user_id=self._owner(request),
@@ -995,6 +1019,7 @@ class ActiveSlice:
         thread_ts = str(request.get("thread_ts") or "")
         if not channel_id or not thread_ts:
             raise BrokerRefused("thread_required")
+        self._require_thread_root(channel_id, thread_ts)
         existing = self.runtime.live_binding_for_thread(
             team_id=team_id, channel_id=channel_id, thread_ts=thread_ts
         )
