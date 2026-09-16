@@ -426,9 +426,22 @@ def collapse_document_candidates(
             if key not in selected_range_keys:
                 selected_range_keys.add(key)
                 ranges.append(item)
+        arm_scores = value.pop("_arm_scores")
+        # The strongest evidence leads: the range from the arm where this
+        # document scored best (its normalized leg score), not a fixed arm
+        # order. The reranker judges most documents by their first range
+        # (50 passages over ~80 documents), so a weak dense window hit must
+        # not displace the lexical or exact passage that carried the
+        # document (live: a P2 review answer fell from rank 1 to 11 when a
+        # dense rank-338 passage took the lead). Stable: ties keep the arm
+        # order dense, lexical, exact.
+        ranges.sort(
+            key=lambda item: -float(
+                (arm_scores.get(item["kind"]) or {}).get("normalized", 0.0)
+            ),
+        )
         reasons = sorted(value.pop("_reasons"))
         score = value.pop("_score")
-        arm_scores = value.pop("_arm_scores")
         temporal_boost = value.pop("_temporal_boost", None)
         source_boost_factor = value.pop("_source_boost", None)
         results.append({
