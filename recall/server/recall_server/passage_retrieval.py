@@ -697,6 +697,109 @@ FOCUS_WINDOW_MIN_GAIN = 2
 RERANK_FOCUS_WINDOW = False
 
 
+# H3 follow-up: near-duplicate documents. Codex sessions carry copied
+# history (forks, sub-agent rollouts, re-runs): on the live namespace
+# 23% of the dense candidates share their text hash with a passage in
+# another document, and for one validation question five copies of one
+# session held ranks 1-5 above the answer. After the reranker, on the
+# hydrated text, a document whose leading passage shares most of its
+# word 5-gram shingles with a higher-ranked document folds into it as a
+# "similar document" (ids, source, times, receipts: enough to open it),
+# so the caller reads each piece of evidence once and the slots below
+# go to distinct documents. ``RECALL_SEARCH_NEAR_DUPLICATES=off``
+# disables; the threshold is the shingle Jaccard similarity.
+NEAR_DUPLICATE_SHINGLE = 5
+NEAR_DUPLICATE_THRESHOLD = 0.6
+_SHINGLE_WORD_RE = re.compile(r"[a-z0-9_]+")
+
+
+def near_duplicates_enabled() -> bool:
+    return os.environ.get("RECALL_SEARCH_NEAR_DUPLICATES", "on").strip().lower() not in {"off", "0", "false"}
+
+
+def near_duplicate_threshold() -> float:
+    raw = os.environ.get("RECALL_SEARCH_NEAR_DUPLICATE_THRESHOLD", "").strip()
+    try:
+        value = float(raw) if raw else NEAR_DUPLICATE_THRESHOLD
+    except ValueError:
+        return NEAR_DUPLICATE_THRESHOLD
+    return value if 0.3 <= value <= 1.0 else NEAR_DUPLICATE_THRESHOLD
+
+
+def text_shingles(text: str, size: int = NEAR_DUPLICATE_SHINGLE) -> frozenset[str]:
+    """Word ``size``-gram shingles of ``text`` (lowercased identifiers and words)."""
+
+    words = _SHINGLE_WORD_RE.findall(text.lower())
+    if len(words) < size:
+        return frozenset()
+    return frozenset(" ".join(words[index:index + size]) for index in range(len(words) - size + 1))
+
+
+def shingle_similarity(left: frozenset[str], right: frozenset[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
+def similar_document_record(row: dict[str, Any], similarity: float) -> dict[str, Any]:
+    """The content-free pointer a primary result carries for a folded duplicate."""
+
+    ranges = row.get("matching_ranges") or ()
+    return {
+        "logical_document_id": row.get("logical_document_id"),
+        "source_id": row.get("source_id"),
+        "native_parent_id": row.get("native_parent_id"),
+        "revision": row.get("revision"),
+        "first_occurred_at": row.get("first_occurred_at"),
+        "last_occurred_at": row.get("last_occurred_at"),
+        "manifest_object_key": row.get("manifest_object_key"),
+        "manifest_content_sha256": row.get("manifest_content_sha256"),
+        "rank": row.get("rank"),
+        "rerank_score": row.get("rerank_score"),
+        "similarity": round(similarity, 4),
+        "receipts": list((ranges[0].get("receipts") or ())[:4]) if ranges else [],
+    }
+
+
+def group_near_duplicates(
+    results: list[dict[str, Any]],
+    *,
+    threshold: float = NEAR_DUPLICATE_THRESHOLD,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Fold documents whose leading passage duplicates a higher-ranked one.
+
+    Order is kept; the first (best-ranked) member of a group stays and
+    carries the others under ``similar_documents``. A document with no
+    leading text, or too short for a shingle, never groups.
+    """
+
+    kept: list[dict[str, Any]] = []
+    signatures: list[frozenset[str]] = []
+    folded = 0
+    for row in results:
+        ranges = row.get("matching_ranges") or ()
+        signature = text_shingles((ranges[0].get("text") or "") if ranges else "")
+        primary_index = None
+        best = 0.0
+        if signature:
+            for index, other in enumerate(signatures):
+                similarity = shingle_similarity(signature, other)
+                if similarity >= threshold and similarity > best:
+                    primary_index, best = index, similarity
+        if primary_index is None:
+            kept.append(row)
+            signatures.append(signature)
+            continue
+        primary = kept[primary_index]
+        primary.setdefault("similar_documents", []).append(similar_document_record(row, best))
+        folded += 1
+    return kept, {
+        "near_duplicates_folded": folded,
+        "near_duplicate_groups": sum(1 for row in kept if row.get("similar_documents")),
+        "near_duplicate_threshold": threshold,
+    }
+
+
 def arm_nominated(arm_scores: dict[str, Any], nominate_per_arm: int) -> bool:
     """True when any arm ranked the document within its top ``nominate_per_arm``."""
 
@@ -2328,6 +2431,11 @@ class PassageHintRetrieval:
                 arm_elapsed_ms=arm_elapsed_ms,
                 lexical_query=lexical_query,
             )
+        near_duplicate_diagnostics: dict[str, Any] = {}
+        if near_duplicates_enabled():
+            results, near_duplicate_diagnostics = group_near_duplicates(
+                results, threshold=near_duplicate_threshold(),
+            )
         results = [
             {key: value for key, value in row.items() if key != "nominated"}
             for row in results[:limit]
@@ -2364,6 +2472,7 @@ class PassageHintRetrieval:
                 **window_diagnostics,
                 **temporal_diagnostics,
                 **rerank_diagnostics,
+                **near_duplicate_diagnostics,
                 "elapsed_ms": round(
                     (time.monotonic() - started_at) * 1000,
                     3,
