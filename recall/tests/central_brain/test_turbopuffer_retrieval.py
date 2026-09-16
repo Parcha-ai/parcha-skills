@@ -17,6 +17,7 @@ sys.path.insert(0, str(SERVER))
 
 from recall_server import turbopuffer_plane as plane  # noqa: E402
 from recall_server.turbopuffer_plane import TurbopufferSettings, namespace_schema, passage_row  # noqa: E402
+from recall_server import turbopuffer_retrieval as plane_retrieval  # noqa: E402
 from recall_server.turbopuffer_retrieval import TurbopufferHintRetrieval, scope_filters  # noqa: E402
 from tests.central_brain.fake_turbopuffer import FakeTurbopuffer  # noqa: E402
 from tests.central_brain.test_canonical_retrieval import RerankWiringTests  # noqa: E402
@@ -113,12 +114,16 @@ class ArmTests(unittest.TestCase):
         self.assertEqual((status, strategy, scope), ("ok", "turbopuffer-ann", None))
         self.assertEqual(ns.queries[-1]["rank_by"], ("embed_text", "ANN", ["Embed", "why did the deploy fail"]))
         self.assertEqual(ns.queries[-1]["filters"], ("And", [("source_id", "In", ["codex:linux:test"]), ("policy_fingerprint", "Eq", "fp-policy")]))
-        # Only the authorized source; the two identical texts collapse to one row.
+        # The arm reads catalog attributes only: no bodies over the wire.
+        self.assertEqual(set(ns.queries[-1]["include_attributes"]), set(plane_retrieval.CATALOG_ATTRIBUTES))
+        self.assertFalse(set(ns.queries[-1]["include_attributes"]) & set(plane_retrieval.BODY_ATTRIBUTES))
+        # Only the authorized source; the two identical texts (same hash) collapse to one row.
         self.assertTrue(all(row["source_id"] == "codex:linux:test" for row in rows))
         self.assertEqual(rows[0]["logical_document_id"], LDOC)
-        self.assertEqual(len([r for r in rows if "deploy failed" in r["text_redacted"]]), 1)
-        self.assertEqual(rows[0]["header_redacted"], "source family: codex")
-        self.assertEqual(rows[0]["spans"], [{"message_index": 1}])
+        hashes = [r["text_sha256"] for r in rows]
+        self.assertEqual(len(hashes), len(set(hashes)))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["text_redacted"], "")  # the body arrives with hydration
         self.assertGreater(rows[0]["score"], rows[-1]["score"])
 
     def test_lexical_and_sparse_arms(self) -> None:
@@ -164,7 +169,7 @@ class ArmTests(unittest.TestCase):
 
     def test_search_runs_fusion_rerank_and_hints_on_the_plane(self) -> None:
         client = FakeTurbopuffer()
-        self._seed(client)
+        ns = self._seed(client)
         retrieval, store = self._retrieval(client)
         store.rerank_runtime = RerankWiringTests._FakeRerank({"the deploy failed because the migration lock timed out": 0.9})
         store.query_clauses = False
@@ -176,6 +181,37 @@ class ArmTests(unittest.TestCase):
         self.assertEqual(diagnostics["source_hint"]["families"], ["codex"])
         self.assertEqual(response["results"][0]["logical_document_id"], LDOC)
         self.assertIn("arm_scores", response["results"][0])
+        # Hydration: one ``id In`` query for the collapsed ranges, ordered by id,
+        # bodies only; the results and the reranker carry the text.
+        hydrate = [q for q in ns.queries if q["rank_by"] == ("id", "asc")]
+        self.assertEqual(len(hydrate), 1)
+        self.assertEqual(set(hydrate[0]["include_attributes"]), set(plane_retrieval.BODY_ATTRIBUTES))
+        self.assertEqual(hydrate[0]["filters"][0], "id")
+        self.assertEqual(hydrate[0]["filters"][2], sorted(hydrate[0]["filters"][2]))
+        self.assertEqual(diagnostics["hydrate_status"], "ok")
+        self.assertEqual(diagnostics["hydrated_passages"], diagnostics["hydrate_wanted"])
+        self.assertIn("hydrate", diagnostics["arm_elapsed_ms"])
+        top = response["results"][0]["matching_ranges"][0]
+        self.assertEqual(top["text"], "the deploy failed because the migration lock timed out")
+        self.assertEqual(top["spans"], [{"message_index": 1}])
+        self.assertTrue(top["receipts"])
+        self.assertTrue(all("deploy failed" in doc for doc in store.rerank_runtime.calls[-1]["documents"] if "migration" in doc))
+        self.assertTrue(any("source family: codex" in doc for doc in store.rerank_runtime.calls[-1]["documents"]))
+        # A hydration shortfall keeps the results and says so.
+        ns.fail_queries = None
+        original_query = ns.query
+
+        def failing_hydration(**kwargs):
+            if kwargs.get("rank_by") == ("id", "asc"):
+                raise RuntimeError("boom")
+            return original_query(**kwargs)
+
+        ns.query = failing_hydration
+        degraded = retrieval.search("In the Codex work, why did the deploy fail?", lexical_query="deploy fail", since=None, until=None, limit=10)
+        ns.query = original_query
+        self.assertEqual(degraded["diagnostics"]["hydrate_status"], "unavailable")
+        self.assertEqual(degraded["results"][0]["logical_document_id"], LDOC)
+        self.assertEqual(degraded["results"][0]["matching_ranges"][0]["text"], "")
         # Temporal hint: a dated question runs the window pass on the plane too.
         response = retrieval.search("what did greptile flag around May 2-4?", lexical_query="greptile flag", since=None, until=None, limit=10)
         self.assertIn("temporal_hint", response["diagnostics"])

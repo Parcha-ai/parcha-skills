@@ -947,6 +947,19 @@ class PassageHintRetrieval:
     temporal_window_budget_ms: int | None = None
     window_pass_concurrent = False
 
+    def _hydrate_ranges(
+        self,
+        results: list[dict[str, Any]],
+        legs: tuple[tuple[str, float, list[dict[str, Any]]], ...],
+        *,
+        deadline_at: float,
+    ) -> dict[str, Any] | None:
+        """Fill the bodies of the collapsed ranges when the arms returned
+        catalog rows (a plane whose rows are wide fetches bodies once, for
+        the head). The Postgres arms return complete rows: nothing to do."""
+
+        return None
+
     def __init__(
         self,
         store: Any,
@@ -2279,6 +2292,11 @@ class PassageHintRetrieval:
             window_boost=window_boost,
             source_boost=source_boost,
         )
+        hydrate_started = time.monotonic()
+        hydrate_diagnostics = self._hydrate_ranges(results, legs, deadline_at=deadline_at)
+        if hydrate_diagnostics is not None:
+            arm_elapsed_ms["hydrate"] = round((time.monotonic() - hydrate_started) * 1000, 3)
+            temporal_diagnostics.update(hydrate_diagnostics)
         if window_boost is not None:
             temporal_diagnostics["temporal_boosted"] = sum(
                 1 for row in results if "temporal_boost" in row

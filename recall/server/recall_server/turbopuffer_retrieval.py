@@ -16,6 +16,7 @@ import os
 import time
 from typing import Any
 
+from .db import bounded_search_text
 from .passage_retrieval import (
     DENSE_NEAREST_LIMIT,
     PassageHintRetrieval,
@@ -23,12 +24,20 @@ from .passage_retrieval import (
 )
 from .turbopuffer_plane import EMBED_TEXT_ATTRIBUTE, TEXT_ATTRIBUTE, TurbopufferSettings
 
-ROW_ATTRIBUTES = (
+# The arms read the catalog attributes only (a few hundred bytes a row);
+# the bodies (text, spans, receipts, header: kilobytes a row) are fetched
+# once, by id, for the ranges that survived the collapse. Live: a dense
+# pass moved ~6 MB of bodies for 400 rows across regions and a dated
+# question ~15 MB over its arms; the collapsed head needs ~150 of them.
+CATALOG_ATTRIBUTES = (
     "source_id", "logical_document_id", "policy_fingerprint", "native_parent_id",
     "revision", "ordinal", "first_occurred_at", "last_occurred_at",
     "doc_first_occurred_at", "doc_last_occurred_at", "manifest_object_key",
-    "manifest_content_sha256", "text_sha256", "receipts", "spans", "header", TEXT_ATTRIBUTE,
+    "manifest_content_sha256", "text_sha256",
 )
+BODY_ATTRIBUTES = ("receipts", "spans", "header", TEXT_ATTRIBUTE)
+ROW_ATTRIBUTES = CATALOG_ATTRIBUTES + BODY_ATTRIBUTES
+HYDRATE_BATCH_IDS = 200
 LEXICAL_LIMIT = 400
 SPARSE_LIMIT = 400
 MAX_SPARSE_TOKENS = 8
@@ -100,15 +109,13 @@ def arm_row(row: Any, score: float) -> dict[str, Any] | None:
 
     passage_id = _value(row, "id")
     text = _value(row, TEXT_ATTRIBUTE)
-    if not isinstance(passage_id, str) or not isinstance(text, str):
+    if not isinstance(passage_id, str):
         return None
-    import json
-
-    spans_raw = _value(row, "spans")
-    try:
-        spans = json.loads(spans_raw) if isinstance(spans_raw, str) else (spans_raw or [])
-    except json.JSONDecodeError:
-        spans = []
+    if text is None:
+        text = ""  # catalog-only row: the body arrives with hydration
+    elif not isinstance(text, str):
+        return None
+    spans = parse_spans(_value(row, "spans"))
     return {
         "source_id": _value(row, "source_id"),
         "logical_document_id": _value(row, "logical_document_id"),
@@ -131,8 +138,24 @@ def arm_row(row: Any, score: float) -> dict[str, Any] | None:
     }
 
 
+def parse_spans(raw: Any) -> list[Any]:
+    """Spans travel as a JSON string attribute."""
+
+    import json
+
+    if isinstance(raw, str):
+        try:
+            return list(json.loads(raw))
+        except (json.JSONDecodeError, TypeError):
+            return []
+    return list(raw or [])
+
+
 def dedupe_texts(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep the first (best) row per distinct passage text, as the dense SQL did."""
+    """Keep the first (best) row per distinct passage text, as the dense SQL did.
+
+    Catalog-only rows carry the text hash, which identifies the text as well.
+    """
 
     seen: set[str] = set()
     kept = []
@@ -210,7 +233,15 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
             return None
         return min(float(self.settings.query_timeout_seconds), remaining)
 
-    def _query(self, *, rank_by: Any, filters: list[Any], limit: int, deadline_at: float) -> tuple[list[Any], str]:
+    def _query(
+        self,
+        *,
+        rank_by: Any,
+        filters: list[Any],
+        limit: int,
+        deadline_at: float,
+        include_attributes: tuple[str, ...] = CATALOG_ATTRIBUTES,
+    ) -> tuple[list[Any], str]:
         timeout = self._timeout(deadline_at)
         if timeout is None:
             return [], "deadline-exceeded"
@@ -219,7 +250,7 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
                 rank_by=rank_by,
                 filters=("And", filters) if len(filters) > 1 else filters[0],
                 limit=limit,
-                include_attributes=list(ROW_ATTRIBUTES),
+                include_attributes=list(include_attributes),
                 timeout=timeout,
             )
         except Exception as error:  # noqa: BLE001 - the arm reports a status, never raises
@@ -328,6 +359,74 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
         if status != "ok":
             return [], status
         return self._scored(raw), "ok"
+
+    def _hydrate_ranges(
+        self,
+        results: list[dict[str, Any]],
+        legs: tuple[tuple[str, float, list[dict[str, Any]]], ...],
+        *,
+        deadline_at: float,
+    ) -> dict[str, Any]:
+        """Fetch the bodies of the collapsed head's ranges in one pass.
+
+        The arms returned catalog rows; the ranges that survived the
+        collapse (and the leg rows behind them, which the reranker reads)
+        get text, spans, receipts, and header here: one ``id In`` query per
+        ``HYDRATE_BATCH_IDS`` ids, ordered by id so the plane reads them in
+        one sweep. A shortfall leaves the affected ranges bodiless
+        (``hydrate_status`` says so) rather than dropping the result.
+        """
+
+        wanted: dict[str, list[dict[str, Any]]] = {}
+        for row in results:
+            for item in row.get("matching_ranges") or ():
+                passage_id = item.get("passage_id")
+                if isinstance(passage_id, str) and not item.get("text"):
+                    wanted.setdefault(passage_id, []).append(item)
+        if not wanted:
+            return {"hydrate_status": "ok", "hydrated_passages": 0}
+        leg_rows: dict[str, list[dict[str, Any]]] = {}
+        for _name, _weight, rows in legs:
+            for row in rows:
+                passage_id = row.get("passage_id")
+                if passage_id in wanted:
+                    leg_rows.setdefault(passage_id, []).append(row)
+        ids = sorted(wanted)
+        hydrated = 0
+        status = "ok"
+        for start in range(0, len(ids), HYDRATE_BATCH_IDS):
+            batch = ids[start:start + HYDRATE_BATCH_IDS]
+            raw, batch_status = self._query(
+                rank_by=("id", "asc"),
+                filters=[("id", "In", batch)],
+                limit=len(batch),
+                deadline_at=deadline_at,
+                include_attributes=BODY_ATTRIBUTES,
+            )
+            if batch_status != "ok":
+                status = batch_status
+                continue
+            for item in raw:
+                passage_id = _value(item, "id")
+                if passage_id not in wanted:
+                    continue
+                text = _value(item, TEXT_ATTRIBUTE)
+                if not isinstance(text, str):
+                    continue
+                spans = parse_spans(_value(item, "spans"))
+                receipts = list(_value(item, "receipts") or ())
+                header = _value(item, "header") or None
+                bounded, clipped = bounded_search_text(text)
+                for hint in wanted[passage_id]:
+                    hint.update({"text": bounded, "text_clipped": clipped, "spans": spans, "receipts": receipts})
+                for row in leg_rows.get(passage_id, ()):
+                    row.update({
+                        "text_redacted": text, "spans": spans, "receipts": receipts, "header_redacted": header,
+                    })
+                hydrated += 1
+        if hydrated < len(ids) and status == "ok":
+            status = "partial"
+        return {"hydrate_status": status, "hydrated_passages": hydrated, "hydrate_wanted": len(ids)}
 
     @staticmethod
     def _scored(raw: list[Any]) -> list[dict[str, Any]]:
