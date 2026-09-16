@@ -183,7 +183,7 @@ DEFAULT_TOKENS_PER_MINUTE = 1_000_000
 # Batches of one page are written concurrently: one write is an embedding
 # round trip of a few seconds, and sequential writes used under half of the
 # token budget live.
-DEFAULT_WRITE_CONCURRENCY = 4
+DEFAULT_WRITE_CONCURRENCY = 1
 TOKEN_CHARS = 4
 
 
