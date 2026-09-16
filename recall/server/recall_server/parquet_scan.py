@@ -1266,9 +1266,14 @@ class CanonicalParquetScanProjector:
         sweep_hint = catalog.compaction or candidate.reason == "compaction"
         if sweep_hint and catalog.fragmented(self.compaction_fragments):
             return "compaction", all_parts, set(current), dirty
+        # A seed backfill marks the month with the whole-month sentinel; a
+        # bare 'backfill' queue reason with no marker is a leftover (the
+        # sweep's row outliving its sentinel after a generation race) and
+        # plans a delta: the fingerprints already name every stale
+        # document (live: a 556-document month rewrote 218 parts in 9 min
+        # for 4 changed documents).
         if (
-            (candidate.reason == "backfill" and not sweep_hint)
-            or (SCAN_DIRTY_ALL in catalog.dirty and not sweep_hint)
+            (SCAN_DIRTY_ALL in catalog.dirty and not sweep_hint)
             or not catalog.members
             or not datasets_complete
         ):

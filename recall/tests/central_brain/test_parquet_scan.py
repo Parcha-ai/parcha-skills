@@ -946,9 +946,10 @@ class ParquetFragmentDeltaTest(unittest.TestCase):
         self.assertEqual(result.documents_rewritten, 1)
 
     def test_backfill_reason_forces_full_rebuild(self):
+        # A seed backfill carries the whole-month marker beside its reason.
         alpha = _month_document("document:alpha")
         beta = _month_document("document:beta")
-        catalog = _catalog({0: [alpha], 1: [beta]}, dirty={"document:beta"})
+        catalog = _catalog({0: [alpha], 1: [beta]}, dirty={"document:beta", SCAN_DIRTY_ALL})
         changed_beta = {**beta, "document_content_sha256": "e" * 64}
         archive = _DocumentArchive({"document:alpha": 2, "document:beta": 3})
         projector = _FragmentProbe([alpha, changed_beta], catalog, archive)
@@ -966,6 +967,20 @@ class ParquetFragmentDeltaTest(unittest.TestCase):
             set(result.references),
             {(dataset, 0) for dataset in SCAN_DATASETS},
         )
+
+    def test_a_bare_backfill_reason_without_the_marker_is_a_delta(self):
+        # A queue row can outlive its sentinel (a generation race after the
+        # sweep's build): with no marker the reason alone rewrites nothing
+        # the fingerprints do not name.
+        alpha = _month_document("document:alpha")
+        beta = _month_document("document:beta")
+        catalog = _catalog({0: [alpha], 1: [beta]}, dirty={"document:beta"})
+        changed_beta = {**beta, "document_content_sha256": "e" * 64}
+        archive = _DocumentArchive({"document:alpha": 2, "document:beta": 3})
+        result = _FragmentProbe([alpha, changed_beta], catalog, archive)._build(_candidate(reason="backfill"))
+        self.assertEqual(result.mode, "delta")
+        self.assertEqual({identity[1] for identity in result.removed}, {1})
+        self.assertEqual(archive.reads, ["document:beta"])
 
     def test_whole_month_sentinel_forces_full_rebuild(self):
         alpha = _month_document("document:alpha")
@@ -1296,8 +1311,9 @@ class ParquetFragmentDeltaTest(unittest.TestCase):
         six = [_month_document(f"document:{index}") for index in range(6)]
         result = _FragmentProbe(six, many, _DocumentArchive({f"document:{index}": 1 for index in range(6)}), compaction_fragments=3)._build(_candidate(reason="compaction"))
         self.assertEqual(result.mode, "compaction")
-        # A real backfill without a hint is still a full rebuild.
-        plain = _catalog({index: [document] for index, document in enumerate(documents)}, dirty={"document:3"})
+        # A real seed backfill (the whole-month marker, no sweep hint) is
+        # still a full rebuild.
+        plain = _catalog({index: [document] for index, document in enumerate(documents)}, dirty={"document:3", SCAN_DIRTY_ALL})
         for row in plain.shards.values():
             row["size_bytes"] = 9 * 1024 * 1024
         result = _FragmentProbe(changed, plain, archive, compaction_fragments=3)._build(_candidate(reason="backfill"))
