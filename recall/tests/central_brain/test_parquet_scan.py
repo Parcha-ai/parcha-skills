@@ -1332,6 +1332,18 @@ class ParquetFragmentDeltaTest(unittest.TestCase):
             row["size_bytes"] = 100 * 1024
         self.assertTrue(catalog.fragmented(3))
         self.assertFalse(catalog.fragmented(4))
+        # Only the dominant dataset decides: full records parts with tiny
+        # documents/actors parts alongside (one flush writes one part for
+        # every dataset) are not fragmentation.
+        for (dataset, index), row in catalog.shards.items():
+            row["size_bytes"] = full if dataset == "records" else 8 * 1024
+        self.assertFalse(catalog.fragmented(3))
+        for (dataset, index), row in catalog.shards.items():
+            row["size_bytes"] = (full if index == 0 else 8 * 1024) if dataset == "records" else 8 * 1024
+        six_records = _catalog({index: [_month_document(f"document:{index}")] for index in range(6)})
+        for (dataset, index), row in six_records.shards.items():
+            row["size_bytes"] = (full if index == 0 else 8 * 1024) if dataset == "records" else 8 * 1024
+        self.assertTrue(six_records.fragmented(3))
 
     def test_below_the_cap_a_delta_stays_a_delta(self):
         documents = [_month_document(f"document:{index}") for index in range(3)]
