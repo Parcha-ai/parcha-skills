@@ -2304,10 +2304,9 @@ class RerankWiringTests(unittest.TestCase):
                 time.sleep(self.sleep)
             if self.error:
                 raise RerankUnavailable(self.error)
-            # Documents arrive as "<context line>\n\n<text window>[\n\n<text window>]";
-            # score by the best-scoring passage chunk.
+            # Documents arrive as "<context line>\n\n<text window>"; score by the text.
             scored = [
-                (index, max(self.scores.get(chunk, 0.0) for chunk in doc.split("\n\n")))
+                (index, self.scores.get(doc.rsplit("\n\n", 1)[-1], 0.0))
                 for index, doc in enumerate(documents)
             ]
             scored.sort(key=lambda item: (-item[1], item[0]))
