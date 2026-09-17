@@ -869,6 +869,16 @@ class McpRemoteHandler(BaseHTTPRequestHandler):
             return
         if body["method"] == "ping":
             value = {}
+        elif body["method"] == "tools/list":
+            value = {"tools": [{
+                "name": "recall_show",
+                "inputSchema": {"type": "object", "properties": {
+                    "target": {"type": "string"},
+                    "around": {"type": "string", "format": "date-time"},
+                    "tail": {"type": "integer", "minimum": 0, "maximum": 100},
+                    "prompts": {"type": "boolean"},
+                }, "required": ["target"], "additionalProperties": False},
+            }]}
         else:
             self.assert_tool_call(body)
             name = body["params"]["name"]
@@ -936,7 +946,7 @@ class McpRemoteHandler(BaseHTTPRequestHandler):
         self.send_json(200, {
             "jsonrpc": "2.0", "id": body["id"],
             "result": (
-                value if body["method"] == "ping" else {
+                value if body["method"] in {"ping", "tools/list"} else {
                     "content": [{"type": "text", "text": json.dumps(value)}],
                     "structuredContent": value,
                     "isError": False,
@@ -1060,7 +1070,7 @@ class RemoteTransportTest(unittest.TestCase):
             self.assertIn("remote MCP prompt", self.call("show", target, "--prompts")[1])
             self.assertEqual(
                 McpRemoteHandler.requests[-1]["body"]["params"]["arguments"],
-                {"target": target, "prompts": True, "tail": 0},
+                {"target": target, "prompts": True},
             )
             self.assertIn(
                 "overlap=2",
