@@ -294,10 +294,9 @@ def _number(value: Any, lower: float, upper: float) -> float:
 def _probabilities(value: Any, options: set[str]) -> dict[str, float]:
     if not isinstance(value, dict) or set(value) != options:
         raise JudgmentUnavailable("judgment_response_invalid")
-    result = {name: _number(number, 0, 1) for name, number in value.items()}
-    if not math.isclose(sum(result.values()), 1, rel_tol=0, abs_tol=0.001):
-        raise JudgmentUnavailable("judgment_response_invalid")
-    return result
+    # Wire values are rounded independently and need not sum to exactly one.
+    # Keep them unchanged; the API does not guarantee their serialized precision.
+    return {name: _number(number, 0, 1) for name, number in value.items()}
 
 
 def _usage(payload: Any) -> TokenUsage:
@@ -346,11 +345,8 @@ def _answers(payload: dict, questions: dict) -> dict[str, Answer]:
                 raise JudgmentUnavailable("judgment_response_invalid")
             probabilities = _probabilities(answer.get("probabilities"), set(legend))
             score = _number(answer.get("score"), 0, len(legend) - 1)
-            expected = sum(
-                int(level) * probability for level, probability in probabilities.items()
-            )
-            if not math.isclose(score, expected, rel_tol=0, abs_tol=0.01):
-                raise JudgmentUnavailable("judgment_response_invalid")
+            # Preserve the provider's score: rounded probabilities need not
+            # reproduce it, and the API specifies no shared field precision.
             result[name] = ScoreAnswer(score, legend, probabilities, confidence)
     return result
 

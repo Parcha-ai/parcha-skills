@@ -190,12 +190,11 @@ is superseded by broker access. Verify the configured `/typesafe/v1/systemone` r
 from each intended runtime, not only an agent sandbox. Pin `jev-1.13.0`, log the resolved
 model, and test all three primitives. The installed skill matches upstream byte for byte.
 
-During this planning run the existing local consumer on loopback port 9411 reported
-healthy. Synthetic POSTs to `/typesafe/v1/systemone` and `/v1/typesafe/v1/systemone`
-both returned nginx 404. No provider credential was loaded or minted, no company text
-was sent, and this was **not** a successful W0 latency trial. The user-reported sandbox
-route may be a different deployment. Resolve routing through the supported broker;
-separately prove broker reachability for the hosted MCP and worker.
+The local consumer on loopback port 9411 now returns valid pinned-model Noul,
+Choice, and Score answers after the September 17 21:23 UTC managed lease refresh.
+The earlier gateway/allowlist failures are resolved on this machine. This does not
+prove access from the separately hosted MCP and worker; Render runtime wiring remains
+separate. The measured prototype decision is recorded below.
 
 Measure query reading and 20/50-document scoring shapes, repeated warm/cold requests,
 token use, malformed answers, timeout/429/5xx behavior, and date agreement with human
@@ -336,88 +335,91 @@ Two supporting cleanups are justified independently of Jev:
   an invalid tool argument. Likewise, promote useful ship/card scripts from scratch
   into the repository as a bounded operational follow-up, not a new orchestration layer.
 
-The first implementation deliverable is a broker contract smoke test, a frozen W0
-replay report, and a W5 review packet. It makes the latency/quality decision concrete
-before changing production retrieval. W0's old key request is removed. The remaining
-human decisions are permission for W4 ingest data sharing and the reviewer who can
-approve W5 labels. The current broker issuer deployment also needs its authorized
-operator: both available machine GCP identities cannot inspect the Daytona cluster.
-The engineer gateway became reachable during the later route recheck below.
+The first implementation deliverable now includes a successful broker contract fixture,
+frozen W0 measurements, and a W5 review packet. W0's key/routing blocker is resolved.
+The current search prototype does not earn activation or deletion. W5 label proposals
+can proceed offline; a person still approves truth, and W4 ingest activation still
+requires the user's data-sharing decision.
 
-### W0 preparation receipt, September 17
+### W0 measured decision, September 17
 
-The inactive client lives in `server/recall_server/judgments.py`: one standard-library
-transport, no new dependency, no retries, no provider fallback, pinned model, typed
-answers and content-free failures. Request preparation is shared with the offline
-experiment. Socket deadlines refuse late answers; they do not hard-cancel DNS or a
-noncooperative transport. No production retrieval caller imports it.
+**No-go for activating the current synchronous query/ranking prototype.** Transport
+works, but the tested request shapes miss the proposed latency budgets and standalone
+Score reordering regresses the frozen strict ranking metrics. This is a decision about
+these snippets, rubrics, and request shapes, not a general claim about Jev.
 
-`evals/judgments_spike.py` accepts private JSONL request fixtures with `id`, `phase`,
-`state`, `questions`, and optional `checks` for independently supplied Choice labels.
-It preflights every request before spending, reserves unknown usage, stops dispatch
-when observed usage consumes the budget, retains HTTP status codes, and writes a
-mode-0600 content-free report. It measures individual requests, not the whole search
-or document-batch stage. Stage acceptance is explicitly false. Date gold, calibration,
-an actual successful wire fixture, and end-to-end timing remain W0 work.
+The client remains one inactive standard-library boundary, with no dependencies,
+retries, provider fallback, or production retrieval import. The live pilot exposed two
+unsupported validation rules: independently rounded probabilities need not sum to
+exactly one, and they need not reconstruct the separately returned Score. The client
+now preserves those fields as returned, matching the SDK. Exact answer/option coverage,
+types, finite bounds, legends, and selected-choice checks remain. Captured-wire
+regressions and existing coverage pass 45 focused tests (21 client, 16 rerank, 8 replay).
 
-The first real-client synthetic smoke returned HTTP 404 through the healthy local
-consumer. The six-line missing-ingress correction and protected-route tests are
-[grep-ops #290](https://github.com/Parcha-ai/grep-ops/pull/290). The TypeSafe pass-through,
-both virtual-key allowlists, and managed lease renewal must be verified together.
-No company text has been sent to Jev and no provider credentials have been loaded or
-LiteLLM keys manually minted.
+The private experiment fixes 15 validation queries and 681 returned candidates, then
+runs two passes through 234 requests grouped into 90 query/scoring stages. Document
+batches use four workers and one shared absolute deadline. All dispatched work is
+collected; errors and overruns are not reported as successful completion. There were
+231 valid responses and three roughly five-second transport failures, with no response
+schema failures after the client correction.
 
-Private preparation under `~/.recall/jev-execution-20260917/` holds:
+| Request shape | Complete stages | p95 across all attempts | Within proposed budget |
+|---|---:|---:|---:|
+| 12-question query reading | 29/30 | 3,391 ms | 9/30 at 400 ms |
+| 20 documents in two 10-document batches | 30/30 | 2,043 ms | 0/30 at 500 ms |
+| Up to 50 documents in up to five batches | 29/30 | 3,578 ms | 0/30 at 500 ms |
+| Four source/intent Nouls only | 30/30 | 1,352 ms | 12/30 at 400 ms |
+| All 20 document Scores in one request | 30/30 | 876 ms | 0/30 at 500 ms |
 
-- The synthetic smoke fixture/report and 15 fresh central search captures.
-- 117 bounded query/document request shapes over 681 candidate documents, a capture
-  manifest and their hashes. The shapes are experiments, not a completed query reader.
-- The unchanged strict scorer's baseline: recall@20 **0.875**, MRR **0.54246**. Search
-  diagnostics p50 **925 ms**, p95 **1518 ms** used concurrency 3 and 1024-character
-  snippets; this is not the full systems card or a comparable isolated latency run.
+The last two shapes are bounded simplification experiments, each 30 requests, run after
+the main experiment. Scoring 20 documents in one request cuts requests and improves the
+observed tail versus batches, but still misses its target. Samples are small, runs
+are sequential experiments rather than a randomized latency comparison, and repeated
+passes do not establish provider cache temperature. These are local-broker request
+or scoring-stage measurements; retrieval, hydration and the complete production search
+graph are not timed here.
 
-After the operator proves routing, first rerun the synthetic fixture with a **new**
-output path. From `recall/`, using the local consumer's compatibility sentinel:
+The unchanged strict scorer was applied to the main experiment’s frozen final-result
+pools (the separate single-request 20-document variant was timed only):
 
-```sh
-PYTHONPATH=server LITELLM_API_KEY=not-a-secret python3 -m evals.judgments_spike \
-  --endpoint http://127.0.0.1:9411/typesafe/v1/systemone \
-  --fixtures "$HOME/.recall/jev-execution-20260917/smoke.jsonl" \
-  --output "$HOME/.recall/jev-execution-20260917/smoke-after-route.json"
-```
+- Existing order: MRR 0.54246, recall@20 0.875, recall@5 0.66667.
+- Fully complete second pass at depth 50: MRR 0.22447 and recall@20 0.66667.
+- Both complete depth 20 passes preserve recall@20 by construction, but MRR falls to
+  0.24083/0.25284 and recall@5 to 0.20833.
+- Across the three complete depth/pass comparisons, zero answerable cases improve,
+  nine worsen, and three tie. All three insufficient cases remain in the evaluation;
+  their false-hit rate remains 1.0. The incomplete first depth 50 pass has one explicit
+  whole-case baseline fallback and is never presented as a pure Jev aggregate.
 
-The validation shapes need an explicit reservation of 20 million input tokens for
-two passes (19,677,100 conservative byte-based reservations, about $0.827 at the
-published input rate). Actual usage must replace this estimate. Do not run those
-fixtures until the synthetic wire contract succeeds. No production wave is accepted
-by this preparation receipt, and no deletion has been earned.
+A second independent reconstruction confirmed the candidate mapping and every
+aggregate against the original baseline. This is reordering of already-returned
+baseline candidates on 256–1025-character excerpts. It is not a full Voyage/Jev
+production substitution, full-evidence reader evaluation, or permission to relabel
+Jev's preferred documents as gold. Gold outside each frozen pool remains absent.
 
-### Broker recheck, September 17 at 18:33–18:40 UTC
+The main 234-request experiment reports 1,024,693 observed input tokens, about $0.043
+at the configured input rate. Three failed calls have unknown usage, so total cost
+remains unknown; their reservations are retained. The two simpler shapes add about
+$0.0129 observed input cost. These figures are not reconciled provider billing.
 
-The gateway now reaches LiteLLM. A synthetic request through the same local consumer
-returns **HTTP 403**, explicitly because the virtual-key route list omits `/typesafe`
-and `/typesafe/*`. The lease was newly issued around 18:32 UTC; its advertised expiry
-is September 18 at 18:32 UTC. Repeating the call does not resolve the issuer policy.
-This is a machine-broker issue, distinct from Render runtime credential wiring.
+Private evidence under `~/.recall/jev-execution-20260917/` includes the exact synthetic
+wire response, failed-pilot diagnostics, frozen fixtures and capture hashes,
+`stage-run-01-report.json`, `stage-run-01-ranking.json`, its independent crosscheck,
+and both variant reports. No source text or private labels are committed.
 
-[parcha #8649](https://github.com/Parcha-ai/parcha/pull/8649), reviewed head `a16d84b`,
-contains the route additions and passed broker CI. The supported next operation is
-to build that immutable broker source, update only the broker Deployment image while
-retaining existing Secret references, and refresh the managed machine lease. The
-operator must inspect the actual deployed digest and save it for rollback before
-applying; a Git manifest is not proof of the live image. The broad broker installer
-also refreshes secrets and is unnecessary for this image-only change.
+**Phase check:** simplicity improves in the client (four fewer production lines and
+zero dependencies); successful typed answers establish usable plumbing. The current
+ranking result fails the power/breakthrough check, and all measured shapes fail their
+proposed tail-latency budgets. Keep the existing ranker. W5 source review and calibration
+come next; date correctness, Render access, and complete search latency remain
+unproven gates before any later activation. No semantic deletion has been earned.
 
-Both the configured `drive-loader` account and the documented `grep-dev-machines`
-machine service account returned `container.clusters.get` 403. The former was checked
-through its configured identity; the latter used the existing documented credentials
-file without changing the global gcloud account. Parcha's broker CI runs tests only;
-grep-ops CI is credentialless. No supported deployment workflow is available to the
-GitHub App. No cluster mutation, IAM change, provider-key load, or manual lease mint
-was attempted. Private evidence is `broker-recheck-20260917.json` in the W0 directory.
-
-This advances routing diagnosis, not W0 acceptance. There is still no successful Jev
-wire response, measured quality improvement, or stage-latency result.
+Routing history: final [parcha #8649](https://github.com/Parcha-ai/parcha/pull/8649)
+merged as `156b580`, including passthrough authorization. The redundant gateway draft
+[grep-ops #290](https://github.com/Parcha-ai/grep-ops/pull/290) was closed in favor of
+[#289](https://github.com/Parcha-ai/grep-ops/pull/289), which contains the same ingress
+configuration. The old operator receipt is marked obsolete; no cluster rollout was
+performed by this agent. Runtime verification and repository merge state are distinct.
 
 Code anchors at the reviewed base:
 

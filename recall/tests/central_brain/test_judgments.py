@@ -148,7 +148,7 @@ class JudgmentContractTest(unittest.TestCase):
     def test_choice_distribution_covers_exact_options_and_agrees_with_choice(self):
         for distribution, choice in (
             ({"chat": 1.0}, "chat"),
-            ({"chat": 0.5, "code": 0.1, "none": 0.1}, "chat"),
+            ({"chat": 0.8, "code": 0.1, "none": 0.1, "extra": 0.0}, "chat"),
             ({"chat": 0.1, "code": 0.8, "none": 0.1}, "chat"),
             ({"chat": 0.8, "code": 0.1, "none": 0.1}, "invented"),
             ({"chat": True, "code": 0.0, "none": 0.0}, "chat"),
@@ -160,14 +160,75 @@ class JudgmentContractTest(unittest.TestCase):
                 )
                 self.assert_unavailable(payload)
 
-    def test_score_requires_matching_legend_all_levels_and_weighted_value(self):
+        for invalid in (float("nan"), float("inf"), -0.1, 1.1):
+            with self.subTest(invalid=invalid):
+                payload = primitive_response()
+                payload["answers"]["source"]["probabilities"]["chat"] = invalid
+                self.assert_unavailable(payload)
+
+    def test_choice_preserves_rounded_wire_distribution_without_normalizing(self):
+        # Numeric fields from Jev 1.13.0; synthetic labels replace question meaning.
+        for values, selected in (
+            ([0.0, 0.01, 0.0, 0.0, 0.01, 0.0, 0.54, 0.0, 0.0, 0.4, 0.01, 0.02], 6),
+            ([0.17, 0.01, 0.0, 0.0, 0.0, 0.81, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 5),
+        ):
+            with self.subTest(option_count=len(values)):
+                questions = primitive_questions()
+                probabilities = {
+                    f"option_{index}": value for index, value in enumerate(values)
+                }
+                questions["source"]["criteria"] = dict.fromkeys(probabilities)
+                payload = primitive_response()
+                payload["answers"]["source"].update(
+                    probabilities=probabilities, choice=f"option_{selected}"
+                )
+                result = self.client(FakeJudgmentTransport(payload)).judge(
+                    state="synthetic state", questions=questions
+                )
+                self.assertEqual(result.answers["source"].probabilities, probabilities)
+                self.assertAlmostEqual(sum(probabilities.values()), 0.99)
+
+    def test_score_preserves_independently_rounded_wire_fields(self):
+        # Numeric fields from a Jev 1.13.0 response; no private state or rubric.
+        for score, distribution in (
+            (3.41, [0.0, 0.0, 0.12, 0.34, 0.54]),
+            (2.59, [0.01, 0.05, 0.47, 0.29, 0.18]),
+            (1.35, [0.13, 0.49, 0.31, 0.05, 0.02]),
+        ):
+            with self.subTest(score=score):
+                questions = primitive_questions()
+                questions["quality"]["criteria"] = [
+                    f"Level {index}" for index in range(5)
+                ]
+                probabilities = {
+                    str(index): value for index, value in enumerate(distribution)
+                }
+                payload = primitive_response()
+                payload["answers"]["quality"].update(
+                    score=score,
+                    probabilities=probabilities,
+                    legend={
+                        str(index): level
+                        for index, level in enumerate(questions["quality"]["criteria"])
+                    },
+                )
+                result = self.client(FakeJudgmentTransport(payload)).judge(
+                    state="synthetic state", questions=questions
+                )
+                self.assertEqual(result.answers["quality"].score, score)
+                self.assertEqual(result.answers["quality"].probabilities, probabilities)
+
+    def test_score_requires_matching_legend_all_levels_and_bounded_numeric_value(self):
         for mutate in (
             lambda a: a.pop("legend"),
             lambda a: a["legend"].update({"0": "Invented rubric"}),
             lambda a: a["probabilities"].pop("0"),
-            lambda a: a.update(score=0.4),
+            lambda a: a.update(score=-0.1),
             lambda a: a.update(score=3),
             lambda a: a.update(score=True),
+            lambda a: a.update(score=float("nan")),
+            lambda a: a.update(score=float("inf")),
+            lambda a: a.update(score="1.6"),
         ):
             with self.subTest(mutate=mutate):
                 payload = primitive_response()
