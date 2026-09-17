@@ -196,13 +196,31 @@ Objective (Miguel 2026-09-17): move every semantic judgment into Jev typed answe
 
 | ID | Deliverable | Status | Owner | Evidence / exit |
 |---|---|---|---|---|
-| W0 | Spike: 15 validation questions + saved probe rows through `read_query` / `judge_documents`; latency p50/p95, tokens, cost, window agreement with regex + gold | blocked (TypeSafe key in 1Password) | next dev | numbers in this table; go/no-go on the 400 ms budget |
-| W5 | Grow the truth set: Noul candidate labels over 50 candidates/case, owner-approved packet; validation answerable 12 → ≥ 40 | todo | next dev + reviewer | card noise < 0.02 MRR between identical runs |
+| W0 | Broker-only client + private spike: validation query reading and bounded 20/50-document batches; latency p50/p95, tokens, cost, date agreement | blocked (live exit); client and request replay preparation done | Codex lead | 43 targeted checks and full 1,531-unit suite pass. Real client smoke: HTTP404. Gateway correction [grep-ops #290](https://github.com/Parcha-ai/grep-ops/pull/290) ready; configured GCP identity lacks cluster access. 15 search captures / 681 documents / 117 private request shapes ready. Request timing is not batch/search timing; 400/500 ms acceptance, date gold and successful wire fixture pending. |
+| W5 | Independent truth expansion and private review packet; validation answerable 12 → ≥ 40 | doing (preparation); approval pending | truth_packet + human reviewer TBD | Frozen set: 25 optimize / 15 validation / 20 test, only 12 answerable validation. Older pools yield at most 11 unused proposal families: ≥17 further independent questions needed. Repeatability and sampling uncertainty measured separately. No gold changed. |
 | W1 | Query reading replaces temporal/source/clause/identifier parsing (`judgments.py`, one fan-out beside the arms, regex fallback) | todo | | card ≥ 0.875 / ≥ 0.57, `judgments.path=jev` ≥ 95%; deletion PR after 3 nightlies |
 | W2 | Document judgment (Score per top-20 doc) replaces rerank plumbing (range order, focus window, nomination) | todo | | MRR ≥ 0.57, recall@5 gate, rerank p95 ≤ 500 ms |
-| W4 | Ingest triage as attributes (`kind`, `keep`, `secret`) on turbopuffer rows + migration 068; thinning/runaway/oversized rules deleted; `kind` filter on search (H4-2 by filter) | blocked (data-sharing OK for ingest text) | | no card regression; churn probe drops tool-noise; decision stratum ≥ baseline |
+| W4 | Versioned evidence-kind/usefulness attributes for new or changed redacted passages, using existing outbox; filterable search attributes | todo; ingest-sharing decision at activation | | Preserve redaction, oversize integrity, exact dedupe and safe canonical-body thinning. No full-corpus rejudge on session growth. A decision filter does not implement H4 recaps or supersession. No card regression; decision/fix strata ≥ baseline. |
 | W3 | Same-work grouping by judgment (copy/continuation/unrelated; most complete member) replaces shingles | todo | | recall@20 ≥ 0.875 strict |
 | W6 | Actor attribution by Choice over known actors; regex fallback | todo | | e2e_employee_attribution unchanged or better |
+
+Execution branch: `codex/recall-jev-plan-20260917`, fresh worktree
+`/home/ubuntu/worktrees/recall-jev-plan-20260917`, base `d5232b2`.
+The [approved plan](../recall/docs/architecture/2026-09-17-recall-jev-simplification-plan.md)
+corrects semantic versus integrity boundaries in the historical handoff. W1 retains
+exact identifier extraction and explicit filters; W6 changes only ambiguous mentions,
+not native identities or authorization. Each deletion still needs three accepted
+nightlies with fallback under 1%; after deletion the deterministic base search survives
+a model outage. The original historical card remains frozen.
+
+**Phase review requested by Miguel:** record simplicity (fewer owners/paths), power
+(real questions served), breakthrough (measured new capability), and speed (end-to-end
+latency/work/cost). Tooling progress does not establish a retrieval improvement.
+
+| Phase checkpoint | Simplicity | Power / breakthrough | Speed | Status |
+|---|---|---|---|---|
+| W0 preparation | One inactive client; zero new dependencies or production paths; shared request validation | Typed contracts and failure behavior verified; retrieval benefit unmeasured; no deletion earned | 404 counted as failure with unknown spend, never a latency success. Fresh existing-search baseline 0.875 / 0.54246 | tooling done; phase exit blocked |
+| W5 preparation | Reuse existing private truth/review utilities; preserve one frozen verifier | Independent question gap exposed; proposed labels are not gold | Offline preparation only; card repeatability pending | doing |
 
 ### H4: Memory layer (3 weeks)
 
