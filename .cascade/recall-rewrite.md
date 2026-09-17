@@ -190,6 +190,20 @@ Design (`server/recall_server/turbopuffer_plane.py`): one namespace per tenant (
 | H3-e' | Retire the Postgres vector plane: migration 067 (HNSW + embeddings table, ledger, passages GIN + generated tsvector; `migrate --retire-postgres-plane` from a turbopuffer-plane process only), plane-gated writers, `search-plane-status` drift CLI, embedding worker refuses on turbopuffer | **done 2026-09-17 00:4x UTC** (Miguel: "go ham"): worker `RECALL_SEARCH_PLANE=turbopuffer` (deploy 67d281e), embedding worker suspended, 067 applied through the temp-role `migrate-file` procedure (the worker DB role has no DDL; the in-app job fails with InsufficientPrivilege) → schema 67; MCP search verified; card after: 0.875 / 0.5425 / server p95 761 ms; one red gate `recall_scan` p95 71 s (scan plane mid-rewrite; re-measure). Rollback to Postgres search no longer exists. Left: PS-80 downsize + budget alert (Miguel, console) | lead | agent built it and ran out of credits; lead fixed CI twice (runner re-runs versions < 067 until retired; retirement e2e on its own database). Exit: Postgres ≤ 40 GB then ≤ 10 GB with T6b; cost probe green |
 | H3-f' | show/session_context/time clip off `canonical_chunks` (unchanged from the old H3-e) | todo | | |
 
+### H6: Judgments, not regex (Jev / TypeSafe) — handoff `recall/docs/architecture/2026-09-17-recall-jev-judgments-handoff.md` (#610)
+
+Objective (Miguel 2026-09-17): move every semantic judgment into Jev typed answers; keep arms, fusion, deadlines, storage in code; delete each regex path only after the card holds with the fallback rate < 1%. One falsifiable wave at a time per `~/ati-harness/AGENTS.md`.
+
+| ID | Deliverable | Status | Owner | Evidence / exit |
+|---|---|---|---|---|
+| W0 | Spike: 15 validation questions + saved probe rows through `read_query` / `judge_documents`; latency p50/p95, tokens, cost, window agreement with regex + gold | blocked (TypeSafe key in 1Password) | next dev | numbers in this table; go/no-go on the 400 ms budget |
+| W5 | Grow the truth set: Noul candidate labels over 50 candidates/case, owner-approved packet; validation answerable 12 → ≥ 40 | todo | next dev + reviewer | card noise < 0.02 MRR between identical runs |
+| W1 | Query reading replaces temporal/source/clause/identifier parsing (`judgments.py`, one fan-out beside the arms, regex fallback) | todo | | card ≥ 0.875 / ≥ 0.57, `judgments.path=jev` ≥ 95%; deletion PR after 3 nightlies |
+| W2 | Document judgment (Score per top-20 doc) replaces rerank plumbing (range order, focus window, nomination) | todo | | MRR ≥ 0.57, recall@5 gate, rerank p95 ≤ 500 ms |
+| W4 | Ingest triage as attributes (`kind`, `keep`, `secret`) on turbopuffer rows + migration 068; thinning/runaway/oversized rules deleted; `kind` filter on search (H4-2 by filter) | blocked (data-sharing OK for ingest text) | | no card regression; churn probe drops tool-noise; decision stratum ≥ baseline |
+| W3 | Same-work grouping by judgment (copy/continuation/unrelated; most complete member) replaces shingles | todo | | recall@20 ≥ 0.875 strict |
+| W6 | Actor attribution by Choice over known actors; regex fallback | todo | | e2e_employee_attribution unchanged or better |
+
 ### H4: Memory layer (3 weeks)
 
 | ID | Deliverable | Files / approach | Exit check |
