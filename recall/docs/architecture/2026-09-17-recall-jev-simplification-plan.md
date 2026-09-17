@@ -340,8 +340,9 @@ The first implementation deliverable is a broker contract smoke test, a frozen W
 replay report, and a W5 review packet. It makes the latency/quality decision concrete
 before changing production retrieval. W0's old key request is removed. The remaining
 human decisions are permission for W4 ingest data sharing and the reviewer who can
-approve W5 labels. The current engineer-gateway deployment also needs its authorized
-operator: this machine's configured GCP identity cannot inspect the Daytona cluster.
+approve W5 labels. The current broker issuer deployment also needs its authorized
+operator: both available machine GCP identities cannot inspect the Daytona cluster.
+The engineer gateway became reachable during the later route recheck below.
 
 ### W0 preparation receipt, September 17
 
@@ -363,7 +364,8 @@ The first real-client synthetic smoke returned HTTP 404 through the healthy loca
 consumer. The six-line missing-ingress correction and protected-route tests are
 [grep-ops #290](https://github.com/Parcha-ai/grep-ops/pull/290). The TypeSafe pass-through,
 both virtual-key allowlists, and managed lease renewal must be verified together.
-No company text has been sent to Jev and no credentials have been loaded or minted.
+No company text has been sent to Jev and no provider credentials have been loaded or
+LiteLLM keys manually minted.
 
 Private preparation under `~/.recall/jev-execution-20260917/` holds:
 
@@ -390,6 +392,33 @@ published input rate). Actual usage must replace this estimate. Do not run those
 fixtures until the synthetic wire contract succeeds. No production wave is accepted
 by this preparation receipt, and no deletion has been earned.
 
+### Broker recheck, September 17 at 18:33–18:40 UTC
+
+The gateway now reaches LiteLLM. A synthetic request through the same local consumer
+returns **HTTP 403**, explicitly because the virtual-key route list omits `/typesafe`
+and `/typesafe/*`. The lease was newly issued around 18:32 UTC; its advertised expiry
+is September 18 at 18:32 UTC. Repeating the call does not resolve the issuer policy.
+This is a machine-broker issue, distinct from Render runtime credential wiring.
+
+[parcha #8649](https://github.com/Parcha-ai/parcha/pull/8649), reviewed head `a16d84b`,
+contains the route additions and passed broker CI. The supported next operation is
+to build that immutable broker source, update only the broker Deployment image while
+retaining existing Secret references, and refresh the managed machine lease. The
+operator must inspect the actual deployed digest and save it for rollback before
+applying; a Git manifest is not proof of the live image. The broad broker installer
+also refreshes secrets and is unnecessary for this image-only change.
+
+Both the configured `drive-loader` account and the documented `grep-dev-machines`
+machine service account returned `container.clusters.get` 403. The former was checked
+through its configured identity; the latter used the existing documented credentials
+file without changing the global gcloud account. Parcha's broker CI runs tests only;
+grep-ops CI is credentialless. No supported deployment workflow is available to the
+GitHub App. No cluster mutation, IAM change, provider-key load, or manual lease mint
+was attempted. Private evidence is `broker-recheck-20260917.json` in the W0 directory.
+
+This advances routing diagnosis, not W0 acceptance. There is still no successful Jev
+wire response, measured quality improvement, or stage-latency result.
+
 Code anchors at the reviewed base:
 
 - `recall/server/recall_server/passage_retrieval.py:116,501,554,764,831,960,2060,2144,2522`
@@ -404,5 +433,6 @@ Code anchors at the reviewed base:
 Validation entry points for implementation: `python3 -m unittest discover -s tests -v`
 from `recall/`, the relevant fresh-Postgres e2e scripts in
 `.github/workflows/recall-ci.yml`, offline replay, then the systems card on the deployed
-candidate. This planning change did not run the application suite or claim Jev quality
-results.
+candidate. The original documentation-only planning pass ran no application tests;
+subsequent implementation checks and their exact PRs are recorded in H6. Passing
+those checks does not establish Jev quality.
