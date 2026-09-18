@@ -6,6 +6,7 @@ means the selected passages only. Every returned candidate keeps its slot.
 from __future__ import annotations
 
 import base64
+import gzip
 import hashlib
 import inspect
 import json
@@ -133,7 +134,7 @@ def _read_page(root, spec):
                     fragments.append({'passage_id': passage['passage_id'], 'span_index': si,
                         'start': offset, 'end': min(offset + 900, len(text)), 'length': len(text),
                         'text': text[offset:offset + 900], 'event_native_id': first['event_native_id'],
-                        'occurred_at': first['occurred_at'], 'receipts': first['receipts']})
+                        'occurred_at': first['occurred_at'], 'ordinal': first['ordinal'], 'receipts': first['receipts']})
             text = '\n'.join(parts)
             for span, part in zip(passage['spans'], parts):
                 require(text.encode()[span['passage_byte_start']:span['passage_byte_end']].decode() == part, 'passage_coordinate_mismatch')
@@ -142,19 +143,26 @@ def _read_page(root, spec):
         cursor = spec['cursor']
         require(type(cursor) is int and 0 <= cursor < len(fragments), 'pagination_invalid')
         result = {**base, 'cursor': cursor, 'next_cursor': cursor, 'total_fragments': len(fragments), 'fragments': [], 'summaries': summaries}
-        for fragment in fragments[cursor:]:
+        for position, fragment in enumerate(fragments[cursor:], start=cursor + 1):
             result['fragments'].append(fragment)
-            if len(json.dumps(result, ensure_ascii=False).encode()) > 11000:
-                result['fragments'].pop(); break
-            result['next_cursor'] += 1
+            result['next_cursor'] = None if position == len(fragments) else position
+            if len(_page_stdout(result).encode()) > 11000:
+                result['fragments'].pop(); result['next_cursor'] = position - 1; break
         require(bool(result['fragments']), 'single_fragment_exceeds_bound')
-        if result['next_cursor'] == len(fragments):
-            result['next_cursor'] = None
         return result
     except (ValueError, KeyError, TypeError, OSError, IndexError, UnicodeError) as error:
         # Do not echo provider text, file contents or JSON decoder details.
         codes = {'manifest_advanced_or_mismatch', 'logical_identity_mismatch', 'native_parent_mismatch', 'part_hash_mismatch', 'nonvisible_role', 'nonvisible_content', 'native_identity_ambiguous', 'native_identity_changed', 'native_identity_unavailable', 'source_span_out_of_bounds', 'passage_coordinate_mismatch', 'selected_receipt_mismatch'}
         return {'error': str(error) if type(error) is ValueError and str(error) in codes else 'source_verification_failed'}
+
+
+def _page_stdout(page):
+    """Recall verifies receipts on top-level canonical evidence JSONL records."""
+    import json
+
+    metadata = {k: v for k, v in page.items() if k != 'fragments'}
+    records = [*page.get('fragments', []), {**metadata, 'capture_meta': True}]
+    return ''.join(json.dumps(row, ensure_ascii=False, separators=(',', ':')) + '\n' for row in records)
 
 
 class CandidateCapture:
@@ -179,8 +187,8 @@ class CandidateCapture:
             stream.write(raw)
 
     def _call(self, client, spec, prefix):
-        encoded = base64.b64encode(json.dumps(spec, separators=(',', ':')).encode()).decode()
-        program = "python3 - <<'RECALL_CAPTURE'\nfrom pathlib import Path\nimport json, base64\n" + inspect.getsource(_read_page) + f"\nSPEC = '{encoded}'\nprint(json.dumps(_read_page(Path('/docs/d1'), json.loads(base64.b64decode(SPEC))), ensure_ascii=False))\nRECALL_CAPTURE"
+        encoded = base64.b64encode(gzip.compress(json.dumps(spec, separators=(',', ':')).encode(), mtime=0)).decode()
+        program = "python3 - <<'RECALL_CAPTURE'\nfrom pathlib import Path\nimport json, base64, gzip\n" + inspect.getsource(_read_page) + '\n' + inspect.getsource(_page_stdout) + f"\nSPEC = '{encoded}'\nprint(_page_stdout(_read_page(Path('/docs/d1'), json.loads(gzip.decompress(base64.b64decode(SPEC))))), end='')\nRECALL_CAPTURE"
         _require(len(program.encode()) <= 16000, 'capture_program_bound')
         args = {'targets': [{'logical_document_id': spec['logical_document_id'], 'alias': 'd1'}], 'program': program, 'timeout_seconds': 30}
         with self.lock:
@@ -194,8 +202,14 @@ class CandidateCapture:
                 response_sha256=_sha(json.dumps(response, sort_keys=True).encode()))
             _require(isinstance(response, dict), 'capture_payload_invalid')
             _require(outcome.ok and response.get('complete') is True and response.get('output_truncated') is False and response.get('exit_code') == 0, 'capture_exec_unavailable')
-            payload = json.loads(response['stdout'])
-            _require(isinstance(payload, dict), 'capture_payload_invalid')
+            records = [json.loads(line) for line in response['stdout'].splitlines()]
+            _require(records and all(isinstance(r, dict) for r in records), 'capture_payload_invalid')
+            _require(records[-1].get('capture_meta') is True and not any(r.get('capture_meta') for r in records[:-1]), 'capture_payload_invalid')
+            payload = {k: v for k, v in records[-1].items() if k != 'capture_meta'}
+            if spec['phase'] == 'text' and not payload.get('error'):
+                payload['fragments'] = records[:-1]
+            else:
+                _require(len(records) == 1, 'capture_payload_invalid')
             if payload.get('error'):
                 _require(payload['error'] in {'manifest_advanced_or_mismatch', 'logical_identity_mismatch', 'native_parent_mismatch', 'part_hash_mismatch', 'nonvisible_role', 'nonvisible_content', 'native_identity_ambiguous', 'native_identity_changed', 'native_identity_unavailable', 'source_span_out_of_bounds', 'passage_coordinate_mismatch', 'selected_receipt_mismatch', 'source_verification_failed'}, 'capture_payload_invalid')
                 receipt['payload'] = payload
@@ -212,7 +226,7 @@ class CandidateCapture:
                 _require(fid not in self.protected and family == spec['expected_family'], 'capture_family_changed')
                 opened = set(response.get('opened_receipts', []))
                 _require(all(set(f['receipts']) <= opened for f in payload['fragments']), 'capture_receipt_unopened')
-                receipt.update(payload=payload, opened_receipts=sorted(opened))
+                receipt.update(payload=payload, stdout=response['stdout'], opened_receipts=sorted(opened))
             return payload
         finally:
             self._write(f'{prefix}-call-{number:05}.json', receipt)
@@ -295,6 +309,7 @@ class CandidateCapture:
                 cursor = 0
                 for chunk in chunks:
                     _require(chunk['start'] == cursor and chunk['end'] == cursor + len(chunk['text']) and chunk['length'] == chunks[0]['length'], 'capture_fragment_gap')
+                    _require(type(chunk['ordinal']) is int and chunk['ordinal'] == span['record_ordinal'], 'capture_fragment_ordinal')
                     _require(all(chunk[k] == chunks[0][k] for k in ('event_native_id', 'occurred_at', 'receipts')), 'capture_fragment_identity')
                     cursor = chunk['end']
                 _require(cursor == chunks[0]['length'], 'capture_fragment_incomplete')

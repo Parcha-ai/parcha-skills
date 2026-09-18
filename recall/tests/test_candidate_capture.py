@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import base64
 import copy
+import gzip
 import hashlib
 import json
 import re
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +19,9 @@ from evals.boundary_identity import native_family_id
 from evals.retrieval import EvaluationInputError
 from evals.systems_card.mcp_client import CallOutcome
 from evals.systems_card import runner
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'server'))
+from recall_server.deep_inspection import agent_evidence_receipts
 
 SID = '12345678-1234-1234-1234-123456789abc'
 PARENT = 'claude-session-' + 'a' * 24
@@ -58,9 +64,13 @@ class LocalClient:
 
     def call_tool(self, name, args, **kwargs):
         self.calls.append((name, args, kwargs))
-        spec = json.loads(base64.b64decode(re.search(r"SPEC = '([^']+)'", args['program']).group(1)))
-        payload = capture._read_page(self.root, spec)
-        result = dict(complete=True, output_truncated=False, exit_code=0, opened_receipts=[RECEIPT], stdout=json.dumps(payload))
+        encoded = base64.b64decode(re.search(r"SPEC = '([^']+)'", args['program']).group(1))
+        spec = json.loads(gzip.decompress(encoded))
+        program = args['program'].replace("Path('/docs/d1')", f'Path({str(self.root)!r})')
+        executed = subprocess.run(['bash', '-c', program], check=True, capture_output=True, text=True)
+        self.last_stdout = executed.stdout
+        result = dict(complete=True, output_truncated=False, exit_code=0,
+                      opened_receipts=agent_evidence_receipts(executed.stdout), stdout=executed.stdout)
         if self.mutate:
             self.mutate(spec, result)
         return CallOutcome(name, True, 1, result=result)
@@ -140,7 +150,8 @@ class CaptureTest(unittest.TestCase):
                 if mode=='truncated':result['output_truncated']=True
                 elif mode=='receipt':result['opened_receipts']=[]
                 else:
-                    d=json.loads(result['stdout']);d['cursor']=100;result['stdout']=json.dumps(d)
+                    rows=[json.loads(line) for line in result['stdout'].splitlines()]
+                    rows[-1]['cursor']=100;result['stdout']='\n'.join(json.dumps(row) for row in rows)
             client=LocalClient(self.mount,mutate)
             recorder=capture.CandidateCapture(self.root/mode,client_factory=lambda:client,protected_families=set())
             row=self.run_case(recorder)['candidates'][0]
@@ -179,6 +190,21 @@ class CaptureTest(unittest.TestCase):
         self.assertEqual(recorder.finish()['source_calls'], 0)
         self.assertEqual(self.client.calls, [])
 
+    def test_final_page_bound_includes_null_cursor_encoding(self):
+        recorder = self.new()
+        spec = recorder._spec(self.hit)
+        spec.update(phase='text', cursor=0, expected_family={'kind': 'claude-parent', 'native_id': SID})
+
+        def boundary_stdout(page):
+            if len(page['fragments']) == 2:
+                return 'x' * (11003 if page['next_cursor'] is None else 11000)
+            return 'x' * 100
+
+        with mock.patch.object(capture, '_page_stdout', side_effect=boundary_stdout):
+            page = capture._read_page(self.mount, spec)
+        self.assertEqual(len(page['fragments']), 1)
+        self.assertEqual(page['next_cursor'], 1)
+
     def test_source_times_are_required_before_capture(self):
         del self.hit['first_occurred_at']
         row = self.run_case(self.new())['candidates'][0]
@@ -214,12 +240,26 @@ class CaptureTest(unittest.TestCase):
         row = self.run_case(recorder)['candidates'][0]
         self.assertEqual(row['text'], text)
         self.assertGreater(len(self.client.calls), 2)
+        selected = [json.loads(line) for line in self.client.last_stdout.splitlines()]
+        self.assertEqual(agent_evidence_receipts(self.client.last_stdout), [RECEIPT])
+        for fragment in selected[:-1]:
+            self.assertEqual(fragment['ordinal'], 0)
+            self.assertEqual(fragment['event_native_id'], 'a' * 24 + '-000001')
+        self.assertTrue(selected[-1]['capture_meta'])
+        self.assertLessEqual(len(self.client.last_stdout.encode()), 11000)
         # Execute the exact generated program, changing only the mounted path.
-        import subprocess
         args = self.client.calls[0][1]
         program = args['program'].replace("Path('/docs/d1')", f'Path({str(self.mount)!r})')
         out = subprocess.run(['bash', '-c', program], check=True, capture_output=True, text=True)
         self.assertEqual(json.loads(out.stdout)['family'], {'kind': 'claude-parent', 'native_id': SID})
+
+    def test_repetitive_specs_compress_without_raising_program_budget(self):
+        self.hit['matching_ranges'][0]['spans'] *= 128
+        recorder = self.new(max_calls=1)
+        row = self.run_case(recorder)['candidates'][0]
+        self.assertNotEqual(row['error'], 'capture_program_bound')
+        self.assertEqual(len(self.client.calls), 1)
+        self.assertLessEqual(len(self.client.calls[0][1]['program'].encode()), 16000)
 
     def test_conflicting_selected_event_families_fail_before_prose(self):
         second = '98765432-1234-1234-1234-123456789abc'
