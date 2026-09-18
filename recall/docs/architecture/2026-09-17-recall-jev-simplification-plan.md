@@ -476,3 +476,88 @@ components; zero observed paired change across two runs does not establish futur
 stability or calibrated candidate relevance. Full source and measurement receipts
 remain in the private freeze directory. Review is complete; a new permission request
 for a reviewer is not a prerequisite for continuing measurement.
+
+
+### Evidence and capability checkpoint, September 18
+
+The production audit corrects the experiment boundary: turbopuffer hydration retains
+stored passage text and headers for `_rerank_fused`; public matching ranges are clipped
+separately. The frozen public result pools already reflect production nomination,
+Voyage ranking and grouping. None of these offline reorderings is a production-equivalent
+Voyage replacement. Document judgment depends on the retrieved evidence and belongs in
+the existing rerank slot; it cannot overlap the arms producing that evidence. A source-only
+query replacement removes roughly eleven lines while adding measured latency, so it is
+not a useful first simplification by itself.
+
+Isolating one candidate per request did not recover ranking quality on saved snippets:
+300 requests, 600 typed answers, no errors; Score MRR .26782 and answer-support Noul
+MRR .23857 versus baseline .54246. Stage p95 was 1,715 ms. The previous evidence-length
+A/B likewise improved slightly with fuller saved snippets, but stayed below baseline.
+
+The subsequent capture recovered 407 verified selected passages, with 226 complete
+candidate rows. Only four of fifteen queries had complete first-two-passage evidence
+for every one of their twenty original candidates (up to two selected passages; some
+candidates originally have only one range). Advanced source manifests, unavailable
+span metadata and one execution failure prevent a full-population replay. All original
+slots remain accounted for; the other eleven queries retain their entire baseline order
+without dispatching a model call. Capture used 660 central reads offline, not on a search
+request. No hidden reasoning or partial fallback source text was sent to Jev.
+
+The independent raw-wire audit reproduces the paired comparison on all four complete cases:
+
+| Evidence/scorer, same four cases | MRR | Recall@5 |
+|---|---:|---:|
+| Existing baseline | .785714 | .75 |
+| Snippet Score / Noul | .600000 / .515625 | .75 / .75 |
+| Full selected passages Score / Noul | .777778 / .772727 | .75 / .75 |
+
+Fuller evidence materially improves the model over its own snippet control but does not
+beat the existing ranker. Eighty requests returned all 160
+typed answers without provider errors; complete-stage p95 was 1,908 ms. The all-fifteen
+mixed Score/baseline MRR .53981 must not be presented as a complete Jev run or evidence
+of general parity. Selected token-window passages are neither complete sessions nor
+necessarily complete original turns. Input estimate: $0.01608, not reconciled billing.
+
+**The promising capability is checking a specific claim against supplied evidence.**
+An initial source-reviewed diagnostic got 14/16 labels correct on each of two runs,
+including one false positive and one false negative. The transfer test used the remaining
+21 approved W5 source cases: each supported claim paired with a plausible different
+source, 42 labels approved by Codex before calls. Both Noul and a three-way Choice
+(supports / contradicts / not established) got all 42 right in both runs, with request
+p95 496 ms over 84 calls. Observed input estimate was $0.00481. Independent reconstruction
+verified the labels, exact request states, responses and metrics.
+
+This is stronger evidence for claim-to-source discrimination than for retrieval ranking.
+The earlier two errors still count. The transfer set has no true contradiction labels,
+and selecting same-claim source swaps does not establish population calibration or an
+automatic trust threshold. A next falsifiable capability test should freeze same-source
+unsupported and contradicted claims, attribution/status/date changes and misleading
+source instructions, then use a never-tuned transfer panel. Keep this outside the ordinary
+search path until it earns a caller-facing use case and total latency budget. Do not add
+a second reranker or a generic agent framework to exploit the promising result.
+
+The verifier now has an operational entry point in separate PR #615:
+`--truth-expansion <private manifest>`. It validates the immutable 60-case base, 28
+approved additions and family map before any card network traffic. The original fifteen
+questions keep independent metrics and all five existing gates. The live opt-in accuracy
+run retained 43 rows, had zero backend errors and passed all ten gates: expanded MRR
+.68423 / recall@20 .9625; original .54246 / .875. Client p95 was 1,649 / 1,962 ms for the
+respective panels. These repeat the frozen baseline; the third bounded measurement is
+not three accepted nightlies. Eight legacy probe/history comparisons match pre-change
+behavior exactly; 85 focused tests and Ruff pass. Candidate code remains in a different PR.
+
+**Phase review:** simplicity passes for the evaluation change through shared math and
+one explicit opt-in; no extra production path or dependency was added. Power improves
+in evaluation coverage and the demonstrated bounded source-checking task. A production
+breakthrough and semantic deletion remain unearned. Speed rejects synchronous reranking
+in the tested shapes, while the source-checking transfer clears a 500 ms request-level
+screen that still excludes application overhead. W1/W2 activation stays unearned; W4's
+ingest-sharing decision remains at activation. Future evidence should concentrate on
+representative source-checking errors and production-shaped evidence, not more repetitions
+of clipped final-result reranking.
+
+Private evidence directories under `~/.recall/jev-execution-20260917/`:
+`single-candidate-20260918-v1`, `full-evidence-20260918-v1`,
+`full-passage-screen-20260918-v1`, and `systems-card-expansion-live-20260918-v1`.
+The source-checking transfer is beside the W5 freeze in
+`delegated-review-20260917/support-transfer-20260918-v1`. Raw evidence stays outside Git.
