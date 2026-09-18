@@ -6,6 +6,13 @@ and H6 in [the Cascade board](../../../.cascade/recall-rewrite.md).
 Execution progress and proof live in H6 of the Cascade board. The initial architecture
 review made no production change.
 
+As of September 18, the expanded-truth verifier [#615](https://github.com/Parcha-ai/parcha-skills/pull/615)
+is merged. W5 has forty approved answerable validation questions, but its separate
+candidate-label/calibration work is still open. The first source-reviewed pilot found
+an underspecified incident question; retain its old truth and scores and version the
+clarification separately. [Candidate diagnostics #616](https://github.com/Parcha-ai/parcha-skills/pull/616)
+are offline only. The board records coverage, exclusions, and the next acceptance checks.
+
 The objective is to give Recall one typed semantic boundary and reusable evidence
 attributes, then remove the incident-specific interpretation and ranking paths that
 boundary supersedes. Success means better evidence near the top, fewer competing
