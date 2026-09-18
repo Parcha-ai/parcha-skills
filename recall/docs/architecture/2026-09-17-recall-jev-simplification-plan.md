@@ -13,6 +13,23 @@ an underspecified incident question; retain its old truth and scores and version
 clarification separately. [Candidate diagnostics #616](https://github.com/Parcha-ai/parcha-skills/pull/616)
 are offline only. The board records coverage, exclusions, and the next acceptance checks.
 
+The follow-up family audit corrected two offline bookkeeping errors: seven replacement
+family hashes lost their namespace, and empty membership entries falsely excluded 93
+candidate slots. All 28 added native families are disjoint from the original 60 and
+each other. The immutable corrected freeze preserves every question, gold fact, and
+source-approval byte; both baseline reports reproduce exactly. Shared helpers in
+[#617](https://github.com/Parcha-ai/parcha-skills/pull/617) enforce one identity rule and
+explicit protected-split membership. A redacted native ID remains unresolved, leaving
+1,907 family-eligible, 110 protected, and four unresolved slots out of 2,021. Source-parent
+uniqueness does not establish statistical independence, and candidate review remains open.
+
+One further question now has 45 source-reviewed evidence bundles across 47 returned
+slots. Two frozen manifests are unavailable; one reviewed bundle exceeds the unchanged
+model context guard. With labels fixed first, all 44 broker calls succeeded: 43 scored
+nonanswers were rejected at the fixed diagnostic cutoff, while one partial answer stays
+outside binary scoring. Request p95 was 720 ms. There are no positive examples in this
+batch, so it measures neither answer recall nor a ranking improvement. W5 is unfinished.
+
 The objective is to give Recall one typed semantic boundary and reusable evidence
 attributes, then remove the incident-specific interpretation and ranking paths that
 boundary supersedes. Success means better evidence near the top, fewer competing
@@ -579,3 +596,36 @@ Private evidence directories under `~/.recall/jev-execution-20260917/`:
 `full-passage-screen-20260918-v1`, and `systems-card-expansion-live-20260918-v1`.
 The source-checking transfer is beside the W5 freeze in
 `delegated-review-20260917/support-transfer-20260918-v1`. Raw evidence stays outside Git.
+
+### W5 evidence capture: the next bounded implementation
+
+Retrospective recovery needed 128 source reads to obtain 45 of one question's 47
+candidate bundles; two historical manifests had advanced. Add one opt-in evaluator
+capture module beside `TruthBoundaryProbe.run`'s private search-result writes. Capture
+the exact selected passage IDs immediately after each search, before the next search,
+with source identity, native family, revision, manifest, source spans and text hashes.
+This reduces recovery work but cannot eliminate concurrent-update races. Keep search
+latency separate from hydration timing and keep existing search payload caps.
+
+The capture contract preserves every returned slot. Protected or unresolved families
+are withheld before source-prose capture. Missing metadata, advanced manifests,
+truncation, exhausted budgets and source-hash mismatches remain explicit unavailable
+rows; never substitute current text or promote a snippet into complete evidence.
+Artifacts stay private, exclusive-create and outside Git. Interrupted runs retain
+partial receipts without a completed manifest. There are no model calls or labels in
+this boundary, and no changes to verifier scoring or production retrieval.
+
+Tests precede code: disabled-path call/artifact parity; invalid configuration rejected
+before traffic; Unicode/multipart exact reconstruction; identity and receipt failures;
+protected and malformed family withholding; pagination/timeout/budget exhaustion;
+private permissions; and partial-output completeness. Keep the implementation small:
+one evaluator module and a narrow opt-in hook. Do not move network capture into
+`judgments_review.py`, whose gold/probability display and excerpt limits serve a
+different review contract.
+
+After capture works, freeze a representative batch across question intents before
+predictions, including separately identified alternative-retriever candidates and
+missed gold. Review the exact evidence the model receives; reuse a label only when
+query, evidence and provenance all match. Selected-passage support remains separate
+from strict document-boundary retrieval truth. Expand the same workflow to finish W5;
+one clean negative-only question is not its acceptance gate.
