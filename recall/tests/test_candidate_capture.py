@@ -26,7 +26,7 @@ from recall_server.deep_inspection import agent_evidence_receipts
 SID = '12345678-1234-1234-1234-123456789abc'
 PARENT = 'claude-session-' + 'a' * 24
 SOURCE = 'claude:test:host'
-DOC = 'ldoc_' + 'a' * 30
+DOC = 'ldoc_' + 'a' * 32
 RECEIPT = 'recall://' + SOURCE + '/' + 'a' * 24 + '-000001?rev=1#item=0'
 
 
@@ -51,7 +51,7 @@ def mounted(root, text='Café 🧠 shipped.\nNext action.', *, role='assistant',
     ranges = []
     for i, value in enumerate(text.split('\n')[:2]):
         start = len('\n'.join(text.split('\n')[:i]).encode()) + (1 if i else 0)
-        ranges.append(dict(passage_id='psg_' + str(i) * 30, text=value[:3], receipts=[RECEIPT], passage_window=['2026-09-18T00:00:00Z']*2,
+        ranges.append(dict(passage_id='psg_' + str(i) * 32, text=value[:3], receipts=[RECEIPT], passage_window=['2026-09-18T00:00:00Z']*2,
                            spans=[dict(record_ordinal=0, record_count=len(records), source_byte_start=start,
                                        source_byte_end=start+len(value.encode()), passage_byte_start=0, passage_byte_end=len(value.encode()))]))
     return dict(source_id=SOURCE, logical_document_id=DOC, native_parent_id=PARENT, revision=2,
@@ -122,7 +122,7 @@ class CaptureTest(unittest.TestCase):
         result=self.run_case(self.new(),hits)
         self.assertEqual([r['candidate_index'] for r in result['candidates']], [0,1,2])
         self.assertTrue(all(not r['complete_selected_passages'] for r in result['candidates']))
-        self.assertEqual(self.client.calls, [])
+        self.assertEqual([c[0] for c in self.client.calls], ['recall_passage_metadata']*2)
 
     def test_advanced_manifest_and_corrupt_part_are_not_current_text(self):
         for target in ['manifest.json','part-00000.jsonl']:
