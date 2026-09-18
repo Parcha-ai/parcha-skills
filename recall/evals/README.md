@@ -93,6 +93,32 @@ the cost probe; `--forget-probe` enables the write-then-forget latency probe (ne
 card. `python -m evals.systems_card render --output-dir DIR` re-renders HTML from an existing
 `card.json`.
 
+An approved validation expansion uses `--truth-expansion /private/bundle/manifest.json`
+instead of `--truth`. Keep the manifest and three JSONL files mode-0600 in an owner-only
+directory outside git. The closed manifest schema is:
+
+```json
+{
+  "schema_version": "recall.systems-card.truth-expansion.v1",
+  "base_canonical_sha256": "<frozen base canonical SHA256>",
+  "base": {"path": "base.jsonl", "sha256": "<raw file SHA256>"},
+  "additions": {"path": "additions.jsonl", "sha256": "<raw file SHA256>"},
+  "families": {"path": "families.jsonl", "sha256": "<raw file SHA256>"}
+}
+```
+
+Artifact paths are relative to the manifest, with no `..` or symlink traversal. The base
+canonical digest comes from `evals.expanded_truth.canonical_sha256`; freeze it before reviewing
+additions. All pins, case schemas, approvals and native-family separation are checked before
+any probe makes a network call. This option requires `--truth-split validation` (the default).
+The expanded validation set retains every original negative and failed search. It uses the
+existing metric math and gates, while `original.*` independently scores the original validation
+panel from the same calls and must pass the same five gates. Both panels and the manifest pin
+appear in card history. Pointer/authorization fields retain the existing candidate adapter's
+semantics; the separate sampled receipt-resolution check is not duplicated as a panel audit.
+The original `--truth` behavior is unchanged. A larger passing set does not establish a
+candidate improvement, calibrated labels, or the required consecutive nightly acceptance.
+
 Unit coverage runs against a fake brain (`tests/test_systems_card.py`); the live run is an
 operator action, not a CI step, because it needs the owner token and takes several minutes.
 

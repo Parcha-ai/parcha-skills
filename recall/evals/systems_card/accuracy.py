@@ -16,9 +16,12 @@ from pathlib import Path
 from typing import Any
 
 from ..agentic_truth import score_boundary_candidates
+from ..expanded_truth import score_expanded_boundary_candidates
 from ..private_holdout import _load_jsonl, _private_path
+from ..retrieval import EvaluationInputError
 from .model import Gate, ProbeResult
 from .probes import ProbeContext
+from .truth import load_truth_expansion
 
 CANDIDATE_LIMIT = 50  # recall_search maximum (H2-d); boundary_recall@50 is measured at real depth
 
@@ -132,6 +135,20 @@ def first_receipt(result: dict[str, Any]) -> str | None:
     return None
 
 
+def _accuracy_gates(aggregate: dict[str, Any], prefix: str = "") -> list[Gate]:
+    # Preserve the existing card thresholds for both independently scored panels.
+    return [
+        Gate(prefix + metric, op, threshold).evaluate(aggregate.get(metric))
+        for metric, op, threshold in (
+            ("boundary_recall@20", ">=", 0.66),
+            ("boundary_mrr", ">=", 0.5),
+            ("authorization_violation_rate", "==", 0.0),
+            ("backend_error_rate", "<=", 0.02),
+            ("latency_p95_ms", "<=", 5000.0),
+        )
+    ]
+
+
 class TruthBoundaryProbe:
     name = "accuracy.truth_boundary"
     dimension = "accuracy"
@@ -139,13 +156,26 @@ class TruthBoundaryProbe:
     def run(self, context: ProbeContext) -> ProbeResult:
         result = ProbeResult(name=self.name, dimension=self.dimension, status="ok")
         truth = context.options.get("truth_path")
-        if not truth:
+        split = context.options.get("truth_split", "validation")
+        expansion = context.options.get("_truth_expansion")
+        expansion_path = context.options.get("truth_expansion_path")
+        if expansion_path:
+            if truth:
+                raise EvaluationInputError("truth sources are mutually exclusive")
+            expansion = expansion or load_truth_expansion(expansion_path, split=split)
+        if not truth and expansion is None:
             result.status = "skipped"
             result.notes.append("no --truth path given; accuracy needs the owner-private truth set")
             return result
-        split = context.options.get("truth_split", "validation")
-        truth_path = _private_path(Path(truth), exists=True)
-        cases, payload = _load_jsonl(truth_path)
+        if expansion is None:
+            truth_path = _private_path(Path(truth), exists=True)
+            cases, payload = _load_jsonl(truth_path)
+            truth_sha256 = hashlib.sha256(payload).hexdigest()
+        else:
+            if split != "validation":
+                raise EvaluationInputError("truth expansion is validation-only")
+            cases = expansion.base + expansion.additions
+            truth_sha256 = expansion.pins["base_sha256"]
         selected = [case for case in cases if split in (None, "all") or case.get("split") == split]
         if not selected:
             result.status = "failed"
@@ -204,18 +234,37 @@ class TruthBoundaryProbe:
                 "backend_error": error,
             })
 
-        report = score_boundary_candidates(cases, rows, split=None if split == "all" else split)
+        original_aggregate = None
+        if expansion is None:
+            report = score_boundary_candidates(cases, rows, split=None if split == "all" else split)
+        else:
+            report = score_expanded_boundary_candidates(
+                expansion.base, expansion.additions, expansion.families, rows,
+                expected_base_sha256=expansion.base_canonical_sha256, split="validation",
+            )
+            original_ids = {case["id"] for case in expansion.base if case["split"] == "validation"}
+            original_report = score_boundary_candidates(
+                expansion.base, [row for row in rows if row["id"] in original_ids], split="validation",
+            )
+            original_aggregate = original_report["aggregate"]
         aggregate = report["aggregate"]
         result.samples = len(rows)
         metrics: dict[str, Any] = {
             "split": split,
             "cases": len(rows),
             "candidate_depth": CANDIDATE_LIMIT,
-            "truth_sha256": hashlib.sha256(payload).hexdigest(),
+            "truth_sha256": truth_sha256,
             **{k: (round(v, 4) if isinstance(v, float) else v) for k, v in aggregate.items()},
             "receipt_resolution_rate": (resolution_ok / resolution_checked) if resolution_checked else None,
             "receipt_resolution_checks": resolution_checked,
         }
+        if original_aggregate is not None:
+            metrics.update({
+                f"original.{key}": round(value, 4) if isinstance(value, float) else value
+                for key, value in original_aggregate.items()
+            })
+            metrics["original.cases"] = original_aggregate["queries"]
+            metrics.update({f"truth_expansion.{key}": value for key, value in expansion.pins.items()})
         if fusion_diagnostics is not None:
             metrics["fusion.mode"] = fusion_diagnostics["mode"]
             metrics["fusion.alphas"] = fusion_diagnostics["alphas"]
@@ -236,17 +285,11 @@ class TruthBoundaryProbe:
         result.metrics = metrics
         result.notes.append("negative_false_hit_rate is reported, not gated: recall_search is a hint engine and abstention belongs to the calling agent")
         result.notes.append("boundary_recall@50 is reported at candidate_depth 50, not gated; boundary_recall@20 stays the gate")
-        result.gates = [
-            # H2-e: raised to the levels the validation split reached on
-            # 2026-09-15 (0.7083 / 0.5674) minus one boundary of noise; the
-            # H2 targets (0.75 / 0.50) stay the goal for recall.
-            Gate("boundary_recall@20", ">=", 0.66).evaluate(aggregate.get("boundary_recall@20")),
-            Gate("boundary_mrr", ">=", 0.5).evaluate(aggregate.get("boundary_mrr")),
-            Gate("authorization_violation_rate", "==", 0.0).evaluate(aggregate.get("authorization_violation_rate")),
-            Gate("backend_error_rate", "<=", 0.02).evaluate(aggregate.get("backend_error_rate")),
-            Gate("latency_p95_ms", "<=", 5000.0).evaluate(aggregate.get("latency_p95_ms")),
-        ]
-        if aggregate.get("backend_error_rate", 0) >= 0.5:
+        result.gates = _accuracy_gates(aggregate)
+        if original_aggregate is not None:
+            result.gates.extend(_accuracy_gates(original_aggregate, "original."))
+            result.notes.append("original.* independently scores the unchanged original validation panel from the same search calls; both panels must pass the existing gates")
+        if aggregate.get("backend_error_rate", 0) >= 0.5 or (original_aggregate is not None and original_aggregate.get("backend_error_rate", 0) >= 0.5):
             result.status = "failed"
         elif any(g.passed is False for g in result.gates):
             result.status = "degraded"

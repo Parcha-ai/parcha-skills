@@ -23,6 +23,7 @@ from .mcp_client import McpClient, load_profile
 from .model import DIMENSIONS, SCHEMA_VERSION, ProbeResult, dimension_status
 from .probes import ProbeContext, timed
 from .render import render_html
+from .truth import load_truth_expansion
 
 PROBES: dict[str, Any] = {
     "availability": [AvailabilityProbe],
@@ -106,7 +107,7 @@ def history_row(card: dict[str, Any]) -> dict[str, Any]:
         "availability.endpoints": ["mcp_ping_p95_ms", "readyz_success_rate"],
         "latency.tools": ["recall_search.p95_ms", "recall_scan.p95_ms", "recall_exec.p95_ms", "error_rate"],
         "latency.search_stages": ["server_p95_ms", "dense_ok_rate", "deadline_exceeded_rate", "arm.dense.p50_ms", "arm.passage_lexical.p50_ms", "arm.sparse_exact.p50_ms"],
-        "accuracy.truth_boundary": ["boundary_recall@20", "boundary_mrr", "negative_false_hit_rate", "search.plane"],
+        "accuracy.truth_boundary": ["boundary_recall@20", "boundary_mrr", "negative_false_hit_rate", "search.plane", "original.boundary_recall@20", "original.boundary_mrr", "original.negative_false_hit_rate", "original.backend_error_rate", "original.latency_p95_ms", "truth_expansion.manifest_sha256"],
         "freshness.source_age": ["newest_age_hours_min", "newest_age_hours_median", "projection_pending"],
         "freshness.projection_churn": ["passages_written_24h", "documents_projected_24h", "passages_unembedded", "embedding_lag_ratio"],
         "freshness.embedding_lag": ["passages_unembedded", "embedded_today", "cap_remaining"],
@@ -141,6 +142,9 @@ def load_history(path: Path, *, limit: int = 60) -> list[dict[str, Any]]:
 
 def run_card(args: argparse.Namespace) -> dict[str, Any]:
     started = time.time()
+    # Preflight before every probe, including availability/latency that run first.
+    expansion_path = getattr(args, "truth_expansion", None)
+    expansion = load_truth_expansion(expansion_path, split=args.truth_split) if expansion_path else None
     base, token = load_profile(url=args.url, token_file=args.token_file)
     client = McpClient(base, token, timeout_seconds=args.timeout)
     repo_root = Path(args.repo_root).resolve()
@@ -160,6 +164,8 @@ def run_card(args: argparse.Namespace) -> dict[str, Any]:
         "forget_probe": bool(args.forget_probe),
         "metrics_token_file": args.metrics_token_file,
     }
+    if expansion is not None:
+        options.update({"truth_expansion_path": expansion_path, "_truth_expansion": expansion})
     if args.queries:
         queries_path = Path(args.queries).expanduser()
         options["queries"] = [line.strip() for line in queries_path.read_text().splitlines() if line.strip()]
@@ -195,7 +201,9 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--metrics-token-file", help="mode-0600 JSON {\"token\": ...} with the metrics scope, for probes that read /metrics (default: RECALL_METRICS_TOKEN_FILE)")
     run.add_argument("--output-dir", required=True)
     run.add_argument("--private-dir", help="owner-only directory for per-case rankings (outside git)")
-    run.add_argument("--truth", help="owner-private agentic truth JSONL (60 approved cases)")
+    truth = run.add_mutually_exclusive_group()
+    truth.add_argument("--truth", help="owner-private agentic truth JSONL (60 approved cases)")
+    truth.add_argument("--truth-expansion", help="private pinned expansion manifest; validation-only, with independent original-panel gates")
     run.add_argument("--truth-split", default="validation", choices=("optimize", "validation", "test", "all"))
     run.add_argument("--synthetic-report", help="path to a recall.retrieval-eval.v1 report to surface")
     run.add_argument("--queries", help="text file, one latency query per line (default: built-in generic set)")

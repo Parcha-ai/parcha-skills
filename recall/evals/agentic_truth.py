@@ -146,13 +146,37 @@ def _validate_cases(
 ) -> dict[str, Any]:
     if not isinstance(cases, list) or len(cases) != 60:
         raise EvaluationInputError("agentic truth set must contain exactly 60 cases")
+    receipt = _validate_case_rows(cases, require_owner_approval=require_owner_approval)
+    if receipt["split_counts"] != SPLIT_COUNTS:
+        raise EvaluationInputError("agentic truth split counts are invalid")
+    if receipt["stratum_counts"] != {stratum: 12 for stratum in STRATA}:
+        raise EvaluationInputError("agentic truth stratum counts are invalid")
+    if receipt["intent_counts"] != {intent: 12 for intent in INTENTS}:
+        raise EvaluationInputError("agentic truth intent counts are invalid")
+    matrix = Counter((case["stratum"], case["split"]) for case in cases)
+    if any(
+        matrix[(stratum, split)] != expected
+        for stratum in STRATA
+        for split, expected in STRATUM_SPLIT_COUNTS.items()
+    ):
+        raise EvaluationInputError("agentic truth split is not stratified")
+    return receipt
+
+
+def _validate_case_rows(
+    cases: list[dict[str, Any]],
+    *,
+    require_owner_approval: bool = True,
+) -> dict[str, Any]:
+    """Validate shared row contracts without imposing frozen-set quotas."""
+    if not isinstance(cases, list):
+        raise EvaluationInputError("agentic truth cases must be a list")
     ids: set[str] = set()
     questions: set[str] = set()
     boundary_splits: dict[tuple[str, str], str] = {}
     split_counts: Counter[str] = Counter()
     stratum_counts: Counter[str] = Counter()
     intent_counts: Counter[str] = Counter()
-    matrix: Counter[tuple[str, str]] = Counter()
     answerable_cases = 0
     insufficient_cases = 0
     approved_cases = 0
@@ -198,7 +222,6 @@ def _validate_cases(
         split_counts[split] += 1
         stratum_counts[stratum] += 1
         intent_counts[intent] += 1
-        matrix[(stratum, split)] += 1
 
         review = case["owner_review"]
         if (
@@ -285,18 +308,6 @@ def _validate_cases(
             fact_ids.add(fact["id"])
             fact_count += 1
 
-    if dict(split_counts) != SPLIT_COUNTS:
-        raise EvaluationInputError("agentic truth split counts are invalid")
-    if dict(stratum_counts) != {stratum: 12 for stratum in STRATA}:
-        raise EvaluationInputError("agentic truth stratum counts are invalid")
-    if dict(intent_counts) != {intent: 12 for intent in INTENTS}:
-        raise EvaluationInputError("agentic truth intent counts are invalid")
-    if any(
-        matrix[(stratum, split)] != expected
-        for stratum in STRATA
-        for split, expected in STRATUM_SPLIT_COUNTS.items()
-    ):
-        raise EvaluationInputError("agentic truth split is not stratified")
     return {
         "case_count": len(cases),
         "split_counts": dict(sorted(split_counts.items())),
@@ -576,6 +587,17 @@ def score_boundary_candidates(
     split: str | None = None,
 ) -> dict[str, Any]:
     _validate_cases(cases)
+    return _score_validated_cases(cases, results, split=split)
+
+
+def _score_validated_cases(
+    cases: list[dict[str, Any]],
+    results: list[dict[str, Any]],
+    *,
+    split: str | None = None,
+    schema_version: str = SCHEMA_VERSION,
+) -> dict[str, Any]:
+    """Score validated cases, retaining strict result and diagnostic checks."""
     if split is not None:
         if split not in SPLIT_COUNTS:
             raise EvaluationInputError("boundary scoring split is invalid")
@@ -714,7 +736,7 @@ def score_boundary_candidates(
         by_stratum[row["stratum"]].append(row)
         by_split[row["split"]].append(row)
     report = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": schema_version,
         "aggregate": _aggregate(rows),
         "strata": {
             key: _aggregate(value)
