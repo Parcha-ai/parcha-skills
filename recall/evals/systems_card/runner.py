@@ -11,6 +11,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+from ..boundary_identity import protected_family_ids
+from ..candidate_capture import CandidateCapture
+from ..retrieval import EvaluationInputError
 from .accuracy import SyntheticSuiteProbe, TruthBoundaryProbe
 from .availability import AvailabilityProbe
 from .churn import ProjectionChurnProbe
@@ -145,6 +148,22 @@ def run_card(args: argparse.Namespace) -> dict[str, Any]:
     # Preflight before every probe, including availability/latency that run first.
     expansion_path = getattr(args, "truth_expansion", None)
     expansion = load_truth_expansion(expansion_path, split=args.truth_split) if expansion_path else None
+    capture = None
+    if getattr(args, "capture_candidate_evidence", False):
+        if expansion is None or not args.private_dir or (args.dimensions and "accuracy" not in args.dimensions.split(",")):
+            raise EvaluationInputError("candidate capture requires private-dir, truth-expansion and accuracy")
+        by_boundary = {(r["source_id"], r["logical_document_id"]): r["family_id"] for r in expansion.families}
+        memberships: dict[str, set[str]] = {}
+        for case in expansion.base + expansion.additions:
+            for boundary in case["gold_boundaries"]:
+                family = by_boundary[(boundary["source_id"], boundary["logical_document_id"])]
+                memberships.setdefault(family, set()).add(case["split"])
+        capture = CandidateCapture(
+            Path(args.private_dir).expanduser() / ("candidate-evidence-" + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())),
+            client_factory=lambda: McpClient(base, token, timeout_seconds=30),
+            protected_families=set(protected_family_ids(memberships)),
+            max_calls=250 * sum(c["split"] == "validation" for c in expansion.base + expansion.additions),
+        )
     base, token = load_profile(url=args.url, token_file=args.token_file)
     client = McpClient(base, token, timeout_seconds=args.timeout)
     repo_root = Path(args.repo_root).resolve()
@@ -166,6 +185,8 @@ def run_card(args: argparse.Namespace) -> dict[str, Any]:
     }
     if expansion is not None:
         options.update({"truth_expansion_path": expansion_path, "_truth_expansion": expansion})
+    if capture is not None:
+        options["_candidate_capture"] = capture
     if args.queries:
         queries_path = Path(args.queries).expanduser()
         options["queries"] = [line.strip() for line in queries_path.read_text().splitlines() if line.strip()]
@@ -201,6 +222,7 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--metrics-token-file", help="mode-0600 JSON {\"token\": ...} with the metrics scope, for probes that read /metrics (default: RECALL_METRICS_TOKEN_FILE)")
     run.add_argument("--output-dir", required=True)
     run.add_argument("--private-dir", help="owner-only directory for per-case rankings (outside git)")
+    run.add_argument("--capture-candidate-evidence", action="store_true", help="freeze private selected-passage evidence after accuracy searches; requires private-dir and truth-expansion")
     truth = run.add_mutually_exclusive_group()
     truth.add_argument("--truth", help="owner-private agentic truth JSONL (60 approved cases)")
     truth.add_argument("--truth-expansion", help="private pinned expansion manifest; validation-only, with independent original-panel gates")

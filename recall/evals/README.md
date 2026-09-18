@@ -331,3 +331,43 @@ can overlap. Standard output contains only aggregate counts, hashes, Brier score
 and a fixed 0.5 confusion matrix. Related candidate documents and selected questions
 are correlated: this diagnostic does not establish population calibration, retrieval
 improvement, or a deployment threshold.
+
+### Capture selected evidence when freezing a search pool
+
+The accuracy probe can opt in to private evidence capture immediately after each
+search, before later projection changes make the pinned source unavailable:
+
+```bash
+PYTHONPATH=recall python -m evals.systems_card run \
+  --dimensions accuracy --truth-expansion "$RECALL_PRIVATE_EVAL_DIR/expansion.json" \
+  --private-dir "$RECALL_PRIVATE_EVAL_DIR" --capture-candidate-evidence \
+  --output-dir "$RECALL_CARD_DIR"
+```
+
+The private directory must already exist, be owner-only and stay outside Git.
+The expansion must use canonical hashed native families. Capture uses at most four
+workers, 30 seconds per source call, no retries, and a run budget of 250 source
+calls per selected validation question. It makes no model calls. Capture duration
+is separate from measured search latency; interleaved reads can still affect the
+live service, so this is an explicit diagnostic run, not a normal latency sample.
+
+Every actual returned slot remains in the new `candidate-evidence-*` directory.
+For the first two matching ranges, a manifest-pinned metadata pass establishes
+native family identity before a separate visible-text pass. Protected, unresolved,
+missing-metadata, advanced-manifest and failed reads retain their status without
+substituting newer text. Complete evidence requires verified source parts, exact
+spans and receipts, closed pagination, and agreement with the original search
+prefix. The passages are joined by one newline with Unicode character offsets,
+UTF-8 source spans and text hashes. Completeness applies only to those selected
+passages, never the complete document or session.
+
+Search receipts pin the raw result hash and preserve selected-range metadata;
+they omit snippet prose until its source family is eligible. Per-call and
+per-candidate receipts survive interruptions. `manifest.json` is written only by
+successful finalization; its presence means capture finished, not that every slot
+was available. See `summary.json` and candidate statuses for actual coverage.
+
+For a separately frozen bounded batch, `CandidateCapture(output, client_factory=...,
+protected_families=set_of_hashes, max_calls=...)` provides the same
+`capture_case(case_id, query, search_result, search_error=...)` and `finish()` API.
+It does not approve labels, change truth, or change systems-card scoring.
