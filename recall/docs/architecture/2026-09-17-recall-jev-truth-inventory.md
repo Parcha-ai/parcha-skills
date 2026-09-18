@@ -1,202 +1,142 @@
-# Jev W5: private truth and review readiness
+# Jev W5: delegated source review and validation expansion
 
-2026-09-17. The owner can now review 28 source-backed question proposals. Together
-with 12 approved answerable validation questions, they give 40 distinct question and
-known native-family groups. **This is preparation, not an approved truth expansion,
-proof of semantic independence, or a retrieval-quality result.** The frozen truth,
-strict boundary scorer, and systems-card accuracy probe are unchanged.
+Updated September 18, 2026. The owner explicitly assigned review and approval to
+Codex. Decisions are recorded as **owner-delegated agent review**, not human review
+and not approval by Jev. The original 60-case benchmark remains byte-for-byte unchanged.
+The expansion is private and separately versioned; production retrieval is unchanged.
 
-## Review the questions first
+## Review decisions
 
-The owner-private directory is `~/.recall/evals/jev-w5-20260917/`. The current focused
-packet is **`owner-review-noul-v1.html`**: the same 28 pending question cards and source
-excerpts, with unapproved Jev relevance proposals and an escaped appendix showing both
-raw relevance and source-support probabilities in the original question order. The
-15-case frozen reference panel remains collapsed. The original
-`owner-review-questions-v2.html` is preserved byte-for-byte.
+The original 28-card packet required substantive review, not a bulk acceptance:
 
-Ten questions come from a historical curator pool; eighteen were drafted by this
-assistant from centrally opened evidence. Jev supplied probability proposals, not the
-questions or human approvals.
+- Eighteen proposals are supported within their reviewed scope: nine retained as
+  written and nine corrected. Corrections separate recorded findings from current
+  behavior, proposed work from completed work, and primary evidence from copied
+  conversations or compaction summaries.
+- Ten historical proposals are excluded from validation. Their child documents had
+  distinct IDs, but their actual parent sessions overlap the frozen optimize/test
+  splits. Native parent IDs, not child-document uniqueness, determine this exclusion.
+- One evidence row incorrectly copied a passage spanning two chunks under both
+  receipts. The reviewed evidence now attributes each portion to its actual chunk;
+  one fact's unsupported second receipt was removed.
+- Ten replacement questions were independently reviewed and approved. Their evidence
+  comes from ten distinct native parents outside the frozen set and the eighteen
+  retained additions. All thirty facts have exact source witnesses; no exact semantic
+  question duplicate was found.
 
-Current private inputs and audit receipts:
+The lead independently checked 113 quotation witnesses against exact source receipts
+and file hashes: eighty for the retained eighteen cases and thirty-three for the ten
+replacements. Two cases are accepted only as
+explicitly attributed accounts of secondary records; their underlying implementation
+claims are not independently established.
 
-- `question-proposals-v3.jsonl`, `candidate-evidence-v4.jsonl`, and
-  `native-families-v3.jsonl` reproduce the original question packet. The new
-  `candidate-evidence-v5.jsonl` preserves every source byte and receipt association;
-  only the previously empty probability proposal field changes.
-- `w5-noul-requests-v1.jsonl`, `w5-noul-answers-v1.jsonl`, and
-  `w5-noul-proposals-v1.jsonl` retain the exact independent-question contract, typed
-  answers, model, input/source digests, question provenance, and pending status.
-  `w5-noul-run-report-v1.json` and `w5-noul-receipt-v1.json` record counts and usage
-  without source text. `python3 w5_noul.py render --output-dir <new-private-directory>`
-  reproduces the new packet offline; it does not repeat inference.
-- `assistant-question-provenance-v2.jsonl` records the eighteen assistant drafts and
-  source digests. Two rely on a copied conversation or compaction summary; their
-  underlying claims need explicit confirmation during review.
-- `semantic-question-audit.json` records the removed semantic duplicate and three
-  related-work groups that still need owner independence review.
-- `preparation-v4-receipt.json` records counts, input hashes, permission checks, and
-  unchanged-truth/protected-evidence checks. Source responses remain private in
-  `source-evidence/` and `new-question-evidence/`.
+The parent audit also found three existing native parents spanning splits inside the
+frozen benchmark. Those historical rows are preserved for comparison, and the limit
+is disclosed. This expansion does not retroactively certify the old test split as
+independent. Related workstreams are recorded separately because unique session IDs
+alone cannot establish semantic or statistical independence.
 
-`candidate-pool-review-v2.html` is a separate preparation artifact for later candidate
-label review. It contains 785 pooled candidates, 757 without attached source excerpts,
-and 527 distinct candidate boundaries with unresolved native families. Its family
-audit correctly reports **incomplete**. Twelve protected-family candidate appearances
-were withheld. Those unfinished rows are absent from the focused question packet.
+## Private artifacts
 
-## Inventory and coverage limits
+The freeze now contains 28 approved additions: **43 validation cases, 40 answerable
+and three insufficient**. The full versioned corpus contains 88 cases; optimize and
+test remain the original twenty-five and twenty cases. No Jev probability became an
+approval.
 
-The approved manifest hash remains
+Owner-private directory:
+`~/.recall/evals/jev-w5-20260917/delegated-review-20260917/`.
+
+- `review-a.json`, `review-b.json`, and `review-c.json` contain per-fact source
+  witnesses, corrections, scope limits, and reviewer provenance.
+- `review-decisions-v1.jsonl` records all approvals/corrections and ten evaluation
+  exclusions; `review-decisions-v1.html` makes approved questions, facts, source text
+  and scope limits readable. `replacement-review-v2.json` holds the independent
+  replacement audit.
+- `freeze-v1.json` pins the base, additions, complete family mapping, approval ledger,
+  source reviews, and readable packet. `approved-additions-v1.jsonl` is the expansion;
+  `expanded-truth-v1.jsonl` includes the unchanged original sixty cases.
+- `native-parent-audit-v2.json` and `parent-resolution.json` retain metadata-only
+  lineage evidence. All previously unresolved frozen receipts were resolved using
+  the configured central Recall service; held-out question text was not inspected.
+- `replacement-source-independence-v1.json` independently verifies replacement
+  lineage against the complete base plus retained additions, and records related
+  workstream cautions.
+
+Source files, previous proposal packets and model outputs remain unchanged. Files
+are mode 0600, directories 0700, outside Git. The raw frozen benchmark hash remains
 `a186b261deb9e23abd5d74b0f9fb801c16b9f3715ffb8b8abf358edae4e5c4bc`.
 
-| Split/status | Questions | Answerable | Insufficient |
-| --- | ---: | ---: | ---: |
-| Approved optimize | 25 | 20 | 5 |
-| Approved validation | 15 | 12 | 3 |
-| Approved test | 20 | 16 | 4 |
-| Pending validation proposals | 28 | 28 | 0 |
+## Verifier boundary
 
-There are 77 saved systems-card candidate files: 74 validation and three optimize.
-They hold candidate identities and scores, without source passages. Repeated retrievals
-and July reader-smoke subsets do not increase independent question coverage. Three
-older 50-question receipt holdouts use another schema and lack explicit split/family
-assignments; their raw counts are not added to validation.
+The verifier change is isolated in [#615](https://github.com/Parcha-ai/parcha-skills/pull/615),
+separate from the Jev client/candidate work. The legacy v2 API still requires exactly
+60 cases, its original balanced splits and strata, approved labels, and strict result
+contracts. An explicit expansion API requires the pinned base plus approved,
+validation-only answerable additions and a complete reviewed family mapping. An
+addition cannot share a family with any frozen case or another addition.
 
-Two historical 180-row curation pools initially yielded eleven unused accepted
-proposals after excluding frozen truth documents. The second pool added no further
-accepted unused document. Central Recall opened their seventeen unique source
-receipts; curator acceptance was never treated as owner approval.
+The APIs share the existing metric calculations. The lead compared the complete real
+15-query baseline report against the pre-change scorer and found exact equality.
+The initial eighteen additions and 78 mapped boundaries also passed the new validator.
+Twenty-seven truth tests and fifty systems-card tests passed; full CI and secret
+scanning passed on `f243976`. No candidate code, acceptance threshold, dependency, or
+production behavior changed in that PR.
 
-A manual comparison with the approved validation answers then found one semantic
-duplicate despite distinct native session IDs. That proposal was removed and replaced
-with a new, centrally opened two-turn decision history. The audit compared the twelve
-approved answerable validation cases with the pending proposals; it did not inspect
-held-out question text. No other exact answer duplicate was observed. Related AML
-investigations, skill-hydration work, and QA-hub work remain explicit grouping questions
-for the owner. Native-session uniqueness cannot certify semantic independence.
+The family map is a reviewed lineage assertion supplied by the caller. The validator
+checks its completeness and consistency; it cannot infer whether a caller supplied
+truthful lineage. Raw artifact hashes, canonical base hashes, source witnesses, and
+reviewer decisions therefore travel together in the private freeze receipt.
 
-The eighteen new assistant drafts use source records dated August 13–September 17,
-from seven source IDs associated with all six configured contributor groups. They span
-fifteen Claude and three Codex sessions, five intent categories, seventeen exact-document
-questions and one bounded timeline. The final 28 proposals comprise thirteen decision
-rationale, eight incident root cause, three project status, two change history, and two
-ownership/next-step questions. They still cover only coding history: explicit searches
-for other source families returned no candidates, and no new cross-source question
-was fabricated. The ten retained historical proposals remain concentrated in May–July.
+## Expanded baseline measurement
 
-All 88 frozen/proposed gold document boundaries have centrally resolved native session
-metadata. No proposed boundary overlaps a frozen family or another proposed family.
-The focused packet has 28 cards with evidence and 36 excerpt associations. The fifteen
-frozen reference candidates have no newly attached excerpts. There are now 28 unapproved
-model relevance proposals and 28 unapproved joint-support proposals, with zero new owner
-approvals. Source availability does not establish that every proposed answer is correct;
-two secondary-record sources need extra care.
+Two sequential passes ran the same frozen forty-three validation questions through
+existing production search, with fifty candidates and 256-character snippets. Every
+case and all three negatives were retained, with zero backend errors. Both passes
+measured recall@20 **0.9625**, recall@5 **0.8000**, and MRR **0.68423**. Client latency
+p50 was **1,371 / 1,355 ms** and p95 **1,859 / 1,634 ms**.
 
-**The approved gap is still 28 answerable questions.** If all proposals pass source,
-usefulness, and independence review, the nominal forty-question target is covered.
-If related questions must be grouped or any proposal is rejected, collect replacements.
-Forty is a minimum sampling target, not a promise that MRR noise will fall below 0.02.
+The original fifteen-case panel still measures MRR **0.54246** in both passes; the
+added twenty-eight measure **0.74498**. Independent direct-rank recalculation confirms
+the weighted overall result. These are baseline measurements on a different question
+mix, not retrieval improvement. The forty answerable cases form thirty-nine native-parent
+components. Per-case reciprocal ranks were identical across these two passes; paired
+cluster resampling therefore reports a zero observed difference and a degenerate
+zero interval. That does not establish future run stability, low sampling uncertainty,
+three accepted nightlies, or sensitivity to a small candidate improvement.
 
-## Bounded Noul proposal pass
+The adapter marks returned candidates as authorized with valid pointers; those fields
+are assumptions in this run, not separate authorization/pointer audits. All three
+insufficient cases returned candidates, so the reported false-hit rate is 1.0; it means
+any search hit, not a judged wrong final answer. Search remains an evidence-hint tool.
+Exact captured responses, score rows, freeze identity, and accounting remain private
+under `baseline-v1/`. A separate manifest binds ninety-four files, including all
+eighty-six responses, score rows, reports, interpretation, capture script and freeze.
 
-One pass asked two independent Nouls per pending card: whether the supplied excerpts
-contain a specific fact relevant to the question, and whether they support every
-material proposed fact as an account of what the source records. The latter judges
-63 proposed facts jointly within their 28 cards; it neither locates an individual
-unsupported assertion nor verifies external truth. Only these already sourced pending
-cards went to Jev. No retrieval, frozen reference questions, or held-out content was sent.
+## Historical Noul pass and limits
 
-All 28 sequential requests returned valid answers: 56 Nouls, no transport/schema errors,
-no retries, and a 10-second deadline per request. Model: `jev-1.13.0`, through the local
-broker. Request p50 was 508.451 ms and p95 734.308 ms. This is one bounded review pass,
-not production latency evidence or a repeated quality measurement.
+Before delegated review, one bounded pass produced 56 valid Noul answers for the
+original 28 proposals, with no retries or transport/schema errors. Request p95 was
+734 ms; observed input usage was 52,125 tokens, about $0.00219 at the configured rate.
+This was an input-only estimate, not reconciled provider billing. Broker passthrough
+billing remains unmetered.
 
-Observed usage was 52,125 input and 1,260 output tokens, with zero unknown-usage requests.
-The conservative input reservation was 338,016 tokens against a 500,000-token cap.
-At the configured $0.042 per million input tokens, observed input usage estimates
-$0.00218925. Output charges and actual billing are not established by this estimate;
-the LiteLLM pass-through remains unmetered and provider billing needs reconciliation.
+Relevance probabilities were 0.90–0.99 and joint fact-support probabilities 0.65–0.96.
+Every answer leaned yes. The pass did not establish calibration or discrimination of
+unsupported claims. Those probabilities were not used to approve the corrected
+questions, and they must not be carried forward as if they describe revised inputs.
+The old `owner-review-noul-v1.html` is a preserved proposal artifact, not the current
+approval ledger.
 
-Relevance probabilities ranged from **0.90–0.99**; support for all proposed facts ranged
-from **0.65–0.96**. Every answer leaned yes. This pass produced no clear negative signal
-and does not demonstrate calibration, correctness, or useful negative discrimination.
-The weaker support cases provide a place for human inspection, not an automatic verdict.
-A manual source comparison identified one draft whose cancellation wording should
-distinguish a recorded row state from its error message. The private
-`w5-noul-review-observations-v1.json` records that concern as an assistant source audit,
-separately from Jev's probabilities; no fact or label was corrected or approved
-automatically. Two of the weakest support scores concern excerpts that
-largely repeat their proposed claims, which also limits what the score spread proves.
+The larger 785-candidate pool remains a separate incomplete preparation artifact:
+757 candidates lack attached source excerpts and 527 candidate boundaries lack resolved
+families. It is not an approved relevance set. Expanded per-candidate relevance labels,
+negative-class calibration, and repeated systems-card evidence remain W5 work.
 
-No thresholds, question/candidate sorting, or approval actions were applied. The new
-packet and its three generated JSON/JSONL artifacts regenerated byte-identically from
-the saved answers, without another model call. All 36 source associations, original
-question/proposal inputs, original packet, approved truth, and strict scorer stayed
-unchanged. Four private fake-client checks cover capture identity, no retry on failure,
-unavailable answers, source preservation, and escaped deterministic output. The 31
-existing tool/truth tests still pass.
+## Phase check
 
-## Small offline boundary
-
-`evals/judgments_review.py` unions saved candidates with known gold, preserves source
-receipts, and renders a private static packet. It reuses existing case/boundary
-validation, receipt identity, and private-file guards. There are no model/network calls,
-approval action, new service, or scorer fork. The existing `build_owner_review_packet`
-requires the complete 60-case truth schema and does not accept these evidence/label
-proposals, so that established function remains unchanged.
-
-Optimize/test normalized receipt identities and known families are withheld. Known
-frozen receipt/document associations are checked even when revisions or fragments
-change. New drafts and attached evidence fail closed when required native families
-are unresolved. Completeness covers all frozen reference and rendered candidate
-boundaries; unknown candidate identities can be inventoried but are not vetted source
-material. Novel receipt associations are explicitly marked `supplied-unverified`:
-an offline renderer cannot prove that supplied text belongs to a newly supplied receipt.
-
-All inputs and outputs must be owner-private and outside Git. Files are mode 0600,
-directories 0700, and symlink inputs are rejected. Summaries contain counts and hashes,
-never question/source text. Real packet checks found no protected document or receipt
-identity leakage, and the original approved manifest bytes are unchanged.
-
-From the repository root, create a fresh focused packet with:
-
-```sh
-PYTHONPATH=recall python3 -m evals.judgments_review \
-  --truth "$HOME/.recall-cascade/agentic-map-reduce-20260727/employee-truth-v2-approved.jsonl" \
-  --questions "$HOME/.recall/evals/jev-w5-20260917/question-proposals-v3.jsonl" \
-  --labels "$HOME/.recall/evals/jev-w5-20260917/candidate-evidence-v4.jsonl" \
-  --families "$HOME/.recall/evals/jev-w5-20260917/native-families-v3.jsonl" \
-  --output "$HOME/.recall/evals/jev-w5-20260917/new-question-review.html"
-```
-
-The output must be a new path. To inspect the full candidate pool, pass the saved
-September 16 09:30 and September 17 06:14 validation files through `--results`.
-Model probability proposals must match pooled identities and
-revisions; they remain proposals. Record owner corrections and decisions separately.
-
-## Validation, remaining work, and phase check
-
-Test-first development began with the absent module. Seventeen tool tests and fourteen
-existing truth tests pass (31 total). Independent review reproduced two held-out receipt
-bypasses and an overclaimed family audit before the fixes; regression tests now cover
-label and proposed-gold laundering, revision/fragment variations, wrong document
-associations, unresolved families, private paths, HTML escaping, candidate unioning,
-nonfinite labels, pending status, duplicate grouping, and unchanged truth bytes. The
-independent reviewer reran the exploits and cleared the offline preparation code 5/5.
-
-The owner must review the 28 cards and related-work groups before anything becomes
-gold. The three existing insufficient validation cases remain; additional reviewed hard
-negatives and broader source/timeline coverage are still needed. Freeze a new manifest
-with split and family assignments before measuring a candidate. Expanded-manifest
-validation belongs in a separate verifier PR; this change does not relax the strict
-60-case scorer. W5 also needs paired repeatability/uncertainty evidence before exit.
-
-**Simplicity:** one offline tool and a focused review task; no permanent workflow or
-production dependency. **Power:** actual source evidence, gold outside retrieved pools,
-explicit uncertainty about independence, and two reusable typed probabilities per card.
-**Breakthrough:** a concrete measurement base for replacing brittle semantic heuristics;
-the Noul pass makes review inspectable but has not demonstrated better labels or retrieval.
-**Company-brain usefulness and speed:** the proposals exercise decisions, causes,
-changes, and next steps; production behavior and latency remain unchanged.
+**Simplicity:** one shared scorer, an explicit expansion boundary, and private review
+artifacts; no production service or dependency. **Power:** approvals now have exact
+source witnesses, corrected facts and parent-family checks. **Breakthrough:** better
+measurement foundations, with no claim of improved retrieval. **Speed:** production
+latency is unchanged. The current Jev search prototype still fails the measured W0
+quality/latency gates, so no ranker replacement or semantic deletion is earned.
