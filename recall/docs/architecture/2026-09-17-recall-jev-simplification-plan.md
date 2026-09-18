@@ -207,8 +207,10 @@ Rollback/deletion: discard the experiment; no production path has changed.
 
 Own the offline labeling/review path in `evals/agentic_truth.py` and systems-card
 instrumentation, in PRs separate from every candidate implementation. Label proposals
-may use Jev; a person approves them with the source evidence visible. Add genuinely
-independent questions from different sessions, people, sources, dates, and failure
+may use Jev; the owner or explicitly delegated reviewer approves them against source
+evidence. On September 18 the owner assigned this review to Codex; the ledger records
+agent review, not human review or model-probability approval. Add independent
+questions from different sessions, people, sources, dates, and failure
 types: at least 40 answerable validation questions, with held-out test cases and hard
 negatives. Fifty labels on each of the same twelve questions do not create forty cases.
 
@@ -337,9 +339,10 @@ Two supporting cleanups are justified independently of Jev:
 
 The first implementation deliverable now includes a successful broker contract fixture,
 frozen W0 measurements, and a W5 review packet. W0's key/routing blocker is resolved.
-The current search prototype does not earn activation or deletion. W5 label proposals
-can proceed offline; a person still approves truth, and W4 ingest activation still
-requires the user's data-sharing decision.
+The current search prototype does not earn activation or deletion. W5 source review
+now has explicit owner delegation to Codex. Twenty-eight reviewed additions are frozen,
+growing validation to forty answerable cases plus three existing insufficient cases.
+W4 ingest activation still requires the user's data-sharing decision.
 
 ### W0 measured decision, September 17
 
@@ -410,8 +413,9 @@ and both variant reports. No source text or private labels are committed.
 **Phase check:** simplicity improves in the client (four fewer production lines and
 zero dependencies); successful typed answers establish usable plumbing. The current
 ranking result fails the power/breakthrough check, and all measured shapes fail their
-proposed tail-latency budgets. Keep the existing ranker. W5 source review and calibration
-come next; date correctness, Render access, and complete search latency remain
+proposed tail-latency budgets. Keep the existing ranker. W5 source review is now
+complete under owner delegation; calibration remains unproven. Date correctness,
+Render access, and complete search latency remain
 unproven gates before any later activation. No semantic deletion has been earned.
 
 Routing history: final [parcha #8649](https://github.com/Parcha-ai/parcha/pull/8649)
@@ -438,3 +442,37 @@ from `recall/`, the relevant fresh-Postgres e2e scripts in
 candidate. The original documentation-only planning pass ran no application tests;
 subsequent implementation checks and their exact PRs are recorded in H6. Passing
 those checks does not establish Jev quality.
+
+### W5 delegated review, September 18
+
+The owner assigned source review and approval to Codex. The review corrected nine
+of eighteen retained proposals, excluded ten whose native parent sessions overlap
+frozen optimize/test sources, and independently reviewed ten replacements. The
+reviewed expansion has 28 additions: 43 validation cases, 40 answerable and three
+insufficient. The original 60-case file remains byte-for-byte unchanged. Source
+quotes and hashes support each approval; prior Jev probabilities did not approve
+or relabel corrected inputs.
+
+The new [verifier PR #615](https://github.com/Parcha-ai/parcha-skills/pull/615) keeps
+v2's strict 60-case contract and shares its metric math with an explicit pinned
+expansion API. Parent-family overlap with any old case or another addition fails
+validation. Full CI passed; the complete old 15-query report is unchanged under the
+refactor. The old benchmark itself contains three parent sessions spanning splits;
+those historical limitations are preserved and disclosed rather than silently fixed.
+
+The private freeze is
+`~/.recall/evals/jev-w5-20260917/delegated-review-20260917/freeze-v1.json`.
+The current approval ledger is `review-decisions-v1.jsonl`, with a readable
+`review-decisions-v1.html`. [W5 inventory #614](https://github.com/Parcha-ai/parcha-skills/pull/614)
+records the source audit, coverage limits, and expanded-baseline measurements.
+No candidate code or approved frozen-base content changed in the verifier PR.
+
+Two frozen expanded-baseline passes retained all forty-three cases without backend
+errors: recall@20 0.9625 and MRR 0.68423 in both. The original fifteen-case panel
+remained at MRR 0.54246; the twenty-eight additions measured 0.74498. The higher
+combined value reflects the changed question mix, not a candidate improvement.
+Client p95 was 1,859/1,634 ms. The forty positives form thirty-nine parent-session
+components; zero observed paired change across two runs does not establish future
+stability or calibrated candidate relevance. Full source and measurement receipts
+remain in the private freeze directory. Review is complete; a new permission request
+for a reviewer is not a prerequisite for continuing measurement.
