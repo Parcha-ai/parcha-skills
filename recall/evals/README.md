@@ -283,3 +283,51 @@ PYTHONPATH=recall:recall/server python -m evals.logical_corpus_audit \
   --concurrency 8 \
   --repo-root "$(git rev-parse --show-toplevel)"
 ```
+
+## Source-reviewed candidate diagnostics
+
+`evals.candidate_review` compares one frozen prediction pass with approved labels on
+selected passages. It is separate from boundary truth and never dispatches models,
+approves labels, updates gold, or selects a production threshold.
+
+Keep all four JSONL inputs in mode-0600 files under an owner-only directory outside git:
+
+```bash
+PYTHONPATH=recall python -m evals.candidate_review \
+  --evidence "$RECALL_PRIVATE_EVAL_DIR/evidence.jsonl" \
+  --reviews "$RECALL_PRIVATE_EVAL_DIR/reviews.jsonl" \
+  --predictions "$RECALL_PRIVATE_EVAL_DIR/predictions.jsonl" \
+  --protected-families "$RECALL_PRIVATE_EVAL_DIR/protected-families.jsonl" \
+  --expected-evidence-sha256 "$RECALL_CANDIDATE_POOL_SHA256"
+```
+
+The schemas are closed; every listed field is required:
+
+| Input | Row fields |
+| --- | --- |
+| Evidence | `id`, `case_id`, `question`, `source_id`, `logical_document_id`, `text`, `context` (object), `receipts` (nonempty list), `families` (list), `complete` (boolean) |
+| Review | `id`, `evidence_sha256`, `reviewer`, `label`, `rationale`, `witnesses` |
+| Prediction | `id`, `evidence_sha256`, `probability`, `error` |
+| Protected families | `family_id` |
+
+Freeze the ordered evidence list with `evidence_digest(evidence)` before review. Each
+review and prediction also pins its full individual evidence row with that function,
+including the question, source metadata in `context`, and provenance. Evidence text
+and context must match what the model saw. IDs identify unique candidates within a
+case; duplicate boundaries, unknown IDs, and stale pins are rejected.
+
+Labels are `answers_query`, `does_not_answer`, or `insufficient_evidence`. Each witness
+contains `start`, `end` (zero-based Unicode character offsets, end exclusive), `quote`,
+and `receipt`. Positive labels require a witness. The scorer checks exact text and
+receipt membership; the reviewer must attest that the receipt actually supports the
+quote and that source-family attribution is correct. A negative label applies only
+to the supplied passages, not an unseen full document.
+
+A prediction has a finite probability in [0, 1] and null error, or null probability
+and a nonempty error. Missing reviews and predictions stay in coverage. Protected
+families, unresolved lineage, incomplete evidence, ambiguous labels, and prediction
+failures are excluded from binary arithmetic and counted separately; coverage counts
+can overlap. Standard output contains only aggregate counts, hashes, Brier score,
+and a fixed 0.5 confusion matrix. Related candidate documents and selected questions
+are correlated: this diagnostic does not establish population calibration, retrieval
+improvement, or a deployment threshold.
