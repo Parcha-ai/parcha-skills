@@ -518,6 +518,17 @@ mixed Score/baseline MRR .53981 must not be presented as a complete Jev run or e
 of general parity. Selected token-window passages are neither complete sessions nor
 necessarily complete original turns. Input estimate: $0.01608, not reconciled billing.
 
+A source audit of the one remaining complete-case loss found two distinct issues.
+Jev highly ranks a Claude record about a different incident despite the query's Codex
+constraint: a clear scope-discrimination weakness. However, two high-ranked Codex
+continuations report the same root cause followed by code changes, while the frozen gold
+is an earlier audit checkpoint saying no source changes. The question asks what happened
+"in the end" without an audit-time cutoff. Eight exact source witnesses support a separate
+temporal-scope and alternative-boundary adjudication. Keep the original gold and every
+reported score unchanged; the whole loss cannot yet be attributed to model error. Future
+company-brain truth needs to distinguish historical checkpoint from eventual outcome.
+
+
 **The promising capability is checking a specific claim against supplied evidence.**
 An initial source-reviewed diagnostic got 14/16 labels correct on each of two runs,
 including one false positive and one false negative. The transfer test used the remaining

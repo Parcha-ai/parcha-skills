@@ -230,7 +230,9 @@ obsolete gateway draft #290 is closed in favor of #289. The tested W0 shapes do 
 justify activating synchronous Jev query reading or replacing ranking. The owner
 delegated W5 review to Codex; source review and the separately versioned verifier are
 complete. Two frozen baseline passes and the live opt-in expanded card agree; calibrated candidate
-labels and consecutive-night evidence remain measurement work. The original 60-case truth stays frozen. W1 production wiring has
+labels and consecutive-night evidence remain measurement work. A full-evidence case audit
+also found ambiguous audit-checkpoint versus eventual-outcome wording; its frozen gold
+and scores stay unchanged pending separate source-based adjudication. The original 60-case truth stays frozen. W1 production wiring has
 not started; no new reviewer permission is needed.
 
 ### H4: Memory layer (3 weeks)
