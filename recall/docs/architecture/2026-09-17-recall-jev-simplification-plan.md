@@ -681,3 +681,80 @@ replacement. Retain the more promising specific-claim support task as its own re
 
 Private capture, approvals, predeclared analysis policy and model receipts are under
 `~/.recall/jev-w5-resume-20260918/representative-capture-v2` and `representative-model-v1`.
+
+
+### W5 exact passage metadata: deployment and recovery
+
+Merged [#619](https://github.com/Parcha-ai/parcha-skills/pull/619) adds one bounded
+canonical metadata read for the exact selected passage IDs, revision and manifest.
+It uses existing tables, returns no source prose, and grants no citation authority.
+The evaluator then applies its existing family screening and verified source reads.
+Search response limits and ranking implementation remain unchanged. The metadata contract checks
+live tenant/source ownership, receipts, complete pagination and content hashes;
+stale, deleted or mismatched records fail closed.
+
+All 1,589 unit tests and fresh-PostgreSQL end-to-end checks passed, including the
+new metadata checks, and exact-head full CI succeeded (run 35309639278). Local and
+independent review scored 5/5; there were zero unresolved PR review threads.
+The MCP service alone deployed merge `481cb142` on September 18. Its preceding
+live revision was `64de873`; worker `67d281` was not restarted. The deployment
+contains no production judgment caller, migration, new provider key or ingest work.
+
+The same evaluator revision `ca0bc5f` and corrected truth freeze are used on both
+sides. Before deployment, 25 card gates passed and one tools-latency gate failed
+because a session-context call timed out. All ten accuracy gates passed: expanded
+MRR .68423 / recall@20 .9625, original .54246 / .875, zero authorization or backend
+errors, and five of five receipt checks. This failure predates the metadata deploy.
+Post-deployment, all 26 gates passed with identical expanded and original accuracy,
+zero authorization/backend errors and five of five receipt checks. Accuracy client
+p95 was 1,610 ms versus 1,544 ms before; no speed gain is claimed. The previous
+session-context timeout did not recur, which does not establish a causal improvement.
+Independent audit confirms all nonlatency accuracy metrics and truth pins match.
+Candidate lists differ on 20 of 43 live cases, so this is aggregate accuracy parity,
+not identical ranking output. Both runs disclose the same dirty evaluator checkout
+(including the untracked precap); the evaluator revision and runner hash are pinned.
+Exact recovery obtained 121 of the original 150 omitted-metadata bundles with
+834 source calls and no new searches or model calls. Four protected candidates were
+withheld before prose; 25 bundles remained unavailable. Independent reconstruction
+verified all metadata pages, source receipts, 3,321 spans and 1,919,232 text bytes.
+The original 131 complete bundles and all earlier freezes remain unchanged. Across
+the six-query pool, complete evidence is now available for 252 of 298 candidates;
+ten are protected and 36 unavailable. Capture coverage is not answer accuracy.
+
+All 121 recovered complete bundles were read under the unchanged broad-label policy:
+117 nonanswers and four partial/uncertain answers, with 147 source quotes mapping
+to 183 exact event-receipt witnesses. Root approved the labels after independent provenance checks and six malformed-input
+controls. The combined immutable pool has 252 approved reviews: four answers,
+208 nonanswers and 40 partial/uncertain; all prior 131 approvals remain unchanged.
+No new model calls were made. These additions improve coverage of unavailable and
+insufficient evidence; they add no complete-answer controls. A separately
+frozen exploratory dimension policy attempted to label incident/date applicability
+and generic requested facts independently. Root review rejected the proposed
+composition before any calls: scope can match one passage while unrelated facts
+come from another, and reviewers interpreted retained facet specificity differently.
+Those annotations and the rejected design are preserved, excluded from approved truth.
+
+The simpler next proposal asks one Choice per requested fact while retaining the full
+query's incident/date/version constraint in each question. Code requires every scoped
+fact to be present; partial information, absence, uncertain applicability and conflicts
+remain explicit. This preserves the relationship being judged and removes a detached
+global scope gate. It still needs newly approved labels and a frozen experiment.
+
+**Phase review:** simplicity improves through one authoritative metadata owner and
+reuse of existing capture; no second projector or larger search payload. Power improves
+in auditable source coverage across all six predeclared question types. No answer-quality
+breakthrough is claimed. Client p95 measured 1,544 ms before and 1,610 ms after; a single paired run
+does not establish a causal speed change. The existing Jev sufficiency and latency failures still bar production
+activation and semantic deletion.
+
+The next W5 step is positive and hard-partial coverage across additional question
+families, including evidence missed by the current selected-passage boundary, before
+claiming complete-answer recall or testing a production gate. More correlated
+nonanswers alone do not answer that question. Keep an exposed development panel
+separate from a genuinely unexposed transfer set, and do not turn the exploratory
+dimension annotations into gold by conversion.
+
+Private recovery receipts are under `~/.recall/jev-w5-resume-20260918/`:
+`representative-metadata-recovery-v1`, `recovered-source-approval-v1` and
+`representative-combined-source-v3`. The rejected composition and next scoped-fact
+proposal are preserved separately. No new Jev calls were needed for this phase.
