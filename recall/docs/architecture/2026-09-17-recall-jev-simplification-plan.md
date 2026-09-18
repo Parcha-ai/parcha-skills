@@ -13,6 +13,15 @@ an underspecified incident question; retain its old truth and scores and version
 clarification separately. [Candidate diagnostics #616](https://github.com/Parcha-ai/parcha-skills/pull/616)
 are offline only. The board records coverage, exclusions, and the next acceptance checks.
 
+**Availability checkpoint, September 18 evening:** the morning postdeploy card below
+is historical. Fresh source reads and public health/readiness returned 502. Render logs
+show PlanetScale `pg_readonly: cluster is read-only` errors during authentication's
+SELECT at 13:01 UTC, followed by failed readiness. One same-commit MCP-only restart
+created fresh processes, but readiness still returned 503 and public checks still
+returned 502 at 20:34 UTC. Current readiness exceptions are not exposed by the handler,
+so their exact cause remains unconfirmed. The worker and configuration were unchanged;
+availability recovery is separate unfinished work, not a Jev result.
+
 The follow-up family audit corrected two offline bookkeeping errors: seven replacement
 family hashes lost their namespace, and empty membership entries falsely excluded 93
 candidate slots. All 28 added native families are disjoint from the original 60 and
@@ -36,7 +45,8 @@ before predictions. The unchanged Jev contract made 123 successful calls (eight 
 skips). On 89 binary labels it produced TP4/TN82/FP3/FN0 at .5. Separately, 21 of 34 evaluated
 partial or uncertain passages exceeded .5. Request p95 was 925 ms. This exposes a specific
 sufficiency/scope failure; it does not earn an answer gate, reranking replacement, or cutover.
-Three predeclared queries still have no complete capture because search omitted span metadata.
+Three predeclared queries initially had no complete capture because search omitted span metadata;
+the metadata recovery below subsequently recovered and reviewed 121 of those bundles.
 
 The objective is to give Recall one typed semantic boundary and reusable evidence
 attributes, then remove the incident-specific interpretation and ranking paths that
@@ -758,3 +768,70 @@ Private recovery receipts are under `~/.recall/jev-w5-resume-20260918/`:
 `representative-metadata-recovery-v1`, `recovered-source-approval-v1` and
 `representative-combined-source-v3`. The rejected composition and next scoped-fact
 proposal are preserved separately. No new Jev calls were needed for this phase.
+
+### W5 scoped facts: broader positive and hard-partial diagnostic
+
+The source-completion check opened one report whose selected passage ended before
+the requested canaries. One existing `recall_show` call took 152 ms and recovered the
+complete visible event. The original partial label stayed unchanged. A first two-input
+diagnostic produced the correct incomplete/complete decisions but only three of four
+exact fact labels; its 913/500 ms request times were not a latency distribution.
+
+The next panel fixed twenty inputs across twelve question groups before source review
+or new predictions: thirteen existing selected-passage bundles, that complete event,
+and six additional exact events. All six fresh event reads returned HTTP 502; separately
+preserved canonical responses from the earlier truth review supplied those same events.
+Their source identity, revision, native family and visible-text extraction were verified.
+This is historical source reuse, not proof that those events are currently readable.
+One stored tool result is itself a file excerpt; completeness refers to the supplied
+visible event, never the whole source file or session. No question or prior label changed.
+
+Delegated reviewers read every supplied input. Root approved eleven complete and nine
+incomplete answers, comprising 42 scoped fact labels and 100 exact receipt witnesses.
+Independent audit verified the six raw event extractions, 41 original capture-span
+mappings, nineteen source families, and no overlap with the 31 protected families.
+The panel is deliberately exposed development data, including known past failures;
+it is not an unseen transfer set or a population estimate.
+
+Each independent Choice retains the entire question's incident/date/version scope.
+Code calls an input complete only when every requested fact is `answer_present`.
+No detached scope gate, second model call, threshold tuning or new production path
+was added. Sources, labels, request bodies, code and approvals were pinned before calls;
+SDK-shaped valid/invalid response checks and changed-input rejection passed.
+
+| Frozen diagnostic | Result |
+|---|---:|
+| Attempts / valid / errors / context skips | 20 / 20 / 0 / 0 |
+| Complete answers recognized | 11 / 11 |
+| Incomplete inputs correctly withheld | 7 / 9 |
+| Correct completeness actions | 18 / 20 |
+| Exact fact labels | 30 / 42 |
+| All-attempt request p50 / p95, nearest rank | 521 / 885 ms |
+| Input / output tokens | 93,346 / 2,592 |
+
+Both predeclared exits fail: two false-complete actions and p95 above 500 ms. The model
+accepted a truncated cancellation mechanism and an outage cause without established
+linkage to the named project. It also attached two unrelated fixes to requested facts;
+other missing facts prevented those inputs from becoming complete. Thus the conjunction's
+18/20 action result does not validate every fact as a reusable attribute. All twelve
+strict errors across seven inputs remain in the result. No labels changed after calls.
+
+On nine byte-identical inputs with earlier broad-Noul results, correct completeness
+actions improved from four to eight. These examples were selected partly because of
+known failures, so that comparison is diagnostic, not a general improvement estimate.
+The sequential model phase took 11.57 seconds; it is not a search-stage measurement.
+Input-only cost is approximately $0.00392 at the supplied rate, excluding output charges
+and unverified against provider billing. Broker pass-through spend remains unmetered.
+
+**Phase review:** simplicity holds at one typed client, one request per input and an
+ordinary conjunction. The diagnostic recognizes all eleven complete reports and exposes
+which facts fail, but wrong scoped facts remain. A production breakthrough is unearned;
+request speed fails the original hypothesis. Keep production retrieval unchanged.
+Do not patch these examples with more regex or a threshold fitted to this panel.
+The next semantic use should stay bounded to checking specific proposed claims against
+opened sources, retaining these hard regressions and adding unexposed families before
+any activation. Full W5 candidate coverage and the later deletion gates remain open.
+
+Private inputs, approval pins, all parsed responses, observed usage and interpretation
+are under `~/.recall/jev-w5-resume-20260918/scoped-fact-expanded-v1`. Independent audits
+are stored alongside, outside the frozen experiment directory.
