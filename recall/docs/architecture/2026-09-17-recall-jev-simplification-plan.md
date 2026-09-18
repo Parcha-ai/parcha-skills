@@ -30,6 +30,14 @@ nonanswers were rejected at the fixed diagnostic cutoff, while one partial answe
 outside binary scoring. Request p95 was 720 ms. There are no positive examples in this
 batch, so it measures neither answer recall nor a ranking improvement. W5 is unfinished.
 
+The next six-query batch is now captured through merged [#618](https://github.com/Parcha-ai/parcha-skills/pull/618).
+Of 298 returned slots, 131 have verified complete selected passages; all were source-reviewed
+before predictions. The unchanged Jev contract made 123 successful calls (eight context-bound
+skips). On 89 binary labels it produced TP4/TN82/FP3/FN0 at .5. Separately, 21 of 34 evaluated
+partial or uncertain passages exceeded .5. Request p95 was 925 ms. This exposes a specific
+sufficiency/scope failure; it does not earn an answer gate, reranking replacement, or cutover.
+Three predeclared queries still have no complete capture because search omitted span metadata.
+
 The objective is to give Recall one typed semantic boundary and reusable evidence
 attributes, then remove the incident-specific interpretation and ranking paths that
 boundary supersedes. Success means better evidence near the top, fewer competing
@@ -597,10 +605,10 @@ Private evidence directories under `~/.recall/jev-execution-20260917/`:
 The source-checking transfer is beside the W5 freeze in
 `delegated-review-20260917/support-transfer-20260918-v1`. Raw evidence stays outside Git.
 
-### W5 evidence capture: the next bounded implementation
+### W5 evidence capture: merged boundary and measured next batch
 
 Retrospective recovery needed 128 source reads to obtain 45 of one question's 47
-candidate bundles; two historical manifests had advanced. Add one opt-in evaluator
+candidate bundles; two historical manifests had advanced. Merged #618 adds one opt-in evaluator
 capture module beside `TruthBoundaryProbe.run`'s private search-result writes. Capture
 the exact selected passage IDs immediately after each search, before the next search,
 with source identity, native family, revision, manifest, source spans and text hashes.
@@ -623,9 +631,53 @@ one evaluator module and a narrow opt-in hook. Do not move network capture into
 `judgments_review.py`, whose gold/probability display and excerpt limits serve a
 different review contract.
 
-After capture works, freeze a representative batch across question intents before
-predictions, including separately identified alternative-retriever candidates and
-missed gold. Review the exact evidence the model receives; reuse a label only when
+Following the initial six-query capture, expand the frozen pool across question intents
+before predictions, including separately identified alternative-retriever candidates
+and missed gold. Review the exact evidence the model receives; reuse a label only when
 query, evidence and provenance all match. Selected-passage support remains separate
 from strict document-boundary retrieval truth. Expand the same workflow to finish W5;
 one clean negative-only question is not its acceptance gate.
+
+
+The reusable capture passed 96 focused tests/86 subtests and full CI. Its first live
+run failed because the fake client invented receipt-opening behavior; the corrected
+tests execute the generated program and use the real server receipt parser. The
+original failure is retained. The corrected run captured 131 complete bundles from
+298 slots using 606 source calls, with six protected, 150 omitted-metadata and eleven
+advanced-manifest slots preserved. Independent audit verified all source-call records,
+1,934 spans and 2,397,608 complete text bytes. Production response caps stay unchanged.
+
+Three delegated reviewers read all 131 supplied texts. Root reviewed all rationales
+and quotes, challenged one incomplete cancellation excerpt before approval, and froze
+four answers, 91 nonanswers and 36 partial/uncertain labels. All 220 source quotes map
+to 383 exact source-event witnesses. The original proposal and source-only correction
+are preserved; model outputs caused no label changes. This is a development diagnostic,
+with prior reviewer exposure and correlated candidates, not a blinded holdout.
+
+The fixed Noul/Score contract evaluated 123 candidates through the machine broker:
+123 valid, zero errors/retries/unknown usage; 721,551 input and 4,674 output tokens.
+The input-only estimate is $0.0303 at the supplied rate, not a provider invoice or
+broker-metered spend. Six negative and two partial bundles exceeded the unchanged
+context guard. On 89 available binary labels, TP4/TN82/FP3/FN0 and Brier .034374;
+34 evaluated partial/uncertain labels remain separate, and 21 exceed .5. Request
+p50/p95 were 552/925 ms; queue latency is separate and neither is search-stage latency.
+A broad answer judgment still confuses related mechanisms and historical snapshots
+with sufficient evidence. Four recognized answers across three questions cannot
+establish population recall or compensate for the partial-evidence failure.
+
+**Phase review:** simplicity improves through one reusable capture owner and shared
+identity/scoring helpers. Power improves in the ability to expose source-selection,
+scope and sufficiency failures. No production breakthrough or speed improvement is
+claimed; this shape still fails the 500 ms hypothesis. No regex deletion is earned.
+
+Next, recover exact omitted passage metadata through a bounded authoritative read,
+with revision/manifest checks, before protected-family screening and text capture.
+Do not enlarge search responses or build another passage projector. Keep the failed
+and successful freezes intact. Expand source-approved candidates across the missing
+question intents. The next semantic experiment should separate evidence support,
+incident/date applicability and missing requested facts in one parallel request;
+it needs newly frozen source labels and transfer cases before any threshold or code
+replacement. Retain the more promising specific-claim support task as its own result.
+
+Private capture, approvals, predeclared analysis policy and model receipts are under
+`~/.recall/jev-w5-resume-20260918/representative-capture-v2` and `representative-model-v1`.
