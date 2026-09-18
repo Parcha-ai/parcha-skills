@@ -352,12 +352,15 @@ is separate from measured search latency; interleaved reads can still affect the
 live service, so this is an explicit diagnostic run, not a normal latency sample.
 
 Every actual returned slot remains in the new `candidate-evidence-*` directory.
-For the first two matching ranges, a manifest-pinned metadata pass establishes
+For the first two matching ranges, missing spans or truncated receipts are recovered
+through `recall_passage_metadata` for the exact passage IDs, revision and manifest
+hash. This bounded, paged read returns only stored metadata hints, never prose or
+opened citation authority. A manifest-pinned source metadata pass then establishes
 native family identity before a separate visible-text pass. Protected, unresolved,
-missing-metadata, advanced-manifest and failed reads retain their status without
-substituting newer text. Complete evidence requires verified source parts, exact
-spans and receipts, closed pagination, and agreement with the original search
-prefix. The passages are joined by one newline with Unicode character offsets,
+unavailable metadata, advanced manifests, over-budget and failed reads retain their
+status without substituting newer text. Complete evidence requires verified source
+parts, exact spans and receipts, closed pagination, agreement with the original
+search prefix and, when metadata was recovered, the stored passage text hash. The passages are joined by one newline with Unicode character offsets,
 UTF-8 source spans and text hashes. Completeness applies only to those selected
 passages, never the complete document or session.
 

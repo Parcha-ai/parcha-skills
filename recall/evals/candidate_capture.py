@@ -231,8 +231,78 @@ class CandidateCapture:
         finally:
             self._write(f'{prefix}-call-{number:05}.json', receipt)
 
+    def _recover_metadata(self, client, hit, prefix):
+        """Recover exact stored hints; never persist prose before family checks."""
+        initial = self._spec(hit, allow_missing=True)
+        ids = [p['passage_id'] for p in initial['passages']]
+        args = {k: hit[k] for k in ('source_id', 'logical_document_id', 'revision', 'manifest_content_sha256')}
+        args['passage_ids'] = ids
+        cursor, selection, pi, rows = None, None, 0, []
+        current = None
+        for _ in range(64):
+            request = {**args, **({'cursor': cursor} if cursor else {})}
+            with self.lock:
+                _require(self.calls < self.max_calls, 'capture_call_budget')
+                number = self.calls; self.calls += 1
+            receipt = {'request': request, 'phase': 'passage_metadata', 'ok': False, 'error': 'capture_transport_exception'}
+            try:
+                outcome = client.call_tool('recall_passage_metadata', request, timeout_seconds=30)
+                response = outcome.result
+                receipt.update(ok=outcome.ok, error=outcome.error, elapsed_ms=outcome.elapsed_ms,
+                    response_sha256=_sha(json.dumps(response, sort_keys=True).encode()))
+                _require(outcome.ok and isinstance(response, dict), 'capture_metadata_unavailable')
+                _require(set(response) == set(args) | {'contract', 'selection_sha256', 'passage', 'next_cursor', 'complete'}, 'capture_metadata_invalid')
+                _require(all(response[k] == v for k, v in args.items()) and response['contract'] == 'recall.passage-metadata.v1', 'capture_response_pin_mismatch')
+                token = response['selection_sha256']
+                _require(isinstance(token, str) and re.fullmatch(r'[0-9a-f]{64}', token) is not None, 'capture_metadata_invalid')
+                _require(selection is None or selection == token, 'capture_response_pin_mismatch'); selection = token
+                part = response['passage']
+                headers = {'passage_id', 'ordinal', 'policy_fingerprint', 'text_sha256', 'metadata_sha256', 'total_spans', 'total_receipts'}
+                _require(isinstance(part, dict) and set(part) == headers | {'span_offset', 'receipt_offset', 'spans', 'receipts'}, 'capture_metadata_invalid')
+                _require(pi < len(ids) and part['passage_id'] == ids[pi], 'capture_metadata_invalid')
+                for key in ('policy_fingerprint', 'text_sha256', 'metadata_sha256'):
+                    _require(isinstance(part[key], str) and re.fullmatch(r'[0-9a-f]{64}', part[key]) is not None, 'capture_metadata_invalid')
+                for key in ('ordinal', 'span_offset', 'receipt_offset', 'total_spans', 'total_receipts'):
+                    _require(type(part[key]) is int and 0 <= part[key] <= 1_000_000, 'capture_metadata_invalid')
+                _require(0 < part['total_spans'] <= 128 and 0 < part['total_receipts'] <= 8192, 'capture_metadata_bound')
+                _require(isinstance(part['spans'], list) and isinstance(part['receipts'], list) and bool(part['spans'] or part['receipts']), 'capture_metadata_invalid')
+                span_fields = {'record_ordinal', 'record_count', 'source_byte_start', 'source_byte_end', 'passage_byte_start', 'passage_byte_end'}
+                for span in part['spans']:
+                    _require(isinstance(span, dict) and span_fields <= set(span) <= span_fields | {'message_index'} and all(type(v) is int and v >= 0 for v in span.values()), 'capture_metadata_invalid')
+                _require(all(isinstance(r, str) and len(r) <= 2048 and receipt_source(r) == args['source_id'] for r in part['receipts']), 'capture_source_mismatch')
+                if current is None:
+                    current = {k: part[k] for k in headers}; current.update(spans=[], receipts=[])
+                _require(all(current[k] == part[k] for k in headers), 'capture_response_pin_mismatch')
+                _require(part['span_offset'] == len(current['spans']) and part['receipt_offset'] == len(current['receipts']), 'capture_metadata_pagination_invalid')
+                for key in ('spans', 'receipts'):
+                    current[key].extend(part[key])
+                    _require(len(current[key]) <= part['total_' + key], 'capture_metadata_pagination_invalid')
+                done = all(len(current[k]) == part['total_' + k] for k in ('spans', 'receipts'))
+                if done:
+                    stored = {k: current[k] for k in ('passage_id', 'ordinal', 'policy_fingerprint', 'text_sha256', 'spans', 'receipts')}
+                    _require(_sha(json.dumps(stored, sort_keys=True, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode()) == part['metadata_sha256'], 'capture_metadata_hash_mismatch')
+                    rows.append(stored); pi += 1; current = None
+                expected = None if pi == len(ids) else f'{selection}:{pi}:{len(current["spans"]) if current else 0}:{len(current["receipts"]) if current else 0}'
+                _require(response['next_cursor'] == expected and type(response['complete']) is bool and response['complete'] == (expected is None), 'capture_metadata_pagination_invalid')
+                receipt['payload'] = response
+                cursor = expected
+                if cursor is None:
+                    break
+            finally:
+                self._write(f'{prefix}-call-{number:05}.json', receipt)
+        else:
+            raise EvaluationInputError('capture_metadata_pagination_bound')
+        recovered = []
+        for original, stored in zip(hit['matching_ranges'][:2], rows, strict=True):
+            old = original.get('receipts') or []
+            _require(stored['receipts'][:len(old)] == old, 'capture_metadata_receipt_mismatch')
+            if original.get('spans'):
+                _require(original['spans'] == stored['spans'], 'capture_metadata_span_mismatch')
+            recovered.append({**original, **stored, 'spans_omitted': False, 'receipts_truncated': 0})
+        return {**hit, 'matching_ranges': recovered}
+
     @staticmethod
-    def _spec(hit):
+    def _spec(hit, *, allow_missing=False):
         keys = ('source_id', 'logical_document_id', 'native_parent_id', 'revision')
         spec = {k: hit[k] for k in keys}
         _require(isinstance(spec['source_id'], str) and spec['source_id'].startswith(('claude:', 'codex:')))
@@ -246,7 +316,12 @@ class CandidateCapture:
         spec['passages'] = []
         for passage in ranges:
             _require(isinstance(passage.get('text'), str) and bool(passage['text']), 'capture_missing_metadata')
-            _require(passage.get('spans') and passage.get('receipts') and not passage.get('spans_omitted') and not passage.get('receipts_truncated'), 'capture_missing_metadata')
+            _require(isinstance(passage.get('passage_id'), str) and re.fullmatch(r'psg_[0-9a-f]{30,32}', passage['passage_id']) is not None)
+            available = passage.get('spans') and passage.get('receipts') and not passage.get('spans_omitted') and not passage.get('receipts_truncated')
+            if not available and allow_missing:
+                spec['passages'].append({'passage_id': passage['passage_id']})
+                continue
+            _require(available, 'capture_missing_metadata')
             _require(all(receipt_source(r) == spec['source_id'] for r in passage['receipts']), 'capture_source_mismatch')
             fields = ('record_ordinal', 'record_count', 'source_byte_start', 'source_byte_end', 'passage_byte_start', 'passage_byte_end')
             spans = [{k: s[k] for k in fields} for s in passage['spans']]
@@ -262,8 +337,10 @@ class CandidateCapture:
         row = {'candidate_index': index, **{k: hit.get(k) for k in ('source_id', 'logical_document_id', 'revision', 'native_parent_id', 'first_occurred_at', 'last_occurred_at')},
             'complete_selected_passages': False, 'complete_document': False, 'capture_status': 'unavailable', 'family_ids': [], 'error': None}
         try:
-            spec = self._spec(hit); row['manifest_sha256'] = spec['manifest_sha256']
+            initial = self._spec(hit, allow_missing=True)
             client = self.factory()
+            recovered = self._recover_metadata(client, hit, prefix) if any('spans' not in p for p in initial['passages']) else hit
+            spec = self._spec(recovered); row['manifest_sha256'] = spec['manifest_sha256']
             metadata = self._call(client, {**spec, 'phase': 'metadata'}, prefix)
             fid = native_family_id(**metadata['family']); row['family_ids'] = [fid]
             if fid in self.protected:
@@ -286,9 +363,11 @@ class CandidateCapture:
             else:
                 raise EvaluationInputError('capture_pagination_bound')
             text, evidence = self._assemble(spec, fragments, summaries)
-            for original, verified in zip(hit['matching_ranges'][:2], evidence):
+            for original, recovered_range, verified in zip(hit['matching_ranges'][:2], recovered['matching_ranges'][:2], evidence):
                 selected = text[verified['combined_char_start']:verified['combined_char_end']]
                 _require(selected.startswith(original['text']), 'capture_search_prefix_mismatch')
+                if 'text_sha256' in recovered_range:
+                    _require(verified['sha256'] == recovered_range['text_sha256'], 'capture_passage_hash_mismatch')
             row.update(capture_status='complete', complete_selected_passages=True, text=text,
                 text_sha256=_sha(text.encode()), text_bytes=len(text.encode()), source_evidence=evidence,
                 selected_passage_ids=[p['passage_id'] for p in spec['passages']])

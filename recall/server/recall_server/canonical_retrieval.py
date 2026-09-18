@@ -3990,6 +3990,123 @@ class BoundCanonicalRetrieval:
             },
         }
 
+    def passage_metadata(
+        self, *, source_id: str, logical_document_id: str, revision: int,
+        manifest_content_sha256: str, passage_ids: list[str], cursor: str | None = None,
+    ) -> dict[str, Any]:
+        """Page stored coordinates for at most two exact, frozen passages.
+
+        Metadata is a routing hint, never opened citation authority. No passage
+        prose is selected. Every page rechecks current authorization and pins;
+        historical manifests that have advanced remain unavailable.
+        """
+        from .mcp import _encoded_result_size
+
+        def require(ok: bool) -> None:
+            if not ok:
+                raise ValueError("passage_metadata_unavailable")
+
+        require(isinstance(source_id, str) and source_id in self.authorized_sources)
+        require(isinstance(logical_document_id, str) and re.fullmatch(r"ldoc_[0-9a-f]{32}", logical_document_id) is not None)
+        require(type(revision) is int and revision >= 1)
+        require(isinstance(manifest_content_sha256, str) and re.fullmatch(r"[0-9a-f]{64}", manifest_content_sha256) is not None)
+        require(isinstance(passage_ids, list) and 1 <= len(passage_ids) <= 2)
+        require(all(isinstance(p, str) and re.fullmatch(r"psg_[0-9a-f]{32}", p) for p in passage_ids))
+        require(len(set(passage_ids)) == len(passage_ids))
+        require(cursor is None or (isinstance(cursor, str) and re.fullmatch(r"[0-9a-f]{64}:[01]:[0-9]{1,6}:[0-9]{1,6}", cursor) is not None))
+        with self.store.connect() as connection:
+            rows = self.store._execute_bounded(
+                connection,
+                """SELECT passage.passage_id,passage.ordinal,passage.policy_fingerprint,
+                          passage.text_sha256,passage.spans,passage.receipts
+                     FROM canonical_passages passage
+                     JOIN canonical_passage_documents projected
+                       USING(tenant_id,source_id,logical_document_id,revision,policy_fingerprint)
+                     JOIN canonical_evidence_documents evidence
+                       USING(tenant_id,source_id,logical_document_id,revision)
+                    WHERE passage.tenant_id=%s AND passage.source_id=%s
+                      AND passage.logical_document_id=%s AND passage.revision=%s
+                      AND evidence.manifest_content_sha256=%s
+                      AND passage.passage_id=ANY(%s)
+                      AND NOT EXISTS (
+                          SELECT 1 FROM unnest(passage.receipts) AS wanted(receipt)
+                          WHERE NOT EXISTS (
+                              SELECT 1 FROM canonical_chunks chunk
+                              JOIN canonical_documents document USING(tenant_id,source_id,document_id)
+                              JOIN canonical_events event USING(tenant_id,source_id,event_id)
+                              WHERE chunk.tenant_id=passage.tenant_id
+                                AND chunk.source_id=passage.source_id AND chunk.receipt=wanted.receipt
+                                AND chunk.deleted_at IS NULL AND document.is_current
+                                AND document.deleted_at IS NULL
+                                AND COALESCE(event.native_parent_id,event.native_id)=evidence.native_parent_id
+                                AND NOT EXISTS (
+                                    SELECT 1 FROM canonical_events later
+                                    WHERE later.tenant_id=document.tenant_id
+                                      AND later.source_id=document.source_id
+                                      AND later.native_id=document.native_id
+                                      AND later.revision>document.revision AND later.is_tombstone
+                                )
+                          )
+                      )""",
+                (self.tenant_id, source_id, logical_document_id, revision, manifest_content_sha256, passage_ids),
+                time.monotonic() + 5.0,
+            ).fetchall()
+        require(len(rows) == len(passage_ids) and {r['passage_id'] for r in rows} == set(passage_ids))
+        ordered = [next(r for r in rows if r['passage_id'] == p) for p in passage_ids]
+        pins = dict(source_id=source_id, logical_document_id=logical_document_id, revision=revision,
+                    manifest_content_sha256=manifest_content_sha256, passage_ids=passage_ids)
+
+        def digest(value):
+            return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+
+        selection = digest({'pins': pins, 'passages': ordered})
+        pi, so, ro = 0, 0, 0
+        if cursor is not None:
+            token, pi, so, ro = cursor.split(':')
+            require(token == selection)
+            pi, so, ro = int(pi), int(so), int(ro)
+        require(pi < len(ordered))
+        row = ordered[pi]
+        require(isinstance(row['spans'], list) and bool(row['spans']) and isinstance(row['receipts'], list) and bool(row['receipts']))
+        require(0 <= so <= len(row['spans']) and 0 <= ro <= len(row['receipts']))
+        require(so < len(row['spans']) or ro < len(row['receipts']))
+        part = {k: row[k] for k in ('passage_id', 'ordinal', 'policy_fingerprint', 'text_sha256')}
+        part.update(metadata_sha256=digest(row), span_offset=so, receipt_offset=ro,
+                    total_spans=len(row['spans']), total_receipts=len(row['receipts']), spans=[], receipts=[])
+        result = {**pins, 'contract': 'recall.passage-metadata.v1', 'selection_sha256': selection,
+                  'passage': part, 'next_cursor': None, 'complete': False}
+
+        def advance():
+            if so == len(row['spans']) and ro == len(row['receipts']):
+                result['next_cursor'] = f'{selection}:{pi + 1}:0:0' if pi + 1 < len(ordered) else None
+            else:
+                result['next_cursor'] = f'{selection}:{pi}:{so}:{ro}'
+            result['complete'] = result['next_cursor'] is None
+
+        advance()
+        # Size the final tool-result form, including JSON's duplicated content
+        # and escaping. Leave the global MCP response cap unchanged.
+        for key in ('spans', 'receipts'):
+            position = so if key == 'spans' else ro
+            while position < len(row[key]):
+                part[key].append(row[key][position])
+                if key == 'spans':
+                    so += 1
+                else:
+                    ro += 1
+                advance()
+                if _encoded_result_size(result) > 16_384:
+                    part[key].pop()
+                    if key == 'spans':
+                        so -= 1
+                    else:
+                        ro -= 1
+                    advance()
+                    break
+                position += 1
+        require(bool(part['spans'] or part['receipts']) and _encoded_result_size(result) <= 16_384)
+        return result
+
     def show(
         self,
         target: str,

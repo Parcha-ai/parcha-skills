@@ -483,6 +483,7 @@ class RemoteMcpContractTest(unittest.TestCase):
                     "recall_exec_map",
                     "recall_scan",
                     "recall_session_context",
+                    "recall_passage_metadata",
                     "recall_show",
                     "recall_related",
                 })

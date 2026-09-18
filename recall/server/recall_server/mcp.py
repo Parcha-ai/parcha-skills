@@ -115,6 +115,26 @@ def _date_time(value: Any, name: str) -> str:
 
 ALL_READ_TOOLS = (
     {
+        "name": "recall_passage_metadata",
+        "description": "Recover paged spans and full receipt hints for one or two exact passage IDs from a frozen search result. Requires its source, logical document, revision and manifest hash. Metadata only: no passage prose or opened citation authority. Advanced manifests fail closed.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source_id": {"type": "string"},
+                "logical_document_id": {"type": "string", "pattern": "^ldoc_[0-9a-f]{32}$"},
+                "revision": {"type": "integer", "minimum": 1},
+                "manifest_content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "passage_ids": {"type": "array", "minItems": 1, "maxItems": 2, "uniqueItems": True,
+                                "items": {"type": "string", "pattern": "^psg_[0-9a-f]{32}$"}},
+                "cursor": {"type": "string", "pattern": "^[0-9a-f]{64}:[01]:[0-9]{1,6}:[0-9]{1,6}$"},
+            },
+            "required": ["source_id", "logical_document_id", "revision", "manifest_content_sha256", "passage_ids"],
+            "additionalProperties": False,
+        },
+        "outputSchema": {"type": "object"},
+        "annotations": {"readOnlyHint": True},
+    },
+    {
         "name": "recall_related",
         "description": (
             "Find Recall evidence related to a working directory or branch. "
@@ -556,6 +576,7 @@ RETRIEVAL_INSTRUCTIONS = (
     "Cite only receipts returned in opened_receipts."
 )
 CANONICAL_ONLY_READ_TOOLS = frozenset({
+    "recall_passage_metadata",
     "recall_exec",
     "recall_exec_map",
     "recall_people",
@@ -977,6 +998,12 @@ def _call_tool(
         if result is None:
             raise McpProtocolError(-32602, "receipt not found")
         return result
+    if name == "recall_passage_metadata":
+        _reject_extra(arguments, frozenset({"source_id", "logical_document_id", "revision", "manifest_content_sha256", "passage_ids", "cursor"}))
+        try:
+            return store.passage_metadata(**arguments)
+        except (ValueError, TypeError):
+            raise McpProtocolError(-32602, "passage metadata unavailable for exact pins") from None
     if name == "recall_show":
         _reject_extra(arguments, frozenset({"target", "around", "tail", "prompts"}))
         target = _string(arguments.get("target"), "target")
