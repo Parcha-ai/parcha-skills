@@ -18,8 +18,12 @@ is historical. Fresh source reads and public health/readiness returned 502. Rend
 show PlanetScale `pg_readonly: cluster is read-only` errors during authentication's
 SELECT at 13:01 UTC, followed by failed readiness. One same-commit MCP-only restart
 created fresh processes, but readiness still returned 503 and public checks still
-returned 502 at 20:34 UTC. Current readiness exceptions are not exposed by the handler,
-so their exact cause remains unconfirmed. The worker and configuration were unchanged;
+returned 502 at 20:34 UTC. A bounded read-only job in that exact runtime reproduced
+`pg_readonly` / SQLSTATE `XX000` on a fresh implicit-transaction `SELECT 1`; a fresh
+autocommit `SELECT 1` succeeded, with both transaction read-only settings reported off.
+The cluster's underlying protective condition remains unconfirmed. The first diagnostic
+job emitted no output because of command quoting; a corrected command produced the
+retained probe results. No database writes were performed. Worker and configuration were unchanged;
 availability recovery is separate unfinished work, not a Jev result.
 
 The follow-up family audit corrected two offline bookkeeping errors: seven replacement
