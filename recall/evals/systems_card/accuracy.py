@@ -200,6 +200,10 @@ class TruthBoundaryProbe:
                 "recall_search", {"query": case["question"], "limit": CANDIDATE_LIMIT, "snippet_chars": 256},
             )
             latency = (time.monotonic() - started) * 1000.0
+            capture = context.options.get("_candidate_capture")
+            if capture is not None:
+                capture.capture_case(case["id"], case["question"], outcome.result if outcome.ok else None,
+                                     search_error=None if outcome.ok else "search_unavailable")
             if outcome.ok and outcome.result:
                 candidates = candidates_from_search(outcome.result)
                 arm_scores[case["id"]] = arm_scores_from_search(outcome.result)
@@ -312,6 +316,10 @@ class TruthBoundaryProbe:
                     }
                     handle.write(json.dumps(saved, sort_keys=True) + "\n")
             result.notes.append(f"per-case rankings saved privately ({results_path.name})")
+        capture = context.options.get("_candidate_capture")
+        if capture is not None:
+            capture.finish()
+            result.notes.append("selected-passage capture saved privately; capture time is separate from search latency and is not a quality gate")
         return result
 
 
