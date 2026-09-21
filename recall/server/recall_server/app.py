@@ -1067,10 +1067,15 @@ class Handler(BaseHTTPRequestHandler):
             principal = self.require("read")
             if not principal:
                 return
-            if principal.get("kind") == "development" and legacy_reads_enabled():
-                # Explicit local rollback mode has no tenant credential and
-                # must still resolve the v1 receipts its read routes return.
-                tenant_id, source_grants = None, None
+            legacy_only = legacy_reads_enabled() and principal.get("kind") in {
+                "development", "tailscale-user", "collector",
+            } and not principal.get("tenant_id")
+            if legacy_only:
+                # Explicit v1 rollback uses v1 authority and cannot enter the
+                # tenantless canonical lookup, even for a colliding receipt.
+                tenant_id = None
+                grants = principal.get("authorized_sources")
+                source_grants = tuple(grants) if grants is not None else None
             elif principal.get("kind") == "mcp":
                 tenant_id = principal.get("tenant_id")
                 if not tenant_id:
@@ -1097,6 +1102,7 @@ class Handler(BaseHTTPRequestHandler):
                     authorized_source=principal.get("source_id"),
                     tenant_id=tenant_id,
                     authorized_sources=source_grants,
+                    legacy_only=legacy_only,
                     chunk_body_archive=(
                         self.evidence_archive_store
                         if os.environ.get("RECALL_CHUNK_BODY_READS") == "archive" else None

@@ -68,6 +68,18 @@ class ArchivedResolveTests(unittest.TestCase):
         self.assertIn('event.tenant_id=%s', self.calls[0][0])
         self.assertIn(TENANT, self.calls[0][1])
 
+    def test_explicit_legacy_resolution_never_queries_canonical_tables(self):
+        self.connection.execute.side_effect = lambda sql, args: (
+            Result([dict(id=1, source_id=SOURCE)]) if 'FROM source_events event' in sql
+            else Result([dict(text_redacted='legacy only')])
+        )
+        with mock.patch.object(self.store, '_resolve_canonical') as canonical:
+            result = self.store.resolve(RECEIPT, authorized_source=SOURCE, legacy_only=True)
+        canonical.assert_not_called()
+        self.assertEqual(result['items'][0]['text_redacted'], 'legacy only')
+        with self.assertRaises(ValueError):
+            self.read(legacy_only=True)
+
     def test_denied_sources_do_no_database_or_archive_io(self):
         for grants in ((), ('source:other',)):
             with self.subTest(grants=grants):
@@ -133,7 +145,7 @@ class ResolveHandlerAuthorityTests(unittest.TestCase):
             handler.do_GET()
         handler.store.resolve.assert_called_once_with(
             RECEIPT, authorized_source=None, tenant_id=TENANT, authorized_sources=(),
-            chunk_body_archive=handler.evidence_archive_store)
+            chunk_body_archive=handler.evidence_archive_store, legacy_only=False)
 
     def test_legacy_development_and_collector_use_ingest_tenant_default(self):
         for principal in ({'kind': 'development'}, {'kind': 'collector', 'source_id': SOURCE},
@@ -152,6 +164,18 @@ class ResolveHandlerAuthorityTests(unittest.TestCase):
             handler.do_GET()
         self.assertIsNone(handler.store.resolve.call_args.kwargs['tenant_id'])
         self.assertIsNone(handler.store.resolve.call_args.kwargs['authorized_sources'])
+        self.assertTrue(handler.store.resolve.call_args.kwargs['legacy_only'])
+
+    def test_legacy_collector_rollback_retains_source_grants(self):
+        handler = self.handler({'kind': 'collector', 'source_id': SOURCE,
+                                'principal_id': 'principal:legacy', 'authorized_sources': ()})
+        with mock.patch.dict(os.environ, {'RECALL_LEGACY_READS': '1'}, clear=True):
+            handler.do_GET()
+        actual = handler.store.resolve.call_args.kwargs
+        self.assertTrue(actual['legacy_only'])
+        self.assertEqual(actual['authorized_source'], SOURCE)
+        self.assertEqual(actual['authorized_sources'], ())
+        handler.store.authorized_canonical_source_ids.assert_not_called()
 
     def test_legacy_rollback_flag_does_not_broaden_mcp_authority(self):
         handler = self.handler({'kind': 'mcp', 'tenant_id': TENANT, 'authorized_sources': ()})
