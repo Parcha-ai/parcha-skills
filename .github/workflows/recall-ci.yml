@@ -71,6 +71,7 @@ jobs:
             e2e_search_outbox.py \
             e2e_search_plane_projection.py \
             e2e_connector_host.py \
+            e2e_collector_health_deadline.py \
             e2e_integration_activation.py \
             e2e_connector_registry.py \
             e2e_connector_sdk.py \
