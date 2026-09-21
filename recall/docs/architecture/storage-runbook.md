@@ -200,3 +200,10 @@ turns, clear only verified synthetic bodies, append/revise/forget, then reprojec
 and reopen every retained receipt. A correct reader alone cannot prove that a
 future projection preserves archived evidence. PR #624 prevents publishing bad
 source bytes; archive-backed reprojection is a separate prerequisite.
+
+The current archive reader's 64 MiB budget is cumulative across all requested
+parents. A parent that fits today can outgrow it after append, and several small
+parents can exceed it together. Therefore a successful current read is not
+permanent retirement coverage. Require stable routing to the requested records
+in existing immutable parts before deleting source bodies; asynchronous passage
+or Parquet pointers alone do not cover the logical-publication lag.
