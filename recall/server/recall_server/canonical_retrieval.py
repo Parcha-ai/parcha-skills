@@ -3071,8 +3071,8 @@ class BoundCanonicalRetrieval:
                 ordering = "DESC" if direction == "before" else "ASC"
                 return self.store._execute_bounded(
                     connection,
-                    f"""SELECT event.source_id,event.native_id,document.document_id,
-                               event.native_parent_id,document.revision,event.kind,
+                    f"""SELECT event.source_id,event.native_id,event.document_id,
+                               event.native_parent_id,event.revision,event.kind,
                                event.occurred_at,event.observed_at,event.created_at,
                                jsonb_agg(
                                  jsonb_build_object(
@@ -3081,40 +3081,54 @@ class BoundCanonicalRetrieval:
                                    'receipt',chunk.receipt
                                  ) ORDER BY chunk.ordinal
                                ) AS chunks
-                        FROM canonical_events event
-                        JOIN canonical_documents document
-                          USING(tenant_id,source_id,event_id)
+                        FROM (
+                          SELECT event.tenant_id,event.source_id,event.native_id,
+                                 document.document_id,event.native_parent_id,
+                                 document.revision,event.kind,event.occurred_at,
+                                 event.observed_at,event.created_at
+                          FROM canonical_events event
+                          JOIN canonical_documents document
+                            USING(tenant_id,source_id,event_id)
+                          WHERE event.tenant_id=%s
+                            AND event.source_id=%s
+                            AND COALESCE(event.native_parent_id,event.native_id)=%s
+                            AND (event.occurred_at,event.native_id)
+                                {comparator} (%s,%s)
+                            AND document.is_current
+                            AND document.deleted_at IS NULL
+                            AND NOT EXISTS (
+                              SELECT 1 FROM canonical_events later
+                               WHERE later.tenant_id=document.tenant_id
+                                 AND later.source_id=document.source_id
+                                 AND later.native_id=document.native_id
+                                 AND later.revision>document.revision
+                                 AND later.is_tombstone
+                            )
+                            AND EXISTS (
+                              SELECT 1 FROM canonical_chunks live
+                               WHERE live.tenant_id=document.tenant_id
+                                 AND live.source_id=document.source_id
+                                 AND live.document_id=document.document_id
+                                 AND live.deleted_at IS NULL
+                            )
+                          ORDER BY event.occurred_at {ordering},event.native_id {ordering}
+                          LIMIT %s
+                        ) event
                         JOIN LATERAL (
                           SELECT bounded.ordinal,{body_sql} AS text_redacted,bounded.receipt
                           FROM canonical_chunks bounded
-                          WHERE bounded.tenant_id=document.tenant_id
-                            AND bounded.source_id=document.source_id
-                            AND bounded.document_id=document.document_id
+                          WHERE bounded.tenant_id=event.tenant_id
+                            AND bounded.source_id=event.source_id
+                            AND bounded.document_id=event.document_id
                             AND bounded.deleted_at IS NULL
                           ORDER BY bounded.ordinal
                           LIMIT 2
                         ) chunk ON true
-                        WHERE event.tenant_id=%s
-                          AND event.source_id=%s
-                          AND COALESCE(event.native_parent_id,event.native_id)=%s
-                          AND (event.occurred_at,event.native_id)
-                              {comparator} (%s,%s)
-                          AND document.is_current
-                          AND document.deleted_at IS NULL
-                          AND NOT EXISTS (
-                            SELECT 1 FROM canonical_events later
-                             WHERE later.tenant_id=document.tenant_id
-                               AND later.source_id=document.source_id
-                               AND later.native_id=document.native_id
-                               AND later.revision>document.revision
-                               AND later.is_tombstone
-                          )
-                        GROUP BY event.source_id,event.native_id,document.document_id,
-                                 event.native_parent_id,document.revision,event.kind,
+                        GROUP BY event.source_id,event.native_id,event.document_id,
+                                 event.native_parent_id,event.revision,event.kind,
                                  event.occurred_at,event.observed_at,event.created_at
                         ORDER BY event.occurred_at {ordering},
-                                 event.native_id {ordering}
-                        LIMIT %s""",
+                                 event.native_id {ordering}""",
                     (
                         self.tenant_id,
                         anchor["source_id"],
