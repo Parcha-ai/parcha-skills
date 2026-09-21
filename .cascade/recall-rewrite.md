@@ -189,7 +189,7 @@ Design (`server/recall_server/turbopuffer_plane.py`): one namespace per tenant (
 
 ### Storage retirement resumed — 2026-09-20
 
-**Checkpoint: 2026-09-21, 20:06 UTC.** Actual provider downsizing completed
+**Checkpoint: 2026-09-21, 20:40 UTC.** Actual provider downsizing completed
 at 19:30 UTC: exactly **three 275 GiB nodes**, one primary and two replicas,
 with no replacement pending. This removes **25 GiB per node / 75 GiB total
 allocated capacity**. Separately, measured relation/index reclaim is **34.23 GiB**;
@@ -206,27 +206,30 @@ measurements, earlier failures, cleanup and limits remain in the
 |---|---|---|---|
 | S0 | Dependencies and storage baseline | verified | Body readers, ingest, reprojection and receipt liveness inventoried; relation allocations are not removable body bytes. |
 | S1 | Last chunk full-text consumer → turbopuffer | done | Consumer migrated; chunk GIN removal reclaimed **18.05 GiB**. Original quality gates passed; no source bodies deleted. |
-| S2 | Reader over existing logical evidence | live and verified | MCP **#662**, projection **#648**, managed **#664**, schema **069**. Exact archive-backed readback and the unchanged original card passed. |
-| S3 | Reprojection, resolve and both ingest writers | compatible; managed ingestion currently failing | Earlier #650 recovery is historical. At 19:07 UTC, the enabled worker had 290 consecutive failures, with latest error `brain_unavailable`, and no success since 09:17:45, despite fresh claims. Diagnose the underlying canonical ingest exception and prove a new successful cycle before more retirement. |
+| S2 | Reader over existing logical evidence | live and verified | MCP **#662**, projection **#648**, managed **#665**, schema **069**. Exact archive-backed readback and the unchanged original card passed. |
+| S3 | Reprojection, resolve and both ingest writers | compatible; managed ingestion repair in progress | Managed #665 identified an invalid `document.v1.artifact_content_sha256` on its natural retry. Actual Slack attachment → SDK → SQLite reproduction shows privacy scrubbing mistakes a Luhn-valid digit run in a real checksum for financial data. Preserve byte-verified digests during privacy traversal and narrowly repair persisted pages from the original archive-reference checksum witness. Require a fresh successful cycle before more retirement. |
 | S4a | Bounded body clear and restore | canary passed | Exact archived and restored responses matched. Restore retired bodies before any PostgreSQL-reader rollback. |
 | S4b | Source-scale retirement | finite progress; incomplete | Priority source: **40 enabled parents**. Original source: **235 discovered / 233 enabled**, three residuals and deadline follow-up retained. Lifetime logical clears: **151,863 documents / 167,244 chunks / 723,382,521 UTF-8 bytes**, not physical savings. Fresh frontier/session required; never replay consumed intents. |
 | S4v | Dropped chunk vector and finite sweep | no physical reclaim | Three copy attempts yielded no reclaim; the finite sweep preserved values but grew files. The failed copy already omitted the vector. No blind retry or whole-table sweep. |
 | S4c | Physical compaction | documents and events complete | Documents reclaimed **6.477 GiB**; events **9.700 GiB**. Catalog/index identities and cleanup verified; each passed 18 response comparisons and the unchanged card. Provider capacity is a separate exit. |
 | S5 | Provider disk and compute reduction | disk capacity reduced; compute unchanged | Actual **3 × 275 GiB** at 19:30 UTC; no replacements. Post-resize 18 exact pairs passed. Latest original card 26/26 at 20:06 UTC; earlier failed cards retained. Invoice savings unobserved. Compute downsizing remains unachieved. |
 
-The latest original card passed **26/26 at 20:06:03 UTC**, with recall@20
-**.9625**, MRR **.6575**, zero backend errors and unchanged verifier/truth pins.
-Search/show/context/scan p95 were **1.438 / .522 / 1.482 / 12.315 seconds**.
+The latest original card passed **26/26 at 20:40:22 UTC**, with recall@20
+**.9625**, MRR **.6554**, zero backend errors and unchanged verifier/truth pins.
+Search/show/context/scan p95 were **1.362 / .485 / 1.372 / 11.818 seconds**.
 Earlier post-resize scan and post-#662 show latency failures remain preserved;
 this card is not a causal speedup or ingestion-freshness claim.
 
 MCP **#662 is live**. It removes unused manifest discovery for scans that need
 no aliases. Sampled staging fell from about .48 to .10 seconds, but the result
 hashes changed, so those reads do not establish a matched-corpus causal gain.
-Managed **#664 is live** with six exact readback pairs passing. Its natural retry
-identified `canonical_contract_invalid` caused by `ValueError`. The next diagnostic
-adds closed invariant/kind/known-field metadata at the validation origin, preserving
-messages, strict validation and pending-page behavior. Recovery remains unproved.
+Managed **#665 is live** with six exact readback pairs passing. Its natural retry
+identified `typed_invalid_known_field / document.v1 / artifact_content_sha256`.
+The pending-page repair accepts only an intact private SDK spool with exact
+legacy checksum scrubbing, original content hash and known attachment lineage;
+it restores the checksum already witnessed during archive upload. This is not a
+new remote payload read or permission to repair arbitrary malformed input.
+Recovery remains unproved until a deployed repair completes a fresh ingestion cycle.
 
 **Next dependency order:** identify the actual queued-page invariant → fix its
 owning producer or compatibility boundary → verify a fresh successful managed
