@@ -100,6 +100,8 @@ jobs:
             e2e_pending_archived_chunks.py \
             e2e_chunk_body_locators.py \
             e2e_locator_spool.py \
+            e2e_locator_backfill_plan.py \
+            e2e_locator_backfill_apply.py \
             e2e_revision_history.py \
             e2e_archived_resolve.py
           do
