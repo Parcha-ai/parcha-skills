@@ -30,8 +30,11 @@ longer returned in the default mode because nothing is written to
 Receipts minted by the canonical writer look like
 `recall://<source>/<native>?rev=<n>#item=<ordinal>`.
 `GET /v1/receipts/resolve` resolves them from `canonical_events` and
-`canonical_chunks` first and falls back to `source_events` for rows written
-before the cut. It keeps the v1 response shape.
+`canonical_chunks` with the authenticated tenant and source grants. HTTP misses
+do not fall through to tenantless `source_events`; trusted unscoped library callers
+retain that legacy fallback until retirement. Explicit unauthenticated local
+development rollback (`RECALL_LEGACY_READS=1`) also retains v1 resolution; the
+flag never broadens MCP tenant or source grants. The v1 response shape remains.
 
 The four legacy read routes answer `410 Gone` before authentication:
 
@@ -200,6 +203,11 @@ turns, clear only verified synthetic bodies, append/revise/forget, then reprojec
 and reopen every retained receipt. A correct reader alone cannot prove that a
 future projection preserves archived evidence. PR #624 prevents publishing bad
 source bytes; archive-backed reprojection is a separate prerequisite.
+
+Receipt resolution retains the exact requested revision. Current documents use
+the shared archive hydration when enabled; historical revisions remain in
+PostgreSQL and are hash checked. Do not thin historical bodies using current
+logical evidence. The public MCP/edge profiles continue to hide this HTTP route.
 
 The current archive reader's 64 MiB budget is cumulative across all requested
 parents. A parent that fits today can outgrow it after append, and several small

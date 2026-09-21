@@ -41,7 +41,8 @@ from .canonical import (
 )
 from .canonical_retrieval import CanonicalRetrieval
 from .control import ControlError, ControlPlane
-from .db import BrainStore, IdempotencyConflict
+from .db import BrainStore, IdempotencyConflict, SearchDeadlineExceeded
+from .chunk_bodies import ChunkBodyError
 from .deep_inspection import DeepInspectionError
 from .deep_inspection_runtime import build_deep_inspector
 from .evidence_projection import (
@@ -55,6 +56,7 @@ from .legacy_plane import (
     LEGACY_READ_ROUTES,
     CanonicalPlaneUnavailable,
     LegacyIngestBridge,
+    legacy_ingest_tenant_id,
     legacy_reads_enabled,
     legacy_retired_response,
     validate_legacy_flags,
@@ -1065,12 +1067,50 @@ class Handler(BaseHTTPRequestHandler):
             principal = self.require("read")
             if not principal:
                 return
+            legacy_only = legacy_reads_enabled() and principal.get("kind") in {
+                "development", "tailscale-user", "collector",
+            } and not principal.get("tenant_id")
+            if legacy_only:
+                # Explicit v1 rollback uses v1 authority and cannot enter the
+                # tenantless canonical lookup, even for a colliding receipt.
+                tenant_id = None
+                grants = principal.get("authorized_sources")
+                source_grants = tuple(grants) if grants is not None else None
+            elif principal.get("kind") == "mcp":
+                tenant_id = principal.get("tenant_id")
+                if not tenant_id:
+                    self.send_json(403, {"error": "forbidden"})
+                    return
+                source_grants = tuple(principal.get("authorized_sources") or ())
+            else:
+                # Match the existing v1-to-canonical ingest bridge for local,
+                # Tailscale and collector callers that predate tenant credentials.
+                tenant_id = legacy_ingest_tenant_id(principal)
+                if principal.get("principal_id"):
+                    # Legacy credentials authenticate on v1, but canonical
+                    # receipts need current grants from the canonical tenant.
+                    source_grants = tuple(self.store.authorized_canonical_source_ids(
+                        tenant_id, principal["principal_id"],
+                    ))
+                else:
+                    grants = principal.get("authorized_sources")
+                    source_grants = tuple(grants) if grants is not None else None
             receipt = parse_qs(parsed.query).get("receipt", [""])[0]
             try:
                 result = self.store.resolve(
                     receipt,
                     authorized_source=principal.get("source_id"),
+                    tenant_id=tenant_id,
+                    authorized_sources=source_grants,
+                    legacy_only=legacy_only,
+                    chunk_body_archive=(
+                        self.evidence_archive_store
+                        if os.environ.get("RECALL_CHUNK_BODY_READS") == "archive" else None
+                    ),
                 )
+            except (SearchDeadlineExceeded, ChunkBodyError):
+                self.send_json(503, {"error": "receipt unavailable"})
+                return
             except ValueError as exc:
                 self.send_json(400, {"error": str(exc)})
                 return
