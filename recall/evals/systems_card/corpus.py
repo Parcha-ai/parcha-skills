@@ -16,6 +16,7 @@ from .model import Gate, ProbeResult
 from .probes import ProbeContext
 
 PASSAGES = "read_parquet('/datasets/*/*/passages-part-*.parquet', union_by_name=true)"
+DOCUMENTS = "read_parquet('/datasets/*/*/documents-part-*.parquet', union_by_name=true)"
 _DATE_ONLY_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?")
 
@@ -204,6 +205,10 @@ class ScanConsistencyProbe:
         enumerated = len(scope_ids)
         if scope_total is None:
             scope_total = enumerated
+        # Count the document projection, not passages. Documents without a
+        # searchable passage are still valid scope boundaries; counting the
+        # passage projection made those documents look like scan-plane loss.
+        #
         # The window must be applied in SQL too. ``recall_scan`` uses the
         # filters only to choose which source-month buckets to stage; the
         # program then sees every document in those buckets, including the
@@ -220,7 +225,7 @@ class ScanConsistencyProbe:
         predicate = (" WHERE " + " AND ".join(window)) if window else ""
         program = (
             "duckdb -json -c \"SELECT count(DISTINCT logical_document_id) AS docs "
-            f"FROM {PASSAGES}{predicate}\""
+            f"FROM {DOCUMENTS}{predicate}\""
         )
         scan = context.client.call_tool(
             "recall_scan", {"filters": filters, "program": program, "timeout_seconds": 120}, timeout_seconds=200,
