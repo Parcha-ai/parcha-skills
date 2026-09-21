@@ -436,8 +436,6 @@ class ProjectionWorkerTest(unittest.TestCase):
         self.assertEqual(calls, ["embeddings", "passages", "logical"])
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class DebounceTests(unittest.TestCase):
@@ -945,3 +943,91 @@ class SkipEmbeddingTests(unittest.TestCase):
         with self.assertRaises(Stopped):
             self._run(calls, work=0, clock=_FakeClock(), sleep=stop)
         self.assertEqual(calls, ["passages", "logical"])
+
+
+class SearchBeforeParquetTests(unittest.TestCase):
+    def kwargs(self):
+        return dict(tenant_id="tenant:company:test", logical_batch_size=5,
+                    passage_batch_size=5, embedding_batch_size=64,
+                    max_batches_per_cycle=2, upload_concurrency=1,
+                    passage_concurrency=1, interval_seconds=1, once=True)
+
+    def test_search_finishes_before_blocked_parquet_with_unchanged_bounds(self):
+        import threading
+        calls = []
+        entered = threading.Event()
+        release = threading.Event()
+        searched = threading.Event()
+        clock = _FakeClock()
+        outcomes = []
+        failures = []
+        scan_bounds = []
+
+        class BlockingScan(_Scan):
+            def project_pending(self, **kwargs):
+                scan_bounds.append(kwargs)
+                entered.set()
+                if not release.wait(2):
+                    raise TimeoutError("synthetic blocked scan")
+                clock.advance(900)
+                return super().project_pending(**kwargs)
+
+        def search():
+            calls.append("search")
+            clock.advance(0.25)
+            searched.set()
+            return dict(status="complete", months=2, rows=9, deleted=3,
+                        failed=1, rate_limited=4, pending=1)
+
+        def run():
+            try:
+                outcomes.append(run_projection_worker(
+                    _Logical(calls, work=0), _Passages(calls, work=0),
+                    BlockingScan(calls, work=0), search_plane=search,
+                    clock=clock, **self.kwargs()))
+            except BaseException as error:
+                failures.append(error)
+
+        worker = threading.Thread(target=run)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            self.assertTrue(searched.is_set(), "search waited behind blocked Parquet")
+            self.assertEqual(calls, ["embeddings", "passages", "logical", "search"])
+        finally:
+            release.set()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(failures)
+        self.assertEqual(calls, ["embeddings", "passages", "logical", "search", "scan"])
+        self.assertEqual(scan_bounds, [dict(tenant_id="tenant:company:test", batch_size=4, max_batches=2)])
+        result = outcomes[0]
+        self.assertEqual(result["search_plane_elapsed_ms"], 250)
+        self.assertEqual(result["parquet_elapsed_ms"], 900000)
+        self.assertEqual(result["cycle_elapsed_ms"], 900250)
+        self.assertEqual(result["search_plane_rows"], 9)
+        self.assertEqual(result["search_plane_failed"], 1)
+        self.assertEqual(result["search_plane_rate_limited"], 4)
+
+    def test_once_parquet_error_preserved_after_search_completed(self):
+        calls = []
+        failure = RuntimeError("synthetic parquet failure")
+
+        class FailingScan(_Scan):
+            def project_pending(self, **kwargs):
+                calls.append("scan")
+                raise failure
+
+        def search():
+            calls.append("search")
+            return dict(status="complete", months=0, rows=0, deleted=0, failed=0)
+
+        with self.assertLogs("recall_server.projection_worker", level="ERROR"), self.assertRaises(RuntimeError) as caught:
+            run_projection_worker(_Logical(calls, work=0), _Passages(calls, work=0),
+                                  FailingScan(calls), search_plane=search, **self.kwargs())
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(calls, ["embeddings", "passages", "logical", "search", "scan"])
+
+
+if __name__ == "__main__":
+    unittest.main()
