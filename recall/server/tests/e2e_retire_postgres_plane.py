@@ -31,7 +31,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(SERVER))
 
 from e2e_lossless_passages import SyntheticEmbeddingRuntime  # noqa: E402
-from recall_server import MANDATORY_SCHEMA_VERSION, RETIRE_POSTGRES_PLANE_VERSION  # noqa: E402
+from recall_server import SCHEMA_VERSION, RETIRE_POSTGRES_PLANE_VERSION  # noqa: E402
 from recall_server.archive import FilesystemArchiveStore  # noqa: E402
 from recall_server.canonical import CanonicalArchiveGateway, CanonicalPlane  # noqa: E402
 from recall_server.canonical_retrieval import BoundCanonicalRetrieval  # noqa: E402
@@ -113,7 +113,7 @@ def main() -> None:
     assert store.search_plane == "postgres"
     migrated = store.migrate()
     assert migrated["deferred"] == [RETIRE_POSTGRES_PLANE_VERSION], migrated
-    assert migrated["schema_version"] == MANDATORY_SCHEMA_VERSION, migrated
+    assert migrated["schema_version"] == SCHEMA_VERSION, migrated
     assert relation_exists(store, "canonical_passage_embeddings")
     assert relation_exists(store, "canonical_embedding_ledger")
     assert column_exists(store, "canonical_passages", "search_vector")
@@ -274,7 +274,7 @@ def main() -> None:
         retired, _ = cli("migrate", "--retire-postgres-plane")
         assert retired["applied"] == [RETIRE_POSTGRES_PLANE_VERSION], retired
         assert retired["deferred"] == [] and retired["postgres_vector_plane"] == "retired", retired
-        assert retired["schema_version"] == MANDATORY_SCHEMA_VERSION, retired
+        assert retired["schema_version"] == SCHEMA_VERSION, retired
         assert RETIRE_POSTGRES_PLANE_VERSION in recorded_versions(reader)
         assert not relation_exists(reader, "canonical_passage_embeddings")
         assert not relation_exists(reader, "canonical_passage_embeddings_hnsw_idx")
@@ -299,10 +299,10 @@ def main() -> None:
         # 6. idempotent: a second retirement run and a plain run change nothing.
         again, _ = cli("migrate", "--retire-postgres-plane")
         assert again["applied"] == [] and again["deferred"] == [], again
-        assert again["skipped"] == MANDATORY_SCHEMA_VERSION, again
+        assert again["skipped"] == SCHEMA_VERSION, again
         again, _ = cli("migrate")
         assert again["applied"] == [] and again["postgres_vector_plane"] == "retired", again
-        assert recorded_versions(reader) == list(range(1, MANDATORY_SCHEMA_VERSION + 1))
+        assert recorded_versions(reader) == list(range(1, SCHEMA_VERSION + 1))
 
         # 7. a postgres-plane store refuses to start against the retired schema.
         os.environ["RECALL_SEARCH_PLANE"] = "postgres"

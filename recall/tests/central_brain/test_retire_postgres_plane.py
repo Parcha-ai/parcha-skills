@@ -138,7 +138,7 @@ class MigrationFileTest(unittest.TestCase):
     def test_067_drops_the_vector_plane_idempotently_and_leaves_chunks_alone(self) -> None:
         self.assertEqual(SCHEMA_VERSION, 70)
         self.assertEqual(RETIRE_POSTGRES_PLANE_VERSION, 67)
-        self.assertEqual(MANDATORY_SCHEMA_VERSION, 70)
+        self.assertEqual(MANDATORY_SCHEMA_VERSION, 69)
         sql = (SCHEMA / "067_retire_postgres_vector_plane.sql").read_text()
         folded = " ".join(sql.split())
         for statement in (
@@ -240,7 +240,7 @@ class StartupCheckTest(unittest.TestCase):
                 "search_plane": "turbopuffer",
                 "schema_version": 67,
                 "postgres_vector_plane": "retired",
-                "mandatory_schema_version": 70,
+                "mandatory_schema_version": 69,
             },
         )
         self.assertEqual(

@@ -272,15 +272,26 @@ ledger are all still there, and the embedding worker resumes where it stopped). 
 rebuilt, if ever needed, with `search-outbox-seed` plus a drain.
 
 The production database gate requires a standard PostgreSQL URL with
-`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 70
-(optional migration 67 retires the Postgres vector plane and is applied by hand from
-the turbopuffer plane; every other migration is mandatory on both planes),
+`sslmode=verify-full` and an explicit trust root. Schema migrations 1 through 70
+are supported: versions through 69 are required except optional migration 67,
+which retires the Postgres vector plane and is applied explicitly from the
+turbopuffer plane. Migration 70 adds only a reconciliation performance index;
+serving accepts both schema 69 and 70 and reports the actual recorded version.
+The gate also requires
 pgvector 0.8.0 or newer, and a runtime role without superuser, database/role creation,
 replication, or RLS-bypass privilege:
 
 ```bash
 python -m recall_server.cli capability-check
 ```
+
+For a rolling 69-to-70 upgrade, first deploy a runtime that accepts both versions
+to every service while the database remains at 69. Then explicitly build and
+verify the concurrent reconciliation index and record migration 70. Keep that
+compatible runtime as the rollback floor: older exact-69 capability checks reject
+a database recording 70. Serving never applies migrations. The generic `migrate`
+command still applies 70 and its concurrent companion; a recorded marker alone
+does not prove that a concurrently built index finished successfully.
 
 `--profile local-fixture` is a visibly non-production exception restricted to a
 loopback PostgreSQL fixture. It never reports production readiness.
