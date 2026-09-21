@@ -221,7 +221,7 @@ and [bounded parent retirement](2026-09-21-recall-parent-chunk-retirement.md).
 
 ### Current company-brain checkpoint — 2026-09-21, after chunks budget cancellation
 
-MCP and projection run #648; managed ingestion runs #650. Schema 069,
+MCP runs #654; projection runs #648 and managed ingestion runs #650. Schema 069,
 archive body reads and turbopuffer search are live. The managed cycle succeeded
 at 09:15:08 UTC; its new record volume was not measured.
 
@@ -244,8 +244,10 @@ It enrolled no parent and cleared no body; the underlying exception remains
 unknown. A diagnostic-only operator preserves the cause on a fresh run. The larger
 outlier remains outside the admitted budget. PR #654 replaces 256 guarded UPDATEs
 plus deadline settings with one guarded batch UPDATE, preserving existing proof,
-locks, predicates and commit accounting. It merged as `c6f617e` after CI passed and is not deployed; local
-mutation-stage timing is not production throughput or a diagnosis of the failure.
+locks, predicates and commit accounting. It merged as `c6f617e` after CI passed and deployed to MCP only, with both workers
+unchanged. The installed publisher checksum, schema readiness and all six
+preserved archive response hashes passed. Fresh source retirement still must
+prove throughput and completion; local timing does not diagnose the old failure.
 
 **Physical progress:** documents attempt 3 completed at 09:35:12 UTC,
 reducing allocation **20,985,446,400 → 14,030,356,480 bytes**:
@@ -295,10 +297,10 @@ custom triggers, rules, RLS, partitions or inheritance on chunks/documents. The 
 boundary is a separately reviewed bounded sweep; physical reclamation and provider
 capacity remain separate exits.
 
-The original post-cancellation card passed **26/26 gates**, with all **16 original
-evaluator hashes unchanged**: recall@20 .9625, MRR .6621, backend error rate zero,
-server search p95 **840 ms**, show p95 **494.9 ms**, context p95 **4,928.3 ms** and
-scan p95 **6,959 ms**. The context result uses only three calls to a variable target;
+The original postdeployment card passed **26/26 gates** at **12:59:18 UTC**, with
+all **16 original evaluator hashes unchanged**: recall@20 .9625, MRR .6622,
+backend error rate zero, server search p95 **1,117.6 ms**, show p95 **516.4 ms**,
+context p95 **6,416.6 ms** and scan p95 **6,939.7 ms**. The context result uses only three calls to a variable target;
 it does not establish representative latency. A separate fixed-receipt diagnostic
 took 5,512 ms cold and 321/304 ms warm, with 4,526 ms in the first neighbor SQL
 query. The optional matching time-index operation merged as #653; the production
@@ -324,8 +326,8 @@ exit. No further whole-table rewrite or provider target is admitted by this chec
    Preserve exact readback and the unchanged card. Count measured allocated-byte
    reduction after cleanup, then separately verify provider volume reduction.
 2. **Finish finite source coverage, then expand explicitly.** Preserve the known
-   locator prefix and the still-unknown failure cause. Review/deploy the guarded
-   batch-update simplification, take fresh source/release proof and drain finite
+   locator prefix and the still-unknown failure cause. The guarded batch-update
+   simplification is deployed; take fresh source/release proof and drain finite
    pages. Audit complete, pending, disabled and excluded targets; retain the
    publication/clear boundary and 60-second grace. No automatic corpus enrollment.
 3. **Close the context latency gap.** Prove the reviewed query/index boundary
