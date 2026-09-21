@@ -15,6 +15,8 @@ legacy read routes.
 
 from __future__ import annotations
 
+from contextlib import ExitStack
+
 import copy
 import json
 import os
@@ -296,7 +298,10 @@ class LegacyIngestBridge:
             envelope["provenance"] = provenance
             prepared.append((principal_id, event_connector_id, artifact, envelope))
         results: list[dict[str, Any]] = []
-        with self.store.connect() as connection:
+        with ExitStack() as stack:
+            history = stack.enter_context(self.canonical_plane.prepare_history(
+                tenant_id=tenant_id, events=[item[3] for item in prepared]))
+            connection = stack.enter_context(self.store.connect())
             with connection.transaction():
                 for principal_id, event_connector_id, artifact, envelope in prepared:
                     results.append(
@@ -308,6 +313,7 @@ class LegacyIngestBridge:
                             envelope=envelope,
                             text_redacted=_text_summary(envelope),
                             _connection=connection,
+                            _history=history,
                         )
                     )
         return {
