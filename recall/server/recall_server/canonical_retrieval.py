@@ -1851,6 +1851,8 @@ class BoundCanonicalRetrieval:
     ) -> dict[str, Any]:
         """Keep hint text and receipts inside the requested event window."""
 
+        if deadline_at is None and self.chunk_body_archive is not None:
+            deadline_at = time.monotonic() + self.store.search_deadline_ms / 1000
         diagnostics = dict(response.get("diagnostics", {}))
         # Ranges whose passage window lies entirely inside [since, until] need
         # no per-receipt event lookup: every receipt in them is in the window.
@@ -3036,6 +3038,8 @@ class BoundCanonicalRetrieval:
         _deadline_at: float | None = None,
     ) -> dict[str, Any] | None:
         """Expand one receipt inside its source session without crossing grants."""
+        if _deadline_at is None and self.chunk_body_archive is not None:
+            _deadline_at = time.monotonic() + self.store.search_deadline_ms / 1000
         if (
             not isinstance(target, str)
             or not target.startswith("recall://")
@@ -4244,24 +4248,30 @@ class BoundCanonicalRetrieval:
             raise ValueError("unsupported canonical show request")
         if not self.authorized_sources:
             return None
+        deadline_at = (
+            time.monotonic() + self.store.search_deadline_ms / 1000
+            if self.chunk_body_archive is not None else None
+        )
         with self.store.connect() as connection:
-            row = self._receipt_event(connection, target)
+            row = self._receipt_event(connection, target, deadline_at=deadline_at)
             if row is None:
                 return None
             body_sql = "NULL::text" if self.chunk_body_archive is not None else "text_redacted"
-            chunks = connection.execute(
+            chunks = self.store._execute_bounded(
+                connection,
                 f"""SELECT ordinal,{body_sql} AS text,receipt
                    FROM canonical_chunks
                    WHERE tenant_id=%s AND source_id=%s AND document_id=%s
                      AND deleted_at IS NULL
                    ORDER BY ordinal""",
                 (self.tenant_id, row["source_id"], row["document_id"]),
+                deadline_at,
             ).fetchall()
         if self.chunk_body_archive is not None:
             for chunk in chunks:
                 chunk["source_id"] = row["source_id"]
                 chunk["document_id"] = row["document_id"]
-            self._hydrate_chunk_rows(chunks, text_key="text")
+            self._hydrate_chunk_rows(chunks, text_key="text", deadline_at=deadline_at)
             chunks = [
                 {key: chunk[key] for key in ("ordinal", "text", "receipt")}
                 for chunk in chunks
@@ -4300,9 +4310,14 @@ class BoundCanonicalRetrieval:
             raise ValueError("unsupported canonical related request")
         if not self.authorized_sources:
             return {"results": [], "diagnostics": {"engine": "canonical-v2"}}
+        deadline_at = (
+            time.monotonic() + self.store.search_deadline_ms / 1000
+            if self.chunk_body_archive is not None else None
+        )
         body_sql = "NULL::text" if self.chunk_body_archive is not None else "chunk.text_redacted"
         with self.store.connect() as connection:
-            rows = connection.execute(
+            rows = self.store._execute_bounded(
+                connection,
                 f"""SELECT chunk.source_id,chunk.document_id,chunk.ordinal,
                           document.native_id,document.revision,
                           event.native_parent_id,event.occurred_at,event.observed_at,
@@ -4334,8 +4349,9 @@ class BoundCanonicalRetrieval:
                     branch,
                     limit,
                 ),
+                deadline_at,
             ).fetchall()
-        self._hydrate_chunk_rows(rows)
+        self._hydrate_chunk_rows(rows, deadline_at=deadline_at)
         return {
             "results": [
                 {

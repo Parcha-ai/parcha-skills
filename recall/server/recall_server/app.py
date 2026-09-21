@@ -1985,7 +1985,9 @@ def configure_runtime(dsn: str) -> None:
                 raise RuntimeError(
                     "RECALL_EVIDENCE_TENANT_ID is required when evidence is enabled"
                 )
-            Handler.evidence_archive_store = build_evidence_archive_store()
+            Handler.evidence_archive_store = build_evidence_archive_store(
+                deadline_reads=chunk_body_reads == "archive",
+            )
             projection = EvidenceProjectionStore(Handler.evidence_archive_store)
             Handler.evidence_projector = CanonicalEvidenceProjector(
                 Handler.store,
