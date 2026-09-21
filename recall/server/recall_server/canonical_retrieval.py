@@ -835,6 +835,8 @@ class BoundCanonicalRetrieval:
         limit: int = 10,
         _authorized_source: Any = None,
     ) -> dict[str, Any]:
+        if getattr(self.store, 'search_plane', 'postgres') != 'postgres':
+            raise ValueError('legacy chunk evaluation requires the postgres search plane')
         if not isinstance(query, str) or not query.strip() or len(query) > 8192:
             raise ValueError("invalid canonical search query")
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 20:
