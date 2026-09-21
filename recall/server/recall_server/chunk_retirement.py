@@ -140,9 +140,14 @@ def _apply_verified(store, *, catalog, plan, tenant_id, source_id, document_ids,
             ledger = store._execute_bounded(connection,
                 "SELECT to_regclass('canonical_chunk_retirement_progress') AS ledger", (), deadline_at).fetchone()['ledger']
             if ledger is not None:
-                store._execute_bounded(connection, '''UPDATE canonical_chunk_retirement_progress
-                    SET enabled=false,scope_epoch=scope_epoch+1,status='disabled',updated_at=clock_timestamp()
-                    WHERE tenant_id=%s AND source_id=%s AND logical_document_id=ANY(%s)''',
+                store._execute_bounded(connection, '''INSERT INTO canonical_chunk_retirement_progress
+                    (tenant_id,source_id,native_parent_id,logical_document_id,enabled,status)
+                    SELECT tenant_id,source_id,native_parent_id,logical_document_id,false,'disabled'
+                    FROM canonical_evidence_documents
+                    WHERE tenant_id=%s AND source_id=%s AND logical_document_id=ANY(%s)
+                    ON CONFLICT(tenant_id,source_id,native_parent_id) DO UPDATE SET
+                    enabled=false,scope_epoch=canonical_chunk_retirement_progress.scope_epoch+1,
+                    status='disabled',updated_at=clock_timestamp()''',
                     (tenant_id, source_id, parents), deadline_at)
             for document in plan['documents']:
                 missing = {chunk['ordinal'] for chunk in document['chunks']
@@ -337,6 +342,17 @@ def _parent_deadline(deadline_at):
     return deadline_at
 
 
+def require_retirement_owner(store, connection, scope, principal_id, deadline_at):
+    """Lock the current source/grant through a bounded body transaction."""
+    found = store._execute_bounded(connection, """SELECT source.source_id
+        FROM canonical_sources source JOIN canonical_source_grants grant_row USING(tenant_id,source_id)
+        WHERE source.tenant_id=%s AND source.source_id=%s AND source.owner_principal_id=%s
+          AND grant_row.principal_id=%s AND grant_row.permission='owner'
+        FOR SHARE OF source,grant_row NOWAIT""", (*scope, principal_id, principal_id), deadline_at).fetchone()
+    if found is None:
+        raise ChunkRetirementError('retirement_owner_required')
+
+
 def _parent_progress(store, connection, scope, deadline_at, *, lock=False):
     sql = '''SELECT * FROM canonical_chunk_retirement_progress
              WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s'''
@@ -374,7 +390,7 @@ def invalidate_parent_retirement(query, scope):
             WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s AND enabled""", scope)
 
 
-def _retire_parent_batch(store, *, proof, rows, scope, limits, deadline_at, complete, remaining_bytes):
+def _retire_parent_batch(store, *, proof, rows, scope, limits, deadline_at, complete, remaining_bytes, owner_principal_id=None):
     from .parent_chunk_proof import manifest_identity, read_parent_catalog
     if os.environ.get('RECALL_CHUNK_BODY_READS', 'postgres') != 'archive':
         raise ChunkRetirementError('chunk_retirement_archive_reads_required')
@@ -387,6 +403,8 @@ def _retire_parent_batch(store, *, proof, rows, scope, limits, deadline_at, comp
     with store.connect() as connection, connection.transaction():
         def query(sql, values=()):
             return store._execute_bounded(connection, sql, values, deadline_at)
+        if owner_principal_id is not None:
+            require_retirement_owner(store, connection, scope[:2], owner_principal_id, deadline_at)
         for key in sorted(f'v2\x1f{scope[0]}\x1f{scope[1]}\x1f{row["native_id"]}' for row in rows):
             if not query('SELECT pg_try_advisory_xact_lock(hashtextextended(%s,0)) AS locked', (key,)).fetchone()['locked']:
                 raise ChunkRetirementError('parent_retirement_lock_busy')
@@ -458,7 +476,8 @@ def _retire_parent_batch(store, *, proof, rows, scope, limits, deadline_at, comp
 
 
 def retire_parent_chunks(store, archive, *, tenant_id, source_id, native_parent_id,
-                         apply=False, reviewed_plan=None, limits=None, deadline_at=None):
+                         apply=False, reviewed_plan=None, limits=None, deadline_at=None,
+                         required_scope_epoch=None, owner_principal_id=None, should_stop=None):
     """Dry-run one exact parent; complete archive proof precedes bounded commits.
 
     Only attempt-local proof authorizes body updates. The persistent cursor is
@@ -469,6 +488,10 @@ def retire_parent_chunks(store, archive, *, tenant_id, source_id, native_parent_
     limits = ParentRetirementLimits() if limits is None else limits
     if not isinstance(limits, ParentRetirementLimits) or type(apply) is not bool:
         raise ChunkRetirementError('parent_retirement_limits_invalid')
+    if (required_scope_epoch is not None and (type(required_scope_epoch) is not int or required_scope_epoch < 1)
+            or owner_principal_id is not None and (not isinstance(owner_principal_id, str) or not IDENTITY_RE.fullmatch(owner_principal_id))
+            or should_stop is not None and not callable(should_stop)):
+        raise ChunkRetirementError('parent_retirement_scope_invalid')
     deadline_at = _parent_deadline(deadline_at)
     totals = dict(cleared_documents=0, cleared_chunks=0, cleared_utf8_bytes=0, hashed_utf8_bytes=0,
                   hash_ms=0.0, sql_ms=0.0, batches=0)
@@ -483,7 +506,8 @@ def retire_parent_chunks(store, archive, *, tenant_id, source_id, native_parent_
                 raise ChunkRetirementError('chunk_retirement_archive_reads_required')
             if not isinstance(reviewed_plan, dict):
                 raise ChunkRetirementError('chunk_retirement_reviewed_plan_required')
-            if not progress or not progress['enabled']:
+            if (not progress or not progress['enabled']
+                    or required_scope_epoch is not None and progress['scope_epoch'] != required_scope_epoch):
                 raise ChunkRetirementError('parent_retirement_disabled')
         with prove_parent_chunks(store, archive, scope=scope, limits=limits, deadline_at=deadline_at) as proof:
             report = {key: value for key, value in proof.items() if key not in {'spool','manifest'}}
@@ -497,11 +521,14 @@ def retire_parent_chunks(store, archive, *, tenant_id, source_id, native_parent_
             def commit(complete=False):
                 result = _retire_parent_batch(store, proof=proof, rows=rows, scope=scope,
                     limits=limits, deadline_at=min(deadline_at, time.monotonic() + 5), complete=complete,
-                    remaining_bytes=limits.max_clear_bytes-totals['cleared_utf8_bytes'])
+                    remaining_bytes=limits.max_clear_bytes-totals['cleared_utf8_bytes'], owner_principal_id=owner_principal_id)
                 for key, value in result.items():
                     totals[key] += value
                 totals['batches'] += 1
             for row in proof['spool'].verified():
+                _check(deadline_at)
+                if should_stop is not None and should_stop():
+                    return dict(report, **totals, status='stopped', complete=False)
                 if row['body_record_ordinal'] <= cursor and row['pg_body_bytes'] == 0:
                     continue
                 if row['pg_body_bytes'] > limits.hash_bytes:
@@ -519,6 +546,8 @@ def retire_parent_chunks(store, archive, *, tenant_id, source_id, native_parent_
                 rows.append(row)
                 chunk_count += len(row['chunks'])
                 byte_count += row['pg_body_bytes']
+            if should_stop is not None and should_stop():
+                return dict(report, **totals, status='stopped', complete=False)
             commit(complete=True)
             return dict(report, **totals, status='applied', complete=True)
     except Exception as error:
