@@ -108,7 +108,7 @@ def run_projection_worker(
     """Service every projection stage without upstream backfill starvation.
 
     ``search_plane`` (H3-b) drains the search projection outbox into
-    turbopuffer once per cycle, after the parquet phase; ``None`` (no
+    turbopuffer once per cycle, after logical projection and before Parquet; ``None`` (no
     turbopuffer settings, or ``--search-plane off``) skips the phase and the
     cycle reports zeros for it.
 
@@ -199,6 +199,27 @@ def run_projection_worker(
             )
             logical_elapsed_ms = elapsed_ms(phase_started)
             phase_started = clock()
+            # Search reads current logical/passages, not Parquet artifacts.
+            # Drain its bounded outbox before a synchronous month rebuild.
+            # H3-b: the search plane drains its own outbox, one bounded batch
+            # of source-months per cycle; a turbopuffer failure on a month is
+            # counted, logged by class inside the projector, and retried next
+            # cycle because the outbox row stays.
+            searched = (
+                search_plane()
+                if search_plane is not None
+                else {
+                    "status": "skipped",
+                    "months": 0,
+                    "rows": 0,
+                    "deleted": 0,
+                    "failed": 0,
+                    "rate_limited": 0,
+                    "pending": 0,
+                }
+            )
+            search_plane_elapsed_ms = elapsed_ms(phase_started) if search_plane is not None else 0
+            phase_started = clock()
             # Parquet shards are source/month materializations of the authoritative
             # logical documents. Prefer to run them once the upstream queues have
             # drained so a dirty month is rebuilt once, but never starve them: with
@@ -238,25 +259,6 @@ def run_projection_worker(
                 }
             )
             parquet_elapsed_ms = elapsed_ms(phase_started)
-            phase_started = clock()
-            # H3-b: the search plane drains its own outbox, one bounded batch
-            # of source-months per cycle; a turbopuffer failure on a month is
-            # counted, logged by class inside the projector, and retried next
-            # cycle because the outbox row stays.
-            searched = (
-                search_plane()
-                if search_plane is not None
-                else {
-                    "status": "skipped",
-                    "months": 0,
-                    "rows": 0,
-                    "deleted": 0,
-                    "failed": 0,
-                    "rate_limited": 0,
-                    "pending": 0,
-                }
-            )
-            search_plane_elapsed_ms = elapsed_ms(phase_started) if search_plane is not None else 0
             phase_started = clock()
             # The thinner has its own row-level authority gates: live S3 raw data,
             # an S3 logical manifest, retained searchable chunks, and no queued
