@@ -182,6 +182,30 @@ class _VerifiedArchive:
         return payload
 
 
+def chunk_catalog_snapshot(
+    store: Any, *, tenant_id: str, source_ids: tuple[str, ...],
+    document_ids: tuple[str, ...], deadline_at: float | None = None,
+    connection: Any = None,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """One complete reader fence; an existing locked transaction may reuse it."""
+    _check_deadline(deadline_at)
+    params = (tenant_id, list(source_ids), list(document_ids))
+    if connection is None:
+        with store.connect() as opened:
+            rows = store._execute_bounded(opened, _CATALOG_SQL, params, deadline_at).fetchall()
+    else:
+        rows = store._execute_bounded(connection, _CATALOG_SQL, params, deadline_at).fetchall()
+    _check_deadline(deadline_at)
+    result = {}
+    for row in rows:
+        key = row["source_id"], row["document_id"]
+        if (row["tenant_id"] != tenant_id or key[0] not in source_ids
+                or key[1] not in document_ids or key in result):
+            raise ChunkBodyError("archived_chunk_body_unavailable")
+        result[key] = row
+    return result
+
+
 def read_archived_chunks(
     store: Any,
     archive: Any,
@@ -239,21 +263,9 @@ def read_archived_chunks(
                for key, values in chunk_ordinals.items())
     ):
         raise ChunkBodyError("archived_chunk_request_invalid")
-    params = (tenant_id, list(source_ids), list(document_ids))
-
     def snapshot():
-        _check_deadline(deadline_at)
-        with store.connect() as connection:
-            rows = store._execute_bounded(connection, _CATALOG_SQL, params, deadline_at).fetchall()
-        _check_deadline(deadline_at)
-        result = {}
-        for row in rows:
-            key = row["source_id"], row["document_id"]
-            if (row["tenant_id"] != tenant_id or key[0] not in source_ids
-                    or key[1] not in document_ids or key in result):
-                raise ChunkBodyError("archived_chunk_body_unavailable")
-            result[key] = row
-        return result
+        return chunk_catalog_snapshot(store, tenant_id=tenant_id, source_ids=source_ids,
+                                      document_ids=document_ids, deadline_at=deadline_at)
 
     try:
         before = snapshot()

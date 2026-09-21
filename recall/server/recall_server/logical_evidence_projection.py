@@ -2315,6 +2315,36 @@ class CanonicalLogicalEvidenceProjector:
                         generation=1,
                         revision=1,
                     )
+                    # Whole-parent deletion cannot discard the only bodies of
+                    # surviving events. Serialize this check with retirement's
+                    # FOR SHARE fence before inspecting any survivor.
+                    try:
+                        connection.execute(
+                            """SELECT logical_document_id FROM canonical_evidence_documents
+                               WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s
+                               FOR UPDATE NOWAIT""",
+                            (tenant_id, source_id, parent_id),
+                        ).fetchall()
+                    except psycopg.errors.LockNotAvailable:
+                        raise LogicalEvidenceError("logical_evidence_parent_busy") from None
+                    survivor = connection.execute(
+                        """SELECT 1 FROM canonical_documents document
+                           JOIN canonical_events event USING(tenant_id,source_id,event_id)
+                           WHERE document.tenant_id=%s AND document.source_id=%s
+                             AND COALESCE(event.native_parent_id,event.native_id)=%s
+                             AND document.is_current AND document.deleted_at IS NULL
+                             AND NOT (document.native_id=ANY(%s))
+                             AND EXISTS (SELECT 1 FROM canonical_chunks chunk
+                                 WHERE chunk.tenant_id=document.tenant_id
+                                   AND chunk.source_id=document.source_id
+                                   AND chunk.document_id=document.document_id
+                                   AND chunk.deleted_at IS NULL AND chunk.text_redacted=''
+                                   AND chunk.text_sha256<>%s)
+                           LIMIT 1""",
+                        (tenant_id, source_id, parent_id, native_ids, hashlib.sha256(b"").hexdigest()),
+                    ).fetchone()
+                    if survivor:
+                        raise LogicalEvidenceError("logical_evidence_survivor_body_required")
                     manifest, parts = self._old_references(
                         connection,
                         candidate,
