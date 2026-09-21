@@ -11,6 +11,7 @@ from unittest import mock
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from recall_server.archive import ArchiveNotFound
 from recall_server.parquet_scan import (
     FRAGMENT_TARGET_BYTES,
     SCAN_DATASETS,
@@ -335,6 +336,49 @@ class ParquetScanContractTest(unittest.TestCase):
         self.assertEqual(projector.built, ["source:ready"])
         self.assertEqual(result["shards"], 1)
         self.assertEqual(result["contended"], 1)
+
+    def test_missing_evidence_candidate_does_not_hide_the_next_ready_candidate(self):
+        class MissingFirst(_WindowProbe):
+            def _build(self, candidate):
+                if candidate.source_id == "source:ready":
+                    raise ParquetScanError("parquet_scan_evidence_requeued")
+                return super()._build(candidate)
+
+        projector = MissingFirst()
+        result = projector.project_pending(
+            tenant_id="tenant:test",
+            batch_size=2,
+            max_batches=1,
+        )
+
+        self.assertEqual(projector.built, ["source:later"])
+        self.assertEqual(result["shards"], 1)
+        self.assertEqual(result["requeued"], 1)
+
+    def test_missing_raw_part_requeues_its_logical_document(self):
+        class MissingArchive:
+            def read_raw(self, _reference):
+                raise ArchiveNotFound("archive object not found")
+
+        class RequeueProbe(CanonicalParquetScanProjector):
+            def __init__(self):
+                super().__init__(None, _Evidence(MissingArchive()))
+                self.requeued = []
+
+            def _requeue_missing_document(self, document):
+                self.requeued.append(document["logical_document_id"])
+
+        projector = RequeueProbe()
+        with self.assertRaisesRegex(ParquetScanError, "evidence_requeued"):
+            projector._project_document(
+                _candidate(),
+                _document("Employee"),
+                bucket_start=datetime(2026, 8, 1, tzinfo=timezone.utc),
+                bucket_end=datetime(2026, 9, 1, tzinfo=timezone.utc),
+                record_budget=100,
+            )
+
+        self.assertEqual(projector.requeued, ["document:test"])
 
     def test_typed_parquet_round_trip_preserves_large_record_json(self):
         row = {

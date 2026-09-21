@@ -231,6 +231,7 @@ def run_projection_worker(
                     "rows": 0,
                     "stale": 0,
                     "contended": 0,
+                    "requeued": 0,
                     "fragments_rewritten": 0,
                     "fragments_total": 0,
                     "documents_dirty": 0,
@@ -302,6 +303,7 @@ def run_projection_worker(
                     and int(scanned["shards"]) == 0
                     and int(scanned["stale"]) == 0
                     and int(scanned["contended"]) == 0
+                    and int(scanned.get("requeued", 0)) == 0
                     and thinned["status"] == "complete"
                     and int(searched["months"]) == 0
                     and int(searched["failed"]) == 0
@@ -330,6 +332,7 @@ def run_projection_worker(
                 "parquet_rows": int(scanned["rows"]),
                 "parquet_stale": int(scanned["stale"]),
                 "parquet_contended": int(scanned["contended"]),
+                "parquet_requeued": int(scanned.get("requeued", 0)),
                 "parquet_fragments_rewritten": int(scanned.get("fragments_rewritten", 0)),
                 "parquet_fragments_total": int(scanned.get("fragments_total", 0)),
                 "parquet_documents_dirty": int(scanned.get("documents_dirty", 0)),
@@ -376,6 +379,7 @@ def run_projection_worker(
                 "embedding_error=%s "
                 "parquet_shards=%s "
                 "parquet_rows=%s parquet_stale=%s parquet_contended=%s "
+                "parquet_requeued=%s "
                 "parquet_fragments_rewritten=%s parquet_fragments_total=%s "
                 "parquet_documents_dirty=%s "
                 "search_plane_months=%s search_plane_rows=%s "
@@ -416,6 +420,7 @@ def run_projection_worker(
                         "parquet_rows",
                         "parquet_stale",
                         "parquet_contended",
+                        "parquet_requeued",
                         "parquet_fragments_rewritten",
                         "parquet_fragments_total",
                         "parquet_documents_dirty",

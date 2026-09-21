@@ -270,6 +270,33 @@ class ProjectionWorkerTest(unittest.TestCase):
         self.assertEqual(result["status"], "pending")
         self.assertEqual(result["parquet_contended"], 1)
 
+    def test_requeued_scan_evidence_is_visible_and_not_truthfully_complete(self):
+        calls: list[str] = []
+
+        class RequeuedScan(_Scan):
+            def project_pending(self, **kwargs):
+                result = super().project_pending(**kwargs)
+                result["requeued"] = 1
+                return result
+
+        result = run_projection_worker(
+            _Logical(calls, work=0),  # type: ignore[arg-type]
+            _Passages(calls, work=0),  # type: ignore[arg-type]
+            RequeuedScan(calls, work=0),  # type: ignore[arg-type]
+            tenant_id="tenant:company:test",
+            logical_batch_size=25,
+            passage_batch_size=100,
+            embedding_batch_size=128,
+            max_batches_per_cycle=10,
+            upload_concurrency=2,
+            passage_concurrency=4,
+            interval_seconds=5,
+            once=True,
+        )
+
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(result["parquet_requeued"], 1)
+
     def test_empty_cycle_is_truthfully_complete(self):
         calls: list[str] = []
         result = run_projection_worker(

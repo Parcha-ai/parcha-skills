@@ -21,6 +21,8 @@ import orjson
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from .archive import ArchiveNotFound
+
 
 PARQUET_MEDIA_TYPE = "application/vnd.apache.parquet"
 SCAN_SCHEMA_VERSION = 2
@@ -1023,7 +1025,11 @@ class CanonicalParquetScanProjector:
                     raise ParquetScanError("parquet_scan_state_invalid")
                 if part_last < bucket_start or part_first >= bucket_end:
                     continue
-            payload = self.archive.read_raw(_reference(part))
+            try:
+                payload = self.archive.read_raw(_reference(part))
+            except ArchiveNotFound:
+                self._requeue_missing_document(document)
+                raise ParquetScanError("parquet_scan_evidence_requeued") from None
             observed_first = observed_last = None
             for line in payload.splitlines():
                 try:
@@ -1136,6 +1142,26 @@ class CanonicalParquetScanProjector:
             last,
             tuple(discovered_bounds),
         )
+
+    def _requeue_missing_document(self, document: dict[str, Any]) -> None:
+        """Rebuild a current logical document whose immutable part disappeared."""
+
+        with self.store.connect() as connection:
+            connection.execute(
+                """INSERT INTO canonical_evidence_document_queue(
+                       tenant_id,source_id,native_parent_id,generation,
+                       reason,changed_at
+                   ) VALUES (%s,%s,%s,1,'backfill',clock_timestamp())
+                   ON CONFLICT(tenant_id,source_id,native_parent_id)
+                   DO UPDATE SET
+                       generation=canonical_evidence_document_queue.generation+1,
+                       reason='backfill',changed_at=clock_timestamp()""",
+                (
+                    document["tenant_id"],
+                    document["source_id"],
+                    document["native_parent_id"],
+                ),
+            )
 
     def _persist_part_bounds(self, bounds: list[PartTimeBound]) -> None:
         if not bounds:
@@ -1876,7 +1902,22 @@ class CanonicalParquetScanProjector:
             if not acquired:
                 totals["contended"] += 1
                 return False
-            upload = self._build(candidate)
+            try:
+                upload = self._build(candidate)
+            except ParquetScanError as error:
+                if str(error) != "parquet_scan_evidence_requeued":
+                    raise
+                totals["requeued"] += 1
+                LOG.warning(
+                    "parquet evidence requeued tenant=%s source=%s bucket=%s "
+                    "reason=%s generation=%s",
+                    hashlib.sha256(candidate.tenant_id.encode()).hexdigest()[:12],
+                    hashlib.sha256(candidate.source_id.encode()).hexdigest()[:12],
+                    candidate.bucket_start.isoformat(),
+                    candidate.reason,
+                    candidate.generation,
+                )
+                return True
             status = self._commit(candidate, upload)
             if status in ("committed", "requeued"):
                 totals["committed"] += 1
@@ -1917,6 +1958,7 @@ class CanonicalParquetScanProjector:
             "fragments_rewritten": 0,
             "documents_dirty": 0,
             "compacted": 0,
+            "requeued": 0,
         }
         for _ in range(max_batches):
             candidate_limit = min(32, batch_size + 7)
@@ -1950,4 +1992,5 @@ class CanonicalParquetScanProjector:
             "fragments_total": self._fragment_total(tenant_id=tenant_id),
             "documents_dirty": totals["documents_dirty"],
             "compacted": totals["compacted"],
+            "requeued": totals["requeued"],
         }
