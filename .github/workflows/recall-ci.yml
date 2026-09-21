@@ -95,7 +95,8 @@ jobs:
             e2e_retire_postgres_plane.py \
             e2e_parent_scoped_retrieval.py \
             e2e_archived_chunk_reads.py \
-            e2e_pending_archived_chunks.py
+            e2e_pending_archived_chunks.py \
+            e2e_archived_resolve.py
           do
             python "server/tests/$test"
           done

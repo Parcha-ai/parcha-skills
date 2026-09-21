@@ -146,6 +146,14 @@ class ResolveHandlerAuthorityTests(unittest.TestCase):
             self.assertEqual(actual['authorized_source'], principal.get('source_id'))
             self.assertIsNone(actual['chunk_body_archive'])
 
+    def test_legacy_principal_uses_current_canonical_grants(self):
+        handler = self.handler({'kind': 'collector', 'tenant_id': TENANT,
+                                'principal_id': 'principal:test', 'authorized_sources': ()})
+        handler.store.authorized_canonical_source_ids.return_value = (SOURCE,)
+        handler.do_GET()
+        handler.store.authorized_canonical_source_ids.assert_called_once_with(TENANT, 'principal:test')
+        self.assertEqual(handler.store.resolve.call_args.kwargs['authorized_sources'], (SOURCE,))
+
     def test_mcp_missing_tenant_is_denied_before_store(self):
         handler = self.handler({'kind': 'mcp', 'authorized_sources': (SOURCE,)})
         with mock.patch.dict(os.environ, {}, clear=True):

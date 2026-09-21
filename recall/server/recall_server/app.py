@@ -1077,8 +1077,15 @@ class Handler(BaseHTTPRequestHandler):
                 # Match the existing v1-to-canonical ingest bridge for local,
                 # Tailscale and collector callers that predate tenant credentials.
                 tenant_id = legacy_ingest_tenant_id(principal)
-                grants = principal.get("authorized_sources")
-                source_grants = tuple(grants) if grants is not None else None
+                if principal.get("principal_id"):
+                    # Legacy credentials authenticate on v1, but canonical
+                    # receipts need current grants from the canonical tenant.
+                    source_grants = tuple(self.store.authorized_canonical_source_ids(
+                        tenant_id, principal["principal_id"],
+                    ))
+                else:
+                    grants = principal.get("authorized_sources")
+                    source_grants = tuple(grants) if grants is not None else None
             receipt = parse_qs(parsed.query).get("receipt", [""])[0]
             try:
                 result = self.store.resolve(
