@@ -102,6 +102,14 @@ def manifest_identity(manifest):
     return {key: value for key, value in manifest.items() if key in fields or key.startswith('manifest_')}
 
 
+def parent_retirement_plan(scope, manifest):
+    """Same exact manifest plan for manual review and explicitly enabled policy."""
+    plan = dict(contract='recall.parent-chunk-retirement-plan.v1', tenant_id=scope[0], source_id=scope[1],
+                native_parent_id=scope[2], manifest=manifest_identity(manifest), operation='clear')
+    plan['proof_sha256'] = hashlib.sha256(orjson.dumps(plan, option=orjson.OPT_SORT_KEYS)).hexdigest()
+    return plan
+
+
 def read_parent_catalog(store, connection, scope, deadline_at, *, lock=False):
     sql = _PARENT_SQL + (' FOR SHARE OF evidence NOWAIT' if lock else '')
     found = store._execute_bounded(connection, sql, scope, deadline_at).fetchone()
@@ -193,9 +201,7 @@ def prove_parent_chunks(store, archive, *, scope, limits, deadline_at):
             if manifest_identity(current['manifest']) != identity:
                 raise _error('parent_retirement_parent_changed')
         _check_deadline(deadline_at)
-        plan = dict(contract='recall.parent-chunk-retirement-plan.v1', tenant_id=scope[0], source_id=scope[1],
-                    native_parent_id=scope[2], manifest=identity, operation='clear')
-        plan['proof_sha256'] = hashlib.sha256(orjson.dumps(plan, option=orjson.OPT_SORT_KEYS)).hexdigest()
+        plan = parent_retirement_plan(scope, identity)
         yield dict(spool=spool, manifest=identity, plan=plan, current_documents=count, current_chunks=chunk_count, eligible_documents=eligible,
                    eligible_utf8_bytes=eligible_bytes, excluded=dict(excluded), archive_gets=meter.gets,
                    archive_bytes=meter.bytes)
