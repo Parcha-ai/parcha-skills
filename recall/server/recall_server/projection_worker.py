@@ -99,6 +99,7 @@ def run_projection_worker(
     max_wait_seconds: float = 0.0,
     clock: Callable[[], float] = time.monotonic,
     parquet_every_cycles: int = 3,
+    parquet_max_wait_seconds: float = 900.0,
     cleanup_concurrency: int = 8,
     max_cycles: int | None = None,
     skip_embedding: bool = False,
@@ -127,12 +128,16 @@ def run_projection_worker(
         isinstance(parquet_every_cycles, bool)
         or not isinstance(parquet_every_cycles, int)
         or not 1 <= parquet_every_cycles <= 1000
+        or isinstance(parquet_max_wait_seconds, bool)
+        or not isinstance(parquet_max_wait_seconds, (int, float))
+        or not 1 <= parquet_max_wait_seconds <= 86_400
         or isinstance(cleanup_concurrency, bool)
         or not isinstance(cleanup_concurrency, int)
         or not 1 <= cleanup_concurrency <= 64
     ):
         raise ValueError("projection worker budget is invalid")
     cycles_since_parquet = 0
+    last_parquet_started = clock()
 
     def elapsed_ms(started: float) -> int:
         return max(0, int(round((clock() - started) * 1000)))
@@ -206,9 +211,13 @@ def run_projection_worker(
                 int(documents.get("pending", 0)) == 0
                 and projected["status"] == "complete"
                 and int(projected["documents"]) == 0
-            ) or cycles_since_parquet >= parquet_every_cycles
+            ) or (
+                cycles_since_parquet >= parquet_every_cycles
+                or clock() - last_parquet_started >= parquet_max_wait_seconds
+            )
             if scan is not None and parquet_due:
                 cycles_since_parquet = 0
+                last_parquet_started = clock()
             scanned = (
                 scan.project_pending(
                     tenant_id=tenant_id,

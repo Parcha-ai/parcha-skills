@@ -1812,6 +1812,10 @@ def main() -> None:
         help="run the parquet scan projector at least every N cycles even while logical work is queued",
     )
     projection_worker.add_argument(
+        "--parquet-max-wait-seconds", type=float, default=900.0,
+        help="run the parquet scan projector after this wall-clock delay even when cycles are long",
+    )
+    projection_worker.add_argument(
         "--cleanup-concurrency", type=int, default=8,
         help="parallel S3 object deletes while draining the evidence cleanup queue",
     )
@@ -2579,6 +2583,7 @@ def main() -> None:
                     quiet_seconds=args.quiet_seconds,
                     max_wait_seconds=args.max_wait_seconds,
                     parquet_every_cycles=args.parquet_every_cycles,
+                    parquet_max_wait_seconds=args.parquet_max_wait_seconds,
                     cleanup_concurrency=args.cleanup_concurrency,
                     skip_embedding=args.skip_embedding,
                     search_plane=search_plane,
