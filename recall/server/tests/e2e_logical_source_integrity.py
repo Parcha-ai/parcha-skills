@@ -132,7 +132,10 @@ def run_case(store, root, *, position, corruption):
         scope = (tenant, source, document)
         where = "WHERE tenant_id=%s AND source_id=%s AND document_id=%s"
         if corruption == "cleared_body":
-            connection.execute("UPDATE canonical_chunks SET text_redacted='' " + where, scope)
+            # A new revision has no matching archive proof. Cleared old
+            # revisions are now explicitly recoverable in the reprojection E2E.
+            connection.execute("UPDATE canonical_documents SET revision=2 " + where, scope)
+            connection.execute("UPDATE canonical_chunks SET text_redacted='', receipt=replace(receipt,'?rev=1#','?rev=2#') " + where, scope)
         elif corruption == "document_hash":
             connection.execute("UPDATE canonical_documents SET text_sha256=%s " + where, ("0" * 64, *scope))
         elif corruption == "chunk_hash":
