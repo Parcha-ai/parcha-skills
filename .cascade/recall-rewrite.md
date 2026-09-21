@@ -189,52 +189,62 @@ Design (`server/recall_server/turbopuffer_plane.py`): one namespace per tenant (
 
 ### Storage retirement resumed — 2026-09-20
 
-Owner: Codex lead. User explicitly reprioritized completing the promised downsizing over H6/Jev. Search cutover is complete; storage retirement is not. Preserve the final catalog-only Postgres objective and all independent card gates.
+**Checkpoint: 2026-09-21, 18:41 UTC.** Measured relation/index reclaim is
+**34.23 GiB**; the latest unchanged original card passed **26/26**. Provider
+replacement remains active: old **3 × 300 GiB** nodes serve while new
+**3 × 275 GiB** nodes restore. No new resize PATCH was submitted. Completed
+capacity reduction, billed savings and full corpus retirement remain unproved.
+Ordinary maintenance stays held until the replacement finishes.
 
-Read-only baseline: Postgres **202,610,153,139 bytes (188.7 GiB)**; writable/ready, PS80, two replicas, 300 GiB disk floor/cap. Chunk table ~106.7 GiB including ~18.04 GiB `canonical_chunks_search_idx`; do not treat total relation size as removable body bytes. `canonical_evidence_objects` exact count **0**; approximately 11.25M live/current document rows, 31K logical documents and 38.6K logical parts. Existing thinning already moved most document/event bodies; their catalog/index footprints remain substantial. Private evidence: `~/.recall/storage-retirement-20260920/`.
+Owner: Codex lead. Storage downsizing remains the priority over H6/Jev. Detailed
+measurements, earlier failures, cleanup and limits remain in the
+[current storage runbook](../recall/docs/architecture/storage-runbook.md#current-company-brain-checkpoint--2026-09-21-events-validated-disk-replacements-in-progress).
 
 | Phase | Boundary | State | Acceptance before next phase |
 |---|---|---|---|
-| S0 | Live dependency/storage baseline | verified | Six body-reading code paths, both ingest paths, logical reprojection and receipt liveness inventoried; heap/index/TOAST separated. The deployed HTTP profile hides public receipt resolution, which remains a supported-code dependency. |
-| S1 | Last chunk full-text consumer → session-scoped turbopuffer | done | PR #622 deployed as `7bf7f8c`; targeted source hits 9/12 → 12/12. Removed only `canonical_chunks_search_idx`: **19,381,166,080 bytes (18.05 GiB)** reclaimed; database 202,818,811,571 → 183,432,861,363 bytes. Independent cards before/after each passed 14/14 gates over 43 cases; after removal recall@20 .9625, MRR .6617, p95 1,589 ms, no backend errors. No source bodies/rows deleted. |
-| S2 | One reader over existing logical evidence parts | live; #658 runtime proof and original card passed | MCP #658 (`78f6ba0`) is live; projection stays #648 (`79eb84a`), managed #650 (`e2afc48`), schema 069, archive reads and turbopuffer. Only MCP restarted; the new release adds closed locator statement-stage diagnostics without changing publication semantics. Runtime verification succeeded at **14:53:40 UTC** in **5,055 ms**: installed publisher/archive hashes, schema69/readiness, six exact preserved response pairs, eight archive reads and two documents still empty in PostgreSQL. The post-#658 original card passed **26/26** at **15:02:32 UTC**, all 16 verifier hashes unchanged, recall@20 **.9625**, MRR **.6628**, backend/auth/tool errors **0**; p95 server **1,009.2 ms**, search **1,464.2 ms**, show **655.3 ms**, context **5,140.3 ms**, scan **7,578.7 ms**, scope **351.3 ms**. The earlier predeploy/source15 card at **14:49:44 UTC** passed **26/26**, all 16 verifier hashes unchanged: recall@20 **.9625**, MRR **.6579**, backend errors **0**, server p95 **813.0 ms**, show **578.1 ms**, context **3,843.2 ms**, scan **8,314.5 ms**. Earlier source13 cards **22/26 then 25/26** remain preserved; recovery is not a causal speed or quality gain. |
-| S3 | Reprojection + public resolve + both ingest writers | archive compatibility live; managed cycle recovered | #624/#626/#627/#629/#633 provide pre-upload integrity, archive-backed reprojection, shared authorized hydration, restore-before-supersession and retired-embedding bypass. Exact retired-body response probes passed, including the latest MCP runtime proof. Managed #650 includes daemon failover retry and the corrected Slack join JSON request; six preserved read pairs matched, and a successful managed cycle was recorded at **09:15:08 UTC**. This supersedes the earlier upstream-error/latest-success-August 15 checkpoint; newly ingested record volume was not measured. |
-| S4a | Locators and bounded clear/restore | production canary passed | Schema068 and ten verified locators were already live. A fresh #638 proof cleared one document/chunk, **22,037 bytes**, with exact archived show/context/resolve; a separate fresh restore proof restored all bytes and exact PostgreSQL responses. The original #632 apply was never launched. Recovery is proved for this bounded canary, not the full corpus. Flag-only PostgreSQL rollback is unsafe whenever retired current bodies remain: restore them first. |
-| S4b | Locators and bounded clear/restore at source scale | finite progress; full volume remains | Source13 published **30,861 locators / 159 transactions**, enrolled 50 parents, then acknowledged **23,676 documents / 28,041 chunks / 166,360,038 UTF-8 bytes** before one deadline stop; no unknown commit, three exact read pairs. Gentler source15 completed **10 parent proofs / 17 batches** in **31.086 s**, clearing **2,289 documents / 2,433 chunks / 9,496,691 bytes**, zero errors/partials/unknowns and three exact pairs; result is `bounded`, not source completion. Lifetime clears are **147,234 documents / 162,492 chunks / 711,293,440 UTF-8 bytes**, not current bytes or physical savings. Discovery reaches **235 parents**, with **233 enabled**; the last whole-source audit remains 183 proof-complete / 2,645 at 10:29:48 UTC. All three earlier pending/outlier residuals remain, including the contended parent whose source11/12 added 51,200 then 2,304 locators before known `55P03` stops. Fresh proof is required; #658 now exposes the closed statement stage, not a previously unknown blocker identity. The three-page driver remains disabled after source13 pressure; use gentler bounded work and fresh quality checks. |
-| S4v | Remove the redundant stored chunk vector | column absent; finite sweep proved safe; physical reclaim pending | #652 removed the column at 10:49:44 UTC after 18 pre / 18 post archive checks: **zero physical reclaim**. Chunk rewrite attempt3 copied **14,969,299 rows**, then canceled at **64.804 GiB growth** inside the existing 64 GiB stop / 48 GiB WAL limits. Cleanup passed; allocation **96,242,982,912 → 96,267,567,104 bytes**, same file/four indexes. The subsequent 256-page pilot committed **1,726 rows / 27 transactions**, all retained values/prose pointers equal, 55 complete journal records, no unknown commits. Pre-COMMIT batch work totaled 5,020 ms; allocation grew **1,449,984 bytes**, cluster-WAL upper bound **27,828,144 bytes**, card26/26. Full no-op sweeping does not inherently shrink the next copy: pg_squeeze already omitted the vector. Prioritize archive-backed body retirement, then measured stored-payload/tail/workspace proof; no expansion or automatic whole-table retry. |
-| S4c | Physical reclaim | documents rewrite and post-rewrite gates passed | Supported pg_squeeze 1.9 and the managed synthetic/cancel rehearsal passed. Attempt 1 canceled after an observer timeout; attempt 2 failed lock acquisition; both cleaned up without reclaim. **Attempt 3 completed at 09:35:12 UTC**, reducing documents allocation **20,985,446,400 → 14,030,356,480 bytes**, reclaiming **6,955,089,920 bytes (6.477 GiB)**. Catalog identity and five indexes were preserved; the storage file changed. Worker/slot disappearance, temporary-role defaults and credential cleanup were verified. One observed table-exclusive wait cleared under the temporary role’s 1 s per-acquisition allowance; provider final-replay allowance remained 100 ms, not a hard total lock-hold cap. The unchanged post-rewrite card passed 26/26 gates; all 18 archived response comparisons passed on the deployed fleet. Remaining body/corpus reclaim and provider disk reduction are separate unfinished exits. |
-| S5 | Provider disk and compute reduction | configuration completed; actual disks unchanged | PS80 remains writable with two replicas. The latest 275 GiB floor request completed by 09:42:40 UTC, but **all three actual disks remain 300 GiB more than an hour later**, with no replacement pending. The cap stays 300 GiB; no billed disk reduction is proved. Do not equate physical table reclaim with provider volume reduction or increase capacity to complete the migration. |
+| S0 | Dependencies and storage baseline | verified | Body readers, ingest, reprojection and receipt liveness inventoried; relation allocations are not removable body bytes. |
+| S1 | Last chunk full-text consumer → turbopuffer | done | Consumer migrated; chunk GIN removal reclaimed **18.05 GiB**. Original quality gates passed; no source bodies deleted. |
+| S2 | Reader over existing logical evidence | live and verified | MCP **#658**, projection **#648**, managed **#650**, schema **069**. Exact archive-backed readback and the unchanged original card passed. |
+| S3 | Reprojection, resolve and both ingest writers | compatible; managed cycle recovered | Shared authorized hydration and restore-before-supersession proved. Managed #650 recovered successful ingestion; new-record volume was not measured. |
+| S4a | Bounded body clear and restore | canary passed | Exact archived and restored responses matched. Restore retired bodies before any PostgreSQL-reader rollback. |
+| S4b | Source-scale retirement | finite progress; incomplete | Priority source: **40 enabled parents**. Original source: **235 discovered / 233 enabled**, three residuals and deadline follow-up retained. Lifetime logical clears: **151,863 documents / 167,244 chunks / 723,382,521 UTF-8 bytes**, not physical savings. Fresh frontier/session required; never replay consumed intents. |
+| S4v | Dropped chunk vector and finite sweep | no physical reclaim | Three copy attempts yielded no reclaim; the finite sweep preserved values but grew files. The failed copy already omitted the vector. No blind retry or whole-table sweep. |
+| S4c | Physical compaction | documents and events complete | Documents reclaimed **6.477 GiB**; events **9.700 GiB**. Catalog/index identities and cleanup verified; each passed 18 response comparisons and the unchanged card. Provider capacity is a separate exit. |
+| S5 | Provider disk and compute reduction | restore active at 18:41 | Actual capacities remain old **3 × 300 GiB** serving / new **3 × 275 GiB** restoring. Replacement-target metadata has fluctuated; it does not establish a capacity change. The 18:23 backup-fetch 100% / restore-active snapshot is not completion. No new PATCH; post-resize validation and billed savings remain pending. Compute downsizing is optional and unachieved. |
 
-Verified checkpoint: **2026-09-21, after source15 and the MCP-only #658 deployment/runtime proof and 15:02:32 UTC postdeploy card**.
-Turbopuffer performs retrieval; S3 holds exact logical evidence and Parquet;
-Archil/DuckDB mount and query authorized analytical evidence. PostgreSQL retains
-current authority and history. Documents reclaimed 6.477 GiB; neither the vector
-DROP nor the finite sweep proved additional physical savings. Combined measured
-reclaim remains **24.53 GiB** from the chunk GIN and documents rewrite only. At
-**14:30:44 UTC**, node usage was about **175.0 GiB**, with all three disks still
-**300 GiB**; no expansion or billed capacity reduction occurred.
+The latest post-events card passed **26/26 at 17:08:45 UTC**, with recall@20
+**.9625**, MRR **.6559**, zero backend/auth/tool errors and unchanged verifier/truth
+pins. Earlier degraded cards remain preserved. This does not prove a causal
+latency gain. Events' **57.356 GiB controller-observed peak growth** was followed
+by higher provider readings; it is not proof of an instantaneous hard bound or
+settled net volume savings.
 
-A read-only 256-page sample found 1,150 rows across four of five authorized sources.
-Current unlocated rows accounted for **1,360,117 / 1,668,728 sampled nonempty stored
-bytes (81.5%)**. This favors locator publication followed by exact retirement;
-extrapolated totals are not physical savings or eligibility proof. Structural
-eligibility was not inspected, and zero observations do not prove absence. The
-next source anchor is validated, but its prepared plan is not an executed clear.
+PRs **#660, #661 and #662** are merged but **not deployed**. The intended MCP
+release is **#662 (`c10e6d3`)**, containing the deadline-query reduction, bounded
+collector-health writes and empty-alias scan simplification. Their tests passed;
+production performance improvement remains unmeasured. Insights upsert timings
+are a diagnostic lead, not attribution of the earlier slow publication.
 
-Next graph: **known locator checkpoints → fresh proof → gentler finite source pages/drains with quality gates →
-remaining stored-payload and physical-reclamation measurement → provider capacity exit**.
-Keep the successful finite sweep as evidence, not an automatic full-table campaign:
-local small-prose sweeps can grow files after VACUUM, and the failed copy already
-omitted the dropped vector. #653's optional context index remains merged but unbuilt;
-representative latency and exact receipt parity are separate acceptance boundaries.
-Lossless audit/job lineage and historical authority moves still precede the
-**catalog/index <10 GB** exit. Full retirement, physical/billed downsize and tool
-latency remain unfinished; semantic/Jev activation is not on this critical path.
-See the [current storage checkpoint and acceptance checks](../recall/docs/architecture/storage-runbook.md#current-company-brain-checkpoint--2026-09-21-after-source15).
+**Next dependency order:** finish provider replacement → **18 exact pairs and
+original card** → MCP #662 → **six exact pairs and original card** → qualify
+**three serial 20-parent pages** → review measured **50-parent pages / 55 claim
+iterations**. Graduation requires clean completion, matched workload and measured
+headroom within existing proof, byte, grace and deadline limits; it is not active
+configuration. New residuals or uncertain outcomes stop the phase.
 
-Private evidence: `~/.recall/storage-retirement-20260920/` retains earlier failed/passing cards, immutable verifier pins, exact retired-body runtime proofs, source-drain plans/progress, managed-rehearsal results, failed documents/chunks attempts and their cleanup, the successful attempt 3 record, provider observations, and `execution-status.json`. Source identities and detailed operational receipts stay private. Saved operator plans never replace fresh source proof. Runtime/source pins must be refreshed after code changes; consumed mutation intents are not reusable.
+Turbopuffer retrieves; S3 holds exact logical evidence and Parquet; Archil/DuckDB
+mount and query authorized analytical evidence. PostgreSQL retains authority and
+history. The **<10 GiB** target also requires explicit history and metadata
+ownership: current-body retirement alone cannot remove the remaining **31.61 GiB**
+events allocation. The five-source sample favors locator work but proves neither
+whole-corpus eligibility nor historical-deletion safety. #653's optional context
+index remains unbuilt; representative tool latency remains a separate exit.
 
-After every phase: simplicity = fewer production responsibilities/copies; power = same exact authorized evidence; breakthrough = measured storage or latency improvement; job done = company brain remains fast and correct. Passing source-reader tests is not evidence of reclaimed or reduced provisioned storage. The independent evaluator stays unchanged in implementation PRs.
+Private evidence: `~/.recall/storage-retirement-20260920/`. Saved plans never
+replace fresh proof. Simplicity means fewer responsibilities and hot copies;
+power means the same exact authorized evidence; breakthrough means measured
+storage or latency improvement. Full retirement and a fast, correct company
+brain remain the goal. The independent evaluator stays unchanged.
 
 ### H6: Judgments, not regex (Jev / TypeSafe) — handoff `recall/docs/architecture/2026-09-17-recall-jev-judgments-handoff.md` (#610)
 
