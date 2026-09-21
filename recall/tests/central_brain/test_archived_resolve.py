@@ -146,6 +146,20 @@ class ResolveHandlerAuthorityTests(unittest.TestCase):
             self.assertEqual(actual['authorized_source'], principal.get('source_id'))
             self.assertIsNone(actual['chunk_body_archive'])
 
+    def test_explicit_development_rollback_keeps_unscoped_legacy_receipts(self):
+        handler = self.handler({'kind': 'development'})
+        with mock.patch.dict(os.environ, {'RECALL_LEGACY_READS': '1'}, clear=True):
+            handler.do_GET()
+        self.assertIsNone(handler.store.resolve.call_args.kwargs['tenant_id'])
+        self.assertIsNone(handler.store.resolve.call_args.kwargs['authorized_sources'])
+
+    def test_legacy_rollback_flag_does_not_broaden_mcp_authority(self):
+        handler = self.handler({'kind': 'mcp', 'tenant_id': TENANT, 'authorized_sources': ()})
+        with mock.patch.dict(os.environ, {'RECALL_LEGACY_READS': '1'}, clear=True):
+            handler.do_GET()
+        self.assertEqual(handler.store.resolve.call_args.kwargs['tenant_id'], TENANT)
+        self.assertEqual(handler.store.resolve.call_args.kwargs['authorized_sources'], ())
+
     def test_legacy_principal_uses_current_canonical_grants(self):
         handler = self.handler({'kind': 'collector', 'tenant_id': TENANT,
                                 'principal_id': 'principal:test', 'authorized_sources': ()})

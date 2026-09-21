@@ -1067,7 +1067,11 @@ class Handler(BaseHTTPRequestHandler):
             principal = self.require("read")
             if not principal:
                 return
-            if principal.get("kind") == "mcp":
+            if principal.get("kind") == "development" and legacy_reads_enabled():
+                # Explicit local rollback mode has no tenant credential and
+                # must still resolve the v1 receipts its read routes return.
+                tenant_id, source_grants = None, None
+            elif principal.get("kind") == "mcp":
                 tenant_id = principal.get("tenant_id")
                 if not tenant_id:
                     self.send_json(403, {"error": "forbidden"})
