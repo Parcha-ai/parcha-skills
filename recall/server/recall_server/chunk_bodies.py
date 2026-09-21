@@ -8,10 +8,12 @@ import math
 import time
 from typing import Any
 
+import orjson
+
 from .canonical_text import canonical_text_chunks
 from .db import SearchDeadlineExceeded
 from .evidence_projection import CanonicalEvidenceProjector, DOCUMENT_ID_RE
-from .logical_evidence import LogicalEvidenceProjectionStore
+from .logical_evidence import IDENTITY_RE, LogicalEvidenceProjectionStore, _receipt
 from .passage_projection import decode_logical_record
 
 MAX_DOCUMENTS = 100
@@ -196,12 +198,27 @@ def read_archived_chunks(
                 receipts_in_part = 0
                 for line in BytesIO(payload):
                     _check_deadline(deadline_at)
-                    record = decode_logical_record(line, source_id=source_id)
-                    if record.ordinal != expected_ordinal:
+                    # The immutable part and whole-document hashes cover every
+                    # byte. Check routing metadata for all records, but avoid
+                    # re-encoding large unrelated bodies into canonical JSON.
+                    value = orjson.loads(line)
+                    if (
+                        not isinstance(value, dict)
+                        or type(value.get("ordinal")) is not int
+                        or value["ordinal"] != expected_ordinal
+                        or not isinstance(value.get("event_native_id"), str)
+                        or not IDENTITY_RE.fullmatch(value["event_native_id"])
+                        or not isinstance(value.get("receipts"), list)
+                    ):
+                        raise ChunkBodyError("archived_chunk_body_unavailable")
+                    for receipt in value["receipts"]:
+                        _receipt(receipt, source_id)
+                    if len(set(value["receipts"])) != len(value["receipts"]):
                         raise ChunkBodyError("archived_chunk_body_unavailable")
                     expected_ordinal += 1
-                    receipts_in_part += len(record.receipts)
-                    if record.event_native_id in records:
+                    receipts_in_part += len(value["receipts"])
+                    if value["event_native_id"] in records:
+                        record = decode_logical_record(line, source_id=source_id)
                         records[record.event_native_id].append(record)
                 if (expected_ordinal - 1 != part["last_record_ordinal"]
                         or receipts_in_part != part["receipt_count"]):
