@@ -206,3 +206,10 @@ Receipt resolution retains the exact requested revision. Current documents use
 the shared archive hydration when enabled; historical revisions remain in
 PostgreSQL and are hash checked. Do not thin historical bodies using current
 logical evidence. The public MCP/edge profiles continue to hide this HTTP route.
+
+The current archive reader's 64 MiB budget is cumulative across all requested
+parents. A parent that fits today can outgrow it after append, and several small
+parents can exceed it together. Therefore a successful current read is not
+permanent retirement coverage. Require stable routing to the requested records
+in existing immutable parts before deleting source bodies; asynchronous passage
+or Parquet pointers alone do not cover the logical-publication lag.
