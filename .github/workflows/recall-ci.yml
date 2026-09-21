@@ -107,6 +107,7 @@ jobs:
             e2e_chunk_vector_retirement.py \
             e2e_parent_chunk_retirement.py \
             e2e_optional_reconcile_index.py \
+            e2e_context_time_index.py \
             e2e_streaming_locators.py \
             e2e_retirement_native_locks.py \
             e2e_context_neighbor_plan.py \
