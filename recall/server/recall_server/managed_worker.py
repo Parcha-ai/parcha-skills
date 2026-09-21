@@ -43,6 +43,11 @@ from .logical_evidence import LogicalEvidenceProjectionStore
 from .logical_evidence_projection import CanonicalLogicalEvidenceProjector
 from .passage_index import CanonicalPassageProjector
 from .passage_projection import DEFAULT_PASSAGE_POLICY
+from .projectors import (
+    ENVELOPE_FIELDS, ENVELOPE_VALIDATION_FIELDS, ENVELOPE_VALIDATION_RULES,
+    TYPED_CONNECTOR_KINDS, TYPED_FIELD_VALIDATION_RULES, TYPED_RECORD_FIELDS,
+    StructuredEnvelopeValidationError,
+)
 from .parquet_scan import CanonicalParquetScanProjector
 
 
@@ -63,6 +68,7 @@ _CANONICAL_FAILURE_CLASSES = frozenset({
     "KeyError", "RuntimeError", "TimeoutError", "OSError", "PermissionError",
     "OperationalError", "InterfaceError", "ProgrammingError", "IntegrityError",
     "DataError", "HistoryUnavailable", "HistoryAuthorityError",
+    "StructuredEnvelopeValidationError",
 })
 _CANONICAL_FAILURE_CODES = frozenset({
     "canonical_batch_invalid", "canonical_contract_invalid",
@@ -250,13 +256,30 @@ class _DirectCanonicalWriter:
                                     sqlstate = candidate
                     if sqlstate == "unrecognized" and error_class not in _CANONICAL_FAILURE_CLASSES:
                         error_class = "unrecognized"
-                    LOG.error(
-                        "managed canonical ingest failed type=%s code=%s sqlstate=%s depth=%s",
+                    message = "managed canonical ingest failed type=%s code=%s sqlstate=%s depth=%s"
+                    fields = (
                         error_class,
                         error_code if type(error_code) is str and error_code in _CANONICAL_FAILURE_CODES else "unrecognized",
                         sqlstate,
                         depth,
                     )
+                    if isinstance(current, StructuredEnvelopeValidationError):
+                        message += " rule=%s kind=%s field=%s"
+                        metadata = []
+                        for name, allowed in (
+                            ("validation_rule", ENVELOPE_VALIDATION_RULES),
+                            ("validation_kind", TYPED_CONNECTOR_KINDS),
+                            ("validation_field", ENVELOPE_VALIDATION_FIELDS),
+                        ):
+                            value = getattr(current, name, None)
+                            metadata.append(value if type(value) is str and value in allowed else "unrecognized")
+                        rule, kind, field = metadata
+                        allowed_fields = (
+                            TYPED_RECORD_FIELDS.get(kind, {}).get("properties", {})
+                            if rule in TYPED_FIELD_VALIDATION_RULES else ENVELOPE_FIELDS
+                        )
+                        fields += (rule, kind, field if field in allowed_fields else "unrecognized")
+                    LOG.error(message, *fields)
                     cause = current.__cause__
                     current = cause if cause is not None else current.__context__
             except Exception:
