@@ -552,16 +552,17 @@ print(
     flush=True,
 )
 manifest_by_document={}
-for path in target.rglob("*"):
-    if not path.is_file() or path.stat().st_size > 100000:
-        continue
-    try:
-        manifest=json.loads(path.read_text())
-    except (OSError,UnicodeDecodeError,json.JSONDecodeError):
-        continue
-    document_id=manifest.get("logical_document_id")
-    if document_id in aliases and isinstance(manifest.get("parts"),list):
-        manifest_by_document[document_id]=(path,manifest)
+if aliases:
+    for path in target.rglob("*"):
+        if not path.is_file() or path.stat().st_size > 100000:
+            continue
+        try:
+            manifest=json.loads(path.read_text())
+        except (OSError,UnicodeDecodeError,json.JSONDecodeError):
+            continue
+        document_id=manifest.get("logical_document_id")
+        if document_id in aliases and isinstance(manifest.get("parts"),list):
+            manifest_by_document[document_id]=(path,manifest)
 if set(manifest_by_document)!=set(aliases):
     raise SystemExit(66)
 for document_id,alias in aliases.items():
