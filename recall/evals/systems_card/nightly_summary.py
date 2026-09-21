@@ -12,12 +12,16 @@ Content-free: only the aggregate numbers already in the card.
 from __future__ import annotations
 
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any
 
 DOCS_HOST = "https://docs.greppy3.parcha.dev"
 MISSING = "–"
+CARD_SCHEMA = "recall.systems-card.v1"
+MAX_RECONCILE_CHARS = 300
+_STATUSES = {"ok", "degraded", "failed"}
 
 SEARCH_LATENCY_MS = "latency.tools.recall_search.p95_ms"
 SERVER_LATENCY_MS = "latency.search_stages.server_p95_ms"
@@ -41,30 +45,91 @@ def percentile_label(metric_key: str) -> str:
     return match.group(1)
 
 
-def _value(row: dict[str, Any], key: str, fmt: str = "{:.0f}") -> str:
+def _counted(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _metric(row: dict[str, Any], key: str) -> float | None:
+    """A metric is absent or a finite number; anything else is a broken card."""
     value = row.get(key)
     if value is None:
-        return MISSING
-    return fmt.format(value) if isinstance(value, (int, float)) else str(value)
+        return None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+    ):
+        raise ValueError(f"systems card metric {key} is invalid")
+    return value
+
+
+def validate_reconcile_line(reconcile_line: str) -> str:
+    """Operator text lands verbatim in a summary, so keep it short and inert."""
+    if len(reconcile_line) > MAX_RECONCILE_CHARS or any(
+        ord(character) < 32 or ord(character) == 127 for character in reconcile_line
+    ):
+        raise ValueError("reconcile summary is invalid")
+    return reconcile_line
+
+
+def validate_card(card: Any) -> dict[str, Any]:
+    """Refuse a card whose shape would let a summary print something false."""
+    if not isinstance(card, dict):
+        raise ValueError("systems card has an invalid shape")
+    overall = card.get("overall")
+    generated_at = card.get("generated_at")
+    if (
+        not isinstance(overall, dict)
+        or not isinstance(card.get("dimensions"), dict)
+        or card.get("schema_version") != CARD_SCHEMA
+        or not isinstance(generated_at, str)
+        or not generated_at
+    ):
+        raise ValueError("systems card has an invalid shape")
+    passed, total = overall.get("gates_passed"), overall.get("gates_total")
+    if (
+        overall.get("status") not in _STATUSES
+        or not _counted(passed)
+        or not _counted(total)
+        or not 0 <= passed <= total
+    ):
+        raise ValueError("systems card overall is invalid")
+    return card
+
+
+def _value(row: dict[str, Any], key: str, fmt: str = "{:.0f}") -> str:
+    value = _metric(row, key)
+    return MISSING if value is None else fmt.format(value)
 
 
 def _delta(previous: dict[str, Any], now: dict[str, Any], key: str) -> str:
-    before, after = previous.get(key), now.get(key)
-    if not isinstance(before, (int, float)) or not isinstance(after, (int, float)):
-        return ""
-    if before == after:
+    before, after = _metric(previous, key), _metric(now, key)
+    if before is None or after is None or before == after:
         return ""
     return f" ({'+' if after > before else ''}{after - before:.0f})"
 
 
 def failed_gates(card: dict[str, Any]) -> list[str]:
-    return [
-        f"{probe['name'].split('.')[-1]}.{gate['metric']}"
-        for dimension in card["dimensions"].values()
-        for probe in dimension["probes"]
-        for gate in probe["gates"]
-        if gate["passed"] is False
-    ]
+    failed = []
+    for dimension in card["dimensions"].values():
+        if not isinstance(dimension, dict) or not isinstance(dimension.get("probes"), list):
+            raise ValueError("systems card dimension is invalid")
+        for probe in dimension["probes"]:
+            if (
+                not isinstance(probe, dict)
+                or not isinstance(probe.get("name"), str)
+                or not isinstance(probe.get("gates"), list)
+            ):
+                raise ValueError("systems card probe is invalid")
+            for gate in probe["gates"]:
+                if not isinstance(gate, dict) or not isinstance(gate.get("metric"), str):
+                    raise ValueError("systems card gate is invalid")
+                passed = gate.get("passed")
+                if passed is not None and not isinstance(passed, bool):
+                    raise ValueError("systems card gate is invalid")
+                if passed is False:
+                    failed.append(f"{probe['name'].split('.')[-1]}.{gate['metric']}")
+    return failed
 
 
 def summary_lines(
@@ -75,7 +140,13 @@ def summary_lines(
     date: str,
     reconcile_line: str = "",
 ) -> list[str]:
-    now = history[-1] if history else {}
+    validate_card(card)
+    validate_reconcile_line(reconcile_line)
+    if not history:
+        raise ValueError("systems card history is empty")
+    if not all(isinstance(row, dict) for row in history):
+        raise ValueError("systems card history has an invalid shape")
+    now = history[-1]
     previous = history[-2] if len(history) > 1 else now
     overall = card["overall"]
     search = percentile_label(SEARCH_LATENCY_MS)

@@ -26,6 +26,8 @@ def _card(status: str = "degraded", failed: list[tuple[str, str]] | None = None)
         for (probe, _), g in zip(failed or [], gates)
     ]
     return {
+        "schema_version": nightly_summary.CARD_SCHEMA,
+        "generated_at": "2026-09-21T06:04:49Z",
         "overall": {"status": status, "gates_passed": 27, "gates_total": 31, "gates_failed": len(gates)},
         "dimensions": {"integrity": {"probes": probes}},
     }
@@ -109,6 +111,81 @@ class SummaryCommandTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(buffer.getvalue().strip(), expected)
             self.assertIn("search p95 1605 ms", expected)
+
+
+class RefusalTests(unittest.TestCase):
+    """The summary refuses a card it cannot describe truthfully.
+
+    These defenses lived in the cron's inline heredoc before the summary moved
+    into the repository; losing them would have traded one silent mislabel for
+    a whole family of them.
+    """
+
+    def _summary(self, card: dict, rows: list[dict] | None = None, **kwargs) -> str:
+        return "\n".join(
+            summary_lines(
+                card,
+                _rows() if rows is None else rows,
+                git_sha="6a823fe",
+                date="2026-09-21",
+                **kwargs,
+            )
+        )
+
+    def test_a_reconcile_line_with_control_characters_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            self._summary(_card(), reconcile_line="plane rows 1\nhttps://evil.example")
+
+    def test_an_overlong_reconcile_line_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            self._summary(_card(), reconcile_line="x" * (nightly_summary.MAX_RECONCILE_CHARS + 1))
+
+    def test_a_foreign_schema_version_is_refused(self) -> None:
+        card = _card() | {"schema_version": "recall.systems-card.v2"}
+        with self.assertRaises(ValueError):
+            self._summary(card)
+
+    def test_gates_passed_above_total_is_refused(self) -> None:
+        card = _card()
+        card["overall"]["gates_passed"] = 32
+        with self.assertRaises(ValueError):
+            self._summary(card)
+
+    def test_a_boolean_gate_count_is_refused(self) -> None:
+        card = _card()
+        card["overall"]["gates_passed"] = True
+        with self.assertRaises(ValueError):
+            self._summary(card)
+
+    def test_an_unknown_overall_status_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            self._summary(_card(status="fine"))
+
+    def test_an_empty_history_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            self._summary(_card(), rows=[])
+
+    def test_a_non_finite_metric_is_refused(self) -> None:
+        rows = _rows()
+        rows[-1][SEARCH_LATENCY_MS] = float("nan")
+        with self.assertRaises(ValueError):
+            self._summary(_card(), rows=rows)
+
+    def test_a_non_numeric_metric_is_refused(self) -> None:
+        rows = _rows()
+        rows[-1][SEARCH_LATENCY_MS] = "1605"
+        with self.assertRaises(ValueError):
+            self._summary(_card(), rows=rows)
+
+    def test_a_non_boolean_gate_verdict_is_refused(self) -> None:
+        card = _card(failed=[("integrity.scan_consistency", "scope_scan_agreement")])
+        card["dimensions"]["integrity"]["probes"][0]["gates"][0]["passed"] = "no"
+        with self.assertRaises(ValueError):
+            self._summary(card)
+
+    def test_a_clean_reconcile_line_is_kept_verbatim(self) -> None:
+        line = "plane rows 421189 · stale 3 deleted 3 · missing 0 written 0"
+        self.assertIn(line, self._summary(_card(), reconcile_line=line))
 
 
 if __name__ == "__main__":
