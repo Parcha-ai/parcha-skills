@@ -237,7 +237,7 @@ class CanonicalRetrieval:
         batch_size: int = 100,
         max_batches: int = 10,
     ) -> dict[str, int | str]:
-        # Turbopuffer owns embeddings; migration 067 retired these PG tables.
+        # Turbopuffer owns embeddings; this legacy writer must not read PG bodies.
         if getattr(self.store, "search_plane", "postgres") == "turbopuffer":
             return {"status": "disabled", "processed": 0, "batches": 0}
         runtime = self.store.semantic_runtime
