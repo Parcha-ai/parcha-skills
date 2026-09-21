@@ -91,6 +91,31 @@ class _Scan:
 
 
 class ProjectionWorkerTest(unittest.TestCase):
+    def test_passage_phase_numbers_reach_cycle_log_without_private_values(self):
+        calls = []
+
+        class TimedPassages(_Passages):
+            def project_pending(self, **kwargs):
+                return {**super().project_pending(**kwargs),
+                        "warmup_ms": 11, "pending_ms": 22, "prepare_ms": 33,
+                        "commit_ms": 44, "count_ms": 55, "private": "SECRET_PAYLOAD"}
+
+        with self.assertLogs("recall_server.projection_worker", level="INFO") as logs:
+            result = run_projection_worker(
+                _Logical(calls), TimedPassages(calls), once=True,
+                tenant_id=None, logical_batch_size=5, passage_batch_size=5,
+                embedding_batch_size=64, max_batches_per_cycle=1,
+                upload_concurrency=1, passage_concurrency=1, interval_seconds=30,
+            )
+        for phase, expected in zip(
+            ("warmup", "pending", "prepare", "commit", "count"),
+            (11, 22, 33, 44, 55), strict=True,
+        ):
+            key = f"passage_{phase}_ms"
+            self.assertEqual(result[key], expected)
+            self.assertIn(f"{key}={expected}", "\n".join(logs.output))
+        self.assertNotIn("SECRET_PAYLOAD", str(result) + str(logs.output))
+
     def test_embedding_disconnect_does_not_terminate_the_projection_worker(self):
         calls: list[str] = []
 
