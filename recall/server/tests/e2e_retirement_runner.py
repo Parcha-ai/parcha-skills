@@ -332,6 +332,143 @@ def paging_and_fairness(store, root):
     refused(lambda: runner.enroll_cohort(store, scope=scope, reviewed_plan=third))
 
 
+def publication_restarts_grace(store, root):
+    tenant, source, archive, _, projector, _ = fixture(store, root, count=2)
+    scope = runner.RetirementScope(tenant, "principal:reprojection", (source,))
+    with store.connect() as c:
+        c.execute(
+            "INSERT INTO canonical_source_grants VALUES(%s,%s,%s,'owner',now())",
+            (tenant, scope.principal_id, source),
+        )
+    runner.enroll_cohort(
+        store, scope=scope, reviewed_plan=runner.plan_cohort(store, scope=scope)
+    )
+
+    def age():
+        with store.connect() as c:
+            c.execute(
+                "UPDATE canonical_chunk_retirement_progress SET updated_at=now()-interval '2 minutes' WHERE tenant_id=%s AND source_id=%s",
+                (tenant, source),
+            )
+
+    def state():
+        with store.connect() as c:
+            return c.execute(
+                "SELECT * FROM canonical_chunk_retirement_progress WHERE tenant_id=%s AND source_id=%s",
+                (tenant, source),
+            ).fetchone()
+
+    age()
+    before = state()
+    with store.connect() as c:
+        insert_record(
+            c,
+            tenant=tenant,
+            source=source,
+            parent="session",
+            native="event-0002",
+            text="Appended exact body",
+            role="assistant",
+            byte_start=30,
+        )
+        mark_logical_evidence_dirty(
+            c,
+            tenant_id=tenant,
+            source_id=source,
+            native_ids=["event-0002"],
+            reason="ingest",
+        )
+    report = projector.project_pending(
+        tenant_id=tenant, batch_size=1, max_batches=1, upload_concurrency=1
+    )
+    assert report["documents"] == 1 and report["failed"] == 0, report
+    with store.connect() as c:
+        assert (
+            c.execute(
+                "SELECT body_record_ordinal FROM canonical_documents WHERE tenant_id=%s AND source_id=%s AND native_id='event-0002'",
+                (tenant, source),
+            ).fetchone()["body_record_ordinal"]
+            is not None
+        )
+        assert not c.execute(
+            "SELECT 1 FROM canonical_evidence_document_queue WHERE tenant_id=%s AND source_id=%s",
+            (tenant, source),
+        ).fetchone()
+    archive.reads.clear()
+    result = runner.run_retirement(store, archive, scope=scope, apply=True)
+    assert result["attempted_parents"] == 0, (
+        "new publication bypassed 60s grace",
+        result,
+    )
+    assert not archive.reads
+    after = state()
+    assert after["scope_epoch"] == before["scope_epoch"] + 1
+    assert after["status"] == "pending" and after["manifest_artifact_id"] is None
+    assert after["last_record_ordinal"] == -1 and after["enabled"]
+
+    # Same-content repairs must retain their existing cooldown behavior too.
+    age()
+    before = state()
+    with store.connect() as c:
+        c.execute(
+            "UPDATE canonical_documents SET body_record_ordinal=NULL,body_record_count=NULL WHERE tenant_id=%s AND source_id=%s AND native_id='event-0002'",
+            (tenant, source),
+        )
+        mark_logical_evidence_dirty(
+            c,
+            tenant_id=tenant,
+            source_id=source,
+            native_ids=["event-0002"],
+            reason="ingest",
+        )
+    report = projector.project_pending(
+        tenant_id=tenant, batch_size=1, max_batches=1, upload_concurrency=1
+    )
+    assert report["failed"] == 0 and report["repaired"] == 1, report
+    archive.reads.clear()
+    assert (
+        runner.run_retirement(store, archive, scope=scope, apply=True)[
+            "attempted_parents"
+        ]
+        == 0
+    )
+    assert not archive.reads and state()["scope_epoch"] == before["scope_epoch"] + 1
+    age()
+    result = runner.run_retirement(store, archive, scope=scope, apply=True)
+    assert result["cleared_documents"] == 3, result
+
+    # Publishing another append cannot re-enable explicitly disabled progress.
+    with store.connect() as c:
+        c.execute(
+            "UPDATE canonical_chunk_retirement_progress SET enabled=false,status='disabled' WHERE tenant_id=%s AND source_id=%s",
+            (tenant, source),
+        )
+    before = state()
+    with store.connect() as c:
+        insert_record(
+            c,
+            tenant=tenant,
+            source=source,
+            parent="session",
+            native="event-0003",
+            text="Disabled parent keeps this body",
+            role="assistant",
+            byte_start=40,
+        )
+        mark_logical_evidence_dirty(
+            c,
+            tenant_id=tenant,
+            source_id=source,
+            native_ids=["event-0003"],
+            reason="ingest",
+        )
+    report = projector.project_pending(
+        tenant_id=tenant, batch_size=1, max_batches=1, upload_concurrency=1
+    )
+    assert report["documents"] == 1 and report["failed"] == 0, report
+    assert state() == before
+
+
 def main():
     admin_dsn = os.environ["RECALL_DATABASE_URL"]
     database = "recall_runner_" + uuid.uuid4().hex
@@ -350,6 +487,7 @@ def main():
             scenario(store, Path(tmp))
             races(store, Path(tmp))
             paging_and_fairness(store, Path(tmp))
+            publication_restarts_grace(store, Path(tmp))
         print(
             json.dumps(
                 dict(
@@ -361,6 +499,7 @@ def main():
                     owner_and_epoch_races=True,
                     stop_before_commit=True,
                     null_locators_reported=True,
+                    publication_restarts_grace=True,
                 )
             )
         )

@@ -1709,6 +1709,12 @@ class CanonicalLogicalEvidenceProjector:
                     reason="logical-update",
                     logical_document_id=prepared.logical_document_id,
                 )
+                # Publish the retirement cooldown with the new catalog. An
+                # older request may still be hydrating a newly located event
+                # from PostgreSQL; an aged enabled ledger must not clear it yet.
+                from .chunk_retirement import invalidate_parent_retirement
+                invalidate_parent_retirement(connection.execute,
+                    (candidate.tenant_id, candidate.source_id, candidate.native_parent_id))
                 deleted = connection.execute(
                     """DELETE FROM canonical_evidence_document_queue
                         WHERE tenant_id=%s AND source_id=%s
