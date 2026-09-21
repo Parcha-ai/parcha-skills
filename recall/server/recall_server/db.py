@@ -2878,21 +2878,81 @@ class BrainStore:
             (PROJECTOR_VERSION, event_id),
         )
 
-    def resolve(self, receipt: str, authorized_source: str | None = None) -> dict | None:
-        event_part = receipt.split("#", 1)[0]
+    def resolve(
+        self, receipt: str, authorized_source: str | None = None, *,
+        tenant_id: str | None = None,
+        authorized_sources: tuple[str, ...] | None = None,
+        chunk_body_archive: Any = None,
+        legacy_only: bool = False,
+    ) -> dict | None:
+        """Resolve an exact revision; explicit tenant authority never falls back to v1."""
         try:
+            if not isinstance(receipt, str) or not receipt.startswith("recall://"):
+                raise ValueError("invalid receipt")
+            event_part = receipt.split("#", 1)[0]
             base, query = event_part.rsplit("?rev=", 1)
             source_native = base.removeprefix("recall://")
             source_id, native_id = source_native.split("/", 1)
             revision = int(query)
         except (ValueError, TypeError):
             raise ValueError("invalid receipt") from None
+        if tenant_id is not None and (
+            not isinstance(tenant_id, str) or not V2_AUTHORITY_RE.fullmatch(tenant_id)
+        ):
+            raise ValueError("invalid receipt authority")
+        if authorized_sources is not None and (
+            not isinstance(authorized_sources, tuple)
+            or any(not isinstance(source, str) or not V2_AUTHORITY_RE.fullmatch(source)
+                   for source in authorized_sources)
+        ):
+            raise ValueError("invalid receipt authority")
+        if ((authorized_source is not None and source_id != authorized_source)
+            or (authorized_sources is not None and source_id not in authorized_sources)):
+            return None
+        deadline_at = (
+            time.monotonic() + self.search_deadline_ms / 1000
+            if chunk_body_archive is not None else None
+        )
+        if legacy_only and tenant_id is not None:
+            raise ValueError("invalid receipt authority")
+        canonical = None
+        if not legacy_only:
+            with self.connect() as conn:
+                canonical = self._resolve_canonical(
+                    conn, source_id, native_id, revision, authorized_source,
+                    tenant_id=tenant_id, metadata_only=chunk_body_archive is not None,
+                    deadline_at=deadline_at,
+                )
+        if canonical is not None:
+            event, items = canonical["event"], canonical["items"]
+            if chunk_body_archive is not None:
+                from .chunk_bodies import ChunkBodyError
+                from .chunk_hydration import hydrate_chunk_rows
+
+                # Old revisions are deliberately retained inline. The logical
+                # archive and its fallback eligibility describe current records.
+                historical = [item for item in items if not item["is_current"]]
+                if any(not isinstance(item["text_redacted"], str)
+                       or hashlib.sha256(item["text_redacted"].encode()).hexdigest() != item["text_sha256"]
+                       for item in historical):
+                    raise ChunkBodyError("archived_chunk_body_unavailable")
+                hydrate_chunk_rows(
+                    self, chunk_body_archive, [item for item in items if item["is_current"]],
+                    tenant_id=event["tenant_id"], source_ids=(source_id,), deadline_at=deadline_at,
+                )
+            if deadline_at is not None and time.monotonic() >= deadline_at:
+                raise SearchDeadlineExceeded()
+            return {
+                "event": {key: value for key, value in event.items()
+                          if key not in {"tenant_id", "event_id"}},
+                "items": [{key: item[key] for key in
+                           ("ordinal", "occurred_at", "role", "surface", "text_redacted", "receipt")}
+                          for item in items],
+            }
+        if tenant_id is not None:
+            return None
+        # Trusted unscoped library callers retain their original v1 behavior.
         with self.connect() as conn:
-            canonical = self._resolve_canonical(
-                conn, source_id, native_id, revision, authorized_source,
-            )
-            if canonical is not None:
-                return canonical
             event = conn.execute(
                 """SELECT id,source_id,native_id,native_parent_id,kind,occurred_at,observed_at,principal_id,
                    visibility,content_type,content_sha256,revision,is_tombstone,
@@ -2927,13 +2987,17 @@ class BrainStore:
             ).fetchall()
             return {"event": {key: value for key, value in event.items() if key != "id"}, "items": items}
 
-    @staticmethod
     def _resolve_canonical(
+        self,
         conn,
         source_id: str,
         native_id: str,
         revision: int,
         authorized_source: str | None,
+        *,
+        tenant_id: str | None = None,
+        metadata_only: bool = False,
+        deadline_at: float | None = None,
     ) -> dict | None:
         """Resolve a receipt against the canonical v2 plane.
 
@@ -2942,7 +3006,8 @@ class BrainStore:
         ``canonical_chunks``. The response keeps the v1 shape so existing
         callers keep working. Content stays out except for redacted chunk text.
         """
-        event = conn.execute(
+        event = self._execute_bounded(
+            conn,
             """SELECT event.tenant_id,event.event_id,event.source_id,event.native_id,
                       event.native_parent_id,event.kind,event.occurred_at,
                       event.observed_at,
@@ -2965,6 +3030,7 @@ class BrainStore:
                FROM canonical_events event
                WHERE event.source_id=%s AND event.native_id=%s AND event.revision=%s
                  AND (%s::text IS NULL OR event.source_id=%s)
+                 AND (%s::text IS NULL OR event.tenant_id=%s)
                  AND NOT EXISTS (
                    SELECT 1 FROM canonical_events later
                    WHERE later.tenant_id=event.tenant_id
@@ -2975,14 +3041,22 @@ class BrainStore:
                  )
                ORDER BY event.created_at
                LIMIT 1""",
-            (source_id, native_id, revision, authorized_source, authorized_source),
+            (source_id, native_id, revision, authorized_source, authorized_source,
+             tenant_id, tenant_id),
+            deadline_at,
         ).fetchone()
         if not event:
             return None
-        items = conn.execute(
-            """SELECT chunk.ordinal,%s::timestamptz AS occurred_at,
+        body_sql = (
+            "CASE WHEN document.is_current THEN NULL ELSE chunk.text_redacted END"
+            if metadata_only else "chunk.text_redacted"
+        )
+        items = self._execute_bounded(
+            conn,
+            f"""SELECT chunk.ordinal,%s::timestamptz AS occurred_at,
                       NULL::text AS role,NULL::text AS surface,
-                      chunk.text_redacted,chunk.receipt
+                      {body_sql} AS text_redacted,chunk.receipt,
+                      chunk.source_id,chunk.document_id,chunk.text_sha256,document.is_current
                FROM canonical_chunks chunk
                JOIN canonical_documents document
                  USING(tenant_id,source_id,document_id)
@@ -2990,13 +3064,10 @@ class BrainStore:
                  AND document.event_id=%s AND chunk.deleted_at IS NULL
                ORDER BY chunk.ordinal""",
             (event["occurred_at"], event["tenant_id"], source_id, event["event_id"]),
+            deadline_at,
         ).fetchall()
         return {
-            "event": {
-                key: value
-                for key, value in event.items()
-                if key not in {"tenant_id", "event_id"}
-            },
+            "event": event,
             "items": items,
         }
 
