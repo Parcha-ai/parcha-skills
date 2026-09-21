@@ -285,13 +285,13 @@ def schema69_capability(store):
     role, password = 'retirement_runtime_' + uuid.uuid4().hex[:12], uuid.uuid4().hex
     identifier = sql.Identifier(role)
     with store.connect() as connection:
-        settings = connection.info.get_parameters()
+        port, database = connection.info.port, connection.info.dbname
         connection.execute(sql.SQL('CREATE ROLE {} LOGIN PASSWORD {}').format(identifier, sql.Literal(password)))
         connection.execute(sql.SQL('GRANT USAGE ON SCHEMA public TO {}').format(identifier))
         connection.execute(sql.SQL('GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA public TO {}').format(identifier))
         connection.execute(sql.SQL('REVOKE INSERT,UPDATE,DELETE ON schema_migrations FROM {}').format(identifier))
         connection.execute(sql.SQL('GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA public TO {}').format(identifier))
-    dsn = f"postgresql://{role}:{password}@127.0.0.1:{settings['port']}/{settings['dbname']}"
+    dsn = f"postgresql://{role}:{password}@127.0.0.1:{port}/{database}"
     try:
         assert probe_database(dsn, profile='local-fixture')['schema_version'] == 69
         with store.connect() as connection:
