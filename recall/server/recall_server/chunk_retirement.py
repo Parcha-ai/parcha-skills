@@ -1,6 +1,8 @@
 """Explicit, reviewed current-chunk retirement; archive proof never uses fallback."""
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import hashlib
 import math
 import os
@@ -133,6 +135,15 @@ def _apply_verified(store, *, catalog, plan, tenant_id, source_id, document_ids,
         if _plan(current_catalog, current_chunks, plan['runtime_profile'], plan['operation']) != plan:
             raise ChunkRetirementError('chunk_retirement_proof_changed')
         if plan['operation'] == 'restore':
+            # Restoration pauses later bulk work for these exact parents. The
+            # ledger is optional for the older explicit schema68 command.
+            ledger = store._execute_bounded(connection,
+                "SELECT to_regclass('canonical_chunk_retirement_progress') AS ledger", (), deadline_at).fetchone()['ledger']
+            if ledger is not None:
+                store._execute_bounded(connection, '''UPDATE canonical_chunk_retirement_progress
+                    SET enabled=false,scope_epoch=scope_epoch+1,status='disabled',updated_at=clock_timestamp()
+                    WHERE tenant_id=%s AND source_id=%s AND logical_document_id=ANY(%s)''',
+                    (tenant_id, source_id, parents), deadline_at)
             for document in plan['documents']:
                 missing = {chunk['ordinal'] for chunk in document['chunks']
                     if chunk['current_bytes'] == 0 and chunk['text_sha256'] != EMPTY_SHA256}
@@ -280,3 +291,244 @@ def read_private_plan(path: Path):
             return plan
     except (OSError, ValueError, TypeError):
         raise ChunkRetirementError('chunk_retirement_plan_unavailable') from None
+
+
+# Parent jobs share the mutation owner above, but carry metadata proof instead
+# of a retained map of archive bodies. They do not run from a worker loop yet.
+@dataclass(frozen=True)
+class ParentRetirementLimits:
+    batch_documents: int = 64
+    batch_chunks: int = 4096
+    hash_bytes: int = 8 * 1024**2
+    max_batches: int = 1000
+    max_clear_bytes: int = 1024**3
+    max_documents: int = 2_000_000
+    max_chunks: int = 8_000_000
+    max_parts: int = 8192
+    max_records: int = 4_000_000
+    max_archive_bytes: int = 8 * 1024**3
+    max_spool_bytes: int = 1024**3
+
+    def __post_init__(self):
+        maxima = dict(batch_documents=256, batch_chunks=8192, hash_bytes=32 * 1024**2,
+            max_batches=100_000, max_clear_bytes=1024**4, max_documents=4_000_000, max_chunks=32_000_000,
+            max_parts=32_768, max_records=8_000_000, max_archive_bytes=64 * 1024**3,
+            max_spool_bytes=8 * 1024**3)
+        if any(type(getattr(self, key)) is not int or not 1 <= getattr(self, key) <= maximum
+               for key, maximum in maxima.items()) or self.max_spool_bytes < 128 * 1024:
+            raise ChunkRetirementError('parent_retirement_limits_invalid')
+
+
+def _parent_scope(tenant_id, source_id, native_parent_id):
+    scope = tenant_id, source_id, native_parent_id
+    if any(not isinstance(value, str) or not IDENTITY_RE.fullmatch(value) for value in scope):
+        raise ChunkRetirementError('parent_retirement_scope_invalid')
+    return scope
+
+
+def _parent_deadline(deadline_at):
+    now = time.monotonic()
+    if deadline_at is None:
+        return now + 300
+    if type(deadline_at) not in (int, float) or not math.isfinite(deadline_at) or deadline_at > now + 3600:
+        raise ChunkRetirementError('parent_retirement_deadline_invalid')
+    if now >= deadline_at:
+        raise ChunkRetirementError('parent_retirement_deadline_exceeded')
+    return deadline_at
+
+
+def _parent_progress(store, connection, scope, deadline_at, *, lock=False):
+    sql = '''SELECT * FROM canonical_chunk_retirement_progress
+             WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s'''
+    return store._execute_bounded(connection, sql + (' FOR UPDATE NOWAIT' if lock else ''), scope, deadline_at).fetchone()
+
+
+def set_parent_retirement_enabled(store, *, tenant_id, source_id, native_parent_id, enabled, deadline_at=None):
+    """Explicit exact-parent switch. Enabling resets the scheduling cursor only."""
+    from .parent_chunk_proof import read_parent_catalog
+    scope = _parent_scope(tenant_id, source_id, native_parent_id)
+    if type(enabled) is not bool:
+        raise ChunkRetirementError('parent_retirement_scope_invalid')
+    deadline_at = _parent_deadline(deadline_at)
+    with store.connect() as connection, connection.transaction():
+        catalog = read_parent_catalog(store, connection, scope, deadline_at, lock=True)
+        store._execute_bounded(connection, '''INSERT INTO canonical_chunk_retirement_progress
+            (tenant_id,source_id,native_parent_id,logical_document_id,enabled,status)
+            VALUES(%s,%s,%s,%s,%s,%s)
+            ON CONFLICT(tenant_id,source_id,native_parent_id) DO UPDATE SET
+              enabled=excluded.enabled,scope_epoch=canonical_chunk_retirement_progress.scope_epoch+1,
+              status=excluded.status,manifest_artifact_id=NULL,
+              last_record_ordinal=-1,updated_at=clock_timestamp()''',
+            (*scope, catalog['manifest']['logical_document_id'], enabled, 'pending' if enabled else 'disabled'), deadline_at)
+        _check(deadline_at)
+
+
+
+def invalidate_parent_retirement(query, scope):
+    """Call with the parent catalog already locked; never enable a scope."""
+    ledger = query("SELECT to_regclass('canonical_chunk_retirement_progress') AS ledger", ()).fetchone()['ledger']
+    if ledger is not None:
+        query("""UPDATE canonical_chunk_retirement_progress
+            SET status='pending',scope_epoch=scope_epoch+1,manifest_artifact_id=NULL,
+                last_record_ordinal=-1,updated_at=clock_timestamp()
+            WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s AND enabled""", scope)
+
+
+def _retire_parent_batch(store, *, proof, rows, scope, limits, deadline_at, complete, remaining_bytes):
+    from .parent_chunk_proof import manifest_identity, read_parent_catalog
+    if os.environ.get('RECALL_CHUNK_BODY_READS', 'postgres') != 'archive':
+        raise ChunkRetirementError('chunk_retirement_archive_reads_required')
+    manifest = proof['manifest']
+    documents = {row['document_id']: row for row in rows}
+    document_ids = sorted(documents)
+    hashed_bytes = cleared_bytes = cleared_chunks = cleared_documents = 0
+    hash_ms = 0.0
+    started = time.monotonic()
+    with store.connect() as connection, connection.transaction():
+        def query(sql, values=()):
+            return store._execute_bounded(connection, sql, values, deadline_at)
+        for key in sorted(f'v2\x1f{scope[0]}\x1f{scope[1]}\x1f{row["native_id"]}' for row in rows):
+            if not query('SELECT pg_try_advisory_xact_lock(hashtextextended(%s,0)) AS locked', (key,)).fetchone()['locked']:
+                raise ChunkRetirementError('parent_retirement_lock_busy')
+        locked = query('''SELECT document.tenant_id,document.source_id,document.document_id,document.native_id,
+                    document.revision,document.text_sha256,document.body_record_ordinal,document.body_record_count,event.kind,
+                    artifact.media_type AS raw_media_type,
+                    ARRAY[event.canonical_redacted->>'type',event.canonical_redacted #>> '{content,type}',
+                          event.canonical_redacted #>> '{content,message,type}',event.canonical_redacted #>> '{content,payload,type}',
+                          event.canonical_redacted #>> '{message,type}',event.canonical_redacted #>> '{payload,type}'] AS structural_types
+                FROM canonical_documents document JOIN canonical_events event USING(tenant_id,source_id,event_id)
+                JOIN raw_artifacts artifact ON artifact.tenant_id=event.tenant_id AND artifact.source_id=event.source_id
+                    AND artifact.artifact_id=event.artifact_id
+                WHERE document.tenant_id=%s AND document.source_id=%s AND document.document_id=ANY(%s)
+                  AND COALESCE(event.native_parent_id,event.native_id)=%s AND document.is_current
+                  AND document.deleted_at IS NULL AND NOT event.is_tombstone
+                  AND NOT EXISTS(SELECT 1 FROM canonical_events later WHERE later.tenant_id=document.tenant_id
+                      AND later.source_id=document.source_id AND later.native_id=document.native_id
+                      AND later.revision>document.revision AND later.is_tombstone)
+                ORDER BY document.document_id FOR UPDATE OF document NOWAIT FOR SHARE OF event,artifact NOWAIT''',
+                (*scope[:2], document_ids, scope[2])).fetchall()
+        if len(locked) != len(documents) or any(any(row[key] != documents[row['document_id']][key] for key in row) for row in locked):
+            raise ChunkRetirementError('parent_retirement_document_changed')
+        current = read_parent_catalog(store, connection, scope, deadline_at, lock=True)
+        if manifest_identity(current['manifest']) != manifest:
+            raise ChunkRetirementError('parent_retirement_parent_changed')
+        progress = _parent_progress(store, connection, scope, deadline_at, lock=True)
+        if not progress or not progress['enabled'] or progress['scope_epoch'] != proof['scope_epoch']:
+            raise ChunkRetirementError('parent_retirement_disabled')
+        chunks = query('''SELECT document_id,ordinal,receipt,text_sha256,octet_length(text_redacted) AS pg_bytes
+            FROM canonical_chunks WHERE tenant_id=%s AND source_id=%s AND document_id=ANY(%s)
+              AND deleted_at IS NULL ORDER BY document_id,ordinal FOR UPDATE NOWAIT''', (*scope[:2], document_ids)).fetchall()
+        expected = {(row['document_id'], chunk['ordinal']): chunk for row in rows for chunk in row['chunks']}
+        if len(chunks) != len(expected) or any(
+            (chunk['document_id'], chunk['ordinal']) not in expected
+            or any(chunk[key] != expected[(chunk['document_id'], chunk['ordinal'])][key] for key in ('ordinal','receipt','text_sha256'))
+            for chunk in chunks):
+            raise ChunkRetirementError('parent_retirement_chunk_changed')
+        hashed_bytes = sum(chunk['pg_bytes'] for chunk in chunks)
+        if len(chunks) > limits.batch_chunks or hashed_bytes > min(limits.hash_bytes, remaining_bytes):
+            raise ChunkRetirementError('parent_retirement_hash_budget')
+        hash_started = time.monotonic()
+        actual = query('''SELECT document_id,ordinal,encode(sha256(convert_to(text_redacted,'UTF8')),'hex') AS actual_sha
+            FROM canonical_chunks WHERE tenant_id=%s AND source_id=%s AND document_id=ANY(%s)
+              AND deleted_at IS NULL AND text_redacted<>'' ORDER BY document_id,ordinal''', (*scope[:2], document_ids)).fetchall()
+        hash_ms = (time.monotonic() - hash_started) * 1000
+        if any(row['actual_sha'] != expected[(row['document_id'], row['ordinal'])]['text_sha256'] for row in actual):
+            raise ChunkRetirementError('parent_retirement_current_body_invalid')
+        cleared_chunks, cleared_documents = len(actual), len({row['document_id'] for row in actual})
+        changed = query('''UPDATE canonical_chunks SET text_redacted=''
+            WHERE tenant_id=%s AND source_id=%s AND document_id=ANY(%s) AND deleted_at IS NULL AND text_redacted<>'' ''',
+            (*scope[:2], document_ids)).rowcount
+        if changed != cleared_chunks:
+            raise ChunkRetirementError('parent_retirement_chunk_changed')
+        cleared_bytes = hashed_bytes
+        cursor = max((row['body_record_ordinal'] + row['body_record_count'] - 1 for row in rows), default=-1)
+        if progress['manifest_artifact_id'] == manifest['manifest_artifact_id']:
+            cursor = max(cursor, progress['last_record_ordinal'])
+        query('''UPDATE canonical_chunk_retirement_progress SET manifest_artifact_id=%s,last_record_ordinal=%s,status=%s,
+                cumulative_cleared_documents=cumulative_cleared_documents+%s,
+                cumulative_cleared_chunks=cumulative_cleared_chunks+%s,
+                cumulative_cleared_utf8_bytes=cumulative_cleared_utf8_bytes+%s,updated_at=clock_timestamp()
+            WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s''',
+            (manifest['manifest_artifact_id'], cursor, 'complete' if complete else 'partial',
+             cleared_documents, cleared_chunks, cleared_bytes, *scope))
+        _check(deadline_at)
+    return dict(cleared_documents=cleared_documents, cleared_chunks=cleared_chunks,
+                cleared_utf8_bytes=cleared_bytes, hashed_utf8_bytes=hashed_bytes,
+                hash_ms=hash_ms, sql_ms=(time.monotonic() - started) * 1000)
+
+
+def retire_parent_chunks(store, archive, *, tenant_id, source_id, native_parent_id,
+                         apply=False, reviewed_plan=None, limits=None, deadline_at=None):
+    """Dry-run one exact parent; complete archive proof precedes bounded commits.
+
+    Only attempt-local proof authorizes body updates. The persistent cursor is
+    scheduling metadata; a restart proves every parent part again exactly once.
+    """
+    from .parent_chunk_proof import prove_parent_chunks
+    scope = _parent_scope(tenant_id, source_id, native_parent_id)
+    limits = ParentRetirementLimits() if limits is None else limits
+    if not isinstance(limits, ParentRetirementLimits) or type(apply) is not bool:
+        raise ChunkRetirementError('parent_retirement_limits_invalid')
+    deadline_at = _parent_deadline(deadline_at)
+    totals = dict(cleared_documents=0, cleared_chunks=0, cleared_utf8_bytes=0, hashed_utf8_bytes=0,
+                  hash_ms=0.0, sql_ms=0.0, batches=0)
+    try:
+        with store.connect() as connection:
+            schema = store._execute_bounded(connection, 'SELECT 1 FROM schema_migrations WHERE version=69', (), deadline_at).fetchone()
+            if schema is None:
+                raise ChunkRetirementError('parent_retirement_schema_required')
+            progress = _parent_progress(store, connection, scope, deadline_at) if apply else None
+        if apply:
+            if os.environ.get('RECALL_CHUNK_BODY_READS', 'postgres') != 'archive':
+                raise ChunkRetirementError('chunk_retirement_archive_reads_required')
+            if not isinstance(reviewed_plan, dict):
+                raise ChunkRetirementError('chunk_retirement_reviewed_plan_required')
+            if not progress or not progress['enabled']:
+                raise ChunkRetirementError('parent_retirement_disabled')
+        with prove_parent_chunks(store, archive, scope=scope, limits=limits, deadline_at=deadline_at) as proof:
+            report = {key: value for key, value in proof.items() if key not in {'spool','manifest'}}
+            if not apply:
+                return dict(report, **totals, status='dry_run', complete=False)
+            if proof['plan'] != reviewed_plan:
+                raise ChunkRetirementError('chunk_retirement_plan_changed')
+            proof['scope_epoch'] = progress['scope_epoch']
+            cursor = (progress['last_record_ordinal'] if progress['manifest_artifact_id'] == proof['manifest']['manifest_artifact_id'] else -1)
+            rows, chunk_count, byte_count = [], 0, 0
+            def commit(complete=False):
+                result = _retire_parent_batch(store, proof=proof, rows=rows, scope=scope,
+                    limits=limits, deadline_at=min(deadline_at, time.monotonic() + 5), complete=complete,
+                    remaining_bytes=limits.max_clear_bytes-totals['cleared_utf8_bytes'])
+                for key, value in result.items():
+                    totals[key] += value
+                totals['batches'] += 1
+            for row in proof['spool'].verified():
+                if row['body_record_ordinal'] <= cursor and row['pg_body_bytes'] == 0:
+                    continue
+                if row['pg_body_bytes'] > limits.hash_bytes:
+                    raise ChunkRetirementError('parent_retirement_hash_budget')
+                if rows and (len(rows) == limits.batch_documents or chunk_count + len(row['chunks']) > limits.batch_chunks
+                             or byte_count + row['pg_body_bytes'] > limits.hash_bytes):
+                    commit()
+                    rows, chunk_count, byte_count = [], 0, 0
+                    if totals['batches'] >= limits.max_batches or totals['cleared_utf8_bytes'] >= limits.max_clear_bytes:
+                        return dict(report, **totals, status='partial', complete=False)
+                if totals['cleared_utf8_bytes'] + byte_count + row['pg_body_bytes'] > limits.max_clear_bytes:
+                    if rows:
+                        commit()
+                    return dict(report, **totals, status='partial', complete=False)
+                rows.append(row)
+                chunk_count += len(row['chunks'])
+                byte_count += row['pg_body_bytes']
+            commit(complete=True)
+            return dict(report, **totals, status='applied', complete=True)
+    except Exception as error:
+        if isinstance(error, ChunkRetirementError):
+            failure = error
+        elif isinstance(error, SearchDeadlineExceeded):
+            failure = ChunkRetirementError('parent_retirement_deadline_exceeded')
+        elif isinstance(error, psycopg.errors.LockNotAvailable):
+            failure = ChunkRetirementError('parent_retirement_lock_busy')
+        else:
+            failure = ChunkRetirementError('parent_retirement_unavailable')
+        failure.committed = totals
+        raise failure from None

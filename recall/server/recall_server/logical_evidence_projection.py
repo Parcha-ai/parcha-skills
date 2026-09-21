@@ -1401,7 +1401,7 @@ class CanonicalLogicalEvidenceProjector:
                     ):
                         return "adopted"
                     return "stale"
-                self._publish_body_locators(connection, candidate, getattr(upload, "body_locators", None))
+                locator_changes = self._publish_body_locators(connection, candidate, getattr(upload, "body_locators", None))
                 old_manifest, old_parts = self._old_references(
                     connection,
                     candidate,
@@ -1419,6 +1419,20 @@ class CanonicalLogicalEvidenceProjector:
                         == prepared.document_content_sha256
                     and same_parts
                 ):
+                    if locator_changes:
+                        # The manifest is unchanged, but newly filled positions
+                        # must revisit enabled retirement progress. Lock order
+                        # remains catalog then ledger; NOWAIT avoids cycles with
+                        # a clear that already owns a document row.
+                        connection.execute(
+                            """SELECT 1 FROM canonical_evidence_documents
+                                WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s
+                                FOR UPDATE NOWAIT""",
+                            (candidate.tenant_id, candidate.source_id, candidate.native_parent_id),
+                        )
+                        from .chunk_retirement import invalidate_parent_retirement
+                        invalidate_parent_retirement(connection.execute,
+                            (candidate.tenant_id, candidate.source_id, candidate.native_parent_id))
                     # Repairing an absent immutable object must not replace an
                     # identical database document. The old path cascaded
                     # through every passage, actor, context, and embedding even
@@ -1739,7 +1753,7 @@ class CanonicalLogicalEvidenceProjector:
             except psycopg.errors.UniqueViolation:
                 raise LogicalEvidenceError("logical_evidence_state_invalid") from None
         connection.execute("ANALYZE pg_temp.recall_body_locator_desired")
-        connection.execute(
+        changed = connection.execute(
             """WITH changed AS MATERIALIZED (
                    SELECT document.document_id,desired.record_ordinal,desired.record_count
                      FROM canonical_documents document
@@ -1762,6 +1776,7 @@ class CanonicalLogicalEvidenceProjector:
             (candidate.tenant_id, candidate.source_id, candidate.native_parent_id,
              candidate.tenant_id, candidate.source_id),
         )
+        return changed.rowcount
 
     def _commit_empty(
         self,
