@@ -205,7 +205,7 @@ measurements, earlier failures, cleanup and limits remain in the
 | S0 | Dependencies and storage baseline | verified | Body readers, ingest, reprojection and receipt liveness inventoried; relation allocations are not removable body bytes. |
 | S1 | Last chunk full-text consumer → turbopuffer | done | Consumer migrated; chunk GIN removal reclaimed **18.05 GiB**. Original quality gates passed; no source bodies deleted. |
 | S2 | Reader over existing logical evidence | live and verified | MCP **#658**, projection **#648**, managed **#650**, schema **069**. Exact archive-backed readback and the unchanged original card passed. |
-| S3 | Reprojection, resolve and both ingest writers | compatible; managed cycle recovered | Shared authorized hydration and restore-before-supersession proved. Managed #650 recovered successful ingestion; new-record volume was not measured. |
+| S3 | Reprojection, resolve and both ingest writers | compatible; managed ingestion currently failing | Earlier #650 recovery is historical. At 19:07 UTC, the enabled worker had 290 consecutive failures, with latest error `brain_unavailable`, and no success since 09:17:45, despite fresh claims. Diagnose the underlying canonical ingest exception and prove a new successful cycle before more retirement. |
 | S4a | Bounded body clear and restore | canary passed | Exact archived and restored responses matched. Restore retired bodies before any PostgreSQL-reader rollback. |
 | S4b | Source-scale retirement | finite progress; incomplete | Priority source: **40 enabled parents**. Original source: **235 discovered / 233 enabled**, three residuals and deadline follow-up retained. Lifetime logical clears: **151,863 documents / 167,244 chunks / 723,382,521 UTF-8 bytes**, not physical savings. Fresh frontier/session required; never replay consumed intents. |
 | S4v | Dropped chunk vector and finite sweep | no physical reclaim | Three copy attempts yielded no reclaim; the finite sweep preserved values but grew files. The failed copy already omitted the vector. No blind retry or whole-table sweep. |
@@ -226,7 +226,8 @@ production performance improvement remains unmeasured. Insights upsert timings
 are a diagnostic lead, not attribution of the earlier slow publication.
 
 **Next dependency order:** finish provider replacement → **18 exact pairs and
-original card** → MCP #662 → **six exact pairs and original card** → qualify
+original card** → MCP #662 → **six exact pairs and original card** → reconcile
+managed ingestion and verify a fresh successful cycle → qualify
 **three serial 20-parent pages** → review measured **50-parent pages / 55 claim
 iterations**. Graduation requires clean completion, matched workload and measured
 headroom within existing proof, byte, grace and deadline limits; it is not active
