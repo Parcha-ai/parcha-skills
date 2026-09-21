@@ -8,7 +8,9 @@ exist yet counts as zero rows.
 """
 from __future__ import annotations
 
+from itertools import islice
 import logging
+import tempfile
 from typing import Any
 
 from .search_outbox import search_outbox_pending
@@ -17,14 +19,17 @@ from .turbopuffer_projection import _LIVE_PASSAGE_PREDICATE
 
 LOG = logging.getLogger("recall.search_plane")
 
-LIVE_PASSAGE_IDS_SQL = f"""
+LIVE_PASSAGE_IDS_PAGE_SQL = f"""
     SELECT passage.passage_id AS passage_id
       FROM canonical_passages passage
       JOIN canonical_passage_documents projected
         USING(tenant_id,source_id,logical_document_id,revision,policy_fingerprint)
      WHERE passage.tenant_id=%s
        AND projected.policy_fingerprint=%s
+       AND passage.passage_id>%s
        AND {_LIVE_PASSAGE_PREDICATE}
+     ORDER BY passage.passage_id
+     LIMIT %s
 """
 RECONCILE_PAGE_ROWS = 1000
 RECONCILE_DELETE_ROWS = 500
@@ -109,10 +114,9 @@ def _row_id(row: Any) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def namespace_ids(namespace: Any, *, page_rows: int = RECONCILE_PAGE_ROWS) -> set[str]:
-    """Every row id in the namespace, paged by id (no attributes over the wire)."""
+def namespace_id_pages(namespace: Any, *, page_rows: int = RECONCILE_PAGE_ROWS):
+    """Yield sorted namespace ids a page at a time, without attributes."""
 
-    ids: set[str] = set()
     last: str | None = None
     while True:
         query: dict[str, Any] = {
@@ -126,11 +130,64 @@ def namespace_ids(namespace: Any, *, page_rows: int = RECONCILE_PAGE_ROWS) -> se
             rows = response.get("rows")
         page = [row_id for row_id in (_row_id(row) for row in rows or ()) if row_id]
         if not page:
-            return ids
-        ids.update(page)
+            return
+        yield from page
         last = page[-1]
         if len(page) < page_rows:
-            return ids
+            return
+
+
+def namespace_ids(namespace: Any, *, page_rows: int = RECONCILE_PAGE_ROWS) -> set[str]:
+    """Compatibility helper for callers that explicitly need the complete set."""
+
+    return set(namespace_id_pages(namespace, page_rows=page_rows))
+
+
+def live_passage_id_pages(
+    store: Any,
+    *,
+    tenant_id: str,
+    policy_fingerprint: str,
+    page_rows: int = RECONCILE_PAGE_ROWS,
+):
+    """Yield unique live ids using short, restartable keyset transactions.
+
+    A page is the unit of database work.  The strict id cursor makes a rerun
+    safe after connection loss, and avoids the former unbounded query plus
+    ``fetchall()``. Passage ids can occur under more than one source, so
+    adjacent duplicates are collapsed.
+    """
+
+    last = ""
+    while True:
+        with store.connect() as connection:
+            rows = connection.execute(
+                LIVE_PASSAGE_IDS_PAGE_SQL,
+                (tenant_id, policy_fingerprint, last, page_rows),
+            ).fetchall()
+            connection.commit()
+        page = [
+            row["passage_id"]
+            for row in rows
+            if isinstance(row.get("passage_id"), str)
+        ]
+        if not page:
+            return
+        seen = last
+        for passage_id in page:
+            if passage_id != seen:
+                yield passage_id
+                seen = passage_id
+        last = page[-1]
+        if len(page) < page_rows:
+            return
+
+
+def _next_or_none(values: Any) -> str | None:
+    try:
+        return next(values)
+    except StopIteration:
+        return None
 
 
 def search_plane_reconcile(
@@ -156,52 +213,85 @@ def search_plane_reconcile(
 
     if not isinstance(tenant_id, str) or not tenant_id:
         raise ValueError("search plane reconcile tenant is invalid")
+    if isinstance(page_rows, bool) or not isinstance(page_rows, int) or page_rows < 1:
+        raise ValueError("search plane reconcile page rows are invalid")
+    if isinstance(delete_rows, bool) or not isinstance(delete_rows, int) or delete_rows < 1:
+        raise ValueError("search plane reconcile delete rows are invalid")
     if client is None:
         client = build_client(settings)
     namespace_name = settings.namespace(tenant_id)
     namespace = client.namespace(namespace_name)
-    with store.connect() as connection:
-        live = {
-            row["passage_id"]
-            for row in connection.execute(LIVE_PASSAGE_IDS_SQL, (tenant_id, policy_fingerprint)).fetchall()
-            if isinstance(row.get("passage_id"), str)
-        }
-        connection.commit()
-    LOG.info("search plane reconcile live_passages=%s", len(live))
+    present_ids = iter(namespace_id_pages(namespace, page_rows=page_rows))
+
+    live_ids = iter(live_passage_id_pages(
+        store,
+        tenant_id=tenant_id,
+        policy_fingerprint=policy_fingerprint,
+        page_rows=page_rows,
+    ))
+    live_id = _next_or_none(live_ids)
     try:
-        present = namespace_ids(namespace, page_rows=page_rows)
+        present_id = _next_or_none(present_ids)
     except Exception as error:  # noqa: BLE001 - the SDK's NotFoundError, by class name
         if type(error).__name__ != "NotFoundError":
             raise
-        present = set()
-    stale = sorted(present - live)
-    missing = sorted(live - present)
-    LOG.info(
-        "search plane reconcile namespace_rows=%s stale=%s missing=%s apply=%s",
-        len(present), len(stale), len(missing), apply,
-    )
+        present_ids = iter(())
+        present_id = None
+    live_count = 0
+    present_count = 0
+    stale_count = 0
+    missing_count = 0
     deleted = 0
     written = 0
-    if apply:
-        for start in range(0, len(stale), delete_rows):
-            batch = stale[start:start + delete_rows]
-            namespace.write(deletes=batch)
-            deleted += len(batch)
-            LOG.info("search plane reconcile deleted=%s/%s", deleted, len(stale))
-        if missing:
-            if projector is None:
+    # Applying while the namespace is being paged would change the input and
+    # corrupt the exact initial counts. Spool content-free ids to bounded disk,
+    # finish the comparison, then replay idempotent batches.
+    with tempfile.TemporaryFile(mode="w+t", encoding="ascii") as stale_ids, \
+            tempfile.TemporaryFile(mode="w+t", encoding="ascii") as missing_ids:
+        while live_id is not None or present_id is not None:
+            if present_id is None or (live_id is not None and live_id < present_id):
+                live_count += 1
+                missing_count += 1
+                if apply:
+                    missing_ids.write(live_id + "\n")
+                live_id = _next_or_none(live_ids)
+            elif live_id is None or present_id < live_id:
+                present_count += 1
+                stale_count += 1
+                if apply:
+                    stale_ids.write(present_id + "\n")
+                present_id = _next_or_none(present_ids)
+            else:
+                live_count += 1
+                present_count += 1
+                live_id = _next_or_none(live_ids)
+                present_id = _next_or_none(present_ids)
+
+        if apply:
+            if missing_count and projector is None:
                 raise ValueError("search plane reconcile needs a projector to write missing passages")
-            written = int(projector.upsert_passages(tenant_id, missing))
-            LOG.info("search plane reconcile written=%s/%s", written, len(missing))
+            stale_ids.seek(0)
+            stale_lines = (value.rstrip("\n") for value in stale_ids)
+            while batch := list(islice(stale_lines, delete_rows)):
+                namespace.write(deletes=batch)
+                deleted += len(batch)
+            missing_ids.seek(0)
+            missing_lines = (value.rstrip("\n") for value in missing_ids)
+            while batch := list(islice(missing_lines, delete_rows)):
+                written += int(projector.upsert_passages(tenant_id, batch))
+    LOG.info(
+        "search plane reconcile live_passages=%s namespace_rows=%s stale=%s missing=%s apply=%s",
+        live_count, present_count, stale_count, missing_count, apply,
+    )
     return {
         "status": "ok",
         "tenant_id": tenant_id,
         "policy_fingerprint": policy_fingerprint,
         "namespace": namespace_name,
-        "live_passages": len(live),
-        "namespace_rows": len(present),
-        "stale": len(stale),
-        "missing": len(missing),
+        "live_passages": live_count,
+        "namespace_rows": present_count,
+        "stale": stale_count,
+        "missing": missing_count,
         "applied": bool(apply),
         "deleted": deleted,
         "written": written,
