@@ -244,5 +244,108 @@ class ArchiveDeadlineTransportTest(ArchiveFixture, unittest.TestCase):
                 self.assertFalse(thread.is_alive())
 
 
+class ArchiveBulkDeadlineTest(ArchiveFixture, unittest.TestCase):
+    def test_bulk_timeout_is_explicit_bounded_and_shared_with_sdk(self):
+        calls = []
+        factory = lambda **kwargs: calls.append(kwargs) or mock.Mock()
+        store = build_evidence_archive_store(
+            environment(), client_factory=factory, deadline_reads=True,
+            deadline_read_timeout_seconds=5.0,
+        )
+        self.assertEqual(calls[1]['config'].read_timeout, 5.0)
+        self.assertEqual(calls[1]['config'].connect_timeout, 0.25)
+        self.assertEqual(calls[1]['config'].retries, {'total_max_attempts': 1})
+        self.assertEqual(store.deadline_read_timeout_seconds, 5.0)
+        self.assertEqual(archive.S3_DEADLINE_READ_TIMEOUT, 0.5)
+
+    def test_invalid_timeout_does_not_construct_any_client(self):
+        factory = mock.Mock()
+        for value in (True, None, '5', 0, 0.49, 5.01, float('nan'), float('inf')):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                build_evidence_archive_store(
+                    environment(), client_factory=factory, deadline_reads=True,
+                    deadline_read_timeout_seconds=value,
+                )
+        with self.assertRaises(ValueError):
+            build_evidence_archive_store(
+                environment(), client_factory=factory, deadline_read_timeout_seconds=5,
+            )
+        factory.assert_not_called()
+
+    def test_bulk_budget_admission_and_body_absolute_deadline_are_preserved(self):
+        self.store = archive.S3ArchiveStore(
+            bucket='evidence-test', endpoint_url='https://s3.us-west-2.amazonaws.com',
+            namespace_key=b'k' * 32, client=mock.Mock(), deadline_client=self.client,
+            deadline_read_timeout_seconds=5,
+        )
+        with self.assertRaises(archive.ArchiveDeadlineExceeded):
+            self.read(time.monotonic() + 5)
+        self.client.get_object.assert_not_called()
+        now = [10.0]
+        def get(**kwargs):
+            now[0] = 15.0
+            return self.response
+        self.client.get_object.side_effect = get
+        original = self.body.read
+        def read(size):
+            now[0] = 16.1
+            return original(size)
+        self.body.read = read
+        with mock.patch.object(archive.time, 'monotonic', side_effect=lambda: now[0]):
+            with self.assertRaises(archive.ArchiveDeadlineExceeded):self.read(16.0)
+        self.assertEqual(self.body.timeouts, [1.0])
+        self.assertTrue(self.body.closed)
+        self.client.get_object.assert_called_once()
+
+    def test_real_sdk_delayed_header_and_body_default_fails_bulk_succeeds_once(self):
+        for stage in ('headers', 'body'):
+            for budget in (0.5, 5.0):
+                attempts = []
+                release = threading.Event()
+                owner = self
+                class Handler(BaseHTTPRequestHandler):
+                    def log_message(self, *args):pass
+                    def do_GET(self):
+                        attempts.append(1)
+                        try:
+                            if stage == 'headers' and release.wait(0.75):return
+                            self.send_response(200)
+                            self.send_header('Content-Length', str(len(owner.payload)))
+                            for key, value in owner.response['Metadata'].items():
+                                self.send_header('x-amz-meta-' + key, value)
+                            self.end_headers();self.wfile.flush()
+                            if stage == 'body' and release.wait(0.75):return
+                            self.wfile.write(owner.payload);self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError):pass
+                server = HTTPServer(('127.0.0.1', 0), Handler)
+                thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.01})
+                thread.start();clients=[];acquired=[]
+                def factory(**kwargs):
+                    kwargs['endpoint_url'] = f'http://127.0.0.1:{server.server_port}'
+                    client = boto3.client(**kwargs);clients.append(client);return client
+                try:
+                    store = build_evidence_archive_store(
+                        environment(), client_factory=factory, deadline_reads=True,
+                        deadline_read_timeout_seconds=budget,
+                    )
+                    original = clients[1].get_object
+                    def get(**kwargs):
+                        response = original(**kwargs)
+                        response['Body'].close = mock.Mock(wraps=response['Body'].close)
+                        acquired.append(response['Body']);return response
+                    self.store=store
+                    with self.subTest(stage=stage, budget=budget), mock.patch.object(clients[1], 'get_object', side_effect=get):
+                        if budget==0.5:
+                            with self.assertRaisesRegex(archive.ArchiveError, '^archive provider request failed$'):
+                                self.read(time.monotonic()+8)
+                        else:self.assertEqual(self.read(time.monotonic()+8),self.payload)
+                    self.assertEqual(attempts,[1])
+                    for body in acquired:body.close.assert_called_once_with()
+                finally:
+                    release.set();server.shutdown();thread.join(2);server.server_close()
+                    for client in clients:client.close()
+                    self.assertFalse(thread.is_alive())
+
+
 if __name__ == '__main__':
     unittest.main()
