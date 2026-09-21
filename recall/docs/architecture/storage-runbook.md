@@ -171,3 +171,32 @@ Rebuilding needs time and free space. Record actual database/index bytes before
 and after removal; lower the provider disk floor only after verifying physical
 usage and live health. Neither source-reader parity nor removal of this index
 completes the remaining ingest/body/catalog migration.
+
+### Verified retirement and provider follow-through
+
+On 2026-09-21, PR #622/main `7bf7f8c` was deployed to the MCP service. The
+independent 43-case availability/accuracy card passed 14/14 gates before and
+after removal of the chunk index. The operation reclaimed 19,381,166,080 bytes
+(18.05 GiB), reducing the database to 183,432,861,363 bytes (170.84 GiB).
+
+The application role correctly refused DDL. A 15-minute PlanetScale role
+inheriting `postgres` ran the bounded operation through a Render one-off; its
+credential traveled through one temporary encrypted environment entry, never a
+command argument or log. The role and entry were deleted afterward. No worker
+deploy or source-body deletion was part of that operation. Verify migration 067
+is recorded before retirement so old idempotent migrations cannot recreate
+the index.
+
+The disk floor changed from 300 to 275 GiB with `confirm_shrink: true`, retaining
+PS80, two replicas and the 300 GiB cap. A completed branch change is insufficient
+proof of physical shrink: query `/infrastructure` and check each node's
+`volume_capacity_bytes` and `disk_replacement`. At 00:46 UTC the floor was
+275 GiB while all three actual disks remained 300 GiB with no replacement
+scheduled. Billing reduction was not verified. Private operation/card artifacts:
+`~/.recall/storage-retirement-20260920/`.
+
+Before clearing any body, require the append/reprojection proof: project older
+turns, clear only verified synthetic bodies, append/revise/forget, then reproject
+and reopen every retained receipt. A correct reader alone cannot prove that a
+future projection preserves archived evidence. PR #624 prevents publishing bad
+source bytes; archive-backed reprojection is a separate prerequisite.

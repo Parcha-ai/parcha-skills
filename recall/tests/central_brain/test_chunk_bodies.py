@@ -148,7 +148,7 @@ class ChunkBodyTests(unittest.TestCase):
                 self.read(store, archive)
 
     def test_denied_unprojected_unsupported_do_no_archive_io(self):
-        for mutation in ({"pending": True}, {"manifest": None},
+        for mutation in ({"manifest": None},
                          {"raw_media_type": "application/vnd.recall.oversized-record+gzip"},
                          {"structural_types": ["token_count"]}):
             row = self.document("native", "body")
@@ -167,6 +167,94 @@ class ChunkBodyTests(unittest.TestCase):
         row["text_sha256"] = digest("different")
         with self.assertRaises(ChunkBodyError):
             self.read(store, archive)
+
+    def test_pending_append_serves_unchanged_document_and_omits_new_document(self):
+        old, new = self.document("old", "exact old body"), self.document("new", "new body")
+        store, archive = self.fixture([old, new], [self.record(old, "exact old body", 0)])
+        old["pending"] = new["pending"] = True
+        result = self.read(store, archive)
+        self.assertEqual(list(result), [("source", old["document_id"])])
+        self.assertEqual(result[("source", old["document_id"])][0]["text_redacted"], "exact old body")
+        self.assertEqual(len(archive.calls), 1)
+        self.assertEqual(len(store.calls), 2)
+
+    def test_pending_revision_omits_old_body_but_keeps_unchanged_sibling(self):
+        revised, sibling = self.document("revised", "old body"), self.document("sibling", "same body")
+        records = [self.record(revised, "old body", 0), self.record(sibling, "same body", 1)]
+        store, archive = self.fixture([revised, sibling], records)
+        revised.update(revision=3, text_sha256=digest("new body"), pending=True)
+        revised["chunks"] = [dict(ordinal=0, receipt="recall://source/revised?rev=3#item=0", text_sha256=digest("new body"))]
+        sibling["pending"] = True
+        result = self.read(store, archive)
+        self.assertEqual(list(result), [("source", sibling["document_id"])])
+        self.assertEqual(result[("source", sibling["document_id"])][0]["text_redacted"], "same body")
+
+    def test_pending_same_revision_hash_or_receipt_corruption_is_not_fallback(self):
+        for mutation in ("hash", "receipt"):
+            row = self.document("native", "body")
+            record = self.record(row, "body", 0)
+            store, archive = self.fixture([row], [record])
+            row["pending"] = True
+            if mutation == "hash":
+                row["text_sha256"] = digest("changed without revision")
+            else:
+                row["chunks"][0]["receipt"] = "recall://source/other?rev=2#item=0"
+            with self.subTest(mutation=mutation), self.assertRaises(ChunkBodyError):
+                self.read(store, archive)
+
+    def test_pending_older_revision_requires_canonical_complete_receipts(self):
+        for receipts in (
+            ("recall://source/native?rev=0#item=0",),
+            ("recall://source/native?rev=01#item=0",),
+            ("recall://source/native?rev=3#item=0",),
+            ("recall://source/native?rev=1#item=1",),
+            ("recall://source/native?rev=1#item=0", "recall://source/native?rev=1#item=2"),
+            ("recall://source/other?rev=1#item=0",),
+        ):
+            row = self.document("native", "current body")
+            store, archive = self.fixture([row], [self.record(row, "old body", 0, receipts=receipts)])
+            row["pending"] = True
+            with self.subTest(receipts=receipts), self.assertRaises(ChunkBodyError):
+                self.read(store, archive)
+
+    def test_pending_unsupported_and_historical_documents_remain_omitted(self):
+        for mutation in (
+            {"raw_media_type": "application/vnd.recall.oversized-record+gzip"},
+            {"structural_types": ["token_count"]},
+            {},
+        ):
+            row = self.document("native", "abcdef", pieces=["abc", "def"])
+            store, archive = self.fixture([row], [self.record(row, "abcdef", 0)])
+            row.update(pending=True, **mutation)
+            with self.subTest(mutation=mutation):
+                self.assertEqual(self.read(store, archive), {})
+                self.assertEqual(len(archive.calls), 0 if mutation else 1)
+
+    def test_pending_corrupt_part_and_incomplete_old_segments_fail_closed(self):
+        row = self.document("native", "old body")
+        first = self.record(row, "old", 0, segment_count=2)
+        store, archive = self.fixture([row], [first])
+        row.update(revision=3, pending=True, text_sha256=digest("new body"))
+        row["chunks"] = [dict(ordinal=0, receipt="recall://source/native?rev=3#item=0", text_sha256=digest("new body"))]
+        with self.assertRaises(ChunkBodyError):
+            self.read(store, archive)
+        archive.payloads[row["parts"][0]["object_key"]] = b"corrupt body"
+        with self.assertRaises(ChunkBodyError):
+            self.read(store, archive)
+
+    def test_pending_publication_race_fails_closed_until_request_retried(self):
+        row = self.document("native", "body")
+        store, archive = self.fixture([row], [self.record(row, "body", 0)])
+        row["pending"] = True
+        published = copy.deepcopy(row)
+        published["pending"] = False
+        published["manifest"]["revision"] += 1
+        store.snapshots = [[row], [published]]
+        with self.assertRaises(ChunkBodyError):
+            self.read(store, archive)
+        store.calls = []
+        store.snapshots = [[published]]
+        self.assertEqual(self.read(store, archive)[("source", row["document_id"])][0]["text_redacted"], "body")
 
     def test_current_multichunk_boundaries_require_every_hash(self):
         text = "multilingual 🐢 text\n" * 3000
