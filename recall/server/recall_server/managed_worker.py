@@ -695,7 +695,14 @@ def run_managed_worker(
         )
     cycles = committed = failed = projection_failures = 0
     while True:
-        result = worker.run_once()
+        try:
+            result = worker.run_once()
+        except Exception as error:
+            if once:
+                raise
+            LOG.error("managed connector cycle failed type=%s", type(error).__name__)
+            time.sleep(interval_seconds)
+            continue
         projection: dict[str, int | str] = {
             "status": "disabled",
             "logical_documents": 0,
