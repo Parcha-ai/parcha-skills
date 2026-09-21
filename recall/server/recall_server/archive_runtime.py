@@ -13,6 +13,8 @@ from .archive import (
     ArchiveRequest,
     ArtifactReference,
     S3ArchiveStore,
+    S3_DEADLINE_CONNECT_TIMEOUT,
+    S3_DEADLINE_READ_TIMEOUT,
 )
 
 R2_REQUIRED_ENV = (
@@ -89,6 +91,7 @@ def build_archive_store(
     environment: Mapping[str, str] | None = None,
     *,
     client_factory: Callable[..., Any] | None = None,
+    deadline_reads: bool = False,
 ) -> S3ArchiveStore:
     values = os.environ if environment is None else environment
     backend = _required(values, "RECALL_ARCHIVE_BACKEND")
@@ -114,19 +117,33 @@ def build_archive_store(
 
         client_factory = boto3.client
         client_options["config"] = Config(max_pool_connections=64)
-    client = client_factory(
+    connection_options = dict(
         service_name="s3",
         endpoint_url=endpoint_url,
         region_name=region,
         aws_access_key_id=configured["RECALL_ARCHIVE_ACCESS_KEY_ID"],
         aws_secret_access_key=configured["RECALL_ARCHIVE_SECRET_ACCESS_KEY"],
-        **client_options,
     )
+    client = client_factory(**connection_options, **client_options)
+    deadline_client = None
+    if deadline_reads:
+        from botocore.config import Config
+
+        deadline_client = BotoS3Client(client_factory(
+            **connection_options,
+            config=Config(
+                retries={"total_max_attempts": 1},
+                connect_timeout=S3_DEADLINE_CONNECT_TIMEOUT,
+                read_timeout=S3_DEADLINE_READ_TIMEOUT,
+                max_pool_connections=8,
+            ),
+        ))
     return S3ArchiveStore(
         bucket=configured["RECALL_ARCHIVE_BUCKET"],
         endpoint_url=endpoint_url,
         namespace_key=namespace_key,
         client=BotoS3Client(client),
+        deadline_client=deadline_client,
         compatibility_profile={
             "r2": "r2",
             "s3": "aws",
@@ -139,6 +156,7 @@ def build_evidence_archive_store(
     environment: Mapping[str, str] | None = None,
     *,
     client_factory: Callable[..., Any] | None = None,
+    deadline_reads: bool = False,
 ) -> S3ArchiveStore:
     """Build the separately credentialed, privacy-processed evidence bucket."""
     values = os.environ if environment is None else environment
@@ -159,7 +177,9 @@ def build_evidence_archive_store(
             values, "RECALL_EVIDENCE_ARCHIVE_NAMESPACE_KEY"
         ),
     }
-    return build_archive_store(translated, client_factory=client_factory)
+    return build_archive_store(
+        translated, client_factory=client_factory, deadline_reads=deadline_reads,
+    )
 
 
 def probe_archive(store: S3ArchiveStore) -> dict[str, Any]:
