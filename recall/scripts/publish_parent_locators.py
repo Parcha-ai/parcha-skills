@@ -18,7 +18,11 @@ import time
 RECALL = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(RECALL), str(RECALL / "server")]
 from recall_server.archive_runtime import build_evidence_archive_store
-from recall_server.chunk_retirement import ParentRetirementLimits, write_private_plan
+from recall_server.chunk_retirement import (
+    ParentRetirementLimits,
+    read_private_plan,
+    write_private_plan,
+)
 from recall_server.db import BrainStore
 from recall_server.streaming_locators import (
     LocatorPublicationError,
@@ -31,6 +35,11 @@ def main(argv=None):
     for name in ("tenant-id", "source-id", "native-parent-id", "owner-principal-id"):
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument(
+        "--reviewed-report",
+        type=Path,
+        help="Optional prior private report identity; fresh proof is still required",
+    )
     parser.add_argument(
         "--report-file",
         type=Path,
@@ -71,6 +80,11 @@ def main(argv=None):
             native_parent_id=args.native_parent_id,
             owner_principal_id=args.owner_principal_id,
             apply=args.apply,
+            reviewed_plan=(
+                read_private_plan(args.reviewed_report)["plan"]
+                if args.reviewed_report is not None
+                else None
+            ),
             limits=limits,
             deadline_at=time.monotonic() + args.timeout_seconds,
         )

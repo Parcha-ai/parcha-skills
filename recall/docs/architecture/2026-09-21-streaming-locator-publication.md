@@ -19,7 +19,7 @@ python scripts/publish_parent_locators.py \
   --report-file "$TASK_PRIVATE_REPORT"
 ```
 
-Add `--apply` for publication and use a different report filename. `RECALL_DATABASE_URL` and the existing evidence archive configuration provide runtime access; the command loads no provider credentials itself. Archive reads use the bounded runtime client. Parent/document/chunk/archive/spool/batch caps and timeout are explicit CLI options; defaults reuse existing parent-proof limits. No worker-loop activation is included.
+Add `--apply` for publication and use a different report filename. `--reviewed-report` optionally requires the fresh catalog identity (including creation time) to equal a prior private report; it still repeats all archive/body proof before any write. `RECALL_DATABASE_URL` and the existing evidence archive configuration provide runtime access; the command loads no provider credentials itself. Archive reads use the bounded runtime client. Parent/document/chunk/archive/spool/batch caps and timeout are explicit CLI options; defaults reuse existing parent-proof limits. No worker-loop activation is included.
 
 ## Resume and failures
 

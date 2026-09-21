@@ -89,9 +89,25 @@ def basic(store, root):
     )
     preview = locators.publish_parent_locators(store, archive, **scope)
     assert preview["proposed_documents"] == 10 and state(store, scope) == initial
+    reviewed = json.loads(json.dumps(preview["plan"], default=str))
+    with store.connect() as connection:
+        connection.execute(
+            "UPDATE canonical_evidence_documents SET created_at=created_at+interval '1 second' WHERE tenant_id=%s AND source_id=%s",
+            (scope["tenant_id"], scope["source_id"]),
+        )
+    denied(
+        lambda: locators.publish_parent_locators(
+            store, archive, **scope, apply=True, reviewed_plan=reviewed
+        )
+    )
+    assert state(store, scope) == initial, (
+        "stale reviewed catalog identity changed locators"
+    )
+    preview = locators.publish_parent_locators(store, archive, **scope)
+    reviewed = json.loads(json.dumps(preview["plan"], default=str))
     archive.reads.clear()
     first = locators.publish_parent_locators(
-        store, archive, **scope, apply=True, limits=limits
+        store, archive, **scope, apply=True, limits=limits, reviewed_plan=reviewed
     )
     assert (
         first["published_documents"] == 6

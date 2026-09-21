@@ -217,6 +217,7 @@ def publish_parent_locators(
     native_parent_id,
     owner_principal_id,
     apply=False,
+    reviewed_plan=None,
     limits=None,
     deadline_at=None,
     should_stop=None,
@@ -283,9 +284,14 @@ def publish_parent_locators(
                 manifest=proof["manifest"],
                 catalog_created_at=proof["catalog_created_at"],
             )
+            # Portable report identity: saved JSON and fresh database datetimes
+            # must compare without accepting serialized proof as authority.
+            plan = orjson.loads(orjson.dumps(plan, default=str))
             plan["proof_sha256"] = hashlib.sha256(
                 orjson.dumps(plan, option=orjson.OPT_SORT_KEYS, default=str)
             ).hexdigest()
+            if reviewed_plan is not None and reviewed_plan != plan:
+                raise LocatorPublicationError("locator_publication_review_changed")
             report = dict(
                 plan=plan,
                 status="dry_run",
