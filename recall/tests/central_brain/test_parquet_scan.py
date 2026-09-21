@@ -1123,9 +1123,9 @@ class ParquetFragmentDeltaTest(unittest.TestCase):
         self.assertEqual(result.references, {})
         self.assertEqual(archive.reads, [])
 
-    def test_fragment_rows_never_duplicate_a_document(self):
-        # alpha spilled across parts 0 and 1 (superset membership); gamma shares
-        # part 1 with alpha's tail; beta lives alone in part 2.
+    def test_shared_tail_plan_retains_unrelated_head_fragment(self):
+        # Actual packed-output parity (including supersets) is covered by
+        # test_parquet_cross_dataset_delta. This isolates the planning boundary.
         alpha = _month_document("document:alpha")
         beta = _month_document("document:beta")
         gamma = _month_document("document:gamma")
@@ -1133,37 +1133,14 @@ class ParquetFragmentDeltaTest(unittest.TestCase):
             {0: [alpha], 1: [alpha, gamma], 2: [beta]},
             dirty={"document:gamma"},
         )
-        changed_gamma = {**gamma, "document_content_sha256": "e" * 64}
-        archive = _DocumentArchive(
-            {"document:alpha": 4, "document:beta": 2, "document:gamma": 3}
+        changed = {**gamma, "document_content_sha256": "e" * 64}
+        projector = _FragmentProbe([alpha, beta, changed], catalog, _DocumentArchive({}))
+        mode, victims, rewrite, _ = projector._plan(
+            _candidate(), [alpha, beta, changed], catalog
         )
-        projector = _FragmentProbe([alpha, beta, changed_gamma], catalog, archive)
-
-        result = projector._build(_candidate())
-
-        # Rewriting gamma's part drags alpha's tail, so alpha's head part goes
-        # too: otherwise alpha's rows would exist twice.
-        self.assertEqual(
-            set(result.removed),
-            {(dataset, index) for dataset in SCAN_DATASETS for index in (0, 1)},
-        )
-        self.assertEqual(sorted(archive.reads), ["document:alpha", "document:gamma"])
-        records = self._records(archive)
-        self.assertEqual(records["document:alpha"], [0, 1, 2, 3])
-        self.assertEqual(records["document:gamma"], [0, 1, 2])
-        self.assertNotIn("document:beta", records)
-        live_after = (set(catalog.shards) - set(result.removed)) | set(
-            result.references
-        )
-        live_members = [
-            member.logical_document_id
-            for identity in live_after
-            for member in (
-                result.members.get(identity) or catalog.members.get(identity) or ()
-            )
-            if identity[0] == "records"
-        ]
-        self.assertEqual(sorted(live_members), ["document:alpha", "document:beta", "document:gamma"])
+        self.assertEqual(mode, "delta")
+        self.assertEqual(victims, {(dataset, 1) for dataset in SCAN_DATASETS})
+        self.assertEqual(rewrite, {"document:gamma"})
 
     def test_new_parts_never_overwrite_live_objects(self):
         alpha = _month_document("document:alpha")

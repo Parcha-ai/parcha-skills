@@ -21,7 +21,7 @@ import orjson
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .archive import ArchiveNotFound
+from .archive import ArchiveCorruption, ArchiveNotFound
 
 
 PARQUET_MEDIA_TYPE = "application/vnd.apache.parquet"
@@ -44,6 +44,33 @@ LOG = logging.getLogger(__name__)
 
 class ParquetScanError(RuntimeError):
     """Content-free projection failure."""
+
+
+class _DerivedFragmentUnavailable(ParquetScanError):
+    """A missing or corrupt derived part can be rebuilt from canonical evidence."""
+
+
+def _preserved_fragment_rows(
+    archive: Any, shard: dict[str, Any], schema: Any,
+) -> Iterator[dict[str, Any]]:
+    try:
+        payload = archive.read_raw(_reference(shard))
+    except (ArchiveNotFound, ArchiveCorruption):
+        raise _DerivedFragmentUnavailable("parquet_scan_fragment_unavailable") from None
+    if (len(payload) != int(shard["size_bytes"])
+            or hashlib.sha256(payload).hexdigest() != shard["content_sha256"]):
+        raise _DerivedFragmentUnavailable("parquet_scan_fragment_unavailable")
+    try:
+        with pq.ParquetFile(pa.BufferReader(payload)) as parquet:
+            # Arrow's Parquet round trip renames list children item -> element.
+            # Field names, nullability and types must otherwise match exactly.
+            if (not parquet.schema_arrow.equals(schema)
+                    or parquet.metadata.num_rows != int(shard["row_count"])):
+                raise _DerivedFragmentUnavailable("parquet_scan_fragment_unavailable")
+            for batch in parquet.iter_batches(batch_size=256):
+                yield from batch.to_pylist()
+    except pa.ArrowInvalid:
+        raise _DerivedFragmentUnavailable("parquet_scan_fragment_unavailable") from None
 
 
 def _month(value: date | datetime | str) -> date:
@@ -1364,32 +1391,106 @@ class CanonicalParquetScanProjector:
             return "compaction", all_parts, set(current), dirty
         effective = stale | uncovered
         victims: set[tuple[str, int]] = set()
-        frontier = set(effective)
-        while frontier:
-            document_id = frontier.pop()
-            for identity in document_parts.get(document_id, ()):
-                if identity in victims:
-                    continue
-                victims.add(identity)
-                for member in catalog.members.get(identity, ()):
-                    if member.logical_document_id not in effective:
-                        effective.add(member.logical_document_id)
-                        frontier.add(member.logical_document_id)
+        # Datasets pack independently: a shared metadata fragment must not pull
+        # unrelated record fragments into this delta. Preserve its sibling rows.
+        for document_id in effective:
+            victims.update(document_parts.get(document_id, ()))
         rewrite = {document_id for document_id in effective if document_id in current}
         if not victims and not rewrite:
             return "reuse", set(), set(), dirty
         return (
-            "full" if victims == all_parts else "delta",
+            "delta",
             victims,
             rewrite,
             dirty,
         )
 
-    def _build(self, candidate: ScanCandidate) -> ScanUpload:
+    def _preserve_rows(
+        self,
+        candidate: ScanCandidate,
+        catalog: ScanCatalog,
+        victims: set[tuple[str, int]],
+        rewrite: set[str],
+        documents: list[dict[str, Any]],
+        upload: _StreamingUpload,
+    ) -> tuple[datetime | None, datetime | None]:
+        """Copy current siblings from immutable victim parts into packed output.
+
+        Membership may be a safe superset after an encoded split. Copy only
+        actual rows, never a sibling's other parts. Publication still uses the
+        existing catalog generation fence and cleanup transaction.
+        """
+        current = {document["logical_document_id"]: document for document in documents}
+        first = last = None
+        for identity in sorted(victims):
+            dataset, shard_index = identity
+            members = {
+                member.logical_document_id: member
+                for member in catalog.members.get(identity, ())
+            }
+            keep = (set(members) & set(current)) - rewrite
+            if not keep:
+                continue
+            shard = catalog.shards[identity]
+            if (
+                shard["tenant_id"] != candidate.tenant_id
+                or shard["source_id"] != candidate.source_id
+                or shard["bucket_start"] != candidate.bucket_start
+                or shard["dataset"] != dataset
+                or int(shard["shard_index"]) != shard_index
+                or shard["media_type"] != PARQUET_MEDIA_TYPE
+                or not 0 < int(shard["size_bytes"]) <= MAX_PARQUET_OBJECT_BYTES
+                or len(members) != len(catalog.members[identity])
+            ):
+                raise ParquetScanError("parquet_scan_state_invalid")
+            for document_id in keep:
+                member = members[document_id]
+                document = current[document_id]
+                if (member.revision != int(document["revision"])
+                        or member.generation_sha256 != self._fingerprint(document)):
+                    raise ParquetScanError("parquet_scan_state_invalid")
+            seen = set()
+            for row in _preserved_fragment_rows(
+                self.archive, shard, upload.schemas[dataset]
+            ):
+                member = members.get(row["logical_document_id"])
+                if (member is None
+                        or row["schema_version"] != SCAN_SCHEMA_VERSION
+                        or row["tenant_id"] != candidate.tenant_id
+                        or row["source_id"] != candidate.source_id
+                        or row["revision"] != member.revision):
+                    raise ParquetScanError("parquet_scan_state_invalid")
+                if member.logical_document_id not in keep:
+                    continue
+                if (dataset == "records"
+                        and upload.rows_seen["records"] >= MAX_SCAN_RECORDS):
+                    raise ParquetScanError("parquet_scan_budget_exceeded")
+                upload.add(dataset, row, member=member)
+                seen.add(member.logical_document_id)
+                if dataset == "documents":
+                    # Aggregate bounds describe document records; passages may
+                    # straddle months. Their own fragment bounds stay separate.
+                    row_first, row_last = _row_bounds(dataset, row)
+                    if row_first is not None:
+                        first = row_first if first is None else min(first, row_first)
+                    if row_last is not None:
+                        last = row_last if last is None else max(last, row_last)
+            if dataset == "documents":
+                # A valid document can own a part without a row in this month.
+                # Preserve that ownership, including encoded-split supersets.
+                for document_id in sorted(keep - seen):
+                    upload.claim(dataset, members[document_id])
+        return first, last
+
+    def _build(self, candidate: ScanCandidate, *, _rebuild: bool = False) -> ScanUpload:
         started = time.perf_counter()
         documents = self._documents(candidate)
         catalog = self._catalog(candidate)
         mode, victims, rewrite, dirty = self._plan(candidate, documents, catalog)
+        if _rebuild:
+            mode, victims, rewrite = "full", set(catalog.shards), {
+                document["logical_document_id"] for document in documents
+            }
         metadata_ms = round((time.perf_counter() - started) * 1_000)
         if mode == "reuse":
             LOG.info(
@@ -1445,9 +1546,22 @@ class CanonicalParquetScanProjector:
         ensure_datasets = tuple(
             dataset for dataset, indexes in surviving.items() if not indexes
         )
+        contributing = rewrite | {
+            member.logical_document_id
+            for identity in victims for member in catalog.members.get(identity, ())
+        }
+        generation = self._generation(candidate, [
+            document for document in documents
+            if document["logical_document_id"] in contributing
+        ])
+        if _rebuild:
+            # Recovery must not reuse objects already queued by the failed delta.
+            generation = hashlib.sha256(
+                (generation + ":canonical-rebuild").encode()
+            ).hexdigest()
         upload = self._streaming_upload(
             candidate,
-            generation=self._generation(candidate, rewrite_documents),
+            generation=generation,
             created_at=bucket_start,
             next_indexes=next_indexes,
         )
@@ -1463,6 +1577,9 @@ class CanonicalParquetScanProjector:
         discovered_bounds: list[PartTimeBound] = []
         removed = tuple(sorted(victims))
         try:
+            first, last = self._preserve_rows(
+                candidate, catalog, victims, rewrite, documents, upload
+            )
             for passage in self._passages(candidate, sorted(members)):
                 upload.add(
                     "passages",
@@ -1574,6 +1691,8 @@ class CanonicalParquetScanProjector:
                     documents_dirty=len(dirty),
                     documents_rewritten=len(rewrite_documents),
                 )
+            if upload.pending_members["documents"] and not upload.rows_seen["documents"]:
+                ensure_datasets = tuple(set(ensure_datasets) | {"documents"})
             result = upload.finish(
                 first=first,
                 last=last,
@@ -1588,6 +1707,10 @@ class CanonicalParquetScanProjector:
                 upload.abort()
             except Exception:
                 raise ParquetScanError("parquet_scan_cleanup_enqueue_failed") from error
+            if isinstance(error, _DerivedFragmentUnavailable) and not _rebuild:
+                # One canonical rebuild, after staged objects are handed to
+                # cleanup. Never retry transport, ownership or publication errors.
+                return self._build(candidate, _rebuild=True)
             raise
         finished = time.perf_counter()
         LOG.info(
