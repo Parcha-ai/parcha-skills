@@ -219,7 +219,7 @@ safe. Asynchronous passage or Parquet pointers alone do not cover logical-public
 lag. See [streaming locator publication](2026-09-21-streaming-locator-publication.md)
 and [bounded parent retirement](2026-09-21-recall-parent-chunk-retirement.md).
 
-### Current company-brain checkpoint — 2026-09-21, after source15
+### Current company-brain checkpoint — 2026-09-21, events validated; disk replacements in progress
 
 MCP now runs #658 (`78f6ba0`); projection remains #648 and managed ingestion
 #650. Schema 069, archive body reads and turbopuffer search remain live. The
@@ -229,7 +229,20 @@ schema69/readiness, six exact preserved response pairs, eight archive reads and
 two documents still empty in PostgreSQL. The unchanged post-#658 original card
 also passed 26/26 at 15:02:32 UTC; detailed latency and limitations are below.
 The earlier #656 runtime proof also passed. The managed cycle succeeded at 09:15:08 UTC;
-its new record volume was not measured. Documentation checkpoint #657 is merged.
+its new record volume was not measured. Documentation checkpoints #657 and #659 are merged.
+#660 (`88f1ca2`) is also merged but **not deployed**: it removes redundant SQL
+pings while preserving deadline setup and proof behavior. Local PostgreSQL
+equivalence and timeout tests passed; no production speed benefit has been measured.
+PR #661 (`8b7e5c2`) merged at **16:39:02 UTC** and is **not deployed**. It gives both
+collector-health writes one five-second SQL budget, preserving atomic rollback
+and generic HTTP 503 on failure. Tests pass, but the budget is not a hard
+network/COMMIT deadline and does not establish the cause of the Insights latency.
+PR #662 merged as `c10e6d3` at **17:39:41 UTC**, after full CI and zero unresolved
+review threads, and is **not deployed**. Its single guard skips document-
+manifest discovery when scan aliases are empty; admitted-object mounts, dataset
+links, tool hash checks and nonempty-alias behavior remain intact. Six generated-
+stage tests and the full **1,835 Python / 8 Node** suite passed; independent
+review scored **4.5/5**. This is a tested simplification, not a measured live speed gain.
 
 | Component | Production responsibility | Boundary still retained |
 |---|---|---|
@@ -256,9 +269,38 @@ clearing **2,289 documents / 2,433 chunks / 9,496,691 UTF-8 bytes**. It reported
 zero errors, partial parents or unknown commits, with three exact read pairs.
 Its result is **`bounded`**, not `no_ready` or source completion; it does not
 individually establish that source13's failed parent has been reconciled.
-Acknowledged lifetime totals are now **147,234 documents / 162,492 chunks /
-711,293,440 UTF-8 bytes**. Restores and revisions do not subtract from those
+After the additional priority-source work below, acknowledged lifetime totals
+are **151,863 documents / 167,244 chunks / 723,382,521 UTF-8 bytes**. Restores and revisions do not subtract from those
 counters; neither remaining stored-body bytes nor physical savings follows from them.
+
+The next priority source now has **40 enabled parents**, separate from the original
+235-parent discovery frontier. Its bounded passes were verified and their
+reservations released:
+
+| Pass | Proven logical work | Timing and limits |
+|---|---|---|
+| Initial ten parents | 10 proofs; 447 documents / 476 chunks / 1,878,423 UTF-8 bytes cleared; seven structural exclusions | 73.027 s; three exact read pairs; bounded result |
+| Next 20-parent page | 3,596 locators in 28 batches; 20 parents enrolled; one proof cleared 12 documents / 15 chunks / 134,049 bytes | 316.082 s, including 251.781 s publication; grace/readiness limited same-job draining |
+| Separate drain 04 | 19 proofs; 3,584 documents / 3,645 chunks / 7,747,339 bytes cleared in 27 batches; 45 structural exclusions | 22.606 s; three exact pairs; no errors, partial parents or unknown commits |
+| Execute 05 timing pass | 586 locators and 10 enrollments; 10 proofs cleared 586 documents / 616 chunks / 2,329,270 bytes; eight structural exclusions | 71.451 s, publication 6.943 s; three exact pairs; no errors, partial parents or unknown commits |
+
+Drain 04's `no_ready_parents` was a momentary scheduling result, not proof of all
+source bodies being removed. Structural exclusions survive completed proofs.
+The driver stopped on a reported lag-metric gate after the 20-parent page; the
+metric's meaning and the job's effects are not established by that coincidence.
+A fresh reviewed session, current frontier and quality gate remain required
+before another bounded page. Never replay consumed intents or resume that stopped
+session; reconcile its known result and reservation first.
+
+Insights for the **15:24–15:30 UTC** window reported **76 collector-health upserts /
+350,434 ms total / 39,450 ms p99**, while **28 canonical-document UPDATE calls
+totaled 573 ms**. These are window aggregates, not job attribution; **COMMIT is
+excluded**. The original field-selected zero values were unusable and are not
+retained as evidence of absent work. The execute 05 timing pass measured
+6.943 s of publication, including 2.150 s in metadata capture and 1.987 s in
+publication batches; nested timing categories overlap and must not be summed.
+The earlier slow publication did not recur. The upsert is a diagnostic lead,
+not an established cause or permission to change writer behavior.
 
 The smaller archive outlier has made separately acknowledged locator progress:
 11,008 NULL-only publications in an earlier attempt whose batch failure cause
@@ -331,8 +373,9 @@ nonempty stored bytes (81.5%)**. This supports prioritizing locator publication
 and exact body retirement over another whole-table copy. Sample extrapolations
 are estimates, not physical savings or guaranteed clear eligibility. Structural
 eligibility was not inspected; zero observations do not prove absence. Historical
-bodies still require their own authority and retention review. The next source's
-anchor has been validated and a plan prepared; no clear is implied by preparation.
+bodies still require their own authority and retention review. The next priority
+source has since advanced through the bounded passes above; that does not expand
+the sample into a full-corpus coverage claim.
 
 **Quality and speed:** the original card after source13 was degraded at **22/26**,
 with availability/search failures during observed database load and replica lag.
@@ -348,36 +391,116 @@ The post-#658 original card then passed **26/26**, terminal at **15:02:32 UTC**
 after 163.6 seconds, with all 16 verifier hashes unchanged: recall@20 **.9625**,
 MRR **.6628**, zero backend/auth/tool errors; p95 scope **351.3 ms**, search
 **1,464.2 ms**, server **1,009.2 ms**, show **655.3 ms**, context **5,140.3 ms**,
-scan **7,578.7 ms**. Both passing cards and the earlier failures remain preserved.
+scan **7,578.7 ms**. The initial priority-source ten-parent card, page20 card and
+drain04 card each also passed **26/26**. After execute 05, the unchanged original
+card passed **26/26 at 16:04:26 UTC** in **184.0 seconds**, over the same 43 validation
+cases and three repetitions with all 16 verifier files and truth pins unchanged:
+recall@20 **.9625**, MRR **.6617**, backend/auth/tool errors **0**; p95 scope
+**233.3 ms**, search **1,465.4 ms**, server **1,060.8 ms**, show **453.0 ms**,
+context **5,068.3 ms**, scan **8,342.7 ms**. All passing cards and the earlier
+failures remain preserved.
 Passing gates does not close the speed objective or establish a causal gain. Context still uses only three calls to a
 variable target and its tail remains unfinished; optional index operation #653
-remains unbuilt. The three-page driver stays disabled after the pressure episode.
+remains unbuilt. The stopped driver is not resumable: continuation requires a
+fresh reviewed session and frontier. No consumed intent is replayed and no causal
+speed claim is implied.
 
-**Provider capacity:** the PS80 primary remains writable, with two replicas. The
-floor is 275 GiB and cap 300 GiB, but **all three actual volumes remain 300 GiB**,
-with no replacement pending and no billed disk reduction proved. At **14:30:44 UTC**,
-used bytes were **187,898,855,424 / 187,901,313,024 / 187,901,280,256** (about
-175.0 GiB per node). The completed 275 GiB request did not shrink the disks, and
-capacity was not expanded. Measured physical reclaim remains **24.53 GiB** from
-the chunk GIN and documents rewrite alone; chunk-body rewrites have reclaimed
-zero. Usage
-changes, reusable pages and accepted configuration are separate from the
-physical-capacity exit.
+**Provider capacity:** the **18:41:35 UTC** observation still showed six
+nodes. The old primary and two replicas continued serving on
+**322,122,547,200-byte (300 GiB)** disks, with replacement in progress. Three new
+nodes remained in `restore`, each with **295,279,001,600-byte (275 GiB)** capacity.
+Replacement-target metadata has fluctuated: all new restore fields were null at
+18:32, but the new primary again listed an unscheduled 300 GiB target at 18:41,
+with no reason given. Its actual disk remained 275 GiB. These hints do not
+establish a capacity change; no actual capacity growth was observed.
+The primary replacement was scheduled at 17:28:51, following the replica schedules
+at 17:08:00 and 17:09:12 UTC. This follows the earlier 275 GiB minimum request;
+**no new PATCH was submitted** and the cap remains 300 GiB.
+
+The separate **18:23:25 UTC** fetch reported 100% backup fetch and restore active
+for all three new nodes. Intrinsic metric measurement time was unavailable;
+backup fetch is not restoration or fleet-switchover completion. The observer
+ending is also not provider completion. Completed resize, final three-node
+capacities, post-resize validation and billed savings remain unproved. Ordinary
+maintenance remains held. A smaller compute tier is an optional proposal only:
+no compute change or compute savings have been achieved, and measurements during
+restore do not establish normal workload headroom.
+
+Measured physical reclaim is **36,751,712,256 bytes (34.23 GiB)** from the chunk
+GIN, documents and events rewrites; chunk-body rewrites have reclaimed zero.
+Relation allocation, provider usage, completed capacity replacement and billing
+are distinct measurements. Earlier observations of three unchanged 300 GiB
+volumes remain valid historical evidence, superseded by this in-progress roll.
+
+The fresh **events-only read-only sample completed at 16:07:47 UTC** in
+**1,760.929 ms**: 256 heap pages / 2,185 visible rows / 58 external values.
+Exact allocations were **41.304 GiB total**, including **14.745 GiB heap /
+17.492 GiB main indexes / 9.063 GiB TOAST**. Estimated live external stored data
+was **1.029 GiB**, standard error **0.373 GiB**. This supports investigating the
+TOAST allocation gap; it does not prove reclaim, a replacement size or a safe
+workspace peak. The sampler activation was reset to disabled after its verified result.
+
+Inspection preserved the exact events target and seven-index catalog identity,
+observed zero replica byte gaps and completed temporary credential cleanup.
+All **18 baseline response comparisons** passed across MCP #658, projection #648
+and managed #650. The first events rewrite **completed at 17:02:45 UTC**, with
+**2,373.092 seconds** reported elapsed time. Allocation fell from
+**44,352,831,488 to 33,937,375,232 bytes**, reclaiming
+**10,415,456,256 bytes (9.700 GiB)**. The same table OID, catalog signature and
+seven indexes were preserved; the storage file changed from 47742688 to 65206644.
+Worker and slot disappearance, temporary-role defaults, role removal and
+credential removal were verified. Apply modes were reset to disabled.
+
+The operation retained the reviewed **64 GiB growth limit / 51 GiB free floor /
+48 GiB retained-WAL limit / 3,600-second work budget**. The controller-observed peak node growth
+was **57.356 GiB**. Later readings were higher: infrastructure reported primary
+usage **249,003,704,320 bytes** at 17:03:53 UTC, and the provider
+17:03 sample reported **255,210,110,976 bytes**. These differently timed readings
+do not establish an instantaneous maximum or prove a hard 64 GiB growth bound
+held. The allocation reclaim is exact; settled net volume usage and the timing
+of temporary-file/WAL release remain unproved.
+The unchanged original card during the rewrite passed **26/26 at 16:26:28 UTC**,
+with recall@20 **.9625**, MRR **.6622** and zero backend/auth/tool errors. Its
+three-call tool samples are not a causal performance comparison.
+
+**The 9.700 GiB events reclaim and its serving checks passed.** All **18 fresh
+post-rewrite response comparisons** matched across the exact deployed fleet.
+The original card passed **26/26 at 17:08:45 UTC** in **161.6 seconds**, with
+all verifier/truth pins unchanged: recall@20 **.9625**, MRR **.6559**, zero
+backend/auth/tool errors; p95 server **808.6 ms**, search **1,354.6 ms**, show
+**600.2 ms**, context **5,314.6 ms**, scan **8,961.5 ms**, scope **302.0 ms**.
+Most tool probes have three calls; these results preserve quality and access
+without proving a causal latency improvement. Earlier degraded cards remain
+preserved. Provider primary and replica replacements are in progress; completion,
+actual final capacities and post-resize verification remain separate gates.
+The canceled chunks copy
+lacks a measured temporary heap/index/sort breakdown or exact remaining-work
+figure, so a blind retry is unjustified; sweeping first does not reduce data
+the failed copy already omitted.
 
 ### Next boundaries and acceptance
 
-1. **Finish finite source coverage without sustained serving pressure.** Reconcile
-   the current bounded drain before advancing discovery from the furthest
-   **235-parent** frontier; do not jump back to the earlier outlier cursor.
-   Retain the three pending/outlier residuals and source13's deadline follow-up.
-   Favor the measured gentler window: ten drain parents, 64 MiB clear, 512 MiB
-   archive and 600 seconds, with fresh proof and unchanged quality checks between
-   jobs. Fifty-parent discovery/publication remains available; the earlier
-   100-parent drain allowance is not evidence that sustained load is acceptable.
-   Keep the three-page driver disabled until this boundary is reviewed again.
-   The next validated source anchor still needs fresh admission before execution.
-   Preserve disabled markers and the publication/clear boundary with 60-second
-   grace; reconcile current catalog keys again after cursor exhaustion.
+The immediate dependency order is **finish provider replacement → 18 exact
+response pairs and the original card → MCP #662 → six exact response pairs and
+the original card → three serial 20-parent qualification pages → measured
+50-parent / 55-claim graduation**. The larger settings are a proposal, not active
+configuration. Graduation requires three clean pages with matched archive-byte
+and record distributions, no residual/unknown outcome, mature drains without a
+bounded remainder, and unchanged quality gates. Projected 50-parent publication
+must fit 250 seconds and total work 450 seconds within the existing 600-second
+job, retaining grace, readback and all proof/byte limits. Otherwise use the timing
+evidence to address the measured cost rather than widening budgets.
+
+1. **Continue bounded source coverage with fresh serving gates.** Keep the original
+   source's 235-parent frontier and three pending/outlier residuals distinct from
+   the priority source's 40 enabled parents. Retain source13's deadline follow-up.
+   Reuse fresh proof and the measured gentler limits; preserve disabled markers,
+   the 60-second publication grace, exact readback and unknown-commit stops.
+   The slow 20-parent publication and faster ten-parent timing pass do not yet
+   establish sustainable throughput. Continue only with a fresh reviewed session
+   and current frontier after reconciling prior results and reservations; never
+   replay a consumed intent or resume the stopped session. Reconcile current
+   catalog keys again after cursor exhaustion.
 
 2. **Measure and reclaim physical space.** Distinguish remaining current-located,
    unlocated and historical bodies before choosing more work. Preserve retained
@@ -391,6 +514,18 @@ physical-capacity exit.
    cold metadata, event/job lineage, old receipts, grants, replay and forget
    before retiring hot rows. Current-only logical archives do not justify
    deleting history. The catalog/index target below 10 GB remains unproved.
+
+Completing current-body retirement alone cannot meet the **<10 GiB** target:
+`canonical_events` still allocates **31.61 GiB** after compaction. The five-source
+sample's stored-byte shares—**81.5% current-unlocated, 3.3% current-located,
+0.8% noncurrent and 14.4% deleted**—are sample composition, not whole-table
+proportions, proof of historical dominance or clear eligibility. Revision
+replacement currently restores superseded cleared bodies into PostgreSQL through
+[`CanonicalPlane.prepare_history`](../../server/recall_server/canonical.py) and
+[`restore_outgoing`](../../server/recall_server/canonical_history.py). Deleting
+historical bodies requires an immutable revision envelope and preserved historical
+receipts, replay and forget semantics first. The immediate order remains finishing
+this resize, verifying the release and continuing proven body retirement.
 
 After every boundary: **simplicity** means fewer redundant responsibilities and
 hot copies; **power** means exact authorized current and historical evidence;
