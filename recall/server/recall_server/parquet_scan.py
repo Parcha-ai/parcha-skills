@@ -359,17 +359,12 @@ class ScanCatalog:
         return max(counts.values(), default=0)
 
     def fragmented(self, cap: int) -> bool:
-        """True when the month's dominant dataset (most bytes) carries at
-        least ``cap`` parts outside its largest single build.
+        """Estimate consolidation pressure outside the largest build.
 
-        Every part of one build shares the build's generation fingerprint,
-        so the largest same-fingerprint group is the layout the last full
-        rewrite produced and the parts outside it are what deltas added
-        since. That is the only fragmentation a compaction can remove: a
-        part's size says nothing (parts close at document boundaries, so a
-        month of large documents legitimately has many small parts, and a
-        "compaction" of such a month grew 205 parts into 226), and a big
-        month at the cap (410 full parts, one build) is not fragmented.
+        A large document replacement changes generation without adding parts.
+        Count its exclusively owned spanning parts once; shared or unknown
+        ownership remains one observation per part. This is a compaction hint,
+        not a guarantee of space savings. The SQL sweep uses the same rule.
         """
 
         counts: dict[str, int] = {}
@@ -384,8 +379,22 @@ class ScanCatalog:
         if not counts:
             return False
         dataset = max(counts, key=lambda name: (total[name], counts[name], name))
-        largest_build = max(builds[dataset].values(), default=0)
-        return counts[dataset] - largest_build >= cap
+        largest_build = max(
+            builds[dataset], key=lambda build: (builds[dataset][build], build)
+        )
+        owners: set[str] = set()
+        other_parts = 0
+        for identity, row in self.shards.items():
+            if identity[0] != dataset or str(row.get("generation_sha256") or "") == largest_build:
+                continue
+            members = self.members.get(identity, ())
+            if (len(members) == 1
+                    and isinstance(members[0].logical_document_id, str)
+                    and members[0].logical_document_id):
+                owners.add(members[0].logical_document_id)
+            else:
+                other_parts += 1
+        return len(owners) + other_parts >= cap
 
 
 @dataclass(frozen=True)
@@ -1921,37 +1930,66 @@ class CanonicalParquetScanProjector:
         tenant_id: str | None,
         limit: int,
     ) -> list[ScanCandidate]:
-        """Queue source-months whose fragment count exceeds the compaction cap."""
+        """Queue source-months whose owner-aware pressure reaches the cap."""
 
         with self.store.connect() as connection:
             with connection.transaction():
                 rows = connection.execute(
-                    """SELECT fragment.tenant_id,fragment.source_id,
+                    """WITH builds AS (
+                           SELECT tenant_id,source_id,bucket_start,dataset,
+                                  coalesce(generation_sha256::text,'') AS build,
+                                  count(*) AS build_parts,sum(size_bytes) AS bytes
+                             FROM canonical_parquet_scan_shards
+                            WHERE (%s::text IS NULL OR tenant_id=%s)
+                            GROUP BY tenant_id,source_id,bucket_start,dataset,
+                                     generation_sha256
+                       ), ranked_builds AS (
+                           SELECT *,row_number() OVER (
+                                      PARTITION BY tenant_id,source_id,bucket_start,dataset
+                                      ORDER BY build_parts DESC,build COLLATE "C" DESC
+                                    ) AS build_rank
+                             FROM builds
+                       ), fragment AS (
+                           SELECT tenant_id,source_id,bucket_start,dataset,
+                                  sum(build_parts) AS parts,
+                                  sum(build_parts)-max(build_parts) AS delta_parts,
+                                  max(build) FILTER (WHERE build_rank=1) AS largest_build,
+                                  row_number() OVER (
+                                      PARTITION BY tenant_id,source_id,bucket_start
+                                      ORDER BY sum(bytes) DESC,sum(build_parts) DESC,
+                                               dataset COLLATE "C" DESC
+                                  ) AS bytes_rank
+                             FROM ranked_builds
+                            GROUP BY tenant_id,source_id,bucket_start,dataset
+                       )
+                       SELECT fragment.tenant_id,fragment.source_id,
                               fragment.bucket_start,max(fragment.parts) AS parts
-                         FROM (
-                               SELECT tenant_id,source_id,bucket_start,dataset,
-                                      count(*) AS parts,
-                                      -- parts outside the largest single build: what deltas
-                                      -- added since the last full rewrite
-                                      count(*) - max(build_parts) AS delta_parts,
-                                      -- the month's dominant dataset by bytes decides
-                                      row_number() OVER (
-                                          PARTITION BY tenant_id,source_id,bucket_start
-                                          ORDER BY sum(size_bytes) DESC,count(*) DESC,dataset
-                                      ) AS bytes_rank
-                                 FROM (
-                                       SELECT tenant_id,source_id,bucket_start,dataset,
-                                              size_bytes,
-                                              count(*) OVER (
-                                                  PARTITION BY tenant_id,source_id,bucket_start,
-                                                               dataset,generation_sha256
-                                              ) AS build_parts
-                                         FROM canonical_parquet_scan_shards
-                                        WHERE (%s::text IS NULL OR tenant_id=%s)
-                                 ) shard
-                                GROUP BY tenant_id,source_id,bucket_start,dataset
-                         ) fragment
-                        WHERE fragment.bytes_rank = 1
+                         FROM fragment
+                         JOIN canonical_parquet_scan_shards shard
+                           ON shard.tenant_id=fragment.tenant_id
+                          AND shard.source_id=fragment.source_id
+                          AND shard.bucket_start=fragment.bucket_start
+                          AND shard.dataset=fragment.dataset
+                          AND coalesce(shard.generation_sha256::text,'')<>fragment.largest_build
+                         CROSS JOIN LATERAL (
+                             SELECT CASE WHEN count(*)=1
+                                               AND min(member.logical_document_id COLLATE "C")<>''
+                                         THEN min(member.logical_document_id COLLATE "C") END AS document_id
+                               FROM (
+                                   -- Two PK-prefix matches distinguish exclusive
+                                   -- ownership from any shared/superset fragment.
+                                   SELECT logical_document_id
+                                     FROM canonical_parquet_scan_fragment_documents owner
+                                    WHERE owner.tenant_id=shard.tenant_id
+                                      AND owner.source_id=shard.source_id
+                                      AND owner.bucket_start=shard.bucket_start
+                                      AND owner.dataset=shard.dataset
+                                      AND owner.shard_index=shard.shard_index
+                                    LIMIT 2
+                               ) member
+                         ) ownership
+                        WHERE fragment.bytes_rank=1
+                          -- Cheap necessary prefilter before membership probes.
                           AND fragment.delta_parts >= %s
                           AND NOT EXISTS (
                               SELECT 1 FROM canonical_parquet_scan_queue queue
@@ -1961,10 +1999,13 @@ class CanonicalParquetScanProjector:
                           )
                         GROUP BY fragment.tenant_id,fragment.source_id,
                                  fragment.bucket_start
+                       HAVING count(DISTINCT ownership.document_id COLLATE "C")
+                              +count(*) FILTER (WHERE ownership.document_id IS NULL) >= %s
                         ORDER BY max(fragment.parts) DESC,fragment.tenant_id,
                                  fragment.source_id,fragment.bucket_start
                         LIMIT %s""",
-                    (tenant_id, tenant_id, self.compaction_fragments, limit),
+                    (tenant_id, tenant_id, self.compaction_fragments,
+                     self.compaction_fragments, limit),
                 ).fetchall()
                 candidates = []
                 for row in rows:
