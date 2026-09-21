@@ -23,6 +23,9 @@ def hydrate_chunk_rows(
 
     if deadline_at is not None and time.monotonic() >= deadline_at:
         raise SearchDeadlineExceeded()
+    requested = {}
+    for row in rows:
+        requested.setdefault((row["source_id"], row["document_id"]), set()).add(row["ordinal"])
     archived = read_archived_chunks(
         store,
         archive,
@@ -30,6 +33,7 @@ def hydrate_chunk_rows(
         source_ids=source_ids,
         document_ids=tuple(dict.fromkeys(row["document_id"] for row in rows)),
         deadline_at=deadline_at,
+        chunk_ordinals={key: tuple(sorted(ordinals)) for key, ordinals in requested.items()},
     )
     by_receipt = {
         chunk["receipt"]: chunk

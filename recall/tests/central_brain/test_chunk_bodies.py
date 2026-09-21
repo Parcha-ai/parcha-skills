@@ -78,6 +78,7 @@ class ChunkBodyTests(unittest.TestCase):
             content_sha256=digest(payload), size_bytes=len(payload), media_type=PART_MEDIA_TYPE,
             encryption="sse-s3", version_id="version", created_at="2026-09-20T00:00:00Z",
             part_ordinal=0, first_record_ordinal=0, last_record_ordinal=len(records) - 1,
+            logical_document_id="ldoc_" + "a" * 32, revision=3,
             receipt_count=sum(len(r.receipts) for r in records),
         )
         for row in rows:
@@ -249,6 +250,8 @@ class ChunkBodyTests(unittest.TestCase):
         published = copy.deepcopy(row)
         published["pending"] = False
         published["manifest"]["revision"] += 1
+        for part in published["parts"]:
+            part["revision"] = published["manifest"]["revision"]
         store.snapshots = [[row], [published]]
         with self.assertRaises(ChunkBodyError):
             self.read(store, archive)

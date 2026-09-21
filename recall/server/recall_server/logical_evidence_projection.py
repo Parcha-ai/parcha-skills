@@ -14,8 +14,10 @@ from itertools import groupby
 from typing import Any
 
 import orjson
+import psycopg
 
 from .actor_attribution import actor_links
+from .canonical_text import MAX_CANONICAL_TEXT_BYTES, canonical_text_chunks
 from .logical_archive_bodies import ArchivedBodyLookup
 from .logical_evidence import (
     LogicalEvidenceError,
@@ -57,6 +59,41 @@ class LogicalGroupCandidate:
     revision: int
     estimated_records: int = 1
     estimated_bytes: int = 1
+
+
+class _LocatorSpool:
+    """Private, replayable metadata stream; RAM does not grow with the parent."""
+
+    def __init__(self):
+        self._file = tempfile.TemporaryFile(mode="w+b")
+
+    def append(self, location):
+        self._file.write(orjson.dumps(location) + b"\n")
+
+    def __iter__(self):
+        self._file.seek(0)
+        for line in self._file:
+            yield tuple(orjson.loads(line))
+
+    @property
+    def closed(self):
+        return self._file.closed
+
+    def close(self):
+        self._file.close()
+
+
+@dataclass(frozen=True)
+class _LocatedUpload(LogicalEvidenceUpload):
+    # Ownership transfers from preparation to _commit_upload. No source text
+    # or parent-sized Python list survives alongside the immutable upload.
+    body_locators: _LocatorSpool | None = None
+
+
+def _close_body_locators(upload):
+    locators = getattr(upload, "body_locators", None)
+    if locators is not None:
+        locators.close()
 
 
 def mark_logical_evidence_dirty(
@@ -384,7 +421,7 @@ class CanonicalLogicalEvidenceProjector:
                 actor_links=attributed,
             )
 
-    def _record_stream(self, cursor: Any):
+    def _record_stream(self, cursor: Any, *, locate=None):
         next_ordinal = 0
         for row in cursor:
             _validate_source_body(row)
@@ -431,6 +468,13 @@ class CanonicalLogicalEvidenceProjector:
                     canonical_content_bytes=canonical_content_bytes,
                 )
             )
+            if (locate is not None and row["raw_media_type"] != OVERSIZED_MEDIA_TYPE
+                    and len(text.encode()) <= MAX_CANONICAL_TEXT_BYTES):
+                pieces = [text] if row["chunk_count"] == 1 else canonical_text_chunks(text)
+                if (len(pieces) == row["chunk_count"]
+                        and all(hashlib.sha256(piece.encode()).hexdigest() == chunk["text_sha256"]
+                                for piece, chunk in zip(pieces, row["source_chunks"]))):
+                    locate((row["document_id"], next_ordinal, len(records)))
             yield from records
             next_ordinal += len(records)
 
@@ -652,6 +696,8 @@ class CanonicalLogicalEvidenceProjector:
         spool = tempfile.TemporaryFile(mode="w+b")
         ranges: list[tuple[int, int, int]] = []
         input_spool = None
+        body_locators: dict[int, _LocatorSpool] = {}
+        transferred = False
         try:
             input_spool = tempfile.TemporaryFile(mode="w+b")
             input_ranges: list[tuple[int, int, int]] = []
@@ -714,6 +760,7 @@ class CanonicalLogicalEvidenceProjector:
                                )
                            )
                            SELECT selected.candidate_ordinal,
+                              document.document_id,
                               event.tenant_id,event.source_id,
                               event.event_id,event.native_id,event.kind,
                               event.occurred_at,
@@ -879,8 +926,9 @@ class CanonicalLogicalEvidenceProjector:
                         yield row
 
                 final_start = spool.tell()
+                locations = body_locators[ordinal] = _LocatorSpool()
                 try:
-                    for record in self._record_stream(resolved_rows()):
+                    for record in self._record_stream(resolved_rows(), locate=locations.append):
                         spool.write(record.encode(source_id=candidate.source_id))
                 finally:
                     if lookup is not None:
@@ -893,6 +941,7 @@ class CanonicalLogicalEvidenceProjector:
             # connection are released before publishing the validated data.
             for ordinal, start, end in ranges:
                 if start == end:
+                    body_locators[ordinal].close()
                     continue
                 candidate = candidates[ordinal]
                 spool.seek(start)
@@ -913,8 +962,10 @@ class CanonicalLogicalEvidenceProjector:
                     retention_profile=self.retention_profile,
                     existing_part_references=tuple(existing_parts.get(ordinal, ())),
                 )
+                upload = _LocatedUpload(**vars(upload), body_locators=body_locators[ordinal])
                 uploads[ordinal] = upload
                 completed.append(upload)
+            transferred = True
             return uploads
         except Exception:
             for upload in completed:
@@ -925,6 +976,9 @@ class CanonicalLogicalEvidenceProjector:
             )
             raise
         finally:
+            if not transferred:
+                for locators in body_locators.values():
+                    locators.close()
             spool.close()
             if input_spool is not None:
                 input_spool.close()
@@ -1129,13 +1183,17 @@ class CanonicalLogicalEvidenceProjector:
         self,
         uploads: list[LogicalEvidenceUpload],
     ) -> int:
-        return self._schedule_cleanup(
-            tuple(
-                reference
-                for upload in uploads
-                for reference in upload.cleanup_references
+        try:
+            return self._schedule_cleanup(
+                tuple(
+                    reference
+                    for upload in uploads
+                    for reference in upload.cleanup_references
+                )
             )
-        )
+        finally:
+            for upload in uploads:
+                _close_body_locators(upload)
 
     def drain_cleanup(
         self,
@@ -1343,6 +1401,7 @@ class CanonicalLogicalEvidenceProjector:
                     ):
                         return "adopted"
                     return "stale"
+                self._publish_body_locators(connection, candidate, getattr(upload, "body_locators", None))
                 old_manifest, old_parts = self._old_references(
                     connection,
                     candidate,
@@ -1651,6 +1710,59 @@ class CanonicalLogicalEvidenceProjector:
                     raise LogicalEvidenceError("logical_evidence_queue_conflict")
         return "committed"
 
+    @staticmethod
+    def _publish_body_locators(connection, candidate, locators):
+        """Change positions in the same transaction as the parent catalog.
+
+        Ingest takes document locks before its queue lock. We already hold the
+        queue, so NOWAIT prevents a wait cycle and rolls back the whole attempt.
+        Unchanged prefixes are neither locked nor updated on parent appends.
+        COPY streams private metadata into a transaction-local table. The
+        changed-row set stays in Postgres, where sorting can spill to disk.
+        """
+        connection.execute(
+            """CREATE TEMP TABLE recall_body_locator_desired (
+                   document_id text PRIMARY KEY,
+                   record_ordinal integer NOT NULL CHECK (record_ordinal >= 0),
+                   record_count integer NOT NULL CHECK (record_count >= 1)
+               ) ON COMMIT DROP"""
+        )
+        if locators is not None:
+            try:
+                with connection.cursor() as cursor:
+                    with cursor.copy(
+                        "COPY pg_temp.recall_body_locator_desired "
+                        "(document_id,record_ordinal,record_count) FROM STDIN"
+                    ) as writer:
+                        for location in locators:
+                            writer.write_row(location)
+            except psycopg.errors.UniqueViolation:
+                raise LogicalEvidenceError("logical_evidence_state_invalid") from None
+        connection.execute("ANALYZE pg_temp.recall_body_locator_desired")
+        connection.execute(
+            """WITH changed AS MATERIALIZED (
+                   SELECT document.document_id,desired.record_ordinal,desired.record_count
+                     FROM canonical_documents document
+                     JOIN canonical_events event USING(tenant_id,source_id,event_id)
+                     LEFT JOIN pg_temp.recall_body_locator_desired desired USING(document_id)
+                    WHERE document.tenant_id=%s AND document.source_id=%s
+                      AND COALESCE(event.native_parent_id,event.native_id)=%s
+                      AND document.is_current AND document.deleted_at IS NULL
+                      AND (document.body_record_ordinal,document.body_record_count)
+                          IS DISTINCT FROM (desired.record_ordinal,desired.record_count)
+                    ORDER BY document.document_id
+                    FOR UPDATE OF document NOWAIT
+               )
+               UPDATE canonical_documents document
+                  SET body_record_ordinal=changed.record_ordinal,
+                      body_record_count=changed.record_count
+                 FROM changed
+                WHERE document.tenant_id=%s AND document.source_id=%s
+                  AND document.document_id=changed.document_id""",
+            (candidate.tenant_id, candidate.source_id, candidate.native_parent_id,
+             candidate.tenant_id, candidate.source_id),
+        )
+
     def _commit_empty(
         self,
         candidate: LogicalGroupCandidate,
@@ -1686,6 +1798,7 @@ class CanonicalLogicalEvidenceProjector:
                     or queued["changed_at"] != candidate.source_updated_at
                 ):
                     return "stale"
+                self._publish_body_locators(connection, candidate, ())
                 old_manifest, old_parts = self._old_references(
                     connection,
                     candidate,
@@ -1752,13 +1865,23 @@ class CanonicalLogicalEvidenceProjector:
         candidate: LogicalGroupCandidate,
         upload: LogicalEvidenceUpload | None,
     ) -> str:
-        if upload is None:
-            return self._commit_empty(candidate)
         try:
+            if upload is None:
+                return self._commit_empty(candidate)
             status = self._commit(candidate, upload)
+        except psycopg.errors.LockNotAvailable:
+            # _commit's transaction has already rolled back and released its
+            # queue lock. Retain the queue for a fresh attempt; contention must
+            # not penalize a newer ingest generation or abort sibling work.
+            if upload is not None:
+                self._schedule_cleanup(upload.cleanup_references)
+            return "stale"
         except Exception:
-            self._schedule_cleanup(upload.cleanup_references)
+            if upload is not None:
+                self._schedule_cleanup(upload.cleanup_references)
             raise
+        finally:
+            _close_body_locators(upload)
         if status == "stale":
             self._schedule_cleanup(upload.cleanup_references)
         return status

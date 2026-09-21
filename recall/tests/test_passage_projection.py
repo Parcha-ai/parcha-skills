@@ -83,7 +83,7 @@ class PassageProjectionTests(unittest.TestCase):
         )
         rendered = " ".join(migration.read_text().split()).casefold()
 
-        self.assertEqual(SCHEMA_VERSION, 67)
+        self.assertEqual(SCHEMA_VERSION, 68)
         self.assertIn(
             "create table if not exists canonical_passage_documents",
             rendered,
@@ -786,6 +786,9 @@ class PassageProjectionTests(unittest.TestCase):
 
             def fetchone(self):
                 return self.one
+
+            def fetchall(self):
+                return []
 
         class Cursor:
             def __init__(self, connection):

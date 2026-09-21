@@ -16,7 +16,7 @@ RECALL = Path(__file__).resolve().parents[2]
 SERVER = RECALL / "server"
 sys.path.insert(0, str(SERVER))
 
-from recall_server import MANDATORY_SCHEMA_VERSION, SCHEMA_VERSION  # noqa: E402
+from recall_server import MANDATORY_SCHEMA_VERSION, RETIRE_POSTGRES_PLANE_VERSION, SCHEMA_VERSION  # noqa: E402
 from recall_server.capabilities import (  # noqa: E402
     CAPABILITY_SQL,
     CapabilityError,
@@ -155,10 +155,11 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
         self.assertNotIn("provider", result)
 
     def test_snapshot_accepts_both_search_planes_and_rejects_a_torn_retirement(self) -> None:
-        # H3-e': 066 with the embeddings table is current on the postgres
-        # plane; 067 without it is current on the turbopuffer plane.
+        # All additive migrations apply on both planes; optional 067 must
+        # agree with presence of the retired table.
         snapshot = healthy_snapshot()
-        snapshot["migration_versions"] = list(range(1, MANDATORY_SCHEMA_VERSION + 1))
+        snapshot["migration_versions"] = [v for v in range(1, MANDATORY_SCHEMA_VERSION + 1)
+                                          if v != RETIRE_POSTGRES_PLANE_VERSION]
         snapshot["postgres_vector_plane_present"] = True
         result = assess_snapshot(snapshot, profile="production")
         self.assertEqual(result["status"], "ready")
@@ -167,10 +168,11 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
         retired = assess_snapshot(healthy_snapshot(), profile="production")
         self.assertEqual(retired["schema_version"], SCHEMA_VERSION)
         self.assertEqual(retired["postgres_vector_plane"], "retired")
-        # 067 recorded but the table still there, or 066 with the table gone.
+        # 067 recorded but the table still there, or absent with the table gone.
         for versions, present in (
             (list(range(1, SCHEMA_VERSION + 1)), True),
-            (list(range(1, MANDATORY_SCHEMA_VERSION + 1)), False),
+            ([v for v in range(1, MANDATORY_SCHEMA_VERSION + 1)
+              if v != RETIRE_POSTGRES_PLANE_VERSION], False),
         ):
             snapshot = healthy_snapshot()
             snapshot["migration_versions"] = versions
