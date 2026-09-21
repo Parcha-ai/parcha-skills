@@ -281,8 +281,9 @@ def newly_located_prefix(store, root, *, projector_repair=False):
 
 
 
-def schema69_capability(store):
+def head_schema_capability(store):
     from psycopg import sql
+    from recall_server import SCHEMA_VERSION
     from recall_server.capabilities import CapabilityError, probe_database
     role, password = 'retirement_runtime_' + uuid.uuid4().hex[:12], uuid.uuid4().hex
     identifier = sql.Identifier(role)
@@ -295,7 +296,7 @@ def schema69_capability(store):
         connection.execute(sql.SQL('GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA public TO {}').format(identifier))
     dsn = f"postgresql://{role}:{password}@127.0.0.1:{port}/{database}"
     try:
-        assert probe_database(dsn, profile='local-fixture')['schema_version'] == 69
+        assert probe_database(dsn, profile='local-fixture')['schema_version'] == SCHEMA_VERSION
         with store.connect() as connection:
             connection.execute(sql.SQL('REVOKE SELECT ON canonical_chunk_retirement_progress FROM {}').format(identifier))
         try:
@@ -342,7 +343,7 @@ def main():
     try:
         store.migrate()
         assert store.migrate()['applied'] == [], 'additive migration is not idempotent'
-        schema69_capability(store)
+        head_schema_capability(store)
         with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, RECALL_CHUNK_BODY_READS='archive'):
             with patch.object(SmallPartProjection, 'put_records', LogicalEvidenceProjectionStore.put_records):
                 tenant, source, archive, _, projector, texts = fixture(store, Path(temporary), count=1000)
