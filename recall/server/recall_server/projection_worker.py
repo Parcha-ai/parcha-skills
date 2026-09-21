@@ -365,6 +365,11 @@ def run_projection_worker(
                 "cycle_elapsed_ms": elapsed_ms(cycle_started),
                 "embed_elapsed_ms": embed_elapsed_ms,
                 "passage_elapsed_ms": passage_elapsed_ms,
+                "passage_warmup_ms": int(projected.get("warmup_ms", 0)),
+                "passage_pending_ms": int(projected.get("pending_ms", 0)),
+                "passage_prepare_ms": int(projected.get("prepare_ms", 0)),
+                "passage_commit_ms": int(projected.get("commit_ms", 0)),
+                "passage_count_ms": int(projected.get("count_ms", 0)),
                 "logical_elapsed_ms": logical_elapsed_ms,
                 "parquet_elapsed_ms": parquet_elapsed_ms,
                 "search_plane_elapsed_ms": search_plane_elapsed_ms,
@@ -398,7 +403,9 @@ def run_projection_worker(
                 "old_objects_deleted=%s search_outbox_pending=%s "
                 "cycle_elapsed_ms=%s embed_elapsed_ms=%s passage_elapsed_ms=%s "
                 "logical_elapsed_ms=%s parquet_elapsed_ms=%s "
-                "search_plane_elapsed_ms=%s thin_elapsed_ms=%s",
+                "search_plane_elapsed_ms=%s thin_elapsed_ms=%s "
+                "passage_warmup_ms=%s passage_pending_ms=%s passage_prepare_ms=%s "
+                "passage_commit_ms=%s passage_count_ms=%s",
                 *(
                     result[key]
                     for key in (
@@ -447,6 +454,11 @@ def run_projection_worker(
                         "old_objects_deleted",
                         "search_outbox_pending",
                         *PHASE_ELAPSED_KEYS,
+                        "passage_warmup_ms",
+                        "passage_pending_ms",
+                        "passage_prepare_ms",
+                        "passage_commit_ms",
+                        "passage_count_ms",
                     )
                 ),
             )
