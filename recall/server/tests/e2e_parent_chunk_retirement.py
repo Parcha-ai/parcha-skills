@@ -157,7 +157,9 @@ def fault_cases(store, root):
         refused(lambda: run(apply=True, reviewed_plan=preview['plan'], limits=ParentRetirementLimits(batch_documents=3)))
     bodies, progress = state()
     assert sum(not row['text_redacted'] for row in bodies) == 6 and progress['cumulative_cleared_documents'] == 6
-    assert progress['status'] == 'partial'
+    assert progress['status'] == 'pending'
+    assert progress['last_record_ordinal'] == -1 and progress['manifest_artifact_id'] is None
+    assert progress['scope_epoch'] == initial_progress['scope_epoch'] + 1
     fresh = run()
     # Disable/re-enable changes scope epoch: an already running job cannot use
     # its old cursor after an operator resets that scope.
