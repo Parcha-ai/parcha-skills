@@ -226,7 +226,7 @@ class SlackSourcePluginTest(unittest.TestCase):
             {"Public channel"},
         )
         self.assertEqual(
-            [call[1]["query"]["channel"] for call in rail.calls
+            [call[1]["json_body"]["channel"] for call in rail.calls
              if call[0] == "channels.join"],
             ["C111"],
         )
@@ -284,7 +284,7 @@ class SlackSourcePluginTest(unittest.TestCase):
         self.assertFalse(discovery[1]["query"]["exclude_archived"])
         self.assertEqual(discovery[1]["query"]["types"], "public_channel")
         self.assertEqual(
-            [call[1]["query"]["channel"] for call in rail.calls
+            [call[1]["json_body"]["channel"] for call in rail.calls
              if call[0] == "channels.join"],
             ["C111"],
         )

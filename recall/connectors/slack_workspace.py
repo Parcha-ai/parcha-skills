@@ -276,7 +276,10 @@ class SlackWorkspaceConnector:
 
     def _request(self, operation: str, query: dict[str, Any]) -> dict[str, Any]:
         try:
-            response = self.rail.request(operation, query=query)
+            if operation == "channels.join":
+                response = self.rail.request(operation, json_body=query)
+            else:
+                response = self.rail.request(operation, query=query)
         except RemoteApiError as error:
             _log_request_failure(operation, "transport", error.code)
             raise ConnectorUpstreamError("connector_upstream_error") from None
