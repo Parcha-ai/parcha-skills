@@ -10,6 +10,7 @@ from typing import Any
 
 import orjson
 
+from .archive import ArchiveDeadlineExceeded
 from .canonical_text import canonical_text_chunks
 from .db import SearchDeadlineExceeded
 from .evidence_projection import CanonicalEvidenceProjector, DOCUMENT_ID_RE
@@ -114,7 +115,16 @@ class _VerifiedArchive:
     def read_raw(self, reference: dict[str, Any]) -> bytes:
         _check_deadline(self.deadline_at)
         try:
-            payload = self.archive.read_raw(reference)
+            bounded_read = getattr(self.archive, "read_raw_bounded", None)
+            if self.deadline_at is not None and callable(bounded_read):
+                payload = bounded_read(reference, deadline_at=self.deadline_at)
+            else:
+                # Filesystem and in-memory archives have no network transport.
+                # S3 always exposes read_raw_bounded and fails closed if its
+                # separate deadline client was not configured.
+                payload = self.archive.read_raw(reference)
+        except ArchiveDeadlineExceeded:
+            raise SearchDeadlineExceeded() from None
         finally:
             _check_deadline(self.deadline_at)
         if not isinstance(payload, bytes) or len(payload) != reference["size_bytes"]:
@@ -144,9 +154,10 @@ def read_archived_chunks(
     part references are checked again after reading. A publication race rejects
     this attempt; retry the whole request against the new catalog snapshot.
 
-    Database work honors deadline_at. The archive transport has no per-request
-    deadline API: checks around each sequential read reject late results, but
-    cannot interrupt an in-flight read. No background I/O survives this call.
+    Database work honors deadline_at. S3 reads use a separate no-retry client
+    with bounded socket inactivity and checks around each sequential read.
+    DNS and continuously arriving bytes can outlast the cooperative budget;
+    late results are rejected, and no background I/O survives this call.
     """
     if (
         not isinstance(tenant_id, str) or not tenant_id
