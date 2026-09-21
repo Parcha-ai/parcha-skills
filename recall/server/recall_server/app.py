@@ -141,6 +141,8 @@ class Handler(BaseHTTPRequestHandler):
     @staticmethod
     def legacy_write_error_status(exc: CanonicalLifecycleError) -> int:
         code = exc.error_code
+        if code == "canonical_history_unavailable":
+            return 503
         if code in {"canonical_identity_forgotten", "archive_identity_forgotten"}:
             return 409
         if code in {
@@ -1429,14 +1431,7 @@ class Handler(BaseHTTPRequestHandler):
             except (binascii.Error, json.JSONDecodeError, TypeError, ValueError):
                 self.send_json(400, {"error": "canonical ingest request invalid"})
             except CanonicalLifecycleError as exc:
-                status = (
-                    409
-                    if exc.error_code == "canonical_identity_forgotten"
-                    else 403
-                    if exc.error_code
-                    in {"canonical_authority_forbidden", "canonical_lineage_invalid"}
-                    else 400
-                )
+                status = self.legacy_write_error_status(exc)
                 self.send_json(status, {"error": exc.error_code})
             except Exception as exc:
                 LOG.error("canonical ingest failed type=%s", type(exc).__name__)
@@ -2034,6 +2029,7 @@ def configure_runtime(dsn: str) -> None:
             Handler.archive_store,
             Handler.evidence_projector,
             actor_identity_index,
+            chunk_body_archive=(Handler.evidence_archive_store if chunk_body_reads == "archive" else None),
         )
         Handler.store.legacy_ingest_bridge = LegacyIngestBridge(
             Handler.store,

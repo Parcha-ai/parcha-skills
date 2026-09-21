@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import datetime, timezone
 from typing import Any, Protocol
 from urllib.parse import unquote, urlsplit
@@ -10,6 +10,9 @@ from urllib.parse import unquote, urlsplit
 from contracts.v2 import ContractError, IDENTITY_RE, validate_contract
 
 from .actor_attribution import ActorIdentityIndex, attribute_canonical_events
+from .canonical_history import (
+    HistoryAuthorityError, HistoryUnavailable, prepare_history, restore_outgoing,
+)
 from .db import BrainStore
 from .identity_cache import REGISTRATION_CACHE, IdentityRegistrationCache
 from .canonical_text import (
@@ -305,11 +308,46 @@ class CanonicalPlane:
         archive: ArchiveLifecycle,
         evidence_projector: Any = None,
         actor_identity_index: ActorIdentityIndex | None = None,
+        *,
+        chunk_body_archive: Any = None,
     ):
         self.store = store
         self.archive = archive
         self.evidence_projector = evidence_projector
         self.actor_identity_index = actor_identity_index
+        self.chunk_body_archive = chunk_body_archive
+
+    @contextmanager
+    def prepare_history(self, *, tenant_id, events, principal_id=None):
+        candidates = []
+        for envelope in events:
+            try:
+                event = validate_envelope(envelope)
+            except ValueError:
+                raise CanonicalLifecycleError("canonical_contract_invalid") from None
+            owner = event["principal_id"] if principal_id is None else principal_id
+            self._validate_host_identity(tenant_id, owner, event["source_id"])
+            if owner != event["principal_id"]:
+                raise CanonicalLifecycleError("canonical_lineage_invalid")
+            if event["kind"] != "tombstone":
+                candidates.append({key: event[key] for key in
+                                   ("source_id", "native_id", "content_sha256", "principal_id")})
+        try:
+            with prepare_history(self.store, self.chunk_body_archive,
+                                 tenant_id=tenant_id, candidates=candidates) as staged:
+                yield staged
+        except HistoryAuthorityError:
+            raise CanonicalLifecycleError("canonical_authority_forbidden") from None
+        except HistoryUnavailable:
+            raise CanonicalLifecycleError("canonical_history_unavailable") from None
+
+    @staticmethod
+    def _restore_history(connection, staged, *, tenant_id, source_id, native_ids):
+        try:
+            restore_outgoing(connection, staged, tenant_id=tenant_id,
+                             source_id=source_id, native_ids=native_ids)
+        except HistoryUnavailable:
+            raise CanonicalLifecycleError("canonical_history_unavailable") from None
 
     @staticmethod
     def _validate_host_identity(
@@ -426,6 +464,7 @@ class CanonicalPlane:
         envelope: dict[str, Any],
         text_redacted: str,
         _connection: Any | None = None,
+        _history: Any = None,
     ) -> dict[str, Any]:
         self._validate_host_identity(tenant_id, principal_id, envelope.get("source_id"))
         if not isinstance(connector_id, str) or not IDENTITY_RE.fullmatch(connector_id):
@@ -466,7 +505,12 @@ class CanonicalPlane:
         connection_context = (
             self.store.connect() if _connection is None else nullcontext(_connection)
         )
-        with connection_context as conn:
+        with ExitStack() as stack:
+            history = _history
+            if _connection is None:
+                history = stack.enter_context(self.prepare_history(
+                    tenant_id=tenant_id, principal_id=principal_id, events=[event]))
+            conn = stack.enter_context(connection_context)
             transaction_context = (
                 conn.transaction() if _connection is None else nullcontext()
             )
@@ -477,6 +521,10 @@ class CanonicalPlane:
                     principal_id=principal_id,
                     source_id=source_id,
                 )
+                conn.execute(
+                    """SELECT pg_advisory_xact_lock(hashtextextended(%s,0))""",
+                    (f"v2\x1f{tenant_id}\x1f{source_id}\x1f{native_id}",),
+                )
                 forgotten = conn.execute(
                     """SELECT 1 FROM forget_tombstones
                        WHERE tenant_id=%s AND source_id=%s
@@ -485,10 +533,6 @@ class CanonicalPlane:
                 ).fetchone()
                 if forgotten:
                     raise CanonicalLifecycleError("canonical_identity_forgotten")
-                conn.execute(
-                    """SELECT pg_advisory_xact_lock(hashtextextended(%s,0))""",
-                    (f"v2\x1f{tenant_id}\x1f{source_id}\x1f{native_id}",),
-                )
                 conn.execute(
                     """INSERT INTO raw_artifacts(
                            tenant_id,source_id,artifact_id,storage_backend,object_key,
@@ -628,6 +672,9 @@ class CanonicalPlane:
                     if is_tombstone
                     else [native_id]
                 )
+                if not is_tombstone:
+                    self._restore_history(conn, history, tenant_id=tenant_id,
+                                          source_id=source_id, native_ids=affected_native_ids)
                 conn.execute(
                     """UPDATE canonical_documents
                        SET is_current=false,
@@ -751,7 +798,10 @@ class CanonicalPlane:
                 events=events,
             )
         results = []
-        with self.store.connect() as connection:
+        with ExitStack() as stack:
+            history = stack.enter_context(self.prepare_history(
+                tenant_id=tenant_id, principal_id=principal_id, events=events))
+            connection = stack.enter_context(self.store.connect())
             with connection.transaction():
                 for envelope in events:
                     provenance = envelope.get("provenance", {})
@@ -777,6 +827,7 @@ class CanonicalPlane:
                                 else text_redacted
                             ),
                             _connection=connection,
+                            _history=history,
                         )
                     )
         return {
@@ -1088,7 +1139,10 @@ class CanonicalPlane:
             for native_id in native_ids
         )
 
-        with self.store.connect() as connection:
+        with ExitStack() as stack:
+            history = stack.enter_context(self.prepare_history(
+                tenant_id=tenant_id, principal_id=principal_id, events=events))
+            connection = stack.enter_context(self.store.connect())
             with connection.transaction():
                 self.register_source(
                     connection,
@@ -1096,6 +1150,13 @@ class CanonicalPlane:
                     principal_id=principal_id,
                     source_id=source_id,
                 )
+                connection.execute(
+                    """SELECT pg_advisory_xact_lock(hashtextextended(value,0))
+                       FROM unnest(%s::text[]) AS lock_key(value)
+                       ORDER BY value""",
+                    (lock_keys,),
+                ).fetchall()
+
                 forgotten = connection.execute(
                     """SELECT target_identity_sha256
                        FROM forget_tombstones
@@ -1109,12 +1170,6 @@ class CanonicalPlane:
                 ).fetchone()
                 if forgotten:
                     raise CanonicalLifecycleError("canonical_identity_forgotten")
-                connection.execute(
-                    """SELECT pg_advisory_xact_lock(hashtextextended(value,0))
-                       FROM unnest(%s::text[]) AS lock_key(value)
-                       ORDER BY value""",
-                    (lock_keys,),
-                ).fetchall()
 
                 artifact_rows = [
                     {
@@ -1249,6 +1304,9 @@ class CanonicalPlane:
                             source_id=source_id,
                             native_ids=affected_native_ids,
                         )
+                    if not is_tombstone_batch:
+                        self._restore_history(connection, history, tenant_id=tenant_id,
+                                              source_id=source_id, native_ids=affected_native_ids)
                     connection.execute(
                         """UPDATE canonical_documents
                            SET is_current=false,
