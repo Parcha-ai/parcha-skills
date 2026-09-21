@@ -87,6 +87,26 @@ def _check_deadline(deadline_at: float | None) -> None:
         raise SearchDeadlineExceeded()
 
 
+def _older_revision_receipts(receipts: tuple[str, ...], row: dict[str, Any]) -> bool:
+    """Recognize a complete older event revision, never an arbitrary mismatch."""
+    prefix = f"recall://{row['source_id']}/{row['native_id']}?rev="
+    if not receipts or not receipts[0].startswith(prefix):
+        return False
+    revision_text = receipts[0][len(prefix):].partition("#item=")[0]
+    try:
+        revision = int(revision_text)
+    except ValueError:
+        return False
+    return (
+        0 < revision < row["revision"]
+        and revision_text == str(revision)
+        and all(receipt == f"{prefix}{revision}#item={index}"
+                for index, receipt in enumerate(receipts))
+        and all(chunk["receipt"] == f"{prefix}{row['revision']}#item={index}"
+                for index, chunk in enumerate(row["chunks"]))
+    )
+
+
 class _VerifiedArchive:
     def __init__(self, archive: Any, deadline_at: float | None):
         self.archive, self.deadline_at = archive, deadline_at
@@ -114,11 +134,15 @@ def read_archived_chunks(
     """Return only hash-verified chunks; unsupported documents are omitted.
 
     Existing logical objects serve multiple events and are read once per group.
-    Pending projection, excluded structural/oversized events, absent manifests,
-    read-budget overflow, or historical chunk boundaries use temporary caller
-    fallback. Wrong content, receipts, incomplete segments, or corrupted objects
-    fail closed. The caller supplies fresh source grants; database eligibility
-    and immutable part references are checked again after reading.
+    Queued parent updates do not hide individually unchanged events. A new
+    event absent from the older projection, or a proven older event revision,
+    is omitted while its parent is pending, for hash-verified caller fallback.
+    Excluded structural/oversized events, absent manifests, read-budget overflow,
+    and historical chunk boundaries also retain temporary fallback. Wrong
+    content, receipts, incomplete segments, or corrupted objects fail closed.
+    The caller supplies fresh source grants; database eligibility and immutable
+    part references are checked again after reading. A publication race rejects
+    this attempt; retry the whole request against the new catalog snapshot.
 
     Database work honors deadline_at. The archive transport has no per-request
     deadline API: checks around each sequential read reject late results, but
@@ -158,7 +182,7 @@ def read_archived_chunks(
         before = snapshot()
         groups = {}
         for row in before.values():
-            if (row["pending"] or row["manifest"] is None
+            if (row["manifest"] is None
                     or row["raw_media_type"] == "application/vnd.recall.oversized-record+gzip"
                     or _EXCLUDED_TYPES.intersection(row["structural_types"])):
                 continue
@@ -229,17 +253,25 @@ def read_archived_chunks(
             for native_id, row in wanted.items():
                 segments = records[native_id]
                 chunks = row["chunks"]
-                if (not segments or not chunks
-                        or [c["ordinal"] for c in chunks] != list(range(len(chunks)))
-                        or segments[0].segment_count != len(segments)
-                        or list(segments[0].receipts) != [c["receipt"] for c in chunks]):
+                if (not chunks
+                        or [c["ordinal"] for c in chunks] != list(range(len(chunks)))):
+                    raise ChunkBodyError("archived_chunk_body_unavailable")
+                if not segments and row["pending"]:
+                    continue
+                if not segments or segments[0].segment_count != len(segments):
                     raise ChunkBodyError("archived_chunk_body_unavailable")
                 for index, segment in enumerate(segments):
                     if (segment.segment_ordinal != index or segment.segment_count != len(segments)
                             or segment.ordinal != segments[0].ordinal + index
-                            or segment.event_kind != row["kind"]
+                            or segment.event_kind != segments[0].event_kind
                             or (index > 0 and segment.receipts)):
                         raise ChunkBodyError("archived_chunk_body_unavailable")
+                if list(segments[0].receipts) != [c["receipt"] for c in chunks]:
+                    if row["pending"] and _older_revision_receipts(segments[0].receipts, row):
+                        continue
+                    raise ChunkBodyError("archived_chunk_body_unavailable")
+                if segments[0].event_kind != row["kind"]:
+                    raise ChunkBodyError("archived_chunk_body_unavailable")
                 text = "".join(segment.text for segment in segments)
                 if hashlib.sha256(text.encode()).hexdigest() != row["text_sha256"]:
                     raise ChunkBodyError("archived_chunk_body_unavailable")
