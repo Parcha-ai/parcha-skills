@@ -1,99 +1,114 @@
-# Existing-part locator coverage: dry run
+# Backfill exact positions from existing logical parts
 
-The locator publisher can fill positions during ordinary projection, but deployment
-alone does not cover existing parents. Reprojecting every parent would reread source
-bodies and upload manifests unnecessarily. This planner instead reads each current
-immutable logical part once, verifies the existing evidence, and proposes only NULL
-positions on current eligible documents. It performs no uploads or database writes.
+Deployment alone does not populate old document positions. This operation verifies
+existing immutable parts once per parent and fills only proven NULL positions.
+It does not reproject, upload objects, change a parent catalog, or delete source prose.
+The default remains a read-only coverage report; publication requires `--apply`.
 
-## Run a bounded private sample
+## Bounded operation
 
 Apply migration 068 first. Use the existing administrative environment with database
-read access and evidence-object read access. The script does not retrieve credentials
-or require archive write permission:
+read access and evidence-object read access. Applying additionally requires database
+TEMP privilege, the runtime role’s existing queue/catalog row-lock privileges, and
+UPDATE access to the two locator columns. Credentials are supplied by that environment; the script does not retrieve or print them.
 
 ```sh
 python server/scripts/plan_body_locators.py \
   --tenant TENANT --source SOURCE --limit 1 \
   --max-bytes 268435456 --seconds 60 \
   --output /private/new-locator-plan.json
+
+python server/scripts/plan_body_locators.py \
+  --tenant TENANT --source SOURCE --limit 1 --apply \
+  --max-bytes 268435456 --seconds 60 \
+  --output /private/new-locator-apply.json
 ```
 
-The new report is created with mode 0600 and exclusive creation. Standard output
-contains only aggregate counts. The private file contains source/parent identifiers,
-current document identifiers, proposed ordinal/count pairs, exclusion counts, and a
-snapshot fingerprint; it contains no source prose. `--resume PRIOR_REPORT` continues
-the prior private keyset cursor in the same tenant/source scope. No `--apply` option
-exists, and the module exposes no write operation.
+Every apply reruns the complete archive proof in process. A saved JSON report is
+advisory and cannot authorize locator writes. `--resume PRIOR_REPORT` uses only its
+keyset cursor and matching tenant/source scope; apply can resume only a prior apply
+report. Apply stops at the first failed parent, preserving the prior successful cursor
+for a fresh retry. Earlier parents remain committed; each individual parent is atomic.
+A dry run may continue through failures to report coverage gaps.
 
-Scope is **parents already present in the logical catalog**. Unprojected parents are
-not silently counted as covered. A successful parent report proves only the current
-snapshot; it does not establish historical recovery or authorize body deletion.
-Failed parents are recorded and the cursor advances, so a later backfill must explicitly
-retry failures rather than interpreting cursor completion as complete coverage.
+Reports use exclusive creation and mode 0600. They contain identifiers, proposed
+positions, exclusion/error counts and the input proof fingerprint, never source prose.
+Standard output contains aggregate counts only. Scope is parents already present in
+the logical catalog; unprojected parents are not counted as covered. Neither mode
+authorizes body thinning or establishes historical receipt recovery.
 
-## Proof and resource bounds
+## Proof before locks
 
 1. Capture parent manifest/parts, queue generation and changed-at, current document
-   identities, revision hashes, chunk receipts/hashes, and existing positions in one
-   read-only repeatable-read transaction. Historical documents and tombstoned events
-   are excluded by the same authority conditions as the current-body reader.
-2. Release the database connection. Check part tenant/source/logical identity and
-   revision, ordinal topology, byte size and digest; decode the complete record stream
-   and verify the aggregate parent digest and receipt count. Each part is fetched once.
-3. Retain only the current event being verified, at most 8 MB. Reuse the reader's
-   `_verified_body` check for exact current receipts, complete-event hash and every
-   canonical chunk hash. Record only ordinal/count metadata. Existing correct positions
-   produce no change; inconsistent existing positions fail the parent plan.
-4. Repeat the metadata snapshot. Any append, revision, tombstone, queue-generation or
-   publication change rejects the entire parent plan. No partial proposed positions
-   escape a failed parent. Ingest remains active throughout the scan.
+   identities, revisions and hashes, chunk receipts/hashes, and existing positions in
+   one read-only repeatable-read transaction. Historical and tombstoned records do not
+   become current candidates.
+2. Release the connection. Verify each part's tenant/source/logical identity, revision,
+   ordinal topology, byte size and digest, and the complete parent digest/receipt count.
+   Fetch each existing part once and retain only the current eligible event, at most
+   8 MB. Reuse the current reader's exact receipt, full-event and every-chunk hash proof.
+3. Keep compact candidate metadata only. Existing correct positions yield no UPDATE;
+   inconsistent existing positions fail the parent. A fresh metadata snapshot rejects
+   publication, revision, tombstone or queue changes during the archive scan.
 
-Default per-parent limits are 10,000 current documents, 100,000 chunks, 4,096 parts,
-200,000 records and 256 MiB of object bytes. Every object is capped at 64 MiB. The
-script shares its byte and time budgets across the parent page, stops after at least
-50,000 proposed documents (one bounded parent can cross the threshold), and accepts
-at most 100 parents per invocation. The API accepts larger explicit limits only up to
-fixed maxima. Database queries and sequential no-retry object reads receive the same
-absolute deadline; the existing transport's cooperative deadline limitations remain.
+Oversized or structural records, unsupported historical chunk layouts, bodies above
+the canonical event bound, pending new documents, and proven older revisions remain
+excluded. Missing/corrupt parts, arbitrary receipt or full-body hash mismatches, and
+malformed streams fail the parent. Some unlocated historical chunk boundaries cannot
+be distinguished from chunk-metadata mismatches by hashes alone; neither yields an
+eligible locator. No partial positions escape a failed proof.
+
+## Atomic NULL-only publication
+
+Apply retains the in-process proof metadata; it never reconstructs authority from a
+saved report. In a READ COMMITTED transaction it locks the existing queue row, the
+parent catalog row, then only changed current document rows, all with NOWAIT. It
+acquires no advisory lock. Candidate identities and positions stream into a TEMP table;
+the UPDATE joins that table and also requires exact native identity, revision, whole
+hash, current/nondeleted status and BOTH locator columns NULL. Omitted, unsupported,
+historical, non-NULL and newly appended documents are never cleared or rewritten.
+
+After acquiring those locks, the operation rereads the full metadata fence through the
+same connection. It rechecks queue absence as well as queue presence/generation.
+An append committed before this check rejects the parent and requires a new proof.
+An append after the check may safely insert a new queue row: the parent catalog cannot
+publish a replacement while locked, old proven documents cannot change while locked,
+and the new unarchived document remains NULL. Locking an absent queue row is not used
+as a fence. The existing archive and locked current documents supply the safety proof.
+
+Both ingest paths lock old current documents before inserting replacement documents
+and marking the queue. If ingest owns a document first, apply fails NOWAIT and releases
+its queue/catalog locks so ingest completes. If apply owns it first, ingest waits until
+verified old positions commit, then makes that old document historical; its new revision
+starts with NULL positions. Any failure or deadline before commit rolls back all writes
+for that parent, including TEMP staging. Repeating a completed parent makes no updates.
+
+## Limits and accounting
+
+Defaults: 10,000 current documents, 100,000 chunks, 4,096 parts, 200,000 records and
+256 MiB of archive bytes per parent. Objects are capped at 64 MiB. The CLI shares byte
+and time budgets across its page, permits at most 100 parents, and stops after at least
+50,000 proposed documents (one bounded parent can cross the threshold). Explicit API
+limits have fixed maxima. Each query and no-retry object read receives the same absolute
+deadline; the existing transport's cooperative deadline limitations remain.
 
 `archive_gets` and `archive_bytes` count attempted GETs and their catalog byte sizes,
-including failed requests. They are work/cost estimates, not provider billing. A
-budget-rejected parent reports expected GET/byte counts when its catalog was captured.
-No dollar estimate is invented. Source bytes are never retained in a second store.
-
-Oversized records, structural records, unsupported historical chunk layouts, bodies
-above the canonical event limit, pending new documents, and a proven older revision
-remain excluded. Missing/corrupt parts, arbitrary receipt/hash mismatches, and malformed
-record sequences fail the whole parent. Unlocated historical chunk boundaries cannot
-be distinguished from some chunk-metadata mismatches by hashes alone; neither yields
-an eligible locator.
-
-## Eventual apply boundary (not implemented)
-
-An apply operation must rerun this proof or receive its in-process captured snapshot;
-a saved JSON report is advisory and must never independently authorize a write. After
-archive verification, acquire locks in the existing projector order: parent queue if
-present, current parent catalog, then only changed current documents with `FOR UPDATE
-NOWAIT`. Recheck the captured manifest/part identity, queue presence/generation and
-current document/revision/chunk authority under those locks. If anything changed or a
-document lock is busy, roll back the entire parent and retry from a fresh proof.
-Absent-queue insertion races must also be tested; locking a missing row is not a fence.
-
-Use the existing changed-only `_publish_body_locators` boundary rather than another
-locator authority. No parent catalog change, reprojection, per-turn object, or source
-body deletion is required. Historical receipt recovery, both ingest writer paths,
-measured coverage and operational rollback remain separate body-retirement gates.
+including failed reads. They are work/cost estimates, not provider billing. Budget
+failures include expected archive work when the catalog was captured. No second body
+store or per-turn objects are created. Over-budget parents remain reported coverage
+gaps and require an explicitly revised operation; they are never silently covered.
 
 ## Witnessed tests
 
-`tests.central_brain.test_locator_backfill_plan` checks exact/shared proof, private
-exclusive reports, absent apply support, unchanged positions, unsupported records,
-corruption, deadline propagation, budgets and failed-read accounting.
+Unit/CLI tests cover exact shared proof, private exclusive reports, explicit apply,
+fresh proof despite saved data, retry cursors, deadlines and failed-read accounting.
+`e2e_locator_backfill_plan.py` proves read-only behavior, single part reads, corruption,
+append/publication races, tenant scoping and revision/oversized/historical exclusions.
+`e2e_locator_backfill_apply.py` uses real concurrent PostgreSQL connections to prove
+NULL-only/idempotent publication, unchanged body bytes and existing locator xmin,
+append both before and after the final fence, revisions in both lock orders, immediate
+busy-lock failure and whole-parent rollback after an injected post-UPDATE failure.
+The archive spy rejects any object read while a database connection is held.
 
-`server/tests/e2e_locator_backfill_plan.py` creates a disposable PostgreSQL database.
-It proves no locator/body/xmin change and no upload; reads every existing part once;
-rejects append and publication races, corrupt/missing objects and current hash
-mismatches; excludes historical revisions, tombstones, historical boundaries and
-oversized records; and checks tenant scoping plus keyset pagination. Its archive spy
-rejects any object read performed while a database connection is held.
+Historical recovery, both writer retirement paths, measured production coverage and
+operational rollback remain separate prerequisites for deleting body copies.

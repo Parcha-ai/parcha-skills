@@ -1,8 +1,8 @@
-"""Read-only proof of body positions in existing immutable parent parts.
+"""Verified body positions in existing immutable parent parts.
 
-This module has no apply operation. A plan is evidence for review, not authority
-for a later write: an eventual writer must recheck the complete snapshot fence
-under the parent queue/catalog locks and use changed-document NOWAIT locking.
+Saved plans are advisory. The opt-in apply API reruns the complete proof in
+process, then fences the fresh metadata under queue/catalog/document locks. It
+only fills proven NULL positions; it never uploads or changes source bodies.
 """
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ import time
 from typing import Any
 
 import orjson
+import psycopg
 
 from .canonical_text import MAX_CANONICAL_TEXT_BYTES
 from .chunk_bodies import (
@@ -45,6 +46,17 @@ class PlanLimits:
         for value, maximum in zip(values, maxima):
             if type(value) is not int or not 1 <= value <= maximum:
                 raise LocatorPlanError('locator_plan_request_invalid')
+
+
+@dataclass(frozen=True)
+class _ParentProof:
+    report: dict[str, Any]
+    snapshot: dict[str, Any]
+    tenant: str
+    source: str
+    parent: str
+    limits: PlanLimits
+    deadline_at: float
 
 
 _PARENT_SQL = """SELECT to_jsonb(evidence) AS manifest,
@@ -80,46 +92,50 @@ _DOCUMENTS_SQL = """SELECT document.tenant_id,document.source_id,document.docume
  ORDER BY document.document_id LIMIT %s"""
 
 
+def _snapshot_on_connection(store, connection, tenant, source, parent, limits, deadline_at):
+    """Read bounded metadata using the caller's existing transaction."""
+    _check_deadline(deadline_at)
+    def query(sql, values):
+        return store._execute_bounded(connection, sql, values, deadline_at)
+
+    catalog = query(_PARENT_SQL, (tenant, source, parent)).fetchone()
+    if catalog is None:
+        raise LocatorPlanError('locator_plan_manifest_missing')
+    manifest = catalog['manifest']
+    parts = query("""SELECT * FROM canonical_evidence_document_parts
+        WHERE tenant_id=%s AND source_id=%s AND logical_document_id=%s AND revision=%s
+        ORDER BY part_ordinal LIMIT %s""", (tenant, source, manifest['logical_document_id'],
+            manifest['revision'], limits.max_parts + 1)).fetchall()
+    documents = query(_DOCUMENTS_SQL, (tenant, source, parent, limits.max_documents + 1)).fetchall()
+    if len(parts) > limits.max_parts or len(documents) > limits.max_documents:
+        raise LocatorPlanError('locator_plan_metadata_budget_exceeded')
+    by_id = {row['document_id']: row for row in documents}
+    if len(by_id) != len(documents):
+        raise LocatorPlanError('locator_plan_catalog_invalid')
+    for row in documents:
+        row.update(chunks=[], pending=catalog['queue'] is not None, pg_body_bytes=0)
+    chunks = query("""SELECT document_id,ordinal,receipt,text_sha256,
+               octet_length(text_redacted) AS pg_bytes
+          FROM canonical_chunks WHERE tenant_id=%s AND source_id=%s
+           AND document_id=ANY(%s) AND deleted_at IS NULL
+         ORDER BY document_id,ordinal LIMIT %s""",
+         (tenant, source, list(by_id), limits.max_chunks + 1)).fetchall()
+    if len(chunks) > limits.max_chunks:
+        raise LocatorPlanError('locator_plan_metadata_budget_exceeded')
+    for chunk in chunks:
+        row = by_id[chunk['document_id']]
+        row['pg_body_bytes'] += chunk['pg_bytes']
+        row['chunks'].append({key: chunk[key] for key in ('ordinal', 'receipt', 'text_sha256')})
+    _check_deadline(deadline_at)
+    return dict(manifest=manifest, queue=catalog['queue'], parts=parts, documents=documents)
+
+
 def _snapshot(store, tenant, source, parent, limits, deadline_at):
     """One metadata-only MVCC view, with independent cardinality bounds."""
-    _check_deadline(deadline_at)
     with store.connect() as connection:
         with connection.transaction():
             connection.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
-
-            def query(sql, values):
-                return store._execute_bounded(connection, sql, values, deadline_at)
-
-            catalog = query(_PARENT_SQL, (tenant, source, parent)).fetchone()
-            if catalog is None:
-                raise LocatorPlanError('locator_plan_manifest_missing')
-            manifest = catalog['manifest']
-            parts = query("""SELECT * FROM canonical_evidence_document_parts
-                WHERE tenant_id=%s AND source_id=%s AND logical_document_id=%s AND revision=%s
-                ORDER BY part_ordinal LIMIT %s""", (tenant, source, manifest['logical_document_id'],
-                    manifest['revision'], limits.max_parts + 1)).fetchall()
-            documents = query(_DOCUMENTS_SQL, (tenant, source, parent, limits.max_documents + 1)).fetchall()
-            if len(parts) > limits.max_parts or len(documents) > limits.max_documents:
-                raise LocatorPlanError('locator_plan_metadata_budget_exceeded')
-            by_id = {row['document_id']: row for row in documents}
-            if len(by_id) != len(documents):
-                raise LocatorPlanError('locator_plan_catalog_invalid')
-            for row in documents:
-                row.update(chunks=[], pending=catalog['queue'] is not None, pg_body_bytes=0)
-            chunks = query("""SELECT document_id,ordinal,receipt,text_sha256,
-                       octet_length(text_redacted) AS pg_bytes
-                  FROM canonical_chunks WHERE tenant_id=%s AND source_id=%s
-                   AND document_id=ANY(%s) AND deleted_at IS NULL
-                 ORDER BY document_id,ordinal LIMIT %s""",
-                 (tenant, source, list(by_id), limits.max_chunks + 1)).fetchall()
-            if len(chunks) > limits.max_chunks:
-                raise LocatorPlanError('locator_plan_metadata_budget_exceeded')
-            for chunk in chunks:
-                row = by_id[chunk['document_id']]
-                row['pg_body_bytes'] += chunk['pg_bytes']
-                row['chunks'].append({key: chunk[key] for key in ('ordinal', 'receipt', 'text_sha256')})
-    _check_deadline(deadline_at)
-    return dict(manifest=manifest, queue=catalog['queue'], parts=parts, documents=documents)
+            return _snapshot_on_connection(store, connection, tenant, source, parent, limits, deadline_at)
 
 
 def select_parents(store, *, tenant_id, source_id=None, after=None, limit=1, deadline_at=None):
@@ -155,9 +171,9 @@ class _MeteredArchive:
         return payload
 
 
-def plan_parent(store: Any, archive: Any, *, tenant_id: str, source_id: str,
+def _prove_parent(store: Any, archive: Any, *, tenant_id: str, source_id: str,
                 native_parent_id: str, limits: PlanLimits | None = None,
-                deadline_at: float | None = None) -> dict[str, Any]:
+                deadline_at: float | None = None) -> _ParentProof:
     """Verify one parent, returning metadata only after its fresh final fence.
 
     Fetches each existing part once, never uploads or holds a DB connection
@@ -284,12 +300,13 @@ def plan_parent(store: Any, archive: Any, *, tenant_id: str, source_id: str,
                     raise LocatorPlanError('locator_plan_current_body_missing')
         if _snapshot(store, tenant_id, source_id, native_parent_id, limits, deadline_at) != before:
             raise LocatorPlanError('locator_plan_catalog_changed')
-        return dict(status='verified_dry_run', current_documents=len(documents), eligible_documents=len(eligible),
+        report = dict(status='verified_dry_run', current_documents=len(documents), eligible_documents=len(eligible),
                     unchanged_locators=unchanged, excluded=dict(sorted(excluded.items())), changes=changes,
                     verified_current_pg_chunk_bytes=sum(documents[native]['pg_body_bytes'] for native in eligible),
                     archive_gets=meter.gets, archive_bytes=meter.bytes, expected_archive_bytes=expected_bytes,
                     pending=before['queue'] is not None,
                     snapshot_sha256=hashlib.sha256(orjson.dumps(before, option=orjson.OPT_SORT_KEYS, default=str)).hexdigest())
+        return _ParentProof(report, before, tenant_id, source_id, native_parent_id, limits, deadline_at)
     except SearchDeadlineExceeded as error:
         error.archive_gets, error.archive_bytes = meter.gets, meter.bytes
         error.expected_archive_gets, error.expected_archive_bytes = expected_gets, expected_bytes
@@ -303,3 +320,106 @@ def plan_parent(store: Any, archive: Any, *, tenant_id: str, source_id: str,
         error.archive_gets, error.archive_bytes = meter.gets, meter.bytes
         error.expected_archive_gets, error.expected_archive_bytes = expected_gets, expected_bytes
         raise error from None
+
+
+def plan_parent(store: Any, archive: Any, *, tenant_id: str, source_id: str,
+                native_parent_id: str, limits: PlanLimits | None = None,
+                deadline_at: float | None = None) -> dict[str, Any]:
+    return _prove_parent(store, archive, tenant_id=tenant_id, source_id=source_id,
+                         native_parent_id=native_parent_id, limits=limits, deadline_at=deadline_at).report
+
+
+def _apply_proof(store, proof):
+    """Publish only proven NULLs; caller cannot supply persisted plan data.
+
+    Existing queue -> parent catalog -> changed current documents, all NOWAIT.
+    No advisory lock is acquired. A late append can insert a new queue row after
+    the final fence: it cannot change the locked old documents or publish a new
+    catalog before this transaction commits, and its new document stays NULL.
+    """
+    changes = proof.report['changes']
+    if not changes:
+        return 0
+    documents = {row['document_id']: row for row in proof.snapshot['documents']}
+    scope = (proof.tenant, proof.source, proof.parent)
+    with store.connect() as connection:
+        with connection.transaction():
+            connection.execute('SET TRANSACTION ISOLATION LEVEL READ COMMITTED')
+
+            def query(sql, values=()):
+                return store._execute_bounded(connection, sql, values, proof.deadline_at)
+
+            query("""SELECT generation FROM canonical_evidence_document_queue
+                WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s FOR UPDATE NOWAIT""", scope)
+            current = query("""SELECT logical_document_id FROM canonical_evidence_documents
+                WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s FOR UPDATE NOWAIT""", scope).fetchone()
+            if current is None:
+                raise LocatorPlanError('locator_plan_catalog_changed')
+            query("""CREATE TEMP TABLE recall_body_locator_backfill (
+                document_id text PRIMARY KEY, native_id text NOT NULL, revision integer NOT NULL,
+                text_sha256 text NOT NULL, record_ordinal integer NOT NULL CHECK(record_ordinal>=0),
+                record_count integer NOT NULL CHECK(record_count>=1)
+            ) ON COMMIT DROP""")
+            with connection.cursor() as cursor:
+                with cursor.copy('COPY pg_temp.recall_body_locator_backfill FROM STDIN') as writer:
+                    for change in changes:
+                        _check_deadline(proof.deadline_at)
+                        row = documents[change['document_id']]
+                        writer.write_row((row['document_id'], row['native_id'], row['revision'], row['text_sha256'],
+                                          change['record_ordinal'], change['record_count']))
+            query('ANALYZE pg_temp.recall_body_locator_backfill')
+            locked = query("""SELECT document.document_id
+                FROM canonical_documents document
+                JOIN pg_temp.recall_body_locator_backfill desired USING(document_id)
+                JOIN canonical_events event USING(tenant_id,source_id,event_id)
+                WHERE document.tenant_id=%s AND document.source_id=%s
+                  AND COALESCE(event.native_parent_id,event.native_id)=%s
+                  AND document.native_id=desired.native_id AND document.revision=desired.revision
+                  AND document.text_sha256=desired.text_sha256 AND document.is_current
+                  AND document.deleted_at IS NULL AND document.body_record_ordinal IS NULL
+                  AND document.body_record_count IS NULL
+                ORDER BY document.document_id FOR UPDATE OF document NOWAIT""", scope).fetchall()
+            if len(locked) != len(changes):
+                raise LocatorPlanError('locator_plan_catalog_changed')
+            # READ COMMITTED here is deliberate: reuse this connection, with
+            # current publication and changed-document rows already locked.
+            current = _snapshot_on_connection(store, connection, *scope, proof.limits, proof.deadline_at)
+            if current != proof.snapshot:
+                raise LocatorPlanError('locator_plan_catalog_changed')
+            updated = query("""UPDATE canonical_documents document
+                SET body_record_ordinal=desired.record_ordinal,body_record_count=desired.record_count
+                FROM pg_temp.recall_body_locator_backfill desired
+                WHERE document.tenant_id=%s AND document.source_id=%s
+                  AND document.document_id=desired.document_id AND document.native_id=desired.native_id
+                  AND document.revision=desired.revision AND document.text_sha256=desired.text_sha256
+                  AND document.is_current AND document.deleted_at IS NULL
+                  AND document.body_record_ordinal IS NULL AND document.body_record_count IS NULL""",
+                  (proof.tenant, proof.source)).rowcount
+            if updated != len(changes):
+                raise LocatorPlanError('locator_plan_catalog_changed')
+            _check_deadline(proof.deadline_at)
+    return updated
+
+
+def apply_parent(store: Any, archive: Any, *, tenant_id: str, source_id: str,
+                 native_parent_id: str, limits: PlanLimits | None = None,
+                 deadline_at: float | None = None) -> dict[str, Any]:
+    """Rerun archive proof, then fill only exact NULL positions atomically."""
+    proof = _prove_parent(store, archive, tenant_id=tenant_id, source_id=source_id,
+                          native_parent_id=native_parent_id, limits=limits, deadline_at=deadline_at)
+    try:
+        count = _apply_proof(store, proof)
+        return dict(proof.report, status='applied', applied_documents=count)
+    except (SearchDeadlineExceeded, LocatorPlanError) as error:
+        failure = error
+    except psycopg.errors.LockNotAvailable:
+        failure = LocatorPlanError('locator_plan_lock_busy')
+    except psycopg.errors.QueryCanceled:
+        failure = SearchDeadlineExceeded()
+    except Exception:
+        failure = LocatorPlanError('locator_plan_apply_unavailable')
+    failure.archive_gets = proof.report['archive_gets']
+    failure.archive_bytes = proof.report['archive_bytes']
+    failure.expected_archive_gets = proof.report['archive_gets']
+    failure.expected_archive_bytes = proof.report['expected_archive_bytes']
+    raise failure from None

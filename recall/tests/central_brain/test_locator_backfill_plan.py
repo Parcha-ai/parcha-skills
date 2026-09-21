@@ -8,7 +8,7 @@ from unittest.mock import patch
 from tests.central_brain import test_chunk_bodies as fixtures
 from tests.central_brain.test_chunk_bodies import digest
 from recall_server.db import SearchDeadlineExceeded
-from recall_server.locator_backfill_plan import LocatorPlanError, PlanLimits, plan_parent
+from recall_server.locator_backfill_plan import LocatorPlanError, PlanLimits, apply_parent, plan_parent
 
 
 class LocatorPlanTests(unittest.TestCase):
@@ -119,6 +119,24 @@ class LocatorPlanTests(unittest.TestCase):
             self.plan(store, archive, snapshot)
         self.assertEqual(archive.calls, [])
 
+    def test_apply_reruns_archive_proof_and_cannot_accept_a_saved_plan(self):
+        store, archive, snapshot = self.fixture()
+        args = dict(tenant_id='tenant', source_id='source', native_parent_id='session')
+        with patch('recall_server.locator_backfill_plan._snapshot', return_value=snapshot), \
+             patch('recall_server.locator_backfill_plan._apply_proof', return_value=1) as publish:
+            result = apply_parent(store, archive, **args)
+            self.assertEqual(result['applied_documents'], 1)
+            self.assertEqual(len(archive.calls), 1)
+            publish.assert_called_once()
+        with self.assertRaises(TypeError):
+            apply_parent(store, archive, **args, plan=result)
+        archive.payloads[snapshot['parts'][0]['object_key']] = b'corrupt'
+        with patch('recall_server.locator_backfill_plan._snapshot', return_value=snapshot), \
+             patch('recall_server.locator_backfill_plan._apply_proof') as publish, \
+             self.assertRaises(LocatorPlanError):
+            apply_parent(store, archive, **args)
+        publish.assert_not_called()
+
 
 class LocatorPlanCliTests(unittest.TestCase):
     def module(self):
@@ -161,10 +179,48 @@ class LocatorPlanCliTests(unittest.TestCase):
                 module.main()
             self.assertEqual(path.read_bytes(), original)
 
-    def test_no_apply_flag_exists(self):
+    def test_apply_is_explicit_and_dry_run_report_cannot_authorize_it(self):
         from contextlib import redirect_stderr
         from io import StringIO
+        import json
+        from pathlib import Path
+        import tempfile
         module = self.module()
-        with patch('sys.argv', ['plan', '--tenant', 'tenant', '--output', '/unused', '--apply']), \
-             redirect_stderr(StringIO()), self.assertRaises(SystemExit):
-            module.main()
+        with tempfile.TemporaryDirectory() as directory:
+            prior = Path(directory) / 'prior.json'
+            prior.write_text(json.dumps(dict(mode='dry_run_only', tenant='tenant', source=None,
+                                            next_cursor=['source', 'parent'], changes=['not-authority'])))
+            with patch('sys.argv', ['plan', '--tenant', 'tenant', '--output', str(Path(directory) / 'out.json'),
+                                    '--apply', '--resume', str(prior)]), \
+                 patch.object(module, 'apply_parent') as apply, redirect_stderr(StringIO()), \
+                 self.assertRaises(SystemExit):
+                module.main()
+            apply.assert_not_called()
+
+    def test_apply_stops_failed_parent_and_keeps_cursor_for_fresh_retry(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        import json
+        import os
+        from pathlib import Path
+        import tempfile
+        from unittest.mock import MagicMock
+        module = self.module()
+        parents = [dict(source_id='source', native_parent_id=value) for value in ('one', 'two')]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'apply.json'
+            with patch('sys.argv', ['plan', '--tenant', 'tenant', '--limit', '2', '--apply', '--output', str(path)]), \
+                 patch.dict(os.environ, RECALL_DATABASE_URL='postgresql://synthetic'), \
+                 patch.object(module, 'BrainStore', return_value=MagicMock()), \
+                 patch.object(module, 'build_evidence_archive_store', return_value=object()), \
+                 patch.object(module, 'select_parents', return_value=(parents, False)), \
+                 patch.object(module, 'apply_parent', side_effect=LocatorPlanError('locator_plan_lock_busy')) as apply, \
+                 patch.object(module, 'plan_parent') as dry_run, redirect_stdout(StringIO()):
+                self.assertEqual(module.main(), 1)
+            report = json.loads(path.read_text())
+            self.assertEqual(report['mode'], 'apply_verified_positions')
+            self.assertEqual(report['next_cursor'], ['', ''])
+            self.assertEqual(report['applied_documents'], 0)
+            self.assertEqual(report['stopped'], 'locator_plan_lock_busy')
+            apply.assert_called_once()
+            dry_run.assert_not_called()

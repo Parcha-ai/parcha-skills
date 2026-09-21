@@ -34,6 +34,7 @@ def state(store, tenant, source):
     with store.connect() as connection:
         return connection.execute('''SELECT document.document_id, document.is_current,
             document.body_record_ordinal,document.body_record_count,document.xmin::text AS xmin,
+            min(document.text_redacted) AS document_text,
             array_agg(chunk.text_redacted ORDER BY chunk.ordinal) AS texts
             FROM canonical_documents document JOIN canonical_chunks chunk USING(tenant_id,source_id,document_id)
             WHERE document.tenant_id=%s AND document.source_id=%s

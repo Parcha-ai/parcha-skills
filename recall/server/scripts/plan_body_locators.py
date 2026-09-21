@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write a private, bounded locator coverage report. No apply operation exists."""
+"""Prove bounded locator coverage; optionally fill only verified NULL positions."""
 from __future__ import annotations
 
 import argparse
@@ -12,11 +12,12 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from recall_server.archive_runtime import build_evidence_archive_store
 from recall_server.db import BrainStore, SearchDeadlineExceeded
-from recall_server.locator_backfill_plan import LocatorPlanError, PlanLimits, plan_parent, select_parents
+from recall_server.locator_backfill_plan import LocatorPlanError, PlanLimits, apply_parent, plan_parent, select_parents
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--apply', action='store_true', help='rerun proof and fill only verified NULL positions')
     parser.add_argument('--tenant', required=True)
     parser.add_argument('--source')
     parser.add_argument('--limit', type=int, default=1, help='parent page size, 1..100')
@@ -34,6 +35,8 @@ def main():
             previous = json.loads(args.resume.read_text())
             if previous['tenant'] != args.tenant or previous['source'] != args.source:
                 parser.error('resume scope differs from requested scope')
+            if args.apply and previous['mode'] != 'apply_verified_positions':
+                parser.error('apply resume requires a prior apply report; start a fresh apply for a dry-run scope')
             if previous['next_cursor'] is None:
                 parser.error('prior report has no continuation')
             after = tuple(previous['next_cursor'])
@@ -44,8 +47,9 @@ def main():
         descriptor = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except (ValueError, KeyError, TypeError, OSError):
         parser.error('invalid limits/resume or output file unavailable')
-    report = dict(mode='dry_run_only', tenant=args.tenant, source=args.source, parents=[], next_cursor=after,
-                  archive_gets=0, archive_bytes=0, proposed_documents=0, errors=0, stopped=None)
+    report = dict(mode='apply_verified_positions' if args.apply else 'dry_run_only',
+                  tenant=args.tenant, source=args.source, parents=[], next_cursor=list(after or ('', '')),
+                  archive_gets=0, archive_bytes=0, proposed_documents=0, applied_documents=0, errors=0, stopped=None)
     store = None
     try:
         deadline = time.monotonic() + args.seconds
@@ -63,10 +67,12 @@ def main():
                 break
             entry = dict(parent)
             try:
-                entry.update(plan_parent(store, archive, tenant_id=args.tenant,
+                operation = apply_parent if args.apply else plan_parent
+                entry.update(operation(store, archive, tenant_id=args.tenant,
                     source_id=parent['source_id'], native_parent_id=parent['native_parent_id'],
                     limits=PlanLimits(max_bytes=remaining), deadline_at=deadline))
                 report['proposed_documents'] += len(entry['changes'])
+                report['applied_documents'] += entry.get('applied_documents', 0)
             except SearchDeadlineExceeded as error:
                 report['archive_gets'] += getattr(error, 'archive_gets', 0)
                 report['archive_bytes'] += getattr(error, 'archive_bytes', 0)
@@ -80,6 +86,9 @@ def main():
             report['archive_gets'] += entry['archive_gets']
             report['archive_bytes'] += entry['archive_bytes']
             report['parents'].append(entry)
+            if args.apply and entry['status'] == 'failed':
+                report['stopped'] = entry['error']
+                break
             report['next_cursor'] = [parent['source_id'], parent['native_parent_id']]
         else:
             if not more:
@@ -100,7 +109,7 @@ def main():
             json.dump(report, output, sort_keys=True)
             output.write('\n')
     print(json.dumps({key: report[key] for key in (
-        'mode', 'archive_gets', 'archive_bytes', 'proposed_documents', 'errors', 'stopped')}, sort_keys=True))
+        'mode', 'archive_gets', 'archive_bytes', 'proposed_documents', 'applied_documents', 'errors', 'stopped')}, sort_keys=True))
     return 1 if report['errors'] or report['stopped'] else 0
 
 
