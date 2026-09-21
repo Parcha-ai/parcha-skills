@@ -15,6 +15,7 @@ import psycopg
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from recall_server.archive import ArchiveNotFound, FilesystemArchiveStore
 from recall_server.canonical import CanonicalArchiveGateway, CanonicalLifecycleError, CanonicalPlane
 from recall_server.db import BrainStore
