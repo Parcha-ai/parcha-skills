@@ -99,6 +99,7 @@ def run_projection_worker(
     max_wait_seconds: float = 0.0,
     clock: Callable[[], float] = time.monotonic,
     parquet_every_cycles: int = 3,
+    parquet_max_wait_seconds: float = 900.0,
     cleanup_concurrency: int = 8,
     max_cycles: int | None = None,
     skip_embedding: bool = False,
@@ -127,12 +128,16 @@ def run_projection_worker(
         isinstance(parquet_every_cycles, bool)
         or not isinstance(parquet_every_cycles, int)
         or not 1 <= parquet_every_cycles <= 1000
+        or isinstance(parquet_max_wait_seconds, bool)
+        or not isinstance(parquet_max_wait_seconds, (int, float))
+        or not 1 <= parquet_max_wait_seconds <= 86_400
         or isinstance(cleanup_concurrency, bool)
         or not isinstance(cleanup_concurrency, int)
         or not 1 <= cleanup_concurrency <= 64
     ):
         raise ValueError("projection worker budget is invalid")
     cycles_since_parquet = 0
+    last_parquet_started = clock()
 
     def elapsed_ms(started: float) -> int:
         return max(0, int(round((clock() - started) * 1000)))
@@ -206,9 +211,13 @@ def run_projection_worker(
                 int(documents.get("pending", 0)) == 0
                 and projected["status"] == "complete"
                 and int(projected["documents"]) == 0
-            ) or cycles_since_parquet >= parquet_every_cycles
+            ) or (
+                cycles_since_parquet >= parquet_every_cycles
+                or clock() - last_parquet_started >= parquet_max_wait_seconds
+            )
             if scan is not None and parquet_due:
                 cycles_since_parquet = 0
+                last_parquet_started = clock()
             scanned = (
                 scan.project_pending(
                     tenant_id=tenant_id,
@@ -222,6 +231,7 @@ def run_projection_worker(
                     "rows": 0,
                     "stale": 0,
                     "contended": 0,
+                    "requeued": 0,
                     "fragments_rewritten": 0,
                     "fragments_total": 0,
                     "documents_dirty": 0,
@@ -293,6 +303,7 @@ def run_projection_worker(
                     and int(scanned["shards"]) == 0
                     and int(scanned["stale"]) == 0
                     and int(scanned["contended"]) == 0
+                    and int(scanned.get("requeued", 0)) == 0
                     and thinned["status"] == "complete"
                     and int(searched["months"]) == 0
                     and int(searched["failed"]) == 0
@@ -321,6 +332,7 @@ def run_projection_worker(
                 "parquet_rows": int(scanned["rows"]),
                 "parquet_stale": int(scanned["stale"]),
                 "parquet_contended": int(scanned["contended"]),
+                "parquet_requeued": int(scanned.get("requeued", 0)),
                 "parquet_fragments_rewritten": int(scanned.get("fragments_rewritten", 0)),
                 "parquet_fragments_total": int(scanned.get("fragments_total", 0)),
                 "parquet_documents_dirty": int(scanned.get("documents_dirty", 0)),
@@ -367,6 +379,7 @@ def run_projection_worker(
                 "embedding_error=%s "
                 "parquet_shards=%s "
                 "parquet_rows=%s parquet_stale=%s parquet_contended=%s "
+                "parquet_requeued=%s "
                 "parquet_fragments_rewritten=%s parquet_fragments_total=%s "
                 "parquet_documents_dirty=%s "
                 "search_plane_months=%s search_plane_rows=%s "
@@ -407,6 +420,7 @@ def run_projection_worker(
                         "parquet_rows",
                         "parquet_stale",
                         "parquet_contended",
+                        "parquet_requeued",
                         "parquet_fragments_rewritten",
                         "parquet_fragments_total",
                         "parquet_documents_dirty",

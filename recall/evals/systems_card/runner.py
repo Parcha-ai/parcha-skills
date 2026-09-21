@@ -24,6 +24,7 @@ from .forget import ForgetLatencyProbe
 from .latency import ArchilPhaseProbe, SearchStageProbe, ToolLatencyProbe
 from .mcp_client import McpClient, load_profile
 from .model import DIMENSIONS, SCHEMA_VERSION, ProbeResult, dimension_status
+from .nightly_summary import summary_from_output_dir
 from .probes import ProbeContext, timed
 from .render import render_html
 from .truth import load_truth_expansion
@@ -242,6 +243,11 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--repo-root", default=str(Path(__file__).resolve().parents[3]))
     render = commands.add_parser("render", help="re-render card.html from an existing card.json")
     render.add_argument("--output-dir", required=True)
+    summary = commands.add_parser("summary", help="print the nightly summary text for an existing card.json")
+    summary.add_argument("--output-dir", required=True)
+    summary.add_argument("--git-sha", required=True)
+    summary.add_argument("--date", required=True)
+    summary.add_argument("--reconcile", default="", help="one reconcile counts line to append")
     return value
 
 
@@ -252,6 +258,16 @@ def main(argv: list[str] | None = None) -> int:
         overall = card["overall"]
         print(json.dumps({"status": overall["status"], "gates_passed": overall["gates_passed"], "gates_failed": overall["gates_failed"], "output_dir": args.output_dir}, sort_keys=True))
         return 0 if overall["status"] != "failed" else 1
+    if args.command == "summary":
+        print(
+            summary_from_output_dir(
+                Path(args.output_dir).expanduser(),
+                git_sha=args.git_sha,
+                date=args.date,
+                reconcile_line=args.reconcile,
+            )
+        )
+        return 0
     out_dir = Path(args.output_dir).expanduser()
     card = json.loads((out_dir / "card.json").read_text())
     (out_dir / "card.html").write_text(render_html(card, load_history(out_dir / "history.jsonl")))

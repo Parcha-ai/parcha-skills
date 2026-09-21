@@ -239,12 +239,16 @@ class ProbeTest(unittest.TestCase):
             self.assertNotIn(":", key)  # hashed, never the source id
 
     def test_scan_consistency_probe_compares_scope_and_scan(self):
-        context = make_context(FakeBrain(default_tools()))
+        brain = FakeBrain(default_tools())
+        context = make_context(brain)
         result = corpus.ScanConsistencyProbe().run(context)
         self.assertEqual(result.status, "ok")
         self.assertEqual(result.metrics["scope_enumerated_documents"], 6)
         self.assertEqual(result.metrics["scan_distinct_documents"], 6)
         self.assertEqual(result.metrics["scope_scan_agreement"], 1.0)
+        program = next(args["program"] for name, args in brain.calls if name == "recall_scan")
+        self.assertIn("documents-part-*.parquet", program)
+        self.assertNotIn("passages-part-*.parquet", program)
 
     def test_scan_consistency_applies_the_window_to_the_scan_sql(self):
         # recall_scan uses the filters only to pick which source-month

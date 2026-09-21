@@ -272,7 +272,7 @@ ledger are all still there, and the embedding worker resumes where it stopped). 
 rebuilt, if ever needed, with `search-outbox-seed` plus a drain.
 
 The production database gate requires a standard PostgreSQL URL with
-`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 69
+`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 70
 (optional migration 67 retires the Postgres vector plane and is applied by hand from
 the turbopuffer plane; every other migration is mandatory on both planes),
 pgvector 0.8.0 or newer, and a runtime role without superuser, database/role creation,

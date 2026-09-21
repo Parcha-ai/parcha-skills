@@ -47,7 +47,12 @@ from recall_server.projection_worker import (  # noqa: E402
     run_embedding_worker,
     run_projection_worker,
 )
-from recall_server.search_plane_status import namespace_ids, search_plane_reconcile, search_plane_status  # noqa: E402
+from recall_server.search_plane_status import (  # noqa: E402
+    live_passage_id_pages,
+    namespace_ids,
+    search_plane_reconcile,
+    search_plane_status,
+)
 from recall_server.turbopuffer_plane import TurbopufferSettings  # noqa: E402
 from tests.central_brain.fake_turbopuffer import FakeTurbopuffer  # noqa: E402
 from tests.central_brain.test_projection_worker import (  # noqa: E402
@@ -131,9 +136,9 @@ def _migration_files_applied(connection: _RecordingConnection) -> list[int]:
 
 class MigrationFileTest(unittest.TestCase):
     def test_067_drops_the_vector_plane_idempotently_and_leaves_chunks_alone(self) -> None:
-        self.assertEqual(SCHEMA_VERSION, 69)
+        self.assertEqual(SCHEMA_VERSION, 70)
         self.assertEqual(RETIRE_POSTGRES_PLANE_VERSION, 67)
-        self.assertEqual(MANDATORY_SCHEMA_VERSION, 69)
+        self.assertEqual(MANDATORY_SCHEMA_VERSION, 70)
         sql = (SCHEMA / "067_retire_postgres_vector_plane.sql").read_text()
         folded = " ".join(sql.split())
         for statement in (
@@ -166,24 +171,24 @@ class MigrateRunnerTest(unittest.TestCase):
         # always did (suites delete a version row to replay a repair).
         connection = _RecordingConnection(set(range(1, 66)))
         result = self._migrate(_store("postgres"), connection)
-        self.assertEqual(_migration_files_applied(connection), [*range(1, 67), 68, 69])
-        self.assertEqual(result["applied"], [66, 68, 69])
+        self.assertEqual(_migration_files_applied(connection), [*range(1, 67), 68, 69, 70])
+        self.assertEqual(result["applied"], [66, 68, 69, 70])
         self.assertEqual(result["deferred"], [67])
         self.assertEqual(result["skipped"], 0)
-        self.assertEqual(result["schema_version"], 69)
+        self.assertEqual(result["schema_version"], 70)
         self.assertEqual(result["postgres_vector_plane"], "present")
         self.assertFalse(any("DROP TABLE IF EXISTS canonical_passage_embeddings" in sql for sql in connection.executed))
         # The turbopuffer plane defers it too: retirement is an explicit act.
         connection = _RecordingConnection(set(range(1, 67)))
         result = self._migrate(_store("turbopuffer"), connection)
-        self.assertEqual(result["applied"], [68, 69])
+        self.assertEqual(result["applied"], [68, 69, 70])
         self.assertEqual(result["deferred"], [67])
 
     def test_fresh_database_applies_every_mandatory_version_in_order(self) -> None:
         connection = _RecordingConnection(set(), has_table=False)
         result = self._migrate(_store("postgres"), connection)
-        self.assertEqual(_migration_files_applied(connection), [*range(1, 67), 68, 69])
-        self.assertEqual(result["applied"], [*range(1, 67), 68, 69])
+        self.assertEqual(_migration_files_applied(connection), [*range(1, 67), 68, 69, 70])
+        self.assertEqual(result["applied"], [*range(1, 67), 68, 69, 70])
         self.assertEqual(result["deferred"], [67])
 
     def test_retirement_is_refused_on_the_postgres_plane(self) -> None:
@@ -199,24 +204,25 @@ class MigrateRunnerTest(unittest.TestCase):
         connection = _RecordingConnection(set(range(1, 67)))
         store = _store("turbopuffer")
         result = self._migrate(store, connection, retire_postgres_plane=True)
-        self.assertEqual(_migration_files_applied(connection)[-3:], [67, 68, 69])
+        self.assertEqual(_migration_files_applied(connection)[-4:], [67, 68, 69, 70])
         connection.executed.clear()
-        self.assertEqual(result["applied"], [67, 68, 69])
+        self.assertEqual(result["applied"], [67, 68, 69, 70])
         self.assertEqual(result["deferred"], [])
         self.assertEqual(result["postgres_vector_plane"], "retired")
         # Once retired, the files below 067 (041 recreates the table, 063
         # alters it) are skipped and 067 itself is not replayed.
         again = self._migrate(store, connection, retire_postgres_plane=True)
         self.assertEqual(again["applied"], [])
-        self.assertEqual(again["skipped"], 69)
+        self.assertEqual(again["skipped"], 70)
         self.assertEqual(_migration_files_applied(connection), [])
         plain = self._migrate(store, connection)
-        self.assertEqual((plain["applied"], plain["skipped"], plain["deferred"]), ([], 69, []))
+        self.assertEqual((plain["applied"], plain["skipped"], plain["deferred"]), ([], 70, []))
 
     def test_companions_always_run(self) -> None:
         connection = _RecordingConnection(set(range(1, 68)))
         self._migrate(_store("turbopuffer"), connection)
         self.assertTrue(any("CREATE UNIQUE INDEX CONCURRENTLY" in sql for sql in connection.executed))
+        self.assertTrue(any("canonical_passages_reconcile_idx" in sql for sql in connection.executed))
 
 
 class StartupCheckTest(unittest.TestCase):
@@ -234,7 +240,7 @@ class StartupCheckTest(unittest.TestCase):
                 "search_plane": "turbopuffer",
                 "schema_version": 67,
                 "postgres_vector_plane": "retired",
-                "mandatory_schema_version": 69,
+                "mandatory_schema_version": 70,
             },
         )
         self.assertEqual(
@@ -624,6 +630,40 @@ class SearchPlaneReconcileTest(unittest.TestCase):
         ns = client.namespace(settings.namespace("tenant:test"))
         ns.write(upsert_rows=[{"id": value, "text": "t", "source_id": "codex:linux:test", "policy_fingerprint": "fp"} for value in ids])
         return ns
+
+    def test_live_ids_use_restartable_keyset_pages_and_collapse_duplicates(self) -> None:
+        pages = {
+            "": ["psg_01", "psg_01", "psg_02"],
+            "psg_02": ["psg_03"],
+        }
+        store = mock.MagicMock()
+        connections = []
+
+        def connect():
+            connection = mock.MagicMock()
+            cursor = mock.MagicMock()
+            connection.execute.return_value = cursor
+            connection.execute.side_effect = lambda _sql, params: cursor
+            cursor.fetchall.side_effect = lambda: [
+                {"passage_id": value}
+                for value in pages[connection.execute.call_args.args[1][2]]
+            ]
+            context = mock.MagicMock()
+            context.__enter__.return_value = connection
+            connections.append(connection)
+            return context
+
+        store.connect.side_effect = connect
+        ids = list(live_passage_id_pages(
+            store, tenant_id="tenant:test", policy_fingerprint="fp", page_rows=3,
+        ))
+        self.assertEqual(ids, ["psg_01", "psg_02", "psg_03"])
+        self.assertEqual(len(connections), 2)
+        self.assertEqual(
+            [connection.execute.call_args.args[1] for connection in connections],
+            [("tenant:test", "fp", "", 3), ("tenant:test", "fp", "psg_02", 3)],
+        )
+        self.assertTrue(all(connection.commit.called for connection in connections))
 
     def test_pages_every_id_without_attributes(self) -> None:
         settings = TurbopufferSettings(api_key="synthetic-key")
