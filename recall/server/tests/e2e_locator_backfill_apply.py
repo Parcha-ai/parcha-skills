@@ -17,13 +17,13 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo
 SERVER = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SERVER.parent))
 sys.path.insert(0, str(SERVER))
-from e2e_archive_reprojection import fixture, mark_dirty
-from e2e_locator_backfill_plan import state
-from e2e_logical_evidence_projection import insert_record
-from e2e_logical_source_integrity import TrackedStore
-from recall_server import locator_backfill_plan as planner
-from recall_server.locator_backfill_plan import apply_parent, LocatorPlanError
-from recall_server.logical_evidence_projection import mark_logical_evidence_dirty
+from e2e_archive_reprojection import fixture, mark_dirty  # noqa: E402
+from e2e_locator_backfill_plan import state  # noqa: E402
+from e2e_logical_evidence_projection import insert_record  # noqa: E402
+from e2e_logical_source_integrity import TrackedStore  # noqa: E402
+from recall_server import locator_backfill_plan as planner  # noqa: E402
+from recall_server.locator_backfill_plan import apply_parent, LocatorPlanError  # noqa: E402
+from recall_server.logical_evidence_projection import mark_logical_evidence_dirty  # noqa: E402
 
 
 def prepared(store, root):
@@ -262,7 +262,8 @@ def rollback_and_busy_catalog(store, root):
 def main():
     admin = os.environ['RECALL_DATABASE_URL']
     database = 'recall_locator_apply_' + uuid.uuid4().hex
-    settings = conninfo_to_dict(admin); settings['dbname'] = database
+    settings = conninfo_to_dict(admin)
+    settings['dbname'] = database
     with psycopg.connect(admin, autocommit=True) as connection:
         connection.execute(f'CREATE DATABASE "{database}"')
     store = TrackedStore(make_conninfo(**settings))

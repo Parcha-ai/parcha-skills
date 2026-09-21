@@ -16,10 +16,10 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo
 SERVER = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SERVER.parent))
 sys.path.insert(0, str(SERVER))
-from e2e_archive_reprojection import fixture, mark_dirty
-from e2e_logical_evidence_projection import insert_record
-from e2e_logical_source_integrity import TrackedStore
-from recall_server.locator_backfill_plan import LocatorPlanError, PlanLimits, plan_parent, select_parents
+from e2e_archive_reprojection import fixture, mark_dirty  # noqa: E402
+from e2e_logical_evidence_projection import insert_record  # noqa: E402
+from e2e_logical_source_integrity import TrackedStore  # noqa: E402
+from recall_server.locator_backfill_plan import LocatorPlanError, PlanLimits, plan_parent, select_parents  # noqa: E402
 
 
 def check_failed(code, call):
@@ -122,7 +122,8 @@ def publication_race(store, root):
         connection.execute('UPDATE canonical_documents SET body_record_ordinal=NULL,body_record_count=NULL WHERE tenant_id=%s AND source_id=%s', (tenant, source))
     mark_dirty(store, tenant, source)
     archive.on_read = lambda: projector.project_pending(tenant_id=tenant, batch_size=1, max_batches=1)
-    call = lambda: plan_parent(store, archive, tenant_id=tenant, source_id=source, native_parent_id='session')
+    def call():
+        return plan_parent(store, archive, tenant_id=tenant, source_id=source, native_parent_id='session')
     check_failed('locator_plan_catalog_changed', call)
     result = call()
     assert result['changes'] == [] and result['unchanged_locators'] == 3
