@@ -159,8 +159,9 @@ remain unchanged. The separate archive reader is opt-in via
 `RECALL_CHUNK_BODY_READS=archive`; its default is `postgres`. It reads existing
 logical parts, verifies exact text/chunk hashes and liveness, and retains verified
 SQL fallback for unprojected, oversized, structural and historical-layout records.
-It is not permission to thin chunks yet, and its transport latency still needs a
-live acceptance run before activation.
+Its source-reader rollout and live acceptance have since passed. Body retirement
+still requires exact per-target archive proof, compatible writers and the separate
+bounded retirement procedure; enabling a reader alone does not authorize a clear.
 
 The index can be restored, if needed, without restoring source data:
 
@@ -209,9 +210,47 @@ the shared archive hydration when enabled; historical revisions remain in
 PostgreSQL and are hash checked. Do not thin historical bodies using current
 logical evidence. The public MCP/edge profiles continue to hide this HTTP route.
 
-The current archive reader's 64 MiB budget is cumulative across all requested
-parents. A parent that fits today can outgrow it after append, and several small
-parents can exceed it together. Therefore a successful current read is not
-permanent retirement coverage. Require stable routing to the requested records
-in existing immutable parts before deleting source bodies; asynchronous passage
-or Parquet pointers alone do not cover the logical-publication lag.
+Current public reads use verified record locators into existing immutable logical
+parts; NULL positions retain hash-checked PostgreSQL fallback without fetching an
+entire parent. Located reads bound each part at 64 MiB, each canonical body at 8 MB,
+and retained results at 64 MiB. A successful read alone is not permanent retirement
+coverage: locator identity, revision transitions and reprojection must remain
+safe. Asynchronous passage or Parquet pointers alone do not cover logical-publication
+lag. See [streaming locator publication](2026-09-21-streaming-locator-publication.md)
+and [bounded parent retirement](2026-09-21-recall-parent-chunk-retirement.md).
+
+### Current storage checkpoint — 2026-09-21, after documents compaction
+
+MCP and projection run #648; managed ingestion runs #650. Archive body reads
+and turbopuffer search are live. The managed cycle succeeded at 09:15:08 UTC;
+its new record volume was not measured. Acknowledged logical retirement totals
+are 80,343 documents, 87,914 chunks and 371,565,367 UTF-8 bytes. These lifetime
+work counters are not current compressed storage or physical savings.
+
+Managed pg_squeeze rehearsal proved concurrent-data preservation, exact external
+cancellation and cleanup. The first documents rewrite was canceled after an
+observer timeout; the second failed on lock acquisition. Neither reclaimed
+documents storage. **Attempt 3 succeeded at 09:35:12 UTC**, reducing allocation
+from **20,985,446,400 to 14,030,356,480 bytes**: **6,955,089,920 bytes (6.477 GiB)
+physically reclaimed**. Catalog identity and five indexes were preserved, the
+storage file changed, and worker, slot, role-default and credential cleanup passed.
+
+The post-rewrite card passed 26/26 gates with all 16 original evaluator hashes
+unchanged: recall@20 .9625, MRR .6579, server search p95 752.9 ms and show p95
+511 ms. Each deployed service matched six preserved archived response hashes,
+for 18 passing comparisons. Context p95 was 4,821.7 ms from three calls to one
+variable receipt, versus 9,927.6 ms during the rewrite; this small, ungated sample
+leaves the context tail unresolved.
+
+One observed table-exclusive wait cleared under the temporary role's 1 s lock
+acquisition timeout. That allowance bounds each wait separately. The provider's
+100 ms final-replay setting excludes index acquisition and final swaps; it is not
+a hard total lock-hold guarantee.
+
+PS80 and two replicas remain; the configured disk floor is 275 GiB and cap 300 GiB,
+while **all three actual volumes remain 300 GiB**. The fresh 275 GiB request
+was accepted at 09:41:17 UTC and completed by 09:42:40 UTC, with no disk
+replacement pending. Documents physical reclaim is proved; billed disk reduction
+is not. Continue bounded source retirement with explicit remaining-coverage
+accounting; a completed provider request does not satisfy the capacity exit. The living phase state is in
+[the storage Cascade](../../../.cascade/recall-rewrite.md#storage-retirement-resumed--2026-09-20).
