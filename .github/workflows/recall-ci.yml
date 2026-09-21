@@ -103,6 +103,7 @@ jobs:
             e2e_locator_backfill_plan.py \
             e2e_locator_backfill_apply.py \
             e2e_revision_history.py \
+            e2e_chunk_retirement.py \
             e2e_archived_resolve.py
           do
             python "server/tests/$test"
