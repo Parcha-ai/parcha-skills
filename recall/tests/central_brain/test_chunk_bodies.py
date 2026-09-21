@@ -7,12 +7,15 @@ import sys
 import unittest
 from unittest.mock import patch
 
+import orjson
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "server"))
 from recall_server.chunk_bodies import ChunkBodyError, read_archived_chunks
 from recall_server.canonical_text import canonical_text_chunks
 from recall_server.db import SearchDeadlineExceeded
 from recall_server.logical_evidence import LogicalEvidenceRecord, PART_MEDIA_TYPE
+from recall_server.passage_projection import decode_logical_record
 
 
 def digest(value):
@@ -100,6 +103,49 @@ class ChunkBodyTests(unittest.TestCase):
         self.assertEqual(len(store.calls), 2)
         self.assertNotIn("chunk.text_redacted", store.calls[0][0])
         self.assertNotIn("canonical_evidence_objects", store.calls[0][0])
+
+    def test_unrequested_large_content_skips_full_record_decode(self):
+        wanted = self.document("wanted", "wanted body")
+        large = '{"content":{"text":"' + "unrelated " * 20_000 + '"}}'
+        unrelated = self.document("unrelated", large)
+        store, archive = self.fixture([wanted], [
+            self.record(unrelated, large, 0), self.record(wanted, "wanted body", 1),
+        ])
+        with patch("recall_server.chunk_bodies.decode_logical_record", wraps=decode_logical_record) as decode:
+            result = self.read(store, archive)
+        self.assertEqual(result[("source", wanted["document_id"])][0]["text_redacted"], "wanted body")
+        self.assertEqual(decode.call_count, 1)
+        self.assertEqual(orjson.loads(decode.call_args.args[0])["event_native_id"], "wanted")
+
+    def test_requested_malformed_record_remains_rejected_with_valid_checksums(self):
+        row = self.document("native", "body")
+        store, archive = self.fixture([row], [self.record(row, "body", 0)])
+        part = row["parts"][0]
+        value = orjson.loads(archive.payloads[part["object_key"]])
+        value["roles"] = [False]
+        payload = orjson.dumps(value, option=orjson.OPT_SORT_KEYS) + b"\n"
+        part.update(content_sha256=digest(payload), size_bytes=len(payload))
+        row["manifest"]["document_content_sha256"] = digest(payload)
+        archive.payloads[part["object_key"]] = payload
+        with self.assertRaisesRegex(ChunkBodyError, "^archived_chunk_body_unavailable$"):
+            self.read(store, archive)
+
+    def test_unrequested_bad_order_or_receipt_scope_remains_rejected(self):
+        for mutation in ({"ordinal": False}, {"ordinal": 99},
+                         {"event_native_id": []}, {"receipts": "invalid"},
+                         {"receipts": ["recall://other/native?rev=2#item=0"]}):
+            wanted, other = self.document("wanted", "body"), self.document("other", "other")
+            store, archive = self.fixture([wanted], [
+                self.record(other, "other", 0), self.record(wanted, "body", 1),
+            ])
+            part = wanted["parts"][0]
+            first, second = archive.payloads[part["object_key"]].splitlines(keepends=True)
+            payload = orjson.dumps(orjson.loads(first) | mutation, option=orjson.OPT_SORT_KEYS) + b"\n" + second
+            part.update(content_sha256=digest(payload), size_bytes=len(payload))
+            wanted["manifest"]["document_content_sha256"] = digest(payload)
+            archive.payloads[part["object_key"]] = payload
+            with self.subTest(mutation=mutation), self.assertRaises(ChunkBodyError):
+                self.read(store, archive)
 
     def test_denied_unprojected_unsupported_do_no_archive_io(self):
         for mutation in ({"pending": True}, {"manifest": None},
