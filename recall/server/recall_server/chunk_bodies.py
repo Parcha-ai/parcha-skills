@@ -73,6 +73,8 @@ _CATALOG_SQL = """
       ) chunks ON true
      WHERE document.tenant_id=%s AND document.source_id=ANY(%s)
        AND document.document_id=ANY(%s)
+       AND (NOT %s OR document.body_record_ordinal IS NOT NULL
+                   OR document.body_record_count IS NOT NULL)
        AND document.is_current AND document.deleted_at IS NULL
        AND NOT event.is_tombstone
        AND NOT EXISTS (
@@ -185,11 +187,11 @@ class _VerifiedArchive:
 def chunk_catalog_snapshot(
     store: Any, *, tenant_id: str, source_ids: tuple[str, ...],
     document_ids: tuple[str, ...], deadline_at: float | None = None,
-    connection: Any = None,
+    connection: Any = None, located_only: bool = False,
 ) -> dict[tuple[str, str], dict[str, Any]]:
     """One complete reader fence; an existing locked transaction may reuse it."""
     _check_deadline(deadline_at)
-    params = (tenant_id, list(source_ids), list(document_ids))
+    params = (tenant_id, list(source_ids), list(document_ids), located_only)
     if connection is None:
         with store.connect() as opened:
             rows = store._execute_bounded(opened, _CATALOG_SQL, params, deadline_at).fetchall()
@@ -215,8 +217,13 @@ def read_archived_chunks(
     document_ids: tuple[str, ...],
     deadline_at: float | None = None,
     chunk_ordinals: dict[tuple[str, str], tuple[int, ...]] | None = None,
+    located_only: bool = False,
 ) -> dict[tuple[str, str], list[dict[str, Any]]]:
     """Return only hash-verified chunks; unsupported documents are omitted.
+
+    Interactive callers set located_only=True: NULL positions are omitted for
+    verified PostgreSQL fallback without scanning their parents. Recovery and
+    migration callers retain the default bounded transitional full scan.
 
     Existing logical objects serve multiple events and are read once per group.
     Located events fetch only intersecting immutable parts, independently of
@@ -241,7 +248,8 @@ def read_archived_chunks(
     late results are rejected, and no background I/O survives this call.
     """
     if (
-        not isinstance(tenant_id, str) or not tenant_id
+        type(located_only) is not bool
+        or not isinstance(tenant_id, str) or not tenant_id
         or not isinstance(source_ids, tuple)
         or any(not isinstance(s, str) or not s for s in source_ids)
         or not isinstance(document_ids, tuple) or len(document_ids) > MAX_DOCUMENTS
@@ -265,13 +273,16 @@ def read_archived_chunks(
         raise ChunkBodyError("archived_chunk_request_invalid")
     def snapshot():
         return chunk_catalog_snapshot(store, tenant_id=tenant_id, source_ids=source_ids,
-                                      document_ids=document_ids, deadline_at=deadline_at)
+                                      document_ids=document_ids, deadline_at=deadline_at,
+                                      located_only=located_only)
 
     try:
         before = snapshot()
         groups = {}
         for row in before.values():
             location = _record_location(row)
+            if located_only and location is None:
+                continue
             if location is not None and row["manifest"] is None:
                 raise ChunkBodyError("archived_chunk_body_unavailable")
             if (row["manifest"] is None

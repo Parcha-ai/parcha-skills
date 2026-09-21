@@ -33,6 +33,7 @@ def hydrate_chunk_rows(
         source_ids=source_ids,
         document_ids=tuple(dict.fromkeys(row["document_id"] for row in rows)),
         deadline_at=deadline_at,
+        located_only=True,
         chunk_ordinals={key: tuple(sorted(ordinals)) for key, ordinals in requested.items()},
     )
     by_receipt = {
@@ -46,7 +47,7 @@ def hydrate_chunk_rows(
     ]
     fallback = {}
     if missing:
-        # Unsupported or not-yet-projected current documents retain verified
+        # Unlocated, unsupported or not-yet-projected documents retain verified
         # PostgreSQL text during migration. Object failures never reach here.
         with store.connect() as connection:
             fallback_rows = store._execute_bounded(
