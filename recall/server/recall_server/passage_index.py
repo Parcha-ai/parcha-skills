@@ -1557,19 +1557,25 @@ class CanonicalPassageProjector:
             or not 1 <= concurrency <= 32
         ):
             raise ValueError("passage projection budget is invalid")
+        phase_started = time.monotonic()
         prepare_pool = getattr(self.store, "prepare_pool", None)
         if callable(prepare_pool):
             prepare_pool(min(PASSAGE_POOL_WARM_SIZE, concurrency))
+        warmup_seconds = time.monotonic() - phase_started
+        pending_seconds = prepare_seconds = commit_seconds = 0.0
         started = time.monotonic()
         documents = passages = stale = requeued = unavailable = batches = 0
         deleted = retained = 0
         while batches < max_batches:
+            phase_started = time.monotonic()
             candidates = self._pending(
                 tenant_id=tenant_id,
                 limit=batch_size,
             )
+            pending_seconds += time.monotonic() - phase_started
             if not candidates:
                 break
+            phase_started = time.monotonic()
             with ThreadPoolExecutor(
                 max_workers=min(concurrency, len(candidates)),
                 thread_name_prefix="recall-passage-projector",
@@ -1591,8 +1597,10 @@ class CanonicalPassageProjector:
                             unavailable_in_batch += 1
                         else:
                             raise
+            prepare_seconds += time.monotonic() - phase_started
             statuses: list[dict[str, Any]] = []
             if prepared_documents:
+                phase_started = time.monotonic()
                 with ThreadPoolExecutor(
                     max_workers=min(
                         concurrency,
@@ -1605,6 +1613,7 @@ class CanonicalPassageProjector:
                     statuses = list(
                         executor.map(self._commit, prepared_documents)
                     )
+                commit_seconds += time.monotonic() - phase_started
             for prepared, status in zip(
                 prepared_documents,
                 statuses,
@@ -1628,6 +1637,7 @@ class CanonicalPassageProjector:
                 # A transient archive failure must never become a destructive
                 # logical-document rebuild.
                 break
+        phase_started = time.monotonic()
         with self.store.connect() as connection:
             pending = connection.execute(
                 """SELECT count(*) AS count
@@ -1635,6 +1645,7 @@ class CanonicalPassageProjector:
                     WHERE (%s::text IS NULL OR tenant_id=%s)""",
                 (tenant_id, tenant_id),
             ).fetchone()["count"]
+        count_seconds = time.monotonic() - phase_started
         elapsed_seconds = max(0.001, time.monotonic() - started)
         return {
             "status": "complete" if int(pending) == 0 else "pending",
@@ -1648,6 +1659,13 @@ class CanonicalPassageProjector:
             "unavailable": unavailable,
             "batches": batches,
             "pending": int(pending),
+            # Wall times include executor joins, connection acquisition and
+            # handled unavailable/missing work. No per-document identifiers.
+            "warmup_ms": max(0, round(warmup_seconds * 1000)),
+            "pending_ms": max(0, round(pending_seconds * 1000)),
+            "prepare_ms": max(0, round(prepare_seconds * 1000)),
+            "commit_ms": max(0, round(commit_seconds * 1000)),
+            "count_ms": max(0, round(count_seconds * 1000)),
             "elapsed_seconds": round(elapsed_seconds, 3),
             "documents_per_second": round(
                 documents / elapsed_seconds,
