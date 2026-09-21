@@ -52,6 +52,7 @@ jobs:
             e2e_storage_legacy_cut.py \
             e2e_canonical_body_thinning.py \
             e2e_logical_source_integrity.py \
+            e2e_archive_reprojection.py \
             e2e_v2_lifecycle.py \
             e2e_bulk_manifest.py \
             e2e_v2_isolation.py \

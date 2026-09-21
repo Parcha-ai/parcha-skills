@@ -5,6 +5,7 @@ import logging
 import hashlib
 import io
 import json
+import pickle
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from typing import Any
 import orjson
 
 from .actor_attribution import actor_links
+from .logical_archive_bodies import ArchivedBodyLookup
 from .logical_evidence import (
     LogicalEvidenceError,
     LogicalEvidenceProjectionStore,
@@ -616,6 +618,7 @@ class CanonicalLogicalEvidenceProjector:
                               last_error_code=left(%s,120)
                         WHERE tenant_id=%s AND source_id=%s
                           AND native_parent_id=%s
+                          AND generation=%s AND changed_at=%s
                     RETURNING attempts""",
                     (
                         LOGICAL_BACKOFF_CAP_SECONDS,
@@ -624,6 +627,8 @@ class CanonicalLogicalEvidenceProjector:
                         candidate.tenant_id,
                         candidate.source_id,
                         candidate.native_parent_id,
+                        candidate.generation,
+                        candidate.source_updated_at,
                     ),
                 ).fetchone()
         attempts = int(row["attempts"]) if row else 0
@@ -646,7 +651,13 @@ class CanonicalLogicalEvidenceProjector:
         completed: list[LogicalEvidenceUpload] = []
         spool = tempfile.TemporaryFile(mode="w+b")
         ranges: list[tuple[int, int, int]] = []
+        input_spool = None
         try:
+            input_spool = tempfile.TemporaryFile(mode="w+b")
+            input_ranges: list[tuple[int, int, int]] = []
+            pins: dict[int, dict[str, Any]] = {}
+            pinned_parts: dict[int, list[dict[str, Any]]] = {}
+            recovered: set[int] = set()
             with self.store.connect() as connection:
                 existing_parts: dict[int, list[dict[str, Any]]] = {}
                 part_rows = connection.execute(
@@ -658,7 +669,8 @@ class CanonicalLogicalEvidenceProjector:
                                %s::integer[],%s::text[],%s::text[],%s::text[]
                            )
                        )
-                       SELECT selected.candidate_ordinal,part.*
+                       SELECT selected.candidate_ordinal,part.*,
+                              to_jsonb(evidence) AS manifest
                          FROM selected
                          JOIN canonical_evidence_documents evidence
                            ON evidence.tenant_id=selected.tenant_id
@@ -681,6 +693,9 @@ class CanonicalLogicalEvidenceProjector:
                     ),
                 ).fetchall()
                 for row in part_rows:
+                    ordinal = int(row["candidate_ordinal"])
+                    pins[ordinal] = row["manifest"]
+                    pinned_parts.setdefault(ordinal, []).append(row)
                     existing_parts.setdefault(
                         int(row["candidate_ordinal"]),
                         [],
@@ -702,11 +717,7 @@ class CanonicalLogicalEvidenceProjector:
                               event.tenant_id,event.source_id,
                               event.event_id,event.native_id,event.kind,
                               event.occurred_at,
-                              CASE
-                                  WHEN left(
-                                      ltrim(source_record.event_text),1
-                                  ) IN ('{','[') THEN '[]'::jsonb
-                                  ELSE jsonb_build_array(
+                              jsonb_build_array(
                                       event.canonical_redacted->>'role',
                                       event.canonical_redacted->>'type',
                                       event.canonical_redacted
@@ -721,13 +732,8 @@ class CanonicalLogicalEvidenceProjector:
                                           #>> '{content,payload,role}',
                                       event.canonical_redacted
                                           #>> '{content,payload,type}'
-                                  )
-                              END AS fallback_role_values,
-                              CASE
-                                  WHEN left(
-                                      ltrim(source_record.event_text),1
-                                  ) IN ('{','[') THEN '[]'::jsonb
-                                  ELSE jsonb_build_array(
+                              ) AS fallback_role_values,
+                              jsonb_build_array(
                                       event.canonical_redacted->>'type',
                                       event.canonical_redacted
                                           #>> '{content,type}',
@@ -735,8 +741,7 @@ class CanonicalLogicalEvidenceProjector:
                                           #>> '{content,message,type}',
                                       event.canonical_redacted
                                           #>> '{content,payload,type}'
-                                  )
-                              END AS fallback_type_values,
+                              ) AS fallback_type_values,
                               CASE WHEN artifact.media_type=%s
                                    THEN event.canonical_redacted->'content'
                                    ELSE NULL
@@ -840,11 +845,49 @@ class CanonicalLogicalEvidenceProjector:
                         if not previous_ordinal < ordinal < len(candidates):
                             raise LogicalEvidenceError("logical_evidence_state_invalid")
                         previous_ordinal = ordinal
-                        candidate = candidates[ordinal]
-                        start = spool.tell()
-                        for record in self._record_stream(rows):
-                            spool.write(record.encode(source_id=candidate.source_id))
-                        ranges.append((ordinal, start, spool.tell()))
+                        start = input_spool.tell()
+                        for row in rows:
+                            # This file is private, self-produced and never
+                            # accepted as input from another process or source.
+                            pickle.dump(dict(row), input_spool, protocol=5)
+                        input_ranges.append((ordinal, start, input_spool.tell()))
+            # Archive recovery and oversized raw restoration run only after
+            # the input cursor and its pool connection have been released.
+            for ordinal, start, end in input_ranges:
+                candidate = candidates[ordinal]
+                input_spool.seek(start)
+                lookup = None
+
+                def resolved_rows():
+                    nonlocal lookup
+                    while input_spool.tell() < end:
+                        row = pickle.load(input_spool)
+                        try:
+                            _validate_source_body(row)
+                        except LogicalEvidenceError:
+                            if lookup is None:
+                                lookup = ArchivedBodyLookup()
+                                lookup.load(
+                                    self.projection, candidate=candidate,
+                                    manifest=pins.get(ordinal),
+                                    parts=pinned_parts.get(ordinal, ()),
+                                    reference=self._reference,
+                                )
+                            row = lookup.restore(row)
+                            _validate_source_body(row)
+                            recovered.add(ordinal)
+                        yield row
+
+                final_start = spool.tell()
+                try:
+                    for record in self._record_stream(resolved_rows()):
+                        spool.write(record.encode(source_id=candidate.source_id))
+                finally:
+                    if lookup is not None:
+                        lookup.close()
+                ranges.append((ordinal, final_start, spool.tell()))
+            if recovered:
+                self._check_recovery_pins(candidates, pins, recovered)
             # No upload starts until every source row in this shard has
             # passed its document and chunk hashes. The SQL cursor and pool
             # connection are released before publishing the validated data.
@@ -883,6 +926,28 @@ class CanonicalLogicalEvidenceProjector:
             raise
         finally:
             spool.close()
+            if input_spool is not None:
+                input_spool.close()
+
+    def _check_recovery_pins(self, candidates, pins, recovered):
+        """Reject stale archive recovery before publishing any candidate."""
+        with self.store.connect() as connection:
+            for ordinal in sorted(recovered):
+                candidate = candidates[ordinal]
+                row = connection.execute(
+                    """SELECT queue.generation,queue.changed_at,
+                              to_jsonb(evidence) AS manifest
+                         FROM canonical_evidence_document_queue queue
+                         LEFT JOIN canonical_evidence_documents evidence
+                           USING(tenant_id,source_id,native_parent_id)
+                        WHERE queue.tenant_id=%s AND queue.source_id=%s
+                          AND queue.native_parent_id=%s""",
+                    (candidate.tenant_id, candidate.source_id, candidate.native_parent_id),
+                ).fetchone()
+                if (row is None or row["generation"] != candidate.generation
+                        or row["changed_at"] != candidate.source_updated_at
+                        or row["manifest"] != pins[ordinal]):
+                    raise LogicalEvidenceError("logical_evidence_source_changed")
 
     def _old_references(
         self,
