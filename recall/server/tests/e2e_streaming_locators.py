@@ -4,7 +4,7 @@
 from pathlib import Path
 import json
 import os
-import resource
+import subprocess
 import sys
 import tempfile
 import time
@@ -336,6 +336,31 @@ def commit_races(store, root):
         and error.committed["published_documents"] == 0
         and state(store, scope) == initial
     )
+    # Expiry after actual UPDATE must roll back the current transaction too.
+    from recall_server.db import SearchDeadlineExceeded
+
+    check = locators._check_deadline
+    updated.clear()
+
+    def expire(deadline_at):
+        if updated:
+            raise SearchDeadlineExceeded()
+        check(deadline_at)
+
+    with (
+        patch.object(store, "_execute_bounded", side_effect=observe_update),
+        patch.object(locators, "_check_deadline", side_effect=expire),
+    ):
+        error = denied(
+            lambda: locators.publish_parent_locators(
+                store, archive, **scope, apply=True
+            )
+        )
+    assert (
+        updated
+        and error.committed["published_documents"] == 0
+        and state(store, scope) == initial
+    )
     # The native lock is shared with both canonical ingest paths.
     with psycopg.connect(store.dsn) as blocker:
         blocker.execute(
@@ -379,6 +404,80 @@ def commit_races(store, root):
     )
     report = locators.publish_parent_locators(store, archive, **scope, apply=True)
     assert report["published_documents"] == 2 and report["complete"]
+
+
+def absent_ledger_enrollment_races(store, root):
+    scope, archive, _ = setup(store, root, count=2)
+    parent_scope = {
+        key: value for key, value in scope.items() if key != "owner_principal_id"
+    }
+    execute = store._execute_bounded
+    attempted = []
+
+    def enroll_during_publication(connection, sql, values, deadline_at):
+        result = execute(connection, sql, values, deadline_at)
+        if (
+            sql.lstrip().startswith(
+                "UPDATE canonical_documents SET body_record_ordinal="
+            )
+            and not attempted
+        ):
+            attempted.append(True)
+            try:
+                # A distinct pooled connection tries the real enrollment API
+                # while the first transaction owns the publication catalog.
+                set_parent_retirement_enabled(store, **parent_scope, enabled=True)
+            except psycopg.errors.LockNotAvailable:
+                pass
+            else:
+                raise AssertionError("enabled enrollment crossed absent-ledger fence")
+        return result
+
+    with patch.object(store, "_execute_bounded", side_effect=enroll_during_publication):
+        report = locators.publish_parent_locators(store, archive, **scope, apply=True)
+    assert attempted and report["published_documents"] == 2
+    with store.connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT 1 FROM canonical_chunk_retirement_progress WHERE tenant_id=%s AND source_id=%s",
+                (scope["tenant_id"], scope["source_id"]),
+            ).fetchone()
+            is None
+        )
+        connection.execute(
+            "UPDATE canonical_documents SET body_record_ordinal=NULL,body_record_count=NULL WHERE tenant_id=%s AND source_id=%s",
+            (scope["tenant_id"], scope["source_id"]),
+        )
+    initial = state(store, scope)
+    with psycopg.connect(store.dsn) as enrolling:
+        # The reverse order: an uncommitted enabled row remains invisible to
+        # the publisher, but enrollment's catalog SHARE lock must exclude it.
+        catalog = enrolling.execute(
+            """SELECT logical_document_id FROM canonical_evidence_documents
+            WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s FOR SHARE NOWAIT""",
+            (scope["tenant_id"], scope["source_id"], scope["native_parent_id"]),
+        ).fetchone()
+        enrolling.execute(
+            """INSERT INTO canonical_chunk_retirement_progress
+            (tenant_id,source_id,native_parent_id,logical_document_id,enabled,status)
+            VALUES(%s,%s,%s,%s,true,'pending')""",
+            (
+                scope["tenant_id"],
+                scope["source_id"],
+                scope["native_parent_id"],
+                catalog[0],
+            ),
+        )
+        error = denied(
+            lambda: locators.publish_parent_locators(
+                store, archive, **scope, apply=True
+            )
+        )
+        assert (
+            error.committed["published_documents"] == 0
+            and state(store, scope) == initial
+        )
+        enrolling.rollback()
 
 
 def large_parent(store, root):
@@ -432,20 +531,19 @@ def large_parent(store, root):
         native_parent_id="session",
         owner_principal_id="principal:large",
     )
-    archive.reads.clear()
-    started = time.monotonic()
-    report = locators.publish_parent_locators(
-        store,
-        archive,
-        **scope,
-        apply=True,
-        deadline_at=started + 300,
-        limits=ParentRetirementLimits(max_spool_bytes=128 * 1024**2),
+    # A fresh interpreter separates proof RSS from fixture/projector memory.
+    child = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), "--large-proof-child"],
+        input=json.dumps(dict(root=str(root / nonce), scope=scope)),
+        text=True,
+        capture_output=True,
+        env=dict(os.environ, RECALL_DATABASE_URL=store.dsn),
+        timeout=360,
     )
+    assert child.returncode == 0, "isolated locator proof failed"
+    report = json.loads(child.stdout)
     assert report["published_documents"] == count and report["complete"], report
-    assert (
-        sum(archive.reads.values()) == len(parts) and max(archive.reads.values()) == 1
-    )
+    assert report["archive_gets"] == len(parts) and report["max_gets_per_part"] == 1
     with store.connect() as connection:
         counters = connection.execute(
             """SELECT count(*) AS documents,count(*) FILTER(WHERE body_record_ordinal IS NULL) AS missing
@@ -465,9 +563,64 @@ def large_parent(store, root):
         archive_bytes=report["archive_bytes"],
         archive_gets=report["archive_gets"],
         batches=report["batches"],
-        elapsed_ms=round((time.monotonic() - started) * 1000),
-        peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        elapsed_ms=report["elapsed_ms"],
+        baseline_rss_kib=report["baseline_rss_kib"],
+        peak_rss_kib=report["peak_rss_kib"],
+        spool_bytes=report["spool_bytes"],
     )
+
+
+def large_proof_child():
+    config = json.loads(sys.stdin.read())
+    store = TrackedStore(os.environ["RECALL_DATABASE_URL"])
+    archive = ReadCountingArchive(
+        FilesystemArchiveStore(Path(config["root"]), namespace_key=b"s" * 32), store
+    )
+
+    def rss(field):
+        # getrusage.ru_maxrss retains the pre-exec parent's high water on Linux.
+        # /proc belongs to this fresh interpreter's current address space.
+        line = next(
+            value
+            for value in Path("/proc/self/status").read_text().splitlines()
+            if value.startswith(field + ":")
+        )
+        return int(line.split()[1])
+
+    baseline = rss("VmRSS")
+    started = time.monotonic()
+    spool_bytes = []
+    publish = locators._publish_batch
+
+    def measured(*args, **kwargs):
+        spool_bytes.append(
+            (Path(kwargs["proof"]["spool"].directory.name) / "metadata.sqlite")
+            .stat()
+            .st_size
+        )
+        return publish(*args, **kwargs)
+
+    try:
+        with patch.object(locators, "_publish_batch", side_effect=measured):
+            report = locators.publish_parent_locators(
+                store,
+                archive,
+                **config["scope"],
+                apply=True,
+                deadline_at=started + 300,
+                limits=ParentRetirementLimits(max_spool_bytes=128 * 1024**2),
+            )
+        report.pop("plan")
+        report.update(
+            elapsed_ms=round((time.monotonic() - started) * 1000),
+            baseline_rss_kib=baseline,
+            peak_rss_kib=rss("VmHWM"),
+            max_gets_per_part=max(archive.reads.values()),
+            spool_bytes=max(spool_bytes),
+        )
+        print(json.dumps(report))
+    finally:
+        store.close()
 
 
 def main():
@@ -484,6 +637,7 @@ def main():
             basic(store, Path(directory))
             failures(store, Path(directory))
             commit_races(store, Path(directory))
+            absent_ledger_enrollment_races(store, Path(directory))
             large = large_parent(store, Path(directory))
         print(
             json.dumps(
@@ -504,4 +658,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] == ["--large-proof-child"]:
+        large_proof_child()
+    else:
+        main()

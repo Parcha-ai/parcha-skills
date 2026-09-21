@@ -8,7 +8,7 @@ The caller must own the source and have its current owner grant. Retirement must
 
 1. Choose a finite reviewed cohort and keep its retirement disabled. Run the command with exact tenant, source, parent and owner principal. Dry proof is the default. Use a new `--report-file` for a private0600 report containing scope, catalog identity and counts; stdout contains counts and a digest.
 2. Run the same exact scope with `--apply`. This repeats current proof; a saved report is never accepted as write authority. Each attempt reads every existing part once and checks the final parent checksum before its first write. It then commits only matching NULL positions in bounded batches.
-3. After the final locator publication, wait **at least60seconds** before separately enrolling/enabling body retirement. This is an operational gate for requests already using PostgreSQL fallback. The command does not enable retirement after waiting. Current service configuration and reader/writer rollout still need their independent gates.
+3. After the final locator publication, wait **at least 60 seconds** before separately enrolling/enabling body retirement. This is an operational gate for requests already using PostgreSQL fallback. The command does not enable retirement after waiting. Current service configuration and reader/writer rollout still need their independent gates.
 
 Example, using identity values from a private reviewed cohort:
 
@@ -33,4 +33,4 @@ The existing small locator API and default retirement proof retain their contrac
 
 ## Validation
 
-A fresh PostgreSQL regression publishes20,003 documents from an81.8MB,20-part logical archive. Every part is read once, publication uses313transactions at64documents per batch, and all PostgreSQL bodies remain intact. The test also covers exact public routes, partial resume, source and catalog races, retirement enable races, native locking, rollback after UPDATE, cancellation before commit, and lost acknowledgment after a real COMMIT. Peak process RSS measurements include fixture/projector preparation and are not a claim of proof-only resident memory.
+A fresh PostgreSQL regression publishes20,003 documents from an81.8MB,20-part logical archive. Every part is read once, publication uses313transactions at64documents per batch, and all PostgreSQL bodies remain intact. The test also covers exact public routes, partial resume, source and catalog races, retirement enable races, native locking, rollback after UPDATE, cancellation before commit, and lost acknowledgment after a real COMMIT. Proof memory is measured in a fresh interpreter using Linux /proc/self/status VmRSS/VmHWM, separately from fixture/projector preparation. No brittle shared-host performance threshold is imposed.

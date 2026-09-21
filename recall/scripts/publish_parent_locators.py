@@ -2,7 +2,7 @@
 """Prove one explicit parent and publish only NULL archive positions.
 
 Dry proof is the default. --apply repeats proof before bounded metadata writes.
-Retirement must be absent or disabled. Wait at least60seconds after the final
+Retirement must be absent or disabled. Wait at least 60 seconds after the final
 publication before separately enabling body retirement. This command never
 clears bodies, enrolls a parent, or enables retirement.
 """
