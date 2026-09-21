@@ -482,9 +482,10 @@ the failed copy already omitted.
 
 The morning managed-worker recovery is historical evidence, not current health.
 A fresh read-only probe on exact managed #650 found one enabled installation,
-a claim at 19:06:48 UTC, **290 consecutive `brain_unavailable` failures**, and
-last success at **09:17:45 UTC**. The worker had released its lease and scheduled
-the next attempt two minutes later. These counts describe installations and
+a claim at 19:06:48 UTC, **290 consecutive failures**, latest error
+`brain_unavailable`, and last success at **09:17:45 UTC**. The probe showed the
+next attempt scheduled two minutes after the latest claim; an earlier 19:00 UTC
+probe observed no active lease. These counts describe installations and
 consecutive failures, not successfully ingested record volume. API readiness
 and the static quality card do not establish ingestion freshness.
 
