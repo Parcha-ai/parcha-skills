@@ -274,8 +274,8 @@ def main() -> None:
         retired, _ = cli("migrate", "--retire-postgres-plane")
         assert retired["applied"] == [RETIRE_POSTGRES_PLANE_VERSION], retired
         assert retired["deferred"] == [] and retired["postgres_vector_plane"] == "retired", retired
-        assert retired["schema_version"] == RETIRE_POSTGRES_PLANE_VERSION, retired
-        assert recorded_versions(reader)[-1] == RETIRE_POSTGRES_PLANE_VERSION
+        assert retired["schema_version"] == MANDATORY_SCHEMA_VERSION, retired
+        assert RETIRE_POSTGRES_PLANE_VERSION in recorded_versions(reader)
         assert not relation_exists(reader, "canonical_passage_embeddings")
         assert not relation_exists(reader, "canonical_passage_embeddings_hnsw_idx")
         assert not relation_exists(reader, "canonical_embedding_ledger")
@@ -299,10 +299,10 @@ def main() -> None:
         # 6. idempotent: a second retirement run and a plain run change nothing.
         again, _ = cli("migrate", "--retire-postgres-plane")
         assert again["applied"] == [] and again["deferred"] == [], again
-        assert again["skipped"] == RETIRE_POSTGRES_PLANE_VERSION, again
+        assert again["skipped"] == MANDATORY_SCHEMA_VERSION, again
         again, _ = cli("migrate")
         assert again["applied"] == [] and again["postgres_vector_plane"] == "retired", again
-        assert recorded_versions(reader) == list(range(1, RETIRE_POSTGRES_PLANE_VERSION + 1))
+        assert recorded_versions(reader) == list(range(1, MANDATORY_SCHEMA_VERSION + 1))
 
         # 7. a postgres-plane store refuses to start against the retired schema.
         os.environ["RECALL_SEARCH_PLANE"] = "postgres"

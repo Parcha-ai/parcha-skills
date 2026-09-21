@@ -94,6 +94,7 @@ class ArchivedResolveTests(unittest.TestCase):
             self.assertFalse(self.connected)
             self.assertEqual(kwargs['tenant_id'], TENANT)
             self.assertEqual(kwargs['source_ids'], (SOURCE,))
+            self.assertEqual(kwargs['chunk_ordinals'], {(SOURCE, 'document:test'): (0,)})
             self.assertIsNotNone(kwargs['deadline_at'])
             return {(SOURCE, 'document:test'): [dict(ordinal=0, receipt=RECEIPT, text_redacted='body')]}
         with mock.patch('recall_server.chunk_bodies.read_archived_chunks', side_effect=archived):

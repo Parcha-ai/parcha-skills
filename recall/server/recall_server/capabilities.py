@@ -169,13 +169,13 @@ def assess_snapshot(snapshot: dict[str, Any], profile: str = "production") -> di
     if _version_tuple(vector_version) < MIN_VECTOR_VERSION:
         raise CapabilityError("extension_unsupported")
     versions = list(snapshot.get("migration_versions") or [])
-    # H3-e': 067 (retire the Postgres vector plane) is applied by hand once a
-    # tenant's turbopuffer namespace is drained; a database at 066 is current
-    # on the postgres plane, one at 067 is current on the turbopuffer plane.
-    # The embeddings table must agree with the recorded version either way.
-    mandatory = list(range(1, MANDATORY_SCHEMA_VERSION + 1))
-    retired = versions == list(range(1, RETIRE_POSTGRES_PLANE_VERSION + 1))
-    if versions != mandatory and not retired:
+    # Retirement 067 is optional; later additive migrations remain mandatory
+    # on both search planes. Membership, not the maximum, proves retirement.
+    mandatory = [version for version in range(1, MANDATORY_SCHEMA_VERSION + 1)
+                 if version != RETIRE_POSTGRES_PLANE_VERSION]
+    retired = RETIRE_POSTGRES_PLANE_VERSION in versions
+    expected = sorted(mandatory + ([RETIRE_POSTGRES_PLANE_VERSION] if retired else []))
+    if versions != expected:
         raise CapabilityError("schema_drift")
     vector_plane_present = snapshot.get("postgres_vector_plane_present")
     if vector_plane_present is not None and bool(vector_plane_present) == retired:
