@@ -15,6 +15,7 @@ from .archive import (
     S3ArchiveStore,
     S3_DEADLINE_CONNECT_TIMEOUT,
     S3_DEADLINE_READ_TIMEOUT,
+    _deadline_read_timeout,
 )
 
 R2_REQUIRED_ENV = (
@@ -92,7 +93,11 @@ def build_archive_store(
     *,
     client_factory: Callable[..., Any] | None = None,
     deadline_reads: bool = False,
+    deadline_read_timeout_seconds: float = S3_DEADLINE_READ_TIMEOUT,
 ) -> S3ArchiveStore:
+    read_timeout = _deadline_read_timeout(deadline_read_timeout_seconds)
+    if not deadline_reads and read_timeout != S3_DEADLINE_READ_TIMEOUT:
+        raise ValueError("archive deadline read timeout requires deadline_reads")
     values = os.environ if environment is None else environment
     backend = _required(values, "RECALL_ARCHIVE_BACKEND")
     if backend not in {"r2", "s3", "s3-unversioned"}:
@@ -134,7 +139,7 @@ def build_archive_store(
             config=Config(
                 retries={"total_max_attempts": 1},
                 connect_timeout=S3_DEADLINE_CONNECT_TIMEOUT,
-                read_timeout=S3_DEADLINE_READ_TIMEOUT,
+                read_timeout=read_timeout,
                 max_pool_connections=8,
             ),
         ))
@@ -144,6 +149,7 @@ def build_archive_store(
         namespace_key=namespace_key,
         client=BotoS3Client(client),
         deadline_client=deadline_client,
+        deadline_read_timeout_seconds=read_timeout,
         compatibility_profile={
             "r2": "r2",
             "s3": "aws",
@@ -157,8 +163,14 @@ def build_evidence_archive_store(
     *,
     client_factory: Callable[..., Any] | None = None,
     deadline_reads: bool = False,
+    deadline_read_timeout_seconds: float = S3_DEADLINE_READ_TIMEOUT,
 ) -> S3ArchiveStore:
-    """Build the separately credentialed, privacy-processed evidence bucket."""
+    """Build the separately credentialed, privacy-processed evidence bucket.
+
+    Maintenance callers may explicitly allow up to five seconds of socket
+    inactivity. Serving defaults, caller deadlines and single-attempt reads
+    remain unchanged.
+    """
     values = os.environ if environment is None else environment
     translated = {
         "RECALL_ARCHIVE_BACKEND": _required(values, "RECALL_EVIDENCE_ARCHIVE_BACKEND"),
@@ -179,6 +191,7 @@ def build_evidence_archive_store(
     }
     return build_archive_store(
         translated, client_factory=client_factory, deadline_reads=deadline_reads,
+        deadline_read_timeout_seconds=deadline_read_timeout_seconds,
     )
 
 

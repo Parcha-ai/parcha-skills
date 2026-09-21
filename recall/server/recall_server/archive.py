@@ -21,6 +21,7 @@ from contracts.v2 import ContractError, validate_contract
 DEFAULT_MAXIMUM_BYTES = 64 * 1024 * 1024
 S3_DEADLINE_CONNECT_TIMEOUT = 0.25
 S3_DEADLINE_READ_TIMEOUT = 0.5
+S3_MAX_DEADLINE_READ_TIMEOUT = 5.0
 S3_PARALLEL_READ_THRESHOLD_BYTES = 128 * 1024 * 1024
 S3_PARALLEL_READ_CHUNK_BYTES = 64 * 1024 * 1024
 S3_PARALLEL_READ_WORKERS = 8
@@ -58,6 +59,13 @@ def _remaining(deadline_at: float) -> float:
     return remaining
 
 
+def _deadline_read_timeout(value: float) -> float:
+    if (type(value) not in (int, float) or not math.isfinite(value)
+            or not S3_DEADLINE_READ_TIMEOUT <= value <= S3_MAX_DEADLINE_READ_TIMEOUT):
+        raise ValueError("archive deadline read timeout must be between 0.5 and 5 seconds")
+    return float(value)
+
+
 class _DeadlineReader:
     """Cooperative budget checks around reads; socket timeout limits inactivity.
 
@@ -65,17 +73,19 @@ class _DeadlineReader:
     not interrupt DNS or claim a hard wall-clock cancellation guarantee.
     """
 
-    def __init__(self, body: Any, deadline_at: float, size_bytes: int):
+    def __init__(self, body: Any, deadline_at: float, size_bytes: int,
+                 read_timeout: float = S3_DEADLINE_READ_TIMEOUT):
         self.body = body
         self.deadline_at = deadline_at
         self.remaining_bytes = size_bytes
+        self.read_timeout = read_timeout
 
     def read(self, size: int) -> bytes:
         remaining = _remaining(self.deadline_at)
         # urllib3 releases the socket after Content-Length bytes. The final EOF
         # check must not try to set a timeout on that already released socket.
         if self.remaining_bytes:
-            self.body.set_socket_timeout(min(S3_DEADLINE_READ_TIMEOUT, remaining))
+            self.body.set_socket_timeout(min(self.read_timeout, remaining))
         result = self.body.read(min(size, 64 * 1024))
         _remaining(self.deadline_at)
         self.remaining_bytes -= len(result)
@@ -610,7 +620,11 @@ class S3ArchiveStore(_ArchiveStore):
         kms_key_id: str | None = None,
         compatibility_profile: str = "aws",
         deadline_client: S3Client | None = None,
+        deadline_read_timeout_seconds: float = S3_DEADLINE_READ_TIMEOUT,
     ) -> None:
+        self.deadline_read_timeout_seconds = _deadline_read_timeout(deadline_read_timeout_seconds)
+        if deadline_client is None and self.deadline_read_timeout_seconds != S3_DEADLINE_READ_TIMEOUT:
+            raise ValueError("archive deadline read timeout requires a deadline client")
         super().__init__(namespace_key=namespace_key, maximum_bytes=maximum_bytes)
         parsed = urlsplit(endpoint_url)
         if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
@@ -828,7 +842,7 @@ class S3ArchiveStore(_ArchiveStore):
             raise ArchiveError("archive deadline reader is not configured")
         # Boto has no per-request connect/header timeout. Refuse admission when
         # their configured allowances would already exceed the caller's budget.
-        if _remaining(deadline_at) < S3_DEADLINE_CONNECT_TIMEOUT + S3_DEADLINE_READ_TIMEOUT:
+        if _remaining(deadline_at) < S3_DEADLINE_CONNECT_TIMEOUT + self.deadline_read_timeout_seconds:
             raise ArchiveDeadlineExceeded("archive read deadline exceeded")
         body = None
         try:
@@ -841,7 +855,8 @@ class S3ArchiveStore(_ArchiveStore):
             if body is None or response.get("ContentLength") != reference.size_bytes:
                 raise ArchiveCorruption("archive metadata mismatch")
             payload = _read_bounded(
-                _DeadlineReader(body, deadline_at, reference.size_bytes),
+                _DeadlineReader(body, deadline_at, reference.size_bytes,
+                                self.deadline_read_timeout_seconds),
                 size_bytes=reference.size_bytes,
                 content_sha256=reference.content_sha256,
                 maximum_bytes=min(self.maximum_bytes, DEFAULT_MAXIMUM_BYTES),
