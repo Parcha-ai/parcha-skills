@@ -43,7 +43,7 @@ def main():
         store.migrate()
         with store.connect() as conn:
             insert_source(conn, TENANT, PRINCIPAL, SOURCE)
-            seed = insert_record(conn, tenant=TENANT, source=SOURCE, parent='seed',
+            insert_record(conn, tenant=TENANT, source=SOURCE, parent='seed',
                                  native='seed', text='seed', role='assistant', byte_start=0)
             conn.execute('''INSERT INTO canonical_events(
                 tenant_id,source_id,event_id,native_id,native_parent_id,artifact_id,job_id,
