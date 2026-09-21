@@ -5,6 +5,7 @@ import logging
 import hashlib
 import io
 import json
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -23,6 +24,7 @@ from .logical_evidence import (
     logical_document_id,
 )
 from .projectors import SOURCE_ID_RE
+from .passage_projection import decode_logical_record
 from .search_outbox import record_passage_deletions
 
 OVERSIZED_MEDIA_TYPE = "application/vnd.recall.oversized-record+gzip"
@@ -174,6 +176,33 @@ def _parsed_structural_values(
 def _structural_values(text: str) -> tuple[bool, tuple[str, ...], tuple[str, ...]]:
     parsed, types, roles, _content = _parsed_structural_values(text)
     return parsed, types, roles
+
+
+def _validate_source_body(row: dict[str, Any]) -> None:
+    """Verify the captured document and its exact stored chunk boundaries."""
+    text = row.get("event_text")
+    chunks = row.get("source_chunks")
+    receipts = row.get("chunk_receipts")
+    if (not isinstance(text, str) or not isinstance(chunks, list) or not chunks
+            or not isinstance(receipts, list) or len(receipts) != len(chunks)
+            or row.get("chunk_count") != len(chunks)):
+        raise LogicalEvidenceError("logical_evidence_source_integrity_invalid")
+    payload = text.encode()
+    if hashlib.sha256(payload).hexdigest() != row.get("document_text_sha256"):
+        raise LogicalEvidenceError("logical_evidence_source_integrity_invalid")
+    offset = 0
+    for ordinal, chunk in enumerate(chunks):
+        if not isinstance(chunk, dict):
+            raise LogicalEvidenceError("logical_evidence_source_integrity_invalid")
+        size = chunk.get("size_bytes")
+        if (type(size) is not int or size < 0 or chunk.get("ordinal") != ordinal
+                or offset + size > len(payload)
+                or hashlib.sha256(payload[offset:offset + size]).hexdigest()
+                    != chunk.get("text_sha256")):
+            raise LogicalEvidenceError("logical_evidence_source_integrity_invalid")
+        offset += size
+    if offset != len(payload):
+        raise LogicalEvidenceError("logical_evidence_source_integrity_invalid")
 
 
 class CanonicalLogicalEvidenceProjector:
@@ -356,6 +385,7 @@ class CanonicalLogicalEvidenceProjector:
     def _record_stream(self, cursor: Any):
         next_ordinal = 0
         for row in cursor:
+            _validate_source_body(row)
             text = row["event_text"]
             revision = row["document_revision"]
             if (
@@ -614,6 +644,8 @@ class CanonicalLogicalEvidenceProjector:
             return []
         uploads: list[LogicalEvidenceUpload | None] = [None] * len(candidates)
         completed: list[LogicalEvidenceUpload] = []
+        spool = tempfile.TemporaryFile(mode="w+b")
+        ranges: list[tuple[int, int, int]] = []
         try:
             with self.store.connect() as connection:
                 existing_parts: dict[int, list[dict[str, Any]]] = {}
@@ -712,6 +744,8 @@ class CanonicalLogicalEvidenceProjector:
                               event.source_ordinal AS byte_start,
                               source_record.event_text,
                               document.revision AS document_revision,
+                              document.text_sha256 AS document_text_sha256,
+                              source_record.source_chunks,
                               source_record.chunk_count,
                               source_record.chunk_receipts,
                               coalesce(
@@ -746,6 +780,11 @@ class CanonicalLogicalEvidenceProjector:
                           AND artifact.artifact_id=event.artifact_id
                          JOIN LATERAL (
                               SELECT count(*)::integer AS chunk_count,
+                                     jsonb_agg(jsonb_build_object(
+                                         'ordinal',chunk.ordinal,
+                                         'size_bytes',octet_length(chunk.text_redacted),
+                                         'text_sha256',chunk.text_sha256
+                                     ) ORDER BY chunk.ordinal) AS source_chunks,
                                      array_agg(
                                          chunk.receipt ORDER BY chunk.ordinal
                                      ) AS chunk_receipts,
@@ -758,8 +797,7 @@ class CanonicalLogicalEvidenceProjector:
                                  AND chunk.source_id=document.source_id
                                  AND chunk.document_id=document.document_id
                                  AND chunk.deleted_at IS NULL
-                         ) source_record
-                           ON source_record.chunk_count>0
+                         ) source_record ON true
                          LEFT JOIN LATERAL (
                               SELECT jsonb_agg(
                                          jsonb_build_object(
@@ -803,24 +841,37 @@ class CanonicalLogicalEvidenceProjector:
                             raise LogicalEvidenceError("logical_evidence_state_invalid")
                         previous_ordinal = ordinal
                         candidate = candidates[ordinal]
-                        try:
-                            upload = self.projection.put_records(
-                                tenant_id=candidate.tenant_id,
-                                source_id=candidate.source_id,
-                                native_parent_id=candidate.native_parent_id,
-                                revision=candidate.revision,
-                                records=self._record_stream(rows),
-                                retention_profile=self.retention_profile,
-                                existing_part_references=tuple(
-                                    existing_parts.get(ordinal, ())
-                                ),
-                            )
-                        except LogicalEvidenceError as error:
-                            if str(error) == "logical_evidence_document_empty":
-                                continue
-                            raise
-                        uploads[ordinal] = upload
-                        completed.append(upload)
+                        start = spool.tell()
+                        for record in self._record_stream(rows):
+                            spool.write(record.encode(source_id=candidate.source_id))
+                        ranges.append((ordinal, start, spool.tell()))
+            # No upload starts until every source row in this shard has
+            # passed its document and chunk hashes. The SQL cursor and pool
+            # connection are released before publishing the validated data.
+            for ordinal, start, end in ranges:
+                if start == end:
+                    continue
+                candidate = candidates[ordinal]
+                spool.seek(start)
+
+                def records():
+                    while spool.tell() < end:
+                        yield decode_logical_record(
+                            spool.readline(), source_id=candidate.source_id,
+                            verify_canonical=False,
+                        )
+
+                upload = self.projection.put_records(
+                    tenant_id=candidate.tenant_id,
+                    source_id=candidate.source_id,
+                    native_parent_id=candidate.native_parent_id,
+                    revision=candidate.revision,
+                    records=records(),
+                    retention_profile=self.retention_profile,
+                    existing_part_references=tuple(existing_parts.get(ordinal, ())),
+                )
+                uploads[ordinal] = upload
+                completed.append(upload)
             return uploads
         except Exception:
             for upload in completed:
@@ -830,6 +881,8 @@ class CanonicalLogicalEvidenceProjector:
                 limit=5_000,
             )
             raise
+        finally:
+            spool.close()
 
     def _old_references(
         self,

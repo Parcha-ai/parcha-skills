@@ -170,11 +170,19 @@ class LogicalPartUploadTests(unittest.TestCase):
     def test_projection_preserves_receipts_from_the_ingested_revision(self) -> None:
         projector = CanonicalLogicalEvidenceProjector(None, None)
         receipt = "recall://source:parallel/event-existing?rev=1#item=0"
+        text = "x" * 25_000
+        text_sha256 = hashlib.sha256(text.encode()).hexdigest()
         records = tuple(
             projector._record_stream(
                 [
                     {
-                        "event_text": "x" * 25_000,
+                        "event_text": text,
+                        "document_text_sha256": text_sha256,
+                        "source_chunks": [{
+                            "ordinal": 0,
+                            "size_bytes": len(text.encode()),
+                            "text_sha256": text_sha256,
+                        }],
                         "document_revision": 1,
                         "fallback_type_values": [],
                         "fallback_role_values": ["assistant"],
