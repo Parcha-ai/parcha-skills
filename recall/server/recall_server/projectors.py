@@ -22,6 +22,35 @@ ENVELOPE_FIELDS = {
 }
 OMISSION_CODE_RE = re.compile(r"[a-z][a-z0-9_]{2,63}\Z")
 
+ENVELOPE_VALIDATION_RULES = frozenset({
+    "envelope_object", "host_controlled", "required_missing", "unknown_fields",
+    "schema_version", "identifier", "kind", "timestamp", "visibility",
+    "content_type", "provenance_object", "connector_schema_version",
+    "typed_object", "typed_kind", "typed_required_missing", "typed_unknown_fields",
+    "typed_invalid_known_field", "typed_fidelity", "digest_shape", "finite_json",
+    "digest_mismatch", "tombstone_target",
+})
+
+TYPED_FIELD_VALIDATION_RULES = frozenset({
+    "typed_required_missing", "typed_invalid_known_field", "typed_fidelity",
+})
+
+
+class StructuredEnvelopeValidationError(ValueError):
+    """Original validation message plus content-free invariant metadata."""
+
+    def __init__(self, message: str, *, rule: str, field: str | None = None,
+                 kind: str | None = None):
+        super().__init__(message)
+        self.validation_rule = rule if type(rule) is str and rule in ENVELOPE_VALIDATION_RULES else "unrecognized"
+        self.validation_kind = kind if type(kind) is str and kind in TYPED_CONNECTOR_KINDS else "unrecognized"
+        allowed = (
+            TYPED_RECORD_FIELDS.get(self.validation_kind, {}).get("properties", {})
+            if self.validation_rule in TYPED_FIELD_VALIDATION_RULES
+            else ENVELOPE_FIELDS
+        )
+        self.validation_field = field if type(field) is str and field in allowed else "unrecognized"
+
 
 def _validate_content_fidelity(content: dict[str, Any]) -> None:
     """Enforce the cross-field fidelity rules at the server trust boundary.
@@ -85,6 +114,9 @@ def _load_typed_record_fields() -> dict[str, dict[str, Any]]:
 
 TYPED_RECORD_FIELDS = _load_typed_record_fields()
 TYPED_CONNECTOR_KINDS = set(TYPED_RECORD_FIELDS)
+ENVELOPE_VALIDATION_FIELDS = frozenset(ENVELOPE_FIELDS).union(
+    *(schema["properties"] for schema in TYPED_RECORD_FIELDS.values())
+)
 
 
 def _valid_typed_value(value: Any, specification: dict[str, Any]) -> bool:
@@ -121,27 +153,37 @@ def validate_typed_connector_content(
     deleted: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(content, dict):
-        raise ValueError("invalid typed connector record")
+        raise StructuredEnvelopeValidationError("invalid typed connector record", rule="typed_object", field="content")
     schema = TYPED_RECORD_FIELDS.get(content.get("kind"))
     if schema is None:
-        raise ValueError("invalid typed connector record")
+        raise StructuredEnvelopeValidationError("invalid typed connector record", rule="typed_kind", field="kind")
     fields = set(content)
     required = {"kind"} if deleted else schema["required"]
     optional = set() if deleted else schema["optional"]
-    if (
-        required - fields
-        or fields - required - optional
-        or any(
-            not _valid_typed_value(content[field], schema["properties"][field])
-            for field in fields
+    if required - fields:
+        raise StructuredEnvelopeValidationError(
+            "invalid typed connector record", rule="typed_required_missing",
+            field=sorted(required - fields)[0], kind=content["kind"],
         )
-    ):
-        raise ValueError("invalid typed connector record")
+    if fields - required - optional:
+        raise StructuredEnvelopeValidationError(
+            "invalid typed connector record", rule="typed_unknown_fields",
+            kind=content["kind"],
+        )
+    for field in fields:
+        if not _valid_typed_value(content[field], schema["properties"][field]):
+            raise StructuredEnvelopeValidationError(
+                "invalid typed connector record", rule="typed_invalid_known_field",
+                field=field, kind=content["kind"],
+            )
     try:
         if not deleted:
             _validate_content_fidelity(content)
     except ValueError:
-        raise ValueError("invalid typed connector record") from None
+        raise StructuredEnvelopeValidationError(
+            "invalid typed connector record", rule="typed_fidelity",
+            field="content_fidelity", kind=content["kind"],
+        ) from None
     return content
 
 
@@ -198,9 +240,9 @@ def content_sha256(envelope: dict) -> str:
 
 def validate_envelope(envelope: dict) -> dict:
     if not isinstance(envelope, dict):
-        raise ValueError("envelope must be an object")
+        raise StructuredEnvelopeValidationError("envelope must be an object", rule="envelope_object")
     if set(envelope) & {"source_profile", "source_family", "source_quality", "quality"}:
-        raise ValueError("source profile is host-controlled")
+        raise StructuredEnvelopeValidationError("source profile is host-controlled", rule="host_controlled")
     required = (
         "schema_version", "source_id", "native_id", "kind", "occurred_at",
         "observed_at", "principal_id", "visibility", "content_type", "content",
@@ -208,66 +250,66 @@ def validate_envelope(envelope: dict) -> dict:
     )
     missing = [key for key in required if key not in envelope]
     if missing:
-        raise ValueError("missing fields: " + ",".join(missing))
+        raise StructuredEnvelopeValidationError("missing fields: " + ",".join(missing), rule="required_missing", field=missing[0])
     unknown = set(envelope) - ENVELOPE_FIELDS
     if unknown:
-        raise ValueError("unknown envelope fields")
+        raise StructuredEnvelopeValidationError("unknown envelope fields", rule="unknown_fields")
     if envelope["schema_version"] != 1 or isinstance(envelope["schema_version"], bool):
-        raise ValueError("unsupported schema_version")
+        raise StructuredEnvelopeValidationError("unsupported schema_version", rule="schema_version", field="schema_version")
     if not isinstance(envelope["source_id"], str) or not SOURCE_ID_RE.fullmatch(envelope["source_id"]):
-        raise ValueError("invalid source_id")
+        raise StructuredEnvelopeValidationError("invalid source_id", rule="identifier", field="source_id")
     for field in ("native_id", "native_parent_id"):
         value = envelope.get(field)
         if value is not None and (not isinstance(value, str) or not NATIVE_ID_RE.fullmatch(value)):
-            raise ValueError(f"invalid {field}")
+            raise StructuredEnvelopeValidationError(f"invalid {field}", rule="identifier", field=field)
     if not isinstance(envelope["kind"], str) or not KIND_RE.fullmatch(envelope["kind"]):
-        raise ValueError("invalid kind")
+        raise StructuredEnvelopeValidationError("invalid kind", rule="kind", field="kind")
     for field in ("occurred_at", "observed_at"):
         value = envelope[field]
         if not isinstance(value, str) or len(value) > 64:
-            raise ValueError(f"invalid {field}")
+            raise StructuredEnvelopeValidationError(f"invalid {field}", rule="timestamp", field=field)
         try:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
-            raise ValueError(f"invalid {field}") from None
+            raise StructuredEnvelopeValidationError(f"invalid {field}", rule="timestamp", field=field) from None
         if parsed.tzinfo is None:
-            raise ValueError(f"invalid {field}")
+            raise StructuredEnvelopeValidationError(f"invalid {field}", rule="timestamp", field=field)
     principal = envelope["principal_id"]
     if (
         not isinstance(principal, str) or not 1 <= len(principal) <= 160
         or any(ord(character) < 32 for character in principal)
     ):
-        raise ValueError("invalid principal_id")
+        raise StructuredEnvelopeValidationError("invalid principal_id", rule="identifier", field="principal_id")
     if envelope["visibility"] not in {"private", "shared"}:
-        raise ValueError("unsupported visibility")
+        raise StructuredEnvelopeValidationError("unsupported visibility", rule="visibility", field="visibility")
     if envelope["content_type"] != "application/json":
-        raise ValueError("unsupported content_type")
+        raise StructuredEnvelopeValidationError("unsupported content_type", rule="content_type", field="content_type")
     provenance = envelope.get("provenance", {})
     if not isinstance(provenance, dict):
-        raise ValueError("provenance must be an object")
+        raise StructuredEnvelopeValidationError("provenance must be an object", rule="provenance_object", field="provenance")
     connector_schema_version = provenance.get("connector_schema_version")
     if connector_schema_version is not None:
         if type(connector_schema_version) is not int or connector_schema_version not in {1, 2}:
-            raise ValueError("unsupported connector schema_version")
+            raise StructuredEnvelopeValidationError("unsupported connector schema_version", rule="connector_schema_version", field="provenance")
         if connector_schema_version == 2 and envelope["kind"] != "tombstone":
             content = envelope["content"]
             if envelope["kind"] != "connector_record":
-                raise ValueError("invalid typed connector record")
+                raise StructuredEnvelopeValidationError("invalid typed connector record", rule="typed_kind", field="kind")
             validate_typed_connector_content(content)
     claimed = envelope["content_sha256"]
     if not isinstance(claimed, str) or not CONTENT_SHA256_RE.fullmatch(claimed):
-        raise ValueError("invalid content_sha256")
+        raise StructuredEnvelopeValidationError("invalid content_sha256", rule="digest_shape", field="content_sha256")
     try:
         actual = content_sha256(envelope)
         canonical_json(provenance)
     except (TypeError, ValueError):
-        raise ValueError("content and provenance must be finite JSON values") from None
+        raise StructuredEnvelopeValidationError("content and provenance must be finite JSON values", rule="finite_json") from None
     if envelope["content_sha256"] != actual:
-        raise ValueError("content_sha256 mismatch")
+        raise StructuredEnvelopeValidationError("content_sha256 mismatch", rule="digest_mismatch", field="content_sha256")
     if envelope["kind"] == "tombstone":
         content = envelope["content"]
         if not isinstance(content, dict) or content.get("target_native_id") != envelope["native_id"]:
-            raise ValueError("tombstone target must match native_id")
+            raise StructuredEnvelopeValidationError("tombstone target must match native_id", rule="tombstone_target", field="content")
     return envelope
 
 

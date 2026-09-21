@@ -189,12 +189,14 @@ Design (`server/recall_server/turbopuffer_plane.py`): one namespace per tenant (
 
 ### Storage retirement resumed — 2026-09-20
 
-**Checkpoint: 2026-09-21, 18:41 UTC.** Measured relation/index reclaim is
-**34.23 GiB**; the latest unchanged original card passed **26/26**. Provider
-replacement remains active: old **3 × 300 GiB** nodes serve while new
-**3 × 275 GiB** nodes restore. No new resize PATCH was submitted. Completed
-capacity reduction, billed savings and full corpus retirement remain unproved.
-Ordinary maintenance stays held until the replacement finishes.
+**Checkpoint: 2026-09-21, 20:06 UTC.** Actual provider downsizing completed
+at 19:30 UTC: exactly **three 275 GiB nodes**, one primary and two replicas,
+with no replacement pending. This removes **25 GiB per node / 75 GiB total
+allocated capacity**. Separately, measured relation/index reclaim is **34.23 GiB**;
+invoice savings have not been independently observed. All 18 post-resize exact
+response comparisons passed. Latest unchanged original card: **26/26**.
+Managed ingestion remains blocked by canonical envelope validation; identify the
+failed invariant and prove a fresh successful cycle before further retirement.
 
 Owner: Codex lead. Storage downsizing remains the priority over H6/Jev. Detailed
 measurements, earlier failures, cleanup and limits remain in the
@@ -204,32 +206,32 @@ measurements, earlier failures, cleanup and limits remain in the
 |---|---|---|---|
 | S0 | Dependencies and storage baseline | verified | Body readers, ingest, reprojection and receipt liveness inventoried; relation allocations are not removable body bytes. |
 | S1 | Last chunk full-text consumer → turbopuffer | done | Consumer migrated; chunk GIN removal reclaimed **18.05 GiB**. Original quality gates passed; no source bodies deleted. |
-| S2 | Reader over existing logical evidence | live and verified | MCP **#658**, projection **#648**, managed **#650**, schema **069**. Exact archive-backed readback and the unchanged original card passed. |
+| S2 | Reader over existing logical evidence | live and verified | MCP **#662**, projection **#648**, managed **#664**, schema **069**. Exact archive-backed readback and the unchanged original card passed. |
 | S3 | Reprojection, resolve and both ingest writers | compatible; managed ingestion currently failing | Earlier #650 recovery is historical. At 19:07 UTC, the enabled worker had 290 consecutive failures, with latest error `brain_unavailable`, and no success since 09:17:45, despite fresh claims. Diagnose the underlying canonical ingest exception and prove a new successful cycle before more retirement. |
 | S4a | Bounded body clear and restore | canary passed | Exact archived and restored responses matched. Restore retired bodies before any PostgreSQL-reader rollback. |
 | S4b | Source-scale retirement | finite progress; incomplete | Priority source: **40 enabled parents**. Original source: **235 discovered / 233 enabled**, three residuals and deadline follow-up retained. Lifetime logical clears: **151,863 documents / 167,244 chunks / 723,382,521 UTF-8 bytes**, not physical savings. Fresh frontier/session required; never replay consumed intents. |
 | S4v | Dropped chunk vector and finite sweep | no physical reclaim | Three copy attempts yielded no reclaim; the finite sweep preserved values but grew files. The failed copy already omitted the vector. No blind retry or whole-table sweep. |
 | S4c | Physical compaction | documents and events complete | Documents reclaimed **6.477 GiB**; events **9.700 GiB**. Catalog/index identities and cleanup verified; each passed 18 response comparisons and the unchanged card. Provider capacity is a separate exit. |
-| S5 | Provider disk and compute reduction | restore active at 18:41 | Actual capacities remain old **3 × 300 GiB** serving / new **3 × 275 GiB** restoring. Replacement-target metadata has fluctuated; it does not establish a capacity change. The 18:23 backup-fetch 100% / restore-active snapshot is not completion. No new PATCH; post-resize validation and billed savings remain pending. Compute downsizing is optional and unachieved. |
+| S5 | Provider disk and compute reduction | disk capacity reduced; compute unchanged | Actual **3 × 275 GiB** at 19:30 UTC; no replacements. Post-resize 18 exact pairs passed. Latest original card 26/26 at 20:06 UTC; earlier failed cards retained. Invoice savings unobserved. Compute downsizing remains unachieved. |
 
-The latest post-events card passed **26/26 at 17:08:45 UTC**, with recall@20
-**.9625**, MRR **.6559**, zero backend/auth/tool errors and unchanged verifier/truth
-pins. Earlier degraded cards remain preserved. This does not prove a causal
-latency gain. Events' **57.356 GiB controller-observed peak growth** was followed
-by higher provider readings; it is not proof of an instantaneous hard bound or
-settled net volume savings.
+The latest original card passed **26/26 at 20:06:03 UTC**, with recall@20
+**.9625**, MRR **.6575**, zero backend errors and unchanged verifier/truth pins.
+Search/show/context/scan p95 were **1.438 / .522 / 1.482 / 12.315 seconds**.
+Earlier post-resize scan and post-#662 show latency failures remain preserved;
+this card is not a causal speedup or ingestion-freshness claim.
 
-PRs **#660, #661 and #662** are merged but **not deployed**. The intended MCP
-release is **#662 (`c10e6d3`)**, containing the deadline-query reduction, bounded
-collector-health writes and empty-alias scan simplification. Their tests passed;
-production performance improvement remains unmeasured. Insights upsert timings
-are a diagnostic lead, not attribution of the earlier slow publication.
+MCP **#662 is live**. It removes unused manifest discovery for scans that need
+no aliases. Sampled staging fell from about .48 to .10 seconds, but the result
+hashes changed, so those reads do not establish a matched-corpus causal gain.
+Managed **#664 is live** with six exact readback pairs passing. Its natural retry
+identified `canonical_contract_invalid` caused by `ValueError`. The next diagnostic
+adds closed invariant/kind/known-field metadata at the validation origin, preserving
+messages, strict validation and pending-page behavior. Recovery remains unproved.
 
-**Next dependency order:** finish provider replacement → **18 exact pairs and
-original card** → MCP #662 → **six exact pairs and original card** → reconcile
-managed ingestion and verify a fresh successful cycle → qualify
-**three serial 20-parent pages** → review measured **50-parent pages / 55 claim
-iterations**. Graduation requires clean completion, matched workload and measured
+**Next dependency order:** identify the actual queued-page invariant → fix its
+owning producer or compatibility boundary → verify a fresh successful managed
+cycle and original quality gates → qualify **three serial 20-parent pages** →
+review measured **50-parent pages / 55 claim iterations**. Graduation requires clean completion, matched workload and measured
 headroom within existing proof, byte, grace and deadline limits; it is not active
 configuration. New residuals or uncertain outcomes stop the phase.
 

@@ -497,11 +497,37 @@ The cause and recovery remain unproved. Require a fresh successful managed cycle
 before resuming source retirement; do not clear or replay the pending spool to
 make the failure disappear.
 
+### Actual disk reduction and current ingestion boundary — 2026-09-21, 20:06 UTC
+
+Provider infrastructure at **19:30:32 UTC** showed exactly three **275 GiB**
+nodes, one primary and two replicas, with no replacement pending. All 18
+post-resize exact response pairs passed. This is **75 GiB less allocated capacity
+across the three nodes**, separate from the **34.23 GiB** measured relation/index
+reclaim. Billing reduction has not been independently observed; compute is unchanged.
+
+MCP #662 and managed #664 are live; projection remains #648, schema 069.
+Each newly deployed service passed six preserved response comparisons. The
+unchanged original card after #664 passed **26/26 at 20:06:03 UTC**: recall@20
+.9625, MRR .6575, zero backend errors, search/show/context/scan p95
+1.438/.522/1.482/12.315 seconds. Retain the preceding post-resize scan-latency
+and post-#662 show-latency failures; one passing card does not establish a
+causal latency repair. A separate count-only scan still reported three pending
+projections and no unavailable objects, so corpus completion remains unproved.
+
+The first #664 natural retry reported `canonical_contract_invalid` with an
+underlying `ValueError`, narrowing the failure to envelope validation before
+writes. Last observed ingestion success remains **09:17:45 UTC**. Structured
+validation diagnostics name only a closed rule, trusted record kind and known
+schema field; unknown input names and values remain hidden. Preserve existing
+validation messages/order and the queued page. A synthetic persisted malformed
+page reproduces repeated failures without new pulls or cursor advancement;
+it demonstrates the mechanism, not the actual live cause.
+
 ### Next boundaries and acceptance
 
-The immediate dependency order is **finish provider replacement → 18 exact
-response pairs and the original card → MCP #662 → six exact response pairs and
-the original card → three serial 20-parent qualification pages → measured
+The immediate dependency order is **identify the live validation invariant →
+repair its owning boundary → prove fresh successful managed ingestion and
+original quality gates → three serial 20-parent qualification pages → measured
 50-parent / 55-claim graduation**. The larger settings are a proposal, not active
 configuration. Graduation requires three clean pages with matched archive-byte
 and record distributions, no residual/unknown outcome, mature drains without a
