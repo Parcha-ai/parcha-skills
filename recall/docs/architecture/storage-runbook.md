@@ -478,6 +478,24 @@ lacks a measured temporary heap/index/sort breakdown or exact remaining-work
 figure, so a blind retry is unjustified; sweeping first does not reduce data
 the failed copy already omitted.
 
+### Managed ingestion regression — 2026-09-21, 19:07 UTC
+
+The morning managed-worker recovery is historical evidence, not current health.
+A fresh read-only probe on exact managed #650 found one enabled installation,
+a claim at 19:06:48 UTC, **290 consecutive `brain_unavailable` failures**, and
+last success at **09:17:45 UTC**. The worker had released its lease and scheduled
+the next attempt two minutes later. These counts describe installations and
+consecutive failures, not successfully ingested record volume. API readiness
+and the static quality card do not establish ingestion freshness.
+
+`ConnectorRunner.flush` maps canonical ingestion exceptions to the generic
+`brain_unavailable` code. Inspect the underlying exception at the managed
+canonical writer boundary without logging content, credentials, IDs or exception
+messages, and preserve the original exception, pending page and cursor behavior.
+The cause and recovery remain unproved. Require a fresh successful managed cycle
+before resuming source retirement; do not clear or replay the pending spool to
+make the failure disappear.
+
 ### Next boundaries and acceptance
 
 The immediate dependency order is **finish provider replacement → 18 exact
