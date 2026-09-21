@@ -9,7 +9,9 @@ from pathlib import Path
 import sys
 import time
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+SERVER = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SERVER.parent))
+sys.path.insert(0, str(SERVER))
 from recall_server.archive_runtime import build_evidence_archive_store
 from recall_server.db import BrainStore, SearchDeadlineExceeded
 from recall_server.locator_backfill_plan import LocatorPlanError, PlanLimits, apply_parent, plan_parent, select_parents

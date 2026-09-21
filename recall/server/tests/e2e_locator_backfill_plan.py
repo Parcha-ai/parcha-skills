@@ -14,6 +14,7 @@ import psycopg
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
 SERVER = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SERVER.parent))
 sys.path.insert(0, str(SERVER))
 from e2e_archive_reprojection import fixture, mark_dirty
 from e2e_logical_evidence_projection import insert_record
