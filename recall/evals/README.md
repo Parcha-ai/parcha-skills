@@ -93,6 +93,11 @@ the cost probe; `--forget-probe` enables the write-then-forget latency probe (ne
 card. `python -m evals.systems_card render --output-dir DIR` re-renders HTML from an existing
 `card.json`.
 
+`python -m evals.systems_card summary --output-dir DIR --git-sha SHA --date YYYY-MM-DD
+[--reconcile LINE]` prints the nightly summary text for an existing `card.json` plus its
+`history.jsonl`. The nightly cron reads it from here rather than formatting its own, so the
+percentile labels stay tied to the metric keys they are read from.
+
 An approved validation expansion uses `--truth-expansion /private/bundle/manifest.json`
 instead of `--truth`. Keep the manifest and three JSONL files mode-0600 in an owner-only
 directory outside git. The closed manifest schema is:
