@@ -22,6 +22,7 @@ from .archive_runtime import (
 )
 from .canonical_retrieval import CanonicalRetrieval
 from .canonical_thinning import _compact_event_expression, thin_canonical_bodies
+from .storage_retirement import retire_chunk_search_index
 from .capabilities import CapabilityError, probe_database
 from .control import ControlPlane, SecretBox
 from .db import BrainStore, SearchPlaneSchemaError
@@ -1547,6 +1548,8 @@ def main() -> None:
     sub.add_parser("storage-footprint")
     sub.add_parser("storage-event-shape")
     sub.add_parser("storage-active-work")
+    retire_chunk_index = sub.add_parser("storage-retire-chunk-search-index")
+    retire_chunk_index.add_argument("--apply", action="store_true")
     sub.add_parser("storage-prepare-event-compaction")
     sub.add_parser("storage-finish-event-compaction")
     sub.add_parser("storage-cancel-stale-event-compaction")
@@ -2141,6 +2144,8 @@ def main() -> None:
         print(json.dumps(_storage_footprint(store), sort_keys=True))
     elif args.command == "storage-event-shape":
         print(json.dumps(_canonical_event_shape(store), sort_keys=True))
+    elif args.command == "storage-retire-chunk-search-index":
+        print(json.dumps(retire_chunk_search_index(store, apply=args.apply), sort_keys=True))
     elif args.command == "storage-active-work":
         print(json.dumps(_active_database_work(store), sort_keys=True))
     elif args.command == "storage-prepare-event-compaction":

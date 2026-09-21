@@ -133,3 +133,41 @@ and `/v1/ingest/batches`; zero rows in `source_events`, `items`, `chunks`,
 answering 410 by default and 200 with `RECALL_LEGACY_READS=1`; and
 `RECALL_LEGACY_WRITES=1` dual-writing. Unit coverage is
 `tests/central_brain/test_legacy_plane.py`.
+
+
+## Chunk search index retirement (2026-09-21)
+
+The turbopuffer deployment now resolves a parent to its exact logical document,
+filters to that document before BM25 ranking, then verifies current passage pins
+and live authorized receipts in Postgres. It no longer uses the chunk GIN index.
+Deploy this reader on every serving instance before running the retirement command:
+
+```sh
+python -m recall_server.cli storage-retire-chunk-search-index
+python -m recall_server.cli storage-retire-chunk-search-index --apply
+```
+
+The first command reports the existing index size without writing. Apply requires
+`RECALL_SEARCH_PLANE=turbopuffer`, drops only
+`public.canonical_chunks_search_idx` concurrently, waits at most two seconds for
+locks, and has a 60-second statement timeout. A timeout is not completion: inspect
+the index state before retrying. Bodies, receipts and the generated search vector
+remain unchanged. The separate archive reader is opt-in via
+`RECALL_CHUNK_BODY_READS=archive`; its default is `postgres`. It reads existing
+logical parts, verifies exact text/chunk hashes and liveness, and retains verified
+SQL fallback for unprojected, oversized, structural and historical-layout records.
+It is not permission to thin chunks yet, and its transport latency still needs a
+live acceptance run before activation.
+
+The index can be restored, if needed, without restoring source data:
+
+```sql
+CREATE INDEX CONCURRENTLY canonical_chunks_search_idx
+ON public.canonical_chunks USING gin(search_vector)
+WHERE deleted_at IS NULL;
+```
+
+Rebuilding needs time and free space. Record actual database/index bytes before
+and after removal; lower the provider disk floor only after verifying physical
+usage and live health. Neither source-reader parity nor removal of this index
+completes the remaining ingest/body/catalog migration.

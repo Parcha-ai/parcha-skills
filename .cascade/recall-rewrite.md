@@ -190,6 +190,23 @@ Design (`server/recall_server/turbopuffer_plane.py`): one namespace per tenant (
 | H3-e' | Retire the Postgres vector plane: migration 067 (HNSW + embeddings table, ledger, passages GIN + generated tsvector; `migrate --retire-postgres-plane` from a turbopuffer-plane process only), plane-gated writers, `search-plane-status` drift CLI, embedding worker refuses on turbopuffer | **done 2026-09-17 00:4x UTC** (Miguel: "go ham"): worker `RECALL_SEARCH_PLANE=turbopuffer` (deploy 67d281e), embedding worker suspended, 067 applied through the temp-role `migrate-file` procedure (the worker DB role has no DDL; the in-app job fails with InsufficientPrivilege) → schema 67; MCP search verified; card after: 0.875 / 0.5425 / server p95 761 ms; one red gate `recall_scan` p95 71 s (scan plane mid-rewrite; re-measure). Rollback to Postgres search no longer exists. Left: PS-80 downsize + budget alert (Miguel, console) | lead | agent built it and ran out of credits; lead fixed CI twice (runner re-runs versions < 067 until retired; retirement e2e on its own database). Exit: Postgres ≤ 40 GB then ≤ 10 GB with T6b; cost probe green |
 | H3-f' | show/session_context/time clip off `canonical_chunks` (unchanged from the old H3-e) | todo | | |
 
+### Storage retirement resumed — 2026-09-20
+
+Owner: Codex lead. User explicitly reprioritized completing the promised downsizing over H6/Jev. Search cutover is complete; storage retirement is not. Preserve the final catalog-only Postgres objective and all independent card gates.
+
+Read-only baseline: Postgres **202,610,153,139 bytes (188.7 GiB)**; writable/ready, PS80, two replicas, 300GiB disk floor/cap. Chunk table ~106.7GiB including ~18.04GiB `canonical_chunks_search_idx`; do not treat total relation size as removable body bytes. `canonical_evidence_objects` exact count **0**; approximately 11.25M live/current document rows, 31K logical documents and 38.6K logical parts. Existing thinning already moved most document/event bodies; their catalog/index footprints remain substantial. Private evidence: `~/.recall/storage-retirement-20260920/`.
+
+| Phase | Boundary | State | Acceptance before next phase |
+|---|---|---|---|
+| S0 | Live dependency/storage baseline | verified | Six live body readers, both ingest paths, logical reprojection and receipt liveness inventoried; actual heap/index/TOAST separated. |
+| S1 | Last chunk full-text consumer → exact session-scoped turbopuffer | implementation + live comparison verified; deployment/index retirement pending | Tenant/source/logical-document/policy/time filters before ranking; live receipt verification. Fresh-PG proof drops the index and keeps exact rows/bodies/receipts. Read-only 12-case validation probe: gold-hit cases 9/12 → 12/12; three old lookups consumed 3s and returned no receipts. New range 235–1,911ms (not a subsecond p95 claim). Then remove 18GiB redundant GIN with bounded lock and retain source data. |
+| S2 | One reader over existing logical evidence parts | in progress | Exact show/context/related/time-clip contracts; full text plus every chunk hash/receipt verified; tombstone/revision/permission fences retained. No millions-of-objects bundle backfill. Historical/structural/oversized gaps remain explicit SQL fallback until resolved. |
+| S3 | Reprojection + public resolve + both ingest writers | pending | Actor refresh, replay, new ingest, indexing and all source readers work without Postgres prose. No network I/O while monopolizing worker DB connections. |
+| S4 | Bounded body retirement and physical reclaim | pending | Object coverage, exact parity, concurrent rewrite/forget guards and retention rules verified before clearing bodies. Measure catalog/index floor; reclaim physical files separately. |
+| S5 | Provider disk and compute reduction | pending | Measured retained size plus operational headroom; resize completed; health, freshness, search/source/permission card gates pass afterward. |
+
+After every phase: simplicity = fewer production responsibilities/copies; power = same exact authorized evidence; breakthrough = measured storage or latency improvement; job done = company brain remains fast and correct. Passing source-reader tests is not evidence of reclaimed or reduced provisioned storage. The independent evaluator stays unchanged in implementation PRs.
+
 ### H6: Judgments, not regex (Jev / TypeSafe) — handoff `recall/docs/architecture/2026-09-17-recall-jev-judgments-handoff.md` (#610)
 
 Objective (Miguel 2026-09-17): move every semantic judgment into Jev typed answers; keep arms, fusion, deadlines, storage in code; delete each regex path only after the card holds with the fallback rate < 1%. One falsifiable wave at a time per `~/ati-harness/AGENTS.md`.

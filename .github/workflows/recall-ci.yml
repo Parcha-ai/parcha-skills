@@ -91,7 +91,9 @@ jobs:
             e2e_workspace_rail.py \
             e2e_retrieval_eval.py \
             e2e_passage_metadata.py \
-            e2e_retire_postgres_plane.py
+            e2e_retire_postgres_plane.py \
+            e2e_parent_scoped_retrieval.py \
+            e2e_archived_chunk_reads.py
           do
             python "server/tests/$test"
           done
