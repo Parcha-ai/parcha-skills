@@ -1756,8 +1756,11 @@ class BrainStore:
             if last_success_epoch is not None
             else None
         )
+        # Pool acquisition consumes the same SQL budget; COMMIT is not a hard deadline.
+        deadline_at = time.monotonic() + 5.0
         with self.connect() as conn:
-            row = conn.execute(
+            row = self._execute_bounded(
+                conn,
                 """INSERT INTO collector_health_reports(
                        tenant_id,source_id,installation_id,collector_kind,
                        collector_version,status,scan_complete,pending_records,
@@ -1795,9 +1798,11 @@ class BrainStore:
                     last_success,
                     last_error,
                 ),
+                deadline_at,
             ).fetchone()
             if installation_id is not None:
-                conn.execute(
+                self._execute_bounded(
+                    conn,
                     """UPDATE connector_installations
                           SET last_success_at=COALESCE(%s,last_success_at),
                               last_error_code=%s,updated_at=now()
@@ -1809,6 +1814,7 @@ class BrainStore:
                         tenant_id,
                         source_id,
                     ),
+                    deadline_at,
                 )
         return {
             "schema_version": 1,
