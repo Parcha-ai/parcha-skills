@@ -254,3 +254,50 @@ replacement pending. Documents physical reclaim is proved; billed disk reduction
 is not. Continue bounded source retirement with explicit remaining-coverage
 accounting; a completed provider request does not satisfy the capacity exit. The living phase state is in
 [the storage Cascade](../../../.cascade/recall-rewrite.md#storage-retirement-resumed--2026-09-20).
+
+### Optional chunk search-vector retirement
+
+After every serving process uses turbopuffer, the generated
+`canonical_chunks.search_vector` is redundant. Retiring its GIN index alone
+preserves that stored column. The explicit operation previews by default:
+
+```sh
+RECALL_SEARCH_PLANE=turbopuffer python -m recall_server.cli \
+  storage-retire-chunk-search-vector
+```
+
+Use the existing database configuration and turbopuffer credentials. Add
+`--apply` only for the reviewed column retirement. The operation requires
+recorded migration 067, the old chunk GIN already absent, the expected stored
+`to_tsvector('simple', text_redacted)` expression, and no other column
+dependencies. It takes the table lock with `NOWAIT`, rechecks the catalog, and
+performs one transactional `DROP COLUMN ... RESTRICT`. Local lock and statement
+limits prevent a queued maintenance operation from lingering. An error rolls
+back the DDL; an ambiguous connection loss at commit requires checking the
+column state before retrying.
+
+This operation preserves every body, receipt, hash and authority/history row.
+It adds no migration version, so existing readiness expectations remain valid;
+067 already prevents ordinary migration from recreating the old vector.
+PostgreSQL-mode installations retain their vector until explicitly retired.
+The private legacy PostgreSQL evaluator refuses turbopuffer mode; public
+retrieval continues through turbopuffer and the verified archive reader.
+
+**A column drop is not physical disk reclamation.** The result reports zero
+physical bytes reclaimed. Existing row/TOAST storage needs a separately admitted
+rewrite, with fresh live-size, index-build, WAL, replica and free-space budgets.
+A sampled vector payload estimate is not a rewrite workspace upper bound.
+Do not combine this command with an automatic rewrite or provider resize.
+
+Rollback, if separately required, rebuilds only derived search data:
+`ALTER TABLE public.canonical_chunks ADD COLUMN search_vector tsvector
+GENERATED ALWAYS AS (to_tsvector('simple', text_redacted)) STORED`.
+That rebuild can rewrite the table and consume substantial time and space;
+plan it explicitly. Recreating the retired GIN would be a second separately
+budgeted operation. Neither action restores the retired PostgreSQL search plane.
+
+Validation retains the existing archive reads, parent routing, chunk clear and
+restore, historical revision, authorization and forget tests on fresh databases
+with the column absent. It also checks PostgreSQL behavior before retirement,
+least-privilege readiness afterward, migration replay, dependency refusal,
+lock contention and rollback after an injected post-DDL failure.
