@@ -62,7 +62,7 @@ _CANONICAL_FAILURE_CLASSES = frozenset({
     "CanonicalLifecycleError", "ControlError", "ValueError", "TypeError",
     "KeyError", "RuntimeError", "TimeoutError", "OSError", "PermissionError",
     "OperationalError", "InterfaceError", "ProgrammingError", "IntegrityError",
-    "DataError",
+    "DataError", "HistoryUnavailable", "HistoryAuthorityError",
 })
 _CANONICAL_FAILURE_CODES = frozenset({
     "canonical_batch_invalid", "canonical_contract_invalid",
@@ -229,28 +229,36 @@ class _DirectCanonicalWriter:
         except Exception as error:
             # Diagnostics must neither expose the exception nor replace it.
             try:
-                error_class = type(error).__name__
-                error_code = getattr(error, "error_code", None)
-                sqlstate = "unrecognized"
-                if isinstance(error, psycopg.Error):
-                    candidate = error.sqlstate
-                    if type(candidate) is str and len(candidate) == 5:
-                        try:
-                            registered = psycopg.errors.lookup(candidate)
-                        except KeyError:
-                            pass
-                        else:
-                            if registered.sqlstate == candidate:
-                                error_class = registered.__name__
-                                sqlstate = candidate
-                if sqlstate == "unrecognized" and error_class not in _CANONICAL_FAILURE_CLASSES:
-                    error_class = "unrecognized"
-                LOG.error(
-                    "managed canonical ingest failed type=%s code=%s sqlstate=%s",
-                    error_class,
-                    error_code if type(error_code) is str and error_code in _CANONICAL_FAILURE_CODES else "unrecognized",
-                    sqlstate,
-                )
+                current, seen = error, set()
+                for depth in range(3):
+                    if not isinstance(current, Exception) or id(current) in seen:
+                        break
+                    seen.add(id(current))
+                    error_class = type(current).__name__
+                    error_code = getattr(current, "error_code", None)
+                    sqlstate = "unrecognized"
+                    if isinstance(current, psycopg.Error):
+                        candidate = current.sqlstate
+                        if type(candidate) is str and len(candidate) == 5:
+                            try:
+                                registered = psycopg.errors.lookup(candidate)
+                            except KeyError:
+                                pass
+                            else:
+                                if registered.sqlstate == candidate:
+                                    error_class = registered.__name__
+                                    sqlstate = candidate
+                    if sqlstate == "unrecognized" and error_class not in _CANONICAL_FAILURE_CLASSES:
+                        error_class = "unrecognized"
+                    LOG.error(
+                        "managed canonical ingest failed type=%s code=%s sqlstate=%s depth=%s",
+                        error_class,
+                        error_code if type(error_code) is str and error_code in _CANONICAL_FAILURE_CODES else "unrecognized",
+                        sqlstate,
+                        depth,
+                    )
+                    cause = current.__cause__
+                    current = cause if cause is not None else current.__context__
             except Exception:
                 # A custom exception attribute or logging handler can also fail.
                 pass

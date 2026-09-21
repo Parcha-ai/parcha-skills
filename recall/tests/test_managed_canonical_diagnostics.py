@@ -12,6 +12,7 @@ from privacy.policy import PrivacyPolicy
 from tests.test_connector_sdk import SyntheticConnector, record
 from server.recall_server import managed_worker
 from server.recall_server.canonical import CanonicalLifecycleError
+from server.recall_server.canonical_history import HistoryAuthorityError, HistoryUnavailable
 
 
 class ManagedCanonicalDiagnosticTests(unittest.TestCase):
@@ -42,7 +43,7 @@ class ManagedCanonicalDiagnosticTests(unittest.TestCase):
         plane.ingest_batch.assert_called_once()
         self.assertEqual(len(logs.records), 1)
         record = logs.records[0]
-        self.assertEqual(record.getMessage(), expected)
+        self.assertEqual(record.getMessage(), expected + " depth=0")
         self.assertIsNone(record.exc_info)
         self.assertIsNone(record.stack_info)
         for secret in ("secret", "private", "Traceback"):
@@ -124,6 +125,79 @@ class ManagedCanonicalDiagnosticTests(unittest.TestCase):
         error = ValueError("secret")
         writer, _ = self.writer(error)
         with patch.object(managed_worker.LOG, "error", side_effect=RuntimeError("private")):
+            with self.assertRaises(ValueError) as caught:
+                writer.ingest([])
+        self.assertIs(caught.exception, error)
+
+    def chain_logs(self, error):
+        writer, plane = self.writer(error)
+        with self.assertLogs(managed_worker.LOG, level="ERROR") as logs:
+            with self.assertRaises(type(error)) as caught:
+                writer.ingest([{"private-payload": "secret"}])
+        self.assertIs(caught.exception, error)
+        plane.ingest_batch.assert_called_once()
+        for entry in logs.records:
+            self.assertIsNone(entry.exc_info)
+            self.assertIsNone(entry.stack_info)
+            for secret in ("private", "secret", "Traceback"):
+                self.assertNotIn(secret, str(entry.__dict__))
+        return [entry.getMessage() for entry in logs.records]
+
+    def test_suppressed_history_chain_preserves_real_sqlstate_at_depth_two(self):
+        try:
+            try:
+                try:
+                    raise UndefinedFunction("private SQL secret")
+                except Exception:
+                    raise HistoryUnavailable() from None
+            except HistoryUnavailable:
+                raise CanonicalLifecycleError("canonical_history_unavailable") from None
+        except CanonicalLifecycleError as error:
+            self.assertTrue(error.__suppress_context__)
+            self.assertTrue(error.__context__.__suppress_context__)
+            messages = self.chain_logs(error)
+        self.assertEqual(messages, [
+            "managed canonical ingest failed type=CanonicalLifecycleError "
+            "code=canonical_history_unavailable sqlstate=unrecognized depth=0",
+            "managed canonical ingest failed type=HistoryUnavailable "
+            "code=unrecognized sqlstate=unrecognized depth=1",
+            "managed canonical ingest failed type=UndefinedFunction "
+            "code=unrecognized sqlstate=42883 depth=2",
+        ])
+
+    def test_chain_cycle_and_three_node_bound(self):
+        errors = [ValueError("secret") for _ in range(4)]
+        for first, second in zip(errors, errors[1:]):
+            first.__context__ = second
+        self.assertEqual(len(self.chain_logs(errors[0])), 3)
+        errors[1].__context__ = errors[0]
+        self.assertEqual(len(self.chain_logs(errors[0])), 2)
+        errors[0].__context__ = errors[0]
+        self.assertEqual(len(self.chain_logs(errors[0])), 1)
+
+    def test_explicit_cause_preferred_and_history_authority_name_closed(self):
+        error = RuntimeError("secret")
+        error.__cause__ = HistoryAuthorityError("private")
+        error.__context__ = UniqueViolation("secret")
+        messages = self.chain_logs(error)
+        self.assertEqual(len(messages), 2)
+        self.assertTrue(messages[1].endswith(
+            "type=HistoryAuthorityError code=unrecognized sqlstate=unrecognized depth=1"))
+
+    def test_chain_attribute_failure_preserves_original(self):
+        class Hostile(Exception):
+            def __getattribute__(self, name):
+                if name == "__cause__":
+                    raise ValueError("secret")
+                return super().__getattribute__(name)
+        error = Hostile("private")
+        self.assertEqual(len(self.chain_logs(error)), 1)
+
+    def test_inner_logging_failure_preserves_outer(self):
+        error = ValueError("secret")
+        error.__context__ = HistoryUnavailable()
+        writer, _ = self.writer(error)
+        with patch.object(managed_worker.LOG, "error", side_effect=[None, RuntimeError("private")]):
             with self.assertRaises(ValueError) as caught:
                 writer.ingest([])
         self.assertIs(caught.exception, error)
