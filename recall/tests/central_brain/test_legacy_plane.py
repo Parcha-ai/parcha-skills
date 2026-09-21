@@ -175,7 +175,7 @@ class LegacyReadRouteHttpTest(unittest.TestCase):
 
     def test_receipt_resolve_is_not_gated(self) -> None:
         def resolve(receipt, authorized_source=None, *, tenant_id=None,
-                    authorized_sources=None, chunk_body_archive=None):
+                    authorized_sources=None, chunk_body_archive=None, legacy_only=False):
             return {"event": {"receipt": receipt}, "items": []}
         self.store.resolve = resolve
         self.store.authorized_canonical_source_ids = mock.Mock(return_value=("s",))

@@ -2883,6 +2883,7 @@ class BrainStore:
         tenant_id: str | None = None,
         authorized_sources: tuple[str, ...] | None = None,
         chunk_body_archive: Any = None,
+        legacy_only: bool = False,
     ) -> dict | None:
         """Resolve an exact revision; explicit tenant authority never falls back to v1."""
         try:
@@ -2912,12 +2913,16 @@ class BrainStore:
             time.monotonic() + self.search_deadline_ms / 1000
             if chunk_body_archive is not None else None
         )
-        with self.connect() as conn:
-            canonical = self._resolve_canonical(
-                conn, source_id, native_id, revision, authorized_source,
-                tenant_id=tenant_id, metadata_only=chunk_body_archive is not None,
-                deadline_at=deadline_at,
-            )
+        if legacy_only and tenant_id is not None:
+            raise ValueError("invalid receipt authority")
+        canonical = None
+        if not legacy_only:
+            with self.connect() as conn:
+                canonical = self._resolve_canonical(
+                    conn, source_id, native_id, revision, authorized_source,
+                    tenant_id=tenant_id, metadata_only=chunk_body_archive is not None,
+                    deadline_at=deadline_at,
+                )
         if canonical is not None:
             event, items = canonical["event"], canonical["items"]
             if chunk_body_archive is not None:
