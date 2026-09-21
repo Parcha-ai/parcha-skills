@@ -105,6 +105,7 @@ jobs:
             e2e_revision_history.py \
             e2e_chunk_retirement.py \
             e2e_parent_chunk_retirement.py \
+            e2e_optional_reconcile_index.py \
             e2e_streaming_locators.py \
             e2e_context_neighbor_plan.py \
             e2e_located_public_reads.py \

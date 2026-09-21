@@ -182,6 +182,31 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
                     assess_snapshot(snapshot, profile="production")
                 self.assertEqual(raised.exception.code, "schema_drift")
 
+    def test_optional_reconciliation_index_reports_the_actual_schema(self) -> None:
+        for version in (69, 70):
+            for retired in (False, True):
+                with self.subTest(version=version, retired=retired):
+                    snapshot = healthy_snapshot()
+                    snapshot['migration_versions'] = [n for n in range(1, version + 1)
+                                                       if retired or n != 67]
+                    snapshot['postgres_vector_plane_present'] = not retired
+                    result = assess_snapshot(snapshot)
+                    self.assertEqual(result['schema_version'], version)
+                    self.assertEqual(result['postgres_vector_plane'], 'retired' if retired else 'present')
+
+    def test_optional_reconciliation_index_does_not_hide_other_schema_drift(self) -> None:
+        complete = list(range(1, 71))
+        for versions in ([n for n in complete if n != 68],
+                         [n for n in complete if n != 69],
+                         complete + [71], complete + [70],
+                         complete[:-2] + [70, 69]):
+            with self.subTest(versions=versions):
+                snapshot = healthy_snapshot()
+                snapshot['migration_versions'] = versions
+                with self.assertRaises(CapabilityError) as raised:
+                    assess_snapshot(snapshot)
+                self.assertEqual(raised.exception.code, 'schema_drift')
+
     def test_snapshot_fails_closed_on_drift_privilege_extension_and_tls(self) -> None:
         failures = {
             "schema_drift": ("migration_versions", list(range(1, MANDATORY_SCHEMA_VERSION))),
