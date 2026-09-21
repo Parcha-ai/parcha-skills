@@ -523,6 +523,35 @@ validation messages/order and the queued page. A synthetic persisted malformed
 page reproduces repeated failures without new pulls or cursor advancement;
 it demonstrates the mechanism, not the actual live cause.
 
+### Artifact checksum privacy regression — 2026-09-21, 20:40 UTC
+
+Managed #665 (`d7b1758`) reported the exact refusal on its 20:34 UTC natural
+retry: `typed_invalid_known_field / document.v1 / artifact_content_sha256`.
+The real Slack attachment → SDK → persisted SQLite pipeline reproduces it with
+synthetic file bytes: the financial-data detector matches a Luhn-valid numeric
+substring inside SHA-256 and replaces it with `[REDACTED:financial_id]`. The
+record was valid before privacy transformation; the server correctly refuses
+its damaged checksum. In drop mode, the same false positive can discard an
+otherwise safe new attachment.
+
+The owning SDK correction preserves only a typed document digest verified
+against its actual `archive_payload` bytes, leaving all other fields under the
+configured scrub/drop policy. Existing pages flush before any new fetch, so a
+future-only correction cannot recover the blocked queue. The narrow queued
+repair uses the original `_archive_raw` checksum witness retained in the private
+spool: exact legacy transformation, original full content hash, validated
+artifact reference and known attachment/source/principal/connector/time/media
+lineage must agree. Change only the checksum field and envelope content hash,
+atomically persist that identity before submission, and keep normal canonical
+acknowledgment, replay and cursor behavior. Ambiguous input remains blocked.
+This trusts the original SDK spool witness; it does not claim a fresh remote
+payload read or native identity verification from the reference alone.
+
+#665 passed six exact evidence comparisons and the unchanged original card
+**26/26 at 20:40:22 UTC** (recall .9625, MRR .6554; zero backend errors).
+Ingestion recovery remains unproved; require a new successful cycle and original
+quality gates after the actual repair before resuming storage retirement.
+
 ### Next boundaries and acceptance
 
 The immediate dependency order is **identify the live validation invariant →

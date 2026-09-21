@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
-from client.mac import canonical_envelope
+from client.mac import canonical_envelope, canonical_json
 from contracts.v2 import ContractError, validate_contract
 from privacy.policy import PrivacyPolicy, summarize_receipts
 from connectors.record_contract import TYPED_RECORD_FIELDS, validate_content_fidelity
@@ -662,9 +662,26 @@ class ConnectorRunner:
                     {"content": {}, "provenance": safe_provenance}
                 )
             else:
-                decision = self.privacy.apply(
-                    {"content": record.content, "provenance": safe_provenance}
+                privacy_content = record.content
+                artifact_digest = record.content.get("artifact_content_sha256")
+                proven_digest = (
+                    record.schema_version == CONNECTOR_SCHEMA_VERSION_V2
+                    and record.content.get("kind") == "document.v1"
+                    and isinstance(artifact_digest, str)
+                    and SHA256.fullmatch(artifact_digest) is not None
+                    and record.archive_payload is not None
+                    and artifact_digest == hashlib.sha256(record.archive_payload).hexdigest()
                 )
+                if proven_digest:
+                    # An exact raw-byte checksum is identity metadata, not prose.
+                    # Keep all other fields under the configured privacy policy.
+                    privacy_content = dict(record.content)
+                    del privacy_content["artifact_content_sha256"]
+                decision = self.privacy.apply(
+                    {"content": privacy_content, "provenance": safe_provenance}
+                )
+                if proven_digest and decision.action != "drop":
+                    decision.value["content"]["artifact_content_sha256"] = artifact_digest
             if decision.action == "drop":
                 event = None
             else:
@@ -731,6 +748,114 @@ class ConnectorRunner:
         if checkpoint is None or checkpoint[0] != 0:
             raise ConnectorRunError("connector_spool_purge_failed")
 
+    def _repair_pending_artifact_digests(
+        self, rows: list[sqlite3.Row], events: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Repair only the known checksum scrub defect in our private spool.
+
+        The reference is the persisted witness checked by _archive_raw before
+        staging. This does not fetch raw bytes or establish new remote authority.
+        Prove every candidate before atomically replacing any queued identity.
+        """
+        repairs = []
+        repaired_events = list(events)
+        for index, (row, event) in enumerate(zip(rows, events)):
+            content = event.get("content")
+            provenance = event.get("provenance")
+            if not (
+                isinstance(content, dict) and content.get("kind") == "document.v1"
+                and "artifact_content_sha256" in content
+                and isinstance(provenance, dict)
+                and provenance.get("connector_schema_version") == 2
+            ):
+                continue
+            damaged = content["artifact_content_sha256"]
+            if isinstance(damaged, str) and SHA256.fullmatch(damaged):
+                continue
+            refusal_code = "archive_invalid_reference"
+            try:
+                reference = validate_contract(
+                    provenance.get("artifact_ref"), expected="recall.artifact-ref.v1",
+                )
+                if not (
+                    reference.get("tenant_id") == self.tenant_id
+                    and reference.get("source_id") == self.source_id
+                    and reference.get("created_at") == event.get("occurred_at")
+                    and reference.get("media_type") == content.get("mime_type")
+                    and 0 <= reference["size_bytes"] <= MAX_ARCHIVE_OVERRIDE_BYTES
+                ):
+                    raise ValueError
+                refusal_code = "connector_invalid_page"
+                digest = reference["content_sha256"]
+                old_digest = hashlib.sha256(canonical_json(content)).hexdigest()
+                legacy = PrivacyPolicy(mode="scrub").apply(digest).value
+                native_id = event["native_id"]
+                known_attachment = (
+                    self.connector_id == "slack.messages"
+                    and native_id.startswith("slack-file:")
+                    and content.get("surface") == "slack"
+                ) or (
+                    self.connector_id == "google.gmail"
+                    and native_id.startswith("gmail-attachment:")
+                    and content.get("surface") == "gmail_attachment"
+                )
+                if not (
+                    known_attachment
+                    and type(damaged) is str
+                    and "[REDACTED:financial_id]" in damaged
+                    and damaged == legacy and legacy != digest
+                    and type(event.get("schema_version")) is int
+                    and event["schema_version"] == 1
+                    and type(provenance.get("connector_schema_version")) is int
+                    and event.get("kind") == "connector_record"
+                    and event.get("content_type") == "application/json"
+                    and event.get("visibility") == "private"
+                    and event.get("source_id") == self.source_id
+                    and event.get("principal_id") == self.principal_id
+                    and event.get("content_sha256") == old_digest
+                    and provenance.get("connector_id") == self.connector_id
+                    and content.get("document_id") == native_id
+                    and content.get("parent_id") == event.get("native_parent_id")
+                    and isinstance(event.get("native_parent_id"), str)
+                ):
+                    raise ValueError
+                fixed_content = {**content, "artifact_content_sha256": digest}
+                # Apply the existing SDK contract, including cross-field fidelity.
+                ConnectorRecordV2(
+                    schema_version=2, native_id=native_id,
+                    native_parent_id=event["native_parent_id"],
+                    occurred_at=event["occurred_at"], content=fixed_content,
+                    provenance=provenance,
+                )
+                fixed = {**event, "content": fixed_content,
+                         "content_sha256": hashlib.sha256(canonical_json(fixed_content)).hexdigest()}
+                expected = canonical_envelope(
+                    source_id=self.source_id, native_id=native_id, kind="connector_record",
+                    content=fixed_content, principal_id=self.principal_id, visibility="private",
+                    occurred_at=event["occurred_at"], parent=event["native_parent_id"],
+                    provenance=provenance,
+                )
+                if fixed != expected:
+                    raise ValueError
+                rendered = json.dumps(fixed, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            except (ContractError, ValueError, TypeError, KeyError, AttributeError):
+                raise ConnectorRunError(refusal_code) from None
+            repairs.append((rendered, row["id"], row["envelope_json"]))
+            repaired_events[index] = fixed
+        if repairs:
+            try:
+                with self.db:
+                    for rendered, row_id, original in repairs:
+                        changed = self.db.execute(
+                            "UPDATE outbox SET envelope_json=? WHERE id=? AND envelope_json=? AND state='pending'",
+                            (rendered, row_id, original),
+                        ).rowcount
+                        if changed != 1:
+                            raise ConnectorRunError("connector_spool_error")
+            except sqlite3.Error:
+                raise ConnectorRunError("connector_spool_error") from None
+        return repaired_events
+
     def flush(self) -> dict[str, int]:
         page = self.db.execute("SELECT * FROM pages ORDER BY id LIMIT 1").fetchone()
         if page is None:
@@ -741,6 +866,7 @@ class ConnectorRunner:
                 self._commit_page(page["id"], json.loads(page["cursor_after"]))
             return {"acked": 0, "replayed": 0}
         events = [json.loads(row["envelope_json"]) for row in rows]
+        events = self._repair_pending_artifact_digests(rows, events)
         try:
             acknowledgement = self.brain.ingest(events)
         except PermissionError:
