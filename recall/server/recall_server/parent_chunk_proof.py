@@ -42,7 +42,7 @@ class ParentMetadataSpool:
             self.index.execute('PRAGMA journal_mode=OFF')  # Attempt-local, discarded on any failure.
             self.index.execute('PRAGMA temp_store=FILE')
             self.index.execute(f'PRAGMA max_page_count={max_bytes // 4096}')
-            self.index.execute('CREATE TABLE documents(native TEXT PRIMARY KEY,document TEXT UNIQUE,payload BLOB NOT NULL,ordinal INTEGER,verified INTEGER NOT NULL DEFAULT 0)')
+            self.index.execute('CREATE TABLE documents(native TEXT PRIMARY KEY,document TEXT UNIQUE,payload BLOB NOT NULL,ordinal INTEGER,verified INTEGER NOT NULL DEFAULT 0,proposed_count INTEGER)')
             self.index.execute('CREATE INDEX documents_position ON documents(verified,ordinal,document)')
             self.index.execute('CREATE TABLE seen(native TEXT PRIMARY KEY)')
         except BaseException:
@@ -83,8 +83,9 @@ class ParentMetadataSpool:
         found = self.index.execute('SELECT payload FROM documents WHERE native=?', (native,)).fetchone()
         return None if found is None else orjson.loads(found[0])
 
-    def mark_verified(self, row):
-        if self.index.execute('UPDATE documents SET verified=1 WHERE native=? AND verified=0', (row['native_id'],)).rowcount != 1:
+    def mark_verified(self, row, location=None):
+        if self.index.execute('UPDATE documents SET verified=1,ordinal=coalesce(?,ordinal),proposed_count=? WHERE native=? AND verified=0',
+                              (None if location is None else location[0], None if location is None else location[1], row['native_id'])).rowcount != 1:
             raise _error('parent_retirement_metadata_invalid')
 
     def unseen(self):
@@ -94,6 +95,11 @@ class ParentMetadataSpool:
     def verified(self):
         for (payload,) in self.index.execute('SELECT payload FROM documents WHERE verified=1 ORDER BY ordinal,document'):
             yield orjson.loads(payload)
+
+
+    def proposals(self):
+        for payload, ordinal, count in self.index.execute('SELECT payload,ordinal,proposed_count FROM documents WHERE proposed_count IS NOT NULL ORDER BY ordinal,document'):
+            yield dict(orjson.loads(payload), record_ordinal=ordinal, record_count=count)
 
 
 def manifest_identity(manifest):
@@ -156,8 +162,10 @@ def _capture(store, spool, scope, limits, deadline_at):
 
 
 @contextmanager
-def prove_parent_chunks(store, archive, *, scope, limits, deadline_at):
+def prove_parent_chunks(store, archive, *, scope, limits, deadline_at, purpose="retire"):
     """Yield a complete sealed metadata proof only after all bytes are verified."""
+    if purpose not in {"retire", "locate"}:
+        raise _error("parent_proof_purpose_invalid")
     with ParentMetadataSpool(max_bytes=limits.max_spool_bytes) as spool:
         catalog, parts, count, chunk_count = _capture(store, spool, scope, limits, deadline_at)
         manifest = catalog['manifest']
@@ -172,12 +180,18 @@ def prove_parent_chunks(store, archive, *, scope, limits, deadline_at):
             reason = ('not_current' if row is None else
                       'oversized' if row['raw_media_type'] == 'application/vnd.recall.oversized-record+gzip' else
                       'structural' if _EXCLUDED_TYPES.intersection(row['structural_types']) else
-                      'unlocated' if _record_location(row) is None else
+                      'unlocated' if purpose == 'retire' and _record_location(row) is None else
                       'event_body_budget' if segments is None else None)
             if reason is None:
                 if _verified_body(row, segments, _record_location(row), ()) is None:
-                    raise _error('parent_retirement_archive_proof_required')
-                spool.mark_verified(row)
+                    if purpose == 'retire':
+                        raise _error('parent_retirement_archive_proof_required')
+                    excluded['pending_revision' if list(first.receipts) != [chunk['receipt'] for chunk in row['chunks']]
+                             else 'historical_chunk_boundaries'] += 1
+                    continue
+                proposed = ((first.ordinal, first.segment_count)
+                            if purpose == 'locate' and _record_location(row) is None else None)
+                spool.mark_verified(row, proposed)
                 eligible += 1
                 eligible_bytes += row['pg_body_bytes']
             else:
@@ -190,18 +204,20 @@ def prove_parent_chunks(store, archive, *, scope, limits, deadline_at):
                 excluded['oversized'] += 1
             elif _EXCLUDED_TYPES.intersection(row['structural_types']):
                 excluded['structural'] += 1
-            elif _record_location(row) is None:
-                excluded['unlocated'] += 1
+            elif _record_location(row) is None and (purpose == 'retire' or row['pending']):
+                excluded['unlocated' if purpose == 'retire' else 'pending_new_document'] += 1
             else:
                 raise _error('parent_retirement_archive_proof_required')
         spool.index.commit()
         identity = manifest_identity(manifest)
         with store.connect() as connection:
             current = read_parent_catalog(store, connection, scope, deadline_at)
-            if manifest_identity(current['manifest']) != identity:
+            if (manifest_identity(current['manifest']) != identity or purpose == 'locate'
+                    and current['manifest']['created_at'] != manifest['created_at']):
                 raise _error('parent_retirement_parent_changed')
         _check_deadline(deadline_at)
         plan = parent_retirement_plan(scope, identity)
+        extra = (dict(parts=parts, catalog_created_at=manifest['created_at']) if purpose == 'locate' else {})
         yield dict(spool=spool, manifest=identity, plan=plan, current_documents=count, current_chunks=chunk_count, eligible_documents=eligible,
                    eligible_utf8_bytes=eligible_bytes, excluded=dict(excluded), archive_gets=meter.gets,
-                   archive_bytes=meter.bytes)
+                   archive_bytes=meter.bytes, **extra)
