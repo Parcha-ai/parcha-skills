@@ -17,7 +17,13 @@ import sys
 import tempfile
 import uuid
 from collections import Counter
+from contextlib import contextmanager
+from datetime import date, datetime, timezone
+import hashlib
+
+from psycopg import sql
 from pathlib import Path
+from types import SimpleNamespace
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -140,6 +146,90 @@ def cleanup_queue(store: BrainStore, tenant: str, source: str) -> set[str]:
                 (tenant, source),
             ).fetchall()
         }
+
+
+def assert_compaction_owner_equivalence(store: BrainStore) -> int:
+    """Exercise the exact owning sweep against actual schema/PKs, isolated in temp tables."""
+    from tests.central_brain.test_parquet_compaction_owner import cases
+
+    with store.connect() as connection:
+        with connection.transaction():
+            for table in (
+                "canonical_parquet_scan_shards", "canonical_parquet_scan_fragment_documents",
+                "canonical_parquet_scan_queue", "canonical_parquet_scan_dirty_documents",
+            ):
+                connection.execute(sql.SQL(
+                    "CREATE TEMP TABLE {} (LIKE public.{} INCLUDING ALL) ON COMMIT DROP"
+                ).format(sql.Identifier(table), sql.Identifier(table)))
+
+            class BoundStore:
+                @contextmanager
+                def connect(self):
+                    yield connection
+
+            for index, (name, catalog, cap, expected) in enumerate(cases()):
+                tenant, source = f"tenant:owner-{index}", "source:owner-proof"
+                bucket = date(2026, 8, 1)
+                for (dataset, shard_index), row in catalog.shards.items():
+                    digest = hashlib.sha256(f"{name}/{dataset}/{shard_index}".encode()).hexdigest()
+                    connection.execute(
+                        """INSERT INTO canonical_parquet_scan_shards(
+                               tenant_id,source_id,bucket_start,dataset,shard_index,
+                               generation_sha256,artifact_id,storage_backend,object_key,
+                               content_sha256,size_bytes,media_type,encryption,version_id,
+                               row_count,created_at
+                           ) VALUES (%s,%s,%s,%s,%s,%s,%s,'filesystem',%s,%s,%s,
+                                     'application/vnd.apache.parquet','filesystem-owner-only',
+                                     'v1',1,%s)""",
+                        (tenant, source, bucket, dataset, shard_index, row["generation_sha256"],
+                         "art_"+digest[:32], "objects/"+digest[:2]+"/"+digest, digest,
+                         row["size_bytes"], datetime(2026, 8, 1, tzinfo=timezone.utc)),
+                    )
+                    for member in catalog.members.get((dataset, shard_index), ()):
+                        connection.execute(
+                            """INSERT INTO canonical_parquet_scan_fragment_documents(
+                                   tenant_id,source_id,bucket_start,dataset,shard_index,
+                                   logical_document_id,revision,generation_sha256
+                               ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+                            (tenant, source, bucket, dataset, shard_index,
+                             member.logical_document_id, member.revision, member.generation_sha256),
+                        )
+                projector = CanonicalParquetScanProjector(
+                    BoundStore(), SimpleNamespace(archive=None), compaction_fragments=cap
+                )
+                queued = projector._over_fragmented(tenant_id=tenant, limit=1)
+                assert bool(queued) == catalog.fragmented(cap) == expected, name
+                if expected:
+                    assert len(queued) == 1 and queued[0].tenant_id == tenant, name
+                    assert projector._over_fragmented(tenant_id=tenant, limit=1) == [], name
+                    dirty = connection.execute(
+                        """SELECT logical_document_id,reason FROM canonical_parquet_scan_dirty_documents
+                            WHERE tenant_id=%s""", (tenant,)
+                    ).fetchall()
+                    assert dirty == [{"logical_document_id": "*", "reason": "compaction"}], name
+            # The unscoped sweep returns none: all eligible rows were consumed,
+            # while large replacements and empty catalogs remain unqueued.
+            projector.compaction_fragments = 16
+            assert projector._over_fragmented(tenant_id=None, limit=10) == []
+            connection.execute("DELETE FROM canonical_parquet_scan_queue")
+            connection.execute("DELETE FROM canonical_parquet_scan_dirty_documents")
+            projector.compaction_fragments = 2
+            eligible = []
+            for index, (_, catalog, _, _) in enumerate(cases()):
+                if catalog.fragmented(2):
+                    by_dataset = {}
+                    for (dataset, _), row in catalog.shards.items():
+                        count, size = by_dataset.get(dataset, (0, 0))
+                        by_dataset[dataset] = (count+1, size+row["size_bytes"])
+                    dominant = max(by_dataset, key=lambda name: (
+                        by_dataset[name][1], by_dataset[name][0], name
+                    ))
+                    eligible.append((-by_dataset[dominant][0], f"tenant:owner-{index}"))
+            queued = projector._over_fragmented(tenant_id=None, limit=2)
+            assert [row.tenant_id for row in queued] == [
+                tenant for _, tenant in sorted(eligible)[:2]
+            ]
+    return len(cases())
 
 
 def main() -> None:
@@ -395,10 +485,12 @@ def main() -> None:
         assert cleanup_queue(store, tenant, source) == set()
         assert assert_each_document_once(archive, parts_v3, every) == counts_v3
 
+    owner_cases = assert_compaction_owner_equivalence(store)
     result = {
         "status": "pass",
         "summary": {
             "sessions": 3,
+            "compaction_owner_sql_python_cases": owner_cases,
             "initial_fragments": len(parts_v1),
             "delta_fragments_rewritten": delta["fragments_rewritten"],
             "delta_documents_dirty": delta["documents_dirty"],
