@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 from .actor_attribution import ACTOR_RELATIONS
 from .authorization import decide
 from .canonical import CanonicalPlane
+from .chunk_bodies import ChunkBodyError
 from .db import BrainStore, SearchDeadlineExceeded, bounded_search_text
 from .deep_inspection import (
     AgentExecObject,
@@ -178,12 +179,14 @@ class CanonicalRetrieval:
         archive: Any = None,
         *,
         evidence_projector: Any = None,
+        chunk_body_archive: Any = None,
         deep_inspector: Any = None,
         passage_policy: PassagePolicy | None = None,
     ):
         self.store = store
         self.archive = archive
         self.evidence_projector = evidence_projector
+        self.chunk_body_archive = chunk_body_archive
         self.deep_inspector = deep_inspector
         self.passage_policy = passage_policy or DEFAULT_PASSAGE_POLICY
 
@@ -222,6 +225,7 @@ class CanonicalRetrieval:
             authorized_sources=sources,
             archive=self.archive,
             evidence_projector=self.evidence_projector,
+            chunk_body_archive=self.chunk_body_archive,
             deep_inspector=self.deep_inspector,
             passage_policy=self.passage_policy,
         )
@@ -505,6 +509,7 @@ class BoundCanonicalRetrieval:
         authorized_sources: tuple[str, ...],
         archive: Any = None,
         evidence_projector: Any = None,
+        chunk_body_archive: Any = None,
         deep_inspector: Any = None,
         passage_policy: PassagePolicy | None = None,
     ):
@@ -514,6 +519,7 @@ class BoundCanonicalRetrieval:
         self.authorized_sources = authorized_sources
         self.archive = archive
         self.evidence_projector = evidence_projector
+        self.chunk_body_archive = chunk_body_archive
         self.deep_inspector = deep_inspector
         self.passage_policy = passage_policy or DEFAULT_PASSAGE_POLICY
 
@@ -1884,11 +1890,13 @@ class BoundCanonicalRetrieval:
                 "diagnostics": diagnostics,
             }
         clip_started = time.monotonic()
+        body_sql = "NULL::text" if self.chunk_body_archive is not None else "chunk.text_redacted"
         try:
             with self.store.connect() as connection:
                 rows = self.store._execute_bounded(
                     connection,
-                    """SELECT chunk.receipt,chunk.text_redacted,
+                    f"""SELECT chunk.receipt,chunk.source_id,chunk.document_id,
+                              chunk.ordinal,{body_sql} AS text_redacted,
                               event.occurred_at
                          FROM canonical_chunks chunk
                          JOIN canonical_documents document
@@ -1921,8 +1929,12 @@ class BoundCanonicalRetrieval:
                     else time.monotonic()
                     + self.store.search_deadline_ms / 1000,
                 ).fetchall()
-        except SearchDeadlineExceeded:
-            diagnostics["time_clip_status"] = "deadline-exceeded"
+            self._hydrate_chunk_rows(rows, deadline_at=deadline_at)
+        except (SearchDeadlineExceeded, ChunkBodyError) as error:
+            diagnostics["time_clip_status"] = (
+                "deadline-exceeded" if isinstance(error, SearchDeadlineExceeded)
+                else "evidence-unavailable"
+            )
             diagnostics["time_clip_elapsed_ms"] = round((time.monotonic() - clip_started) * 1000, 3)
             diagnostics["time_filter_requires_exec"] = True
             # Every retrieval arm already applied the document-level time
@@ -2864,6 +2876,83 @@ class BoundCanonicalRetrieval:
             "objects_available": result.get("objects_available"),
         }
 
+    def _hydrate_chunk_rows(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        text_key: str = "text_redacted",
+        deadline_at: float | None = None,
+    ) -> None:
+        """Fill catalog rows from exact archived bodies; fallback only if unprojected."""
+        if self.chunk_body_archive is None or not rows:
+            return
+        from .chunk_bodies import ChunkBodyError, read_archived_chunks
+
+        if deadline_at is not None and time.monotonic() >= deadline_at:
+            raise SearchDeadlineExceeded()
+        archived = read_archived_chunks(
+            self.store,
+            self.chunk_body_archive,
+            tenant_id=self.tenant_id,
+            source_ids=self.authorized_sources,
+            document_ids=tuple(dict.fromkeys(row["document_id"] for row in rows)),
+            deadline_at=deadline_at,
+        )
+        by_receipt = {
+            chunk["receipt"]: chunk
+            for chunks in archived.values()
+            for chunk in chunks
+        }
+        missing = [
+            row for row in rows
+            if (row["source_id"], row["document_id"]) not in archived
+        ]
+        fallback = {}
+        if missing:
+            # During migration only: no object catalog means this document has
+            # not been projected yet. Object failures never reach this branch.
+            with self.store.connect() as connection:
+                fallback_rows = self.store._execute_bounded(
+                    connection,
+                    """SELECT chunk.receipt,chunk.text_redacted,chunk.text_sha256
+                         FROM canonical_chunks chunk
+                         JOIN canonical_documents document
+                           USING(tenant_id,source_id,document_id)
+                        WHERE chunk.tenant_id=%s AND chunk.source_id=ANY(%s)
+                          AND chunk.receipt=ANY(%s)
+                          AND chunk.deleted_at IS NULL
+                          AND document.is_current AND document.deleted_at IS NULL
+                          AND NOT EXISTS (
+                              SELECT 1 FROM canonical_events later
+                               WHERE later.tenant_id=document.tenant_id
+                                 AND later.source_id=document.source_id
+                                 AND later.native_id=document.native_id
+                                 AND later.revision>document.revision
+                                 AND later.is_tombstone
+                          )""",
+                    (self.tenant_id, list(self.authorized_sources),
+                     [row["receipt"] for row in missing]),
+                    deadline_at,
+                ).fetchall()
+            for row in fallback_rows:
+                if (not isinstance(row["text_redacted"], str)
+                    or hashlib.sha256(row["text_redacted"].encode()).hexdigest()
+                    != row["text_sha256"]):
+                    raise ChunkBodyError("archived_chunk_body_unavailable")
+            fallback = {row["receipt"]: row["text_redacted"] for row in fallback_rows}
+        if deadline_at is not None and time.monotonic() >= deadline_at:
+            raise SearchDeadlineExceeded()
+        for row in rows:
+            if (row["source_id"], row["document_id"]) in archived:
+                chunk = by_receipt.get(row["receipt"])
+                if chunk is None or chunk["ordinal"] != row["ordinal"]:
+                    raise ChunkBodyError("archived_chunk_body_unavailable")
+                row[text_key] = chunk["text_redacted"]
+            elif row["receipt"] in fallback:
+                row[text_key] = fallback[row["receipt"]]
+            else:
+                raise ChunkBodyError("archived_chunk_body_unavailable")
+
     def _receipt_event(
         self,
         connection: Any,
@@ -2969,6 +3058,7 @@ class BoundCanonicalRetrieval:
             if anchor is None:
                 return None
             parent = anchor["native_parent_id"] or anchor["native_id"]
+            body_sql = "NULL::text" if self.chunk_body_archive is not None else "bounded.text_redacted"
 
             def neighbors(direction: str, limit: int) -> list[dict[str, Any]]:
                 if limit == 0:
@@ -2977,7 +3067,7 @@ class BoundCanonicalRetrieval:
                 ordering = "DESC" if direction == "before" else "ASC"
                 return self.store._execute_bounded(
                     connection,
-                    f"""SELECT event.source_id,event.native_id,
+                    f"""SELECT event.source_id,event.native_id,document.document_id,
                                event.native_parent_id,document.revision,event.kind,
                                event.occurred_at,event.observed_at,event.created_at,
                                jsonb_agg(
@@ -2991,7 +3081,7 @@ class BoundCanonicalRetrieval:
                         JOIN canonical_documents document
                           USING(tenant_id,source_id,event_id)
                         JOIN LATERAL (
-                          SELECT bounded.ordinal,bounded.text_redacted,bounded.receipt
+                          SELECT bounded.ordinal,{body_sql} AS text_redacted,bounded.receipt
                           FROM canonical_chunks bounded
                           WHERE bounded.tenant_id=document.tenant_id
                             AND bounded.source_id=document.source_id
@@ -3007,7 +3097,15 @@ class BoundCanonicalRetrieval:
                               {comparator} (%s,%s)
                           AND document.is_current
                           AND document.deleted_at IS NULL
-                        GROUP BY event.source_id,event.native_id,
+                          AND NOT EXISTS (
+                            SELECT 1 FROM canonical_events later
+                             WHERE later.tenant_id=document.tenant_id
+                               AND later.source_id=document.source_id
+                               AND later.native_id=document.native_id
+                               AND later.revision>document.revision
+                               AND later.is_tombstone
+                          )
+                        GROUP BY event.source_id,event.native_id,document.document_id,
                                  event.native_parent_id,document.revision,event.kind,
                                  event.occurred_at,event.observed_at,event.created_at
                         ORDER BY event.occurred_at {ordering},
@@ -3026,11 +3124,12 @@ class BoundCanonicalRetrieval:
 
             previous = list(reversed(neighbors("before", before)))
             following = neighbors("after", after)
+            anchor_body_sql = "NULL::text" if self.chunk_body_archive is not None else "text_redacted"
             anchor_chunks = self.store._execute_bounded(
                 connection,
-                """SELECT ordinal,text,receipt
+                f"""SELECT ordinal,text,receipt
                    FROM (
-                     SELECT ordinal,text_redacted AS text,receipt
+                     SELECT ordinal,{anchor_body_sql} AS text,receipt
                      FROM canonical_chunks
                      WHERE tenant_id=%s AND source_id=%s AND document_id=%s
                        AND deleted_at IS NULL
@@ -3047,6 +3146,16 @@ class BoundCanonicalRetrieval:
                 _deadline_at,
             ).fetchall()
             anchor["chunks"] = anchor_chunks
+        if self.chunk_body_archive is not None:
+            selected_chunks = []
+            for event in previous + [anchor] + following:
+                for chunk in event["chunks"]:
+                    chunk["source_id"] = event["source_id"]
+                    chunk["document_id"] = event["document_id"]
+                    selected_chunks.append(chunk)
+            self._hydrate_chunk_rows(
+                selected_chunks, text_key="text", deadline_at=_deadline_at,
+            )
         return {
             "session": {
                 "source_id": anchor["source_id"],
@@ -3459,6 +3568,15 @@ class BoundCanonicalRetrieval:
             self._routing_filters(filters or {})
         )
         deadline_at = time.monotonic() + self.store.search_deadline_ms / 1000
+        if getattr(self.store, "search_plane", "postgres") == "turbopuffer":
+            from .parent_scoped_retrieval import parent_scoped_receipts
+
+            return parent_scoped_receipts(
+                self.store, tenant_id=self.tenant_id, source_id=source_id,
+                parent_id=parent_id, terms=terms,
+                policy_fingerprint=self.passage_policy.fingerprint,
+                since=since, until=until, limit=limit, deadline_at=deadline_at,
+            )
         try:
             with self.store.connect() as connection:
                 rows = self.store._execute_bounded(
@@ -4130,14 +4248,24 @@ class BoundCanonicalRetrieval:
             row = self._receipt_event(connection, target)
             if row is None:
                 return None
+            body_sql = "NULL::text" if self.chunk_body_archive is not None else "text_redacted"
             chunks = connection.execute(
-                """SELECT ordinal,text_redacted AS text,receipt
+                f"""SELECT ordinal,{body_sql} AS text,receipt
                    FROM canonical_chunks
                    WHERE tenant_id=%s AND source_id=%s AND document_id=%s
                      AND deleted_at IS NULL
                    ORDER BY ordinal""",
                 (self.tenant_id, row["source_id"], row["document_id"]),
             ).fetchall()
+        if self.chunk_body_archive is not None:
+            for chunk in chunks:
+                chunk["source_id"] = row["source_id"]
+                chunk["document_id"] = row["document_id"]
+            self._hydrate_chunk_rows(chunks, text_key="text")
+            chunks = [
+                {key: chunk[key] for key in ("ordinal", "text", "receipt")}
+                for chunk in chunks
+            ]
         return {
             "event": {
                 "source_id": row["source_id"],
@@ -4172,13 +4300,15 @@ class BoundCanonicalRetrieval:
             raise ValueError("unsupported canonical related request")
         if not self.authorized_sources:
             return {"results": [], "diagnostics": {"engine": "canonical-v2"}}
+        body_sql = "NULL::text" if self.chunk_body_archive is not None else "chunk.text_redacted"
         with self.store.connect() as connection:
             rows = connection.execute(
-                """SELECT chunk.source_id,document.native_id,document.revision,
+                f"""SELECT chunk.source_id,chunk.document_id,chunk.ordinal,
+                          document.native_id,document.revision,
                           event.native_parent_id,event.occurred_at,event.observed_at,
-                          event.created_at,chunk.text_redacted,chunk.receipt,
-                          event.canonical_redacted #>> '{provenance,cwd}' AS path,
-                          event.canonical_redacted #>> '{provenance,branch}' AS branch
+                          event.created_at,{body_sql} AS text_redacted,chunk.receipt,
+                          event.canonical_redacted #>> '{{provenance,cwd}}' AS path,
+                          event.canonical_redacted #>> '{{provenance,branch}}' AS branch
                    FROM canonical_chunks chunk
                    JOIN canonical_documents document
                      USING(tenant_id,source_id,document_id)
@@ -4190,9 +4320,9 @@ class BoundCanonicalRetrieval:
                      AND document.is_current
                      AND document.deleted_at IS NULL
                      AND (%s::text IS NULL OR
-                          event.canonical_redacted #>> '{provenance,cwd}'=%s)
+                          event.canonical_redacted #>> '{{provenance,cwd}}'=%s)
                      AND (%s::text IS NULL OR
-                          event.canonical_redacted #>> '{provenance,branch}'=%s)
+                          event.canonical_redacted #>> '{{provenance,branch}}'=%s)
                    ORDER BY event.occurred_at DESC,chunk.chunk_id
                    LIMIT %s""",
                 (
@@ -4205,6 +4335,7 @@ class BoundCanonicalRetrieval:
                     limit,
                 ),
             ).fetchall()
+        self._hydrate_chunk_rows(rows)
         return {
             "results": [
                 {

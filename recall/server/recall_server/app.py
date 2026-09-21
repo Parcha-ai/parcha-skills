@@ -1958,6 +1958,14 @@ def configure_runtime(dsn: str) -> None:
         semantic_runtime=SemanticRuntime.from_env(),
         rerank_runtime=build_rerank_runtime(),
     )
+    chunk_body_reads = os.environ.get("RECALL_CHUNK_BODY_READS", "postgres")
+    if chunk_body_reads not in {"postgres", "archive"}:
+        raise RuntimeError("RECALL_CHUNK_BODY_READS must be postgres or archive")
+    if chunk_body_reads == "archive" and (
+        os.environ.get("RECALL_CANONICAL_V2_ENABLED") != "1"
+        or os.environ.get("RECALL_EVIDENCE_ENABLED") != "1"
+    ):
+        raise RuntimeError("archived chunk reads require canonical evidence storage")
     Handler.external_identity_verifier = OidcJwtVerifier.from_env()
     Handler.control_plane = (
         ControlPlane.from_env(Handler.store)
@@ -2005,6 +2013,10 @@ def configure_runtime(dsn: str) -> None:
                 Handler.store,
                 Handler.archive_store,
                 evidence_projector=Handler.evidence_projector,
+                chunk_body_archive=(
+                    Handler.evidence_archive_store
+                    if chunk_body_reads == "archive" else None
+                ),
                 deep_inspector=Handler.deep_inspector,
             )
             if os.environ.get("RECALL_CANONICAL_MCP_ENABLED") == "1"
