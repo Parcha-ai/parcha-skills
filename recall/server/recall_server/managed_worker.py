@@ -226,6 +226,7 @@ class ManagedConnectorWorker:
         interval_seconds: int = DEFAULT_INTERVAL_SECONDS,
         lease_seconds: int = DEFAULT_LEASE_SECONDS,
         embedding_max_batches: int = 1,
+        chunk_body_archive: Any = None,
     ):
         if (
             type(interval_seconds) is not int
@@ -257,6 +258,7 @@ class ManagedConnectorWorker:
             store,
             archive,
             actor_identity_index=ActorIdentityIndex(secret_box.blind_index),
+            chunk_body_archive=chunk_body_archive,
         )
         self.retrieval = CanonicalRetrieval(store, archive)
 
@@ -663,6 +665,11 @@ def run_managed_worker(
         interval_seconds=interval_seconds,
         embedding_max_batches=int(
             os.environ.get("RECALL_CANONICAL_EMBED_MAX_BATCHES", "1")
+        ),
+        chunk_body_archive=(
+            build_evidence_archive_store(deadline_reads=True)
+            if os.environ.get("RECALL_CHUNK_BODY_READS", "postgres") == "archive"
+            else None
         ),
     )
     projection_enabled = os.environ.get("RECALL_MANAGED_PROJECTIONS_ENABLED") == "1"
