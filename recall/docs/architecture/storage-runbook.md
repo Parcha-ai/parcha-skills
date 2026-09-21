@@ -219,11 +219,13 @@ safe. Asynchronous passage or Parquet pointers alone do not cover logical-public
 lag. See [streaming locator publication](2026-09-21-streaming-locator-publication.md)
 and [bounded parent retirement](2026-09-21-recall-parent-chunk-retirement.md).
 
-### Current company-brain checkpoint — 2026-09-21, after chunks budget cancellation
+### Current company-brain checkpoint — 2026-09-21, after bulk archive correction
 
-MCP runs #654; projection runs #648 and managed ingestion runs #650. Schema 069,
-archive body reads and turbopuffer search are live. The managed cycle succeeded
-at 09:15:08 UTC; its new record volume was not measured.
+MCP runs #656 (`3161214`); projection remains #648 and managed ingestion #650.
+Schema 069, archive body reads and turbopuffer search are live. MCP deployed at
+13:33 UTC without restarting either worker. Installed archive/publisher checksums,
+database readiness and six preserved archive response hashes passed. The managed
+cycle succeeded at 09:15:08 UTC; its new record volume was not measured.
 
 | Component | Production responsibility | Boundary still retained |
 |---|---|---|
@@ -234,124 +236,121 @@ at 09:15:08 UTC; its new record volume was not measured.
 
 **Logical progress:** the 10:29:48 UTC source audit found **183 proof-complete
 parents out of 2,645**, with 2,462 unrepresented and zero orphan progress rows.
-That is one source, not full-corpus coverage. Acknowledged cumulative work is
-**121,269 documents / 132,018 chunks / 535,436,711 UTF-8 bytes**. These are lifetime
-clear counters; restores and revisions do not subtract from them. Manifest
-records, supported current documents and structural exclusions are different
-counts. The smaller archive outlier completed full source proof, then published
-**11,008 document locators in 43 acknowledged batches** before publication failed.
-It enrolled no parent and cleared no body; the underlying exception remains
-unknown. A diagnostic-only operator preserves the cause on a fresh run. The larger
-outlier remains outside the admitted budget. PR #654 replaces 256 guarded UPDATEs
-plus deadline settings with one guarded batch UPDATE, preserving existing proof,
-locks, predicates and commit accounting. It merged as `c6f617e` after CI passed and deployed to MCP only, with both workers
-unchanged. The installed publisher checksum, schema readiness and all six
-preserved archive response hashes passed. Fresh source retirement still must
-prove throughput and completion; local timing does not diagnose the old failure.
+This is one source, not full-corpus coverage. Acknowledged lifetime clears remain
+**121,269 documents / 132,018 chunks / 535,436,711 UTF-8 bytes** at this checkpoint.
+Restores and revisions do not subtract from those counters; neither remaining
+stored-body bytes nor physical savings can be inferred from them.
 
-**Physical progress:** documents attempt 3 completed at 09:35:12 UTC,
-reducing allocation **20,985,446,400 → 14,030,356,480 bytes**:
+The smaller archive outlier has made separately acknowledged locator progress:
+11,008 NULL-only publications in an earlier attempt whose batch failure cause
+remains unknown, then **51,200 more in 200 transactions** on #656. The latter
+completed the 52-part / 220,194,071-byte archive proof, then stopped on a known
+PostgreSQL lock conflict (`55P03`) at **13:42:49 UTC**. It enrolled no parent,
+cleared no body and reported no uncertain commit. Its authenticated recovery
+and source-reservation release passed; only a fresh plan and full proof may resume.
+A fresh follow-up then committed **2,304 more locators in nine transactions**
+before another known `55P03` at **13:52:49 UTC**, again with no body clear or
+uncertain commit. It was recovered and released; the contended parent remains
+an explicit residual while normal discovery advances. The larger archive outlier
+also remains excluded. These are publication checkpoints, not permission to
+clear from a saved proof.
+
+Two small changes now support the existing retirement path. #654 replaces
+per-document locator UPDATE/deadline calls with one guarded batch UPDATE. #656
+lets maintenance explicitly select a five-second archive socket inactivity
+allowance: the preceding attempt had failed on the serving 500 ms allowance.
+Serving remains at **500 ms**, SDK retries remain off, and overall deadlines,
+byte/hash proof and stream closure are unchanged. The #656 production archive
+proof passed; the subsequent lock conflict is a separate cause.
+
+**Physical progress:** removing the redundant chunk GIN reclaimed
+**19,381,166,080 bytes (18.05 GiB)**. Documents rewrite attempt 3 completed at
+09:35:12 UTC, reducing allocation **20,985,446,400 → 14,030,356,480 bytes**:
 **6,955,089,920 bytes (6.477 GiB) reclaimed**. Catalog identity, five indexes and
 exact receipts survived; worker, slot and temporary credential cleanup passed.
-The first attempt canceled after an observer timeout and the second failed lock
-acquisition; neither reclaimed documents storage.
+Its first two attempts reclaimed nothing. The unchanged post-rewrite card and
+18 archived-response comparisons passed.
 
-**Redundant vector removed:** PR #652's source-pinned oneoff removed
-`canonical_chunks.search_vector` at **10:49:44 UTC**, without a serving restart.
-Exact #648/#650 no-column PostgreSQL tests passed first. Production app readiness
-passed before and after DDL; all three services matched six preserved archive
-response hashes before and again after (**18 + 18 comparisons**). This column
-drop reclaimed **zero physical bytes**. The sampled vector payload estimate,
-39.72 GiB with standard error 3.48 GiB, is neither a promised saving nor a copy
-workspace bound. Fresh inspection still found **96,227,934,208 bytes (89.62 GiB)**
-allocated to chunks, four indexes and the original storage file. The first
-monitored chunk rewrite stopped after about 18 seconds on
-`provider_observation_failed`. After correcting observation freshness against
-measured provider cadence, the second stopped after **871 seconds** at its
-**16 GiB retained-WAL allowance**. Both retained the original storage file:
-**zero chunk bytes reclaimed**. The second left allocation at
-**96,229,064,704 bytes**; its worker and slot were cleaned up. Its exact progress
-probe witnessed 6.56 million copied rows before cancellation. The measured
-maximum node growth was 23.70 GiB, below the 64 GiB total-growth stop; this does
-not establish the remaining copy/index workspace or guarantee completion. A
-third attempt allowed **48 GiB WAL inside the same 64 GiB total-growth envelope**.
-It copied **14,969,299 rows**, then hit the workspace stop at **64.804 GiB observed
-growth**. The cancel worker started in **188 ms**; the job finished at
-**12:17:24 UTC**, with workers, slots, role defaults, temporary environment and
-login all cleaned up. Allocation was **96,242,982,912 → 96,267,567,104 bytes** on
-the same file and four indexes: **zero reclaim**. The whole-table copy did not fit
-this budget; do not expand capacity or blindly repeat it.
+The chunk vector column was removed at 10:49:44 UTC after 18 pre / 18 post exact
+archive checks. The column DROP reclaimed **zero physical bytes**. Three chunk
+rewrite attempts stopped respectively on provider-observation freshness, a
+16 GiB retained-WAL allowance, and the 64 GiB total-growth limit. Attempt 3 allowed
+48 GiB WAL within that unchanged total limit, copied 14,969,299 rows, then canceled
+at **64.804 GiB observed growth**. Cancellation started in 188 ms; the job finished
+at 12:17:24 UTC and all worker/slot/role/environment/login cleanup passed.
+Allocation **96,242,982,912 → 96,267,567,104 bytes**, original file/four indexes:
+**zero chunk reclaim**. Neither the copied-row count nor the estimated removed
+vector payload proves the remaining index, WAL, replay or swap workspace fits.
 
-Two local PostgreSQL fixtures show a bounded alternative: no-op row UPDATEs discard
-the dropped vector representation while preserving existing prose TOAST pointers.
-VACUUM can then recover internal space and sometimes truncate the tail. Rebuilding
-equal prose into new datums can move live tail values into holes, but was not
-monotonic: later batches grew files, and held snapshots defeated shrink. These are
-small fixture results, not a production cursor or savings estimate. The first
-production canary completed at **12:44:44 UTC**: **11 rows / 35,980 raw prose bytes**
-rewritten in **335 ms**, with every retained value and prose pointer unchanged.
-The cluster WAL upper bound was **393,712 bytes**; allocation stayed exactly
-**96,286,425,088 bytes**, so this proves no physical savings. The connection closed
-and the one-shot launch was disabled afterward. Live inventory also confirmed no
-custom triggers, rules, RLS, partitions or inheritance on chunks/documents. The next
-boundary is a separately reviewed bounded sweep; physical reclamation and provider
-capacity remain separate exits.
+A finite row-rewrite pilot completed at **13:26:16 UTC** after the earlier 11-row
+canary. It traversed 256 original heap pages and committed **1,726 rows in 27
+transactions**, preserving every retained value and native prose TOAST pointer.
+All 55 journal records were recovered with no pending or uncertain commit;
+connection, journal lease and temporary-file cleanup passed. Summed pre-COMMIT
+batch time was 5,020 ms, maximum 338 ms. Allocation **96,403,865,600 → 96,405,315,584
+bytes** grew by 1,449,984 bytes; cluster-WAL growth was at most 27,828,144 bytes.
+The unchanged post-pilot card passed 26/26. This proves finite traversal safety,
+not physical reclaim or a reason to rewrite every row.
 
-The original postdeployment card passed **26/26 gates** at **12:59:18 UTC**, with
-all **16 original evaluator hashes unchanged**: recall@20 .9625, MRR .6622,
-backend error rate zero, server search p95 **1,117.6 ms**, show p95 **516.4 ms**,
-context p95 **6,416.6 ms** and scan p95 **6,939.7 ms**. The context result uses only three calls to a variable target;
-it does not establish representative latency. A separate fixed-receipt diagnostic
-took 5,512 ms cold and 321/304 ms warm, with 4,526 ms in the first neighbor SQL
-query. The optional matching time-index operation merged as #653; the production
-index has not been built. These observations
-leave the cold/context and analytical tool tails unresolved.
+The scale investigation changes the next step: a small-prose local fixture grew
+after both a no-op sweep and ordinary VACUUM. Surviving tail rows can prevent file
+truncation, and internal holes cannot fund a separate destination relation.
+pg_squeeze already omitted the dropped vector while making its failed copy, so
+sweeping first does not inherently reduce its surviving prose/index payload.
+**Continue archive-backed body retirement before another full sweep or copy.**
+Measure remaining stored payload and any actual tail reclaim before admitting a
+new total-workspace budget. Pausing ingestion alone is not proof: the copy's own
+writes also generate WAL. No expansion or repeated whole-table attempt is implied.
 
-**Provider capacity:** PS80 and two replicas remain. The configured floor is
-275 GiB and cap 300 GiB, but **all three actual volumes remain 300 GiB**, more
-than an hour after the latest 275 GiB request completed. No replacement is
-pending and no billed disk reduction is proved. At **12:26:17 UTC**, all nodes had
-settled to about **174 GiB used / 126 GiB free**, clearing the aborted rewrite’s
-temporary growth. A completed configuration request is not the physical-capacity
-exit. No further whole-table rewrite or provider target is admitted by this checkpoint.
+**Quality and speed:** the original post-#656 card passed 26/26 at 13:36:32 UTC.
+The post-publication card also passed 26/26 at **13:49:26 UTC**, with all 16 original
+evaluator hashes unchanged: recall@20 **.9625**, MRR **.6811**, backend errors **0**.
+Its server p95 was **3,012.7 ms**, show **645.9 ms**, context **5,338.5 ms**, scan
+**11,887.5 ms**. Latency was higher than the prior run; passing gates does not
+close the speed objective or establish a causal quality gain. Context uses only
+three calls to a variable target. The separate fixed-receipt diagnostic's first
+neighbor query took 4,526 ms; optional index operation #653 remains unbuilt.
+
+**Provider capacity:** the PS80 primary remains writable, with two replicas. The floor is
+275 GiB and cap 300 GiB, but **all three actual volumes remain 300 GiB**, with no
+replacement pending and no billed disk reduction proved. At **13:44:21 UTC**,
+node usage was approximately **169.6–169.8 GiB**. The earlier completed 275 GiB
+configuration request did not shrink the disks. Usage changes, reusable pages
+and accepted configuration are separate from the physical-capacity exit.
 
 ### Next boundaries and acceptance
 
-1. **Finish the vector physical boundary in bounded steps.** The live catalog
-   inventory and tiny exact-value row rewrite passed. Prepare a finite sweep
-   that avoids revisiting moved/new row versions and preserves concurrent clears,
-   transaction limits and unknown-commit accounting. Scale only from witnessed
-   duration, allocation, WAL and concurrency behavior. Plain vacuum internal free
-   space is not file shrink; equal-text rematerialization can also grow files.
-   Preserve exact readback and the unchanged card. Count measured allocated-byte
-   reduction after cleanup, then separately verify provider volume reduction.
-2. **Finish finite source coverage, then expand explicitly.** Preserve the known
-   locator prefix and the still-unknown failure cause. The guarded batch-update
-   simplification is deployed; take fresh source/release proof and drain finite
-   pages. Audit complete, pending, disabled and excluded targets; retain the
-   publication/clear boundary and 60-second grace. No automatic corpus enrollment.
-3. **Close the context latency gap.** Prove the reviewed query/index boundary
-   with exact receipt parity and representative cold/warm/load measurements,
-   then apply the existing latency gates. A passing overall card does not close
-   an ungated tool tail.
-4. **Shrink the catalog without losing history.** Inventory audit/job consumers
-   and preserve exact cold metadata and event/job lineage before retiring hot
-   rows. Historical replay, old receipts, grants and forget must keep working.
-   Existing current-only logical archives cannot alone justify dropping history.
-   The catalog/index target below 10 GB remains unproved.
+1. **Finish finite source coverage.** Resume the known locator prefix only through
+   fresh proof. Normal pages use the existing 50-parent discovery/publication and
+   100-parent drain limits; the one-parent limit is for the isolated outlier.
+   Resume normal discovery from its furthest 185-parent frontier, not the earlier
+   outlier page. Preserve the pending projection and archive-budget residuals.
+   Keep the publication/clear boundary, disabled markers and 60-second grace;
+   reconcile current catalog keys again after cursor exhaustion.
+2. **Measure and reclaim physical space.** Distinguish remaining current-located,
+   unlocated and historical bodies before choosing more work. Preserve retained
+   history. Require measured duration, allocation, WAL and cleanup before scaling
+   a sweep or copy; ordinary VACUUM holes are not file shrink. Then verify each
+   provider volume's actual capacity separately.
+3. **Close the latency gap.** Prove the reviewed query/index boundary with exact
+   receipt parity and representative cold/warm/load measurements. A passing
+   overall card does not close an ungated tool tail.
+4. **Shrink the catalog without losing history.** Preserve audit/job consumers,
+   cold metadata, event/job lineage, old receipts, grants, replay and forget
+   before retiring hot rows. Current-only logical archives do not justify
+   deleting history. The catalog/index target below 10 GB remains unproved.
 
-After every boundary, check the user's criteria: **simplicity** means one owner
-per body/proof and fewer redundant hot representations; **power** means exact,
-authorized current and historical evidence remains usable for search and
-analysis; **doing the job** requires fresh ingestion and unchanged receipt,
-forget and quality checks; **fast** requires measured tool latency under the
-actual workload. The vector deletion removes a measured duplication; it is not
-a semantic breakthrough or a completed downsize. Jev/W5 work retains its own
-acceptance gates and does not replace this storage work.
+After every boundary: **simplicity** means fewer redundant responsibilities and
+hot copies; **power** means exact authorized current and historical evidence;
+**breakthrough** requires measured storage or latency improvement; **doing the
+job fast** requires fresh ingestion and measured tool performance alongside the
+unchanged correctness checks. The finite pilot and timeout correction are useful
+prerequisites, not a completed downsize. Jev/W5 retains its separate acceptance
+and does not substitute for this storage work.
 
-See [the living storage Cascade](../../../.cascade/recall-rewrite.md#storage-retirement-resumed--2026-09-20)
-for phase ownership. Private operational artifacts retain exact job/source
-identities; this checkpoint contains no company text or receipt identifiers.
+See [the living storage Cascade](../../../.cascade/recall-rewrite.md#storage-retirement-resumed--2026-09-20).
+Private operational artifacts retain source identities, original failed/passing
+cards, exact jobs, authenticated progress and unchanged verifier pins.
 
 ### Optional chunk search-vector retirement
 
