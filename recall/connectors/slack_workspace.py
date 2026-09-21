@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import logging
 from datetime import datetime, timezone
 from typing import Any, Mapping, Protocol
 
@@ -19,6 +20,30 @@ from connectors.attachment_extract import extract_attachment_text
 EPOCH = "1970-01-01T00:00:00Z"
 CHANNEL_BATCH_SIZE = 50
 MAX_CONFIGURED_CHANNELS = 128
+LOG = logging.getLogger(__name__)
+_DIAGNOSTIC_OPERATIONS = frozenset({
+    "channels.list", "channels.join", "users.list", "messages.history", "messages.replies",
+})
+_DIAGNOSTIC_ERRORS = frozenset({
+    "not_in_channel", "channel_not_found", "is_archived", "missing_scope",
+    "invalid_auth", "not_authed", "token_revoked", "token_expired", "account_inactive",
+    "not_allowed_token_type", "access_denied", "no_permission", "restricted_action",
+    "team_access_not_granted", "org_login_required", "ekm_access_denied", "ratelimited",
+    "invalid_cursor", "invalid_arguments", "internal_error", "fatal_error",
+    "service_unavailable", "request_timeout", "method_not_supported_for_channel_type",
+    "authority_revoked", "authority_forbidden", "upstream_error", "upstream_unavailable",
+    "cursor_expired", "response_invalid", "content_type_invalid", "response_too_large",
+    "redirect_rejected", "operation_not_allowed", "parameter_invalid", "parameter_not_allowed",
+})
+
+
+def _log_request_failure(operation: str, kind: str, error: Any) -> None:
+    operation = operation if isinstance(operation, str) and operation in _DIAGNOSTIC_OPERATIONS else "unrecognized"
+    code = error if isinstance(error, str) and error in _DIAGNOSTIC_ERRORS else "unrecognized"
+    LOG.warning(
+        "slack request failed operation=%s kind=%s error=%s", operation, kind, code,
+        extra={"slack_operation": operation, "slack_error_kind": kind, "slack_error_code": code},
+    )
 
 
 class JsonRail(Protocol):
@@ -251,9 +276,15 @@ class SlackWorkspaceConnector:
 
     def _request(self, operation: str, query: dict[str, Any]) -> dict[str, Any]:
         try:
-            return _response(self.rail.request(operation, query=query))
-        except RemoteApiError:
+            response = self.rail.request(operation, query=query)
+        except RemoteApiError as error:
+            _log_request_failure(operation, "transport", error.code)
             raise ConnectorUpstreamError("connector_upstream_error") from None
+        if not isinstance(response, dict):
+            _log_request_failure(operation, "response", "response_invalid")
+        elif response.get("ok") is not True:
+            _log_request_failure(operation, "response", response.get("error"))
+        return _response(response)
 
     def pull(self, cursor: str | None) -> ConnectorPage:
         state = _state(cursor, self.channel_ids, self.public_history)
