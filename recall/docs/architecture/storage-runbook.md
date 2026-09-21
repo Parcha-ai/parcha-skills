@@ -219,13 +219,17 @@ safe. Asynchronous passage or Parquet pointers alone do not cover logical-public
 lag. See [streaming locator publication](2026-09-21-streaming-locator-publication.md)
 and [bounded parent retirement](2026-09-21-recall-parent-chunk-retirement.md).
 
-### Current company-brain checkpoint — 2026-09-21, after bulk archive correction
+### Current company-brain checkpoint — 2026-09-21, after source15
 
-MCP runs #656 (`3161214`); projection remains #648 and managed ingestion #650.
-Schema 069, archive body reads and turbopuffer search are live. MCP deployed at
-13:33 UTC without restarting either worker. Installed archive/publisher checksums,
-database readiness and six preserved archive response hashes passed. The managed
-cycle succeeded at 09:15:08 UTC; its new record volume was not measured.
+MCP now runs #658 (`78f6ba0`); projection remains #648 and managed ingestion
+#650. Schema 069, archive body reads and turbopuffer search remain live. The
+MCP-only deployment is live without restarting either worker. Runtime verification
+succeeded at **14:53:40 UTC** in **5,055 ms**: installed publisher/archive checksums,
+schema69/readiness, six exact preserved response pairs, eight archive reads and
+two documents still empty in PostgreSQL. The unchanged post-#658 original card
+also passed 26/26 at 15:02:32 UTC; detailed latency and limitations are below.
+The earlier #656 runtime proof also passed. The managed cycle succeeded at 09:15:08 UTC;
+its new record volume was not measured. Documentation checkpoint #657 is merged.
 
 | Component | Production responsibility | Boundary still retained |
 |---|---|---|
@@ -234,12 +238,27 @@ cycle succeeded at 09:15:08 UTC; its new record volume was not measured.
 | Archil and DuckDB | Mount authorized evidence and query analytical files in execution/analysis | They do not replace transactional grants, tombstones, replay or historical receipt lookup |
 | PostgreSQL | Current authority, revision history and operational catalog | Duplicate bodies, metadata and indexes still prevent the small-catalog goal |
 
-**Logical progress:** the 10:29:48 UTC source audit found **183 proof-complete
-parents out of 2,645**, with 2,462 unrepresented and zero orphan progress rows.
-This is one source, not full-corpus coverage. Acknowledged lifetime clears remain
-**121,269 documents / 132,018 chunks / 535,436,711 UTF-8 bytes** at this checkpoint.
-Restores and revisions do not subtract from those counters; neither remaining
-stored-body bytes nor physical savings can be inferred from them.
+**Logical progress:** the last whole-source audit, at 10:29:48 UTC, found
+**183 proof-complete parents out of 2,645**, with 2,462 unrepresented and zero
+orphan progress rows. This is one source, not full-corpus coverage. New discovery
+has reached **235 parents**, and **233 are enabled**; neither count is an updated
+proof-complete count. The three earlier pending/outlier residuals remain explicit.
+
+Normal source13 published **30,861 locators in 159 transactions** and enrolled
+50 parents. It then acknowledged **23,676 documents / 28,041 chunks /
+166,360,038 UTF-8 bytes** cleared in 124 batches before one retirement deadline
+stop. Forty parent proofs completed; one failed. Three exact archived read pairs
+passed, no uncertain commit was reported, and authenticated recovery preceded
+reservation release. Enrollment did not imply all 50 parents were cleared.
+
+Gentler source15 completed **10 parent proofs / 17 batches** in **31.086 seconds**,
+clearing **2,289 documents / 2,433 chunks / 9,496,691 UTF-8 bytes**. It reported
+zero errors, partial parents or unknown commits, with three exact read pairs.
+Its result is **`bounded`**, not `no_ready` or source completion; it does not
+individually establish that source13's failed parent has been reconciled.
+Acknowledged lifetime totals are now **147,234 documents / 162,492 chunks /
+711,293,440 UTF-8 bytes**. Restores and revisions do not subtract from those
+counters; neither remaining stored-body bytes nor physical savings follows from them.
 
 The smaller archive outlier has made separately acknowledged locator progress:
 11,008 NULL-only publications in an earlier attempt whose batch failure cause
@@ -255,13 +274,16 @@ an explicit residual while normal discovery advances. The larger archive outlier
 also remains excluded. These are publication checkpoints, not permission to
 clear from a saved proof.
 
-Two small changes now support the existing retirement path. #654 replaces
+Three small changes now support the existing retirement path. #654 replaces
 per-document locator UPDATE/deadline calls with one guarded batch UPDATE. #656
 lets maintenance explicitly select a five-second archive socket inactivity
 allowance: the preceding attempt had failed on the serving 500 ms allowance.
 Serving remains at **500 ms**, SDK retries remain off, and overall deadlines,
 byte/hash proof and stream closure are unchanged. The #656 production archive
-proof passed; the subsequent lock conflict is a separate cause.
+proof passed; the subsequent lock conflict is a separate cause. #658 adds closed
+statement-stage labels to publication failures while preserving SQL, locks,
+deadlines, committed prefixes and unknown-COMMIT behavior. It does not retroactively
+identify the statement or writer responsible for the earlier conflicts.
 
 **Physical progress:** removing the redundant chunk GIN reclaimed
 **19,381,166,080 bytes (18.05 GiB)**. Documents rewrite attempt 3 completed at
@@ -302,31 +324,61 @@ Measure remaining stored payload and any actual tail reclaim before admitting a
 new total-workspace budget. Pausing ingestion alone is not proof: the copy's own
 writes also generate WAL. No expansion or repeated whole-table attempt is implied.
 
-**Quality and speed:** the original post-#656 card passed 26/26 at 13:36:32 UTC.
-The post-publication card also passed 26/26 at **13:49:26 UTC**, with all 16 original
-evaluator hashes unchanged: recall@20 **.9625**, MRR **.6811**, backend errors **0**.
-Its server p95 was **3,012.7 ms**, show **645.9 ms**, context **5,338.5 ms**, scan
-**11,887.5 ms**. Latency was higher than the prior run; passing gates does not
-close the speed objective or establish a causal quality gain. Context uses only
-three calls to a variable target. The separate fixed-receipt diagnostic's first
-neighbor query took 4,526 ms; optional index operation #653 remains unbuilt.
+**Remaining bodies:** the read-only sample completed at 14:26:06 UTC, covering
+**256 heap pages / 1,150 rows**, with four of five explicitly authorized sources
+observed. Current unlocated rows accounted for **1,360,117 of 1,668,728 sampled
+nonempty stored bytes (81.5%)**. This supports prioritizing locator publication
+and exact body retirement over another whole-table copy. Sample extrapolations
+are estimates, not physical savings or guaranteed clear eligibility. Structural
+eligibility was not inspected; zero observations do not prove absence. Historical
+bodies still require their own authority and retention review. The next source's
+anchor has been validated and a plan prepared; no clear is implied by preparation.
 
-**Provider capacity:** the PS80 primary remains writable, with two replicas. The floor is
-275 GiB and cap 300 GiB, but **all three actual volumes remain 300 GiB**, with no
-replacement pending and no billed disk reduction proved. At **13:44:21 UTC**,
-node usage was approximately **169.6–169.8 GiB**. The earlier completed 275 GiB
-configuration request did not shrink the disks. Usage changes, reusable pages
-and accepted configuration are separate from the physical-capacity exit.
+**Quality and speed:** the original card after source13 was degraded at **22/26**,
+with availability/search failures during observed database load and replica lag.
+These observations do not establish the precise cause. Its recovery card reached **25/26**,
+leaving an isolated scope-latency failure whose exact cause was not established.
+Both results remain preserved. After gentler source15, the unchanged original
+card passed **26/26 at 14:49:44 UTC**, with all 16 evaluator hashes unchanged:
+recall@20 **.9625**, MRR **.6579**, zero backend errors; p95 scope **342.8 ms**,
+search **1,706.7 ms**, server **813.0 ms**, show **578.1 ms**, context **3,843.2 ms**,
+scan **8,314.5 ms**. This is the pre-#658-deployment recovery card.
+
+The post-#658 original card then passed **26/26**, terminal at **15:02:32 UTC**
+after 163.6 seconds, with all 16 verifier hashes unchanged: recall@20 **.9625**,
+MRR **.6628**, zero backend/auth/tool errors; p95 scope **351.3 ms**, search
+**1,464.2 ms**, server **1,009.2 ms**, show **655.3 ms**, context **5,140.3 ms**,
+scan **7,578.7 ms**. Both passing cards and the earlier failures remain preserved.
+Passing gates does not close the speed objective or establish a causal gain. Context still uses only three calls to a
+variable target and its tail remains unfinished; optional index operation #653
+remains unbuilt. The three-page driver stays disabled after the pressure episode.
+
+**Provider capacity:** the PS80 primary remains writable, with two replicas. The
+floor is 275 GiB and cap 300 GiB, but **all three actual volumes remain 300 GiB**,
+with no replacement pending and no billed disk reduction proved. At **14:30:44 UTC**,
+used bytes were **187,898,855,424 / 187,901,313,024 / 187,901,280,256** (about
+175.0 GiB per node). The completed 275 GiB request did not shrink the disks, and
+capacity was not expanded. Measured physical reclaim remains **24.53 GiB** from
+the chunk GIN and documents rewrite alone; chunk-body rewrites have reclaimed
+zero. Usage
+changes, reusable pages and accepted configuration are separate from the
+physical-capacity exit.
 
 ### Next boundaries and acceptance
 
-1. **Finish finite source coverage.** Resume the known locator prefix only through
-   fresh proof. Normal pages use the existing 50-parent discovery/publication and
-   100-parent drain limits; the one-parent limit is for the isolated outlier.
-   Resume normal discovery from its furthest 185-parent frontier, not the earlier
-   outlier page. Preserve the pending projection and archive-budget residuals.
-   Keep the publication/clear boundary, disabled markers and 60-second grace;
-   reconcile current catalog keys again after cursor exhaustion.
+1. **Finish finite source coverage without sustained serving pressure.** Reconcile
+   the current bounded drain before advancing discovery from the furthest
+   **235-parent** frontier; do not jump back to the earlier outlier cursor.
+   Retain the three pending/outlier residuals and source13's deadline follow-up.
+   Favor the measured gentler window: ten drain parents, 64 MiB clear, 512 MiB
+   archive and 600 seconds, with fresh proof and unchanged quality checks between
+   jobs. Fifty-parent discovery/publication remains available; the earlier
+   100-parent drain allowance is not evidence that sustained load is acceptable.
+   Keep the three-page driver disabled until this boundary is reviewed again.
+   The next validated source anchor still needs fresh admission before execution.
+   Preserve disabled markers and the publication/clear boundary with 60-second
+   grace; reconcile current catalog keys again after cursor exhaustion.
+
 2. **Measure and reclaim physical space.** Distinguish remaining current-located,
    unlocated and historical bodies before choosing more work. Preserve retained
    history. Require measured duration, allocation, WAL and cleanup before scaling
