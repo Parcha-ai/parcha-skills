@@ -159,6 +159,7 @@ def prepare_history(store, archive, *, tenant_id: str, candidates: list[dict[str
                         if chunks is None:
                             raise HistoryUnavailable()
                         staged.add(row, chunks)
+                    del chunks, restored
         except HistoryAuthorityError:
             raise
         except Exception:
