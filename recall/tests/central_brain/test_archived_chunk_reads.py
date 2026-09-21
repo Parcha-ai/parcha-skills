@@ -95,7 +95,9 @@ class ReaderStore:
             if not self.live or SOURCE not in values[1] or values[2] != self.target:
                 return Rows([])
             return Rows([{**self.anchor, "anchor_ordinal": 2}])
-        if "FROM canonical_events event" in normalized and "GROUP BY" in normalized:
+        if "FROM canonical_events" in normalized and "GROUP BY" in normalized:
+            if tuple(values[:3]) != (TENANT, SOURCE, PARENT):
+                return Rows([])
             previous = "< (%s,%s)" in normalized
             selected = list(reversed(self.events[:2])) if previous else self.events[3:]
             result = []

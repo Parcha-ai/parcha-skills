@@ -3011,6 +3011,9 @@ class BoundCanonicalRetrieval:
                     return []
                 comparator = "<" if direction == "before" else ">"
                 ordering = "DESC" if direction == "before" else "ASC"
+                # Keep event ordering ahead of the correlated eligibility work.
+                # The two OFFSET fences let LIMIT stop document/chunk/tombstone
+                # probes after enough live neighbors, without capping candidates.
                 return self.store._execute_bounded(
                     connection,
                     f"""SELECT event.source_id,event.native_id,event.document_id,
@@ -3028,31 +3031,42 @@ class BoundCanonicalRetrieval:
                                  document.document_id,event.native_parent_id,
                                  document.revision,event.kind,event.occurred_at,
                                  event.observed_at,event.created_at
-                          FROM canonical_events event
-                          JOIN canonical_documents document
-                            USING(tenant_id,source_id,event_id)
-                          WHERE event.tenant_id=%s
-                            AND event.source_id=%s
-                            AND COALESCE(event.native_parent_id,event.native_id)=%s
-                            AND (event.occurred_at,event.native_id)
-                                {comparator} (%s,%s)
-                            AND document.is_current
-                            AND document.deleted_at IS NULL
-                            AND NOT EXISTS (
-                              SELECT 1 FROM canonical_events later
-                               WHERE later.tenant_id=document.tenant_id
-                                 AND later.source_id=document.source_id
-                                 AND later.native_id=document.native_id
-                                 AND later.revision>document.revision
-                                 AND later.is_tombstone
-                            )
-                            AND EXISTS (
-                              SELECT 1 FROM canonical_chunks live
-                               WHERE live.tenant_id=document.tenant_id
-                                 AND live.source_id=document.source_id
-                                 AND live.document_id=document.document_id
-                                 AND live.deleted_at IS NULL
-                            )
+                          FROM (
+                            SELECT tenant_id,source_id,event_id,native_id,
+                                   native_parent_id,kind,occurred_at,observed_at,created_at
+                            FROM canonical_events
+                            WHERE tenant_id=%s
+                              AND source_id=%s
+                              AND COALESCE(native_parent_id,native_id)=%s
+                              AND (occurred_at,native_id) {comparator} (%s,%s)
+                            ORDER BY occurred_at {ordering},native_id {ordering}
+                            OFFSET 0
+                          ) event
+                          JOIN LATERAL (
+                            SELECT document.document_id,document.revision
+                            FROM canonical_documents document
+                            WHERE document.tenant_id=event.tenant_id
+                              AND document.source_id=event.source_id
+                              AND document.event_id=event.event_id
+                              AND document.is_current
+                              AND document.deleted_at IS NULL
+                              AND NOT EXISTS (
+                                SELECT 1 FROM canonical_events later
+                                 WHERE later.tenant_id=document.tenant_id
+                                   AND later.source_id=document.source_id
+                                   AND later.native_id=document.native_id
+                                   AND later.revision>document.revision
+                                   AND later.is_tombstone
+                              )
+                              AND EXISTS (
+                                SELECT 1 FROM canonical_chunks live
+                                 WHERE live.tenant_id=document.tenant_id
+                                   AND live.source_id=document.source_id
+                                   AND live.document_id=document.document_id
+                                   AND live.deleted_at IS NULL
+                              )
+                            OFFSET 0
+                          ) document ON true
                           ORDER BY event.occurred_at {ordering},event.native_id {ordering}
                           LIMIT %s
                         ) event
