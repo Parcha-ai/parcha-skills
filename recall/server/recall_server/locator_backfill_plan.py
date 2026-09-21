@@ -10,22 +10,18 @@ from collections import Counter
 from dataclasses import dataclass
 import hashlib
 import math
-from io import BytesIO
 import time
 from typing import Any
 
 import orjson
 import psycopg
 
-from .canonical_text import MAX_CANONICAL_TEXT_BYTES
 from .chunk_bodies import (
     _EXCLUDED_TYPES, _VerifiedArchive, _check_deadline,
     _record_location, _verified_body,
 )
 from .db import SearchDeadlineExceeded
-from .evidence_projection import CanonicalEvidenceProjector
-from .logical_evidence import LogicalEvidenceProjectionStore, MAX_PART_BYTES
-from .passage_projection import decode_logical_record
+from .logical_body_proof import LogicalBodyProofError, iter_parent_bodies
 
 
 class LocatorPlanError(ValueError):
@@ -213,81 +209,40 @@ def _prove_parent(store: Any, archive: Any, *, tenant_id: str, source_id: str,
         if len(documents) != len(before['documents']):
             raise LocatorPlanError('locator_plan_catalog_invalid')
         excluded, eligible, changes, unchanged = Counter(), set(), [], 0
-        projection = LogicalEvidenceProjectionStore(meter)
-        digest = hashlib.sha256()
-        ordinal, receipts, seen, first, segments, body_bytes = 0, 0, set(), None, [], 0
-        for part_number, part in enumerate(parts):
-            if (part['tenant_id'] != tenant_id or part['source_id'] != source_id
-                    or part['logical_document_id'] != manifest['logical_document_id']
-                    or part['revision'] != manifest['revision'] or part['part_ordinal'] != part_number
-                    or part['first_record_ordinal'] != ordinal
-                    or type(part['size_bytes']) is not int or not 0 < part['size_bytes'] <= MAX_PART_BYTES):
-                raise LocatorPlanError('locator_plan_catalog_invalid')
-            payload = projection.read_part(CanonicalEvidenceProjector._reference(part),
-                                           tenant_id=tenant_id, source_id=source_id)
-            digest.update(payload)
-            if not payload.endswith(b'\n'):
-                raise LocatorPlanError('locator_plan_part_invalid')
-            part_receipts = 0
-            for line in BytesIO(payload):
-                _check_deadline(deadline_at)
-                record = decode_logical_record(line, source_id=source_id)
-                if record.ordinal != ordinal or ordinal >= limits.max_records:
+        seen = set()
+        try:
+            for first, segments in iter_parent_bodies(meter, tenant_id=tenant_id, source_id=source_id,
+                    native_parent_id=native_parent_id, manifest=manifest, parts=parts,
+                    max_records=limits.max_records, max_bytes=limits.max_bytes, deadline_at=deadline_at):
+                native = first.event_native_id
+                if native in seen:
                     raise LocatorPlanError('locator_plan_part_invalid')
-                ordinal += 1
-                if first is None:
-                    if record.segment_ordinal != 0 or not record.receipts or record.event_native_id in seen:
-                        raise LocatorPlanError('locator_plan_part_invalid')
-                    first, segment_index, body_bytes = record, 0, 0
-                    row = documents.get(record.event_native_id)
-                    reason = ('not_current' if row is None else
-                              'oversized' if row['raw_media_type'] == 'application/vnd.recall.oversized-record+gzip' else
-                              'structural' if _EXCLUDED_TYPES.intersection(row['structural_types']) else None)
-                elif (record.event_native_id != first.event_native_id or record.event_kind != first.event_kind
-                      or record.occurred_at != first.occurred_at or record.roles != first.roles
-                      or record.actor_links != first.actor_links or record.receipts):
-                    raise LocatorPlanError('locator_plan_part_invalid')
-                if record.segment_ordinal != segment_index or record.segment_count != first.segment_count:
-                    raise LocatorPlanError('locator_plan_part_invalid')
-                segment_index += 1
-                part_receipts += len(record.receipts)
-                body_bytes += len(record.text.encode())
-                if reason is None and body_bytes > MAX_CANONICAL_TEXT_BYTES:
-                    reason = 'event_body_budget'
-                    segments.clear()
+                seen.add(native)
+                row = documents.get(native)
+                reason = ('not_current' if row is None else
+                          'oversized' if row['raw_media_type'] == 'application/vnd.recall.oversized-record+gzip' else
+                          'structural' if _EXCLUDED_TYPES.intersection(row['structural_types']) else
+                          'event_body_budget' if segments is None else None)
                 if reason is None:
-                    segments.append(record)
-                if segment_index == first.segment_count:
-                    native = first.event_native_id
-                    seen.add(native)
-                    if reason is None:
-                        stored = _record_location(row)
-                        location = (first.ordinal, first.ordinal + first.segment_count)
-                        if stored is not None and stored != location:
-                            raise LocatorPlanError('locator_plan_existing_position_invalid')
-                        verified = _verified_body(row, segments, stored, ())
-                        if verified is None:
-                            reason = ('pending_revision' if list(first.receipts) != [c['receipt'] for c in row['chunks']]
-                                      else 'historical_chunk_boundaries')
+                    stored = _record_location(row)
+                    location = (first.ordinal, first.ordinal + first.segment_count)
+                    if stored is not None and stored != location:
+                        raise LocatorPlanError('locator_plan_existing_position_invalid')
+                    verified = _verified_body(row, segments, stored, ())
+                    if verified is None:
+                        reason = ('pending_revision' if list(first.receipts) != [c['receipt'] for c in row['chunks']]
+                                  else 'historical_chunk_boundaries')
+                    else:
+                        eligible.add(native)
+                        if stored is None:
+                            changes.append(dict(document_id=row['document_id'], record_ordinal=first.ordinal,
+                                                record_count=first.segment_count))
                         else:
-                            eligible.add(native)
-                            if stored is None:
-                                changes.append(dict(document_id=row['document_id'], record_ordinal=first.ordinal,
-                                                    record_count=first.segment_count))
-                            else:
-                                unchanged += 1
-                    if reason is not None:
-                        excluded[reason] += 1
-                    first = None
-                    segments.clear()
-                del record
-            if ordinal - 1 != part['last_record_ordinal'] or part_receipts != part['receipt_count']:
-                raise LocatorPlanError('locator_plan_part_invalid')
-            receipts += part_receipts
-            del payload, line
-        if (first is not None or ordinal != manifest['record_count'] or receipts != manifest['receipt_count']
-                or digest.hexdigest() != manifest['document_content_sha256']):
-            raise LocatorPlanError('locator_plan_part_invalid')
+                            unchanged += 1
+                if reason is not None:
+                    excluded[reason] += 1
+        except LogicalBodyProofError as error:
+            raise LocatorPlanError(str(error).replace('logical_body_', 'locator_plan_')) from None
         for native, row in documents.items():
             if native not in seen:
                 if row['raw_media_type'] == 'application/vnd.recall.oversized-record+gzip':
@@ -397,6 +352,12 @@ def _apply_proof(store, proof):
                   (proof.tenant, proof.source)).rowcount
             if updated != len(changes):
                 raise LocatorPlanError('locator_plan_catalog_changed')
+            # Filling earlier NULL positions changes retirement eligibility
+            # without changing the immutable parent manifest. Pause any old
+            # attempt via its epoch and revisit this enabled parent. Schema68
+            # and explicitly disabled scopes retain their prior behavior.
+            from .chunk_retirement import invalidate_parent_retirement
+            invalidate_parent_retirement(query, scope)
             _check_deadline(proof.deadline_at)
     return updated
 
