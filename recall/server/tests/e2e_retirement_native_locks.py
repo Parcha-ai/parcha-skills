@@ -59,9 +59,9 @@ def case(store, root, mode, failure):
         result = execute(conn, sql, values, deadline_at)
         if 'WITH ORDINALITY AS keys' in sql:
             arrays.append(values[0])
-        update = ("UPDATE canonical_chunks SET text_redacted=''" if mode == 'clear'
-                  else 'UPDATE canonical_documents SET body_record_ordinal=')
-        if failure == 'deadline' and update in sql and not timed_out:
+        update = ("UPDATE canonical_chunks SET text_redacted=''" in sql if mode == 'clear'
+                  else sql.lstrip().startswith('UPDATE canonical_documents') and 'SET body_record_ordinal=' in sql)
+        if failure == 'deadline' and update and not timed_out:
             timed_out.append(True)
             # Real SQL timeout after a real UPDATE; the caller must roll it back.
             execute(conn, 'SELECT pg_sleep(0.2)', (), time.monotonic()+0.03)

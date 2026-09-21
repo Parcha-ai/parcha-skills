@@ -88,7 +88,7 @@ def _publish_batch(
                 (*scope[:2], ids, scope[2]),
             ).fetchall()
             desired = {row["document_id"]: row for row in rows}
-            if len(current) != len(desired):
+            if len(desired) != len(rows) or len(current) != len(desired):
                 raise LocatorPublicationError("locator_publication_document_changed")
             changes = []
             for row in current:
@@ -163,24 +163,38 @@ def _publish_batch(
                 raise LocatorPublicationError("locator_publication_chunks_changed")
             if should_stop is not None and should_stop():
                 raise LocatorPublicationError("locator_publication_interrupted")
-            for row in changes:
-                if (
-                    query(
-                        """UPDATE canonical_documents SET body_record_ordinal=%s,body_record_count=%s
-                    WHERE tenant_id=%s AND source_id=%s AND document_id=%s
-                      AND is_current AND deleted_at IS NULL AND revision=%s AND text_sha256=%s
-                      AND body_record_ordinal IS NULL AND body_record_count IS NULL""",
-                        (
-                            row["record_ordinal"],
-                            row["record_count"],
-                            *scope[:2],
-                            row["document_id"],
-                            row["revision"],
-                            row["text_sha256"],
-                        ),
-                    ).rowcount
-                    != 1
-                ):
+            if changes:
+                # Rows are already locked and unique. Retain every predicate
+                # and reject a partial match before this transaction commits.
+                placeholders = ",".join(
+                    ["(%s::text,%s::integer,%s::text,%s::integer,%s::integer)"]
+                    * len(changes)
+                )
+                if query(
+                    """UPDATE canonical_documents AS document
+                    SET body_record_ordinal=desired.record_ordinal,body_record_count=desired.record_count
+                    FROM (VALUES """
+                    + placeholders
+                    + """) AS desired(
+                        document_id,revision,text_sha256,record_ordinal,record_count)
+                    WHERE document.tenant_id=%s AND document.source_id=%s
+                      AND document.document_id=desired.document_id
+                      AND document.is_current AND document.deleted_at IS NULL
+                      AND document.revision=desired.revision AND document.text_sha256=desired.text_sha256
+                      AND document.body_record_ordinal IS NULL AND document.body_record_count IS NULL""",
+                    tuple(
+                        row[key]
+                        for row in changes
+                        for key in (
+                            "document_id",
+                            "revision",
+                            "text_sha256",
+                            "record_ordinal",
+                            "record_count",
+                        )
+                    )
+                    + scope[:2],
+                ).rowcount != len(changes):
                     raise LocatorPublicationError(
                         "locator_publication_document_changed"
                     )

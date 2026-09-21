@@ -71,6 +71,111 @@ def state(store, scope):
         ).fetchall()
 
 
+def is_locator_update(statement):
+    return statement.lstrip().startswith("UPDATE canonical_documents") and (
+        "SET body_record_ordinal=" in statement
+    )
+
+
+def batch_updates(store, root):
+    scope, archive, _ = setup(store, root, count=256)
+    initial = state(store, scope)
+    execute = store._execute_bounded
+    updates = []
+
+    def observe(connection, statement, values, deadline_at):
+        result = execute(connection, statement, values, deadline_at)
+        if is_locator_update(statement):
+            updates.append(result.rowcount)
+        return result
+
+    with patch.object(store, "_execute_bounded", side_effect=observe):
+        report = locators.publish_parent_locators(
+            store,
+            archive,
+            **scope,
+            apply=True,
+            limits=ParentRetirementLimits(batch_documents=256),
+        )
+    assert report["published_documents"] == 256 and report["batches"] == 1
+    assert updates == [256], updates
+    final = state(store, scope)
+    assert all(row["body_record_ordinal"] is not None for row in final)
+    assert [
+        {k: v for k, v in row.items() if not k.startswith("body_record")}
+        for row in final
+    ] == [
+        {k: v for k, v in row.items() if not k.startswith("body_record")}
+        for row in initial
+    ]
+    updates.clear()
+    with patch.object(store, "_execute_bounded", side_effect=observe):
+        assert (
+            locators.publish_parent_locators(store, archive, **scope, apply=True)[
+                "published_documents"
+            ]
+            == 0
+        )
+    assert updates == []
+
+
+def batch_mismatch_and_duplicate(store, root):
+    scope, archive, _ = setup(store, root, count=4)
+    initial = state(store, scope)
+    execute = store._execute_bounded
+    attempted = []
+
+    def change_locked_row(connection, statement, values, deadline_at):
+        if is_locator_update(statement) and not attempted:
+            # Change a predicate after the owning snapshots on the same
+            # connection, so the actual UPDATE count guard must roll back.
+            connection.execute(
+                """UPDATE canonical_documents SET text_sha256=%s
+                WHERE tenant_id=%s AND source_id=%s AND document_id=%s""",
+                (
+                    "f" * 64,
+                    scope["tenant_id"],
+                    scope["source_id"],
+                    initial[-1]["document_id"],
+                ),
+            )
+            attempted.append(True)
+        return execute(connection, statement, values, deadline_at)
+
+    with patch.object(store, "_execute_bounded", side_effect=change_locked_row):
+        error = denied(
+            lambda: locators.publish_parent_locators(
+                store, archive, **scope, apply=True
+            )
+        )
+    assert attempted and str(error) == "locator_publication_document_changed"
+    assert not error.commit_unknown and error.committed == dict(
+        batches=0, published_documents=0
+    )
+    assert state(store, scope) == initial
+    # A fresh full proof also verifies that the injected document hash rolled
+    # back; the existing state helper intentionally contains only body/locators.
+    assert (
+        locators.publish_parent_locators(store, archive, **scope)["proposed_documents"]
+        == 4
+    )
+    publish = locators._publish_batch
+
+    def duplicate(*args, **kwargs):
+        kwargs["rows"] = kwargs["rows"] + [kwargs["rows"][0]]
+        return publish(*args, **kwargs)
+
+    with patch.object(locators, "_publish_batch", side_effect=duplicate):
+        error = denied(
+            lambda: locators.publish_parent_locators(
+                store, archive, **scope, apply=True
+            )
+        )
+    assert str(error) == "locator_publication_document_changed"
+    assert not error.commit_unknown and error.committed["published_documents"] == 0
+    assert state(store, scope) == initial
+
+
 def basic(store, root):
     scope, archive, _ = setup(store, root)
     limits = ParentRetirementLimits(batch_documents=3, max_batches=2)
@@ -209,9 +314,7 @@ def failures(store, root):
 
     def fail_after_update(connection, sql, values, deadline_at):
         result = execute(connection, sql, values, deadline_at)
-        if sql.lstrip().startswith(
-            "UPDATE canonical_documents SET body_record_ordinal="
-        ):
+        if is_locator_update(sql):
             updated.append(True)
             raise RuntimeError("synthetic after update")
         return result
@@ -335,9 +438,7 @@ def commit_races(store, root):
 
     def observe_update(connection, sql, values, deadline_at):
         result = execute(connection, sql, values, deadline_at)
-        if sql.lstrip().startswith(
-            "UPDATE canonical_documents SET body_record_ordinal="
-        ):
+        if is_locator_update(sql):
             updated.append(True)
         return result
 
@@ -422,6 +523,51 @@ def commit_races(store, root):
     assert report["published_documents"] == 2 and report["complete"]
 
 
+def lost_ack_after_prefix(store, root):
+    from contextlib import contextmanager
+
+    scope, archive, _ = setup(store, root, count=6)
+    initial = state(store, scope)
+    publish = locators._publish_batch
+    transaction = psycopg.Connection.transaction
+    attempts = []
+
+    def track(*args, **kwargs):
+        attempts.append(True)
+        return publish(*args, **kwargs)
+
+    @contextmanager
+    def commit_then_disconnect(connection, *args, **kwargs):
+        with transaction(connection, *args, **kwargs):
+            yield
+        if len(attempts) == 2:
+            raise psycopg.OperationalError("synthetic lost commit acknowledgement")
+
+    with (
+        patch.object(locators, "_publish_batch", side_effect=track),
+        patch.object(psycopg.Connection, "transaction", commit_then_disconnect),
+    ):
+        error = denied(
+            lambda: locators.publish_parent_locators(
+                store,
+                archive,
+                **scope,
+                apply=True,
+                limits=ParentRetirementLimits(batch_documents=2),
+            )
+        )
+    assert len(attempts) == 2 and error.commit_unknown
+    assert error.committed == dict(batches=1, published_documents=2)
+    assert (
+        sum(row["body_record_ordinal"] is not None for row in state(store, scope)) == 4
+    )
+    report = locators.publish_parent_locators(store, archive, **scope, apply=True)
+    assert report["published_documents"] == 2 and report["complete"]
+    assert [row["text_redacted"] for row in state(store, scope)] == [
+        row["text_redacted"] for row in initial
+    ]
+
+
 def absent_ledger_enrollment_races(store, root):
     scope, archive, _ = setup(store, root, count=2)
     parent_scope = {
@@ -432,12 +578,7 @@ def absent_ledger_enrollment_races(store, root):
 
     def enroll_during_publication(connection, sql, values, deadline_at):
         result = execute(connection, sql, values, deadline_at)
-        if (
-            sql.lstrip().startswith(
-                "UPDATE canonical_documents SET body_record_ordinal="
-            )
-            and not attempted
-        ):
+        if is_locator_update(sql) and not attempted:
             attempted.append(True)
             try:
                 # A distinct pooled connection tries the real enrollment API
@@ -650,9 +791,12 @@ def main():
     try:
         store.migrate()
         with tempfile.TemporaryDirectory() as directory:
+            batch_updates(store, Path(directory))
+            batch_mismatch_and_duplicate(store, Path(directory))
             basic(store, Path(directory))
             failures(store, Path(directory))
             commit_races(store, Path(directory))
+            lost_ack_after_prefix(store, Path(directory))
             absent_ledger_enrollment_races(store, Path(directory))
             large = large_parent(store, Path(directory))
         print(
