@@ -377,10 +377,10 @@ class BrainStore:
                 elif version in recorded:
                     skipped.append(version)
                     continue
-                elif not retire_postgres_plane:
+                elif version == RETIRE_POSTGRES_PLANE_VERSION and not retire_postgres_plane:
                     deferred.append(version)
                     continue
-                elif self.search_plane != "turbopuffer":
+                elif version == RETIRE_POSTGRES_PLANE_VERSION and self.search_plane != "turbopuffer":
                     raise SearchPlaneSchemaError(RETIRE_POSTGRES_PLANE_REFUSED)
                 conn.execute(schema.read_text())
                 if version not in recorded:
@@ -393,7 +393,7 @@ class BrainStore:
             "skipped": len(skipped),
             "deferred": deferred,
             "postgres_vector_plane": (
-                "retired" if current >= RETIRE_POSTGRES_PLANE_VERSION else "present"
+                "retired" if RETIRE_POSTGRES_PLANE_VERSION in recorded | set(applied) else "present"
             ),
         }
 
@@ -401,8 +401,9 @@ class BrainStore:
         """Refuse the postgres plane once migration 067 retired it (H3-e').
 
         Runs once when the pool opens. A database without ``schema_migrations``
-        (fresh, before ``migrate``) or below version 067 passes on either
-        plane; a database at or above 067 passes only on the turbopuffer plane.
+        (fresh, before ``migrate``) or without migration 067 passes on either
+        plane; recorded 067 permits only the turbopuffer plane, regardless
+        of later additive migration versions.
         """
 
         versions = applied_migration_versions(connection)

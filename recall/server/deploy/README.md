@@ -223,8 +223,9 @@ them. It is destructive, so `migrate` never applies it on its own:
 - After 067 every process must run with `RECALL_SEARCH_PLANE=turbopuffer`: a store started
   with `RECALL_SEARCH_PLANE=postgres` (web, workers, `cli migrate`) refuses to open its pool
   with `migration 067 retired the Postgres vector plane ...`. `capability-check` accepts a
-  database at 066 with the embeddings table (postgres plane) or at 067 without it
-  (turbopuffer plane), and reports `schema_drift` for the torn states in between.
+  database with all mandatory migrations, including 068. The embeddings table must
+  exist when optional migration 067 is absent and be absent when 067 is recorded;
+  disagreement is `schema_drift`.
 
 On the turbopuffer plane the writers already leave the retired objects alone, before and
 after 067: the differential passage commit neither captures nor re-attaches embeddings,
@@ -271,10 +272,9 @@ ledger are all still there, and the embedding worker resumes where it stopped). 
 rebuilt, if ever needed, with `search-outbox-seed` plus a drain.
 
 The production database gate requires a standard PostgreSQL URL with
-`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 67
-(migration 67 retires the Postgres vector plane and is applied by hand from the
-turbopuffer plane, see below; a database at 66 with the embeddings table is current on
-the postgres plane, one at 67 without it is current on the turbopuffer plane),
+`sslmode=verify-full` and an explicit trust root, schema migrations 1 through 68
+(optional migration 67 retires the Postgres vector plane and is applied by hand from
+the turbopuffer plane; every other migration is mandatory on both planes),
 pgvector 0.8.0 or newer, and a runtime role without superuser, database/role creation,
 replication, or RLS-bypass privilege:
 
@@ -1408,3 +1408,21 @@ python -m recall_server.archive_snapshot restore-test /secure/archive-snapshot /
 
 Both commands emit aggregate counts and fingerprints only. The restore refuses a symlink, a
 non-owner-only tree, tampered bytes or metadata, and any nonempty destination.
+
+### Exact body record positions (068)
+
+Apply migration 068 before deploying the worker or enabling archive body reads;
+application startup does not apply it. It adds two nullable integers on existing
+canonical documents and does not clear any prose. Logical publication fills only
+changed record positions in the same transaction as the current parent catalog.
+Unchanged append prefixes are not rewritten. A document-lock conflict aborts that
+publication attempt immediately and leaves the queue for retry.
+
+Located reads fetch intersecting existing parts and verify current receipts, complete
+event text and every canonical chunk hash. Parent growth beyond 64 MiB cannot strand
+a located body. NULL positions retain the transitional reader; deployment alone does
+not backfill existing parents. Context callers can retain only requested chunks after
+full-event verification, and excess retained output fails explicitly.
+
+This migration does not authorize body thinning. Historical receipt recovery, measured
+locator coverage, and both ingest writer paths remain separate retirement gates.
