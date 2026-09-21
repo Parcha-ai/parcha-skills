@@ -19,6 +19,7 @@ from .chunk_retirement import (
     ParentRetirementLimits,
     _parent_deadline,
     _parent_scope,
+    _try_parent_native_locks,
     require_retirement_owner,
 )
 from .logical_evidence import IDENTITY_RE
@@ -64,14 +65,8 @@ def _publish_batch(
             require_retirement_owner(
                 store, connection, scope[:2], principal, deadline_at
             )
-            for key in sorted(
-                f"v2\x1f{scope[0]}\x1f{scope[1]}\x1f{row['native_id']}" for row in rows
-            ):
-                if not query(
-                    "SELECT pg_try_advisory_xact_lock(hashtextextended(%s,0)) AS locked",
-                    (key,),
-                ).fetchone()["locked"]:
-                    raise LocatorPublicationError("locator_publication_lock_busy")
+            if not _try_parent_native_locks(query, scope, rows):
+                raise LocatorPublicationError("locator_publication_lock_busy")
             ids = sorted(row["document_id"] for row in rows)
             current = query(
                 """SELECT document.tenant_id,document.source_id,document.document_id,document.native_id,

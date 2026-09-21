@@ -390,6 +390,22 @@ def invalidate_parent_retirement(query, scope):
             WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s AND enabled""", scope)
 
 
+def _try_parent_native_locks(query, scope, rows):
+    keys = sorted(f'v2\x1f{scope[0]}\x1f{scope[1]}\x1f{row["native_id"]}' for row in rows)
+    if not keys:
+        return True
+    # Preserve Python's existing key order regardless of database collation.
+    # PostgreSQL evaluates this volatile output after ORDER BY ordinality.
+    locks = query('''SELECT ordinality,
+        pg_try_advisory_xact_lock(hashtextextended(lock_key,0)) AS locked
+        FROM unnest(%s::text[]) WITH ORDINALITY AS keys(lock_key,ordinality)
+        ORDER BY ordinality''', (keys,)).fetchall()
+    return len(locks) == len(keys) and all(
+        row['ordinality'] == ordinal and row['locked'] is True
+        for ordinal, row in enumerate(locks, 1)
+    )
+
+
 def _retire_parent_batch(store, *, proof, rows, scope, limits, deadline_at, complete, remaining_bytes, owner_principal_id=None):
     from .parent_chunk_proof import manifest_identity, read_parent_catalog
     if os.environ.get('RECALL_CHUNK_BODY_READS', 'postgres') != 'archive':
@@ -405,9 +421,8 @@ def _retire_parent_batch(store, *, proof, rows, scope, limits, deadline_at, comp
             return store._execute_bounded(connection, sql, values, deadline_at)
         if owner_principal_id is not None:
             require_retirement_owner(store, connection, scope[:2], owner_principal_id, deadline_at)
-        for key in sorted(f'v2\x1f{scope[0]}\x1f{scope[1]}\x1f{row["native_id"]}' for row in rows):
-            if not query('SELECT pg_try_advisory_xact_lock(hashtextextended(%s,0)) AS locked', (key,)).fetchone()['locked']:
-                raise ChunkRetirementError('parent_retirement_lock_busy')
+        if not _try_parent_native_locks(query, scope, rows):
+            raise ChunkRetirementError('parent_retirement_lock_busy')
         locked = query('''SELECT document.tenant_id,document.source_id,document.document_id,document.native_id,
                     document.revision,document.text_sha256,document.body_record_ordinal,document.body_record_count,event.kind,
                     artifact.media_type AS raw_media_type,
