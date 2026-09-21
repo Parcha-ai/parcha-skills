@@ -172,7 +172,10 @@ class LegacyReadRouteHttpTest(unittest.TestCase):
         self.assertEqual(denied, 401)
 
     def test_receipt_resolve_is_not_gated(self) -> None:
-        self.store.resolve = lambda receipt, authorized_source=None: {"event": {"receipt": receipt}, "items": []}
+        def resolve(receipt, authorized_source=None, *, tenant_id=None,
+                    authorized_sources=None, chunk_body_archive=None):
+            return {"event": {"receipt": receipt}, "items": []}
+        self.store.resolve = resolve
         with WebhookServer(self.store) as server:
             status, raw = server.request(
                 "GET", "/v1/receipts/resolve?receipt=recall%3A%2F%2Fs%2Fn%3Frev%3D1",

@@ -959,6 +959,7 @@ class SourceScopedResolveContractTest(unittest.TestCase):
 
         handler.store.resolve.assert_called_once_with(
             "recall://source-a/item-1?rev=1", authorized_source="source-a",
+            tenant_id="tenant:personal", authorized_sources=None, chunk_body_archive=None,
         )
         handler.send_json.assert_called_once_with(404, {"error": "not found"})
 

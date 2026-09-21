@@ -41,7 +41,8 @@ from .canonical import (
 )
 from .canonical_retrieval import CanonicalRetrieval
 from .control import ControlError, ControlPlane
-from .db import BrainStore, IdempotencyConflict
+from .db import BrainStore, IdempotencyConflict, SearchDeadlineExceeded
+from .chunk_bodies import ChunkBodyError
 from .deep_inspection import DeepInspectionError
 from .deep_inspection_runtime import build_deep_inspector
 from .evidence_projection import (
@@ -55,6 +56,7 @@ from .legacy_plane import (
     LEGACY_READ_ROUTES,
     CanonicalPlaneUnavailable,
     LegacyIngestBridge,
+    legacy_ingest_tenant_id,
     legacy_reads_enabled,
     legacy_retired_response,
     validate_legacy_flags,
@@ -1065,12 +1067,33 @@ class Handler(BaseHTTPRequestHandler):
             principal = self.require("read")
             if not principal:
                 return
+            if principal.get("kind") == "mcp":
+                tenant_id = principal.get("tenant_id")
+                if not tenant_id:
+                    self.send_json(403, {"error": "forbidden"})
+                    return
+                source_grants = tuple(principal.get("authorized_sources") or ())
+            else:
+                # Match the existing v1-to-canonical ingest bridge for local,
+                # Tailscale and collector callers that predate tenant credentials.
+                tenant_id = legacy_ingest_tenant_id(principal)
+                grants = principal.get("authorized_sources")
+                source_grants = tuple(grants) if grants is not None else None
             receipt = parse_qs(parsed.query).get("receipt", [""])[0]
             try:
                 result = self.store.resolve(
                     receipt,
                     authorized_source=principal.get("source_id"),
+                    tenant_id=tenant_id,
+                    authorized_sources=source_grants,
+                    chunk_body_archive=(
+                        self.evidence_archive_store
+                        if os.environ.get("RECALL_CHUNK_BODY_READS") == "archive" else None
+                    ),
                 )
+            except (SearchDeadlineExceeded, ChunkBodyError):
+                self.send_json(503, {"error": "receipt unavailable"})
+                return
             except ValueError as exc:
                 self.send_json(400, {"error": str(exc)})
                 return
