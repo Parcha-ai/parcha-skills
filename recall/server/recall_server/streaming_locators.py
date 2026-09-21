@@ -31,15 +31,48 @@ from .parent_chunk_proof import (
 )
 
 
+# Closed diagnostic labels only; never copy SQL, parameters or PG error text.
+STATEMENT_STAGES = frozenset(
+    {
+        "connection_setup",
+        "source_authority",
+        "native_locks",
+        "current_rows",
+        "parent_share",
+        "parent_exclusive",
+        "retirement_ledger",
+        "parts",
+        "chunks",
+        "locator_update",
+        "precommit",
+        "commit_or_cleanup",
+    }
+)
+
+
 class LocatorPublicationError(LocatorPlanError):
     def __init__(self, code="locator_publication_unavailable"):
         super().__init__(code)
         self.committed = dict(batches=0, published_documents=0)
         self.commit_unknown = False
+        self.statement_stage = None
 
 
-def _authority(store, connection, scope, principal, deadline_at, *, lock_ledger=False):
+def _authority(
+    store,
+    connection,
+    scope,
+    principal,
+    deadline_at,
+    *,
+    lock_ledger=False,
+    diagnostic=None,
+):
+    if diagnostic is not None:
+        diagnostic["statement_stage"] = "source_authority"
     require_retirement_owner(store, connection, scope[:2], principal, deadline_at)
+    if diagnostic is not None:
+        diagnostic["statement_stage"] = "retirement_ledger"
     progress = store._execute_bounded(
         connection,
         """SELECT enabled FROM canonical_chunk_retirement_progress
@@ -56,18 +89,22 @@ def _publish_batch(
     store, *, proof, rows, scope, principal, deadline_at, first, should_stop=None
 ):
     about_to_commit = False
+    diagnostic = {"statement_stage": "connection_setup"}
     try:
         with store.connect() as connection, connection.transaction():
 
             def query(sql, values=()):
                 return store._execute_bounded(connection, sql, values, deadline_at)
 
+            diagnostic["statement_stage"] = "source_authority"
             require_retirement_owner(
                 store, connection, scope[:2], principal, deadline_at
             )
+            diagnostic["statement_stage"] = "native_locks"
             if not _try_parent_native_locks(query, scope, rows):
                 raise LocatorPublicationError("locator_publication_lock_busy")
             ids = sorted(row["document_id"] for row in rows)
+            diagnostic["statement_stage"] = "current_rows"
             current = query(
                 """SELECT document.tenant_id,document.source_id,document.document_id,document.native_id,
                     document.revision,document.text_sha256,document.body_record_ordinal,document.body_record_count,event.kind,
@@ -108,6 +145,7 @@ def _publish_batch(
                     raise LocatorPublicationError(
                         "locator_publication_position_changed"
                     )
+            diagnostic["statement_stage"] = "parent_share"
             catalog = read_parent_catalog(
                 store, connection, scope, deadline_at, lock=True
             )
@@ -118,15 +156,23 @@ def _publish_batch(
                 raise LocatorPublicationError("locator_publication_parent_changed")
             # Enrollment takes the same catalog lock before inserting a ledger;
             # FOR UPDATE on an absent ledger alone would not exclude that race.
+            diagnostic["statement_stage"] = "parent_exclusive"
             query(
                 """SELECT 1 FROM canonical_evidence_documents WHERE tenant_id=%s AND source_id=%s
                 AND native_parent_id=%s FOR UPDATE NOWAIT""",
                 scope,
             )
             _authority(
-                store, connection, scope, principal, deadline_at, lock_ledger=True
+                store,
+                connection,
+                scope,
+                principal,
+                deadline_at,
+                lock_ledger=True,
+                diagnostic=diagnostic,
             )
             if first:
+                diagnostic["statement_stage"] = "parts"
                 parts = query(
                     """SELECT * FROM canonical_evidence_document_parts
                     WHERE tenant_id=%s AND source_id=%s AND logical_document_id=%s AND revision=%s
@@ -140,6 +186,7 @@ def _publish_batch(
                 ).fetchall()
                 if parts != proof["parts"]:
                     raise LocatorPublicationError("locator_publication_parent_changed")
+            diagnostic["statement_stage"] = "chunks"
             chunks = query(
                 """SELECT document_id,ordinal,receipt,text_sha256 FROM canonical_chunks
                 WHERE tenant_id=%s AND source_id=%s AND document_id=ANY(%s) AND deleted_at IS NULL
@@ -170,6 +217,7 @@ def _publish_batch(
                     ["(%s::text,%s::integer,%s::text,%s::integer,%s::integer)"]
                     * len(changes)
                 )
+                diagnostic["statement_stage"] = "locator_update"
                 if query(
                     """UPDATE canonical_documents AS document
                     SET body_record_ordinal=desired.record_ordinal,body_record_count=desired.record_count
@@ -200,7 +248,9 @@ def _publish_batch(
                     )
             if should_stop is not None and should_stop():
                 raise LocatorPublicationError("locator_publication_interrupted")
+            diagnostic["statement_stage"] = "precommit"
             _check_deadline(deadline_at)
+            diagnostic["statement_stage"] = "commit_or_cleanup"
             about_to_commit = True
         return len(changes)
     except Exception as error:
@@ -214,6 +264,7 @@ def _publish_batch(
             )
         )
         failure.commit_unknown = about_to_commit
+        failure.statement_stage = diagnostic["statement_stage"]
         raise failure from None
 
 

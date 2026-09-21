@@ -9,7 +9,9 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout, redirect_stderr
 from io import StringIO
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
+
+import psycopg
 
 RECALL = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(RECALL), str(RECALL / "server")]
@@ -116,6 +118,57 @@ class StreamingLocatorTests(unittest.TestCase):
                 publish_parent_locators(store, archive, **scope)
         store.connect.assert_not_called()
         archive.read_raw.assert_not_called()
+
+
+class LocatorStatementDiagnosticsTests(unittest.TestCase):
+    def test_unattempted_statement_is_unknown(self):
+        error = LocatorPublicationError()
+        self.assertIsNone(error.statement_stage)
+
+    def test_closed_stage_does_not_copy_database_message(self):
+        from recall_server import streaming_locators as locators
+
+        store = MagicMock()
+        original = psycopg.errors.LockNotAvailable("private document and SQL detail")
+        store._execute_bounded.side_effect = original
+        with self.assertRaises(LocatorPublicationError) as raised:
+            locators._publish_batch(
+                store,
+                proof={},
+                rows=[],
+                scope=("tenant", "source", "parent"),
+                principal="owner",
+                deadline_at=None,
+                first=True,
+            )
+        error = raised.exception
+        self.assertEqual(str(error), "locator_publication_lock_busy")
+        self.assertEqual(error.statement_stage, "source_authority")
+        self.assertIs(error.__context__, original)
+        self.assertFalse(error.commit_unknown)
+        self.assertEqual(error.committed, dict(batches=0, published_documents=0))
+        self.assertNotIn("private", json.dumps(error.__dict__))
+
+    def test_advisory_refusal_is_separate_from_sql_lock_error(self):
+        from recall_server import streaming_locators as locators
+
+        with patch.object(locators, "_try_parent_native_locks", return_value=False):
+            with self.assertRaises(LocatorPublicationError) as raised:
+                locators._publish_batch(
+                    MagicMock(),
+                    proof={},
+                    rows=[],
+                    scope=("tenant", "source", "parent"),
+                    principal="owner",
+                    deadline_at=None,
+                    first=True,
+                )
+        self.assertEqual(raised.exception.statement_stage, "native_locks")
+        self.assertEqual(str(raised.exception), "locator_publication_lock_busy")
+        self.assertNotIsInstance(
+            raised.exception.__context__, psycopg.errors.LockNotAvailable
+        )
+        self.assertFalse(raised.exception.commit_unknown)
 
 
 if __name__ == "__main__":

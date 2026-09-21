@@ -176,6 +176,99 @@ def batch_mismatch_and_duplicate(store, root):
     assert state(store, scope) == initial
 
 
+def lock_statement_diagnostics(store, root):
+    """Real SQL lock refusal after an acknowledged prefix, without retrying it."""
+    cases = [
+        ("source_authority", "canonical_sources", "FOR UPDATE"),
+        ("source_authority", "canonical_source_grants", "FOR UPDATE"),
+        ("current_rows", "canonical_documents", "FOR UPDATE"),
+        ("current_rows", "canonical_events", "FOR UPDATE"),
+        ("current_rows", "raw_artifacts", "FOR UPDATE"),
+        ("parent_share", "canonical_evidence_documents", "FOR UPDATE"),
+        ("parent_exclusive", "canonical_evidence_documents", "FOR SHARE"),
+        ("retirement_ledger", "canonical_chunk_retirement_progress", "FOR UPDATE"),
+        ("chunks", "canonical_chunks", "FOR UPDATE"),
+        ("locator_update", "canonical_documents", None),
+    ]
+    markers = {
+        "source_authority": "FOR SHARE OF source,grant_row NOWAIT",
+        "current_rows": "FOR UPDATE OF document NOWAIT",
+        "parent_share": "FOR SHARE OF evidence NOWAIT",
+        "parent_exclusive": "AND native_parent_id=%s FOR UPDATE NOWAIT",
+        "retirement_ledger": "SELECT enabled FROM canonical_chunk_retirement_progress",
+        "chunks": "ORDER BY document_id,ordinal LIMIT %s FOR SHARE NOWAIT",
+        "locator_update": "UPDATE canonical_documents AS document",
+    }
+    observed = []
+    for stage, table, mode in cases:
+        scope, archive, _ = setup(store, root, count=4)
+        if stage == "retirement_ledger":
+            set_parent_retirement_enabled(
+                store,
+                **{k: scope[k] for k in ("tenant_id", "source_id", "native_parent_id")},
+                enabled=False,
+            )
+        initial = state(store, scope)
+        execute, publish = store._execute_bounded, locators._publish_batch
+        attempts, locked = [], []
+        with psycopg.connect(store.dsn) as blocker:
+
+            def track(*args, **kwargs):
+                attempts.append(True)
+                return publish(*args, **kwargs)
+
+            def contention(connection, statement, values, deadline_at):
+                if len(attempts) == 2 and not locked and markers[stage] in statement:
+                    if mode is None:
+                        blocker.execute("LOCK TABLE canonical_documents IN SHARE MODE")
+                        connection.execute("SET LOCAL lock_timeout='100ms'")
+                    else:
+                        # Identifiers come only from the literal test case list.
+                        blocker.execute(
+                            f"SELECT 1 FROM {table} WHERE tenant_id=%s AND source_id=%s {mode}",
+                            (scope["tenant_id"], scope["source_id"]),
+                        )
+                    locked.append(True)
+                return execute(connection, statement, values, deadline_at)
+
+            with (
+                patch.object(locators, "_publish_batch", side_effect=track),
+                patch.object(store, "_execute_bounded", side_effect=contention),
+            ):
+                error = denied(
+                    lambda: locators.publish_parent_locators(
+                        store,
+                        archive,
+                        **scope,
+                        apply=True,
+                        limits=ParentRetirementLimits(batch_documents=2),
+                    )
+                )
+            blocker.rollback()
+        assert locked and len(attempts) == 2, stage
+        assert str(error) == "locator_publication_lock_busy", stage
+        assert isinstance(error.__context__, psycopg.errors.LockNotAvailable), stage
+        assert error.__context__.sqlstate == "55P03", stage
+        assert error.statement_stage == stage, (stage, error.statement_stage)
+        assert not error.commit_unknown and error.committed == dict(
+            batches=1, published_documents=2
+        )
+        final = state(store, scope)
+        assert sum(row["body_record_ordinal"] is not None for row in final) == 2
+        assert [row["text_redacted"] for row in final] == [
+            row["text_redacted"] for row in initial
+        ]
+        # NOWAIT errors do not reliably populate PG diagnostic table/schema.
+        observed.append(
+            dict(
+                stage=stage,
+                table_metadata=error.__context__.diag.table_name,
+                schema_metadata=error.__context__.diag.schema_name,
+            )
+        )
+    return observed
+
+
 def basic(store, root):
     scope, archive, _ = setup(store, root)
     limits = ParentRetirementLimits(batch_documents=3, max_batches=2)
@@ -557,6 +650,7 @@ def lost_ack_after_prefix(store, root):
             )
         )
     assert len(attempts) == 2 and error.commit_unknown
+    assert error.statement_stage == "commit_or_cleanup"
     assert error.committed == dict(batches=1, published_documents=2)
     assert (
         sum(row["body_record_ordinal"] is not None for row in state(store, scope)) == 4
@@ -791,6 +885,7 @@ def main():
     try:
         store.migrate()
         with tempfile.TemporaryDirectory() as directory:
+            lock_statement_diagnostics(store, Path(directory))
             batch_updates(store, Path(directory))
             batch_mismatch_and_duplicate(store, Path(directory))
             basic(store, Path(directory))
