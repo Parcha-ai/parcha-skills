@@ -141,10 +141,10 @@ def _capture(store, spool, scope, limits, deadline_at):
                         AND document_id=selected.document_id AND deleted_at IS NULL ORDER BY ordinal LIMIT %s) item) items'''
         count, chunk_count = 0, 0
         with connection.cursor(name='retirement_metadata') as cursor:
-            store._execute_bounded(connection, 'SELECT 1', (), deadline_at)
+            store._set_statement_deadline(connection, deadline_at)
             cursor.execute(sql, (*scope, limits.max_documents + 1, limits.batch_chunks + 1))
             while True:
-                store._execute_bounded(connection, 'SELECT 1', (), deadline_at)
+                store._set_statement_deadline(connection, deadline_at)
                 rows = cursor.fetchmany(32)
                 if not rows:
                     break

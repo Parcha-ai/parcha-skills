@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import uuid
 from unittest.mock import patch
 
@@ -19,6 +20,8 @@ from e2e_archive_reprojection import fixture, mark_dirty
 from e2e_logical_evidence_projection import insert_record
 from e2e_logical_source_integrity import SmallPartProjection, TrackedStore
 from recall_server import chunk_retirement as retirement
+from recall_server import parent_chunk_proof
+from recall_server.db import SearchDeadlineExceeded
 from recall_server.canonical import CanonicalArchiveGateway, CanonicalPlane
 from recall_server.canonical_retrieval import BoundCanonicalRetrieval
 from recall_server.projectors import canonical_json
@@ -331,6 +334,98 @@ def schema68_compatibility(store, root):
     assert body == texts[document['native_id']]
 
 
+def metadata_cursor_deadlines(store, root):
+    """Actual portal FETCH stays bounded; timeout policy and cleanup are exact."""
+    tenant, source, archive, _, _, texts = fixture(store, root, count=70)
+    scope = tenant, source, 'session'
+    execute = psycopg.Connection.execute
+    declare = psycopg.ServerCursor.execute
+    fetch = psycopg.ServerCursor.fetchmany
+    spool_class = ParentMetadataSpool
+
+    def observed(deadline, *, slow=False):
+        statements, batches, portals, directories = [], [], [], []
+        expired_at_entry = deadline <= time.monotonic()
+
+        class ObservedSpool(spool_class):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                directories.append(self.directory.name)
+
+        def trace_execute(connection, statement, *args, **kwargs):
+            if isinstance(statement, str):
+                statements.append(statement)
+                assert statement != 'SELECT 1', 'metadata capture emitted a dummy ping'
+            return execute(connection, statement, *args, **kwargs)
+
+        def trace_declare(cursor, statement, *args, **kwargs):
+            portals.append(cursor)
+            if slow:
+                # DECLARE is lazy: this delay runs inside the actual FETCH.
+                statement = statement.replace('SELECT selected.*,items.chunks FROM (',
+                    'SELECT selected.*,items.chunks,pg_sleep(0.05) AS fetch_stall FROM (')
+            return declare(cursor, statement, *args, **kwargs)
+
+        def trace_fetch(cursor, size=0):
+            assert size == 32, 'metadata fetch memory bound changed'
+            rows = fetch(cursor, size)
+            batches.append(len(rows))
+            assert len(rows) <= 32
+            return rows
+
+        try:
+            with patch.object(psycopg.Connection, 'execute', trace_execute), \
+                 patch.object(psycopg.ServerCursor, 'execute', trace_declare), \
+                 patch.object(psycopg.ServerCursor, 'fetchmany', trace_fetch), \
+                 patch.object(parent_chunk_proof, 'ParentMetadataSpool', ObservedSpool):
+                with parent_chunk_proof.prove_parent_chunks(store, archive, scope=scope,
+                        limits=ParentRetirementLimits(), deadline_at=deadline) as proof:
+                    assert proof['current_documents'] == proof['current_chunks'] == 70
+                    assert proof['eligible_documents'] == 70 and proof['excluded'] == {}
+                    assert proof['eligible_utf8_bytes'] == sum(len(text.encode()) for text in texts.values())
+                    rows = list(proof['spool'].verified())
+                    assert len(rows) == len({row['document_id'] for row in rows}) == 70
+                    for ordinal, row in enumerate(rows):
+                        text = texts[f'event-{ordinal:04}']
+                        assert row['native_id'] == f'event-{ordinal:04}'
+                        assert row['text_sha256'] == hashlib.sha256(text.encode()).hexdigest()
+                        assert row['body_record_ordinal'] == ordinal and row['body_record_count'] == 1
+                        assert row['pg_body_bytes'] == len(text.encode())
+                        assert len(row['chunks']) == 1
+                        assert row['chunks'][0]['text_sha256'] == row['text_sha256']
+                    snapshot = {key: value for key, value in proof.items() if key != 'spool'}
+                    payloads = list(proof['spool'].index.execute(
+                        'SELECT native,document,payload,ordinal,verified,proposed_count FROM documents ORDER BY native'))
+            assert batches == [32, 32, 6, 0]
+            # Initial catalog/parts/DECLARE, four FETCHes and final catalog.
+            assert sum("set_config('statement_timeout'" in sql for sql in statements) == 8
+            return snapshot, payloads
+        finally:
+            if expired_at_entry:
+                assert not portals and not batches, 'expired deadline reached DECLARE/FETCH'
+            assert all(cursor.closed for cursor in portals)
+            assert directories and all(not Path(path).exists() for path in directories)
+            assert store.active_connections == 0
+            with store.connect() as connection:
+                assert connection.execute('SELECT 1 AS healthy').fetchone()['healthy'] == 1
+
+    first = observed(time.monotonic() + 20)
+    assert observed(time.monotonic() + 20) == first, 'full proof or private spool changed'
+    try:
+        observed(time.monotonic() + 1, slow=True)
+    except psycopg.errors.QueryCanceled as error:
+        assert error.sqlstate == '57014' and error.__context__ is None
+    else:
+        raise AssertionError('slow actual FETCH did not time out')
+    try:
+        observed(time.monotonic() - 1)
+    except SearchDeadlineExceeded:
+        pass
+    else:
+        raise AssertionError('expired metadata capture reached FETCH')
+    assert observed(time.monotonic() + 20) == first, 'failed proof changed stored state'
+
+
 def main():
     admin_dsn = os.environ['RECALL_DATABASE_URL']
     database = 'recall_parent_retirement_' + uuid.uuid4().hex
@@ -345,6 +440,7 @@ def main():
         assert store.migrate()['applied'] == [], 'additive migration is not idempotent'
         head_schema_capability(store)
         with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, RECALL_CHUNK_BODY_READS='archive'):
+            metadata_cursor_deadlines(store, Path(temporary))
             with patch.object(SmallPartProjection, 'put_records', LogicalEvidenceProjectionStore.put_records):
                 tenant, source, archive, _, projector, texts = fixture(store, Path(temporary), count=1000)
             scope = dict(tenant_id=tenant, source_id=source, native_parent_id='session')

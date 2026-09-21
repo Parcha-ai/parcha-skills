@@ -3220,13 +3220,19 @@ class BrainStore:
         return [{**dict(row), "leg": "exact-question", "tier": 3} for row in rows]
 
     @staticmethod
-    def _execute_bounded(conn, sql: str, values: list[Any] | tuple[Any, ...], deadline_at: float | None):
+    def _set_statement_deadline(conn, deadline_at: float | None):
         if deadline_at is None:
-            return conn.execute(sql, values)
+            return
         remaining_ms = int((deadline_at - time.monotonic()) * 1000)
         if remaining_ms <= 0:
             raise SearchDeadlineExceeded("search deadline exceeded")
         conn.execute("SELECT set_config('statement_timeout', %s, true)", (f"{remaining_ms}ms",))
+
+    @staticmethod
+    def _execute_bounded(conn, sql: str, values: list[Any] | tuple[Any, ...], deadline_at: float | None):
+        if deadline_at is None:
+            return conn.execute(sql, values)
+        BrainStore._set_statement_deadline(conn, deadline_at)
         try:
             return conn.execute(sql, values)
         except psycopg.errors.QueryCanceled as exc:
