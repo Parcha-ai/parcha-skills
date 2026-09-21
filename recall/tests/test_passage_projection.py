@@ -824,6 +824,8 @@ class PassageProjectionTests(unittest.TestCase):
             def execute(self, sql, params=None):
                 normalized = " ".join(sql.split())
                 self.statements.append((normalized, params))
+                if normalized.startswith("SELECT to_regclass('canonical_chunk_retirement_progress')"):
+                    return Result(one={"ledger": None})
                 if "FROM canonical_evidence_document_queue" in normalized:
                     if normalized.startswith("DELETE"):
                         return Result(rowcount=1)
