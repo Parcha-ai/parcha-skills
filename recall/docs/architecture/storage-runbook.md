@@ -219,41 +219,137 @@ safe. Asynchronous passage or Parquet pointers alone do not cover logical-public
 lag. See [streaming locator publication](2026-09-21-streaming-locator-publication.md)
 and [bounded parent retirement](2026-09-21-recall-parent-chunk-retirement.md).
 
-### Current storage checkpoint — 2026-09-21, after documents compaction
+### Current company-brain checkpoint — 2026-09-21, after chunks budget cancellation
 
-MCP and projection run #648; managed ingestion runs #650. Archive body reads
-and turbopuffer search are live. The managed cycle succeeded at 09:15:08 UTC;
-its new record volume was not measured. Acknowledged logical retirement totals
-are 80,343 documents, 87,914 chunks and 371,565,367 UTF-8 bytes. These lifetime
-work counters are not current compressed storage or physical savings.
+MCP and projection run #648; managed ingestion runs #650. Schema 069,
+archive body reads and turbopuffer search are live. The managed cycle succeeded
+at 09:15:08 UTC; its new record volume was not measured.
 
-Managed pg_squeeze rehearsal proved concurrent-data preservation, exact external
-cancellation and cleanup. The first documents rewrite was canceled after an
-observer timeout; the second failed on lock acquisition. Neither reclaimed
-documents storage. **Attempt 3 succeeded at 09:35:12 UTC**, reducing allocation
-from **20,985,446,400 to 14,030,356,480 bytes**: **6,955,089,920 bytes (6.477 GiB)
-physically reclaimed**. Catalog identity and five indexes were preserved, the
-storage file changed, and worker, slot, role-default and credential cleanup passed.
+| Component | Production responsibility | Boundary still retained |
+|---|---|---|
+| turbopuffer | Dense, lexical and identifier retrieval over passages | PostgreSQL verifies current identity, scope and receipt authority |
+| S3 logical evidence and Parquet | Exact redacted evidence and analytical projections | Unsupported/current-unlocated records and historical chunks retain PostgreSQL bodies |
+| Archil and DuckDB | Mount authorized evidence and query analytical files in execution/analysis | They do not replace transactional grants, tombstones, replay or historical receipt lookup |
+| PostgreSQL | Current authority, revision history and operational catalog | Duplicate bodies, metadata and indexes still prevent the small-catalog goal |
 
-The post-rewrite card passed 26/26 gates with all 16 original evaluator hashes
-unchanged: recall@20 .9625, MRR .6579, server search p95 752.9 ms and show p95
-511 ms. Each deployed service matched six preserved archived response hashes,
-for 18 passing comparisons. Context p95 was 4,821.7 ms from three calls to one
-variable receipt, versus 9,927.6 ms during the rewrite; this small, ungated sample
-leaves the context tail unresolved.
+**Logical progress:** the 10:29:48 UTC source audit found **183 proof-complete
+parents out of 2,645**, with 2,462 unrepresented and zero orphan progress rows.
+That is one source, not full-corpus coverage. Acknowledged cumulative work is
+**121,269 documents / 132,018 chunks / 535,436,711 UTF-8 bytes**. These are lifetime
+clear counters; restores and revisions do not subtract from them. Manifest
+records, supported current documents and structural exclusions are different
+counts. The smaller archive outlier completed full source proof, then published
+**11,008 document locators in 43 acknowledged batches** before publication failed.
+It enrolled no parent and cleared no body; the underlying exception remains
+unknown. A diagnostic-only operator preserves the cause on a fresh run. The larger
+outlier remains outside the admitted budget. PR #654 replaces 256 guarded UPDATEs
+plus deadline settings with one guarded batch UPDATE, preserving existing proof,
+locks, predicates and commit accounting. It merged as `c6f617e` after CI passed and is not deployed; local
+mutation-stage timing is not production throughput or a diagnosis of the failure.
 
-One observed table-exclusive wait cleared under the temporary role's 1 s lock
-acquisition timeout. That allowance bounds each wait separately. The provider's
-100 ms final-replay setting excludes index acquisition and final swaps; it is not
-a hard total lock-hold guarantee.
+**Physical progress:** documents attempt 3 completed at 09:35:12 UTC,
+reducing allocation **20,985,446,400 → 14,030,356,480 bytes**:
+**6,955,089,920 bytes (6.477 GiB) reclaimed**. Catalog identity, five indexes and
+exact receipts survived; worker, slot and temporary credential cleanup passed.
+The first attempt canceled after an observer timeout and the second failed lock
+acquisition; neither reclaimed documents storage.
 
-PS80 and two replicas remain; the configured disk floor is 275 GiB and cap 300 GiB,
-while **all three actual volumes remain 300 GiB**. The fresh 275 GiB request
-was accepted at 09:41:17 UTC and completed by 09:42:40 UTC, with no disk
-replacement pending. Documents physical reclaim is proved; billed disk reduction
-is not. Continue bounded source retirement with explicit remaining-coverage
-accounting; a completed provider request does not satisfy the capacity exit. The living phase state is in
-[the storage Cascade](../../../.cascade/recall-rewrite.md#storage-retirement-resumed--2026-09-20).
+**Redundant vector removed:** PR #652's source-pinned oneoff removed
+`canonical_chunks.search_vector` at **10:49:44 UTC**, without a serving restart.
+Exact #648/#650 no-column PostgreSQL tests passed first. Production app readiness
+passed before and after DDL; all three services matched six preserved archive
+response hashes before and again after (**18 + 18 comparisons**). This column
+drop reclaimed **zero physical bytes**. The sampled vector payload estimate,
+39.72 GiB with standard error 3.48 GiB, is neither a promised saving nor a copy
+workspace bound. Fresh inspection still found **96,227,934,208 bytes (89.62 GiB)**
+allocated to chunks, four indexes and the original storage file. The first
+monitored chunk rewrite stopped after about 18 seconds on
+`provider_observation_failed`. After correcting observation freshness against
+measured provider cadence, the second stopped after **871 seconds** at its
+**16 GiB retained-WAL allowance**. Both retained the original storage file:
+**zero chunk bytes reclaimed**. The second left allocation at
+**96,229,064,704 bytes**; its worker and slot were cleaned up. Its exact progress
+probe witnessed 6.56 million copied rows before cancellation. The measured
+maximum node growth was 23.70 GiB, below the 64 GiB total-growth stop; this does
+not establish the remaining copy/index workspace or guarantee completion. A
+third attempt allowed **48 GiB WAL inside the same 64 GiB total-growth envelope**.
+It copied **14,969,299 rows**, then hit the workspace stop at **64.804 GiB observed
+growth**. The cancel worker started in **188 ms**; the job finished at
+**12:17:24 UTC**, with workers, slots, role defaults, temporary environment and
+login all cleaned up. Allocation was **96,242,982,912 → 96,267,567,104 bytes** on
+the same file and four indexes: **zero reclaim**. The whole-table copy did not fit
+this budget; do not expand capacity or blindly repeat it.
+
+Two local PostgreSQL fixtures show a bounded alternative: no-op row UPDATEs discard
+the dropped vector representation while preserving existing prose TOAST pointers.
+VACUUM can then recover internal space and sometimes truncate the tail. Rebuilding
+equal prose into new datums can move live tail values into holes, but was not
+monotonic: later batches grew files, and held snapshots defeated shrink. These are
+small fixture results, not a production cursor or savings estimate. The first
+production canary completed at **12:44:44 UTC**: **11 rows / 35,980 raw prose bytes**
+rewritten in **335 ms**, with every retained value and prose pointer unchanged.
+The cluster WAL upper bound was **393,712 bytes**; allocation stayed exactly
+**96,286,425,088 bytes**, so this proves no physical savings. The connection closed
+and the one-shot launch was disabled afterward. Live inventory also confirmed no
+custom triggers, rules, RLS, partitions or inheritance on chunks/documents. The next
+boundary is a separately reviewed bounded sweep; physical reclamation and provider
+capacity remain separate exits.
+
+The original post-cancellation card passed **26/26 gates**, with all **16 original
+evaluator hashes unchanged**: recall@20 .9625, MRR .6621, backend error rate zero,
+server search p95 **840 ms**, show p95 **494.9 ms**, context p95 **4,928.3 ms** and
+scan p95 **6,959 ms**. The context result uses only three calls to a variable target;
+it does not establish representative latency. A separate fixed-receipt diagnostic
+took 5,512 ms cold and 321/304 ms warm, with 4,526 ms in the first neighbor SQL
+query. The optional matching time-index operation merged as #653; the production
+index has not been built. These observations
+leave the cold/context and analytical tool tails unresolved.
+
+**Provider capacity:** PS80 and two replicas remain. The configured floor is
+275 GiB and cap 300 GiB, but **all three actual volumes remain 300 GiB**, more
+than an hour after the latest 275 GiB request completed. No replacement is
+pending and no billed disk reduction is proved. At **12:26:17 UTC**, all nodes had
+settled to about **174 GiB used / 126 GiB free**, clearing the aborted rewrite’s
+temporary growth. A completed configuration request is not the physical-capacity
+exit. No further whole-table rewrite or provider target is admitted by this checkpoint.
+
+### Next boundaries and acceptance
+
+1. **Finish the vector physical boundary in bounded steps.** The live catalog
+   inventory and tiny exact-value row rewrite passed. Prepare a finite sweep
+   that avoids revisiting moved/new row versions and preserves concurrent clears,
+   transaction limits and unknown-commit accounting. Scale only from witnessed
+   duration, allocation, WAL and concurrency behavior. Plain vacuum internal free
+   space is not file shrink; equal-text rematerialization can also grow files.
+   Preserve exact readback and the unchanged card. Count measured allocated-byte
+   reduction after cleanup, then separately verify provider volume reduction.
+2. **Finish finite source coverage, then expand explicitly.** Preserve the known
+   locator prefix and the still-unknown failure cause. Review/deploy the guarded
+   batch-update simplification, take fresh source/release proof and drain finite
+   pages. Audit complete, pending, disabled and excluded targets; retain the
+   publication/clear boundary and 60-second grace. No automatic corpus enrollment.
+3. **Close the context latency gap.** Prove the reviewed query/index boundary
+   with exact receipt parity and representative cold/warm/load measurements,
+   then apply the existing latency gates. A passing overall card does not close
+   an ungated tool tail.
+4. **Shrink the catalog without losing history.** Inventory audit/job consumers
+   and preserve exact cold metadata and event/job lineage before retiring hot
+   rows. Historical replay, old receipts, grants and forget must keep working.
+   Existing current-only logical archives cannot alone justify dropping history.
+   The catalog/index target below 10 GB remains unproved.
+
+After every boundary, check the user's criteria: **simplicity** means one owner
+per body/proof and fewer redundant hot representations; **power** means exact,
+authorized current and historical evidence remains usable for search and
+analysis; **doing the job** requires fresh ingestion and unchanged receipt,
+forget and quality checks; **fast** requires measured tool latency under the
+actual workload. The vector deletion removes a measured duplication; it is not
+a semantic breakthrough or a completed downsize. Jev/W5 work retains its own
+acceptance gates and does not replace this storage work.
+
+See [the living storage Cascade](../../../.cascade/recall-rewrite.md#storage-retirement-resumed--2026-09-20)
+for phase ownership. Private operational artifacts retain exact job/source
+identities; this checkpoint contains no company text or receipt identifiers.
 
 ### Optional chunk search-vector retirement
 
