@@ -18,6 +18,8 @@ class Store:
 
     def execute(self, sql, params):
         self.calls.append((sql, params))
+        if sql.startswith("SET LOCAL statement_timeout"):
+            return self
         if sql.lstrip().startswith('SELECT source_id,document_id') and 'ORDER BY source_id DESC' in sql:
             self.row = {'source_id': 's', 'document_id': 'z'}
         elif sql.lstrip().startswith('SELECT source_id,document_id'):

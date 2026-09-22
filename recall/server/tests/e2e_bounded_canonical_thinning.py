@@ -140,6 +140,15 @@ class Thinning(unittest.TestCase):
 
     def test_ready_window_does_not_lock_unselected_suffix(self):
         ids = sorted(self.insert('locks:' + str(i))[1] for i in range(1024))
+        # This fixture isolates row-lock scope with usable statistics. It is
+        # not a performance proof: stale-statistics probes can hit the worker's
+        # statement budget and are covered separately by deadline/plan tests.
+        with self.store.connect() as c:
+            for table in ('canonical_documents', 'canonical_events',
+                          'raw_artifacts', 'canonical_chunks',
+                          'canonical_evidence_documents',
+                          'canonical_evidence_document_queue'):
+                c.execute('ANALYZE ' + table)
         owner = self
         class CheckLocks:
             @contextmanager

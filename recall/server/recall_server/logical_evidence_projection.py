@@ -88,6 +88,7 @@ class _LocatedUpload(LogicalEvidenceUpload):
     # Ownership transfers from preparation to _commit_upload. No source text
     # or parent-sized Python list survives alongside the immutable upload.
     body_locators: _LocatorSpool | None = None
+    inline_document_ids: tuple[str, ...] = ()
 
 
 def _close_body_locators(upload):
@@ -290,6 +291,12 @@ class CanonicalLogicalEvidenceProjector:
         self.excluded_structural_types = excluded_structural_types
         self.retention_profile = retention_profile
         self.cursor_fetch_rows = cursor_fetch_rows
+        self._committed_body_keys: dict[tuple[str, str, str], None] = {}
+
+    def _take_committed_body_keys(self) -> tuple[tuple[str, str, str], ...]:
+        keys = tuple(self._committed_body_keys)
+        self._committed_body_keys.clear()
+        return keys
 
     def _tenant(self, tenant_id: str | None) -> str | None:
         if self.bound_tenant_id is None:
@@ -688,6 +695,7 @@ class CanonicalLogicalEvidenceProjector:
     def _prepare_batch_and_upload(
         self,
         candidates: tuple[LogicalGroupCandidate, ...],
+        *, hint_limit: int = 32,
     ) -> list[LogicalEvidenceUpload | None]:
         if not candidates:
             return []
@@ -697,6 +705,7 @@ class CanonicalLogicalEvidenceProjector:
         ranges: list[tuple[int, int, int]] = []
         input_spool = None
         body_locators: dict[int, _LocatorSpool] = {}
+        inline_document_ids: dict[int, tuple[str, ...]] = {}
         transferred = False
         try:
             input_spool = tempfile.TemporaryFile(mode="w+b")
@@ -763,7 +772,7 @@ class CanonicalLogicalEvidenceProjector:
                                )
                            )
                            SELECT selected.candidate_ordinal,
-                              document.document_id,
+                              document.document_id,document.body_location,
                               event.tenant_id,event.source_id,
                               event.event_id,event.native_id,event.kind,
                               event.occurred_at,
@@ -910,6 +919,7 @@ class CanonicalLogicalEvidenceProjector:
                 candidate = candidates[ordinal]
                 input_spool.seek(start)
                 lookup = None
+                inline_ids: dict[str, None] = {}
 
                 def resolved_rows():
                     nonlocal lookup
@@ -929,6 +939,12 @@ class CanonicalLogicalEvidenceProjector:
                             row = lookup.restore(row)
                             _validate_source_body(row)
                             recovered.add(ordinal)
+                        document_id = row.get("document_id")
+                        if (row.get("body_location") == "inline"
+                                and len(inline_ids) < hint_limit
+                                and isinstance(document_id, str)
+                                and 1 <= len(document_id) <= 255):
+                            inline_ids[document_id] = None
                         yield row
 
                 final_start = spool.tell()
@@ -939,6 +955,7 @@ class CanonicalLogicalEvidenceProjector:
                 finally:
                     if lookup is not None:
                         lookup.close()
+                inline_document_ids[ordinal] = tuple(inline_ids)
                 ranges.append((ordinal, final_start, spool.tell()))
             if recovered:
                 self._check_recovery_pins(candidates, pins, recovered)
@@ -968,7 +985,10 @@ class CanonicalLogicalEvidenceProjector:
                     retention_profile=self.retention_profile,
                     existing_part_references=tuple(existing_parts.get(ordinal, ())),
                 )
-                upload = _LocatedUpload(**vars(upload), body_locators=body_locators[ordinal])
+                upload = _LocatedUpload(
+                    **vars(upload), body_locators=body_locators[ordinal],
+                    inline_document_ids=inline_document_ids[ordinal],
+                )
                 uploads[ordinal] = upload
                 completed.append(upload)
             transferred = True
@@ -2016,6 +2036,9 @@ class CanonicalLogicalEvidenceProjector:
             if not candidates:
                 break
             worker_count = min(upload_concurrency, len(candidates))
+            # At most 256 identifiers across all uploads, including individual
+            # retries of a failed shard. Large batches can simply omit hints.
+            hint_limit = min(32, 256 // len(candidates))
             shards: list[list[tuple[int, LogicalGroupCandidate]]] = [
                 [] for _ in range(worker_count)
             ]
@@ -2050,6 +2073,7 @@ class CanonicalLogicalEvidenceProjector:
                             executor.submit(
                                 self._prepare_batch_and_upload,
                                 tuple(candidate for _, candidate in shard),
+                                hint_limit=hint_limit,
                             ),
                         )
                         for shard in shards
@@ -2101,7 +2125,9 @@ class CanonicalLogicalEvidenceProjector:
                     continue
                 for index, candidate in shard:
                     try:
-                        (upload,) = self._prepare_batch_and_upload((candidate,))
+                        (upload,) = self._prepare_batch_and_upload(
+                            (candidate,), hint_limit=hint_limit,
+                        )
                     except Exception as single_error:
                         skipped.add(index)
                         self._mark_failed(candidate, single_error)
@@ -2160,6 +2186,16 @@ class CanonicalLogicalEvidenceProjector:
                     continue
                 if status != "committed" or upload is None:
                     raise LogicalEvidenceError("logical_evidence_state_invalid")
+                candidate = candidates[index]
+                inline_ids = getattr(upload, "inline_document_ids", ())
+                if any(not isinstance(value, str) or not 1 <= len(value) <= 255
+                       for value in (candidate.tenant_id, candidate.source_id)):
+                    inline_ids = ()
+                for document_id in inline_ids:
+                    key = (candidate.tenant_id, candidate.source_id, document_id)
+                    self._committed_body_keys[key] = None
+                    if len(self._committed_body_keys) > 256:
+                        del self._committed_body_keys[next(iter(self._committed_body_keys))]
                 documents += 1
                 records += upload.prepared.record_count
                 receipts += upload.prepared.receipt_count

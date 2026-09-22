@@ -75,7 +75,7 @@ class InterruptingProjector(CanonicalLogicalEvidenceProjector):
             for native_parent_id in ("complete", "interrupt")
         ]
 
-    def _prepare_batch_and_upload(self, candidates):
+    def _prepare_batch_and_upload(self, candidates, **kwargs):
         if candidates[0].native_parent_id == "interrupt":
             raise KeyboardInterrupt
         return [self.upload]
@@ -217,7 +217,7 @@ class PoisonedGroupIsolationTests(TestCase):
                     for parent in ("good-a", "poison", "good-b")
                 ]
 
-            def _prepare_batch_and_upload(self, candidates):
+            def _prepare_batch_and_upload(self, candidates, **kwargs):
                 self.prepare_calls.append(tuple(c.native_parent_id for c in candidates))
                 if any(c.native_parent_id == "poison" for c in candidates):
                     raise LogicalEvidenceError("logical_evidence_full_record_corrupt")
