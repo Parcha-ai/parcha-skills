@@ -743,6 +743,50 @@ def _run_deep_inspection_tool(
         raise McpProtocolError(-32603, f"{name}_failed") from None
 
 
+def _log_scan_timing(result: dict[str, Any], elapsed_ms: float) -> None:
+    """Persist only closed numeric phases; missing/invalid values are -1."""
+    try:
+        def numeric(value: Any) -> float:
+            return (
+                round(float(value), 3)
+                if type(value) in (int, float) and 0 <= value <= 3_600_000
+                else -1.0
+            )
+
+        timing = result.get("timing")
+        timing = timing if isinstance(timing, dict) else {}
+        phases = timing.get("phases")
+        phases = phases if isinstance(phases, dict) else {}
+        elapsed, total = numeric(elapsed_ms), numeric(timing.get("totalMs"))
+        values = [
+            ("elapsed_ms", elapsed),
+            ("archil_total_ms", total),
+            ("queue_ms", numeric(timing.get("queueMs"))),
+            ("execute_ms", numeric(timing.get("executeMs"))),
+            # Includes catalog, command construction, transport and validation.
+            ("unallocated_ms", numeric(elapsed - total) if 0 <= total <= elapsed else -1.0),
+        ]
+        for label, key in (
+            ("wrapper_start_to_payload_ready_ms", "wrapper_start_to_payload_readyMs"),
+            ("payload_ready_to_namespace_start_ms", "payload_ready_to_namespace_startMs"),
+            ("namespace_start_to_stage_start_ms", "namespace_start_to_stage_startMs"),
+            ("stage_start_to_objects_ready_ms", "stage_start_to_objects_readyMs"),
+            ("objects_ready_to_views_ready_ms", "objects_ready_to_views_readyMs"),
+            ("views_ready_to_tool_ready_ms", "views_ready_to_tool_readyMs"),
+            ("tool_ready_to_stage_end_ms", "tool_ready_to_stage_endMs"),
+            ("stage_end_to_sandbox_ready_ms", "stage_end_to_sandbox_readyMs"),
+            ("sandbox_ready_to_program_start_ms", "sandbox_ready_to_program_startMs"),
+            ("program_start_to_program_end_ms", "program_start_to_program_endMs"),
+            ("wrapper_ms", "wrapperMs"),
+            ("archil_unobserved_execute_ms", "archilUnobservedExecuteMs"),
+        ):
+            values.append((label, numeric(phases.get(key))))
+        LOG.info("recall_scan_timing %s", " ".join(f"{key}={value:.3f}" for key, value in values))
+    except Exception:
+        # Best-effort diagnostics must not change a successful tool result.
+        return
+
+
 def _call_tool_observed(
     store: Any,
     principal: dict[str, Any],
@@ -768,12 +812,15 @@ def _call_tool_observed(
         if isinstance(diagnostics, dict)
         else None
     )
+    elapsed_ms = (time.monotonic() - started) * 1000
     LOG.info(
         "mcp_tool tool=%s outcome=ok elapsed_ms=%.3f deadline_exceeded=%s",
         name,
-        (time.monotonic() - started) * 1000,
+        elapsed_ms,
         deadline_exceeded if isinstance(deadline_exceeded, bool) else "unknown",
     )
+    if name == "recall_scan":
+        _log_scan_timing(result, elapsed_ms)
     return result
 
 def _reject_extra(arguments: dict, allowed: frozenset[str]) -> None:
