@@ -144,6 +144,9 @@ def thin_canonical_bodies(
                                    AND queued.native_parent_id=COALESCE(
                                        event.native_parent_id,event.native_id
                                    )
+                                -- Keep the full parent key correlated; a source-only
+                                -- anti-merge can repeatedly scan unrelated parents.
+                                OFFSET 0
                             )
                           ORDER BY document.source_id,document.document_id
                           LIMIT %s
