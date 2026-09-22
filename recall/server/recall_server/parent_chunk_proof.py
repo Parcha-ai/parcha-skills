@@ -9,10 +9,13 @@ from pathlib import Path
 import shutil
 import sqlite3
 import tempfile
+import time
 
 import orjson
+from psycopg import sql as pg_sql
 
 from .chunk_bodies import _EXCLUDED_TYPES, _check_deadline, _record_location, _verified_body
+from .db import SearchDeadlineExceeded
 from .locator_backfill_plan import _DOCUMENTS_SQL, _MeteredArchive, _PARENT_SQL
 from .logical_body_proof import iter_parent_bodies
 
@@ -144,8 +147,27 @@ def _capture(store, spool, scope, limits, deadline_at):
             store._set_statement_deadline(connection, deadline_at)
             cursor.execute(sql, (*scope, limits.max_documents + 1, limits.batch_chunks + 1))
             while True:
-                store._set_statement_deadline(connection, deadline_at)
-                rows = cursor.fetchmany(32)
+                if deadline_at is None:
+                    rows = cursor.fetchmany(32)
+                else:
+                    remaining_ms = int((deadline_at - time.monotonic()) * 1000)
+                    if remaining_ms <= 0:
+                        raise SearchDeadlineExceeded('search deadline exceeded')
+                    # Keep the 32-row memory bound; update the timeout and fetch
+                    # in one request rather than paying a second round trip.
+                    with connection.cursor() as fetch:
+                        fetch.execute(pg_sql.SQL(
+                            "SELECT set_config('statement_timeout', {}, true); "
+                            'FETCH FORWARD 32 FROM {}'
+                        ).format(pg_sql.Literal(f'{remaining_ms}ms'),
+                                 pg_sql.Identifier('retirement_metadata')), prepare=False)
+                        setting = fetch.fetchone()
+                        if (not isinstance(setting, dict) or set(setting) != {'set_config'}
+                                or not isinstance(setting['set_config'], str) or not fetch.nextset()):
+                            raise _error('parent_retirement_metadata_invalid')
+                        rows = fetch.fetchall()
+                        if len(rows) > 32 or fetch.nextset():
+                            raise _error('parent_retirement_metadata_invalid')
                 if not rows:
                     break
                 for row in rows:

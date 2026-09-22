@@ -28,6 +28,7 @@ from recall_server.chunk_retirement import (
     set_parent_retirement_enabled,
 )
 from recall_server import streaming_locators as locators
+from recall_server import parent_chunk_proof
 
 
 def denied(callback):
@@ -59,6 +60,79 @@ def setup(store, root, count=10):
         archive,
         projector,
     )
+
+
+def metadata_fetch_protocol(store, root):
+    """Real portal results, deadline cancellation and cleanup through _capture."""
+    scope, _, _ = setup(store, root, count=65)
+    before = state(store, scope)
+    execute = psycopg.Cursor.execute
+    statements = []
+
+    def observed(cursor, query, *args, **kwargs):
+        text = query.as_string() if isinstance(query, psycopg.sql.Composable) else str(query)
+        if text.startswith("SELECT set_config('statement_timeout',") and '; FETCH FORWARD' in text:
+            statements.append(text)
+            assert kwargs == {'prepare': False}
+            assert text.endswith('FETCH FORWARD 32 FROM "retirement_metadata"')
+        return execute(cursor, query, *args, **kwargs)
+
+    def capture(deadline):
+        path = None
+        try:
+            with parent_chunk_proof.ParentMetadataSpool(max_bytes=1024**2) as spool:
+                path = Path(spool.directory.name)
+                result = parent_chunk_proof._capture(
+                    store, spool,
+                    (scope['tenant_id'], scope['source_id'], scope['native_parent_id']),
+                    ParentRetirementLimits(), deadline,
+                )
+                assert result[2:] == (65, 65)
+                assert spool.index.execute('SELECT count(*) FROM documents').fetchone()[0] == 65
+        finally:
+            assert (path is None or not path.exists()) and store.active_connections == 0
+
+    with patch.object(psycopg.Cursor, 'execute', observed):
+        capture(time.monotonic() + 30)
+    assert len(statements) == 4  # Three bounded data FETCHes and one empty FETCH.
+    assert state(store, scope) == before
+
+    for stage in ('setting', 'fetch'):
+        injected = []
+
+        def stalled(cursor, query, *args, **kwargs):
+            text = query.as_string() if isinstance(query, psycopg.sql.Composable) else str(query)
+            if text.startswith("SELECT set_config('statement_timeout',") and '; FETCH FORWARD' in text:
+                assert not injected
+                injected.append(stage)
+                with cursor.connection.cursor() as control:
+                    if stage == 'setting':
+                        execute(control, "SET LOCAL statement_timeout='25ms'")
+                        query = psycopg.sql.SQL(
+                            "SELECT set_config('statement_timeout','50ms',true) "
+                            'FROM (SELECT pg_sleep(2)) delayed; '
+                            'FETCH FORWARD 32 FROM "retirement_metadata"'
+                        )
+                    else:
+                        execute(control, 'CLOSE "retirement_metadata"; '
+                                'DECLARE "retirement_metadata" CURSOR FOR SELECT pg_sleep(2)', prepare=False)
+                # FETCH uses the production remaining deadline, not a test override.
+            return execute(cursor, query, *args, **kwargs)
+
+        with patch.object(psycopg.Cursor, 'execute', stalled):
+            try:
+                capture(time.monotonic() + .5)
+            except psycopg.errors.QueryCanceled:
+                pass
+            else:
+                raise AssertionError('stalled metadata request accepted')
+        assert injected == [stage] and store.active_connections == 0
+        with store.connect() as connection:
+            assert connection.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
+            assert connection.execute(
+                "SELECT count(*) AS count FROM pg_cursors WHERE name='retirement_metadata'"
+            ).fetchone()['count'] == 0
+        assert state(store, scope) == before
 
 
 def state(store, scope):
@@ -885,6 +959,7 @@ def main():
     try:
         store.migrate()
         with tempfile.TemporaryDirectory() as directory:
+            metadata_fetch_protocol(store, Path(directory))
             lock_statement_diagnostics(store, Path(directory))
             batch_updates(store, Path(directory))
             batch_mismatch_and_duplicate(store, Path(directory))

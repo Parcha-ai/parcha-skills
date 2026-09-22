@@ -340,11 +340,13 @@ def metadata_cursor_deadlines(store, root):
     scope = tenant, source, 'session'
     execute = psycopg.Connection.execute
     declare = psycopg.ServerCursor.execute
-    fetch = psycopg.ServerCursor.fetchmany
+    client_execute = psycopg.Cursor.execute
+    fetch = psycopg.Cursor.fetchall
     spool_class = ParentMetadataSpool
 
     def observed(deadline, *, slow=False):
         statements, batches, portals, directories = [], [], [], []
+        fetch_cursors = []
         expired_at_entry = deadline <= time.monotonic()
 
         class ObservedSpool(spool_class):
@@ -366,17 +368,27 @@ def metadata_cursor_deadlines(store, root):
                     'SELECT selected.*,items.chunks,pg_sleep(0.05) AS fetch_stall FROM (')
             return declare(cursor, statement, *args, **kwargs)
 
-        def trace_fetch(cursor, size=0):
-            assert size == 32, 'metadata fetch memory bound changed'
-            rows = fetch(cursor, size)
-            batches.append(len(rows))
-            assert len(rows) <= 32
+        def trace_client(cursor, statement, *args, **kwargs):
+            text = statement.as_string() if isinstance(statement, psycopg.sql.Composable) else str(statement)
+            if '; FETCH FORWARD' in text:
+                assert text.endswith('FETCH FORWARD 32 FROM "retirement_metadata"')
+                assert kwargs == {'prepare': False}
+                fetch_cursors.append(cursor)
+                statements.append(text)
+            return client_execute(cursor, statement, *args, **kwargs)
+
+        def trace_fetch(cursor):
+            rows = fetch(cursor)
+            if any(cursor is item for item in fetch_cursors):
+                batches.append(len(rows))
+                assert len(rows) <= 32
             return rows
 
         try:
             with patch.object(psycopg.Connection, 'execute', trace_execute), \
                  patch.object(psycopg.ServerCursor, 'execute', trace_declare), \
-                 patch.object(psycopg.ServerCursor, 'fetchmany', trace_fetch), \
+                 patch.object(psycopg.Cursor, 'execute', trace_client), \
+                 patch.object(psycopg.Cursor, 'fetchall', trace_fetch), \
                  patch.object(parent_chunk_proof, 'ParentMetadataSpool', ObservedSpool):
                 with parent_chunk_proof.prove_parent_chunks(store, archive, scope=scope,
                         limits=ParentRetirementLimits(), deadline_at=deadline) as proof:
