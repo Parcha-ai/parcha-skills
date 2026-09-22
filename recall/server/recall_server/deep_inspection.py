@@ -505,6 +505,7 @@ def _agent_exec_command(
     encoded_allow_missing = "1" if allow_missing_objects else "0"
     stage_script = r"""
 import base64,gzip,hashlib,json,pathlib,platform,re,shutil,subprocess,sys,time
+from concurrent.futures import ThreadPoolExecutor
 def mark(name):
     print(f"RECALL_EXEC_TIMING_V1\t{name}\t{time.time_ns()//1000}",file=sys.stderr,flush=True)
 mark("stage_start")
@@ -525,8 +526,7 @@ dataset_root=pathlib.Path("/tmp/recall-datasets").resolve()
 target.mkdir(mode=0o700,parents=True,exist_ok=True)
 docs.mkdir(mode=0o700,parents=True,exist_ok=True)
 dataset_root.mkdir(mode=0o700,parents=True,exist_ok=True)
-missing=set()
-for item in items:
+def stage_object(item):
     relative=pathlib.PurePosixPath(item["object_key"])
     if relative.is_absolute() or ".." in relative.parts:
         raise SystemExit(64)
@@ -535,8 +535,7 @@ for item in items:
         raise SystemExit(64)
     if not src.is_file():
         if allow_missing and item["object_key"] not in tool_keys:
-            missing.add(item["object_key"])
-            continue
+            return item["object_key"]
         raise SystemExit(66)
     dst=(target/pathlib.Path(*relative.parts)).resolve()
     if target not in dst.parents:
@@ -545,6 +544,15 @@ for item in items:
     dst.touch(mode=0o400,exist_ok=False)
     subprocess.run(["mount","--bind",str(src),str(dst)],check=True)
     subprocess.run(["mount","-o","remount,bind,ro",str(dst)],check=True)
+if datasets:
+    # Distinct destinations are required before concurrent namespace changes.
+    if len({item["object_key"] for item in items})!=len(items):
+        raise SystemExit(64)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        absent=list(pool.map(stage_object,items))
+else:
+    absent=[stage_object(item) for item in items]
+missing={key for key in absent if key is not None}
 mark("objects_ready")
 print(
     f"RECALL_EXEC_VISIBILITY_V1\tobjects_unavailable\t{len(missing)}",
