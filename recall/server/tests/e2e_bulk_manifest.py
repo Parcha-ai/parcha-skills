@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -8,6 +9,9 @@ import sys
 import tempfile
 import uuid
 from pathlib import Path
+from unittest.mock import patch
+
+from psycopg.pq import TransactionStatus
 
 SERVER = Path(__file__).resolve().parents[1]
 ROOT = SERVER.parent
@@ -15,6 +19,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(SERVER))
 
 from recall_server.archive import FilesystemArchiveStore
+from recall_server import canonical
 from recall_server.canonical import CanonicalArchiveGateway, CanonicalPlane
 from recall_server.db import BrainStore
 from recall_server.projectors import canonical_json
@@ -83,6 +88,115 @@ def forget(
         "requested_at": "2026-07-24T07:15:00Z",
         "idempotency_key": "forget-bulk-" + suffix,
     })
+
+
+def tombstone_jit_checks(store, archive, tenant_id, principal_id, source_id):
+    """Real public ingest, cyclic historical lineage and pooled-setting isolation."""
+    source_id += ":jit"
+    created = "2026-07-24T07:00:00Z"
+    gateway = CanonicalArchiveGateway(
+        store, archive, tenant_id=tenant_id, principal_id=principal_id)
+    artifact = gateway.put_raw(
+        tenant_id=tenant_id, source_id=source_id, native_id="jit-fixture",
+        payload=b"synthetic lineage fixture", media_type="application/json",
+        created_at=created)
+    plane = CanonicalPlane(store, archive)
+    ids = [f"native:jit:{i}" for i in range(10, 15)]
+
+    def envelope(index, parent, version=1, tombstone=False):
+        value = event(source_id=source_id, principal_id=principal_id,
+                      native_id=ids[index],
+                      content=({"target_native_id": ids[index]} if tombstone
+                               else {"text": f"safe version {version}"}),
+                      artifact=artifact, created_at=created)
+        value["native_parent_id"] = ids[parent]
+        if tombstone:
+            value["kind"] = "tombstone"
+        return value
+
+    statements, resolutions, restored = [], [], []
+    connect = store.connect
+
+    class ObservedConnection:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def __getattr__(self, name):
+            return getattr(self.connection, name)
+
+        def execute(self, query, *args, **kwargs):
+            if isinstance(query, str):
+                statements.append(query)
+                if query.startswith("WITH RECURSIVE roots"):
+                    assert self.connection.execute("SHOW jit").fetchone()["jit"] == "off"
+                    rows = self.connection.execute(query, *args, **kwargs).fetchall()
+                    resolutions.append({row["native_id"] for row in rows})
+                    class Result:
+                        def fetchall(self):
+                            return rows
+                    return Result()
+            return self.connection.execute(query, *args, **kwargs)
+
+        @contextmanager
+        def transaction(self):
+            try:
+                with self.connection.transaction():
+                    yield
+            finally:
+                assert self.connection.info.transaction_status == TransactionStatus.IDLE
+                assert self.connection.execute("SHOW jit").fetchone()["jit"] == "on"
+                self.connection.rollback()  # End only the SHOW observation transaction.
+                restored.append(True)
+
+    @contextmanager
+    def observed_connect():
+        with connect() as connection:
+            connection.execute("SET jit = on")
+            connection.commit()
+            yield ObservedConnection(connection)
+
+    def ingest(events):
+        with patch.object(store, "connect", observed_connect):
+            return plane.ingest_batch(tenant_id=tenant_id, principal_id=principal_id,
+                                      events=events)
+
+    # A-B-C-A cycle; D has an old parent B and a newer parent E.
+    ingest([envelope(i, parent) for i, parent in enumerate((2, 0, 1, 1, 4))])
+    ingest([envelope(3, 4, version=2)])
+    assert not any("SET LOCAL" in sql for sql in statements)
+    tombstone = envelope(0, 2, version=3, tombstone=True)
+    statements.clear()
+    before_restored = len(restored)
+    with patch.object(canonical, "MAX_LINKED_IDENTITIES", 2):
+        try:
+            ingest([tombstone])
+        except canonical.CanonicalLifecycleError as error:
+            assert str(error) == "canonical_lineage_limit"
+        else:
+            raise AssertionError("cyclic descendant overflow was accepted")
+    assert len(restored) > before_restored
+    with connect() as connection:
+        assert connection.execute(
+            "SELECT count(*) AS n FROM canonical_events WHERE tenant_id=%s "
+            "AND source_id=%s AND is_tombstone", (tenant_id, source_id)
+        ).fetchone()["n"] == 0
+        assert connection.execute(
+            "SELECT count(*) AS n FROM canonical_documents WHERE tenant_id=%s "
+            "AND source_id=%s AND is_current", (tenant_id, source_id)
+        ).fetchone()["n"] == 5
+    before_restored = len(restored)
+    ack = ingest([tombstone])
+    assert ack["inserted"] == 1 and len(restored) > before_restored
+    assert resolutions[-1] == set(ids[:4])
+    with connect() as connection:
+        remaining = connection.execute(
+            "SELECT native_id FROM canonical_documents WHERE tenant_id=%s "
+            "AND source_id=%s AND is_current", (tenant_id, source_id)
+        ).fetchall()
+        assert {row["native_id"] for row in remaining} == {ids[4]}
+    statements.clear()
+    assert ingest([tombstone])["replay"] is True
+    assert not any("SET LOCAL" in sql for sql in statements)
 
 
 def main() -> None:
@@ -271,6 +385,8 @@ def main() -> None:
             ).fetchone()
         if tuple(counts.values()) != (0, 0, 0):
             raise RuntimeError("bulk lifecycle left authoritative content behind")
+
+        tombstone_jit_checks(store, archive, tenant_id, principal_id, source_id)
 
     store.close()
     print(json.dumps({

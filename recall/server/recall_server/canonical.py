@@ -1298,6 +1298,9 @@ class CanonicalPlane:
                 if new_rows:
                     affected_native_ids = [item["native_id"] for item in new_rows]
                     if is_tombstone_batch:
+                        # Avoid compilation overhead for recursive lineage lookup;
+                        # the setting expires with this ingest transaction.
+                        connection.execute("SET LOCAL jit = off")
                         affected_native_ids = _linked_native_ids_batch(
                             connection,
                             tenant_id=tenant_id,
