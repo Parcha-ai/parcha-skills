@@ -34,7 +34,8 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, nullcontext
 from datetime import date, datetime, timezone
 from typing import Any
 
@@ -227,6 +228,37 @@ class TokenPacer:
 
 def estimated_tokens(rows: list[dict[str, Any]]) -> int:
     return sum(len(row.get(EMBED_TEXT_ATTRIBUTE) or "") for row in rows) // TOKEN_CHARS + len(rows)
+
+
+class _MonthTiming:
+    """Owner-call wall sums; concurrent intervals overlap, not HTTP attempts."""
+
+    def __init__(self) -> None:
+        self.started = time.monotonic()
+        self.values = {phase: [0.0, 0] for phase in ("catalog", "page", "pacer", "sdk", "backoff", "commit")}
+        self.lock = threading.Lock()
+
+    @contextmanager
+    def measure(self, phase: str) -> Iterator[None]:
+        started = time.monotonic()
+        try:
+            yield
+        finally:
+            elapsed = time.monotonic() - started
+            with self.lock:
+                self.values[phase][0] += elapsed
+                self.values[phase][1] += 1
+
+    def log(self, succeeded: bool, concurrency: int) -> None:
+        LOG.info(
+            "search plane month timing succeeded=%s month_ms=%s "
+            "catalog_ms=%s catalog_calls=%s page_ms=%s page_calls=%s "
+            "pacer_ms=%s pacer_calls=%s sdk_ms=%s sdk_calls=%s "
+            "backoff_ms=%s backoff_calls=%s commit_ms=%s commit_calls=%s concurrency=%s",
+            int(succeeded), round((time.monotonic() - self.started) * 1000),
+            *(value for elapsed, count in self.values.values() for value in (round(elapsed * 1000), count)),
+            concurrency,
+        )
 
 
 class TurbopufferProjector:
@@ -458,7 +490,10 @@ class TurbopufferProjector:
 
     # -- turbopuffer writes --------------------------------------------------
 
-    def _write(self, namespace: Any, budget: dict[str, float], **kwargs: Any) -> int:
+    def _write(
+        self, namespace: Any, budget: dict[str, float],
+        *, timing: _MonthTiming | None = None, **kwargs: Any,
+    ) -> int:
         """One write call; a 429 backs off and retries the same batch.
 
         ``budget`` carries the month's remaining backoff seconds and the
@@ -470,11 +505,12 @@ class TurbopufferProjector:
         attempts = 0
         while True:
             try:
-                namespace.write(
-                    distance_metric="cosine_distance",
-                    schema=namespace_schema(self.settings),
-                    **kwargs,
-                )
+                with timing.measure("sdk") if timing is not None else nullcontext():
+                    namespace.write(
+                        distance_metric="cosine_distance",
+                        schema=namespace_schema(self.settings),
+                        **kwargs,
+                    )
                 return attempts
             except Exception as error:  # noqa: BLE001 - transient errors are retried
                 if not is_transient(error):
@@ -488,77 +524,88 @@ class TurbopufferProjector:
                     )
                     raise
                 budget["remaining"] -= delay
-                self.sleep(delay)
+                with timing.measure("backoff") if timing is not None else nullcontext():
+                    self.sleep(delay)
                 delay = min(delay * 2, RATE_LIMIT_BACKOFF_CAP_SECONDS)
 
     def project_month(self, claim: dict[str, Any]) -> dict[str, Any]:
         """Project one claimed source-month; raises on a turbopuffer failure."""
 
-        tenant_id = claim["tenant_id"]
-        name = self.settings.namespace(tenant_id)
-        namespace = self.client.namespace(name)
-        budget = {"remaining": self.rate_limit_budget_seconds, "rate_limited": 0}
-        with self.store.connect() as connection:
-            since = (
-                self.shard_watermark(connection, claim)
-                if claim["reason"] in INCREMENTAL_REASONS
-                else None
-            )
-            watermark = self.read_watermark(connection)
-            tombstones = self.tombstone_ids(connection, claim)
-            connection.commit()
-        # Deletes first: a tombstone for an id that is live again (the same
-        # passage re-inserted) must not erase the row upserted below.
-        deleted = 0
-        for batch in _chunks(tombstones, self.batch_rows):
-            try:
-                self._write(namespace, budget, deletes=batch)
-            except Exception as error:  # noqa: BLE001 - class checked below
-                if type(error).__name__ != "NotFoundError":
-                    raise
-            deleted += len(batch)
-        written = 0
-        after: tuple[datetime, str] | None = None
-        while True:
-            with self.store.connect() as connection:
-                page = self.passage_page(connection, claim, since=since, after=after)
+        timing = _MonthTiming()
+        succeeded = False
+        try:
+            tenant_id = claim["tenant_id"]
+            name = self.settings.namespace(tenant_id)
+            namespace = self.client.namespace(name)
+            budget = {"remaining": self.rate_limit_budget_seconds, "rate_limited": 0}
+            with timing.measure("catalog"), self.store.connect() as connection:
+                since = (
+                    self.shard_watermark(connection, claim)
+                    if claim["reason"] in INCREMENTAL_REASONS
+                    else None
+                )
+                watermark = self.read_watermark(connection)
+                tombstones = self.tombstone_ids(connection, claim)
                 connection.commit()
-            if not page:
-                break
-            rows = [
-                passage_row({**passage, "actors": [tuple(actor) for actor in passage["actors"]]})
-                for passage in page
-            ]
-            batches = byte_bounded_batches(rows, max_rows=self.batch_rows, max_bytes=self.max_batch_bytes)
+            # Deletes first: a tombstone for an id that is live again (the same
+            # passage re-inserted) must not erase the row upserted below.
+            deleted = 0
+            for batch in _chunks(tombstones, self.batch_rows):
+                try:
+                    self._write(namespace, budget, timing=timing, deletes=batch)
+                except Exception as error:  # noqa: BLE001 - class checked below
+                    if type(error).__name__ != "NotFoundError":
+                        raise
+                deleted += len(batch)
+            written = 0
+            after: tuple[datetime, str] | None = None
+            while True:
+                with timing.measure("page"), self.store.connect() as connection:
+                    page = self.passage_page(connection, claim, since=since, after=after)
+                    connection.commit()
+                if not page:
+                    break
+                rows = [
+                    passage_row({**passage, "actors": [tuple(actor) for actor in passage["actors"]]})
+                    for passage in page
+                ]
+                batches = byte_bounded_batches(rows, max_rows=self.batch_rows, max_bytes=self.max_batch_bytes)
 
-            def write_batch(batch: list[dict[str, Any]]) -> int:
-                self.pacer.wait_for(estimated_tokens(batch))
-                self._write(namespace, budget, upsert_rows=batch)
-                return len(batch)
+                def write_batch(batch: list[dict[str, Any]]) -> int:
+                    with timing.measure("pacer"):
+                        self.pacer.wait_for(estimated_tokens(batch))
+                    self._write(namespace, budget, timing=timing, upsert_rows=batch)
+                    return len(batch)
 
-            if self.write_concurrency > 1 and len(batches) > 1:
-                with ThreadPoolExecutor(
-                    max_workers=min(self.write_concurrency, len(batches)),
-                    thread_name_prefix="recall-search-plane",
-                ) as executor:
-                    written += sum(executor.map(write_batch, batches))
-            else:
-                for batch in batches:
-                    written += write_batch(batch)
-            last = page[-1]
-            after = (last["first_occurred_at"], last["passage_id"])
-            if len(page) < self.page_rows:
-                break
-        with self.store.connect() as connection:
-            retired = self.finish_month(
-                connection, claim,
-                namespace=name, rows_written=written,
-                tombstones=tombstones, watermark=watermark,
-            )
-        return {
-            "rows": written, "deleted": deleted, "retired": retired,
-            "rate_limited": int(budget["rate_limited"]),
-        }
+                if self.write_concurrency > 1 and len(batches) > 1:
+                    with ThreadPoolExecutor(
+                        max_workers=min(self.write_concurrency, len(batches)),
+                        thread_name_prefix="recall-search-plane",
+                    ) as executor:
+                        written += sum(executor.map(write_batch, batches))
+                else:
+                    for batch in batches:
+                        written += write_batch(batch)
+                last = page[-1]
+                after = (last["first_occurred_at"], last["passage_id"])
+                if len(page) < self.page_rows:
+                    break
+            with timing.measure("commit"), self.store.connect() as connection:
+                retired = self.finish_month(
+                    connection, claim,
+                    namespace=name, rows_written=written,
+                    tombstones=tombstones, watermark=watermark,
+                )
+            succeeded = True
+            return {
+                "rows": written, "deleted": deleted, "retired": retired,
+                "rate_limited": int(budget["rate_limited"]),
+            }
+        finally:
+            try:
+                timing.log(succeeded, self.write_concurrency)
+            except Exception:  # noqa: BLE001 - diagnostics must preserve the outcome
+                pass
 
     def drain(
         self,
