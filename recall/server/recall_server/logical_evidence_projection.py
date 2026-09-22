@@ -2146,7 +2146,7 @@ class CanonicalLogicalEvidenceProjector:
             cleanup = self.drain_cleanup(
                 tenant_id=tenant_id,
                 limit=5_000,
-                concurrency=upload_concurrency,
+                concurrency=cleanup_concurrency,
             )
             old_objects_deleted += int(cleanup["deleted"])
             cleanup_failures += int(cleanup["failures"])
