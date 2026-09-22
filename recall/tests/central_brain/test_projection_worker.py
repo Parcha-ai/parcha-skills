@@ -1025,7 +1025,8 @@ class SearchBeforeParquetTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertFalse(failures)
         self.assertEqual(calls, ["embeddings", "passages", "logical", "search", "scan"])
-        self.assertEqual(scan_bounds, [dict(tenant_id="tenant:company:test", batch_size=4, max_batches=2)])
+        self.assertEqual(scan_bounds, [dict(tenant_id="tenant:company:test", batch_size=4,
+                                           max_batches=2, compaction_budget=1)])
         result = outcomes[0]
         self.assertEqual(result["search_plane_elapsed_ms"], 250)
         self.assertEqual(result["parquet_elapsed_ms"], 900000)
@@ -1056,3 +1057,74 @@ class SearchBeforeParquetTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OptionalCompactionYieldsTests(unittest.TestCase):
+    """Exercise the real queued scan loop while optional maintenance yields."""
+
+    def run_cycles(self, states, *, every=1):
+        from dataclasses import replace
+        from tests.central_brain.test_parquet_scan import _WindowProbe, _candidate
+
+        calls = []
+        current = [0]
+
+        class Logical(_Logical):
+            def project_pending(self, **kwargs):
+                state = states[current[0]]
+                current[0] += 1
+                return {**super().project_pending(**kwargs),
+                        "pending": state.get("logical_pending", 0),
+                        "waiting": state.get("logical_waiting", 0),
+                        "documents": state.get("logical_documents", 0)}
+
+        class Passages(_Passages):
+            def project_pending(self, **kwargs):
+                state = states[current[0]]
+                return {**super().project_pending(**kwargs),
+                        "pending": state.get("passage_pending", 0),
+                        "documents": state.get("passage_documents", 0)}
+
+        class Scan(_WindowProbe):
+            def _over_fragmented(self, *, tenant_id, limit):
+                super()._over_fragmented(tenant_id=tenant_id, limit=limit)
+                return [replace(_candidate(), source_id="source:maintenance")]
+
+        scan = Scan()
+        result = run_projection_worker(
+            Logical(calls, work=0), Passages(calls, work=0), scan,
+            tenant_id="tenant:company:test", logical_batch_size=5,
+            passage_batch_size=5, embedding_batch_size=64,
+            max_batches_per_cycle=1, upload_concurrency=1,
+            passage_concurrency=1, interval_seconds=30,
+            max_cycles=len(states), parquet_every_cycles=every,
+            sleep=lambda _seconds: None,
+        )
+        return scan, result
+
+    def test_busy_signals_commit_queued_work_without_optional_sweep(self):
+        for signal in ("logical_pending", "logical_waiting", "passage_pending",
+                       "logical_documents", "passage_documents"):
+            with self.subTest(signal=signal):
+                scan, result = self.run_cycles([{signal: 1}])
+                self.assertEqual(scan.built, ["source:ready", "source:later"])
+                self.assertEqual(getattr(scan, "compaction_sweeps", []), [])
+                self.assertEqual(result["parquet_shards"], 2)
+                self.assertEqual(result["parquet_contended"], 1)
+
+    def test_idle_runs_queued_work_and_existing_one_candidate_sweep(self):
+        scan, result = self.run_cycles([{}])
+        self.assertEqual(scan.built, ["source:ready", "source:later", "source:maintenance"])
+        self.assertEqual(scan.compaction_sweeps, [("tenant:company:test", 1)])
+        self.assertEqual(result["parquet_shards"], 3)
+
+    def test_idle_after_busy_restores_optional_maintenance(self):
+        scan, _result = self.run_cycles([{"logical_documents": 1}, {}])
+        self.assertEqual(scan.built, ["source:ready", "source:later",
+                                      "source:ready", "source:later", "source:maintenance"])
+        self.assertEqual(scan.compaction_sweeps, [("tenant:company:test", 1)])
+
+    def test_busy_queued_rebuilds_keep_cycle_cadence(self):
+        scan, _result = self.run_cycles([{"logical_pending": 1}] * 4, every=2)
+        self.assertEqual(scan.built, ["source:ready", "source:later"] * 2)
+        self.assertEqual(getattr(scan, "compaction_sweeps", []), [])
