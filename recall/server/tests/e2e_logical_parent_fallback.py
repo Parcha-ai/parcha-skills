@@ -26,7 +26,10 @@ ROOT = re.compile(r'CROSS JOIN LATERAL jsonb_to_record\(.*?\)\s+(?:AS\s+)?root_f
 def queries():
     current = next(value for value in CanonicalLogicalEvidenceProjector._prepare_batch_and_upload.__code__.co_consts
                    if isinstance(value, str) and 'fallback_role_values' in value)
-    legacy = ROOT.sub('', current)
+    # Hints add metadata to the current projection, not the frozen legacy SQL.
+    added = 'document.document_id,document.body_location,'
+    assert current.count(added) == 1
+    legacy = ROOT.sub('', current.replace(added, 'document.document_id,'))
     for field in ('role', 'type'):
         for nested in ('message', 'payload'):
             legacy = re.sub(r"root_fields\.content\s*#>>\s*'\{" + nested + ',' + field + r"\}'",
@@ -113,7 +116,12 @@ def main():
                     cursor.execute(query, args)
                     all_rows.append(list(cursor))
             assert len(all_rows[0]) == len(all_rows[1]) == 264
-            assert digest_rows(all_rows[0]) == digest_rows(all_rows[1])
+            for old, new in zip(*all_rows, strict=True):
+                assert set(new) == set(old) | {'body_location'}
+                assert new['body_location'] == 'inline'
+            common_rows = [{key: value for key, value in row.items() if key != 'body_location'}
+                           for row in all_rows[1]]
+            assert digest_rows(all_rows[0]) == digest_rows(common_rows)
             assert {row['source_id'] for row in all_rows[1]} == {source}
             assert all(row['document_revision'] == (1 if row['native_id'] == 'native:' + seed else 3) for row in all_rows[1])
             projector = CanonicalLogicalEvidenceProjector(store, None)

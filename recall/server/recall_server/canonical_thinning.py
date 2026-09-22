@@ -71,7 +71,11 @@ def _thinning_statement(*, bounded: bool = False, probe: bool = False) -> str:
     key_filter = document_filter = event_filter = ""
     document_relation = "canonical_documents document"
     event_relation = "canonical_events event"
+    artifact_relation = "raw_artifacts artifact"
+    queue_offset = ""
     if bounded and probe:
+        # Keep the unlocked queue check tied to each enumerated parent.
+        queue_offset = "\n                              OFFSET 0"
         # These unlocked identity lookups stay correlated to enumerated keys.
         # The final mutation below uses plain base relations so its row locks
         # remain after the original ORDER/LIMIT, rather than being pushed here.
@@ -93,6 +97,13 @@ def _thinning_statement(*, bounded: bool = False, probe: bool = False) -> str:
                                 AND e.event_id=document.event_id
                               OFFSET 0
                            ) event"""
+        artifact_relation = """LATERAL (
+                             SELECT a.* FROM raw_artifacts a
+                              WHERE a.tenant_id=event.tenant_id
+                                AND a.source_id=event.source_id
+                                AND a.artifact_id=event.artifact_id
+                              OFFSET 0
+                           ) artifact"""
     if bounded and not probe:
         key_filter = """AND (document.source_id,document.document_id) IN (
                                 SELECT * FROM unnest(%s::text[],%s::text[]))
@@ -117,7 +128,7 @@ def _thinning_statement(*, bounded: bool = False, probe: bool = False) -> str:
                            FROM {document_relation}
                            JOIN {event_relation}
                              USING(tenant_id,source_id,event_id)
-                           JOIN raw_artifacts artifact
+                           JOIN {artifact_relation}
                              ON artifact.tenant_id=event.tenant_id
                             AND artifact.source_id=event.source_id
                             AND artifact.artifact_id=event.artifact_id
@@ -152,7 +163,7 @@ def _thinning_statement(*, bounded: bool = False, probe: bool = False) -> str:
                                    AND queued.source_id=event.source_id
                                    AND queued.native_parent_id=COALESCE(
                                        event.native_parent_id,event.native_id
-                                   )
+                                   ){queue_offset}
                             )
                           ORDER BY document.source_id,document.document_id
                           LIMIT %s
@@ -282,16 +293,36 @@ class CanonicalBodyThinner:
         self._tenant_id = tenant_id
         self._after: tuple[str, str] | None = None
         self._through: tuple[str, str] | None = None
+        self._committed_keys: dict[tuple[str, str], None] = {}
 
-    def thin(self, *, batch_size: int) -> dict[str, Any]:
+    def thin(
+        self, *, batch_size: int,
+        committed_keys: tuple[tuple[str, str, str], ...] = (),
+    ) -> dict[str, Any]:
         if (isinstance(batch_size, bool) or not isinstance(batch_size, int)
                 or not 1 <= batch_size <= 10_000):
             raise ValueError("canonical body thinning budget is invalid")
+        # Best-effort hints are bounded and never authoritative. Import before
+        # opening the transaction so an unknown COMMIT retains them for recheck.
+        for tenant, source, document in committed_keys:
+            if tenant != self._tenant_id or any(
+                not isinstance(value, str) or not 1 <= len(value) <= 255
+                for value in (source, document)
+            ):
+                continue
+            self._committed_keys[(source, document)] = None
+            if len(self._committed_keys) > 256:
+                del self._committed_keys[next(iter(self._committed_keys))]
         through, after = self._through, self._after
         row = dict(candidates=0, documents=0, events=0,
                    document_bytes=0, event_bytes=0)
         keys = []
+        eligible = []
+        attempted_hints = []
         with self._store.connect() as connection:
+            # Per-statement cancellation bounds a bad plan or lock wait. This
+            # is not a whole-callback deadline; context exit rolls back errors.
+            connection.execute("SET LOCAL statement_timeout='2s'", ())
             if through is None:
                 bound = connection.execute(
                     """SELECT source_id,document_id FROM canonical_documents
@@ -324,21 +355,37 @@ class CanonicalBodyThinner:
                     (sources, documents, self._tenant_id, self._tenant_id,
                      batch_size),
                 ).fetchall()
-                if eligible:
-                    sources = [key["source_id"] for key in eligible]
-                    documents = [key["document_id"] for key in eligible]
-                    source_scope = sorted(set(sources))
-                    row = connection.execute(
-                        _thinning_statement(bounded=True),
-                        (self._tenant_id, sources, documents, source_scope,
-                         documents, batch_size, self._tenant_id, source_scope,
-                         self._tenant_id, source_scope),
-                    ).fetchone()
                 if len(eligible) == batch_size:
                     after = (eligible[-1]["source_id"], eligible[-1]["document_id"])
                 else:
                     after = (keys[-1]["source_id"], keys[-1]["document_id"])
+            # Historical selection owns the cursor and has first claim on the
+            # batch. Hints only fill unused slots in the same atomic mutation.
+            if len(eligible) < batch_size and self._committed_keys:
+                selected = {(key["source_id"], key["document_id"]) for key in eligible}
+                attempted_hints = [key for key in self._committed_keys if key not in selected]
+                if attempted_hints:
+                    eligible.extend(connection.execute(
+                        _thinning_statement(bounded=True, probe=True),
+                        ([key[0] for key in attempted_hints],
+                         [key[1] for key in attempted_hints], self._tenant_id,
+                         self._tenant_id, batch_size - len(eligible)),
+                    ).fetchall())
+            if eligible:
+                sources = [key["source_id"] for key in eligible]
+                documents = [key["document_id"] for key in eligible]
+                source_scope = sorted(set(sources))
+                row = connection.execute(
+                    _thinning_statement(bounded=True),
+                    (self._tenant_id, sources, documents, source_scope,
+                     documents, batch_size, self._tenant_id, source_scope,
+                     self._tenant_id, source_scope),
+                ).fetchone()
         # Publish progress only after successful context exit (COMMIT ACK).
+        # Keep unselected hints for later batches. Ineligible hints remain
+        # bounded and are evicted by new arrivals; history still revisits them.
+        for key in eligible:
+            self._committed_keys.pop((key["source_id"], key["document_id"]), None)
         complete = not keys or after == through
         self._after, self._through = ((None, None) if complete
                                      else (after, through))

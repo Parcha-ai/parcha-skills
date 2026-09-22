@@ -2597,6 +2597,7 @@ def main() -> None:
                     skip_embedding=args.skip_embedding,
                     search_plane=search_plane,
                     body_thinner=lambda busy: body_thinner.thin(
+                        committed_keys=logical._take_committed_body_keys(),
                         batch_size=(
                             args.thin_busy_batch_size
                             if busy

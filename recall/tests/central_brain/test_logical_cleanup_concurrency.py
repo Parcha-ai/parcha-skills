@@ -94,7 +94,7 @@ class Projector(CanonicalLogicalEvidenceProjector):
     def _pending(self, **kwargs):
         return [LogicalGroupCandidate('tenant:synthetic', 'source:synthetic', 'parent', datetime.now(timezone.utc), 1, 1)]
 
-    def _prepare_batch_and_upload(self, candidates):
+    def _prepare_batch_and_upload(self, candidates, **kwargs):
         self.prepared += len(candidates)
         assert not self.store.rows
         return [SimpleNamespace(prepared=SimpleNamespace(record_count=1, receipt_count=1), all_references=()) for _ in candidates]
