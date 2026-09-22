@@ -138,6 +138,8 @@ def run_projection_worker(
         raise ValueError("projection worker budget is invalid")
     cycles_since_parquet = 0
     last_parquet_started = clock()
+    last_busy_thin_cycle: int | None = None
+    last_busy_thin_started = 0.0
 
     def elapsed_ms(started: float) -> int:
         return max(0, int(round((clock() - started) * 1000)))
@@ -272,21 +274,24 @@ def run_projection_worker(
             )
             parquet_elapsed_ms = elapsed_ms(phase_started)
             phase_started = clock()
-            # The thinner has its own row-level authority gates: live S3 raw data,
-            # an S3 logical manifest, retained searchable chunks, and no queued
-            # reprojection for that source group. Run one bounded batch every cycle
-            # so steady ingestion cannot permanently prevent safe rows from being
-            # thinned merely because an unrelated global queue is non-empty. While
-            # freshness work is queued the thinner is told it is busy so it takes
-            # a small batch: measured in production, a 1000-body batch held the
-            # cycle for ~12 minutes while the logical queue grew.
+            # Preserve the thinner's row-level authority gates. While busy,
+            # yield two cycles between batches, but run after 30 seconds at the
+            # next reachable boundary. Earlier phases can exceed that interval.
+            # Idle thinning runs immediately; each new busy streak starts ready.
             thin_busy = (
                 int(documents.get("pending", 0)) > 0
                 or int(projected.get("pending", 0)) > 0
             )
+            if not thin_busy:
+                last_busy_thin_cycle = None
+            thin_due = (
+                last_busy_thin_cycle is None
+                or cycles - last_busy_thin_cycle >= 3
+                or phase_started - last_busy_thin_started >= 30.0
+            )
             thinned = (
                 body_thinner(thin_busy)
-                if body_thinner is not None
+                if body_thinner is not None and thin_due
                 else {
                     "status": "deferred" if body_thinner is not None else "complete",
                     "documents": 0,
@@ -295,6 +300,11 @@ def run_projection_worker(
                     "event_bytes_replaced": 0,
                 }
             )
+            if body_thinner is not None and thin_due and thin_busy:
+                # Failed calls do not consume cadence; the existing failed-cycle
+                # path can retry at its next reachable thinning boundary.
+                last_busy_thin_cycle = cycles
+                last_busy_thin_started = phase_started
             thin_elapsed_ms = elapsed_ms(phase_started)
             # H3-a: source-months waiting for the Lance writer, one cheap
             # count per cycle (a projector double without a store reports 0).
@@ -357,6 +367,7 @@ def run_projection_worker(
                 "search_plane_rate_limited": int(searched.get("rate_limited", 0)),
                 "canonical_bodies_thinned": int(thinned["documents"]),
                 "thin_mode": "busy" if thin_busy else "idle",
+                "thin_deferred": int(body_thinner is not None and not thin_due),
                 "canonical_bodies_refused": int(thinned["refused"]),
                 "canonical_document_bytes_removed": int(
                     thinned["document_bytes_removed"]

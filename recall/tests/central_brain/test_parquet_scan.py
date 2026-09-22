@@ -263,7 +263,7 @@ class _WindowProbe(CanonicalParquetScanProjector):
     def _candidate_lease(self, candidate):
         yield candidate.source_id != "source:locked"
 
-    def _build(self, candidate):
+    def _build(self, candidate, *, allow_compaction=True):
         self.built.append(candidate.source_id)
         return ScanUpload(
             "a" * 64,
@@ -339,10 +339,10 @@ class ParquetScanContractTest(unittest.TestCase):
 
     def test_missing_evidence_candidate_does_not_hide_the_next_ready_candidate(self):
         class MissingFirst(_WindowProbe):
-            def _build(self, candidate):
+            def _build(self, candidate, *, allow_compaction=True):
                 if candidate.source_id == "source:ready":
                     raise ParquetScanError("parquet_scan_evidence_requeued")
-                return super()._build(candidate)
+                return super()._build(candidate, allow_compaction=allow_compaction)
 
         projector = MissingFirst()
         result = projector.project_pending(
