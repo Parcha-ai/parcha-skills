@@ -750,6 +750,9 @@ class CanonicalLogicalEvidenceProjector:
                     name="logical_evidence_batch_stream",
                 ) as cursor:
                     cursor.itersize = self.cursor_fetch_rows
+                    # Decode the root once to avoid repeated TOAST reads. The
+                    # cheap match guard avoids decoding before parent filtering;
+                    # the unchanged joins retain all scope/current-row authority.
                     cursor.execute(
                         """WITH selected(
                                candidate_ordinal,tenant_id,source_id,
@@ -765,32 +768,23 @@ class CanonicalLogicalEvidenceProjector:
                               event.event_id,event.native_id,event.kind,
                               event.occurred_at,
                               jsonb_build_array(
-                                      event.canonical_redacted->>'role',
-                                      event.canonical_redacted->>'type',
-                                      event.canonical_redacted
-                                          #>> '{content,role}',
-                                      event.canonical_redacted
-                                          #>> '{content,type}',
-                                      event.canonical_redacted
-                                          #>> '{content,message,role}',
-                                      event.canonical_redacted
-                                          #>> '{content,message,type}',
-                                      event.canonical_redacted
-                                          #>> '{content,payload,role}',
-                                      event.canonical_redacted
-                                          #>> '{content,payload,type}'
+                                      root_fields.role,
+                                      root_fields.type,
+                                      root_fields.content->>'role',
+                                      root_fields.content->>'type',
+                                      root_fields.content #>> '{message,role}',
+                                      root_fields.content #>> '{message,type}',
+                                      root_fields.content #>> '{payload,role}',
+                                      root_fields.content #>> '{payload,type}'
                               ) AS fallback_role_values,
                               jsonb_build_array(
-                                      event.canonical_redacted->>'type',
-                                      event.canonical_redacted
-                                          #>> '{content,type}',
-                                      event.canonical_redacted
-                                          #>> '{content,message,type}',
-                                      event.canonical_redacted
-                                          #>> '{content,payload,type}'
+                                      root_fields.type,
+                                      root_fields.content->>'type',
+                                      root_fields.content #>> '{message,type}',
+                                      root_fields.content #>> '{payload,type}'
                               ) AS fallback_type_values,
                               CASE WHEN artifact.media_type=%s
-                                   THEN event.canonical_redacted->'content'
+                                   THEN root_fields.content
                                    ELSE NULL
                               END AS oversized_content,
                               event.source_ordinal AS byte_start,
@@ -830,6 +824,18 @@ class CanonicalLogicalEvidenceProjector:
                            ON artifact.tenant_id=event.tenant_id
                           AND artifact.source_id=event.source_id
                           AND artifact.artifact_id=event.artifact_id
+                         CROSS JOIN LATERAL jsonb_to_record(
+                             CASE WHEN document.event_id=event.event_id
+                                  AND COALESCE(
+                                      event.native_parent_id,event.native_id
+                                  )=selected.native_parent_id
+                             THEN CASE WHEN jsonb_typeof(
+                                      event.canonical_redacted
+                                  )='object'
+                                  THEN event.canonical_redacted
+                                  ELSE '{}'::jsonb END
+                             ELSE '{}'::jsonb END
+                         ) AS root_fields(role text,type text,content jsonb)
                          JOIN LATERAL (
                               SELECT count(*)::integer AS chunk_count,
                                      jsonb_agg(jsonb_build_object(
