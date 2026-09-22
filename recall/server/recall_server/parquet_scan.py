@@ -1463,11 +1463,30 @@ class CanonicalParquetScanProjector:
                 self.archive, shard, upload.schemas[dataset]
             ):
                 member = members.get(row["logical_document_id"])
-                if (member is None
-                        or row["schema_version"] != SCAN_SCHEMA_VERSION
-                        or row["tenant_id"] != candidate.tenant_id
-                        or row["source_id"] != candidate.source_id
-                        or row["revision"] != member.revision):
+                reason = None
+                if member is None:
+                    reason = "membership"
+                elif row["schema_version"] != SCAN_SCHEMA_VERSION:
+                    reason = "schema"
+                elif row["tenant_id"] != candidate.tenant_id:
+                    reason = "tenant"
+                elif row["source_id"] != candidate.source_id:
+                    reason = "source"
+                elif dataset == "passages":
+                    # Logical commits retain the previous passage projection.
+                    # Its immutable rows keep their original revision; the
+                    # member fingerprints the logical AND passage-pointer state.
+                    if (type(row["revision"]) is not int
+                            or not 0 < row["revision"] <= member.revision):
+                        reason = "revision"
+                elif row["revision"] != member.revision:
+                    reason = "revision"
+                if reason is not None:
+                    LOG.warning(
+                        "parquet preserve refused dataset=%s reason=%s",
+                        dataset if dataset in SCAN_DATASETS else "unrecognized",
+                        reason,
+                    )
                     raise ParquetScanError("parquet_scan_state_invalid")
                 if member.logical_document_id not in keep:
                     continue

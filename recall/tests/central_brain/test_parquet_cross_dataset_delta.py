@@ -132,6 +132,122 @@ class CrossDatasetDeltaTests(unittest.TestCase):
         shard['size_bytes'] = len(payload)
         shard['content_sha256'] = hashlib.sha256(payload).hexdigest()
 
+    def lagging_passage_fixture(self):
+        # Logical commits retain the previous passage revision until the next
+        # passage phase. The real _passages query selects that stored revision.
+        class LaggingProbe(Probe):
+            def _passages(self, candidate, document_ids):
+                revisions = {d['logical_document_id']: d.get('passage_revision', 1)
+                             for d in self.month_documents}
+                for row in super()._passages(candidate, document_ids):
+                    yield {**row, 'revision': revisions[row['logical_document_id']]}
+
+        documents = [{**_month_document(f'document:{i}'), 'revision': 2,
+                      'passage_source_sha256': 'a'*64,
+                      'passage_policy_fingerprint': 'b'*64, 'passage_count': 1}
+                     for i in range(6)]
+        archive = Archive({d['logical_document_id']: 2 for d in documents})
+        initial = LaggingProbe(documents, ScanCatalog({}, {}, frozenset()), archive)._build(_candidate())
+        catalog = catalog_from_upload(initial, {'document:0'})
+        changed = [{**documents[0], 'document_content_sha256': 'e'*64}, *documents[1:]]
+        archive.reads.clear()
+        return LaggingProbe, documents, changed, catalog, archive
+
+    def test_lagging_passage_revision_preserves_exact_full_build_parity(self):
+        probe, _, changed, catalog, archive = self.lagging_passage_fixture()
+        original = self.rows(catalog.shards, archive)['passages']
+        self.assertTrue(all(json.loads(row)['revision'] == 1 for row in original))
+        self.assertTrue(all(member.revision == 2
+                            for identity, members in catalog.members.items()
+                            if identity[0] == 'passages' for member in members))
+        result = probe(changed, catalog, archive)._build(_candidate())
+        self.assertEqual(result.mode, 'delta')
+        self.assertEqual(archive.reads, ['document:0'])
+        after = self.after(catalog, result)
+        full_archive = Archive(archive.records)
+        full = probe(changed, ScanCatalog({}, {}, frozenset()), full_archive)._build(_candidate())
+        self.assertEqual(self.rows(after.shards, archive), self.rows(full.references, full_archive))
+        self.assertEqual(self.rows(after.shards, archive)['passages'], original)
+        self.assertEqual(probe(changed, after, archive)._plan(_candidate(), changed, after)[0], 'reuse')
+
+    def test_passage_pointer_content_change_regenerates_lagging_sibling(self):
+        probe, documents, changed, catalog, archive = self.lagging_passage_fixture()
+        changed[1] = {**documents[1], 'passage_source_sha256': 'f'*64, 'passage_revision': 2}
+        result = probe(changed, catalog, archive)._build(_candidate())
+        self.assertEqual(archive.reads, ['document:0', 'document:1'])
+        after = self.after(catalog, result)
+        full_archive = Archive(archive.records)
+        full = probe(changed, ScanCatalog({}, {}, frozenset()), full_archive)._build(_candidate())
+        actual = self.rows(after.shards, archive)
+        self.assertEqual(actual, self.rows(full.references, full_archive))
+        rows = [json.loads(row) for row in actual['passages']]
+        self.assertEqual({r['revision'] for r in rows if r['logical_document_id'] == 'document:1'}, {2})
+        self.assertEqual({r['revision'] for r in rows if r['logical_document_id'] == 'document:2'}, {1})
+
+    def test_invalid_passage_revisions_refuse_with_closed_reason(self):
+        for revision in (None, 0, -1, 3):
+            with self.subTest(revision=revision):
+                probe, _, changed, catalog, archive = self.lagging_passage_fixture()
+                identity = ('passages', 0)
+                rows = decode(archive.read_raw(catalog.shards[identity]))
+                rows[1]['revision'] = revision
+                self.replace_payload(catalog, archive, identity, encode(rows, _schemas()['passages']))
+                with self.assertLogs('recall_server.parquet_scan', level='WARNING') as logs:
+                    with self.assertRaisesRegex(ParquetScanError, '^parquet_scan_state_invalid$'):
+                        probe(changed, catalog, archive)._build(_candidate())
+                self.assertEqual(logs.output, ['WARNING:recall_server.parquet_scan:parquet preserve refused dataset=passages reason=revision'])
+                self.assertNotIn('document:', str(logs.output))
+
+    def test_boolean_passage_revision_refuses_at_decoded_row_boundary(self):
+        from recall_server.parquet_scan import _preserved_fragment_rows
+
+        for revision in (False, True):
+            with self.subTest(revision=revision):
+                probe, _, changed, catalog, archive = self.lagging_passage_fixture()
+                def malformed_rows(store, shard, schema):
+                    for row in _preserved_fragment_rows(store, shard, schema):
+                        if shard['dataset'] == 'passages':
+                            row = {**row, 'revision': revision}
+                        yield row
+                # Arrow int32 normally yields int; defend the consumer boundary
+                # explicitly without claiming a boolean survives Arrow encoding.
+                with mock.patch('recall_server.parquet_scan._preserved_fragment_rows',
+                                side_effect=malformed_rows):
+                    with self.assertRaisesRegex(ParquetScanError, '^parquet_scan_state_invalid$'):
+                        probe(changed, catalog, archive)._build(_candidate())
+
+    def test_preservation_refusal_log_contains_only_closed_labels(self):
+        hostile = 'PRIVATE_SOURCE_AND_PAYLOAD\nforged-log'
+        for key, value, reason in (
+            ('logical_document_id', hostile, 'membership'),
+            ('tenant_id', hostile, 'tenant'), ('source_id', hostile, 'source'),
+            ('schema_version', 9, 'schema'),
+        ):
+            with self.subTest(key=key):
+                probe, _, changed, catalog, archive = self.lagging_passage_fixture()
+                identity = ('passages', 0)
+                rows = decode(archive.read_raw(catalog.shards[identity]))
+                rows[1][key] = value
+                self.replace_payload(catalog, archive, identity, encode(rows, _schemas()['passages']))
+                with self.assertLogs('recall_server.parquet_scan', level='WARNING') as logs:
+                    with self.assertRaisesRegex(ParquetScanError, '^parquet_scan_state_invalid$'):
+                        probe(changed, catalog, archive)._build(_candidate())
+                self.assertEqual(logs.output, [
+                    f'WARNING:recall_server.parquet_scan:parquet preserve refused dataset=passages reason={reason}'
+                ])
+                self.assertNotIn('PRIVATE', str(logs.output))
+
+    def test_older_revision_still_refused_for_other_datasets(self):
+        for dataset in ('documents', 'records', 'actors'):
+            with self.subTest(dataset=dataset):
+                probe, _, changed, catalog, archive = self.lagging_passage_fixture()
+                identity = next(key for key in catalog.shards if key[0] == dataset)
+                rows = decode(archive.read_raw(catalog.shards[identity]))
+                rows[1]['revision'] = 1
+                self.replace_payload(catalog, archive, identity, encode(rows, _schemas()[dataset]))
+                with self.assertRaisesRegex(ParquetScanError, '^parquet_scan_state_invalid$'):
+                    probe(changed, catalog, archive)._build(_candidate())
+
     def test_current_writer_packs_shared_metadata_but_isolated_record_parts(self):
         _, _, catalog, _ = self.fixture()
         metadata = [members for (dataset, _), members in catalog.members.items() if dataset == 'documents']
