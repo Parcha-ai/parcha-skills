@@ -21,7 +21,9 @@ from .archive_runtime import (
     probe_archive,
 )
 from .canonical_retrieval import CanonicalRetrieval
-from .canonical_thinning import _compact_event_expression, thin_canonical_bodies
+from .canonical_thinning import (
+    CanonicalBodyThinner, _compact_event_expression, thin_canonical_bodies,
+)
 from .storage_retirement import retire_chunk_search_index, retire_chunk_search_vector
 from .capabilities import CapabilityError, probe_database
 from .control import ControlPlane, SecretBox
@@ -2559,6 +2561,7 @@ def main() -> None:
             store,
             LogicalEvidenceProjectionStore(build_evidence_archive_store()),
         )
+        body_thinner = CanonicalBodyThinner(store, tenant_id=args.tenant)
         # H3-b: one client for the life of the process; the phase is skipped
         # entirely (search_plane=None) when turbopuffer is not configured.
         search_settings = _search_plane_settings(args.search_plane)
@@ -2593,15 +2596,12 @@ def main() -> None:
                     cleanup_concurrency=args.cleanup_concurrency,
                     skip_embedding=args.skip_embedding,
                     search_plane=search_plane,
-                    body_thinner=lambda busy: thin_canonical_bodies(
-                        store,
-                        tenant_id=args.tenant,
+                    body_thinner=lambda busy: body_thinner.thin(
                         batch_size=(
                             args.thin_busy_batch_size
                             if busy
                             else args.thin_batch_size
                         ),
-                        max_batches=1,
                     ),
                 ),
                 sort_keys=True,
