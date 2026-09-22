@@ -1217,130 +1217,155 @@ class CanonicalLogicalEvidenceProjector:
             raise LogicalEvidenceError("logical_evidence_budget_invalid")
         tenant_id = self._tenant(tenant_id)
         completed = deleted = failures = 0
-        with self.store.connect() as connection:
-            with connection.transaction():
-                rows = connection.execute(
-                    """SELECT queue.*,
-                              NOT EXISTS (
-                                  SELECT 1
-                                    FROM canonical_evidence_documents document
-                                   WHERE document.tenant_id=queue.tenant_id
-                                     AND document.source_id=queue.source_id
-                                     AND document.manifest_artifact_id
-                                         =queue.artifact_id
-                                  UNION ALL
-                                  SELECT 1
-                                    FROM canonical_evidence_document_parts part
-                                   WHERE part.tenant_id=queue.tenant_id
-                                     AND part.source_id=queue.source_id
-                                     AND part.artifact_id=queue.artifact_id
-                                  UNION ALL
-                                  SELECT 1
-                                    FROM canonical_parquet_scan_shards shard
-                                   WHERE shard.tenant_id=queue.tenant_id
-                                     AND shard.source_id=queue.source_id
-                                     AND shard.artifact_id=queue.artifact_id
-                              ) AS removable
-                         FROM canonical_evidence_cleanup_queue queue
-                        WHERE (%s::text IS NULL OR queue.tenant_id=%s)
-                        ORDER BY queue.queued_at,queue.tenant_id,
-                                 queue.source_id,queue.artifact_id
-                        LIMIT %s
-                        FOR UPDATE SKIP LOCKED""",
-                    (tenant_id, tenant_id, limit),
-                ).fetchall()
-                protected = [
-                    row
-                    for row in rows
-                    if row["removable"] is not True
-                ]
-                removable = [
-                    row
-                    for row in rows
-                    if row["removable"] is True
-                ]
-                references = [
-                    self._reference(row)
-                    for row in removable
-                ]
-                with ThreadPoolExecutor(
-                    max_workers=min(concurrency, max(1, len(removable))),
-                    thread_name_prefix="recall-logical-cleanup",
-                ) as executor:
-                    futures = [
-                        executor.submit(
-                            self.projection.delete_reference,
-                            reference,
-                        )
-                        for reference in references
+        # Keep locks through each delete, but release the transaction/connection
+        # before another network wave. Never retry an identity within this drain.
+        attempted: list[tuple[str, str, str]] = []
+        while len(attempted) < limit:
+            with self.store.connect() as connection:
+                with connection.transaction():
+                    rows = connection.execute(
+                        """SELECT queue.*,
+                                  NOT EXISTS (
+                                      SELECT 1
+                                        FROM canonical_evidence_documents document
+                                       WHERE document.tenant_id=queue.tenant_id
+                                         AND document.source_id=queue.source_id
+                                         AND document.manifest_artifact_id
+                                             =queue.artifact_id
+                                      UNION ALL
+                                      SELECT 1
+                                        FROM canonical_evidence_document_parts part
+                                       WHERE part.tenant_id=queue.tenant_id
+                                         AND part.source_id=queue.source_id
+                                         AND part.artifact_id=queue.artifact_id
+                                      UNION ALL
+                                      SELECT 1
+                                        FROM canonical_parquet_scan_shards shard
+                                       WHERE shard.tenant_id=queue.tenant_id
+                                         AND shard.source_id=queue.source_id
+                                         AND shard.artifact_id=queue.artifact_id
+                                  ) AS removable
+                             FROM canonical_evidence_cleanup_queue queue
+                            WHERE (%s::text IS NULL OR queue.tenant_id=%s)
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM unnest(
+                                      %s::text[],%s::text[],%s::text[]
+                                  ) AS attempted(tenant_id,source_id,artifact_id)
+                                  WHERE attempted.tenant_id=queue.tenant_id
+                                    AND attempted.source_id=queue.source_id
+                                    AND attempted.artifact_id=queue.artifact_id
+                              )
+                            ORDER BY queue.queued_at,queue.tenant_id,
+                                     queue.source_id,queue.artifact_id
+                            LIMIT %s
+                            FOR UPDATE SKIP LOCKED""",
+                        (
+                            tenant_id,
+                            tenant_id,
+                            [identity[0] for identity in attempted],
+                            [identity[1] for identity in attempted],
+                            [identity[2] for identity in attempted],
+                            min(concurrency, limit - len(attempted)),
+                        ),
+                    ).fetchall()
+                    if not rows:
+                        break
+                    attempted.extend(
+                        (row["tenant_id"], row["source_id"], row["artifact_id"])
+                        for row in rows
+                    )
+                    protected = [
+                        row
+                        for row in rows
+                        if row["removable"] is not True
                     ]
-                succeeded: list[tuple[str, str, str]] = [
-                    (
-                        row["tenant_id"],
-                        row["source_id"],
-                        row["artifact_id"],
-                    )
-                    for row in protected
-                ]
-                completed += len(protected)
-                failed: list[tuple[str, str, str]] = []
-                for row, future in zip(removable, futures, strict=True):
-                    identity = (
-                        row["tenant_id"],
-                        row["source_id"],
-                        row["artifact_id"],
-                    )
-                    try:
-                        removed = future.result()
-                    except Exception:
-                        failed.append(identity)
-                        failures += 1
-                        continue
-                    succeeded.append(identity)
-                    completed += 1
-                    deleted += int(removed)
-                if succeeded:
-                    connection.execute(
-                        """WITH completed(
-                               tenant_id,source_id,artifact_id
-                           ) AS (
-                               SELECT * FROM unnest(
-                                   %s::text[],%s::text[],%s::text[]
-                               )
-                           )
-                           DELETE FROM canonical_evidence_cleanup_queue queue
-                           USING completed
-                           WHERE queue.tenant_id=completed.tenant_id
-                             AND queue.source_id=completed.source_id
-                             AND queue.artifact_id=completed.artifact_id""",
+                    removable = [
+                        row
+                        for row in rows
+                        if row["removable"] is True
+                    ]
+                    references = [
+                        self._reference(row)
+                        for row in removable
+                    ]
+                    with ThreadPoolExecutor(
+                        max_workers=min(concurrency, max(1, len(removable))),
+                        thread_name_prefix="recall-logical-cleanup",
+                    ) as executor:
+                        futures = [
+                            executor.submit(
+                                self.projection.delete_reference,
+                                reference,
+                            )
+                            for reference in references
+                        ]
+                    succeeded: list[tuple[str, str, str]] = [
                         (
-                            [identity[0] for identity in succeeded],
-                            [identity[1] for identity in succeeded],
-                            [identity[2] for identity in succeeded],
-                        ),
-                    )
-                if failed:
-                    connection.execute(
-                        """WITH failed(
-                               tenant_id,source_id,artifact_id
-                           ) AS (
-                               SELECT * FROM unnest(
-                                   %s::text[],%s::text[],%s::text[]
+                            row["tenant_id"],
+                            row["source_id"],
+                            row["artifact_id"],
+                        )
+                        for row in protected
+                    ]
+                    completed += len(protected)
+                    failed: list[tuple[str, str, str]] = []
+                    for row, future in zip(removable, futures, strict=True):
+                        identity = (
+                            row["tenant_id"],
+                            row["source_id"],
+                            row["artifact_id"],
+                        )
+                        try:
+                            removed = future.result()
+                        except Exception:
+                            failed.append(identity)
+                            failures += 1
+                            continue
+                        succeeded.append(identity)
+                        completed += 1
+                        deleted += int(removed)
+                    if succeeded:
+                        connection.execute(
+                            """WITH completed(
+                                   tenant_id,source_id,artifact_id
+                               ) AS (
+                                   SELECT * FROM unnest(
+                                       %s::text[],%s::text[],%s::text[]
+                                   )
                                )
-                           )
-                           UPDATE canonical_evidence_cleanup_queue queue
-                              SET attempts=queue.attempts+1,
-                                  last_attempt_at=clock_timestamp()
-                             FROM failed
-                            WHERE queue.tenant_id=failed.tenant_id
-                              AND queue.source_id=failed.source_id
-                              AND queue.artifact_id=failed.artifact_id""",
-                        (
-                            [identity[0] for identity in failed],
-                            [identity[1] for identity in failed],
-                            [identity[2] for identity in failed],
-                        ),
-                    )
+                               DELETE FROM canonical_evidence_cleanup_queue queue
+                               USING completed
+                               WHERE queue.tenant_id=completed.tenant_id
+                                 AND queue.source_id=completed.source_id
+                                 AND queue.artifact_id=completed.artifact_id""",
+                            (
+                                [identity[0] for identity in succeeded],
+                                [identity[1] for identity in succeeded],
+                                [identity[2] for identity in succeeded],
+                            ),
+                        )
+                    if failed:
+                        connection.execute(
+                            """WITH failed(
+                                   tenant_id,source_id,artifact_id
+                               ) AS (
+                                   SELECT * FROM unnest(
+                                       %s::text[],%s::text[],%s::text[]
+                                   )
+                               )
+                               UPDATE canonical_evidence_cleanup_queue queue
+                                  SET attempts=queue.attempts+1,
+                                      last_attempt_at=clock_timestamp()
+                                 FROM failed
+                                WHERE queue.tenant_id=failed.tenant_id
+                                  AND queue.source_id=failed.source_id
+                                  AND queue.artifact_id=failed.artifact_id""",
+                            (
+                                [identity[0] for identity in failed],
+                                [identity[1] for identity in failed],
+                                [identity[2] for identity in failed],
+                            ),
+                        )
         with self.store.connect() as connection:
             pending = connection.execute(
                 """SELECT count(*) AS count

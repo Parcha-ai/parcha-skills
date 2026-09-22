@@ -35,7 +35,10 @@ class Store:
         if 'SELECT queue.*' in query:
             assert self.in_transaction and 'FOR UPDATE SKIP LOCKED' in query
             assert all(name in query for name in ('canonical_evidence_documents', 'canonical_evidence_document_parts', 'canonical_parquet_scan_shards'))
-            return SimpleNamespace(fetchall=lambda: list(self.rows.values()))
+            excluded = set(zip(*values[2:5])) if len(values) == 6 else set()
+            rows = [row for row in self.rows.values()
+                    if (row['tenant_id'], row['source_id'], row['artifact_id']) not in excluded]
+            return SimpleNamespace(fetchall=lambda: rows[:values[-1]])
         if 'WITH completed(' in query:
             for key in values[2]:
                 self.acknowledged.append(key)
