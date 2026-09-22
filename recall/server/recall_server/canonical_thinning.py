@@ -72,7 +72,10 @@ def _thinning_statement(*, bounded: bool = False, probe: bool = False) -> str:
     document_relation = "canonical_documents document"
     event_relation = "canonical_events event"
     artifact_relation = "raw_artifacts artifact"
+    queue_offset = ""
     if bounded and probe:
+        # Keep the unlocked queue check tied to each enumerated parent.
+        queue_offset = "\n                              OFFSET 0"
         # These unlocked identity lookups stay correlated to enumerated keys.
         # The final mutation below uses plain base relations so its row locks
         # remain after the original ORDER/LIMIT, rather than being pushed here.
@@ -160,7 +163,7 @@ def _thinning_statement(*, bounded: bool = False, probe: bool = False) -> str:
                                    AND queued.source_id=event.source_id
                                    AND queued.native_parent_id=COALESCE(
                                        event.native_parent_id,event.native_id
-                                   )
+                                   ){queue_offset}
                             )
                           ORDER BY document.source_id,document.document_id
                           LIMIT %s

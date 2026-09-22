@@ -8,7 +8,7 @@ import time
 import unittest
 
 import e2e_bounded_canonical_thinning as retained
-from recall_server.canonical_thinning import CanonicalBodyThinner
+from recall_server.canonical_thinning import CanonicalBodyThinner, _thinning_statement
 from recall_server.logical_evidence_projection import (
     CanonicalLogicalEvidenceProjector,
     mark_logical_evidence_dirty,
@@ -52,6 +52,33 @@ class CommittedKeys(retained.Thinning):
                 "canonical_evidence_document_queue",
             )
             before = {t: digest(t) for t in tables}
+            # Preserve stale queue statistics from preceding tests. The queue
+            # INSERT and these probes share a transaction, so auto-analyze
+            # cannot turn this regression into a refreshed-statistics control.
+            from psycopg.sql import Literal
+
+            for mode in ("auto", "force_custom_plan", "force_generic_plan"):
+                for label, numbers, expected in (
+                    ("history", range(1, 1025), 0),
+                    ("hints", range(39770, 40026), 10),
+                ):
+                    keys = ["doc_" + str(i).zfill(32) for i in numbers]
+                    parameters = ([self.source] * len(keys), keys,
+                                  self.tenant, self.tenant, 10)
+                    parts = _thinning_statement(bounded=True, probe=True).split("%s")
+                    sql = "".join(part + (f"${i + 1}" if i < len(parts) - 1 else "")
+                                  for i, part in enumerate(parts))
+                    name = "stale_queue_" + mode + "_" + label
+                    call = "EXECUTE " + name + "(" + ",".join(
+                        Literal(value).as_string() for value in parameters) + ")"
+                    with c.transaction(force_rollback=True):
+                        c.execute("SET LOCAL statement_timeout='2s'")
+                        c.execute("SET LOCAL plan_cache_mode=" + mode)
+                        c.execute("PREPARE " + name + " AS " + sql)
+                        plan = c.execute("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "
+                                         + call).fetchone()["QUERY PLAN"][0]
+                        self.assertEqual(plan["Plan"]["Actual Rows"], expected)
+                        c.execute("DEALLOCATE " + name)
         started = time.monotonic()
         baseline = CanonicalBodyThinner(self.store, tenant_id=self.tenant)
         self.assertEqual(baseline.thin(batch_size=10)["documents"], 0)
