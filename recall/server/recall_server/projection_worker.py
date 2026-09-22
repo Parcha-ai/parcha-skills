@@ -239,11 +239,23 @@ def run_projection_worker(
             if scan is not None and parquet_due:
                 cycles_since_parquet = 0
                 last_parquet_started = clock()
+            # The extra maintenance sweep can rebuild a whole month after the
+            # queued batch. Yield it while freshness work remains or just ran;
+            # logical work can enqueue passages after their pending count above.
+            # Queued builds still run on cadence and can themselves compact.
+            freshness_busy = (
+                int(documents.get("pending", 0)) > 0
+                or int(documents.get("waiting", 0)) > 0
+                or int(documents.get("documents", 0)) > 0
+                or int(projected.get("pending", 0)) > 0
+                or int(projected.get("documents", 0)) > 0
+            )
             scanned = (
                 scan.project_pending(
                     tenant_id=tenant_id,
                     batch_size=min(4, logical_batch_size),
                     max_batches=max_batches_per_cycle,
+                    compaction_budget=0 if freshness_busy else 1,
                 )
                 if scan is not None and parquet_due
                 else {
