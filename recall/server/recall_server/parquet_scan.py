@@ -1320,6 +1320,8 @@ class CanonicalParquetScanProjector:
         candidate: ScanCandidate,
         documents: list[dict[str, Any]],
         catalog: ScanCatalog,
+        *,
+        allow_compaction: bool = True,
     ) -> tuple[str, set[tuple[str, int]], set[str], set[str]]:
         """Decide what to rewrite.
 
@@ -1359,10 +1361,10 @@ class CanonicalParquetScanProjector:
             if not all_parts:
                 return "reuse", set(), set(), dirty
             return "full", all_parts, set(), dirty
-        if not stale and not uncovered and datasets_complete and not catalog.fragmented(
-            self.compaction_fragments
+        if not stale and not uncovered and datasets_complete and (
+            not allow_compaction or not catalog.fragmented(self.compaction_fragments)
         ):
-            # Content-identical and not fragmented: keep every immutable
+            # Content-identical with no eligible compaction: keep every immutable
             # object, clear the queue. This outranks the compaction sentinel
             # on purpose. The sentinel is a hint from the sweep, written
             # before the month was read; if the month turns out to need no
@@ -1380,7 +1382,7 @@ class CanonicalParquetScanProjector:
         # changed document rewrote all 374 parts (20 min) on a hint the
         # old sweep left behind.
         sweep_hint = catalog.compaction or candidate.reason == "compaction"
-        if sweep_hint and catalog.fragmented(self.compaction_fragments):
+        if allow_compaction and sweep_hint and catalog.fragmented(self.compaction_fragments):
             return "compaction", all_parts, set(current), dirty
         # A seed backfill marks the month with the whole-month sentinel; a
         # bare 'backfill' queue reason with no marker is a leftover (the
@@ -1394,8 +1396,9 @@ class CanonicalParquetScanProjector:
             or not datasets_complete
         ):
             return "full", all_parts, set(current), dirty
-        if catalog.fragmented(self.compaction_fragments) or (
-            len(stale) * 2 > len(recorded)
+        if allow_compaction and (
+            catalog.fragmented(self.compaction_fragments)
+            or len(stale) * 2 > len(recorded)
         ):
             return "compaction", all_parts, set(current), dirty
         effective = stale | uncovered
@@ -1510,11 +1513,16 @@ class CanonicalParquetScanProjector:
                     upload.claim(dataset, members[document_id])
         return first, last
 
-    def _build(self, candidate: ScanCandidate, *, _rebuild: bool = False) -> ScanUpload:
+    def _build(
+        self, candidate: ScanCandidate, *, _rebuild: bool = False,
+        allow_compaction: bool = True,
+    ) -> ScanUpload:
         started = time.perf_counter()
         documents = self._documents(candidate)
         catalog = self._catalog(candidate)
-        mode, victims, rewrite, dirty = self._plan(candidate, documents, catalog)
+        mode, victims, rewrite, dirty = self._plan(
+            candidate, documents, catalog, allow_compaction=allow_compaction
+        )
         if _rebuild:
             mode, victims, rewrite = "full", set(catalog.shards), {
                 document["logical_document_id"] for document in documents
@@ -2078,6 +2086,8 @@ class CanonicalParquetScanProjector:
         self,
         candidate: ScanCandidate,
         totals: dict[str, int],
+        *,
+        allow_compaction: bool = True,
     ) -> bool:
         """Build and commit one candidate under its lease; True when handled."""
 
@@ -2086,7 +2096,7 @@ class CanonicalParquetScanProjector:
                 totals["contended"] += 1
                 return False
             try:
-                upload = self._build(candidate)
+                upload = self._build(candidate, allow_compaction=allow_compaction)
             except ParquetScanError as error:
                 if str(error) != "parquet_scan_evidence_requeued":
                     raise
@@ -2127,6 +2137,8 @@ class CanonicalParquetScanProjector:
         max_batches: int = 1,
         compaction_budget: int = 1,
     ) -> dict[str, int | str]:
+        """Process queued updates; zero budget also defers optional compaction there."""
+
         if (
             not 1 <= batch_size <= 32
             or not 1 <= max_batches <= 100
@@ -2155,7 +2167,9 @@ class CanonicalParquetScanProjector:
             for candidate in candidates:
                 if batch_completed >= batch_size:
                     break
-                if self._process(candidate, totals):
+                # A busy worker disables optional maintenance in queued builds
+                # too; required full builds and corruption recovery still run.
+                if self._process(candidate, totals, allow_compaction=bool(compaction_budget)):
                     batch_completed += 1
             if len(candidates) < candidate_limit:
                 break

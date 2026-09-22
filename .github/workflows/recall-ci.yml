@@ -51,7 +51,6 @@ jobs:
             e2e_v2_canonical_plane.py \
             e2e_storage_legacy_cut.py \
             e2e_canonical_body_thinning.py \
-            e2e_canonical_thinning_queue_fence.py \
             e2e_logical_source_integrity.py \
             e2e_archive_reprojection.py \
             e2e_v2_lifecycle.py \

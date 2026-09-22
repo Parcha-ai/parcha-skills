@@ -457,6 +457,33 @@ def main() -> None:
         compactor = CanonicalParquetScanProjector(
             store, logical_store, compaction_fragments=1
         )
+        # A prior idle sweep can leave a queued compaction sentinel. Busy
+        # processing must not turn that hint into a mandatory whole-month build.
+        queued = compactor._over_fragmented(tenant_id=tenant, limit=1)
+        assert len(queued) == 1, queued
+        assert compactor._catalog(queued[0]).compaction
+        before_rows = {
+            dataset: sorted(json.dumps(row, sort_keys=True, default=str)
+                            for row in read_dataset(archive, parts_v2, dataset))
+            for dataset in parquet_scan.SCAN_DATASETS
+        }
+        busy = compactor.project_pending(
+            tenant_id=tenant, batch_size=4, max_batches=1, compaction_budget=0
+        )
+        assert busy["shards"] == 1 and busy["compacted"] == 0, busy
+        assert busy["fragments_rewritten"] == 0, busy
+        after_busy = live_parts(store, tenant, source)
+        assert [(r["dataset"], r["shard_index"], r["artifact_id"]) for r in after_busy] == [
+            (r["dataset"], r["shard_index"], r["artifact_id"]) for r in parts_v2
+        ]
+        assert {
+            dataset: sorted(json.dumps(row, sort_keys=True, default=str)
+                            for row in read_dataset(archive, after_busy, dataset))
+            for dataset in parquet_scan.SCAN_DATASETS
+        } == before_rows
+        assert not compactor._pending(tenant_id=tenant, limit=1)
+        # Idle maintenance rediscovers the same fragmentation autonomously,
+        # despite successful busy queue processing consuming the old hint.
         compacted = compactor.project_pending(
             tenant_id=tenant, batch_size=4, max_batches=1, compaction_budget=1
         )
