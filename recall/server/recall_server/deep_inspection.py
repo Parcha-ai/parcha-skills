@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import gzip
 import json
+import logging
 import re
 import shlex
 import ssl
@@ -81,6 +82,54 @@ EXEC_TIMING_ORDER = (
     "program_start",
     "program_end",
 )
+STAGING_TIMING_PREFIX = "RECALL_STAGE_TIMING_V1\t"
+STAGING_PHASES = ("lookup", "local", "bind", "remount")
+STAGING_COUNTS = ("object_count", "slow_1s_count", "slow_5s_count")
+STAGING_DURATIONS = ("task_max_us",) + tuple(
+    f"{phase}_{metric}_us" for phase in STAGING_PHASES
+    for metric in ("sum", "max")
+)
+
+
+def _log_staging_timing(raw: str | None, phases: dict[str, Any]) -> None:
+    """Consume private diagnostics without changing the public execution result."""
+    value = None
+    try:
+        if raw is not None and len(raw) <= 4096:
+            pairs = json.loads(raw, object_pairs_hook=list)
+            if (type(pairs) is list and all(type(p) is tuple and len(p) == 2 for p in pairs)
+                    and len({p[0] for p in pairs}) == len(pairs)):
+                value = dict(pairs)
+        valid = type(value) is dict and set(value) == set(STAGING_COUNTS + STAGING_DURATIONS)
+        valid = valid and all(type(v) is int and 0 <= v <= 14_400_000_000 for v in value.values())
+        if valid:
+            n, task_max = value["object_count"], value["task_max_us"]
+            valid = (1 <= n <= 513 and task_max <= 3_600_000_000
+                     and value["slow_5s_count"] <= value["slow_1s_count"] <= n
+                     and (value["slow_1s_count"] > 0) == (task_max >= 1_000_000)
+                     and (value["slow_5s_count"] > 0) == (task_max >= 5_000_000))
+            for phase in STAGING_PHASES:
+                total, maximum = value[f"{phase}_sum_us"], value[f"{phase}_max_us"]
+                valid = valid and maximum <= task_max and maximum <= total <= n * maximum
+            valid = valid and task_max <= sum(value[f"{p}_max_us"] for p in STAGING_PHASES)
+            valid = valid and sum(value[f"{p}_sum_us"] for p in STAGING_PHASES) <= min(n * task_max, 14_400_000_000)
+    except (ValueError, TypeError, KeyError, OverflowError, RecursionError):
+        valid = False
+    try:
+        def measured(key: str) -> float:
+            value = phases.get(key)
+            return float(value) if type(value) in (int, float) and 0 <= value <= 3_600_000 else -1.0
+        fields = " ".join(f"{key}={value[key] if valid else -1}" for key in STAGING_COUNTS + STAGING_DURATIONS)
+        logging.getLogger("recall.mcp").info(
+            "recall_scan_staging_timing valid=%d stage_ms=%.3f program_ms=%.3f %s",
+            int(valid), measured("stage_start_to_objects_readyMs"),
+            measured("program_start_to_program_endMs"), fields,
+        )
+    except Exception:
+        # A diagnostic sink must not change the tool result or original failure.
+        pass
+
+
 EVIDENCE_RECORD_KEYS = frozenset({
     "event_native_id",
     "occurred_at",
@@ -107,8 +156,13 @@ def _execution_timing(
     visible: list[str] = []
     markers: dict[str, int] = {}
     objects_unavailable = 0
+    staging_raw, staging_count = None, 0
     for raw_line in stderr.splitlines(keepends=True):
         line = raw_line.rstrip("\r\n")
+        if line.startswith(STAGING_TIMING_PREFIX):
+            staging_raw = line[len(STAGING_TIMING_PREFIX):] if staging_count == 0 else None
+            staging_count += 1
+            continue
         visibility = EXEC_VISIBILITY_LINE_RE.fullmatch(line)
         if visibility is not None:
             objects_unavailable = max(objects_unavailable, int(visibility.group(1)))
@@ -152,6 +206,8 @@ def _execution_timing(
                     else None
                 ),
             }
+    if staging_count:
+        _log_staging_timing(staging_raw if staging_count == 1 else None, timing.get("phases", {}))
     return "".join(visible), timing, objects_unavailable
 
 
@@ -526,15 +582,21 @@ dataset_root=pathlib.Path("/tmp/recall-datasets").resolve()
 target.mkdir(mode=0o700,parents=True,exist_ok=True)
 docs.mkdir(mode=0o700,parents=True,exist_ok=True)
 dataset_root.mkdir(mode=0o700,parents=True,exist_ok=True)
+if datasets:
+    stage_times=[]
 def stage_object(item):
+    if datasets: started=time.monotonic_ns()//1000
     relative=pathlib.PurePosixPath(item["object_key"])
     if relative.is_absolute() or ".." in relative.parts:
         raise SystemExit(64)
     src=(source/pathlib.Path(*relative.parts)).resolve()
     if source not in src.parents:
         raise SystemExit(64)
-    if not src.is_file():
+    available=src.is_file()
+    if datasets: looked_up=time.monotonic_ns()//1000
+    if not available:
         if allow_missing and item["object_key"] not in tool_keys:
+            if datasets: stage_times.append((looked_up-started,0,0,0))
             return item["object_key"]
         raise SystemExit(66)
     dst=(target/pathlib.Path(*relative.parts)).resolve()
@@ -542,8 +604,13 @@ def stage_object(item):
         raise SystemExit(64)
     dst.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
     dst.touch(mode=0o400,exist_ok=False)
+    if datasets: local_ready=time.monotonic_ns()//1000
     subprocess.run(["mount","--bind",str(src),str(dst)],check=True)
+    if datasets: bound=time.monotonic_ns()//1000
     subprocess.run(["mount","-o","remount,bind,ro",str(dst)],check=True)
+    if datasets:
+        ended=time.monotonic_ns()//1000
+        stage_times.append((looked_up-started,local_ready-looked_up,bound-local_ready,ended-bound))
 if datasets:
     # Distinct destinations are required before concurrent namespace changes.
     if len({item["object_key"] for item in items})!=len(items):
@@ -554,6 +621,22 @@ else:
     absent=[stage_object(item) for item in items]
 missing={key for key in absent if key is not None}
 mark("objects_ready")
+if datasets:
+    try:
+        sums=[0]*4;maxima=[0]*4;task_max=slow_1s=slow_5s=0
+        for durations in stage_times:
+            total=sum(durations);task_max=max(task_max,total)
+            slow_1s+=total>=1_000_000;slow_5s+=total>=5_000_000
+            for i,duration in enumerate(durations):
+                sums[i]+=duration;maxima[i]=max(maxima[i],duration)
+        value=dict(object_count=len(stage_times),task_max_us=task_max,
+                   slow_1s_count=slow_1s,slow_5s_count=slow_5s)
+        for i,phase in enumerate(("lookup","local","bind","remount")):
+            value.update({phase+"_sum_us":sums[i],phase+"_max_us":maxima[i]})
+        print("RECALL_STAGE_TIMING_V1\t"+json.dumps(value,separators=(",",":")),file=sys.stderr,flush=True)
+    except Exception:
+        pass
+
 print(
     f"RECALL_EXEC_VISIBILITY_V1\tobjects_unavailable\t{len(missing)}",
     file=sys.stderr,

@@ -38,22 +38,35 @@ class ScanStagingConcurrencyTests(unittest.TestCase):
         self.stderr = io.StringIO()
 
     def stage(self, *, delay=0, single=False, fail=None, missing=False,
-              duplicate=False, escape=False, scan=True, tools=None):
+              duplicate=False, escape=False, scan=True, tools=None, timing_phase="bind"):
         items = tuple(self.items + ([self.items[0]] if duplicate else []))
+        selected_tools = tools or {'linux-x86_64': self.tool}
+        tool_keys = {item.object_key for item in selected_tools.values()}
+        data_items = [item for item in self.items if item.object_key not in tool_keys]
         command = _agent_exec_command(
             program='true', objects=items, document_aliases={}, record_spans={},
             routing_receipts={}, timeout_seconds=10,
             dataset_aliases={item.object_key: f's1/2026-09/passages-part-{i:05}.parquet'
-                             for i, item in enumerate(self.items[:-1])} if scan else {},
-            tool_objects=tools or {'linux-x86_64': self.tool}, allow_missing_objects=missing,
+                             for i, item in enumerate(data_items)} if scan else {},
+            tool_objects=selected_tools, allow_missing_objects=missing,
         )
         inner = shlex.split(shlex.split(command[command.index('\nunshare ') + 1:])[-1])
         start = inner.index('python3')
         script, arguments = inner[start + 2], inner[start + 3:start + 10]
         cls, copy = type(self.root), shutil.copyfile
-        original_is_file = cls.is_file
+        original_is_file, original_touch = cls.is_file, cls.touch
+
+        def pause(phase, path):
+            if delay and timing_phase == phase and (not single or str(path).endswith(self.items[0].object_key)):
+                time.sleep(delay)
+
+        def touch(path, *args, **kwargs):
+            pause("local", path)
+            return original_touch(path, *args, **kwargs)
 
         def is_file(path):
+            if "/mnt/archil/evidence/" in str(path):
+                pause("lookup", path)
             if fail == 'stat' and str(path).endswith(self.items[0].object_key):
                 raise OSError('synthetic metadata failure')
             return original_is_file(path)
@@ -73,10 +86,8 @@ class ScanStagingConcurrencyTests(unittest.TestCase):
                     if self.active == 4:
                         self.four.set()
             if bind:
-                if delay:
-                    if not single or command[2].endswith(self.items[0].object_key):
-                        time.sleep(delay)
-                elif fail is None:
+                pause("bind", command[2])
+                if not delay and fail is None:
                     self.four.wait(.1)
                 if fail == 'bind' and command[2].endswith(self.items[0].object_key):
                     with self.lock:
@@ -86,6 +97,7 @@ class ScanStagingConcurrencyTests(unittest.TestCase):
                 copy(command[2], command[3])
                 cls(command[3]).chmod(0o400)
             else:
+                pause("remount", command[-1])
                 self.assertEqual(command[:3], ['mount', '-o', 'remount,bind,ro'])
                 with self.lock:
                     self.active -= 1
@@ -101,12 +113,14 @@ class ScanStagingConcurrencyTests(unittest.TestCase):
         with ExitStack() as stack:
             stack.enter_context(patch('pathlib.Path', mapped))
             stack.enter_context(patch.object(cls, 'is_file', is_file))
+            stack.enter_context(patch.object(cls, 'touch', touch))
             stack.enter_context(patch('subprocess.run', side_effect=mounted))
             stack.enter_context(patch('platform.machine', return_value='x86_64'))
             stack.enter_context(patch('sys.argv', ['stage', *arguments]))
             stack.enter_context(patch('shutil.copyfile', side_effect=lambda src, dst: copy(src, mapped(dst))))
             stack.enter_context(redirect_stderr(self.stderr))
-            exec(compile(script, '<generated-stage>', 'exec'), {})
+            self.stage_namespace = {}
+            exec(compile(script, '<generated-stage>', 'exec'), self.stage_namespace)
 
     def test_four_real_overlapping_tasks_and_readonly_order(self):
         self.stage()
