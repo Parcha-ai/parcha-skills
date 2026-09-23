@@ -127,7 +127,8 @@ def mark_logical_evidence_dirty(
            ON CONFLICT(tenant_id,source_id,native_parent_id)
            DO UPDATE SET
                generation=canonical_evidence_document_queue.generation+1,
-               reason=excluded.reason,
+               reason=CASE WHEN canonical_evidence_document_queue.reason='forget'
+                           THEN 'forget' ELSE excluded.reason END,
                changed_at=clock_timestamp()""",
         (reason, tenant_id, source_id, native_ids),
     )
@@ -622,7 +623,8 @@ class CanonicalLogicalEvidenceProjector:
                        ON CONFLICT(tenant_id,source_id,native_parent_id)
                        DO UPDATE SET
                            generation=canonical_evidence_document_queue.generation+1,
-                           reason='backfill',
+                           reason=CASE WHEN canonical_evidence_document_queue.reason='forget'
+                                       THEN 'forget' ELSE 'backfill' END,
                            changed_at=clock_timestamp()""",
                     (tenant_id, tenant_id, source_id, source_id),
                 )
@@ -1201,7 +1203,7 @@ class CanonicalLogicalEvidenceProjector:
                        tenant_id,source_id,bucket_start,
                        logical_document_id,reason,queued_at
                    )
-                   SELECT %s,%s,month.value::date,%s,%s,clock_timestamp()
+                   SELECT %s,%s,month.value::date,%s,%s,queue.changed_at
                      FROM unnest(%s::timestamptz[],%s::timestamptz[])
                           AS span(first_at,last_at)
                      CROSS JOIN LATERAL generate_series(
@@ -1209,11 +1211,15 @@ class CanonicalLogicalEvidenceProjector:
                          date_trunc('month',span.last_at),
                          interval '1 month'
                      ) month(value)
-                    GROUP BY month.value
+                     JOIN canonical_parquet_scan_queue queue
+                       ON queue.tenant_id=%s AND queue.source_id=%s
+                      AND queue.bucket_start=month.value::date
+                    GROUP BY month.value,queue.changed_at
                    ON CONFLICT(tenant_id,source_id,bucket_start,logical_document_id)
                    DO UPDATE SET reason=excluded.reason,
-                                 queued_at=clock_timestamp()""",
-                (tenant_id, source_id, logical_document_id, reason, starts, ends),
+                                 queued_at=excluded.queued_at""",
+                (tenant_id, source_id, logical_document_id, reason, starts, ends,
+                 tenant_id, source_id),
             )
         return max(0, result.rowcount)
 
@@ -1916,6 +1922,26 @@ class CanonicalLogicalEvidenceProjector:
                         for reference in (old_manifest, *old_parts)
                         if reference is not None
                     ),
+                )
+                # Capture remote IDs before the evidence-document cascade
+                # removes passages. The outbox and deletion commit together.
+                doomed_passages = connection.execute(
+                    """SELECT passage.passage_id,passage.first_occurred_at,
+                              passage.last_occurred_at
+                         FROM canonical_passages passage
+                         JOIN canonical_evidence_documents document
+                           USING(tenant_id,source_id,logical_document_id)
+                        WHERE document.tenant_id=%s AND document.source_id=%s
+                          AND document.native_parent_id=%s""",
+                    (candidate.tenant_id, candidate.source_id,
+                     candidate.native_parent_id),
+                ).fetchall()
+                record_passage_deletions(
+                    connection,
+                    tenant_id=candidate.tenant_id,
+                    source_id=candidate.source_id,
+                    passages=doomed_passages,
+                    reason="forget",
                 )
                 connection.execute(
                     """DELETE FROM canonical_evidence_documents

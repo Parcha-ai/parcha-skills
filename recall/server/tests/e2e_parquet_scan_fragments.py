@@ -46,6 +46,7 @@ from recall_server.logical_evidence import (  # noqa: E402
 )
 from recall_server.logical_evidence_projection import (  # noqa: E402
     CanonicalLogicalEvidenceProjector,
+    mark_logical_evidence_dirty,
 )
 from recall_server.parquet_scan import CanonicalParquetScanProjector  # noqa: E402
 from recall_server.passage_index import CanonicalPassageProjector  # noqa: E402
@@ -230,6 +231,102 @@ def assert_compaction_owner_equivalence(store: BrainStore) -> int:
                 tenant for _, tenant in sorted(eligible)[:2]
             ]
     return len(cases())
+
+
+def assert_dirty_fence(store, tenant, source):
+    with store.connect() as connection:
+        rows = connection.execute(
+            """SELECT dirty.queued_at,queue.changed_at
+                 FROM canonical_parquet_scan_dirty_documents dirty
+                 LEFT JOIN canonical_parquet_scan_queue queue
+                   USING(tenant_id,source_id,bucket_start)
+                WHERE dirty.tenant_id=%s AND dirty.source_id=%s""",
+            (tenant, source),
+        ).fetchall()
+    assert rows and all(row['changed_at'] is not None and
+                        row['queued_at'] <= row['changed_at'] for row in rows), rows
+
+
+def assert_forget_read_fence(store, logical, scan, tenant, principal, source, parent):
+    """Exercise the actual catalog SQL while old immutable bytes still exist."""
+    retrieval = BoundCanonicalRetrieval(
+        store, tenant_id=tenant, principal_id=principal, authorized_sources=(source,),
+    )
+    def selected():
+        return retrieval._parquet_shards([source], since=None, until=None)
+    empty_ids = {row['artifact_id'] for row in live_parts(store, tenant, source)
+                 if row['row_count'] == 0}
+    before, pending = selected()
+    assert len(before) == 4 and pending == 0, (before, pending)
+    with store.connect() as connection:
+        document = connection.execute(
+            "SELECT * FROM canonical_evidence_documents WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s",
+            (tenant, source, parent),
+        ).fetchone()
+        connection.execute(
+            "INSERT INTO canonical_evidence_document_queue(tenant_id,source_id,native_parent_id,generation,reason) VALUES (%s,%s,%s,1,'backfill')",
+            (tenant, source, parent),
+        )
+    # Ordinary projection lag does not hide the corpus.
+    ordinary, pending = selected()
+    assert len(ordinary) == 4 and pending == 1, (ordinary, pending)
+    with store.connect() as connection:
+        connection.execute(
+            "UPDATE canonical_evidence_document_queue SET reason='forget' WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s",
+            (tenant, source, parent),
+        )
+    # Existing packed objects contain this parent. All are withheld, and a
+    # new worker build must not read its old logical archive either.
+    hidden, pending = selected()
+    assert {r['artifact_id'] for r in hidden} == empty_ids and pending >= 4-len(empty_ids), (hidden, pending)
+    candidate = parquet_scan.ScanCandidate(tenant, source, before[0]['bucket_start'],
+        generation=1, changed_at=datetime.now(timezone.utc), reason='forget')
+    assert document['logical_document_id'] not in {
+        row['logical_document_id'] for row in scan._documents(candidate)
+    }
+    scan._requeue_missing_document(document)
+    with store.connect() as connection:
+        assert connection.execute(
+            "SELECT reason FROM canonical_evidence_document_queue WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s",
+            (tenant, source, parent),
+        ).fetchone()['reason'] == 'forget'
+    logical.seed_backfill(tenant_id=tenant, source_id=source, include_existing=True)
+    with store.connect() as connection:
+        reason = connection.execute(
+            "SELECT reason FROM canonical_evidence_document_queue WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s",
+            (tenant, source, parent),
+        ).fetchone()['reason']
+        assert reason == 'forget', reason
+        connection.execute(
+            "DELETE FROM canonical_evidence_document_queue WHERE tenant_id=%s AND source_id=%s", (tenant, source),
+        )
+        # Models the sanitized logical generation advancing while old shards
+        # remain. The old catalog cannot become visible when the queue clears.
+        connection.execute(
+            "UPDATE canonical_evidence_documents SET revision=revision+1 WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s",
+            (tenant, source, parent),
+        )
+    hidden, pending = selected()
+    assert {r['artifact_id'] for r in hidden} == empty_ids and pending == 4-len(empty_ids), (hidden, pending)
+    with store.connect() as connection:
+        connection.execute(
+            "UPDATE canonical_evidence_documents SET revision=revision-1 WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s",
+            (tenant, source, parent),
+        )
+        memberships = connection.execute(
+            "DELETE FROM canonical_parquet_scan_fragment_documents WHERE tenant_id=%s AND source_id=%s AND dataset='records' RETURNING *",
+            (tenant, source),
+        ).fetchall()
+    without_members, pending = selected()
+    assert len(without_members) == 3 and pending == 1, (without_members, pending)
+    with store.connect() as connection:
+        for row in memberships:
+            connection.execute(
+                "INSERT INTO canonical_parquet_scan_fragment_documents(tenant_id,source_id,bucket_start,dataset,shard_index,logical_document_id,revision,generation_sha256) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                tuple(row[key] for key in ('tenant_id','source_id','bucket_start','dataset','shard_index','logical_document_id','revision','generation_sha256')),
+            )
+    restored, pending = selected()
+    assert len(restored) == 4 and pending == 0
 
 
 def main() -> None:
@@ -428,7 +525,7 @@ def main() -> None:
             principal_id=principal,
             authorized_sources=(source,),
         )._parquet_shards([source], since=None, until=None)
-        assert pending == 0
+        assert pending == 0, (pending, listing)
         listed = {(row["dataset"], row["shard_index"]) for row in listing}
         assert listed == {(row["dataset"], row["shard_index"]) for row in parts_v2}
         aliases = {
@@ -461,6 +558,7 @@ def main() -> None:
         # processing must not turn that hint into a mandatory whole-month build.
         queued = compactor._over_fragmented(tenant_id=tenant, limit=1)
         assert len(queued) == 1, queued
+        assert_dirty_fence(store, tenant, source)
         assert compactor._catalog(queued[0]).compaction
         before_rows = {
             dataset: sorted(json.dumps(row, sort_keys=True, default=str)
@@ -516,6 +614,7 @@ def main() -> None:
         # unchanged month through the owning API, then let reuse consume that
         # older hint so the deletion regression starts with no unrelated dirt.
         assert scan.seed_backfill(tenant_id=tenant, source_id=source) == 1
+        assert_dirty_fence(store, tenant, source)
         clean_before_forget = scan.project_pending(
             tenant_id=tenant, batch_size=4, max_batches=1, compaction_budget=0,
         )
@@ -526,6 +625,8 @@ def main() -> None:
                    WHERE tenant_id=%s AND source_id=%s""", (tenant, source),
             ).fetchone()["count"] == 0
         assert not scan._pending(tenant_id=tenant, limit=1)
+
+        assert_forget_read_fence(store, logical, scan, tenant, principal, source, session_b)
 
         # Forget a whole parent after compaction packed it with siblings. The
         # empty logical rebuild has no old document left from which to recover
@@ -563,10 +664,11 @@ def main() -> None:
                    WHERE tenant_id=%s AND source_id=%s""", (tenant, source),
             ).fetchall()
         assert forgotten_dirty == [dict(logical_document_id=forgotten_document, reason="forget")], forgotten_dirty
-        _, pending_after_forget = BoundCanonicalRetrieval(
+        visible_after_forget, pending_after_forget = BoundCanonicalRetrieval(
             store, tenant_id=tenant, principal_id=principal, authorized_sources=(source,),
         )._parquet_shards([source], since=None, until=None)
-        assert pending_after_forget == 1, pending_after_forget
+        assert all(row['dataset'] == 'actors' for row in visible_after_forget)
+        assert pending_after_forget >= 1, pending_after_forget
         forgotten_scan = scan.project_pending(
             tenant_id=tenant, batch_size=4, max_batches=1, compaction_budget=0,
         )
@@ -578,6 +680,99 @@ def main() -> None:
             assert all(row["logical_document_id"] != forgotten_document
                        for row in read_dataset(archive, parts_after_forget, dataset)), dataset
         assert not scan._pending(tenant_id=tenant, limit=1)
+
+        # The public path queues logical forget asynchronously. Unlike the
+        # direct deletion above, _commit_empty must capture TP IDs itself.
+        with store.connect() as connection:
+            async_ids = [row['native_id'] for row in connection.execute(
+                "SELECT native_id FROM canonical_events WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s",
+                (tenant, source, session_c),
+            ).fetchall()]
+            doomed = {row['passage_id'] for row in connection.execute(
+                "SELECT passage_id FROM canonical_passages WHERE tenant_id=%s AND source_id=%s AND logical_document_id=%s",
+                (tenant, source, documents[session_c]),
+            ).fetchall()}
+            assert doomed
+            surviving_ids = {row['passage_id'] for row in connection.execute(
+                "SELECT passage_id FROM canonical_passages WHERE tenant_id=%s AND source_id=%s AND logical_document_id<>%s",
+                (tenant, source, documents[session_c]),
+            ).fetchall()}
+            connection.execute(
+                "UPDATE canonical_chunks SET deleted_at=now() WHERE tenant_id=%s AND source_id=%s AND document_id IN (SELECT document_id FROM canonical_documents WHERE tenant_id=%s AND source_id=%s AND native_id=ANY(%s))",
+                (tenant, source, tenant, source, async_ids),
+            )
+            connection.execute(
+                "UPDATE canonical_documents SET is_current=false,deleted_at=now() WHERE tenant_id=%s AND source_id=%s AND native_id=ANY(%s)",
+                (tenant, source, async_ids),
+            )
+            mark_logical_evidence_dirty(connection, tenant_id=tenant,
+                source_id=source, native_ids=async_ids, reason='forget')
+        async_result = logical.project_pending(tenant_id=tenant, batch_size=10, max_batches=1)
+        assert async_result['pruned'] == 1, async_result
+        assert_dirty_fence(store, tenant, source)
+        scan.project_pending(tenant_id=tenant, batch_size=4, max_batches=1, compaction_budget=0)
+        with store.connect() as connection:
+            assert connection.execute(
+                "SELECT count(*) AS count FROM canonical_parquet_scan_dirty_documents WHERE tenant_id=%s AND source_id=%s",
+                (tenant, source),
+            ).fetchone()['count'] == 0
+        with store.connect() as connection:
+            tombstones = {row['passage_id'] for row in connection.execute(
+                "SELECT passage_id FROM search_projection_tombstones WHERE tenant_id=%s AND source_id=%s",
+                (tenant, source),
+            ).fetchall()}
+            assert doomed <= tombstones and not (surviving_ids & tombstones)
+            actual_survivors = {row['passage_id'] for row in connection.execute(
+                "SELECT passage_id FROM canonical_passages WHERE tenant_id=%s AND source_id=%s",
+                (tenant, source),
+            ).fetchall()}
+            assert actual_survivors == surviving_ids
+            assert connection.execute(
+                "SELECT count(*) AS count FROM search_projection_outbox WHERE tenant_id=%s AND source_id=%s",
+                (tenant, source),
+            ).fetchone()['count'] > 0
+
+        # Partial forget sanitizes logical records before the passage worker.
+        # A scan build in that gap must not republish the old passage bytes.
+        native = session_a + ':user'
+        with store.connect() as connection:
+            forgotten_receipts = {row['receipt'] for row in connection.execute(
+                "SELECT chunk.receipt FROM canonical_chunks chunk JOIN canonical_documents document USING(tenant_id,source_id,document_id) WHERE document.tenant_id=%s AND document.source_id=%s AND document.native_id=%s",
+                (tenant, source, native),
+            ).fetchall()}
+            assert forgotten_receipts
+            connection.execute(
+                "UPDATE canonical_chunks SET deleted_at=now() WHERE tenant_id=%s AND source_id=%s AND receipt=ANY(%s)",
+                (tenant, source, list(forgotten_receipts)),
+            )
+            connection.execute(
+                "UPDATE canonical_documents SET is_current=false,deleted_at=now() WHERE tenant_id=%s AND source_id=%s AND native_id=%s",
+                (tenant, source, native),
+            )
+            mark_logical_evidence_dirty(connection, tenant_id=tenant,
+                source_id=source, native_ids=[native], reason='forget')
+        assert logical.project_pending(tenant_id=tenant, batch_size=10, max_batches=1)['documents'] == 1
+        with store.connect() as connection:
+            old_passages = connection.execute(
+                "SELECT receipts FROM canonical_passages WHERE tenant_id=%s AND source_id=%s AND logical_document_id=%s",
+                (tenant, source, documents[session_a]),
+            ).fetchall()
+            assert any(forgotten_receipts & set(row['receipts']) for row in old_passages)
+        scan.project_pending(tenant_id=tenant, batch_size=4, max_batches=1, compaction_budget=0)
+        partial_parts = live_parts(store, tenant, source)
+        for dataset in ('records', 'passages'):
+            projected_rows = read_dataset(archive, partial_parts, dataset)
+            assert all(not (forgotten_receipts & set(row['receipts'])) for row in projected_rows), dataset
+        assert read_dataset(archive, partial_parts, 'records')
+        _, partial_pending = BoundCanonicalRetrieval(store, tenant_id=tenant,
+            principal_id=principal, authorized_sources=(source,))._parquet_shards([source], since=None, until=None)
+        assert partial_pending > 0
+        passages.project_pending(tenant_id=tenant, batch_size=10, max_batches=1, concurrency=2)
+        scan.project_pending(tenant_id=tenant, batch_size=4, max_batches=1, compaction_budget=0)
+        final_parts = live_parts(store, tenant, source)
+        assert read_dataset(archive, final_parts, 'passages')
+        assert all(not (forgotten_receipts & set(row['receipts']))
+                   for row in read_dataset(archive, final_parts, 'passages'))
 
     owner_cases = assert_compaction_owner_equivalence(store)
     result = {
@@ -599,6 +794,7 @@ def main() -> None:
             "cleanup_completed": drained["completed"],
             "forget_scan_pending_before_rebuild": pending_after_forget,
             "forgotten_document_absent_from_all_datasets": True,
+            "async_empty_commit_tombstones": len(doomed),
         },
     }
     rendered = json.dumps(result, sort_keys=True)

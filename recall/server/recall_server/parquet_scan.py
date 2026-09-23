@@ -739,13 +739,17 @@ class CanonicalParquetScanProjector:
                            logical_document_id,reason,queued_at
                        )
                        SELECT DISTINCT document.tenant_id,document.source_id,
-                              month.value::date,%s,'backfill',statement_timestamp()
+                              month.value::date,%s,'backfill',queue.changed_at
                          FROM canonical_evidence_documents document
                          CROSS JOIN LATERAL generate_series(
                              date_trunc('month',document.first_occurred_at),
                              date_trunc('month',document.last_occurred_at),
                              interval '1 month'
                          ) month(value)
+                         JOIN canonical_parquet_scan_queue queue
+                           ON queue.tenant_id=document.tenant_id
+                          AND queue.source_id=document.source_id
+                          AND queue.bucket_start=month.value::date
                         WHERE document.tenant_id=%s
                           AND (%s::text IS NULL OR document.source_id=%s)
                        ON CONFLICT DO NOTHING""",
@@ -838,6 +842,13 @@ class CanonicalParquetScanProjector:
                     WHERE document.tenant_id=%s AND document.source_id=%s
                       AND document.last_occurred_at >= %s
                       AND document.first_occurred_at < %s
+                      AND NOT EXISTS (
+                          SELECT 1 FROM canonical_evidence_document_queue queued
+                           WHERE queued.tenant_id=document.tenant_id
+                             AND queued.source_id=document.source_id
+                             AND queued.native_parent_id=document.native_parent_id
+                             AND queued.reason='forget'
+                      )
                     ORDER BY document.logical_document_id""",
                 (
                     candidate.tenant_id,
@@ -933,6 +944,21 @@ class CanonicalParquetScanProjector:
                      ) attributed ON true
                     WHERE passage.tenant_id=%s AND passage.source_id=%s
                       AND passage.logical_document_id=ANY(%s)
+                      AND cardinality(passage.receipts)>0
+                      AND NOT EXISTS (
+                          SELECT 1 FROM unnest(passage.receipts) AS receipt(value)
+                          LEFT JOIN canonical_chunks chunk
+                            ON chunk.tenant_id=passage.tenant_id
+                           AND chunk.source_id=passage.source_id
+                           AND chunk.receipt=receipt.value
+                           AND chunk.deleted_at IS NULL
+                          LEFT JOIN canonical_documents document
+                            ON document.tenant_id=chunk.tenant_id
+                           AND document.source_id=chunk.source_id
+                           AND document.document_id=chunk.document_id
+                           AND document.is_current AND document.deleted_at IS NULL
+                          WHERE document.document_id IS NULL
+                      )
                       AND passage.last_occurred_at >= %s
                       AND passage.first_occurred_at < %s
                     ORDER BY passage.logical_document_id,
@@ -1191,7 +1217,9 @@ class CanonicalParquetScanProjector:
                    ON CONFLICT(tenant_id,source_id,native_parent_id)
                    DO UPDATE SET
                        generation=canonical_evidence_document_queue.generation+1,
-                       reason='backfill',changed_at=clock_timestamp()""",
+                       reason=CASE WHEN canonical_evidence_document_queue.reason='forget'
+                                   THEN 'forget' ELSE 'backfill' END,
+                       changed_at=clock_timestamp()""",
                 (
                     document["tenant_id"],
                     document["source_id"],
@@ -2053,13 +2081,13 @@ class CanonicalParquetScanProjector:
                         """INSERT INTO canonical_parquet_scan_dirty_documents(
                                tenant_id,source_id,bucket_start,
                                logical_document_id,reason,queued_at
-                           ) VALUES (%s,%s,%s,%s,'compaction',clock_timestamp())
+                           ) VALUES (%s,%s,%s,%s,'compaction',%s)
                            ON CONFLICT(
                                tenant_id,source_id,bucket_start,logical_document_id
                            )
                            DO UPDATE SET reason='compaction',
-                                         queued_at=clock_timestamp()""",
-                        (*scope, SCAN_DIRTY_ALL),
+                                         queued_at=excluded.queued_at""",
+                        (*scope, SCAN_DIRTY_ALL, queued["changed_at"]),
                     )
                     candidates.append(
                         ScanCandidate(

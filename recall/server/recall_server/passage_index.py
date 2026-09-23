@@ -684,7 +684,8 @@ class CanonicalPassageProjector:
                    DO UPDATE SET
                        generation=
                            canonical_evidence_document_queue.generation+1,
-                       reason='backfill',
+                       reason=CASE WHEN canonical_evidence_document_queue.reason='forget'
+                                   THEN 'forget' ELSE 'backfill' END,
                        changed_at=clock_timestamp()""",
                 (
                     candidate.tenant_id,
