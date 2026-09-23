@@ -27,12 +27,19 @@ class Store:
         self.fail = fail
         self.calls = []
         self.mutations = []
+        self.savepoint_exits = 0
 
     @contextmanager
     def connect(self):
         yield self
         if self.fail:
             raise RuntimeError("unknown commit")
+
+    @contextmanager
+    def transaction(self):
+        # Nested probe savepoint is distinct from the outer COMMIT ACK.
+        yield self
+        self.savepoint_exits += 1
 
     def execute(self, q, p):
         self.calls.append((q, p))
@@ -111,6 +118,9 @@ class SelectionTests(unittest.TestCase):
         t = CanonicalBodyThinner(s, tenant_id="t")
         with self.assertRaisesRegex(RuntimeError, "unknown commit"):
             t.thin(batch_size=1, committed_keys=(("t", "s", "x"),))
+        self.assertEqual(s.savepoint_exits, 1)
+        self.assertEqual(s.mutations, [[("s", "x")]])
+        self.assertIn(("s", "x"), t._committed_keys)
         self.assertIsNone(t._after)
         self.assertIsNone(t._through)
         s.fail = False
