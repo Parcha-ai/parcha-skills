@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import time
+import json
+import math
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -16,6 +18,7 @@ from .logical_evidence import (
 )
 from .passage_projection import (
     MAX_PASSAGE_HEADER_BYTES,
+    LOGICAL_DOCUMENT_ID_RE,
     PASSAGE_EMBEDDING_SEPARATOR,
     LosslessPassage,
     PassagePolicy,
@@ -1351,6 +1354,8 @@ class CanonicalPassageProjector:
         tenant_id: str,
         source_id: str,
         limit: int = 50,
+        _empty_only: bool = False,
+        _after: str | None = None,
     ) -> dict[str, Any]:
         """Read-only parity gate: recompute passages and compare with the rows.
 
@@ -1408,7 +1413,19 @@ class CanonicalPassageProjector:
                            SELECT *
                              FROM canonical_passage_documents sampled
                             WHERE sampled.tenant_id=%s AND sampled.source_id=%s
-                            ORDER BY sampled.created_at DESC,
+                              AND (NOT %s OR (
+                                  sampled.passage_count=0
+                                  AND sampled.policy_fingerprint=%s
+                                  AND NOT EXISTS (
+                                      SELECT 1 FROM canonical_passage_projection_queue queued
+                                       WHERE queued.tenant_id=sampled.tenant_id
+                                         AND queued.source_id=sampled.source_id
+                                         AND queued.logical_document_id=sampled.logical_document_id
+                                  )
+                              ))
+                              AND (%s::text IS NULL OR sampled.logical_document_id>%s)
+                            ORDER BY CASE WHEN %s THEN sampled.logical_document_id END,
+                                     sampled.created_at DESC,
                                      sampled.logical_document_id
                             LIMIT %s
                      ) projected
@@ -1424,7 +1441,8 @@ class CanonicalPassageProjector:
                           =evidence.logical_document_id
                       AND part.revision=evidence.revision
                     ORDER BY projected.logical_document_id,part.part_ordinal""",
-                (tenant_id, source_id, limit),
+                (tenant_id, source_id, _empty_only, self.policy.fingerprint,
+                 _after, _after, _empty_only, limit),
             ).fetchall()
             grouped: dict[str, list[dict[str, Any]]] = {}
             for row in rows:
@@ -1495,6 +1513,22 @@ class CanonicalPassageProjector:
                 ),
             )
             prepared = self._prepare(candidate, policy=policy)
+            if _empty_only:
+                embedding_bytes = sum(
+                    len(passage.text.encode()) + MAX_PASSAGE_HEADER_BYTES
+                    + len(PASSAGE_EMBEDDING_SEPARATOR.encode())
+                    for passage in prepared.passages
+                )
+                report.update({
+                    "source_document_sha256": candidate.source_document_sha256,
+                    "policy_fingerprint": policy.fingerprint,
+                    "archive_bytes": candidate.manifest_reference["size_bytes"]
+                    + sum(ref["size_bytes"] for ref in candidate.part_references),
+                    "embedding_bytes_estimate": embedding_bytes,
+                    "embedding_tokens_estimate": math.ceil(
+                        embedding_bytes / PASSAGE_PLAN_BYTES_PER_TOKEN
+                    ),
+                })
             recomputed = {
                 passage.passage_id: passage.receipts
                 for passage in prepared.passages
@@ -1533,6 +1567,95 @@ class CanonicalPassageProjector:
             "receipt_parity": (
                 totals["receipt_set_equal"] == totals["documents"]
             ),
+            "documents": documents,
+        }
+
+    def repair_empty(
+        self,
+        *,
+        tenant_id: str,
+        source_id: str,
+        limit: int = 25,
+        after: str | None = None,
+        apply: bool = False,
+        price_per_mtoken: float | None = None,
+    ) -> dict[str, Any]:
+        """Plan one source's empty-projection repair; optionally queue that batch.
+
+        Reads archived evidence through the existing shadow projector. Never
+        embeds or executes projection work. The existing worker owns commits.
+        The cursor allows finite batches without a permanent corpus ceiling.
+        """
+        tenant_id = self._tenant(tenant_id)
+        if (
+            not isinstance(tenant_id, str) or not tenant_id
+            or not isinstance(source_id, str) or not source_id
+            or type(limit) is not int or not 1 <= limit <= MAX_PASSAGE_PROJECTION_BATCH
+            or type(apply) is not bool
+            or (after is not None and (
+                not isinstance(after, str) or LOGICAL_DOCUMENT_ID_RE.fullmatch(after) is None
+            ))
+            or (price_per_mtoken is not None and (
+                type(price_per_mtoken) not in (int, float)
+                or not math.isfinite(price_per_mtoken) or price_per_mtoken < 0
+            ))
+        ):
+            raise ValueError("empty passage repair scope is invalid")
+        report = self.shadow_diff(
+            tenant_id=tenant_id, source_id=source_id, limit=limit,
+            _empty_only=True, _after=after,
+        )
+        documents = report["documents"]
+        eligible = [doc for doc in documents
+                    if doc["status"] == "compared" and doc["passages_existing"] == 0
+                    and doc["passages_recomputed"] > 0]
+        queued = 0
+        if apply and eligible:
+            with self.store.connect() as connection:
+                with connection.transaction():
+                    result = connection.execute(
+                        """INSERT INTO canonical_passage_projection_queue(
+                               tenant_id,source_id,logical_document_id,revision,
+                               generation,reason,changed_at
+                           )
+                           SELECT evidence.tenant_id,evidence.source_id,
+                                  evidence.logical_document_id,evidence.revision,
+                                  1,'backfill',clock_timestamp()
+                             FROM canonical_evidence_documents evidence
+                             JOIN canonical_passage_documents projected
+                               USING(tenant_id,source_id,logical_document_id)
+                             JOIN jsonb_to_recordset(%s::jsonb) selected(
+                                 logical_document_id text,revision integer,
+                                 source_document_sha256 text,policy_fingerprint text
+                             ) ON selected.logical_document_id=evidence.logical_document_id
+                            WHERE evidence.tenant_id=%s AND evidence.source_id=%s
+                              AND evidence.revision=selected.revision
+                              AND evidence.document_content_sha256=selected.source_document_sha256
+                              AND projected.revision=evidence.revision
+                              AND projected.source_document_sha256=evidence.document_content_sha256
+                              AND projected.policy_fingerprint=selected.policy_fingerprint
+                              AND projected.passage_count=0
+                           ON CONFLICT(tenant_id,source_id,logical_document_id)
+                           DO NOTHING""",
+                        (json.dumps(eligible), tenant_id, source_id),
+                    )
+                    queued = max(0, result.rowcount)
+        tokens = sum(doc.get("embedding_tokens_estimate", 0) for doc in eligible)
+        return {
+            "status": "queued" if apply else "planned",
+            "read_only": not apply, "tenant_id": tenant_id, "source_id": source_id,
+            "limit": limit, "after": after,
+            "next_after": max((doc["logical_document_id"] for doc in documents), default=None),
+            "documents_examined": len(documents), "eligible_documents": len(eligible),
+            "queued": queued,
+            "archive_bytes": sum(doc.get("archive_bytes", 0) for doc in documents),
+            "embedding_bytes_estimate": sum(doc.get("embedding_bytes_estimate", 0) for doc in eligible),
+            "embedding_tokens_estimate": tokens,
+            "price_per_mtoken": price_per_mtoken,
+            "embedding_cost_usd_estimate": (
+                None if price_per_mtoken is None else tokens / 1_000_000 * price_per_mtoken
+            ),
+            "estimate_basis": "UTF-8 bytes / 4; maximum context header per new passage; advisory batch estimate only",
             "documents": documents,
         }
 

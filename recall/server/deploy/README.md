@@ -623,8 +623,18 @@ Configure the returned opaque object identities as
 `RECALL_ARCHIL_DUCKDB_OBJECT_KEY` / `RECALL_ARCHIL_DUCKDB_SHA256` (arm64) and
 `RECALL_ARCHIL_DUCKDB_X86_64_OBJECT_KEY` / `RECALL_ARCHIL_DUCKDB_X86_64_SHA256`
 (x86_64). Either pair alone is accepted, but only sandboxes of that
-architecture can then run DuckDB. At execution
-time Recall mounts only shards inside the caller's tenant/source grants, stages
+architecture can then run DuckDB.
+
+The execution host must also provide util-linux `setpriv`: after mounting the authorized
+view, both exec and scan drop all capability sets and enable `no_new_privs`
+before running the caller's shell. Missing or failing `setpriv` fails closed.
+The Linux kernel regression can be run explicitly as root with
+`python server/tests/e2e_agent_namespace.py`; it uses only synthetic local
+objects and checks mount escapes, normal subprocess/thread behavior, and
+network namespace routes. It does not prove every possible sandbox escape or
+replace a real DuckDB/provider compatibility check.
+
+At execution time Recall mounts only shards inside the caller's tenant/source grants, stages
 that checksum-pinned binary into the networkless sandbox, and verifies every
 emitted `recall://` receipt against current canonical evidence before returning
 it in `opened_receipts`. The caller's agent writes one shell/DuckDB program; no

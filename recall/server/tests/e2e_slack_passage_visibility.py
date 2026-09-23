@@ -132,22 +132,96 @@ def main():
                     (tenant,),
                 ).fetchone()
             )
-            # Narrow repair fixture only: no production command or global policy invalidation.
-            queued = con.execute(
-                """INSERT INTO canonical_passage_projection_queue(
-                tenant_id,source_id,logical_document_id,revision,generation,reason,changed_at)
-                SELECT evidence.tenant_id,evidence.source_id,evidence.logical_document_id,
-                       evidence.revision,1,'backfill',clock_timestamp()
-                  FROM canonical_evidence_documents evidence
-                  JOIN canonical_passage_documents projected USING(tenant_id,source_id,logical_document_id)
-                 WHERE evidence.tenant_id=%s AND evidence.source_id=%s
-                   AND evidence.logical_document_id=%s AND projected.passage_count=0
-                   AND projected.revision=evidence.revision
-                   AND projected.source_document_sha256=evidence.document_content_sha256
-                ON CONFLICT(tenant_id,source_id,logical_document_id) DO NOTHING""",
-                (tenant, source, before["logical_document_id"]),
+        plan = passages.repair_empty(tenant_id=tenant, source_id=source, limit=2)
+        assert plan["read_only"] and plan["queued"] == 0
+        assert plan["eligible_documents"] == 1 and plan["archive_bytes"] > 0
+        assert (
+            plan["embedding_tokens_estimate"] > 0
+            and plan["embedding_cost_usd_estimate"] is None
+        )
+        assert plan["next_after"] == before["logical_document_id"]
+        assert (
+            passages.repair_empty(
+                tenant_id=tenant, source_id=source, after=plan["next_after"], limit=2
+            )["documents_examined"]
+            == 0
+        )
+        assert (
+            passages.repair_empty(
+                tenant_id=tenant, source_id=source + ":other", limit=2
+            )["eligible_documents"]
+            == 0
+        )
+        # Inspection is not an authorization to enqueue later stale evidence.
+        # Mutate one fence at a time in this isolated tenant, then restore it.
+        inspected = passages.shadow_diff(
+            tenant_id=tenant, source_id=source, limit=2, _empty_only=True
+        )
+        stale_cases = (
+            ("canonical_passage_documents", "revision", before["revision"] + 1),
+            ("canonical_evidence_documents", "document_content_sha256", "0" * 64),
+            ("canonical_passage_documents", "policy_fingerprint", "0" * 64),
+            ("canonical_passage_documents", "passage_count", 1),
+        )
+        for table, column, changed in stale_cases:
+            # Identifiers are the closed literals above, never fixture/user input.
+            predicate = "tenant_id=%s AND source_id=%s AND logical_document_id=%s"
+            scope = (tenant, source, before["logical_document_id"])
+            with store.connect() as con:
+                original = con.execute(
+                    f"SELECT {column} FROM {table} WHERE {predicate}", scope
+                ).fetchone()[column]
+                con.execute(
+                    f"UPDATE {table} SET {column}=%s WHERE {predicate}",
+                    (changed, *scope),
+                )
+            try:
+                with patch.object(passages, "shadow_diff", return_value=inspected):
+                    stale = passages.repair_empty(
+                        tenant_id=tenant, source_id=source, limit=2, apply=True
+                    )
+                assert stale["eligible_documents"] == 1 and stale["queued"] == 0, (
+                    column,
+                    stale,
+                )
+                with store.connect() as con:
+                    assert (
+                        con.execute(
+                            "SELECT count(*) AS n FROM canonical_passage_projection_queue "
+                            "WHERE tenant_id=%s AND source_id=%s",
+                            (tenant, source),
+                        ).fetchone()["n"]
+                        == 0
+                    )
+            finally:
+                with store.connect() as con:
+                    con.execute(
+                        f"UPDATE {table} SET {column}=%s WHERE {predicate}",
+                        (original, *scope),
+                    )
+        queued = passages.repair_empty(
+            tenant_id=tenant, source_id=source, limit=2, apply=True
+        )
+        assert queued["queued"] == 1
+        with store.connect() as con:
+            generation = con.execute(
+                "SELECT generation,changed_at FROM canonical_passage_projection_queue WHERE tenant_id=%s",
+                (tenant,),
+            ).fetchone()
+        assert (
+            passages.repair_empty(
+                tenant_id=tenant, source_id=source, limit=2, apply=True
+            )["queued"]
+            == 0
+        )
+        with store.connect() as con:
+            assert (
+                con.execute(
+                    "SELECT generation,changed_at FROM canonical_passage_projection_queue WHERE tenant_id=%s",
+                    (tenant,),
+                ).fetchone()
+                == generation
             )
-            assert queued.rowcount == 1
         repaired = passages.project_pending(
             tenant_id=tenant, batch_size=2, max_batches=1, concurrency=1
         )
@@ -227,6 +301,7 @@ def main():
                 "actor_links_invented": 0,
                 "old_empty_seed_skipped": True,
                 "targeted_repair_passages": 1,
+                "stale_enqueue_refusals": len(stale_cases),
                 "logical_revision_and_policy_unchanged": True,
                 "idle_rewrites": 0,
             },

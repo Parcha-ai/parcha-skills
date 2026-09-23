@@ -613,6 +613,13 @@ def stage_object(item):
     if source not in src.parents:
         raise SystemExit(64)
     available=src.is_file()
+    if not available and item["object_key"] in datasets:
+        # Only the trusted bootstrap writes this directory, after verifying
+        # exact catalog bytes. It is removed before user code starts.
+        fallback=(pathlib.Path("/tmp/recall-agent/fallback")/pathlib.Path(*relative.parts)).resolve()
+        if fallback.is_file():
+            src=fallback
+            available=True
     if datasets: looked_up=time.monotonic_ns()//1000
     if not available:
         if allow_missing and item["object_key"] not in tool_keys:
@@ -656,6 +663,11 @@ if datasets:
 else:
     absent=[stage_object(item) for item in items]
 missing={key for key in absent if key is not None}
+# Bind mounts retain their inode after unlink. Remove every writable backing
+# alias, including copies no longer needed because Archil became visible.
+fallback_root=pathlib.Path("/tmp/recall-agent/fallback")
+if fallback_root.exists():
+    shutil.rmtree(fallback_root)
 mark("objects_ready")
 if datasets:
     try:
@@ -773,17 +785,70 @@ printf 'RECALL_EXEC_TIMING_V1\t%s\t%s\n' "$1" "${EPOCHREALTIME/./}" >&2
                 or type(inventory_size_bytes) is not int or inventory_size_bytes <= 0):
             raise DeepInspectionError("deep_inspector_inventory_invalid")
         fetch_script = r"""
-import hashlib,json,pathlib,sys,urllib.request
+import hashlib,json,pathlib,re,sys,time,urllib.error,urllib.request
+from concurrent.futures import ThreadPoolExecutor
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self,*args,**kwargs):
         return None
 try:
+    deadline=time.monotonic()+45
     url,size,digest=json.loads(sys.argv[1])
     with urllib.request.build_opener(NoRedirect()).open(url,timeout=45) as response:
         raw=response.read(size+1)
     if len(raw)!=size or hashlib.sha256(raw).hexdigest()!=digest:
         raise ValueError()
     pathlib.Path("/tmp/recall-agent/inventory.json").write_bytes(raw)
+    inventory=json.loads(raw)
+    fallbacks=inventory.get("fallbacks",{})
+    if fallbacks:
+        source=pathlib.Path("/mnt/archil/evidence").resolve()
+        target=pathlib.Path("/tmp/recall-agent/fallback").resolve()
+        hashes={item["object_key"]:item["content_sha256"] for item in inventory["objects"]}
+        if set(fallbacks)!=set(inventory["datasets"]):
+            raise ValueError()
+        def fetch(item):
+            key,ref=item
+            if (re.fullmatch(r"objects/[0-9a-f]{2}/[0-9a-f]{64}",key) is None
+                    or key not in hashes or type(ref["size_bytes"]) is not int
+                    or ref["size_bytes"]<0 or not ref["url"].startswith("https://")):
+                raise ValueError()
+            path=(source/key).resolve()
+            if source not in path.parents:
+                raise ValueError()
+            if path.is_file():
+                return
+            dst=target/key
+            dst.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+            partial=dst.with_suffix(".partial")
+            try:
+                remaining=deadline-time.monotonic()
+                if remaining<=0:
+                    raise TimeoutError()
+                opener=urllib.request.build_opener(NoRedirect())
+                with opener.open(ref["url"],timeout=remaining) as response,partial.open("xb") as writer:
+                    digest=hashlib.sha256();count=0
+                    while True:
+                        if time.monotonic()>=deadline:
+                            raise TimeoutError()
+                        block=response.read(min(1024*1024,ref["size_bytes"]-count+1))
+                        if not block:
+                            break
+                        count+=len(block)
+                        if count>ref["size_bytes"]:
+                            raise ValueError()
+                        digest.update(block);writer.write(block)
+                if count!=ref["size_bytes"] or digest.hexdigest()!=hashes[key]:
+                    raise ValueError()
+                partial.replace(dst)
+            except urllib.error.HTTPError as error:
+                if error.code!=404:
+                    raise
+                # An object absent in both stores remains unavailable. Stage
+                # reports it through the existing truthful incomplete result.
+            finally:
+                partial.unlink(missing_ok=True)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(fetch,fallbacks.items()))
 except Exception:
     # A failed download must never print the signed read capability.
     raise SystemExit(66)
@@ -845,7 +910,11 @@ except Exception:
         "mount -o remount,bind,ro /datasets",
         "/tmp/recall-agent/recall-mark sandbox_ready",
         (
-            "exec env -i HOME=/tmp "
+            # Read-only overlays are not an authorization boundary while the
+            # program can unmount them. Drop setup privileges before any user
+            # code; descendants cannot regain them through exec/file caps.
+            "exec setpriv --bounding-set=-all --inh-caps=-all "
+            "--ambient-caps=-all --no-new-privs env -i HOME=/tmp "
             "PATH=/tmp/recall-agent:/usr/local/bin:/usr/bin:/bin "
             "RECALL_POINTERS_PATH=/tmp/recall-agent/pointers.json "
             "LC_ALL=C bash -c "
@@ -1036,13 +1105,29 @@ class ArchilDeepInspector:
         self.transport = transport or UrllibTransport()
 
     @contextmanager
-    def _inventory(self, tenant_id, objects, dataset_aliases=None):
+    def _inventory(self, tenant_id, objects, dataset_aliases=None, catalog_references=None):
         if self.execution_archive is None:
             # Standalone inspectors retain inline transport; production supplies
             # the existing evidence archive through build_deep_inspector.
             yield None, None, 0
             return
+        fallbacks = {}
+        if catalog_references is not None:
+            hashes = {o.object_key: o.content_sha256 for o in objects}
+            if (set(catalog_references) != set(dataset_aliases or {})
+                    or any(ref.get("tenant_id") != tenant_id
+                           or ref.get("object_key") != key
+                           or ref.get("content_sha256") != hashes.get(key)
+                           for key, ref in catalog_references.items())):
+                raise DeepInspectionError("deep_inspector_inventory_invalid")
+            for key, ref in catalog_references.items():
+                fallbacks[key] = dict(
+                    url=self.execution_archive.read_catalog_url(
+                        ref, tenant_id=tenant_id, source_id=ref["source_id"], expires_in=300),
+                    size_bytes=ref["size_bytes"],
+                )
         payload = json.dumps({
+            "fallbacks": fallbacks,
             "objects": [dict(object_key=o.object_key, content_sha256=o.content_sha256)
                         for o in objects],
             "datasets": dataset_aliases or {},
@@ -1195,6 +1280,7 @@ class ArchilDeepInspector:
         objects: tuple[AgentExecObject, ...],
         dataset_aliases: dict[str, str],
         timeout_seconds: int,
+        catalog_references: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Run DuckDB beside only authorized source/month Parquet shards."""
 
@@ -1225,7 +1311,7 @@ class ArchilDeepInspector:
             or not 1 <= timeout_seconds <= 240
         ):
             raise DeepInspectionError("deep_inspector_exec_invalid")
-        with self._inventory(tenant_id, (*objects, *self.duckdb_tools.values()), dataset_aliases) as (inventory, inventory_url, inventory_size_bytes):
+        with self._inventory(tenant_id, (*objects, *self.duckdb_tools.values()), dataset_aliases, catalog_references) as (inventory, inventory_url, inventory_size_bytes):
             command = _agent_exec_command(
                 program=program,
                 inventory=inventory,
