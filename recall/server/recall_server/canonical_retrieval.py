@@ -1457,43 +1457,45 @@ class BoundCanonicalRetrieval:
                 "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY", ()
             )
             rows = connection.execute(
-                """SELECT tenant_id,source_id,bucket_start,dataset,shard_index,
-                          artifact_id,storage_backend,object_key,content_sha256,
-                          size_bytes,media_type,encryption,version_id,created_at,
-                          (SELECT (shard.row_count=0 AND count(*)=0)
-                               OR (count(*) > 0 AND bool_and(
-                              document.logical_document_id IS NOT NULL
-                              AND document.revision=member.revision
-                              AND NOT EXISTS (
-                                  SELECT 1 FROM canonical_evidence_document_queue queued
-                                   WHERE queued.tenant_id=document.tenant_id
-                                     AND queued.source_id=document.source_id
-                                     AND queued.native_parent_id=document.native_parent_id
-                                     AND queued.reason='forget'
-                              )
-                           ))
-                             FROM canonical_parquet_scan_fragment_documents member
-                             LEFT JOIN canonical_evidence_documents document
-                               ON document.tenant_id=member.tenant_id
-                              AND document.source_id=member.source_id
-                              AND document.logical_document_id=member.logical_document_id
-                            WHERE member.tenant_id=shard.tenant_id
-                              AND member.source_id=shard.source_id
-                              AND member.bucket_start=shard.bucket_start
-                              AND member.dataset=shard.dataset
-                              AND member.shard_index=shard.shard_index
-                          ) AS scan_safe
-                     FROM canonical_parquet_scan_shards shard
-                    WHERE tenant_id=%s AND source_id=ANY(%s)
-                      AND (
-                          %s::timestamptz IS NULL OR bucket_start >=
-                          date_trunc('month',%s::timestamptz)::date
-                      )
-                      AND (
-                          %s::timestamptz IS NULL OR bucket_start <=
-                          date_trunc('month',%s::timestamptz)::date
-                      )
-                    ORDER BY source_id,bucket_start,dataset,shard_index""",
+                """WITH selected AS MATERIALIZED (
+                    SELECT tenant_id,source_id,bucket_start,dataset,shard_index,
+                           artifact_id,storage_backend,object_key,content_sha256,
+                           size_bytes,media_type,encryption,version_id,created_at,row_count
+                      FROM canonical_parquet_scan_shards
+                     WHERE tenant_id=%s AND source_id=ANY(%s)
+                       AND (%s::timestamptz IS NULL OR bucket_start >=
+                            date_trunc('month',%s::timestamptz)::date)
+                       AND (%s::timestamptz IS NULL OR bucket_start <=
+                            date_trunc('month',%s::timestamptz)::date)
+                ), safety AS MATERIALIZED (
+                    SELECT member.tenant_id,member.source_id,member.bucket_start,
+                           member.dataset,member.shard_index,count(*) AS members,
+                           bool_and(document.logical_document_id IS NOT NULL
+                                    AND document.revision=member.revision
+                                    AND queued.native_parent_id IS NULL) AS scan_safe
+                      FROM selected
+                      JOIN canonical_parquet_scan_fragment_documents member
+                        USING(tenant_id,source_id,bucket_start,dataset,shard_index)
+                      LEFT JOIN canonical_evidence_documents document
+                        ON document.tenant_id=member.tenant_id
+                       AND document.source_id=member.source_id
+                       AND document.logical_document_id=member.logical_document_id
+                      LEFT JOIN canonical_evidence_document_queue queued
+                        ON queued.tenant_id=document.tenant_id
+                       AND queued.source_id=document.source_id
+                       AND queued.native_parent_id=document.native_parent_id
+                       AND queued.reason='forget'
+                     GROUP BY member.tenant_id,member.source_id,member.bucket_start,
+                              member.dataset,member.shard_index
+                )
+                SELECT shard.tenant_id,shard.source_id,shard.bucket_start,shard.dataset,
+                       shard.shard_index,artifact_id,storage_backend,object_key,content_sha256,
+                       size_bytes,media_type,encryption,version_id,created_at,
+                       CASE WHEN safety.members IS NULL THEN shard.row_count=0
+                            ELSE safety.scan_safe END AS scan_safe
+                  FROM selected shard
+                  LEFT JOIN safety USING(tenant_id,source_id,bucket_start,dataset,shard_index)
+                 ORDER BY shard.source_id,shard.bucket_start,shard.dataset,shard.shard_index""",
                 values,
             ).fetchall()
             pending = connection.execute(
