@@ -68,6 +68,18 @@ def _parse_json_rows(stdout: str) -> list[dict[str, Any]]:
     return value if isinstance(value, list) else [value]
 
 
+def _nonnegative_integer(value: Any) -> int | None:
+    """DuckDB JSON emits COUNT as integers and SUM(HUGEINT) as strings."""
+    if type(value) is int:
+        return value if value >= 0 else None
+    if isinstance(value, str) and re.fullmatch(r"0|[1-9][0-9]*", value):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
 def _source_hash(source_id: str) -> str:
     return hashlib.sha256(source_id.encode()).hexdigest()[:12]
 
@@ -197,30 +209,60 @@ class ScanConsistencyProbe:
         scope_total: int | None = None
         offset = 0
         pages = 0
-        max_pages = int(context.options.get("scope_max_pages", 125))  # 125 * 80 = 10,000 documents
         scope_ids: set[str] = set()
         scope_complete = False
-        while pages < max_pages:
+        duplicates = 0
+
+        def failed_scope(note: str) -> ProbeResult:
+            result.status = "failed"
+            result.samples = pages
+            result.notes.append(note)
+            result.metrics = {
+                "scope_total_documents": scope_total,
+                "scope_enumerated_documents": len(scope_ids),
+                "scope_complete": False,
+                "scope_pages": pages,
+                "scope_duplicate_documents": duplicates,
+                "scope_scan_agreement": None,
+            }
+            result.gates = [Gate("scope_complete", "==", 1.0).evaluate(0.0)]
+            return result
+
+        while True:
             outcome = context.client.call_tool("recall_scope", {"filters": filters, "limit": 80, "offset": offset})
-            if not outcome.ok or not outcome.result:
-                result.status = "failed"
-                result.notes.append("scope call failed")
-                return result
-            docs = outcome.result.get("documents", [])
-            for doc in docs:
-                if isinstance(doc.get("logical_document_id"), str):
-                    scope_ids.add(doc["logical_document_id"])
-            reported = outcome.result.get("total_documents")
-            if isinstance(reported, int) and not isinstance(reported, bool):
-                scope_total = reported
             pages += 1
-            offset += len(docs)
-            if outcome.result.get("complete") or not docs:
-                scope_complete = bool(outcome.result.get("complete")) or not docs
+            if not outcome.ok or not isinstance(outcome.result, dict):
+                return failed_scope("scope call failed before confirmed exhaustion")
+            payload = outcome.result
+            docs = payload.get("documents")
+            if (not isinstance(docs, list) or type(payload.get("complete")) is not bool
+                    or type(payload.get("offset")) is not int or payload["offset"] != offset):
+                return failed_scope("scope page did not verify its position and completeness")
+            page_ids = [doc.get("logical_document_id") for doc in docs if isinstance(doc, dict)]
+            if (len(page_ids) != len(docs)
+                    or any(not isinstance(identity, str) or not identity for identity in page_ids)):
+                return failed_scope("scope page contained invalid document identities")
+            unique_ids = set(page_ids)
+            new_ids = unique_ids.difference(scope_ids)
+            duplicates += len(page_ids) - len(new_ids)
+            scope_ids.update(new_ids)
+            reported = payload.get("total_documents")
+            if reported is not None:
+                if type(reported) is not int or reported < 0:
+                    return failed_scope("scope page contained an invalid total")
+                scope_total = reported
+            if payload["complete"]:
+                scope_complete = True
                 break
+            if not new_ids:
+                return failed_scope("scope returned no new document identities without confirmed exhaustion")
+            offset += len(docs)
         enumerated = len(scope_ids)
+        reported_total = scope_total
         if scope_total is None:
             scope_total = enumerated
+        if duplicates:
+            result.notes.append("scope pages overlapped; comparison uses unique document identities")
         # Count the document projection, not passages. Documents without a
         # searchable passage are still valid scope boundaries; counting the
         # passage projection made those documents look like scan-plane loss.
@@ -246,32 +288,39 @@ class ScanConsistencyProbe:
         scan = context.client.call_tool(
             "recall_scan", {"filters": filters, "program": program, "timeout_seconds": 120}, timeout_seconds=200,
         )
+        result.gates = [Gate("scope_complete", "==", 1.0).evaluate(float(scope_complete)),
+                        *_scan_evidence_gates(scan)]
         if not scan.ok or not scan.result or scan.result.get("exit_code") != 0:
             result.status = "failed"
             result.notes.append("scan call failed")
             return result
         rows = _parse_json_rows(scan.result.get("stdout", ""))
         scan_docs = int(rows[0].get("docs", 0)) if rows else 0
-        agreement = (min(scan_docs, enumerated) / max(scan_docs, enumerated)) if max(scan_docs, enumerated) else 1.0
+        agreement = None
+        if scan.result.get("complete") is True:
+            agreement = (min(scan_docs, enumerated) / max(scan_docs, enumerated)) if max(scan_docs, enumerated) else 1.0
+        else:
+            result.notes.append("scan coverage is incomplete; count agreement is unverified")
         result.samples = pages
-        if not scope_complete:
-            result.notes.append("scope enumeration stopped at the page cap; agreement is a lower bound")
         result.metrics = {
             "scope_total_documents": scope_total,
             "scope_enumerated_documents": enumerated,
             "scope_complete": scope_complete,
             "scope_pages": pages,
+            "scope_duplicate_documents": duplicates,
+            "scope_reported_total_documents": reported_total,
+            "scope_reported_total_delta": None if reported_total is None else reported_total - enumerated,
             "scan_distinct_documents": scan_docs,
-            "scope_scan_agreement": round(agreement, 4),
+            "scope_scan_agreement": None if agreement is None else round(agreement, 4),
             "scan_complete": bool(scan.result.get("complete")),
             "objects_unavailable": int(scan.result.get("objects_unavailable", 0) or 0),
             "projection_pending": int(scan.result.get("projection_pending", 0) or 0),
         }
-        result.gates = [
+        result.gates += [
             Gate("scope_scan_agreement", ">=", 0.98).evaluate(agreement),
             Gate("objects_unavailable", "==", 0.0).evaluate(float(result.metrics["objects_unavailable"])),
         ]
-        if any(g.passed is False for g in result.gates):
+        if any(g.passed is not True for g in result.gates):
             result.status = "degraded"
         return result
 
@@ -388,20 +437,24 @@ class SecretScanProbe:
         rows = _parse_json_rows(outcome.result.get("stdout", ""))
         row = rows[0] if rows else {}
         required = ["passages", *("secret_" + name for name in SECRET_PATTERNS)]
-        counts_valid = len(rows) == 1 and all(
-            type(row.get(key)) is int and row[key] >= 0 for key in required
-        )
+        counts = {
+            key: _nonnegative_integer(value)
+            for key, value in row.items()
+            if key == "passages" or key.startswith(("secret_", "report_"))
+        } if isinstance(row, dict) else {}
+        counts_valid = (len(rows) == 1
+                        and all(counts.get(key) is not None for key in required)
+                        and all(value is not None for value in counts.values()))
         result.gates.append(Gate("aggregate_valid", "==", 1.0).evaluate(float(counts_valid)))
         if not counts_valid:
             result.status = "failed"
             result.notes.append("secret scan did not return the required counts")
             return result
-        passages = row["passages"]
+        passages = counts["passages"]
         secret_total = 0
         metrics: dict[str, Any] = {"passages_scanned": passages, "scan_complete": bool(outcome.result.get("complete"))}
-        for key, value in row.items():
+        for key, count in counts.items():
             if key.startswith("secret_") or key.startswith("report_"):
-                count = int(value or 0)
                 metrics[key] = count
                 if key.startswith("secret_"):
                     secret_total += count
