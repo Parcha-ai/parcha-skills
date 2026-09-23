@@ -732,6 +732,48 @@ def main() -> None:
                 (tenant, source),
             ).fetchone()['count'] > 0
 
+        # Partial forget sanitizes logical records before the passage worker.
+        # A scan build in that gap must not republish the old passage bytes.
+        native = session_a + ':user'
+        with store.connect() as connection:
+            forgotten_receipts = {row['receipt'] for row in connection.execute(
+                "SELECT chunk.receipt FROM canonical_chunks chunk JOIN canonical_documents document USING(tenant_id,source_id,document_id) WHERE document.tenant_id=%s AND document.source_id=%s AND document.native_id=%s",
+                (tenant, source, native),
+            ).fetchall()}
+            assert forgotten_receipts
+            connection.execute(
+                "UPDATE canonical_chunks SET deleted_at=now() WHERE tenant_id=%s AND source_id=%s AND receipt=ANY(%s)",
+                (tenant, source, list(forgotten_receipts)),
+            )
+            connection.execute(
+                "UPDATE canonical_documents SET is_current=false,deleted_at=now() WHERE tenant_id=%s AND source_id=%s AND native_id=%s",
+                (tenant, source, native),
+            )
+            mark_logical_evidence_dirty(connection, tenant_id=tenant,
+                source_id=source, native_ids=[native], reason='forget')
+        assert logical.project_pending(tenant_id=tenant, batch_size=10, max_batches=1)['documents'] == 1
+        with store.connect() as connection:
+            old_passages = connection.execute(
+                "SELECT receipts FROM canonical_passages WHERE tenant_id=%s AND source_id=%s AND logical_document_id=%s",
+                (tenant, source, documents[session_a]),
+            ).fetchall()
+            assert any(forgotten_receipts & set(row['receipts']) for row in old_passages)
+        scan.project_pending(tenant_id=tenant, batch_size=4, max_batches=1, compaction_budget=0)
+        partial_parts = live_parts(store, tenant, source)
+        for dataset in ('records', 'passages'):
+            projected_rows = read_dataset(archive, partial_parts, dataset)
+            assert all(not (forgotten_receipts & set(row['receipts'])) for row in projected_rows), dataset
+        assert read_dataset(archive, partial_parts, 'records')
+        _, partial_pending = BoundCanonicalRetrieval(store, tenant_id=tenant,
+            principal_id=principal, authorized_sources=(source,))._parquet_shards([source], since=None, until=None)
+        assert partial_pending > 0
+        passages.project_pending(tenant_id=tenant, batch_size=10, max_batches=1, concurrency=2)
+        scan.project_pending(tenant_id=tenant, batch_size=4, max_batches=1, compaction_budget=0)
+        final_parts = live_parts(store, tenant, source)
+        assert read_dataset(archive, final_parts, 'passages')
+        assert all(not (forgotten_receipts & set(row['receipts']))
+                   for row in read_dataset(archive, final_parts, 'passages'))
+
     owner_cases = assert_compaction_owner_equivalence(store)
     result = {
         "status": "pass",

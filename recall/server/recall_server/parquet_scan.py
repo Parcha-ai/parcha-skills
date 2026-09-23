@@ -944,6 +944,21 @@ class CanonicalParquetScanProjector:
                      ) attributed ON true
                     WHERE passage.tenant_id=%s AND passage.source_id=%s
                       AND passage.logical_document_id=ANY(%s)
+                      AND cardinality(passage.receipts)>0
+                      AND NOT EXISTS (
+                          SELECT 1 FROM unnest(passage.receipts) AS receipt(value)
+                          LEFT JOIN canonical_chunks chunk
+                            ON chunk.tenant_id=passage.tenant_id
+                           AND chunk.source_id=passage.source_id
+                           AND chunk.receipt=receipt.value
+                           AND chunk.deleted_at IS NULL
+                          LEFT JOIN canonical_documents document
+                            ON document.tenant_id=chunk.tenant_id
+                           AND document.source_id=chunk.source_id
+                           AND document.document_id=chunk.document_id
+                           AND document.is_current AND document.deleted_at IS NULL
+                          WHERE document.document_id IS NULL
+                      )
                       AND passage.last_occurred_at >= %s
                       AND passage.first_occurred_at < %s
                     ORDER BY passage.logical_document_id,
