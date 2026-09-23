@@ -1018,13 +1018,13 @@ class SearchBeforeParquetTests(unittest.TestCase):
         try:
             self.assertTrue(entered.wait(2))
             self.assertTrue(searched.is_set(), "search waited behind blocked Parquet")
-            self.assertEqual(calls, ["embeddings", "passages", "logical", "search"])
+            self.assertEqual(calls, ["embeddings", "passages", "search", "logical"])
         finally:
             release.set()
             worker.join(2)
         self.assertFalse(worker.is_alive())
         self.assertFalse(failures)
-        self.assertEqual(calls, ["embeddings", "passages", "logical", "search", "scan"])
+        self.assertEqual(calls, ["embeddings", "passages", "search", "logical", "scan"])
         self.assertEqual(scan_bounds, [dict(tenant_id="tenant:company:test", batch_size=4,
                                            max_batches=2, compaction_budget=1)])
         result = outcomes[0]
@@ -1052,7 +1052,7 @@ class SearchBeforeParquetTests(unittest.TestCase):
             run_projection_worker(_Logical(calls, work=0), _Passages(calls, work=0),
                                   FailingScan(calls), search_plane=search, **self.kwargs())
         self.assertIs(caught.exception, failure)
-        self.assertEqual(calls, ["embeddings", "passages", "logical", "search", "scan"])
+        self.assertEqual(calls, ["embeddings", "passages", "search", "logical", "scan"])
 
 
 if __name__ == "__main__":

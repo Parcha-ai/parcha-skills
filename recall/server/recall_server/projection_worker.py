@@ -195,23 +195,10 @@ def run_projection_worker(
             )
             passage_elapsed_ms = elapsed_ms(phase_started)
             phase_elapsed["passage_elapsed_ms"] = passage_elapsed_ms
-            active_phase = "logical"
-            phase_started = clock()
-            documents = logical.project_pending(
-                tenant_id=tenant_id,
-                batch_size=logical_batch_size,
-                max_batches=max_batches_per_cycle,
-                upload_concurrency=upload_concurrency,
-                quiet_seconds=quiet_seconds,
-                max_wait_seconds=max_wait_seconds,
-                cleanup_concurrency=cleanup_concurrency,
-            )
-            logical_elapsed_ms = elapsed_ms(phase_started)
-            phase_elapsed["logical_elapsed_ms"] = logical_elapsed_ms
             active_phase = "search_plane"
             phase_started = clock()
-            # Search reads current logical/passages, not Parquet artifacts.
-            # Drain its bounded outbox before a synchronous month rebuild.
+            # Publish ready passages before unrelated logical uploads or
+            # Parquet rebuilds. Search reads current passages, not Parquet.
             # H3-b: the search plane drains its own outbox, one bounded batch
             # of source-months per cycle; a turbopuffer failure on a month is
             # counted, logged by class inside the projector, and retried next
@@ -231,6 +218,19 @@ def run_projection_worker(
             )
             search_plane_elapsed_ms = elapsed_ms(phase_started) if search_plane is not None else 0
             phase_elapsed["search_plane_elapsed_ms"] = search_plane_elapsed_ms
+            active_phase = "logical"
+            phase_started = clock()
+            documents = logical.project_pending(
+                tenant_id=tenant_id,
+                batch_size=logical_batch_size,
+                max_batches=max_batches_per_cycle,
+                upload_concurrency=upload_concurrency,
+                quiet_seconds=quiet_seconds,
+                max_wait_seconds=max_wait_seconds,
+                cleanup_concurrency=cleanup_concurrency,
+            )
+            logical_elapsed_ms = elapsed_ms(phase_started)
+            phase_elapsed["logical_elapsed_ms"] = logical_elapsed_ms
             active_phase = "parquet"
             phase_started = clock()
             # Parquet shards are source/month materializations of the authoritative
