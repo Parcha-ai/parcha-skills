@@ -111,6 +111,20 @@ def _filters(context: ProbeContext) -> dict[str, Any]:
     return filters
 
 
+def _scan_evidence_gates(outcome: Any) -> list[Gate]:
+    payload = outcome.result or {}
+    return [
+        Gate("scan_succeeded", "==", 1.0).evaluate(
+            float(bool(outcome.ok and payload and payload.get("exit_code") == 0))
+        ),
+        Gate("scan_complete", "==", 1.0).evaluate(
+            None
+            if not isinstance(payload.get("complete"), bool)
+            else float(payload["complete"])
+        ),
+    ]
+
+
 class FreshnessProbe:
     """Age of the newest visible passage per source, plus projection backlog."""
 
@@ -123,6 +137,7 @@ class FreshnessProbe:
             "recall_scan", {"filters": _filters(context), "program": FRESHNESS_PROGRAM, "timeout_seconds": 120},
             timeout_seconds=200,
         )
+        result.gates = _scan_evidence_gates(outcome)
         if not outcome.ok or not outcome.result or outcome.result.get("exit_code") != 0:
             result.status = "failed"
             result.notes.append("freshness scan did not complete")
@@ -160,11 +175,12 @@ class FreshnessProbe:
             "buckets_available": outcome.result.get("buckets_available"),
             "per_source": per_source,
         }
-        result.gates = [
+        result.gates += [
+            Gate("sources_observed", ">=", 1.0).evaluate(float(len(rows))),
             Gate("newest_age_hours_min", "<=", 24.0, note="at least one source landed data in the last day").evaluate(result.metrics["newest_age_hours_min"]),
             Gate("projection_pending", "==", 0.0).evaluate(float(pending)),
         ]
-        if any(g.passed is False for g in result.gates):
+        if any(g.passed is not True for g in result.gates):
             result.status = "degraded"
         return result
 
@@ -271,12 +287,15 @@ class AuthorizationProbe:
         client = context.client
         leaks = 0
         checks = 0
+        unverified = 0
         notes: list[str] = []
         bogus_source = "systemscard:probe:unauthorized-source"
         bogus_person = "Systems Card Nonexistent Person 7f3a"
 
         outcome = client.call_tool("recall_search", {"query": "anything at all", "filters": {"source_id": bogus_source}, "limit": 5})
         checks += 1
+        if not outcome.ok or not isinstance((outcome.result or {}).get("results"), list):
+            unverified += 1
         if outcome.ok and outcome.result and outcome.result.get("results"):
             leaks += 1
             notes.append("search returned results for an unauthorized source filter")
@@ -284,18 +303,32 @@ class AuthorizationProbe:
 
         outcome = client.call_tool("recall_search", {"query": "anything at all", "filters": {"person": bogus_person}, "limit": 5})
         checks += 1
+        if not outcome.ok or not isinstance((outcome.result or {}).get("results"), list):
+            unverified += 1
         if outcome.ok and outcome.result and outcome.result.get("results"):
             leaks += 1
             notes.append("search returned results for an unknown person filter")
 
         outcome = client.call_tool("recall_scan", {"filters": {"source_id": bogus_source}, "program": "ls /datasets | wc -l", "timeout_seconds": 30}, timeout_seconds=90)
         checks += 1
-        if outcome.ok and outcome.result and int(outcome.result.get("sources_available", 0) or 0) > 0:
+        scan = outcome.result or {}
+        if not (
+            outcome.ok and type(scan.get("sources_available")) is int
+            and scan["sources_available"] >= 0 and scan.get("exit_code") == 0
+            and scan.get("complete") is True
+        ):
+            unverified += 1
+        if outcome.ok and type(scan.get("sources_available")) is int and scan["sources_available"] > 0:
             leaks += 1
             notes.append("scan mounted datasets for an unauthorized source filter")
 
         outcome = client.call_tool("recall_scope", {"filters": {"source_id": bogus_source}, "limit": 5})
         checks += 1
+        if not (
+            outcome.ok and isinstance((outcome.result or {}).get("documents"), list)
+            and outcome.result.get("complete") is True
+        ):
+            unverified += 1
         if outcome.ok and outcome.result and outcome.result.get("documents"):
             leaks += 1
             notes.append("scope enumerated documents for an unauthorized source filter")
@@ -312,17 +345,25 @@ class AuthorizationProbe:
             if ping.ok:
                 leaks += 1
                 notes.append("foreign tenant path accepted the token")
+            elif ping.http_status not in (401, 403):
+                unverified += 1
 
         result.samples = checks
         result.metrics = {
             "checks": checks,
+            "checks_unverified": unverified,
             "leaks": leaks,
             "unauthorized_source_reason": source_reason,
             "foreign_tenant_http_status": foreign_status,
         }
-        result.gates = [Gate("leaks", "==", 0.0).evaluate(float(leaks))]
+        result.gates = [
+            Gate("leaks", "==", 0.0).evaluate(float(leaks) if leaks or not unverified else None),
+            Gate("checks_unverified", "==", 0.0).evaluate(float(unverified)),
+        ]
+        if unverified:
+            notes.append("negative authorization checks lacked a verified response")
         result.notes = notes
-        if leaks:
+        if leaks or unverified:
             result.status = "failed"
         return result
 
@@ -339,13 +380,23 @@ class SecretScanProbe:
             "recall_scan", {"filters": _filters(context), "program": secret_scan_program(), "timeout_seconds": 240},
             timeout_seconds=300,
         )
+        result.gates = _scan_evidence_gates(outcome)
         if not outcome.ok or not outcome.result or outcome.result.get("exit_code") != 0:
             result.status = "failed"
             result.notes.append("secret scan did not complete")
             return result
         rows = _parse_json_rows(outcome.result.get("stdout", ""))
         row = rows[0] if rows else {}
-        passages = int(row.get("passages", 0) or 0)
+        required = ["passages", *("secret_" + name for name in SECRET_PATTERNS)]
+        counts_valid = len(rows) == 1 and all(
+            type(row.get(key)) is int and row[key] >= 0 for key in required
+        )
+        result.gates.append(Gate("aggregate_valid", "==", 1.0).evaluate(float(counts_valid)))
+        if not counts_valid:
+            result.status = "failed"
+            result.notes.append("secret scan did not return the required counts")
+            return result
+        passages = row["passages"]
         secret_total = 0
         metrics: dict[str, Any] = {"passages_scanned": passages, "scan_complete": bool(outcome.result.get("complete"))}
         for key, value in row.items():
@@ -358,7 +409,10 @@ class SecretScanProbe:
         metrics["secret_hits_per_million_passages"] = round(secret_total * 1_000_000 / passages, 2) if passages else None
         result.samples = passages
         result.metrics = metrics
-        result.gates = [Gate("secret_hits_total", "==", 0.0).evaluate(float(secret_total))]
-        if secret_total:
+        result.gates += [
+            Gate("passages_scanned", ">=", 1.0).evaluate(float(passages)),
+            Gate("secret_hits_total", "==", 0.0).evaluate(float(secret_total)),
+        ]
+        if any(g.passed is not True for g in result.gates):
             result.status = "failed"
         return result

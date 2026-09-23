@@ -54,6 +54,7 @@ from recall_server.search_plane_status import (  # noqa: E402
     search_plane_status,
 )
 from recall_server.turbopuffer_plane import TurbopufferSettings  # noqa: E402
+from recall_server.turbopuffer_projection import TurbopufferProjector  # noqa: E402
 from tests.central_brain.fake_turbopuffer import FakeTurbopuffer  # noqa: E402
 from tests.central_brain.test_projection_worker import (  # noqa: E402
     _Logical,
@@ -608,7 +609,7 @@ if __name__ == "__main__":
 
 
 class SearchPlaneReconcileTest(unittest.TestCase):
-    """Exact drift over ids: stale rows go on --apply, missing ids are the outbox's."""
+    """Observed drift is not deletion authority; repairs reread current rows."""
 
     def _store(self, live_ids: list[str]) -> mock.MagicMock:
         store = mock.MagicMock(search_plane="turbopuffer")
@@ -677,7 +678,7 @@ class SearchPlaneReconcileTest(unittest.TestCase):
         self.assertNotIn("filters", pages[0])
         self.assertEqual(pages[1]["filters"], ("id", "Gt", ids[2]))
 
-    def test_reports_stale_and_missing_and_deletes_only_on_apply(self) -> None:
+    def test_reports_unresolved_stale_and_repairs_missing_on_apply(self) -> None:
         settings = TurbopufferSettings(api_key="synthetic-key")
         client = FakeTurbopuffer(settings)
         live = [f"psg_{index:032d}" for index in range(4)]
@@ -706,15 +707,63 @@ class SearchPlaneReconcileTest(unittest.TestCase):
         )
         self.assertEqual(
             (applied["stale"], applied["deleted"], applied["missing"], applied["written"], applied["applied"]),
-            (2, 2, 1, 1, True),
+            (2, 0, 1, 1, True),
         )
+        self.assertEqual(applied["unresolved_stale"], 2)
+        self.assertEqual(applied["status"], "unresolved")
         self.assertEqual(_Projector.calls, [("tenant:test", [live[3]])])
-        self.assertEqual(set(ns.rows), set(live))
+        self.assertEqual(set(ns.rows), set(live + stale))
         with self.assertRaises(ValueError):
             search_plane_reconcile(
                 self._store(live + ["psg_" + "9" * 32]), settings, tenant_id="tenant:test", policy_fingerprint="fp",
                 client=client, apply=True,
             )
+
+    def test_insert_behind_sql_cursor_is_not_deleted_after_writer_ack(self) -> None:
+        settings = TurbopufferSettings(api_key="synthetic-key")
+        client = FakeTurbopuffer(settings)
+        old_id, new_id = "psg_" + "b" * 32, "psg_" + "a" * 32
+        live = [old_id]
+        ns = self._seed(client, settings, live)
+        original_query = ns.query
+
+        def publish_then_query(**kwargs):
+            # SQL has already read old_id; the writer commits/upserts an ID
+            # behind that cursor before reconciliation reads the namespace.
+            live.insert(0, new_id)
+            self._seed(client, settings, [new_id])
+            return original_query(**kwargs)
+
+        with mock.patch.object(ns, "query", side_effect=publish_then_query):
+            result = search_plane_reconcile(
+                self._store(live), settings, tenant_id="tenant:test",
+                policy_fingerprint="fp", client=client, apply=True,
+            )
+        self.assertIn(new_id, live)
+        self.assertIn(new_id, ns.rows)
+        self.assertEqual(result["deleted"], 0)
+        self.assertEqual((result["stale"], result["unresolved_stale"]), (1, 1))
+
+    def test_missing_then_forgotten_is_not_reinserted_by_repair(self) -> None:
+        settings = TurbopufferSettings(api_key="synthetic-key")
+        client = FakeTurbopuffer(settings)
+        passage_id = "psg_" + "a" * 32
+        # The comparison sees this ID, but its current-authority lookup no
+        # longer returns it. Exercise the actual repair owner, not a double.
+        store = self._store([passage_id])
+        projector = TurbopufferProjector(store, settings, client=client)
+        result = search_plane_reconcile(
+            store, settings, tenant_id="tenant:test", policy_fingerprint="fp",
+            client=client, apply=True, projector=projector,
+        )
+        self.assertEqual((result["missing"], result["written"], result["deleted"]), (1, 0, 0))
+        self.assertNotIn(passage_id, client.namespace(settings.namespace("tenant:test")).rows)
+        connection = store.connect.return_value.__enter__.return_value
+        repair_queries = [
+            call for call in connection.execute.call_args_list
+            if "passage.passage_id=ANY" in call.args[0]
+        ]
+        self.assertEqual(len(repair_queries), 1)
 
     def test_a_namespace_never_written_reports_everything_missing(self) -> None:
         settings = TurbopufferSettings(api_key="synthetic-key")

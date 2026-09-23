@@ -198,6 +198,14 @@ python -m recall_server.cli search-plane-project --tenant tenant:company:example
   cause and the next cycle retries it. A namespace that must be rebuilt (model or
   dimension change) is re-seeded with `search-outbox-seed`, which promotes every month to
   `backfill`.
+- **Reconciliation**: `search-plane-reconcile --tenant ... --apply` repairs observed
+  missing passages through the projector's current-authority lookup. Its independently
+  paged reads are not a shared snapshot: a concurrent insert can appear stale. It never
+  deletes inferred-stale rows; `unresolved_stale` reports their count and makes the
+  report's `status` `unresolved`. Authoritative outbox tombstones still own deletion.
+  This command walks the full namespace and catalog; page size is not a duration or
+  temporary-disk bound. Run it explicitly with operator supervision, not as an
+  unattended recurring job or a proof of exact coverage.
 - **Cost**: native embeddings bill at about $0.06 per million tokens of `embed_text`; the
   organisation rate limit is about 2M embedding tokens per minute, so a full backfill of
   the production corpus takes roughly 8 hours regardless of `--max-months`. Incremental
