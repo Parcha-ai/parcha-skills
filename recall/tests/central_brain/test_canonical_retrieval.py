@@ -375,6 +375,27 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
             next(iter(Inspector.calls[-1]["dataset_aliases"].values())),
         )
 
+    def test_parquet_scan_keeps_all_parts_above_old_count_limit(self) -> None:
+        rows = [dict(source_id="source:test", bucket_start=date(2026, 9, 1),
+                     dataset="passages", shard_index=i,
+                     object_key=f"objects/aa/{i:064x}", content_sha256=f"{i + 1:064x}")
+                for i in range(600)]
+        inspector = mock.Mock()
+        inspector.execute_scan.return_value = dict(
+            provider="synthetic", stdout="[]", stderr="", exit_code=0,
+            complete=True, stopped_reason="completed", output_truncated=False,
+            objects_unavailable=0, timing={})
+        retrieval = BoundCanonicalRetrieval(
+            DeadlineStore(), tenant_id="tenant:test", principal_id="principal:test",
+            authorized_sources=("source:test",), deep_inspector=inspector)
+        with (mock.patch.object(retrieval, "_sources", return_value=["source:test"]),
+              mock.patch.object(retrieval, "_parquet_shards", return_value=(rows, 0))):
+            result = retrieval.execute_parquet_scan("true", filters={}, timeout_seconds=60)
+        self.assertTrue(result["complete"])
+        args = inspector.execute_scan.call_args.kwargs
+        self.assertEqual(len(args["objects"]), 600)
+        self.assertEqual(set(args["dataset_aliases"]), {r["object_key"] for r in rows})
+
     def test_parquet_scan_caps_stdout_at_sixteen_kibibytes_truthfully(self) -> None:
         class Inspector:
             @staticmethod

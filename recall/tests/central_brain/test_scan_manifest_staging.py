@@ -36,9 +36,10 @@ class ScanManifestStagingTests(unittest.TestCase):
         self.objects.append(value)
         return value
 
-    def stage(self, aliases=None, datasets=None, *, tools=None):
+    def stage(self, aliases=None, datasets=None, *, tools=None, inventory=None):
         command = _agent_exec_command(
             program='true', objects=tuple(self.objects), document_aliases=aliases or {},
+            inventory=inventory,
             record_spans={}, routing_receipts={}, timeout_seconds=10,
             dataset_aliases=datasets if datasets is not None else {self.data.object_key: 's1/2026-09/passages-part-00000.parquet'},
             tool_objects=tools if tools is not None else {'linux-x86_64': self.tool},
@@ -84,6 +85,48 @@ class ScanManifestStagingTests(unittest.TestCase):
             stack.enter_context(patch('shutil.copyfile', side_effect=lambda src, dst: original_copy(src, mapped_path(dst))))
             stack.enter_context(redirect_stderr(io.StringIO()))
             exec(compile(script, '<generated-stage>', 'exec'), {})
+
+    def inventory(self, datasets):
+        body = json.dumps({"objects": [dict(object_key=o.object_key,
+                            content_sha256=o.content_sha256) for o in self.objects],
+                           "datasets": datasets}).encode()
+        digest = hashlib.sha256(body).hexdigest()
+        ref = AgentExecObject(f"objects/{digest[:2]}/{digest}", digest)
+        path = self.root / "mnt/archil/evidence" / ref.object_key
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(body)
+        return ref, path
+
+    def test_external_inventory_stages_all_600_parts_and_hides_inventory(self):
+        parts = [self.data] + [self.object(f"part-{i}".encode()) for i in range(599)]
+        datasets = {o.object_key: f"s1000/2026-09/passages-part-{i:05}.parquet"
+                    for i, o in enumerate(parts)}
+        ref, _path = self.inventory(datasets)
+        self.stage(datasets=datasets, inventory=ref)
+        self.assertEqual(len(self.mounts), len(self.objects) * 2)
+        self.assertEqual(len(list((self.root / "tmp/recall-datasets").rglob("*.parquet"))), 600)
+        self.assertFalse((self.root / "tmp/recall-authorized" / ref.object_key).exists())
+        self.assertFalse(any(ref.object_key in str(call) for call in self.mounts))
+
+    def test_changed_inventory_refuses_before_mounting(self):
+        ref, path = self.inventory({self.data.object_key: "s1/2026-09/passages-part-00000.parquet"})
+        path.write_bytes(path.read_bytes() + b" ")
+        with self.assertRaises(SystemExit) as error:
+            self.stage(inventory=ref)
+        self.assertEqual(error.exception.code, 66)
+        self.assertEqual(self.mounts, [])
+
+    def test_inventory_symlink_escape_refuses_before_reading(self):
+        ref, path = self.inventory({})
+        body = path.read_bytes()
+        path.unlink()
+        outside = self.root / "private-inventory"
+        outside.write_bytes(body)
+        path.symlink_to(outside)
+        with self.assertRaises(SystemExit) as error:
+            self.stage(inventory=ref)
+        self.assertEqual(error.exception.code, 64)
+        self.assertEqual(self.mounts, [])
 
     def test_scan_skips_manifest_traversal_but_keeps_mounts_dataset_and_tool(self):
         self.stage()

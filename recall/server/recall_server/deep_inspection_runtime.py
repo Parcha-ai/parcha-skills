@@ -80,5 +80,6 @@ def build_deep_inspector(
         disk_id=required["RECALL_ARCHIL_DISK_ID"],
         region=required["RECALL_ARCHIL_REGION"],
         duckdb_tools=tools or None,
+        execution_archive=projection.archive,
         transport=transport,
     )

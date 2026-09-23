@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
+from datetime import datetime, timezone
 import gzip
+import hashlib
 import json
 import logging
 import re
@@ -9,11 +12,12 @@ import shlex
 import ssl
 import urllib.error
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from .agent_scan import AGENT_SCAN_SCRIPT
-from .evidence_projection import EvidenceProjectionStore
+from .evidence_projection import EvidenceArchive, EvidenceProjectionStore
 
 OBJECT_KEY_RE = re.compile(r"objects/[0-9a-f]{2}/[0-9a-f]{64}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -104,7 +108,7 @@ def _log_staging_timing(raw: str | None, phases: dict[str, Any]) -> None:
         valid = valid and all(type(v) is int and 0 <= v <= 14_400_000_000 for v in value.values())
         if valid:
             n, task_max = value["object_count"], value["task_max_us"]
-            valid = (1 <= n <= 513 and task_max <= 3_600_000_000
+            valid = (1 <= n and task_max <= 3_600_000_000
                      and value["slow_5s_count"] <= value["slow_1s_count"] <= n
                      and (value["slow_1s_count"] > 0) == (task_max >= 1_000_000)
                      and (value["slow_5s_count"] > 0) == (task_max >= 5_000_000))
@@ -490,6 +494,7 @@ def _agent_exec_command(
     dataset_aliases: dict[str, str] | None = None,
     tool_objects: dict[str, AgentExecObject] | None = None,
     allow_missing_objects: bool = False,
+    inventory: AgentExecObject | None = None,
 ) -> str:
     """Build a content-addressed, no-network view for an agent-authored program."""
 
@@ -498,11 +503,9 @@ def _agent_exec_command(
 
     payload = encode(
         json.dumps(
-            [
-                {
-                    "object_key": item.object_key,
-                    "content_sha256": item.content_sha256,
-                }
+            {"object_key": inventory.object_key, "content_sha256": inventory.content_sha256}
+            if inventory is not None else [
+                {"object_key": item.object_key, "content_sha256": item.content_sha256}
                 for item in objects
             ],
             separators=(",", ":"),
@@ -538,7 +541,7 @@ def _agent_exec_command(
     )
     encoded_datasets = encode(
         json.dumps(
-            dataset_aliases or {},
+            {} if inventory is not None else (dataset_aliases or {}),
             separators=(",", ":"),
             sort_keys=True,
         ).encode()
@@ -576,6 +579,19 @@ tool_keys={item["object_key"] for item in tools.values()}
 arch={"aarch64":"linux-arm64","arm64":"linux-arm64","x86_64":"linux-x86_64","amd64":"linux-x86_64"}.get(platform.machine())
 tool=tools.get(arch) if arch else None
 source=pathlib.Path("/mnt/archil/evidence").resolve()
+if isinstance(items,dict):
+    # Read the server-authored inventory before hiding the rest of the disk.
+    key=items["object_key"]
+    if re.fullmatch(r"objects/[0-9a-f]{2}/[0-9a-f]{64}",key) is None:
+        raise SystemExit(64)
+    path=(source/key).resolve()
+    if source not in path.parents:
+        raise SystemExit(64)
+    raw=path.read_bytes()
+    if hashlib.sha256(raw).hexdigest()!=items["content_sha256"]:
+        raise SystemExit(66)
+    inventory=json.loads(raw)
+    items,datasets=inventory["objects"],inventory["datasets"]
 target=pathlib.Path("/tmp/recall-authorized").resolve()
 docs=pathlib.Path("/tmp/recall-docs").resolve()
 dataset_root=pathlib.Path("/tmp/recall-datasets").resolve()
@@ -679,8 +695,8 @@ for document_id,alias in aliases.items():
         )
 for object_key,alias in datasets.items():
     if not re.fullmatch(
-        r"s[1-9][0-9]{0,2}/[0-9]{4}-[0-9]{2}/"
-        r"(?:documents|passages|records|actors)-part-[0-9]{5}\.parquet",
+        r"s[1-9][0-9]*/[0-9]{4}-[0-9]{2}/"
+        r"(?:documents|passages|records|actors)-part-[0-9]{5,}\.parquet",
         alias,
     ):
         raise SystemExit(64)
@@ -937,6 +953,7 @@ class ArchilDeepInspector:
         region: str,
         duckdb_tool: AgentExecObject | None = None,
         duckdb_tools: dict[str, AgentExecObject] | None = None,
+        execution_archive: EvidenceArchive | None = None,
         transport: HttpTransport | None = None,
     ) -> None:
         if (
@@ -962,7 +979,38 @@ class ArchilDeepInspector:
             raise DeepInspectionError("deep_inspector_configuration_invalid")
         self.duckdb_tool = tools.get("linux-arm64")
         self.duckdb_tools = tools
+        self.execution_archive = execution_archive
         self.transport = transport or UrllibTransport()
+
+    @contextmanager
+    def _inventory(self, tenant_id, objects, dataset_aliases=None):
+        if self.execution_archive is None:
+            # Standalone inspectors retain inline transport; production supplies
+            # the existing evidence archive through build_deep_inspector.
+            yield None
+            return
+        payload = json.dumps({
+            "objects": [dict(object_key=o.object_key, content_sha256=o.content_sha256)
+                        for o in objects],
+            "datasets": dataset_aliases or {},
+        }, separators=(",", ":"), sort_keys=True).encode()
+        reference = self.execution_archive.put_raw(
+            tenant_id=tenant_id, source_id="source:execution-inventory",
+            native_id=uuid.uuid4().hex, payload=payload, media_type="application/json",
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+        try:
+            inventory = AgentExecObject(reference["object_key"], reference["content_sha256"])
+            if inventory.content_sha256 != hashlib.sha256(payload).hexdigest():
+                raise DeepInspectionError("deep_inspector_inventory_invalid")
+            yield inventory
+        finally:
+            # Each invocation owns a distinct object, so cleanup cannot remove
+            # a concurrent request's inventory. No canonical data is deleted.
+            try:
+                self.execution_archive.delete_raw(reference)
+            except Exception:
+                logging.getLogger("recall.mcp").warning("execution_inventory_cleanup_failed")
 
     def execute(
         self,
@@ -984,7 +1032,7 @@ class ArchilDeepInspector:
             or not program.strip()
             or len(program.encode()) > MAX_AGENT_PROGRAM_BYTES
             or not isinstance(objects, tuple)
-            or not 1 <= len(objects) <= 512
+            or not objects
             or any(not isinstance(item, AgentExecObject) for item in objects)
             or (
                 document_aliases is not None
@@ -1049,30 +1097,32 @@ class ArchilDeepInspector:
             document_id: f"d{ordinal}"
             for ordinal, document_id in enumerate(record_spans, start=1)
         }
-        command = _agent_exec_command(
-            program=program,
-            objects=unique,
-            document_aliases=aliases,
-            record_spans=record_spans,
-            routing_receipts=routing_receipts,
-            timeout_seconds=timeout_seconds,
-        )
-        if len(command.encode()) > MAX_ARCHIL_COMMAND_BYTES:
-            raise DeepInspectionError("deep_inspector_request_too_large")
-        response = self.transport.post(
-            url=REGION_ENDPOINTS[self.region] + "/api/exec",
-            headers={"Authorization": self.api_key},
-            body={
-                "disks": {
-                    "evidence": {
-                        "disk": self.disk_id,
-                        "readOnly": True,
-                    }
+        with self._inventory(tenant_id, unique, None) as inventory:
+            command = _agent_exec_command(
+                program=program,
+                inventory=inventory,
+                objects=unique,
+                document_aliases=aliases,
+                record_spans=record_spans,
+                routing_receipts=routing_receipts,
+                timeout_seconds=timeout_seconds,
+            )
+            if len(command.encode()) > MAX_ARCHIL_COMMAND_BYTES:
+                raise DeepInspectionError("deep_inspector_request_too_large")
+            response = self.transport.post(
+                url=REGION_ENDPOINTS[self.region] + "/api/exec",
+                headers={"Authorization": self.api_key},
+                body={
+                    "disks": {
+                        "evidence": {
+                            "disk": self.disk_id,
+                            "readOnly": True,
+                        }
+                    },
+                    "command": command,
                 },
-                "command": command,
-            },
-            timeout=timeout_seconds + AGENT_EXEC_STAGE_GRACE_SECONDS,
-        )
+                timeout=timeout_seconds + AGENT_EXEC_STAGE_GRACE_SECONDS,
+            )
         if (
             not isinstance(response, dict)
             or response.get("success") is not True
@@ -1100,7 +1150,7 @@ class ArchilDeepInspector:
             or not program.strip()
             or len(program.encode()) > MAX_AGENT_PROGRAM_BYTES
             or not isinstance(objects, tuple)
-            or not 1 <= len(objects) <= 511
+            or not objects
             or any(not isinstance(item, AgentExecObject) for item in objects)
             or not isinstance(dataset_aliases, dict)
             or set(dataset_aliases) != {item.object_key for item in objects}
@@ -1108,8 +1158,8 @@ class ArchilDeepInspector:
             or any(
                 not isinstance(alias, str)
                 or re.fullmatch(
-                    r"s[1-9][0-9]{0,2}/[0-9]{4}-[0-9]{2}/"
-                    r"(?:documents|passages|records|actors)-part-[0-9]{5}\.parquet",
+                    r"s[1-9][0-9]*/[0-9]{4}-[0-9]{2}/"
+                    r"(?:documents|passages|records|actors)-part-[0-9]{5,}\.parquet",
                     alias,
                 ) is None
                 for alias in dataset_aliases.values()
@@ -1119,30 +1169,32 @@ class ArchilDeepInspector:
             or not 1 <= timeout_seconds <= 240
         ):
             raise DeepInspectionError("deep_inspector_exec_invalid")
-        command = _agent_exec_command(
-            program=program,
-            objects=(*objects, *self.duckdb_tools.values()),
-            document_aliases={},
-            record_spans={},
-            routing_receipts={},
-            timeout_seconds=timeout_seconds,
-            dataset_aliases=dataset_aliases,
-            tool_objects=self.duckdb_tools,
-            allow_missing_objects=True,
-        )
-        if len(command.encode()) > MAX_ARCHIL_COMMAND_BYTES:
-            raise DeepInspectionError("deep_inspector_request_too_large")
-        response = self.transport.post(
-            url=REGION_ENDPOINTS[self.region] + "/api/exec",
-            headers={"Authorization": self.api_key},
-            body={
-                "disks": {
-                    "evidence": {"disk": self.disk_id, "readOnly": True}
+        with self._inventory(tenant_id, (*objects, *self.duckdb_tools.values()), dataset_aliases) as inventory:
+            command = _agent_exec_command(
+                program=program,
+                inventory=inventory,
+                objects=(*objects, *self.duckdb_tools.values()),
+                document_aliases={},
+                record_spans={},
+                routing_receipts={},
+                timeout_seconds=timeout_seconds,
+                dataset_aliases=dataset_aliases,
+                tool_objects=self.duckdb_tools,
+                allow_missing_objects=True,
+            )
+            if len(command.encode()) > MAX_ARCHIL_COMMAND_BYTES:
+                raise DeepInspectionError("deep_inspector_request_too_large")
+            response = self.transport.post(
+                url=REGION_ENDPOINTS[self.region] + "/api/exec",
+                headers={"Authorization": self.api_key},
+                body={
+                    "disks": {
+                        "evidence": {"disk": self.disk_id, "readOnly": True}
+                    },
+                    "command": command,
                 },
-                "command": command,
-            },
-            timeout=timeout_seconds + AGENT_EXEC_STAGE_GRACE_SECONDS,
-        )
+                timeout=timeout_seconds + AGENT_EXEC_STAGE_GRACE_SECONDS,
+            )
         if (
             not isinstance(response, dict)
             or response.get("success") is not True

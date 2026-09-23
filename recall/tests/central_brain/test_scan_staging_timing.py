@@ -52,6 +52,12 @@ class StagingTimingTests(unittest.TestCase):
         self.assertEqual(len(summary()), 12)
         self.assertIn("valid=1", row)
 
+    def test_large_inventory_keeps_valid_timing(self):
+        with self.assertLogs("recall.mcp", "INFO") as logs:
+            deep._execution_timing(PREFIX + json.dumps(dict(summary(), object_count=6002)) + "\n", {})
+        self.assertIn("valid=1", logs.records[0].getMessage())
+        self.assertIn("object_count=6002", logs.records[0].getMessage())
+
     def test_invalid_duplicate_and_oversized_summary_unknown_only(self):
         cases = [
             "{PRIVATE",
@@ -60,7 +66,7 @@ class StagingTimingTests(unittest.TestCase):
             "[" * 1500 + "]" * 1500,
         ]
         for key, value in [
-            ("object_count", 514),
+            ("object_count", 0),
             ("slow_1s_count", 5),
             ("task_max_us", 3_600_000_001),
             ("lookup_max_us", True),
