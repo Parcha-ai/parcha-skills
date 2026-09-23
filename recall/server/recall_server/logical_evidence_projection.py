@@ -1203,7 +1203,7 @@ class CanonicalLogicalEvidenceProjector:
                        tenant_id,source_id,bucket_start,
                        logical_document_id,reason,queued_at
                    )
-                   SELECT %s,%s,month.value::date,%s,%s,clock_timestamp()
+                   SELECT %s,%s,month.value::date,%s,%s,queue.changed_at
                      FROM unnest(%s::timestamptz[],%s::timestamptz[])
                           AS span(first_at,last_at)
                      CROSS JOIN LATERAL generate_series(
@@ -1211,11 +1211,15 @@ class CanonicalLogicalEvidenceProjector:
                          date_trunc('month',span.last_at),
                          interval '1 month'
                      ) month(value)
-                    GROUP BY month.value
+                     JOIN canonical_parquet_scan_queue queue
+                       ON queue.tenant_id=%s AND queue.source_id=%s
+                      AND queue.bucket_start=month.value::date
+                    GROUP BY month.value,queue.changed_at
                    ON CONFLICT(tenant_id,source_id,bucket_start,logical_document_id)
                    DO UPDATE SET reason=excluded.reason,
-                                 queued_at=clock_timestamp()""",
-                (tenant_id, source_id, logical_document_id, reason, starts, ends),
+                                 queued_at=excluded.queued_at""",
+                (tenant_id, source_id, logical_document_id, reason, starts, ends,
+                 tenant_id, source_id),
             )
         return max(0, result.rowcount)
 

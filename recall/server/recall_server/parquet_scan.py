@@ -739,13 +739,17 @@ class CanonicalParquetScanProjector:
                            logical_document_id,reason,queued_at
                        )
                        SELECT DISTINCT document.tenant_id,document.source_id,
-                              month.value::date,%s,'backfill',statement_timestamp()
+                              month.value::date,%s,'backfill',queue.changed_at
                          FROM canonical_evidence_documents document
                          CROSS JOIN LATERAL generate_series(
                              date_trunc('month',document.first_occurred_at),
                              date_trunc('month',document.last_occurred_at),
                              interval '1 month'
                          ) month(value)
+                         JOIN canonical_parquet_scan_queue queue
+                           ON queue.tenant_id=document.tenant_id
+                          AND queue.source_id=document.source_id
+                          AND queue.bucket_start=month.value::date
                         WHERE document.tenant_id=%s
                           AND (%s::text IS NULL OR document.source_id=%s)
                        ON CONFLICT DO NOTHING""",
@@ -2062,13 +2066,13 @@ class CanonicalParquetScanProjector:
                         """INSERT INTO canonical_parquet_scan_dirty_documents(
                                tenant_id,source_id,bucket_start,
                                logical_document_id,reason,queued_at
-                           ) VALUES (%s,%s,%s,%s,'compaction',clock_timestamp())
+                           ) VALUES (%s,%s,%s,%s,'compaction',%s)
                            ON CONFLICT(
                                tenant_id,source_id,bucket_start,logical_document_id
                            )
                            DO UPDATE SET reason='compaction',
-                                         queued_at=clock_timestamp()""",
-                        (*scope, SCAN_DIRTY_ALL),
+                                         queued_at=excluded.queued_at""",
+                        (*scope, SCAN_DIRTY_ALL, queued["changed_at"]),
                     )
                     candidates.append(
                         ScanCandidate(

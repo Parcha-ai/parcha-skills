@@ -233,6 +233,20 @@ def assert_compaction_owner_equivalence(store: BrainStore) -> int:
     return len(cases())
 
 
+def assert_dirty_fence(store, tenant, source):
+    with store.connect() as connection:
+        rows = connection.execute(
+            """SELECT dirty.queued_at,queue.changed_at
+                 FROM canonical_parquet_scan_dirty_documents dirty
+                 LEFT JOIN canonical_parquet_scan_queue queue
+                   USING(tenant_id,source_id,bucket_start)
+                WHERE dirty.tenant_id=%s AND dirty.source_id=%s""",
+            (tenant, source),
+        ).fetchall()
+    assert rows and all(row['changed_at'] is not None and
+                        row['queued_at'] <= row['changed_at'] for row in rows), rows
+
+
 def assert_forget_read_fence(store, logical, scan, tenant, principal, source, parent):
     """Exercise the actual catalog SQL while old immutable bytes still exist."""
     retrieval = BoundCanonicalRetrieval(
@@ -544,6 +558,7 @@ def main() -> None:
         # processing must not turn that hint into a mandatory whole-month build.
         queued = compactor._over_fragmented(tenant_id=tenant, limit=1)
         assert len(queued) == 1, queued
+        assert_dirty_fence(store, tenant, source)
         assert compactor._catalog(queued[0]).compaction
         before_rows = {
             dataset: sorted(json.dumps(row, sort_keys=True, default=str)
@@ -599,6 +614,7 @@ def main() -> None:
         # unchanged month through the owning API, then let reuse consume that
         # older hint so the deletion regression starts with no unrelated dirt.
         assert scan.seed_backfill(tenant_id=tenant, source_id=source) == 1
+        assert_dirty_fence(store, tenant, source)
         clean_before_forget = scan.project_pending(
             tenant_id=tenant, batch_size=4, max_batches=1, compaction_budget=0,
         )
@@ -693,6 +709,13 @@ def main() -> None:
                 source_id=source, native_ids=async_ids, reason='forget')
         async_result = logical.project_pending(tenant_id=tenant, batch_size=10, max_batches=1)
         assert async_result['pruned'] == 1, async_result
+        assert_dirty_fence(store, tenant, source)
+        scan.project_pending(tenant_id=tenant, batch_size=4, max_batches=1, compaction_budget=0)
+        with store.connect() as connection:
+            assert connection.execute(
+                "SELECT count(*) AS count FROM canonical_parquet_scan_dirty_documents WHERE tenant_id=%s AND source_id=%s",
+                (tenant, source),
+            ).fetchone()['count'] == 0
         with store.connect() as connection:
             tombstones = {row['passage_id'] for row in connection.execute(
                 "SELECT passage_id FROM search_projection_tombstones WHERE tenant_id=%s AND source_id=%s",
