@@ -666,6 +666,26 @@ class S3ArchiveStore(_ArchiveStore):
                                   **self._version_kwargs(reference)}, ExpiresIn=expires_in,
         )
 
+    def read_catalog_url(
+        self, value: dict[str, Any], *, tenant_id: str, source_id: str, expires_in: int,
+    ) -> str:
+        """Sign a server-selected, tenant/source-authorized catalog reference.
+
+        This internal path trusts the database catalog's immutable key/version;
+        it must never accept caller-supplied artifact references. Arbitrary
+        references continue through read_raw_url's metadata verification.
+        The execution bootstrap verifies the catalog's byte count and digest.
+        """
+        reference = self._from_contract(value)
+        self._validate_reference(reference)
+        self._authorize(reference, tenant_id=tenant_id, source_id=source_id)
+        if type(expires_in) is not int or not 1 <= expires_in <= 300:
+            raise ValueError("archive URL lifetime is invalid")
+        return self.client.generate_presigned_url(
+            "get_object", Params={"Bucket": self.bucket, "Key": reference.object_key,
+                                  **self._version_kwargs(reference)}, ExpiresIn=expires_in,
+        )
+
     def _version_id(self, content_sha256: str, response: dict[str, Any]) -> str:
         if self.compatibility_profile == "r2":
             return "r2-sha256-" + content_sha256
