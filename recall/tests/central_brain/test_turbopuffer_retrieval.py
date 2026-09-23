@@ -79,6 +79,17 @@ class SettingsTests(unittest.TestCase):
 class ArmTests(unittest.TestCase):
     def _retrieval(self, client, **kwargs):
         store = RerankWiringTests._Store()
+        original_execute = store._execute_bounded
+        def canonical_authority(connection, sql, values, deadline):
+            if "cardinality(passage.receipts)>0" not in sql:
+                return original_execute(connection, sql, values, deadline)
+            from types import SimpleNamespace
+            namespace = client.namespace(SETTINGS.namespace(TENANT))
+            rows = [dict(row, tenant_id=TENANT, passage_id=row["id"])
+                    for row in namespace.rows.values()
+                    if row["id"] in values[3] and row["source_id"] in values[1]]
+            return SimpleNamespace(fetchall=lambda: rows)
+        store._execute_bounded = canonical_authority
         return TurbopufferHintRetrieval(
             store, settings=SETTINGS, client=client, tenant_id=TENANT,
             sources=["codex:linux:test"], policy_fingerprint="fp-policy", **kwargs,

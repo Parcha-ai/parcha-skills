@@ -16,7 +16,7 @@ import os
 import time
 from typing import Any
 
-from .db import bounded_search_text
+from .db import SearchDeadlineExceeded, bounded_search_text
 from .passage_retrieval import (
     DENSE_NEAREST_LIMIT,
     PassageHintRetrieval,
@@ -360,6 +360,82 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
             return [], status
         return self._scored(raw), "ok"
 
+    def _authorize_ranges(self, results, legs, *, deadline_at):
+        """Canonical receipt metadata fences asynchronous search-plane writes.
+
+        Body retirement clears text, retaining the receipt rows. A deleting or
+        forgotten receipt makes the entire passage ineligible, including its
+        cached vendor body and diagnostic arm results.
+        """
+        candidates = [row for _name, _weight, rows in legs for row in rows]
+        ids = sorted({row["passage_id"] for row in candidates
+                      if isinstance(row.get("passage_id"), str)})
+        if not ids:
+            results.clear()
+            for _name, _weight, rows in legs:
+                rows.clear()
+            return {"authority_status": "ok", "authority_rejected": 0}
+        status = "ok"
+        authoritative = []
+        try:
+            if time.monotonic() >= deadline_at:
+                raise SearchDeadlineExceeded()
+            with self.store.connect() as connection:
+                authoritative = self.store._execute_bounded(
+                    connection,
+                    """SELECT passage.tenant_id,passage.source_id,passage.passage_id,
+                              passage.logical_document_id,passage.text_sha256
+                         FROM canonical_passages passage
+                         JOIN canonical_passage_documents projected
+                           USING(tenant_id,source_id,logical_document_id,policy_fingerprint)
+                         JOIN canonical_evidence_documents evidence
+                           USING(tenant_id,source_id,logical_document_id)
+                        WHERE passage.tenant_id=%s AND passage.source_id=ANY(%s)
+                          AND passage.policy_fingerprint=%s
+                          AND passage.passage_id=ANY(%s)
+                          AND cardinality(passage.receipts)>0
+                          AND NOT EXISTS (
+                              SELECT 1 FROM unnest(passage.receipts) AS receipt(value)
+                              LEFT JOIN canonical_chunks chunk
+                                ON chunk.tenant_id=passage.tenant_id
+                               AND chunk.source_id=passage.source_id
+                               AND chunk.receipt=receipt.value
+                               AND chunk.deleted_at IS NULL
+                              LEFT JOIN canonical_documents document
+                                ON document.tenant_id=chunk.tenant_id
+                               AND document.source_id=chunk.source_id
+                               AND document.document_id=chunk.document_id
+                               AND document.is_current AND document.deleted_at IS NULL
+                              WHERE document.document_id IS NULL
+                          )""",
+                    (self.tenant_id, self.sources, self.policy_fingerprint, ids),
+                    deadline_at,
+                ).fetchall()
+        except SearchDeadlineExceeded:
+            status = "deadline-exceeded"
+        except Exception:
+            status = "unavailable"
+        def identity(row):
+            return (row.get("source_id"), row.get("logical_document_id"),
+                    row.get("passage_id"), row.get("text_sha256"))
+        allowed = {identity(row) for row in authoritative
+                   if row.get("tenant_id") == self.tenant_id
+                   and row.get("source_id") in self.sources}
+        live = set()
+        for _name, _weight, rows in legs:
+            rows[:] = [row for row in rows if identity(row) in allowed]
+            live.update((row["source_id"], row["logical_document_id"], row["passage_id"])
+                        for row in rows)
+        # A collapsed document can carry metadata from any of its selected
+        # ranges. Drop the whole collapsed row if any range lost authority;
+        # never preserve a forgotten range's receipts, title, or body.
+        results[:] = [row for row in results if row.get("matching_ranges") and all(
+            (row.get("source_id"), row.get("logical_document_id"), item.get("passage_id")) in live
+            for item in row["matching_ranges"]
+        )]
+        return {"authority_status": status,
+                "authority_rejected": len(set(ids) - {key[2] for key in live})}
+
     def _hydrate_ranges(
         self,
         results: list[dict[str, Any]],
@@ -377,6 +453,7 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
         (``hydrate_status`` says so) rather than dropping the result.
         """
 
+        authority = self._authorize_ranges(results, legs, deadline_at=deadline_at)
         wanted: dict[str, list[dict[str, Any]]] = {}
         for row in results:
             for item in row.get("matching_ranges") or ():
@@ -384,7 +461,7 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
                 if isinstance(passage_id, str) and not item.get("text"):
                     wanted.setdefault(passage_id, []).append(item)
         if not wanted:
-            return {"hydrate_status": "ok", "hydrated_passages": 0}
+            return {**authority, "hydrate_status": authority["authority_status"], "hydrated_passages": 0}
         leg_rows: dict[str, list[dict[str, Any]]] = {}
         for _name, _weight, rows in legs:
             for row in rows:
@@ -426,7 +503,7 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
                 hydrated += 1
         if hydrated < len(ids) and status == "ok":
             status = "partial"
-        return {"hydrate_status": status, "hydrated_passages": hydrated, "hydrate_wanted": len(ids)}
+        return {**authority, "hydrate_status": status, "hydrated_passages": hydrated, "hydrate_wanted": len(ids)}
 
     @staticmethod
     def _scored(raw: list[Any]) -> list[dict[str, Any]]:
