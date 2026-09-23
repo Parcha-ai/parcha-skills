@@ -63,7 +63,7 @@ def main():
         page = bound.scope_documents(limit=80, offset=10_000)
         assert len(page['documents']) == 80 and page['complete'] is False
         late = bound.scope_documents(filters={'source_id':source}, limit=80, offset=10_080)
-        expected = ['ldoc_' + hashlib.md5(f'{tenant}:{source}:{i}'.encode()).hexdigest()
+        expected = ['ldoc_' + hashlib.md5(f'{tenant}:{source}:{i}'.encode(), usedforsecurity=False).hexdigest()
                     for i in range(10_081, 10_122)]
         assert [row['logical_document_id'] for row in late['documents']] == expected
         assert all(row['source_id'] == source for row in late['documents'])
