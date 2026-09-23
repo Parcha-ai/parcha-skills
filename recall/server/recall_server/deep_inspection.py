@@ -495,6 +495,8 @@ def _agent_exec_command(
     tool_objects: dict[str, AgentExecObject] | None = None,
     allow_missing_objects: bool = False,
     inventory: AgentExecObject | None = None,
+    inventory_url: str | None = None,
+    inventory_size_bytes: int = 0,
 ) -> str:
     """Build a content-addressed, no-network view for an agent-authored program."""
 
@@ -580,18 +582,18 @@ arch={"aarch64":"linux-arm64","arm64":"linux-arm64","x86_64":"linux-x86_64","amd
 tool=tools.get(arch) if arch else None
 source=pathlib.Path("/mnt/archil/evidence").resolve()
 if isinstance(items,dict):
-    # Read the server-authored inventory before hiding the rest of the disk.
-    key=items["object_key"]
-    if re.fullmatch(r"objects/[0-9a-f]{2}/[0-9a-f]{64}",key) is None:
-        raise SystemExit(64)
-    path=(source/key).resolve()
-    if source not in path.parents:
+    # The trusted bootstrap fetched this before network isolation. The agent
+    # receives neither the read capability nor the inventory file.
+    base=pathlib.Path("/tmp/recall-agent").resolve()
+    path=(base/"inventory.json").resolve()
+    if path.parent!=base:
         raise SystemExit(64)
     raw=path.read_bytes()
     if hashlib.sha256(raw).hexdigest()!=items["content_sha256"]:
         raise SystemExit(66)
     inventory=json.loads(raw)
     items,datasets=inventory["objects"],inventory["datasets"]
+    path.unlink()
 target=pathlib.Path("/tmp/recall-authorized").resolve()
 docs=pathlib.Path("/tmp/recall-docs").resolve()
 dataset_root=pathlib.Path("/tmp/recall-datasets").resolve()
@@ -746,6 +748,31 @@ printf 'RECALL_EXEC_TIMING_V1\t%s\t%s\n' "$1" "${EPOCHREALTIME/./}" >&2
             + shlex.quote(path)
         )
 
+    inventory_bootstrap = []
+    if inventory is not None:
+        if (not isinstance(inventory_url, str)
+                or not inventory_url.startswith("https://")
+                or type(inventory_size_bytes) is not int or inventory_size_bytes <= 0):
+            raise DeepInspectionError("deep_inspector_inventory_invalid")
+        fetch_script = r"""
+import hashlib,json,pathlib,sys,urllib.request
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self,*args,**kwargs):
+        return None
+try:
+    url,size,digest=json.loads(sys.argv[1])
+    with urllib.request.build_opener(NoRedirect()).open(url,timeout=45) as response:
+        raw=response.read(size+1)
+    if len(raw)!=size or hashlib.sha256(raw).hexdigest()!=digest:
+        raise ValueError()
+    pathlib.Path("/tmp/recall-agent/inventory.json").write_bytes(raw)
+except Exception:
+    # A failed download must never print the signed read capability.
+    raise SystemExit(66)
+""".strip()
+        inventory_bootstrap.append("python3 -c " + shlex.quote(fetch_script) + " " +
+            shlex.quote(json.dumps([inventory_url, inventory_size_bytes, inventory.content_sha256])))
+
     program_body = (
         "set -o pipefail; "
         + (
@@ -812,6 +839,7 @@ printf 'RECALL_EXEC_TIMING_V1\t%s\t%s\n' "$1" "${EPOCHREALTIME/./}" >&2
         "rm -rf /tmp/recall-authorized /tmp/recall-agent /tmp/recall-docs "
         "/tmp/recall-datasets",
         "mkdir -p /tmp/recall-agent",
+        *inventory_bootstrap,
         inflate(encoded_program, "/tmp/recall-agent/program.sh"),
         inflate(encoded_scan, "/tmp/recall-agent/recall-scan"),
         inflate(encoded_pointers, "/tmp/recall-agent/pointers.json"),
@@ -987,7 +1015,7 @@ class ArchilDeepInspector:
         if self.execution_archive is None:
             # Standalone inspectors retain inline transport; production supplies
             # the existing evidence archive through build_deep_inspector.
-            yield None
+            yield None, None, 0
             return
         payload = json.dumps({
             "objects": [dict(object_key=o.object_key, content_sha256=o.content_sha256)
@@ -1003,7 +1031,8 @@ class ArchilDeepInspector:
             inventory = AgentExecObject(reference["object_key"], reference["content_sha256"])
             if inventory.content_sha256 != hashlib.sha256(payload).hexdigest():
                 raise DeepInspectionError("deep_inspector_inventory_invalid")
-            yield inventory
+            url = self.execution_archive.read_raw_url(reference, expires_in=300)
+            yield inventory, url, len(payload)
         finally:
             # Each invocation owns a distinct object, so cleanup cannot remove
             # a concurrent request's inventory. No canonical data is deleted.
@@ -1097,10 +1126,12 @@ class ArchilDeepInspector:
             document_id: f"d{ordinal}"
             for ordinal, document_id in enumerate(record_spans, start=1)
         }
-        with self._inventory(tenant_id, unique, None) as inventory:
+        with self._inventory(tenant_id, unique, None) as (inventory, inventory_url, inventory_size_bytes):
             command = _agent_exec_command(
                 program=program,
                 inventory=inventory,
+                inventory_url=inventory_url,
+                inventory_size_bytes=inventory_size_bytes,
                 objects=unique,
                 document_aliases=aliases,
                 record_spans=record_spans,
@@ -1169,10 +1200,12 @@ class ArchilDeepInspector:
             or not 1 <= timeout_seconds <= 240
         ):
             raise DeepInspectionError("deep_inspector_exec_invalid")
-        with self._inventory(tenant_id, (*objects, *self.duckdb_tools.values()), dataset_aliases) as inventory:
+        with self._inventory(tenant_id, (*objects, *self.duckdb_tools.values()), dataset_aliases) as (inventory, inventory_url, inventory_size_bytes):
             command = _agent_exec_command(
                 program=program,
                 inventory=inventory,
+                inventory_url=inventory_url,
+                inventory_size_bytes=inventory_size_bytes,
                 objects=(*objects, *self.duckdb_tools.values()),
                 document_aliases={},
                 record_spans={},

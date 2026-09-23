@@ -37,9 +37,14 @@ class ScanManifestStagingTests(unittest.TestCase):
         return value
 
     def stage(self, aliases=None, datasets=None, *, tools=None, inventory=None):
+        if inventory is not None:
+            local = self.root / "tmp/recall-agent/inventory.json"
+            if not local.is_symlink():
+                local.write_bytes((self.root / "mnt/archil/evidence" / inventory.object_key).read_bytes())
         command = _agent_exec_command(
             program='true', objects=tuple(self.objects), document_aliases=aliases or {},
-            inventory=inventory,
+            inventory=inventory, inventory_url="https://synthetic.invalid/inventory",
+            inventory_size_bytes=1,
             record_spans={}, routing_receipts={}, timeout_seconds=10,
             dataset_aliases=datasets if datasets is not None else {self.data.object_key: 's1/2026-09/passages-part-00000.parquet'},
             tool_objects=tools if tools is not None else {'linux-x86_64': self.tool},
@@ -119,10 +124,9 @@ class ScanManifestStagingTests(unittest.TestCase):
     def test_inventory_symlink_escape_refuses_before_reading(self):
         ref, path = self.inventory({})
         body = path.read_bytes()
-        path.unlink()
         outside = self.root / "private-inventory"
         outside.write_bytes(body)
-        path.symlink_to(outside)
+        (self.root / "tmp/recall-agent/inventory.json").symlink_to(outside)
         with self.assertRaises(SystemExit) as error:
             self.stage(inventory=ref)
         self.assertEqual(error.exception.code, 64)
