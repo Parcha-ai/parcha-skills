@@ -213,6 +213,57 @@ class ProbeTest(unittest.TestCase):
         self.assertEqual(first["dense_strategy"], "exact-scoped")
         self.assertNotIn("results", json.dumps(first))
 
+    def test_tool_latency_counts_program_failure_and_retains_its_timing(self):
+        for tool in ("recall_scan", "recall_exec"):
+            with self.subTest(tool=tool):
+                tools = default_tools()
+                exits = iter((1, 0))
+                tools[tool] = lambda _args: {"exit_code": next(exits), "stderr": "synthetic failure"}
+                context = make_context(FakeBrain(tools), latency_repetitions=2, queries=["q"])
+                original_call = context.client.call_tool
+                durations = iter((110.0, 240.0))
+
+                def call(name, args, **kwargs):
+                    outcome = original_call(name, args, **kwargs)
+                    if name == tool:
+                        self.assertTrue(outcome.ok)  # Both HTTP/MCP envelopes succeeded.
+                        self.assertEqual(outcome.http_status, 200)
+                        outcome.elapsed_ms = next(durations)
+                    return outcome
+
+                with mock.patch.object(context.client, "call_tool", side_effect=call):
+                    result = latency.ToolLatencyProbe().run(context)
+                self.assertEqual(result.metrics[f"{tool}.errors"], 1)
+                self.assertEqual(result.metrics[f"{tool}.n"], 2)
+                self.assertEqual(result.metrics[f"{tool}.first_call_ms"], 110.0)
+                self.assertEqual(result.metrics[f"{tool}.p95_ms"], 233.5)
+                self.assertEqual(result.metrics["error_rate"], 1 / result.samples)
+                self.assertEqual(result.status, "degraded")
+                gate = next(g for g in result.gates if g.metric == "error_rate")
+                self.assertEqual(gate.threshold, 0.02)
+                self.assertFalse(gate.passed)
+                self.assertNotIn("synthetic failure", json.dumps(result.as_dict()))
+
+    def test_tool_latency_requires_a_valid_zero_program_exit(self):
+        for tool in ("recall_scan", "recall_exec"):
+            for code in (None, "0", False, 0.0):
+                with self.subTest(tool=tool, exit_code=code):
+                    tools = default_tools()
+                    tools[tool] = {} if code is None else {"exit_code": code}
+                    result = latency.ToolLatencyProbe().run(make_context(
+                        FakeBrain(tools), latency_repetitions=1, queries=["q"]))
+                    self.assertEqual(result.metrics[f"{tool}.errors"], 1)
+                    self.assertNotEqual(result.status, "ok")
+
+    def test_tool_latency_does_not_double_count_protocol_program_errors(self):
+        tools = default_tools()
+        tools["recall_exec"] = None
+        result = latency.ToolLatencyProbe().run(make_context(
+            FakeBrain(tools), latency_repetitions=1, queries=["q"]))
+        self.assertEqual(result.metrics["recall_exec.errors"], 1)
+        self.assertEqual(result.metrics["recall_scan.errors"], 0)
+        self.assertEqual(result.metrics["error_rate"], 1 / result.samples)
+
     def test_search_stage_probe_reads_server_diagnostics(self):
         context = make_context(FakeBrain(default_tools()), queries=["q1", "q2", "q3"])
         result = latency.SearchStageProbe().run(context)
