@@ -45,7 +45,12 @@ For a question such as “What did Alice work on yesterday?”, the client shoul
    of candidate logical document IDs. Use raw record shards only when required
    tool output or exact low-level details cannot be present in visible passages.
 3. Treat `complete=false` or `projection_pending>0` as partial planning, never as
-   proof that the missing work does not exist.
+   proof that the missing work does not exist. `projection_pending` counts queue
+   work: logical parents, passage documents, and Parquet source/month rebuilds,
+   not distinct documents. Catalog rows and these counters share a read snapshot.
+   Logical work remains pending for its authorized source until current event
+   bounds and actor links are projected; passage and Parquet work respect the
+   requested month range when those bounds are known.
 4. Call `recall_exec_map` on the selected document IDs. Use small shards for large
    documents or heterogeneous sessions, and more parallel workers when breadth is
    the bottleneck.

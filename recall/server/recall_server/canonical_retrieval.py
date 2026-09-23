@@ -1447,8 +1447,15 @@ class BoundCanonicalRetrieval:
         since: datetime | None,
         until: datetime | None,
     ) -> tuple[list[dict[str, Any]], int]:
+        # Pending is queue work, not distinct documents: one logical parent,
+        # passage document, or source/month may each contribute a pending item.
         values = (self.tenant_id, sources, since, since, until, until)
         with self.store.connect() as connection:
+            # Publication can remove queue rows while adding catalog rows.
+            # Both reads must describe one snapshot, including the empty case.
+            connection.execute(
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY", ()
+            )
             rows = connection.execute(
                 """SELECT tenant_id,source_id,bucket_start,dataset,shard_index,
                           artifact_id,storage_backend,object_key,content_sha256,
@@ -1467,8 +1474,8 @@ class BoundCanonicalRetrieval:
                 values,
             ).fetchall()
             pending = connection.execute(
-                """SELECT count(*) AS count
-                     FROM canonical_parquet_scan_queue
+                """SELECT (
+                   SELECT count(*) FROM canonical_parquet_scan_queue
                     WHERE tenant_id=%s AND source_id=ANY(%s)
                       AND (
                           %s::timestamptz IS NULL OR bucket_start >=
@@ -1477,8 +1484,31 @@ class BoundCanonicalRetrieval:
                       AND (
                           %s::timestamptz IS NULL OR bucket_start <=
                           date_trunc('month',%s::timestamptz)::date
-                      )""",
-                values,
+                      )
+                   ) + (
+                   -- Logical dirt precedes trustworthy current event bounds.
+                   -- Conservatively retain it for this source, even when old
+                   -- projected bounds fall outside the requested month range.
+                   SELECT count(*) FROM canonical_evidence_document_queue
+                    WHERE tenant_id=%s AND source_id=ANY(%s)
+                   ) + (
+                   SELECT count(*)
+                     FROM canonical_passage_projection_queue queue
+                     JOIN canonical_evidence_documents document
+                       ON document.tenant_id=queue.tenant_id
+                      AND document.source_id=queue.source_id
+                      AND document.logical_document_id=queue.logical_document_id
+                    WHERE queue.tenant_id=%s AND queue.source_id=ANY(%s)
+                      AND (
+                          %s::timestamptz IS NULL OR document.last_occurred_at >=
+                          date_trunc('month',%s::timestamptz)
+                      )
+                      AND (
+                          %s::timestamptz IS NULL OR document.first_occurred_at <
+                          date_trunc('month',%s::timestamptz)+interval '1 month'
+                      )
+                   ) AS count""",
+                (*values, self.tenant_id, sources, *values),
             ).fetchone()["count"]
         return rows, int(pending)
 
@@ -1618,14 +1648,6 @@ class BoundCanonicalRetrieval:
             source_alias=source_alias,
             source_connector=source_connector,
         )
-        deadline_at = time.monotonic() + self.store.search_deadline_ms / 1000
-        if person is not None:
-            sources = self._parquet_person_sources(
-                sources,
-                person=person.strip(),
-                relation=relation,
-                deadline_at=deadline_at,
-            )
         if not sources:
             return self._empty_parquet_scan(sources_available=0)
         rows, pending = self._parquet_shards(
@@ -1633,6 +1655,17 @@ class BoundCanonicalRetrieval:
             since=since,
             until=until,
         )
+        if person is not None:
+            # Actor links are themselves projected. Capture pending work in
+            # authorized sources before an unresolved person narrows them away.
+            sources = self._parquet_person_sources(
+                sources,
+                person=person.strip(),
+                relation=relation,
+                deadline_at=time.monotonic() + self.store.search_deadline_ms / 1000,
+            )
+            person_sources = set(sources)
+            rows = [row for row in rows if row["source_id"] in person_sources]
         referenced_datasets = {
             dataset
             for dataset in ("documents", "passages", "records", "actors")
@@ -1726,6 +1759,8 @@ class BoundCanonicalRetrieval:
             "buckets_available": len(buckets),
             "projection_pending": pending,
             "complete": bool(result.get("complete")) and pending == 0,
+            "stopped_reason": "projection_pending"
+                if pending and result.get("complete") else result.get("stopped_reason"),
         }
 
     def passage_hints(
