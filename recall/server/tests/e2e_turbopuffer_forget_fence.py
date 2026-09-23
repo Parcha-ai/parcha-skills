@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 
@@ -16,7 +17,7 @@ from recall_server.logical_evidence import LogicalEvidenceProjectionStore
 from recall_server.logical_evidence_projection import CanonicalLogicalEvidenceProjector, mark_logical_evidence_dirty
 from recall_server.passage_index import CanonicalPassageProjector
 from recall_server.passage_projection import DEFAULT_PASSAGE_POLICY
-from recall_server.turbopuffer_retrieval import TurbopufferHintRetrieval
+from recall_server.turbopuffer_retrieval import TurbopufferHintRetrieval, arm_row
 from recall_server.turbopuffer_plane import TurbopufferSettings, passage_row
 from tests.central_brain.fake_turbopuffer import FakeTurbopuffer
 
@@ -32,6 +33,9 @@ class ForgetFence(unittest.TestCase):
         cls.store._pool.close()
 
     def setUp(self):
+        self.populate()
+
+    def populate(self, text="Synthetic forgotten deployment phrase."):
         nonce = uuid.uuid4().hex
         self.tenant, self.source = 'tenant:forget:' + nonce, 'codex:forget:' + nonce
         self.principal = 'principal:forget:' + nonce
@@ -39,7 +43,7 @@ class ForgetFence(unittest.TestCase):
             insert_source(c, self.tenant, self.principal, self.source)
             self.receipt = insert_record(c, tenant=self.tenant, source=self.source,
                 parent='parent:synthetic', native='turn:synthetic',
-                text='Synthetic forgotten deployment phrase.', role='user', byte_start=0)
+                text=text, role='user', byte_start=0)
             mark_logical_evidence_dirty(c, tenant_id=self.tenant, source_id=self.source,
                 native_ids=['turn:synthetic'], reason='ingest')
         tmp = tempfile.TemporaryDirectory()
@@ -57,7 +61,7 @@ class ForgetFence(unittest.TestCase):
                 FROM canonical_passages passage JOIN canonical_evidence_documents evidence
                 USING(tenant_id,source_id,logical_document_id)
                 WHERE passage.tenant_id=%s AND passage.source_id=%s''', (self.tenant,self.source)).fetchall()
-        self.assertEqual(len(rows), 1)
+        self.assertGreaterEqual(len(rows), 1)
         self.client = FakeTurbopuffer()
         self.settings = TurbopufferSettings(api_key='synthetic-local-only')
         self.ns = self.client.namespace(self.settings.namespace(self.tenant))
@@ -98,6 +102,47 @@ class ForgetFence(unittest.TestCase):
         with self.store.connect() as c:
             c.execute('UPDATE canonical_documents SET is_current=false WHERE tenant_id=%s AND source_id=%s', (self.tenant,self.source))
         self.assertEqual(self.search()['results'], [])
+
+    def test_overlapping_passages_check_each_receipt_once(self):
+        # Many genuine overlapping windows share one canonical receipt. The
+        # authority owner should probe its metadata once, not once per window.
+        self.populate(' '.join('deploymentword' + str(i) for i in range(12000)))
+        self.assertGreater(len(self.vendor_rows), 10)
+        plans = []
+        owner = self.store
+        class ObservedStore:
+            def __getattr__(self, name):
+                return getattr(owner, name)
+            def _execute_bounded(self, connection, statement, values, deadline):
+                if 'cardinality(passage.receipts)>0' in statement:
+                    plans.append(connection.execute(
+                        'EXPLAIN (ANALYZE, FORMAT JSON) ' + statement, values,
+                    ).fetchone()['QUERY PLAN'][0]['Plan'])
+                return owner._execute_bounded(connection, statement, values, deadline)
+        self.retrieval.store = ObservedStore()
+        result = self.search()
+        self.assertEqual(len(result['results']), 1)
+        self.assertEqual(len(plans), 1)
+        def nodes(plan):
+            yield plan
+            for child in plan.get('Plans', []):
+                yield from nodes(child)
+        chunk_scans = [node for node in nodes(plans[0])
+                       if node.get('Relation Name') == 'canonical_chunks']
+        self.assertTrue(chunk_scans)
+        unique_receipts = {receipt for row in self.vendor_rows for receipt in row['receipts']}
+        self.assertLessEqual(sum(node['Actual Loops'] for node in chunk_scans), len(unique_receipts))
+        # One missing member must reject every passage containing it. Keep
+        # this content-level assertion beside the physical-work assertion.
+        forgotten = sorted(unique_receipts)[0]
+        with self.store.connect() as c:
+            c.execute('UPDATE canonical_chunks SET deleted_at=clock_timestamp() WHERE tenant_id=%s AND receipt=%s',
+                      (self.tenant, forgotten))
+        rows = [arm_row(row, 1.0) for row in self.vendor_rows]
+        expected = {row['id'] for row in self.vendor_rows if forgotten not in row['receipts']}
+        diagnostics = self.retrieval._authorize_ranges([], (('dense',1.0,rows),), deadline_at=time.monotonic()+5)
+        self.assertEqual(diagnostics['authority_status'], 'ok')
+        self.assertEqual({row['passage_id'] for row in rows}, expected)
 
     def test_vendor_namespace_cannot_authorize_foreign_source_or_tenant(self):
         # Keep a real live passage in PG, then put its ID in an unrelated namespace.

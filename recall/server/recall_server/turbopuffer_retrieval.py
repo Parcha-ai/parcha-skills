@@ -367,6 +367,7 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
         forgotten receipt makes the entire passage ineligible, including its
         cached vendor body and diagnostic arm results.
         """
+        started = time.monotonic()
         candidates = [row for _name, _weight, rows in legs for row in rows]
         ids = sorted({row["passage_id"] for row in candidates
                       if isinstance(row.get("passage_id"), str)})
@@ -374,7 +375,8 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
             results.clear()
             for _name, _weight, rows in legs:
                 rows.clear()
-            return {"authority_status": "ok", "authority_rejected": 0}
+            return {"authority_status": "ok", "authority_rejected": 0,
+                    "authority_elapsed_ms": round((time.monotonic() - started) * 1000, 3)}
         status = "ok"
         authoritative = []
         try:
@@ -383,31 +385,45 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
             with self.store.connect() as connection:
                 authoritative = self.store._execute_bounded(
                     connection,
-                    """SELECT passage.tenant_id,passage.source_id,passage.passage_id,
-                              passage.logical_document_id,passage.text_sha256
-                         FROM canonical_passages passage
-                         JOIN canonical_passage_documents projected
-                           USING(tenant_id,source_id,logical_document_id,policy_fingerprint)
-                         JOIN canonical_evidence_documents evidence
-                           USING(tenant_id,source_id,logical_document_id)
-                        WHERE passage.tenant_id=%s AND passage.source_id=ANY(%s)
-                          AND passage.policy_fingerprint=%s
-                          AND passage.passage_id=ANY(%s)
-                          AND cardinality(passage.receipts)>0
-                          AND NOT EXISTS (
-                              SELECT 1 FROM unnest(passage.receipts) AS receipt(value)
-                              LEFT JOIN canonical_chunks chunk
-                                ON chunk.tenant_id=passage.tenant_id
-                               AND chunk.source_id=passage.source_id
-                               AND chunk.receipt=receipt.value
+                    """WITH selected AS MATERIALIZED (
+                            SELECT passage.tenant_id,passage.source_id,passage.passage_id,
+                                   passage.logical_document_id,passage.text_sha256,passage.receipts
+                              FROM canonical_passages passage
+                              JOIN canonical_passage_documents projected
+                                USING(tenant_id,source_id,logical_document_id,policy_fingerprint)
+                              JOIN canonical_evidence_documents evidence
+                                USING(tenant_id,source_id,logical_document_id)
+                             WHERE passage.tenant_id=%s AND passage.source_id=ANY(%s)
+                               AND passage.policy_fingerprint=%s
+                               AND passage.passage_id=ANY(%s)
+                               AND cardinality(passage.receipts)>0
+                        ), requested_receipts AS MATERIALIZED (
+                            SELECT DISTINCT selected.tenant_id,selected.source_id,receipt.value
+                              FROM selected CROSS JOIN LATERAL unnest(selected.receipts) AS receipt(value)
+                        ), live_receipts AS MATERIALIZED (
+                            SELECT requested.tenant_id,requested.source_id,requested.value
+                              FROM requested_receipts requested
+                              JOIN canonical_chunks chunk
+                                ON chunk.tenant_id=requested.tenant_id
+                               AND chunk.source_id=requested.source_id
+                               AND chunk.receipt=requested.value
                                AND chunk.deleted_at IS NULL
-                              LEFT JOIN canonical_documents document
+                              JOIN canonical_documents document
                                 ON document.tenant_id=chunk.tenant_id
                                AND document.source_id=chunk.source_id
                                AND document.document_id=chunk.document_id
                                AND document.is_current AND document.deleted_at IS NULL
-                              WHERE document.document_id IS NULL
-                          )""",
+                        )
+                        SELECT selected.tenant_id,selected.source_id,selected.passage_id,
+                               selected.logical_document_id,selected.text_sha256
+                          FROM selected
+                          CROSS JOIN LATERAL unnest(selected.receipts) AS receipt(value)
+                          LEFT JOIN live_receipts live
+                            ON live.tenant_id=selected.tenant_id
+                           AND live.source_id=selected.source_id AND live.value=receipt.value
+                         GROUP BY selected.tenant_id,selected.source_id,selected.passage_id,
+                                  selected.logical_document_id,selected.text_sha256
+                        HAVING bool_and(live.value IS NOT NULL)""",
                     (self.tenant_id, self.sources, self.policy_fingerprint, ids),
                     deadline_at,
                 ).fetchall()
@@ -434,7 +450,8 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
             for item in row["matching_ranges"]
         )]
         return {"authority_status": status,
-                "authority_rejected": len(set(ids) - {key[2] for key in live})}
+                "authority_rejected": len(set(ids) - {key[2] for key in live}),
+                "authority_elapsed_ms": round((time.monotonic() - started) * 1000, 3)}
 
     def _hydrate_ranges(
         self,
