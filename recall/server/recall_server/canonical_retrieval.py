@@ -1173,7 +1173,7 @@ class BoundCanonicalRetrieval:
             or not 1 <= limit <= 80
             or isinstance(offset, bool)
             or not isinstance(offset, int)
-            or not 0 <= offset <= 10_000
+            or offset < 0
         ):
             raise ValueError("invalid canonical scope page")
         started_at = time.monotonic()
