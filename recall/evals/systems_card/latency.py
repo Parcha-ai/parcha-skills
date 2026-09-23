@@ -71,7 +71,13 @@ class ToolLatencyProbe:
             # separately so cold-path cost stays visible.
             per_tool.setdefault(outcome.tool, []).append(outcome.elapsed_ms)
             first_call.setdefault(outcome.tool, outcome.elapsed_ms)
-            if not outcome.ok:
+            failed = not outcome.ok
+            if outcome.tool in {"recall_scan", "recall_exec"}:
+                # MCP success only describes the envelope, not the program.
+                payload = outcome.result if isinstance(outcome.result, dict) else {}
+                exit_code = payload.get("exit_code")
+                failed = failed or type(exit_code) is not int or exit_code != 0
+            if failed:
                 errors[outcome.tool] = errors.get(outcome.tool, 0) + 1
 
         filters = _filters(context)
