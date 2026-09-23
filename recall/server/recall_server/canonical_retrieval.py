@@ -1459,8 +1459,30 @@ class BoundCanonicalRetrieval:
             rows = connection.execute(
                 """SELECT tenant_id,source_id,bucket_start,dataset,shard_index,
                           artifact_id,storage_backend,object_key,content_sha256,
-                          size_bytes,media_type,encryption,version_id,created_at
-                     FROM canonical_parquet_scan_shards
+                          size_bytes,media_type,encryption,version_id,created_at,
+                          (SELECT count(*) > 0 AND bool_and(
+                              document.logical_document_id IS NOT NULL
+                              AND document.revision=member.revision
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM canonical_evidence_document_queue queued
+                                   WHERE queued.tenant_id=document.tenant_id
+                                     AND queued.source_id=document.source_id
+                                     AND queued.native_parent_id=document.native_parent_id
+                                     AND queued.reason='forget'
+                              )
+                           )
+                             FROM canonical_parquet_scan_fragment_documents member
+                             LEFT JOIN canonical_evidence_documents document
+                               ON document.tenant_id=member.tenant_id
+                              AND document.source_id=member.source_id
+                              AND document.logical_document_id=member.logical_document_id
+                            WHERE member.tenant_id=shard.tenant_id
+                              AND member.source_id=shard.source_id
+                              AND member.bucket_start=shard.bucket_start
+                              AND member.dataset=shard.dataset
+                              AND member.shard_index=shard.shard_index
+                          ) AS scan_safe
+                     FROM canonical_parquet_scan_shards shard
                     WHERE tenant_id=%s AND source_id=ANY(%s)
                       AND (
                           %s::timestamptz IS NULL OR bucket_start >=
@@ -1510,7 +1532,11 @@ class BoundCanonicalRetrieval:
                    ) AS count""",
                 (*values, self.tenant_id, sources, *values),
             ).fetchone()["count"]
-        return rows, int(pending)
+        # Never stage an immutable fragment with forgotten or stale members.
+        # Missing membership is unknown, not an empty safe fragment. Count
+        # withheld objects even after the logical queue has been consumed.
+        safe = [row for row in rows if row.pop("scan_safe", False) is True]
+        return safe, int(pending) + len(rows) - len(safe)
 
     def _verify_parquet_receipts(
         self,

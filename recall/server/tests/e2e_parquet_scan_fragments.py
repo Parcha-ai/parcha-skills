@@ -232,6 +232,80 @@ def assert_compaction_owner_equivalence(store: BrainStore) -> int:
     return len(cases())
 
 
+def assert_forget_read_fence(store, logical, scan, tenant, principal, source, parent):
+    """Exercise the actual catalog SQL while old immutable bytes still exist."""
+    retrieval = BoundCanonicalRetrieval(
+        store, tenant_id=tenant, principal_id=principal, authorized_sources=(source,),
+    )
+    def selected():
+        return retrieval._parquet_shards([source], since=None, until=None)
+    before, pending = selected()
+    assert len(before) == 4 and pending == 0, (before, pending)
+    with store.connect() as connection:
+        document = connection.execute(
+            "SELECT * FROM canonical_evidence_documents WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s",
+            (tenant, source, parent),
+        ).fetchone()
+        connection.execute(
+            "INSERT INTO canonical_evidence_document_queue(tenant_id,source_id,native_parent_id,generation,reason) VALUES (%s,%s,%s,1,'backfill')",
+            (tenant, source, parent),
+        )
+    # Ordinary projection lag does not hide the corpus.
+    ordinary, pending = selected()
+    assert len(ordinary) == 4 and pending == 1, (ordinary, pending)
+    with store.connect() as connection:
+        connection.execute(
+            "UPDATE canonical_evidence_document_queue SET reason='forget' WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s",
+            (tenant, source, parent),
+        )
+    # Existing packed objects contain this parent. All are withheld, and a
+    # new worker build must not read its old logical archive either.
+    hidden, pending = selected()
+    assert hidden == [] and pending >= 4, (hidden, pending)
+    candidate = parquet_scan.ScanCandidate(tenant, source, before[0]['bucket_start'],
+        generation=1, changed_at=datetime.now(timezone.utc), reason='forget')
+    assert document['logical_document_id'] not in {
+        row['logical_document_id'] for row in scan._documents(candidate)
+    }
+    logical.seed_backfill(tenant_id=tenant, source_id=source, include_existing=True)
+    with store.connect() as connection:
+        reason = connection.execute(
+            "SELECT reason FROM canonical_evidence_document_queue WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s",
+            (tenant, source, parent),
+        ).fetchone()['reason']
+        assert reason == 'forget', reason
+        connection.execute(
+            "DELETE FROM canonical_evidence_document_queue WHERE tenant_id=%s AND source_id=%s", (tenant, source),
+        )
+        # Models the sanitized logical generation advancing while old shards
+        # remain. The old catalog cannot become visible when the queue clears.
+        connection.execute(
+            "UPDATE canonical_evidence_documents SET revision=revision+1 WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s",
+            (tenant, source, parent),
+        )
+    hidden, pending = selected()
+    assert hidden == [] and pending == 4, (hidden, pending)
+    with store.connect() as connection:
+        connection.execute(
+            "UPDATE canonical_evidence_documents SET revision=revision-1 WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s",
+            (tenant, source, parent),
+        )
+        memberships = connection.execute(
+            "DELETE FROM canonical_parquet_scan_fragment_documents WHERE tenant_id=%s AND source_id=%s AND dataset='records' RETURNING *",
+            (tenant, source),
+        ).fetchall()
+    without_members, pending = selected()
+    assert len(without_members) == 3 and pending == 1, (without_members, pending)
+    with store.connect() as connection:
+        for row in memberships:
+            connection.execute(
+                "INSERT INTO canonical_parquet_scan_fragment_documents(tenant_id,source_id,bucket_start,dataset,shard_index,logical_document_id,revision,generation_sha256) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                tuple(row[key] for key in ('tenant_id','source_id','bucket_start','dataset','shard_index','logical_document_id','revision','generation_sha256')),
+            )
+    restored, pending = selected()
+    assert len(restored) == 4 and pending == 0
+
+
 def main() -> None:
     store = BrainStore(os.environ["RECALL_DATABASE_URL"])
     store.migrate()
@@ -527,6 +601,8 @@ def main() -> None:
             ).fetchone()["count"] == 0
         assert not scan._pending(tenant_id=tenant, limit=1)
 
+        assert_forget_read_fence(store, logical, scan, tenant, principal, source, session_b)
+
         # Forget a whole parent after compaction packed it with siblings. The
         # empty logical rebuild has no old document left from which to recover
         # month bounds, so delete_native_ids must have persisted them already.
@@ -563,10 +639,11 @@ def main() -> None:
                    WHERE tenant_id=%s AND source_id=%s""", (tenant, source),
             ).fetchall()
         assert forgotten_dirty == [dict(logical_document_id=forgotten_document, reason="forget")], forgotten_dirty
-        _, pending_after_forget = BoundCanonicalRetrieval(
+        visible_after_forget, pending_after_forget = BoundCanonicalRetrieval(
             store, tenant_id=tenant, principal_id=principal, authorized_sources=(source,),
         )._parquet_shards([source], since=None, until=None)
-        assert pending_after_forget == 1, pending_after_forget
+        assert visible_after_forget == []
+        assert pending_after_forget >= 1, pending_after_forget
         forgotten_scan = scan.project_pending(
             tenant_id=tenant, batch_size=4, max_batches=1, compaction_budget=0,
         )

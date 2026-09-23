@@ -838,6 +838,13 @@ class CanonicalParquetScanProjector:
                     WHERE document.tenant_id=%s AND document.source_id=%s
                       AND document.last_occurred_at >= %s
                       AND document.first_occurred_at < %s
+                      AND NOT EXISTS (
+                          SELECT 1 FROM canonical_evidence_document_queue queued
+                           WHERE queued.tenant_id=document.tenant_id
+                             AND queued.source_id=document.source_id
+                             AND queued.native_parent_id=document.native_parent_id
+                             AND queued.reason='forget'
+                      )
                     ORDER BY document.logical_document_id""",
                 (
                     candidate.tenant_id,

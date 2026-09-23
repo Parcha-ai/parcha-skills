@@ -127,7 +127,8 @@ def mark_logical_evidence_dirty(
            ON CONFLICT(tenant_id,source_id,native_parent_id)
            DO UPDATE SET
                generation=canonical_evidence_document_queue.generation+1,
-               reason=excluded.reason,
+               reason=CASE WHEN canonical_evidence_document_queue.reason='forget'
+                           THEN 'forget' ELSE excluded.reason END,
                changed_at=clock_timestamp()""",
         (reason, tenant_id, source_id, native_ids),
     )
@@ -622,7 +623,8 @@ class CanonicalLogicalEvidenceProjector:
                        ON CONFLICT(tenant_id,source_id,native_parent_id)
                        DO UPDATE SET
                            generation=canonical_evidence_document_queue.generation+1,
-                           reason='backfill',
+                           reason=CASE WHEN canonical_evidence_document_queue.reason='forget'
+                                       THEN 'forget' ELSE 'backfill' END,
                            changed_at=clock_timestamp()""",
                     (tenant_id, tenant_id, source_id, source_id),
                 )
