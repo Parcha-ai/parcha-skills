@@ -1,5 +1,5 @@
 """Run the generated stage; gates prove overlap and failure barriers."""
-from contextlib import ExitStack, redirect_stderr
+from contextlib import ExitStack, contextmanager, redirect_stderr
 import hashlib
 import io
 from pathlib import Path
@@ -32,6 +32,7 @@ class ScanStagingConcurrencyTests(unittest.TestCase):
         (self.root / 'tmp/recall-agent').mkdir(parents=True)
         self.tool = self.items[-1]
         self.calls = []
+        self.copies = []
         self.active = self.peak = self.completed = 0
         self.lock = threading.Lock()
         self.four = threading.Event()
@@ -46,7 +47,7 @@ class ScanStagingConcurrencyTests(unittest.TestCase):
         command = _agent_exec_command(
             program='true', objects=items, document_aliases={}, record_spans={},
             routing_receipts={}, timeout_seconds=10,
-            dataset_aliases={item.object_key: f's1/2026-09/passages-part-{i:05}.parquet'
+            dataset_aliases={item.object_key: f's1/2026-09/documents-part-{i:05}.parquet'
                              for i, item in enumerate(data_items)} if scan else {},
             tool_objects=selected_tools, allow_missing_objects=missing,
         )
@@ -54,7 +55,34 @@ class ScanStagingConcurrencyTests(unittest.TestCase):
         start = inner.index('python3')
         script, arguments = inner[start + 2], inner[start + 3:start + 10]
         cls, copy = type(self.root), shutil.copyfile
-        original_is_file, original_touch = cls.is_file, cls.touch
+        original_is_file, original_touch, original_open = cls.is_file, cls.touch, cls.open
+        copy_keys = {item.object_key for item in data_items} if scan else set()
+
+        @contextmanager
+        def copied(path, mode, *args, **kwargs):
+            with original_open(path, mode, *args, **kwargs) as reader:
+                with self.lock:
+                    self.copies.append(str(path))
+                    self.active += 1
+                    self.peak = max(self.peak, self.active)
+                    if self.active == 4:
+                        self.four.set()
+                try:
+                    if not delay and fail is None:
+                        self.four.wait(.1)
+                    yield reader
+                finally:
+                    with self.lock:
+                        self.active -= 1
+                        self.completed += 1
+
+        def opening(path, mode='r', *args, **kwargs):
+            if mode == 'xb':
+                pause('local', path)
+            if (mode == 'rb' and '/mnt/archil/evidence/' in str(path)
+                    and any(str(path).endswith(key) for key in copy_keys)):
+                return copied(path, mode, *args, **kwargs)
+            return original_open(path, mode, *args, **kwargs)
 
         def pause(phase, path):
             if delay and timing_phase == phase and (not single or str(path).endswith(self.items[0].object_key)):
@@ -89,7 +117,7 @@ class ScanStagingConcurrencyTests(unittest.TestCase):
                 pause("bind", command[2])
                 if not delay and fail is None:
                     self.four.wait(.1)
-                if fail == 'bind' and command[2].endswith(self.items[0].object_key):
+                if fail == 'bind' and command[2].endswith(self.tool.object_key if scan else self.items[0].object_key):
                     with self.lock:
                         self.active -= 1
                     raise subprocess.CalledProcessError(1, ['mount'])
@@ -102,7 +130,7 @@ class ScanStagingConcurrencyTests(unittest.TestCase):
                 with self.lock:
                     self.active -= 1
                     self.completed += 1
-                if fail == 'remount' and command[3].endswith(self.items[0].object_key):
+                if fail == 'remount' and command[3].endswith(self.tool.object_key if scan else self.items[0].object_key):
                     raise subprocess.CalledProcessError(1, ['mount'])
 
         if escape:
@@ -114,6 +142,7 @@ class ScanStagingConcurrencyTests(unittest.TestCase):
             stack.enter_context(patch('pathlib.Path', mapped))
             stack.enter_context(patch.object(cls, 'is_file', is_file))
             stack.enter_context(patch.object(cls, 'touch', touch))
+            stack.enter_context(patch.object(cls, 'open', opening))
             stack.enter_context(patch('subprocess.run', side_effect=mounted))
             stack.enter_context(patch('platform.machine', return_value='x86_64'))
             stack.enter_context(patch('sys.argv', ['stage', *arguments]))
@@ -128,9 +157,11 @@ class ScanStagingConcurrencyTests(unittest.TestCase):
         self.assertEqual(self.peak, 4)
         self.assertEqual(self.active, 0)
         self.assertEqual(self.completed, len(self.items))
+        self.assertEqual(len(self.copies), len(self.items)-1)
         for item in self.items:
             calls = [call for call in self.calls if call[-1].endswith(item.object_key)]
-            self.assertEqual([call[1] for call in calls], ['--bind', '-o'])
+            self.assertEqual([call[1] for call in calls],
+                             ['--bind', '-o'] if item == self.tool else [])
         self.assertIn('objects_ready', self.stderr.getvalue())
 
     def test_bind_and_remount_failures_join_before_stage_exits(self):
