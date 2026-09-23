@@ -498,10 +498,49 @@ class CanonicalLogicalEvidenceProjector:
         With a quiet period, a group is ready only once it has not changed for
         `quiet_seconds`, or has been waiting longer than `max_wait_seconds`
         since it first entered the queue. Forget and backfill never wait.
+        Admit one ready group per source before another source's second group;
+        forget takes precedence. Join archive size estimates only after the
+        bounded admission, so a bulk backfill cannot monopolize the batch.
         """
         with self.store.connect() as connection:
             rows = connection.execute(
-                """SELECT queue.tenant_id,queue.source_id,
+                """WITH eligible AS MATERIALIZED (
+                       SELECT queue.*,
+                              CASE WHEN queue.reason='forget' THEN 0 ELSE 1 END
+                                  AS admission_priority
+                         FROM canonical_evidence_document_queue queue
+                         WHERE (%s::text IS NULL OR queue.tenant_id=%s)
+                           AND queue.attempts<%s
+                           AND (
+                               queue.next_attempt_at IS NULL
+                               OR queue.next_attempt_at<=clock_timestamp()
+                           )
+                           AND (
+                               %s::float8<=0
+                               OR queue.reason IN ('forget','backfill')
+                               OR queue.changed_at
+                                  < clock_timestamp()-%s*interval '1 second'
+                               OR (
+                                   %s::float8>0
+                                   AND queue.first_queued_at
+                                       < clock_timestamp()-%s*interval '1 second'
+                               )
+                           )
+                   ), ranked AS (
+                       SELECT eligible.*,
+                              row_number() OVER (
+                                  PARTITION BY tenant_id,source_id
+                                  ORDER BY admission_priority,first_queued_at,
+                                           native_parent_id
+                              ) AS source_position
+                         FROM eligible
+                   ), admitted AS MATERIALIZED (
+                       SELECT * FROM ranked
+                        ORDER BY admission_priority,source_position,first_queued_at,
+                                 tenant_id,source_id,native_parent_id
+                        LIMIT %s
+                   )
+                   SELECT queue.tenant_id,queue.source_id,
                           queue.native_parent_id,
                           queue.changed_at AS source_updated_at,
                           queue.generation,
@@ -513,7 +552,7 @@ class CanonicalLogicalEvidenceProjector:
                               evidence.record_count,
                               1
                           ) AS estimated_bytes
-                     FROM canonical_evidence_document_queue queue
+                     FROM admitted queue
                      LEFT JOIN canonical_evidence_documents evidence
                        ON evidence.tenant_id=queue.tenant_id
                       AND evidence.source_id=queue.source_id
@@ -528,26 +567,9 @@ class CanonicalLogicalEvidenceProjector:
                                      =evidence.logical_document_id
                                  AND part.revision=evidence.revision
                      ) evidence_size ON true
-                    WHERE (%s::text IS NULL OR queue.tenant_id=%s)
-                      AND queue.attempts<%s
-                      AND (
-                          queue.next_attempt_at IS NULL
-                          OR queue.next_attempt_at<=clock_timestamp()
-                      )
-                      AND (
-                          %s::float8<=0
-                          OR queue.reason IN ('forget','backfill')
-                          OR queue.changed_at
-                             < clock_timestamp()-%s*interval '1 second'
-                          OR (
-                              %s::float8>0
-                              AND queue.first_queued_at
-                                  < clock_timestamp()-%s*interval '1 second'
-                          )
-                      )
-                    ORDER BY queue.changed_at,queue.tenant_id,
-                             queue.source_id,queue.native_parent_id
-                    LIMIT %s""",
+                    ORDER BY queue.admission_priority,queue.source_position,
+                             queue.first_queued_at,queue.tenant_id,
+                             queue.source_id,queue.native_parent_id""",
                 (
                     tenant_id, tenant_id,
                     MAX_LOGICAL_ATTEMPTS,
@@ -2382,6 +2404,7 @@ class CanonicalLogicalEvidenceProjector:
                     (tenant_id, source_id, native_ids),
                 ).fetchall()
                 references: list[dict[str, Any]] = []
+                doomed_documents: list[dict[str, Any]] = []
                 for parent in parents:
                     parent_id = parent["native_parent_id"]
                     connection.execute(
@@ -2407,12 +2430,13 @@ class CanonicalLogicalEvidenceProjector:
                     # surviving events. Serialize this check with retirement's
                     # FOR SHARE fence before inspecting any survivor.
                     try:
-                        connection.execute(
-                            """SELECT logical_document_id FROM canonical_evidence_documents
+                        doomed_documents.extend(connection.execute(
+                            """SELECT logical_document_id,first_occurred_at,last_occurred_at
+                               FROM canonical_evidence_documents
                                WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s
                                FOR UPDATE NOWAIT""",
                             (tenant_id, source_id, parent_id),
-                        ).fetchall()
+                        ).fetchall())
                     except psycopg.errors.LockNotAvailable:
                         raise LogicalEvidenceError("logical_evidence_parent_busy") from None
                     survivor = connection.execute(
@@ -2471,6 +2495,18 @@ class CanonicalLogicalEvidenceProjector:
                     passages=doomed_passages,
                     reason="forget",
                 )
+                # Once deleted, an empty logical rebuild cannot recover these
+                # old month bounds. Persist the exact scan invalidation with
+                # the deletion, even when no surviving parent will be rebuilt.
+                for document in doomed_documents:
+                    self._queue_parquet_scan(
+                        connection,
+                        tenant_id=tenant_id,
+                        source_id=source_id,
+                        ranges=((document["first_occurred_at"], document["last_occurred_at"]),),
+                        reason="forget",
+                        logical_document_id=document["logical_document_id"],
+                    )
                 connection.execute(
                     """DELETE FROM canonical_evidence_documents
                         WHERE tenant_id=%s AND source_id=%s
