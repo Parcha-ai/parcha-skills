@@ -69,7 +69,7 @@ def _integer(
     *,
     default: int,
     minimum: int = 0,
-    maximum: int = 100,
+    maximum: int | None = 100,
 ) -> int:
     if value is None:
         return default
@@ -81,9 +81,11 @@ def _integer(
         value = int(value.strip())
     if isinstance(value, bool) or not isinstance(value, int):
         raise McpProtocolError(-32602, f"{name} must be an integer")
-    if not minimum <= value <= maximum:
+    if value < minimum or (maximum is not None and value > maximum):
         raise McpProtocolError(
-            -32602, f"{name} must be between {minimum} and {maximum}"
+            -32602,
+            f"{name} must be at least {minimum}" if maximum is None
+            else f"{name} must be between {minimum} and {maximum}",
         )
     return value
 
@@ -284,7 +286,6 @@ ALL_READ_TOOLS = (
                 "offset": {
                     "type": "integer",
                     "minimum": 0,
-                    "maximum": 10000,
                     "default": 0,
                 },
             },
@@ -892,7 +893,7 @@ def _call_tool(
             "offset",
             default=0,
             minimum=0,
-            maximum=10_000,
+            maximum=None,
         )
         return store.scope_documents(filters=filters, limit=limit, offset=offset)
     if name == "recall_search":

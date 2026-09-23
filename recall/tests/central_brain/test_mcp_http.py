@@ -332,6 +332,42 @@ def _tool_result_for_test(value):
 
 
 class RemoteMcpContractTest(unittest.TestCase):
+    def test_scope_late_page_is_publicly_advertised_and_dispatched(self) -> None:
+        store = PolicyStore()
+        with McpHttpServer(store) as server:
+            status, _, raw = server.request('POST', request('tools/list'),
+                token='synthetic-human-read', protocol='2025-11-25')
+            self.assertEqual(status, 200)
+            scope = next(tool for tool in json.loads(raw)['result']['tools']
+                         if tool['name'] == 'recall_scope')
+            self.assertEqual(scope['inputSchema']['properties']['offset'],
+                             {'type':'integer', 'minimum':0, 'default':0})
+            status, _, raw = server.request('POST', request('tools/call', params={
+                'name':'recall_scope', 'arguments':{'offset':10_080, 'limit':80,
+                    'filters':{'source_id':'source:synthetic:company'}}}),
+                token='synthetic-human-read', protocol='2025-11-25')
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(raw)['result']['structuredContent']['offset'], 10_080)
+            self.assertIn(('scope', {'source_id':'source:synthetic:company'},80,10_080),store.calls)
+
+    def test_scope_late_page_keeps_auth_and_parameter_validation(self) -> None:
+        store = PolicyStore()
+        with McpHttpServer(store) as server:
+            for arguments in ({'offset':-1}, {'offset':True}, {'offset':1.25},
+                              {'offset':[]}, {'offset':{}}, {'offset':'not-an-integer'},
+                              {'offset':10_080,'limit':81}):
+                with self.subTest(arguments=arguments):
+                    status, _, raw = server.request('POST', request('tools/call', params={
+                        'name':'recall_scope','arguments':arguments}),
+                        token='synthetic-human-read',protocol='2025-11-25')
+                    self.assertEqual(status,200)
+                    self.assertEqual(json.loads(raw)['error']['code'],-32602)
+            status, _, _ = server.request('POST', request('tools/call', params={
+                'name':'recall_scope','arguments':{'offset':10_080}}),
+                token=None,protocol='2025-11-25')
+            self.assertEqual(status,401)
+        self.assertFalse(any(call[0]=='scope' for call in store.calls))
+
     def setUp(self) -> None:
         self.store = FakeStore()
         self.environment = mock.patch.dict(
