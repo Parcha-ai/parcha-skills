@@ -52,11 +52,17 @@ class ScanLocalMaterializationTests(unittest.TestCase):
         original_ro = command.index('mount -o remount,bind,ro /tmp/recall-authorized')
         public_bind = command.index('mount --rbind /tmp/recall-authorized /mnt/archil/evidence')
         public_ro = command.index('mount -o remount,bind,ro /mnt/archil/evidence')
-        agent = command.index('exec env -i HOME=/tmp')
+        privilege_drop = command.index(
+            'exec setpriv --bounding-set=-all --inh-caps=-all '
+            '--ambient-caps=-all --no-new-privs env -i HOME=/tmp')
+        agent = command.index('env -i HOME=/tmp', privilege_drop)
         self.assertLess(self_bind, original_ro)
         self.assertLess(original_ro, public_bind)
         self.assertLess(public_bind, public_ro)
-        self.assertLess(public_ro, agent)
+        self.assertLess(public_ro, privilege_drop)
+        for path in ('/docs', '/datasets'):
+            self.assertLess(command.index(f'mount -o remount,bind,ro {path}'), privilege_drop)
+        self.assertLess(privilege_drop, agent)
 
     def test_corrupt_dataset_prevents_publication(self):
         case = self.case()
