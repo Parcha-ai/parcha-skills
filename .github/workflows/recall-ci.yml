@@ -75,6 +75,7 @@ jobs:
             e2e_parquet_scan_fragments.py \
             e2e_search_outbox.py \
             e2e_search_plane_projection.py \
+            e2e_slack_passage_visibility.py \
             e2e_connector_host.py \
             e2e_collector_health_deadline.py \
             e2e_integration_activation.py \

@@ -680,6 +680,23 @@ def decode_logical_record(
     return record
 
 
+def _typed_communication_message(event_kind: str, text: str) -> bool:
+    """Typed provider messages are visible even when their person is unknown."""
+
+    if event_kind != "connector_record":
+        return False
+    try:
+        content = orjson.loads(text)
+    except orjson.JSONDecodeError:
+        return False
+    return (
+        isinstance(content, dict)
+        and content.get("kind") == "communication_message.v1"
+        and isinstance(content.get("text"), str)
+        and bool(content["text"].strip())
+    )
+
+
 def visible_messages(
     records: Iterable[LogicalEvidenceRecord],
 ) -> tuple[PassageMessage, ...]:
@@ -715,13 +732,14 @@ def visible_messages(
                 )
             group.append(continuation)
         expected_ordinal += len(group)
+        source_text = "".join(record.text for record in group)
         dense_roles = first.roles
-        if not dense_roles and any(
-            link.relation == "author" for link in first.actor_links
+        if not dense_roles and (
+            any(link.relation == "author" for link in first.actor_links)
+            or _typed_communication_message(first.event_kind, source_text)
         ):
-            # Provider records such as Slack messages carry exact authorship
-            # but no chat-harness role. They are human-visible messages, not
-            # sparse tool output, so include them in actor-aware embeddings.
+            # Visibility and person resolution are separate: typed provider
+            # messages remain searchable without inventing an actor link.
             dense_roles = ("user",)
         if (
             not first.receipts
@@ -729,9 +747,7 @@ def visible_messages(
             or not set(dense_roles) <= VISIBLE_DENSE_ROLES
         ):
             continue
-        text = visible_message_text(
-            "".join(record.text for record in group)
-        )
+        text = visible_message_text(source_text)
         if text is None:
             continue
         message = PassageMessage(
