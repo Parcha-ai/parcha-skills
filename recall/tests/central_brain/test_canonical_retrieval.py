@@ -313,6 +313,13 @@ class ParallelExecRetrieval(BoundCanonicalRetrieval):
         }
 
 
+def _catalog_metadata():
+    return dict(tenant_id="tenant:test", artifact_id="art_" + "a" * 32,
+                storage_backend="s3", size_bytes=12,
+                media_type="application/octet-stream", encryption="sse-s3",
+                version_id="synthetic-version", created_at="2026-09-23T00:00:00Z")
+
+
 class CanonicalRetrievalDeadlineTest(unittest.TestCase):
     def test_parquet_scan_stages_only_dataset_families_named_by_program(self) -> None:
         class Inspector:
@@ -340,6 +347,7 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
             def _parquet_shards(self, _sources, *, since, until):
                 return ([
                     {
+                        **_catalog_metadata(),
                         "source_id": "source:test",
                         "bucket_start": date(2026, 8, 1),
                         "dataset": dataset,
@@ -370,13 +378,20 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
         )
         self.assertEqual(result["datasets_available"], 1)
         self.assertEqual(len(Inspector.calls[-1]["objects"]), 1)
+        refs = Inspector.calls[-1]["catalog_references"]
+        self.assertEqual(set(refs), {o.object_key for o in Inspector.calls[-1]["objects"]})
+        ref = next(iter(refs.values()))
+        self.assertEqual(ref["tenant_id"], "tenant:test")
+        self.assertEqual(ref["source_id"], "source:test")
+        self.assertEqual(ref["contract"], "recall.artifact-ref.v1")
+        self.assertEqual(ref["size_bytes"], 12)
         self.assertIn(
             "passages-part-",
             next(iter(Inspector.calls[-1]["dataset_aliases"].values())),
         )
 
     def test_parquet_scan_keeps_all_parts_above_old_count_limit(self) -> None:
-        rows = [dict(source_id="source:test", bucket_start=date(2026, 9, 1),
+        rows = [dict(**_catalog_metadata(), source_id="source:test", bucket_start=date(2026, 9, 1),
                      dataset="passages", shard_index=i,
                      object_key=f"objects/aa/{i:064x}", content_sha256=f"{i + 1:064x}")
                 for i in range(600)]
@@ -417,6 +432,7 @@ class CanonicalRetrievalDeadlineTest(unittest.TestCase):
 
             def _parquet_shards(self, _sources, *, since, until):
                 return ([{
+                    **_catalog_metadata(),
                     "source_id": "source:test",
                     "bucket_start": date(2026, 8, 1),
                     "dataset": "passages",

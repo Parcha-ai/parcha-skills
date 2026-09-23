@@ -36,7 +36,7 @@ class ScanManifestStagingTests(unittest.TestCase):
         self.objects.append(value)
         return value
 
-    def stage(self, aliases=None, datasets=None, *, tools=None, inventory=None):
+    def stage(self, aliases=None, datasets=None, *, tools=None, inventory=None, allow_missing=False):
         if inventory is not None:
             local = self.root / "tmp/recall-agent/inventory.json"
             if not local.is_symlink():
@@ -44,7 +44,7 @@ class ScanManifestStagingTests(unittest.TestCase):
         command = _agent_exec_command(
             program='true', objects=tuple(self.objects), document_aliases=aliases or {},
             inventory=inventory, inventory_url="https://synthetic.invalid/inventory",
-            inventory_size_bytes=1,
+            inventory_size_bytes=1, allow_missing_objects=allow_missing,
             record_spans={}, routing_receipts={}, timeout_seconds=10,
             dataset_aliases=datasets if datasets is not None else {self.data.object_key: 's1/2026-09/documents-part-00000.parquet'},
             tool_objects=tools if tools is not None else {'linux-x86_64': self.tool},
@@ -88,8 +88,10 @@ class ScanManifestStagingTests(unittest.TestCase):
             stack.enter_context(patch('platform.machine', return_value='x86_64'))
             stack.enter_context(patch('sys.argv', ['stage', *arguments]))
             stack.enter_context(patch('shutil.copyfile', side_effect=lambda src, dst: original_copy(src, mapped_path(dst))))
-            stack.enter_context(redirect_stderr(io.StringIO()))
+            stderr = io.StringIO()
+            stack.enter_context(redirect_stderr(stderr))
             exec(compile(script, '<generated-stage>', 'exec'), {})
+        return stderr.getvalue()
 
     def inventory(self, datasets):
         body = json.dumps({"objects": [dict(object_key=o.object_key,
@@ -175,6 +177,36 @@ class ScanManifestStagingTests(unittest.TestCase):
             self.stage({'synthetic-doc': 'd1'})
         self.assertEqual(error.exception.code, 66)
         self.assertTrue(self.reads)
+
+    def test_verified_fallback_stages_and_removes_all_writable_aliases(self):
+        for family in ("documents", "passages"):
+            with self.subTest(family=family):
+                # Each family needs a fresh namespace destination.
+                helper = ScanManifestStagingTests()
+                helper.setUp()
+                self.addCleanup(helper.doCleanups)
+                source = helper.root / "mnt/archil/evidence" / helper.data.object_key
+                body = source.read_bytes()
+                source.unlink()
+                fallback = helper.root / "tmp/recall-agent/fallback" / helper.data.object_key
+                fallback.parent.mkdir(parents=True)
+                fallback.write_bytes(body)
+                unused = fallback.parent / "unused"
+                unused.write_bytes(b"bootstrap copy superseded by Archil")
+                stderr = helper.stage(datasets={helper.data.object_key:
+                    f"s1/2026-09/{family}-part-00000.parquet"}, allow_missing=True)
+                self.assertIn("objects_unavailable\t0", stderr)
+                self.assertEqual((helper.root / "tmp/recall-authorized" / helper.data.object_key).read_bytes(), body)
+                self.assertFalse((helper.root / "tmp/recall-agent/fallback").exists())
+                mounts = [call for call in helper.mounts if call[1] == "--bind" and call[2] == str(fallback)]
+                self.assertEqual(len(mounts), int(family == "passages"))
+
+    def test_missing_in_both_stores_keeps_visibility_incomplete(self):
+        (self.root / "mnt/archil/evidence" / self.data.object_key).unlink()
+        stderr = self.stage(allow_missing=True)
+        self.assertIn("objects_unavailable\t1", stderr)
+        self.assertFalse((self.root / "tmp/recall-authorized" / self.data.object_key).exists())
+        self.assertFalse((self.root / "tmp/recall-datasets/s1/2026-09/documents-part-00000.parquet").exists())
 
 
 if __name__ == '__main__':
