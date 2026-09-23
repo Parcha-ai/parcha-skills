@@ -46,6 +46,7 @@ from recall_server.logical_evidence import (  # noqa: E402
 )
 from recall_server.logical_evidence_projection import (  # noqa: E402
     CanonicalLogicalEvidenceProjector,
+    mark_logical_evidence_dirty,
 )
 from recall_server.parquet_scan import CanonicalParquetScanProjector  # noqa: E402
 from recall_server.passage_index import CanonicalPassageProjector  # noqa: E402
@@ -664,6 +665,50 @@ def main() -> None:
                        for row in read_dataset(archive, parts_after_forget, dataset)), dataset
         assert not scan._pending(tenant_id=tenant, limit=1)
 
+        # The public path queues logical forget asynchronously. Unlike the
+        # direct deletion above, _commit_empty must capture TP IDs itself.
+        with store.connect() as connection:
+            async_ids = [row['native_id'] for row in connection.execute(
+                "SELECT native_id FROM canonical_events WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s",
+                (tenant, source, session_c),
+            ).fetchall()]
+            doomed = {row['passage_id'] for row in connection.execute(
+                "SELECT passage_id FROM canonical_passages WHERE tenant_id=%s AND source_id=%s AND logical_document_id=%s",
+                (tenant, source, documents[session_c]),
+            ).fetchall()}
+            assert doomed
+            surviving_ids = {row['passage_id'] for row in connection.execute(
+                "SELECT passage_id FROM canonical_passages WHERE tenant_id=%s AND source_id=%s AND logical_document_id<>%s",
+                (tenant, source, documents[session_c]),
+            ).fetchall()}
+            connection.execute(
+                "UPDATE canonical_chunks SET deleted_at=now() WHERE tenant_id=%s AND source_id=%s AND document_id IN (SELECT document_id FROM canonical_documents WHERE tenant_id=%s AND source_id=%s AND native_id=ANY(%s))",
+                (tenant, source, tenant, source, async_ids),
+            )
+            connection.execute(
+                "UPDATE canonical_documents SET is_current=false,deleted_at=now() WHERE tenant_id=%s AND source_id=%s AND native_id=ANY(%s)",
+                (tenant, source, async_ids),
+            )
+            mark_logical_evidence_dirty(connection, tenant_id=tenant,
+                source_id=source, native_ids=async_ids, reason='forget')
+        async_result = logical.project_pending(tenant_id=tenant, batch_size=10, max_batches=1)
+        assert async_result['pruned'] == 1, async_result
+        with store.connect() as connection:
+            tombstones = {row['passage_id'] for row in connection.execute(
+                "SELECT passage_id FROM search_projection_tombstones WHERE tenant_id=%s AND source_id=%s",
+                (tenant, source),
+            ).fetchall()}
+            assert doomed <= tombstones and not (surviving_ids & tombstones)
+            actual_survivors = {row['passage_id'] for row in connection.execute(
+                "SELECT passage_id FROM canonical_passages WHERE tenant_id=%s AND source_id=%s",
+                (tenant, source),
+            ).fetchall()}
+            assert actual_survivors == surviving_ids
+            assert connection.execute(
+                "SELECT count(*) AS count FROM search_projection_outbox WHERE tenant_id=%s AND source_id=%s",
+                (tenant, source),
+            ).fetchone()['count'] > 0
+
     owner_cases = assert_compaction_owner_equivalence(store)
     result = {
         "status": "pass",
@@ -684,6 +729,7 @@ def main() -> None:
             "cleanup_completed": drained["completed"],
             "forget_scan_pending_before_rebuild": pending_after_forget,
             "forgotten_document_absent_from_all_datasets": True,
+            "async_empty_commit_tombstones": len(doomed),
         },
     }
     rendered = json.dumps(result, sort_keys=True)

@@ -1919,6 +1919,26 @@ class CanonicalLogicalEvidenceProjector:
                         if reference is not None
                     ),
                 )
+                # Capture remote IDs before the evidence-document cascade
+                # removes passages. The outbox and deletion commit together.
+                doomed_passages = connection.execute(
+                    """SELECT passage.passage_id,passage.first_occurred_at,
+                              passage.last_occurred_at
+                         FROM canonical_passages passage
+                         JOIN canonical_evidence_documents document
+                           USING(tenant_id,source_id,logical_document_id)
+                        WHERE document.tenant_id=%s AND document.source_id=%s
+                          AND document.native_parent_id=%s""",
+                    (candidate.tenant_id, candidate.source_id,
+                     candidate.native_parent_id),
+                ).fetchall()
+                record_passage_deletions(
+                    connection,
+                    tenant_id=candidate.tenant_id,
+                    source_id=candidate.source_id,
+                    passages=doomed_passages,
+                    reason="forget",
+                )
                 connection.execute(
                     """DELETE FROM canonical_evidence_documents
                         WHERE tenant_id=%s AND source_id=%s
