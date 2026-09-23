@@ -170,6 +170,8 @@ class Thinning(unittest.TestCase):
         injected = [False]
         class Connection:
             def __init__(self, connection): self.connection = connection
+            def transaction(self): return self.connection.transaction()
+            def __getattr__(self, name): return getattr(self.connection, name)
             def execute(self, query, params):
                 if 'updated_documents AS' in query and not injected[0]:
                     owner.queue('race')
@@ -212,6 +214,49 @@ class Thinning(unittest.TestCase):
             self.assertEqual(self.remaining(), remaining)
         fault.mode = None
         self.assertEqual(thinner.thin(batch_size=10)['documents'], 0)
+
+    def test_real_probe_timeout_rolls_back_savepoint_and_thins_fresh_hint(self):
+        ids = sorted([self.insert('historical')[1], self.insert('fresh')[1]])
+        owner = self
+        injected = []
+        class Connection:
+            def __init__(self, connection): self.connection = connection
+            def transaction(self): return self.connection.transaction()
+            def __getattr__(self, name): return getattr(self.connection, name)
+            def execute(self, query, params):
+                if 'WITH candidates AS MATERIALIZED' in query and 'updated_documents AS' not in query and not injected:
+                    injected.append(True)
+                    # A real server-side statement timeout aborts this savepoint.
+                    # Rollback must restore the original2s setting before hints.
+                    self.connection.execute("SET LOCAL statement_timeout='10ms'")
+                    self.connection.execute('SELECT pg_sleep(0.05)')
+                    raise AssertionError('actual statement timeout did not fire')
+                return self.connection.execute(query, params)
+        class TimeoutStore:
+            @contextmanager
+            def connect(self):
+                with owner.store.connect() as connection:
+                    yield Connection(connection)
+        thinner = CanonicalBodyThinner(TimeoutStore(), tenant_id=self.tenant)
+        first = thinner.thin(batch_size=1,
+                             committed_keys=((self.tenant, self.source, ids[1]),))
+        self.assertEqual(first['historical_probe_timeouts'], 1)
+        self.assertEqual(first['historical_window_size'], 512)
+        self.assertEqual(first['documents'], 1)
+        self.assertEqual(first['status'], 'pending')
+        self.assertEqual(first['committed_hints_pending'], 0)
+        self.assertIsNone(thinner._after)
+        self.assertFalse(first['pass_complete'])
+        with self.store.connect() as c:
+            locations = {row['document_id']: row['body_location'] for row in c.execute(
+                'SELECT document_id,body_location FROM canonical_documents WHERE tenant_id=%s',
+                (self.tenant,)).fetchall()}
+        self.assertEqual(locations[ids[0]], 'inline')
+        self.assertEqual(locations[ids[1]], 'chunks')
+        second = thinner.thin(batch_size=1)
+        self.assertEqual(second['historical_probe_timeouts'], 0)
+        self.assertEqual(second['documents'], 1)
+        self.assertEqual(self.remaining(), 0)
 
     def test_missing_manifest_raw_authority_and_deleted_document_refuse(self):
         for suffix in ('manifest', 'raw', 'deleted'):

@@ -147,13 +147,16 @@ def run_projection_worker(
     cycles = 0
     while True:
         cycles += 1
+        cycle_started = phase_started = clock()
+        active_phase = "setup"
+        phase_elapsed = {key: 0 for key in PHASE_ELAPSED_KEYS}
         try:
-            cycle_started = clock()
             # Drain already-ready downstream work before an expensive logical
             # document batch. New upstream output becomes eligible next cycle;
             # dependency correctness stays in each projector while searchable
             # freshness no longer waits behind an unbounded backfill.
             embedding_error = 0
+            active_phase = "embed"
             phase_started = clock()
             try:
                 embedded = (
@@ -181,6 +184,8 @@ def run_projection_worker(
                     type(error).__name__,
                 )
             embed_elapsed_ms = 0 if skip_embedding else elapsed_ms(phase_started)
+            phase_elapsed["embed_elapsed_ms"] = embed_elapsed_ms
+            active_phase = "passage"
             phase_started = clock()
             projected = passages.project_pending(
                 tenant_id=tenant_id,
@@ -189,6 +194,8 @@ def run_projection_worker(
                 concurrency=passage_concurrency,
             )
             passage_elapsed_ms = elapsed_ms(phase_started)
+            phase_elapsed["passage_elapsed_ms"] = passage_elapsed_ms
+            active_phase = "logical"
             phase_started = clock()
             documents = logical.project_pending(
                 tenant_id=tenant_id,
@@ -200,6 +207,8 @@ def run_projection_worker(
                 cleanup_concurrency=cleanup_concurrency,
             )
             logical_elapsed_ms = elapsed_ms(phase_started)
+            phase_elapsed["logical_elapsed_ms"] = logical_elapsed_ms
+            active_phase = "search_plane"
             phase_started = clock()
             # Search reads current logical/passages, not Parquet artifacts.
             # Drain its bounded outbox before a synchronous month rebuild.
@@ -221,6 +230,8 @@ def run_projection_worker(
                 }
             )
             search_plane_elapsed_ms = elapsed_ms(phase_started) if search_plane is not None else 0
+            phase_elapsed["search_plane_elapsed_ms"] = search_plane_elapsed_ms
+            active_phase = "parquet"
             phase_started = clock()
             # Parquet shards are source/month materializations of the authoritative
             # logical documents. Prefer to run them once the upstream queues have
@@ -273,6 +284,8 @@ def run_projection_worker(
                 }
             )
             parquet_elapsed_ms = elapsed_ms(phase_started)
+            phase_elapsed["parquet_elapsed_ms"] = parquet_elapsed_ms
+            active_phase = "thin"
             phase_started = clock()
             # Preserve the thinner's row-level authority gates. While busy,
             # yield two cycles between batches, but run after 30 seconds at the
@@ -306,6 +319,9 @@ def run_projection_worker(
                 last_busy_thin_cycle = cycles
                 last_busy_thin_started = phase_started
             thin_elapsed_ms = elapsed_ms(phase_started)
+            phase_elapsed["thin_elapsed_ms"] = thin_elapsed_ms
+            active_phase = "outbox"
+            phase_started = clock()
             # H3-a: source-months waiting for the Lance writer, one cheap
             # count per cycle (a projector double without a store reports 0).
             search_outbox_queued = 0
@@ -315,6 +331,8 @@ def run_projection_worker(
                     search_outbox_queued = search_outbox_pending(
                         connection, tenant_id=tenant_id or None,
                     )
+            active_phase = "report"
+            phase_started = clock()
             result: dict[str, int | str] = {
                 "status": (
                     "complete"
@@ -368,6 +386,9 @@ def run_projection_worker(
                 "canonical_bodies_thinned": int(thinned["documents"]),
                 "thin_mode": "busy" if thin_busy else "idle",
                 "thin_deferred": int(body_thinner is not None and not thin_due),
+                "thin_probe_timeouts": int(thinned.get("historical_probe_timeouts", 0)),
+                "thin_window_size": int(thinned.get("historical_window_size", 0)),
+                "thin_hints_pending": int(thinned.get("committed_hints_pending", 0)),
                 "canonical_bodies_refused": int(thinned["refused"]),
                 "canonical_document_bytes_removed": int(
                     thinned["document_bytes_removed"]
@@ -416,7 +437,7 @@ def run_projection_worker(
                 "search_plane_deleted=%s search_plane_failed=%s "
                 "search_plane_rate_limited=%s "
                 "canonical_bodies_thinned=%s canonical_bodies_refused=%s "
-                "thin_mode=%s "
+                "thin_mode=%s thin_probe_timeouts=%s thin_window_size=%s thin_hints_pending=%s "
                 "canonical_document_bytes_removed=%s "
                 "canonical_event_bytes_replaced=%s "
                 "stale=%s pruned=%s "
@@ -464,6 +485,9 @@ def run_projection_worker(
                         "canonical_bodies_thinned",
                         "canonical_bodies_refused",
                         "thin_mode",
+                        "thin_probe_timeouts",
+                        "thin_window_size",
+                        "thin_hints_pending",
                         "canonical_document_bytes_removed",
                         "canonical_event_bytes_replaced",
                         "stale",
@@ -489,7 +513,18 @@ def run_projection_worker(
             # A data error in one cycle (a poisoned group, a provider outage)
             # is logged content-free and the worker keeps serving; the logical
             # projector already backs off the guilty group.
-            LOG.exception("projection cycle failed type=%s", type(error).__name__)
+            # A late maintenance failure must not hide time already spent in
+            # earlier independent transactions. Do not report unknown writes as
+            # successful counters or a completed cycle.
+            phase_elapsed["cycle_elapsed_ms"] = elapsed_ms(cycle_started)
+            if active_phase + "_elapsed_ms" in phase_elapsed:
+                phase_elapsed[active_phase + "_elapsed_ms"] = elapsed_ms(phase_started)
+            LOG.exception(
+                "projection cycle failed type=%s failed_phase=%s phase_elapsed_ms=%s "
+                + " ".join(key + "=%s" for key in PHASE_ELAPSED_KEYS),
+                type(error).__name__, active_phase, elapsed_ms(phase_started),
+                *(phase_elapsed[key] for key in PHASE_ELAPSED_KEYS),
+            )
             if once or (max_cycles is not None and cycles >= max_cycles):
                 raise
             sleep(interval_seconds)
