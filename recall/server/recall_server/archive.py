@@ -93,6 +93,8 @@ class _DeadlineReader:
 
 
 class S3Client(Protocol):
+    def generate_presigned_url(self, operation: str, **kwargs: Any) -> str: ...
+
     def put_object(self, **kwargs: Any) -> dict[str, Any]: ...
     def head_object(self, **kwargs: Any) -> dict[str, Any]: ...
     def get_object(self, **kwargs: Any) -> dict[str, Any]: ...
@@ -652,6 +654,17 @@ class S3ArchiveStore(_ArchiveStore):
         self.kms_key_id = kms_key_id
         self.compatibility_profile = compatibility_profile
         self.encryption = "sse-kms" if kms_key_id else "sse-s3"
+
+    def read_raw_url(self, value: dict[str, Any], *, expires_in: int) -> str:
+        """Short-lived read capability for a server-owned execution inventory."""
+        reference = self._from_contract(value)
+        self.verify(reference, tenant_id=value["tenant_id"], source_id=value["source_id"])
+        if type(expires_in) is not int or not 1 <= expires_in <= 300:
+            raise ValueError("archive URL lifetime is invalid")
+        return self.client.generate_presigned_url(
+            "get_object", Params={"Bucket": self.bucket, "Key": reference.object_key,
+                                  **self._version_kwargs(reference)}, ExpiresIn=expires_in,
+        )
 
     def _version_id(self, content_sha256: str, response: dict[str, Any]) -> str:
         if self.compatibility_profile == "r2":

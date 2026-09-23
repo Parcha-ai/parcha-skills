@@ -1644,8 +1644,6 @@ class BoundCanonicalRetrieval:
                 sources_available=len(sources),
                 pending=pending,
             )
-        if len(rows) > 511:
-            raise DeepInspectionError("parquet_scan_scope_too_large")
         source_aliases = {
             value: f"s{index}"
             for index, value in enumerate(
@@ -2161,7 +2159,6 @@ class BoundCanonicalRetrieval:
         }
         if (
             admitted_documents != set(logical_document_ids)
-            or len(rows) > 512
         ):
             raise DeepInspectionError("deep_inspector_target_invalid")
         objects = tuple(

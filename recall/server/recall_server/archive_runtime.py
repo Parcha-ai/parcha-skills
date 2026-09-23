@@ -58,6 +58,9 @@ class BotoS3Client:
                 raise ArchiveNotFound("archive object not found") from None
             raise
 
+    def generate_presigned_url(self, operation: str, **kwargs: Any) -> str:
+        return self.client.generate_presigned_url(operation, **kwargs)
+
     def put_object(self, **kwargs: Any) -> dict[str, Any]:
         return self._call("put_object", **kwargs)
 
