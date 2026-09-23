@@ -360,7 +360,7 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
             return [], status
         return self._scored(raw), "ok"
 
-    def _authorize_ranges(self, results, legs, *, deadline_at):
+    def _authorize_ranges(self, results, legs, *, deadline_at, include_arms=False):
         """Canonical receipt metadata fences asynchronous search-plane writes.
 
         Body retirement clears text, retaining the receipt rows. A deleting or
@@ -368,7 +368,14 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
         cached vendor body and diagnostic arm results.
         """
         started = time.monotonic()
-        candidates = [row for _name, _weight, rows in legs for row in rows]
+        # Normal output and reranking consume only this already-collapsed
+        # pool, including every nominated row and all its matching ranges.
+        # Diagnostic arms have a separate collapse, so they require all IDs.
+        candidates = (
+            [row for _name, _weight, rows in legs for row in rows]
+            if include_arms else
+            [item for row in results for item in row.get("matching_ranges", ())]
+        )
         ids = sorted({row["passage_id"] for row in candidates
                       if isinstance(row.get("passage_id"), str)})
         if not ids:
@@ -459,6 +466,7 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
         legs: tuple[tuple[str, float, list[dict[str, Any]]], ...],
         *,
         deadline_at: float,
+        include_arms: bool = False,
     ) -> dict[str, Any]:
         """Fetch the bodies of the collapsed head's ranges in one pass.
 
@@ -470,7 +478,9 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
         (``hydrate_status`` says so) rather than dropping the result.
         """
 
-        authority = self._authorize_ranges(results, legs, deadline_at=deadline_at)
+        authority = self._authorize_ranges(
+            results, legs, deadline_at=deadline_at, include_arms=include_arms,
+        )
         wanted: dict[str, list[dict[str, Any]]] = {}
         for row in results:
             for item in row.get("matching_ranges") or ():

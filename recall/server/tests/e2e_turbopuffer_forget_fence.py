@@ -71,9 +71,9 @@ class ForgetFence(unittest.TestCase):
             sources=[self.source], policy_fingerprint=DEFAULT_PASSAGE_POLICY.fingerprint,
             settings=self.settings, client=self.client)
 
-    def search(self):
+    def search(self, *, include_arms=True):
         return self.retrieval.search('forgotten deployment phrase', lexical_query='deployment phrase',
-            since=None, until=None, limit=10, include_arms=True)
+            since=None, until=None, limit=10, include_arms=include_arms)
 
     def test_body_retired_then_deleting_and_deleted_receipt(self):
         with self.store.connect() as c:
@@ -82,6 +82,7 @@ class ForgetFence(unittest.TestCase):
         self.assertEqual(len(live['results']), 1)
         self.assertEqual(live['diagnostics']['authority_status'], 'ok')
         self.assertIn('Synthetic forgotten', live['results'][0]['matching_ranges'][0]['text'])
+        self.assertEqual(len(self.search(include_arms=False)['results']), 1)
         with self.store.connect() as c:
             c.execute('UPDATE canonical_chunks SET deleted_at=clock_timestamp() WHERE tenant_id=%s AND source_id=%s', (self.tenant,self.source))
         for phase in ('deleting', 'deleted'):
@@ -97,6 +98,7 @@ class ForgetFence(unittest.TestCase):
                 self.assertTrue(all(not rows for rows in response['arms'].values()))
                 self.assertEqual(response['diagnostics']['authority_status'], 'ok')
                 self.assertFalse(any(q['rank_by'] == ('id','asc') for q in self.ns.queries))
+                self.assertEqual(self.search(include_arms=False)['results'], [])
 
     def test_authorized_vendor_row_without_current_canonical_document_is_hidden(self):
         with self.store.connect() as c:
@@ -140,7 +142,7 @@ class ForgetFence(unittest.TestCase):
                       (self.tenant, forgotten))
         rows = [arm_row(row, 1.0) for row in self.vendor_rows]
         expected = {row['id'] for row in self.vendor_rows if forgotten not in row['receipts']}
-        diagnostics = self.retrieval._authorize_ranges([], (('dense',1.0,rows),), deadline_at=time.monotonic()+5)
+        diagnostics = self.retrieval._authorize_ranges([], (('dense',1.0,rows),), deadline_at=time.monotonic()+5, include_arms=True)
         self.assertEqual(diagnostics['authority_status'], 'ok')
         self.assertEqual({row['passage_id'] for row in rows}, expected)
 

@@ -1075,6 +1075,7 @@ class PassageHintRetrieval:
         legs: tuple[tuple[str, float, list[dict[str, Any]]], ...],
         *,
         deadline_at: float,
+        include_arms: bool = False,
     ) -> dict[str, Any] | None:
         """Fill the bodies of the collapsed ranges when the arms returned
         catalog rows (a plane whose rows are wide fetches bodies once, for
@@ -2415,7 +2416,9 @@ class PassageHintRetrieval:
             source_boost=source_boost,
         )
         hydrate_started = time.monotonic()
-        hydrate_diagnostics = self._hydrate_ranges(results, legs, deadline_at=deadline_at)
+        hydrate_diagnostics = self._hydrate_ranges(
+            results, legs, deadline_at=deadline_at, include_arms=include_arms,
+        )
         if hydrate_diagnostics is not None:
             arm_elapsed_ms["hydrate"] = round((time.monotonic() - hydrate_started) * 1000, 3)
             temporal_diagnostics.update(hydrate_diagnostics)
