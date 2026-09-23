@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from psycopg.errors import QueryCanceled
+from psycopg.pq import TransactionStatus
+
 from .db import BrainStore
 
 
@@ -294,6 +297,7 @@ class CanonicalBodyThinner:
         self._after: tuple[str, str] | None = None
         self._through: tuple[str, str] | None = None
         self._committed_keys: dict[tuple[str, str], None] = {}
+        self._window_size = self.WINDOW_SIZE
 
     def thin(
         self, *, batch_size: int,
@@ -314,6 +318,8 @@ class CanonicalBodyThinner:
             if len(self._committed_keys) > 256:
                 del self._committed_keys[next(iter(self._committed_keys))]
         through, after = self._through, self._after
+        window_size = min(self._window_size, self.WINDOW_SIZE)
+        historical_probe_timeouts = 0
         row = dict(candidates=0, documents=0, events=0,
                    document_bytes=0, event_bytes=0)
         keys = []
@@ -338,7 +344,7 @@ class CanonicalBodyThinner:
                          if after is not None else "")
                 params = ((self._tenant_id,) + through
                           + (after if after is not None else ())
-                          + (self.WINDOW_SIZE,))
+                          + (window_size,))
                 keys = connection.execute(
                     f"""SELECT source_id,document_id FROM canonical_documents
                         WHERE tenant_id=%s AND body_location='inline'
@@ -350,15 +356,37 @@ class CanonicalBodyThinner:
             if keys:
                 sources = [key["source_id"] for key in keys]
                 documents = [key["document_id"] for key in keys]
-                eligible = connection.execute(
-                    _thinning_statement(bounded=True, probe=True),
-                    (sources, documents, self._tenant_id, self._tenant_id,
-                     batch_size),
-                ).fetchall()
-                if len(eligible) == batch_size:
-                    after = (eligible[-1]["source_id"], eligible[-1]["document_id"])
+                cancelled = None
+                try:
+                    # Only this read-only probe can recover from cancellation.
+                    # SET LOCAL above has opened the outer transaction; this is
+                    # a savepoint, whose rollback must succeed before hints run.
+                    with connection.transaction():
+                        try:
+                            eligible = connection.execute(
+                                _thinning_statement(bounded=True, probe=True),
+                                (sources, documents, self._tenant_id, self._tenant_id,
+                                 batch_size),
+                            ).fetchall()
+                        except QueryCanceled as error:
+                            cancelled = error
+                            raise
+                except QueryCanceled as error:
+                    if (error is not cancelled or connection.closed or connection.broken
+                            or connection.info.transaction_status != TransactionStatus.INTRANS):
+                        # Psycopg can preserve the probe exception while warning
+                        # about a failed rollback. Require a healthy outer
+                        # transaction, not merely the same exception identity.
+                        raise
+                    historical_probe_timeouts = 1
+                    window_size = max(1, window_size // 2)
+                    # No in-call retry and no skipped keys. Retry the same lower
+                    # cursor with a smaller page on the next maintenance cycle.
                 else:
-                    after = (keys[-1]["source_id"], keys[-1]["document_id"])
+                    if len(eligible) == batch_size:
+                        after = (eligible[-1]["source_id"], eligible[-1]["document_id"])
+                    else:
+                        after = (keys[-1]["source_id"], keys[-1]["document_id"])
             # Historical selection owns the cursor and has first claim on the
             # batch. Hints only fill unused slots in the same atomic mutation.
             if len(eligible) < batch_size and self._committed_keys:
@@ -386,7 +414,8 @@ class CanonicalBodyThinner:
         # bounded and are evicted by new arrivals; history still revisits them.
         for key in eligible:
             self._committed_keys.pop((key["source_id"], key["document_id"]), None)
-        complete = not keys or after == through
+        self._window_size = window_size
+        complete = not historical_probe_timeouts and (not keys or after == through)
         self._after, self._through = ((None, None) if complete
                                      else (after, through))
         candidates, documents = int(row["candidates"]), int(row["documents"])
@@ -399,4 +428,7 @@ class CanonicalBodyThinner:
             document_bytes_removed=int(row["document_bytes"]),
             event_bytes_replaced=int(row["event_bytes"]),
             scanned_keys=len(keys), pass_complete=complete,
+            historical_probe_timeouts=historical_probe_timeouts,
+            historical_window_size=window_size,
+            committed_hints_pending=len(self._committed_keys),
         )

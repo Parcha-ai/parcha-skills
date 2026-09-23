@@ -16,6 +16,10 @@ class Store:
         if self.fail_commit:
             raise RuntimeError('unknown commit')
 
+    @contextmanager
+    def transaction(self):
+        yield self
+
     def execute(self, sql, params):
         self.calls.append((sql, params))
         if sql.startswith("SET LOCAL statement_timeout"):
