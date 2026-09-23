@@ -512,6 +512,73 @@ def main() -> None:
         assert cleanup_queue(store, tenant, source) == set()
         assert assert_each_document_once(archive, parts_v3, every) == counts_v3
 
+        # A compaction hint can outlive its consumed queue row. Re-queue the
+        # unchanged month through the owning API, then let reuse consume that
+        # older hint so the deletion regression starts with no unrelated dirt.
+        assert scan.seed_backfill(tenant_id=tenant, source_id=source) == 1
+        clean_before_forget = scan.project_pending(
+            tenant_id=tenant, batch_size=4, max_batches=1, compaction_budget=0,
+        )
+        assert clean_before_forget["fragments_rewritten"] == 0, clean_before_forget
+        with store.connect() as connection:
+            assert connection.execute(
+                """SELECT count(*) AS count FROM canonical_parquet_scan_dirty_documents
+                   WHERE tenant_id=%s AND source_id=%s""", (tenant, source),
+            ).fetchone()["count"] == 0
+        assert not scan._pending(tenant_id=tenant, limit=1)
+
+        # Forget a whole parent after compaction packed it with siblings. The
+        # empty logical rebuild has no old document left from which to recover
+        # month bounds, so delete_native_ids must have persisted them already.
+        forgotten_parent = session_b
+        forgotten_document = documents[forgotten_parent]
+        with store.connect() as connection:
+            forgotten_ids = [row["native_id"] for row in connection.execute(
+                """SELECT native_id FROM canonical_events
+                   WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s""",
+                (tenant, source, forgotten_parent),
+            ).fetchall()]
+            connection.execute(
+                """UPDATE canonical_chunks chunk SET deleted_at=now()
+                   FROM canonical_documents document
+                   WHERE chunk.tenant_id=document.tenant_id
+                     AND chunk.source_id=document.source_id
+                     AND chunk.document_id=document.document_id
+                     AND document.tenant_id=%s AND document.source_id=%s
+                     AND document.native_id=ANY(%s)""",
+                (tenant, source, forgotten_ids),
+            )
+            connection.execute(
+                """UPDATE canonical_documents SET is_current=false,deleted_at=now()
+                   WHERE tenant_id=%s AND source_id=%s AND native_id=ANY(%s)""",
+                (tenant, source, forgotten_ids),
+            )
+        assert logical.delete_native_ids(
+            tenant_id=tenant, source_id=source, native_ids=forgotten_ids,
+        ) > 0
+        logical.project_pending(tenant_id=tenant, batch_size=10, max_batches=1)
+        with store.connect() as connection:
+            forgotten_dirty = connection.execute(
+                """SELECT logical_document_id,reason FROM canonical_parquet_scan_dirty_documents
+                   WHERE tenant_id=%s AND source_id=%s""", (tenant, source),
+            ).fetchall()
+        assert forgotten_dirty == [dict(logical_document_id=forgotten_document, reason="forget")], forgotten_dirty
+        _, pending_after_forget = BoundCanonicalRetrieval(
+            store, tenant_id=tenant, principal_id=principal, authorized_sources=(source,),
+        )._parquet_shards([source], since=None, until=None)
+        assert pending_after_forget == 1, pending_after_forget
+        forgotten_scan = scan.project_pending(
+            tenant_id=tenant, batch_size=4, max_batches=1, compaction_budget=0,
+        )
+        assert forgotten_scan["shards"] == 1, forgotten_scan
+        parts_after_forget = live_parts(store, tenant, source)
+        remaining = every - {forgotten_document}
+        assert_each_document_once(archive, parts_after_forget, remaining)
+        for dataset in parquet_scan.SCAN_DATASETS:
+            assert all(row["logical_document_id"] != forgotten_document
+                       for row in read_dataset(archive, parts_after_forget, dataset)), dataset
+        assert not scan._pending(tenant_id=tenant, limit=1)
+
     owner_cases = assert_compaction_owner_equivalence(store)
     result = {
         "status": "pass",
@@ -530,6 +597,8 @@ def main() -> None:
             "compacted_months": compacted["compacted"],
             "fragments_after_compaction": len(parts_v3),
             "cleanup_completed": drained["completed"],
+            "forget_scan_pending_before_rebuild": pending_after_forget,
+            "forgotten_document_absent_from_all_datasets": True,
         },
     }
     rendered = json.dumps(result, sort_keys=True)
