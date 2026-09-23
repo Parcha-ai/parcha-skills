@@ -75,7 +75,7 @@ class BusyThinningCadenceTest(unittest.TestCase):
         self.assertEqual([r['thin_deferred'] for r in results], [0, 1, 1, 0, 1, 1, 0, 1])
         expected = []
         for cycle in range(1, 9):
-            expected.extend(['embeddings', 'passages', 'logical', 'search', 'scan'])
+            expected.extend(['embeddings', 'passages', 'search', 'logical', 'scan'])
             if cycle in (1, 4, 7):
                 expected.append('thin')
         self.assertEqual(calls, expected)
