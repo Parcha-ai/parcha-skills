@@ -820,7 +820,11 @@ except Exception:
         "mount -o remount,bind,ro /datasets",
         "/tmp/recall-agent/recall-mark sandbox_ready",
         (
-            "exec env -i HOME=/tmp "
+            # Read-only overlays are not an authorization boundary while the
+            # program can unmount them. Drop setup privileges before any user
+            # code; descendants cannot regain them through exec/file caps.
+            "exec setpriv --bounding-set=-all --inh-caps=-all "
+            "--ambient-caps=-all --no-new-privs env -i HOME=/tmp "
             "PATH=/tmp/recall-agent:/usr/local/bin:/usr/bin:/bin "
             "RECALL_POINTERS_PATH=/tmp/recall-agent/pointers.json "
             "LC_ALL=C bash -c "
