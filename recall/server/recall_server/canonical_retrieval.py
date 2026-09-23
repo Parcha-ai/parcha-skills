@@ -1450,8 +1450,9 @@ class BoundCanonicalRetrieval:
         values = (self.tenant_id, sources, since, since, until, until)
         with self.store.connect() as connection:
             rows = connection.execute(
-                """SELECT source_id,bucket_start,dataset,shard_index,
-                          object_key,content_sha256
+                """SELECT tenant_id,source_id,bucket_start,dataset,shard_index,
+                          artifact_id,storage_backend,object_key,content_sha256,
+                          size_bytes,media_type,encryption,version_id,created_at
                      FROM canonical_parquet_scan_shards
                     WHERE tenant_id=%s AND source_id=ANY(%s)
                       AND (
@@ -1666,11 +1667,27 @@ class BoundCanonicalRetrieval:
             )
             for row in rows
         }
+        # These references come only from the tenant/source-scoped catalog
+        # query above, after dataset selection. Never accept them from callers.
+        catalog_references = {
+            row["object_key"]: {
+                "contract": "recall.artifact-ref.v1", "schema_version": 1,
+                **{name: row[name] for name in (
+                    "tenant_id", "source_id", "artifact_id", "storage_backend",
+                    "object_key", "content_sha256", "size_bytes", "media_type",
+                    "encryption", "version_id",
+                )},
+                "created_at": row["created_at"].isoformat()
+                    if isinstance(row["created_at"], datetime) else row["created_at"],
+            }
+            for row in rows
+        }
         result = self.deep_inspector.execute_scan(
             tenant_id=self.tenant_id,
             program=program,
             objects=objects,
             dataset_aliases=dataset_aliases,
+            catalog_references=catalog_references,
             timeout_seconds=timeout_seconds,
         )
         stdout = result.get("stdout")
