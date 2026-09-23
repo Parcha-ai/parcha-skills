@@ -594,6 +594,8 @@ if isinstance(items,dict):
     inventory=json.loads(raw)
     items,datasets=inventory["objects"],inventory["datasets"]
     path.unlink()
+materialized_keys={key for key,alias in datasets.items()
+                   if alias.rsplit("/",1)[-1].startswith("documents-part-")}
 target=pathlib.Path("/tmp/recall-authorized").resolve()
 docs=pathlib.Path("/tmp/recall-docs").resolve()
 dataset_root=pathlib.Path("/tmp/recall-datasets").resolve()
@@ -621,13 +623,29 @@ def stage_object(item):
     if target not in dst.parents:
         raise SystemExit(64)
     dst.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
-    dst.touch(mode=0o400,exist_ok=False)
-    if datasets: local_ready=time.monotonic_ns()//1000
-    subprocess.run(["mount","--bind",str(src),str(dst)],check=True)
-    if datasets: bound=time.monotonic_ns()//1000
-    subprocess.run(["mount","-o","remount,bind,ro",str(dst)],check=True)
+    if item["object_key"] in materialized_keys:
+        # Document catalogs are small metadata files. Materialize them once
+        # so DuckDB's repeated footer/column reads stay local. Other datasets
+        # retain lazy reads; a records count must not copy every record body.
+        digest=hashlib.sha256()
+        with src.open("rb") as reader,dst.open("xb") as writer:
+            while block:=reader.read(1024*1024):
+                writer.write(block)
+                digest.update(block)
+        if digest.hexdigest()!=item["content_sha256"]:
+            dst.unlink()
+            raise SystemExit(66)
+        dst.chmod(0o400)
+        local_ready=time.monotonic_ns()//1000
+        bound=local_ready
+    else:
+        dst.touch(mode=0o400,exist_ok=False)
+        if datasets: local_ready=time.monotonic_ns()//1000
+        subprocess.run(["mount","--bind",str(src),str(dst)],check=True)
+        if datasets: bound=time.monotonic_ns()//1000
+        subprocess.run(["mount","-o","remount,bind,ro",str(dst)],check=True)
     if datasets:
-        ended=time.monotonic_ns()//1000
+        ended=bound if item["object_key"] in materialized_keys else time.monotonic_ns()//1000
         stage_times.append((looked_up-started,local_ready-looked_up,bound-local_ready,ended-bound))
 if datasets:
     # Distinct destinations are required before concurrent namespace changes.
@@ -810,6 +828,13 @@ except Exception:
             + " "
             + shlex.quote(encoded_duckdb_stub)
         ),
+        # Protect the original staging path as well as the public alias. A
+        # chmod alone is reversible by the mapped root that runs the program.
+        *([
+            "mount --rbind /tmp/recall-authorized /tmp/recall-authorized",
+            "mount -o remount,bind,ro /tmp/recall-authorized",
+        ] if any("/documents-part-" in alias
+                 for alias in (dataset_aliases or {}).values()) else []),
         "mount --rbind /tmp/recall-authorized /mnt/archil/evidence",
         "mount -o remount,bind,ro /mnt/archil/evidence",
         "mkdir -p /docs",

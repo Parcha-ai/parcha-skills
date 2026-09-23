@@ -130,11 +130,13 @@ class StagingTimingTests(unittest.TestCase):
             with self.subTest(phase=phase):
                 case, value = self.stage(delay=0.04, timing_phase=phase)
                 self.assertEqual(value["object_count"], len(case.items))
-                self.assertGreaterEqual(value[f"{phase}_sum_us"], 9 * 35_000)
+                affected = 1 if phase in ("bind", "remount") else 9
+                self.assertGreaterEqual(value[f"{phase}_sum_us"], affected * 35_000)
                 self.assertGreaterEqual(value[f"{phase}_max_us"], 35_000)
                 self.assertEqual(case.completed, 9)
                 self.assertLessEqual(case.peak, 4)
-                self.assertEqual(len(case.calls), 18)
+                self.assertEqual(len(case.calls), 2)
+                self.assertEqual(len(case.copies), 8)
                 self.assertEqual(set(value), set(summary()))
                 self.assertTrue(all(type(v) is int for v in value.values()))
                 with self.assertLogs("recall.mcp", "INFO") as logs:
