@@ -46,7 +46,7 @@ class ScanManifestStagingTests(unittest.TestCase):
             inventory=inventory, inventory_url="https://synthetic.invalid/inventory",
             inventory_size_bytes=1,
             record_spans={}, routing_receipts={}, timeout_seconds=10,
-            dataset_aliases=datasets if datasets is not None else {self.data.object_key: 's1/2026-09/passages-part-00000.parquet'},
+            dataset_aliases=datasets if datasets is not None else {self.data.object_key: 's1/2026-09/documents-part-00000.parquet'},
             tool_objects=tools if tools is not None else {'linux-x86_64': self.tool},
         )
         inner = shlex.split(shlex.split(command[command.index('\nunshare ') + 1:])[-1])
@@ -104,17 +104,17 @@ class ScanManifestStagingTests(unittest.TestCase):
 
     def test_external_inventory_stages_all_600_parts_and_hides_inventory(self):
         parts = [self.data] + [self.object(f"part-{i}".encode()) for i in range(599)]
-        datasets = {o.object_key: f"s1000/2026-09/passages-part-{i:05}.parquet"
+        datasets = {o.object_key: f"s1000/2026-09/documents-part-{i:05}.parquet"
                     for i, o in enumerate(parts)}
         ref, _path = self.inventory(datasets)
         self.stage(datasets=datasets, inventory=ref)
-        self.assertEqual(len(self.mounts), len(self.objects) * 2)
+        self.assertEqual(len(self.mounts), (len(self.objects) - len(parts)) * 2)
         self.assertEqual(len(list((self.root / "tmp/recall-datasets").rglob("*.parquet"))), 600)
         self.assertFalse((self.root / "tmp/recall-authorized" / ref.object_key).exists())
         self.assertFalse(any(ref.object_key in str(call) for call in self.mounts))
 
     def test_changed_inventory_refuses_before_mounting(self):
-        ref, path = self.inventory({self.data.object_key: "s1/2026-09/passages-part-00000.parquet"})
+        ref, path = self.inventory({self.data.object_key: "s1/2026-09/documents-part-00000.parquet"})
         path.write_bytes(path.read_bytes() + b" ")
         with self.assertRaises(SystemExit) as error:
             self.stage(inventory=ref)
@@ -136,9 +136,9 @@ class ScanManifestStagingTests(unittest.TestCase):
         self.stage()
         self.assertEqual(self.walks, [])
         self.assertEqual(self.reads, [])
-        self.assertEqual(len(self.mounts), len(self.objects) * 2)
+        self.assertEqual(len(self.mounts), (len(self.objects) - 1) * 2)
         self.assertEqual((self.root / 'tmp/recall-agent/duckdb-real').read_bytes(), b'synthetic duckdb executable')
-        link = self.root / 'tmp/recall-datasets/s1/2026-09/passages-part-00000.parquet'
+        link = self.root / 'tmp/recall-datasets/s1/2026-09/documents-part-00000.parquet'
         self.assertEqual(str(link.readlink()), '/mnt/archil/evidence/' + self.data.object_key)
 
     def test_scan_still_rejects_tool_hash_mismatch(self):
