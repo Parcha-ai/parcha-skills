@@ -224,9 +224,91 @@ def inspect_enabled(store, *, scope, limits, deadline_at):
     return dict(row, limits=asdict(limits), body_eligibility="requires_parent_proof")
 
 
-def _claim(store, *, scope, limits, deadline_at, attempted):
-    with store.connect() as connection, connection.transaction():
+_CLAIM_PHASES = frozenset(
+    {
+        "connect",
+        "connection_enter",
+        "transaction_enter",
+        "authorize",
+        "candidate_select",
+        "epoch_update",
+        "transaction_exit",
+        "connection_exit",
+    }
+)
+_CLAIM_SQLSTATES = {
+    "55P03": "sql_lock_not_available",
+    "57014": "sql_query_canceled",
+    "40001": "sql_serialization_failure",
+    "40P01": "sql_deadlock",
+    "42501": "sql_insufficient_privilege",
+    "25006": "sql_read_only",
+    "08003": "sql_connection_missing",
+    "08006": "sql_connection_failure",
+}
+_CLAIM_TYPES = {
+    "TimeoutError": "timeout",
+    "SearchDeadlineExceeded": "search_deadline",
+    "PoolTimeout": "pool_timeout",
+    "OperationalError": "operational_error",
+    "InterfaceError": "interface_error",
+    "ValueError": "value_error",
+    "TypeError": "type_error",
+    "KeyError": "key_error",
+}
+
+
+class _ClaimContext:
+    """Observe context entry/exit failures without replacing or suppressing them."""
+
+    def __init__(self, factory, diagnostic, name):
+        self.factory, self.diagnostic, self.name = factory, diagnostic, name
+
+    def __enter__(self):
+        self.diagnostic["phase"] = (
+            "connect" if self.name == "connection" else "transaction_enter"
+        )
+        self.context = self.factory()
+        self.diagnostic["phase"] = self.name + "_enter"
+        return type(self.context).__enter__(self.context)
+
+    def __exit__(self, *exception):
+        try:
+            return type(self.context).__exit__(self.context, *exception)
+        except Exception:
+            # An exit error can replace the body error. This identifies the
+            # failing boundary, not whether COMMIT or ROLLBACK took effect.
+            self.diagnostic["phase"] = self.name + "_exit"
+            raise
+
+
+def _claim_error_label(diagnostic, error):
+    phase = diagnostic.get("phase")
+    if phase not in _CLAIM_PHASES:
+        return None
+    try:
+        category = _CLAIM_SQLSTATES.get(getattr(error, "sqlstate", None))
+        if category is None:
+            category = (
+                "chunk_retirement"
+                if isinstance(error, ChunkRetirementError)
+                else _CLAIM_TYPES.get(type(error).__name__, "other")
+            )
+    except Exception:
+        # Diagnostic attributes must never replace the original failure.
+        category = "other"
+    return f"retirement_claim_{phase}_{category}"
+
+
+def _claim(store, *, scope, limits, deadline_at, attempted, diagnostic=None):
+    diagnostic = {} if diagnostic is None else diagnostic
+    with (
+        _ClaimContext(store.connect, diagnostic, "connection") as connection,
+        _ClaimContext(connection.transaction, diagnostic, "transaction"),
+    ):
+        diagnostic["phase"] = "authorize"
         _authorize(store, connection, scope, deadline_at)
+        diagnostic["phase"] = "candidate_select"
         row = store._execute_bounded(
             connection,
             """SELECT progress.source_id,progress.native_parent_id,
@@ -253,6 +335,7 @@ def _claim(store, *, scope, limits, deadline_at, attempted):
             return None
         # An epoch is a commit fence, not an exclusive lifetime lease. A later
         # invocation can supersede a slow proof; its old claimant cannot publish.
+        diagnostic["phase"] = "epoch_update"
         updated = store._execute_bounded(
             connection,
             """UPDATE canonical_chunk_retirement_progress
@@ -348,6 +431,7 @@ def run_retirement(
         remaining_archive = limits.max_archive_bytes - meter.bytes
         if remaining_bytes <= 0 or remaining_archive <= 0:
             break
+        claim_diagnostic = {}
         try:
             candidate = _claim(
                 store,
@@ -355,6 +439,7 @@ def run_retirement(
                 limits=limits,
                 deadline_at=min(deadline_at, time.monotonic() + 5),
                 attempted=attempted,
+                diagnostic=claim_diagnostic,
             )
         except Exception as error:
             if not attempted:
@@ -364,6 +449,9 @@ def run_retirement(
                 if isinstance(error, ChunkRetirementError)
                 else "retirement_claim_unavailable"
             ] += 1
+            label = _claim_error_label(claim_diagnostic, error)
+            if label is not None:
+                errors[label] += 1
             report["status"] = "claim_refused"
             break
         if candidate is None:

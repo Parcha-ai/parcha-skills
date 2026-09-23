@@ -469,6 +469,279 @@ def publication_restarts_grace(store, root):
     assert state() == before
 
 
+def claim_unknown_state_recovery(store, root):
+    """A new invocation recovers from state, not an invented old claim ACK.
+
+    Exercise the live runner API unchanged. The injected errors happen after
+    real PostgreSQL UPDATE work, either inside its transaction or after COMMIT.
+    Fixture-only timestamp aging avoids a minute's sleep; no recovery operation
+    resets a production epoch, cursor, enable flag or ledger.
+    """
+    for outcome, changed_manifest in (
+        ("rollback", False),
+        ("commit_reply_lost", False),
+        ("rollback", True),
+        ("commit_reply_lost", True),
+    ):
+        tenant, source, archive, _, projector, _ = fixture(store, root, count=4)
+        scope = runner.RetirementScope(tenant, "principal:reprojection", (source,))
+        with store.connect() as c:
+            c.execute(
+                "INSERT INTO canonical_source_grants VALUES(%s,%s,%s,'owner',now())",
+                (tenant, scope.principal_id, source),
+            )
+        page = runner.plan_cohort(store, scope=scope)
+        assert (
+            runner.enroll_cohort(store, scope=scope, reviewed_plan=page)[
+                "inserted_parents"
+            ]
+            == 1
+        )
+
+        def state():
+            with store.connect() as c:
+                return c.execute(
+                    "SELECT * FROM canonical_chunk_retirement_progress WHERE tenant_id=%s AND source_id=%s",
+                    (tenant, source),
+                ).fetchone()
+
+        def age():
+            # Test time advancement only, never a recovery prescription.
+            with store.connect() as c:
+                c.execute(
+                    "UPDATE canonical_chunk_retirement_progress SET updated_at=now()-interval '2 minutes' WHERE tenant_id=%s AND source_id=%s",
+                    (tenant, source),
+                )
+
+        reader = BoundCanonicalRetrieval(
+            store,
+            tenant_id=tenant,
+            principal_id=scope.principal_id,
+            authorized_sources=(source,),
+            chunk_body_archive=archive,
+        )
+        anchor = f"recall://{source}/event-0001?rev=1#item=0"
+
+        def reads():
+            return (
+                reader.show(anchor),
+                reader.session_context(anchor, before=1, after=1),
+                store.resolve(
+                    anchor,
+                    tenant_id=tenant,
+                    authorized_sources=(source,),
+                    chunk_body_archive=archive,
+                ),
+            )
+
+        expected_reads = reads()
+        age()
+        first = runner.run_retirement(
+            store,
+            archive,
+            scope=scope,
+            apply=True,
+            parent_limits=ParentRetirementLimits(batch_documents=1, max_batches=1),
+        )
+        assert first["cleared_documents"] == first["partial_parents"] == 1, first
+        age()
+        before = state()
+        old_plan = page["parents"][0]["manifest"]
+        original_claim = runner._claim
+        original_query = store._execute_bounded
+        lost = []
+        archive.reads.clear()
+
+        def rollback_after_update(connection, sql, values, deadline_at):
+            cursor = original_query(connection, sql, values, deadline_at)
+            if "SET scope_epoch=scope_epoch+1" in sql:
+                lost.append(cursor.fetchone()["scope_epoch"])
+                raise TimeoutError("synthetic claim reply lost before COMMIT")
+            return cursor
+
+        def lose_committed_reply(*args, **kwargs):
+            candidate = original_claim(*args, **kwargs)
+            assert candidate is not None
+            lost.append(candidate["scope_epoch"])
+            raise TimeoutError("synthetic claim reply lost after COMMIT")
+
+        context = (
+            patch.object(store, "_execute_bounded", side_effect=rollback_after_update)
+            if outcome == "rollback"
+            else patch.object(runner, "_claim", side_effect=lose_committed_reply)
+        )
+        with context:
+            try:
+                runner.run_retirement(store, archive, scope=scope, apply=True)
+            except TimeoutError:
+                pass
+            else:
+                raise AssertionError("unknown first claim was silently accepted")
+        assert len(lost) == 1 and not archive.reads
+        after = state()
+        assert lost[0] == before["scope_epoch"] + 1
+        assert after["scope_epoch"] == before["scope_epoch"] + int(
+            outcome == "commit_reply_lost"
+        )
+        for field in (
+            "status",
+            "last_record_ordinal",
+            "manifest_artifact_id",
+            "cumulative_cleared_documents",
+            "cumulative_cleared_chunks",
+            "cumulative_cleared_utf8_bytes",
+        ):
+            assert after[field] == before[field], (outcome, field)
+        if outcome == "rollback":
+            assert after["updated_at"] == before["updated_at"]
+        else:
+            assert after["updated_at"] > before["updated_at"]
+            assert (
+                runner.run_retirement(store, archive, scope=scope, apply=True)[
+                    "attempted_parents"
+                ]
+                == 0
+            )
+            assert not archive.reads, "lost committed claim bypassed cooldown"
+
+        assert reads() == expected_reads
+        archive.reads.clear()
+
+        # Existing disabled intent and queue exclusion still win after either
+        # unknown outcome. These fixture toggles test the guard, not a reset API.
+        age()
+        with store.connect() as c:
+            c.execute(
+                "UPDATE canonical_chunk_retirement_progress SET enabled=false WHERE tenant_id=%s AND source_id=%s",
+                (tenant, source),
+            )
+        disabled = state()
+        assert (
+            runner.run_retirement(store, archive, scope=scope, apply=True)[
+                "attempted_parents"
+            ]
+            == 0
+        )
+        assert state() == disabled and not archive.reads
+        with store.connect() as c:
+            c.execute(
+                "UPDATE canonical_chunk_retirement_progress SET enabled=true WHERE tenant_id=%s AND source_id=%s",
+                (tenant, source),
+            )
+        if changed_manifest:
+            with store.connect() as c:
+                insert_record(
+                    c,
+                    tenant=tenant,
+                    source=source,
+                    parent="session",
+                    native="event-0004",
+                    text="New revision after unknown claim",
+                    role="assistant",
+                    byte_start=40,
+                )
+                mark_logical_evidence_dirty(
+                    c,
+                    tenant_id=tenant,
+                    source_id=source,
+                    native_ids=["event-0004"],
+                    reason="ingest",
+                )
+            queued = state()
+            assert (
+                runner.run_retirement(store, archive, scope=scope, apply=True)[
+                    "attempted_parents"
+                ]
+                == 0
+            )
+            assert state() == queued and not archive.reads
+            projected = projector.project_pending(
+                tenant_id=tenant, batch_size=1, max_batches=1, upload_concurrency=1
+            )
+            assert projected["documents"] == 1 and projected["failed"] == 0, projected
+            current_page = runner.plan_cohort(store, scope=scope)
+            assert current_page["parents"][0]["manifest"] != old_plan
+            expected_reads = reads()  # Exact new-manifest public reads before recovery.
+            archive.reads.clear()
+            assert (
+                runner.run_retirement(store, archive, scope=scope, apply=True)[
+                    "attempted_parents"
+                ]
+                == 0
+            )
+            assert not archive.reads, "changed manifest bypassed publication grace"
+        else:
+            current_page = runner.plan_cohort(store, scope=scope)
+            assert current_page["parents"][0]["manifest"] == old_plan
+            # No publication/reset intervenes: the original partial cursor and
+            # durable counters must drive recovery from the actual old state.
+            unchanged = state()
+            for field in (
+                "scope_epoch",
+                "last_record_ordinal",
+                "manifest_artifact_id",
+                "status",
+            ):
+                assert unchanged[field] == after[field]
+        age()
+        fresh_before = state()
+        original_retire = runner.retire_parent_chunks
+        stale_checks = []
+        # An uncommitted epoch number can legitimately be reused after rollback.
+        # Fence only the last actually committed old epoch. The old invocation
+        # has terminated; its unreturned candidate is never a live authority.
+        stale_epoch = before["scope_epoch"] if outcome == "rollback" else lost[0]
+
+        def assert_old_epoch_fenced(*args, **kwargs):
+            assert kwargs["required_scope_epoch"] > stale_epoch
+            assert (
+                kwargs["reviewed_plan"]["manifest"]
+                == current_page["parents"][0]["manifest"]
+            )
+            prior_reads = dict(archive.reads)
+            try:
+                original_retire(*args, **dict(kwargs, required_scope_epoch=stale_epoch))
+            except ChunkRetirementError as error:
+                assert error.error_code == "parent_retirement_disabled"
+            else:
+                raise AssertionError("stale retained claim cleared a body")
+            assert dict(archive.reads) == prior_reads
+            stale_checks.append(True)
+            return original_retire(*args, **kwargs)
+
+        with patch.object(
+            runner, "retire_parent_chunks", side_effect=assert_old_epoch_fenced
+        ):
+            recovered = runner.run_retirement(store, archive, scope=scope, apply=True)
+        assert stale_checks == [True] and recovered["completed_parent_proofs"] == 1
+        assert (
+            recovered["cleared_documents"] == 3 + int(changed_manifest)
+            and recovered["failed_parents"] == 0
+        ), recovered
+        assert not recovered["commit_outcome_unknown"]
+        assert archive.reads and all(n == 1 for n in archive.reads.values()), (
+            "new invocation did not make one fresh proof"
+        )
+        final = state()
+        assert final["scope_epoch"] == fresh_before["scope_epoch"] + 1
+        assert final["status"] == "complete" and final[
+            "cumulative_cleared_documents"
+        ] == 4 + int(changed_manifest)
+        for field in ("cleared_documents", "cleared_chunks", "cleared_utf8_bytes"):
+            assert final["cumulative_" + field] == first[field] + recovered[field]
+        archive.reads.clear()
+        assert (
+            runner.run_retirement(store, archive, scope=scope, apply=True)[
+                "attempted_parents"
+            ]
+            == 0
+        )
+        assert not archive.reads and state() == final, (
+            "completed current manifest was recounted"
+        )
+        assert reads() == expected_reads
+
+
 def main():
     admin_dsn = os.environ["RECALL_DATABASE_URL"]
     database = "recall_runner_" + uuid.uuid4().hex
@@ -488,6 +761,7 @@ def main():
             races(store, Path(tmp))
             paging_and_fairness(store, Path(tmp))
             publication_restarts_grace(store, Path(tmp))
+            claim_unknown_state_recovery(store, Path(tmp))
         print(
             json.dumps(
                 dict(
@@ -500,6 +774,7 @@ def main():
                     stop_before_commit=True,
                     null_locators_reported=True,
                     publication_restarts_grace=True,
+                    claim_unknown_state_recovery=True,
                 )
             )
         )
