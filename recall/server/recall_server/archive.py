@@ -658,7 +658,7 @@ class S3ArchiveStore(_ArchiveStore):
     def read_raw_url(self, value: dict[str, Any], *, expires_in: int) -> str:
         """Short-lived read capability for a server-owned execution inventory."""
         reference = self._from_contract(value)
-        self._authorize(reference, tenant_id=value["tenant_id"], source_id=value["source_id"])
+        self.verify(reference, tenant_id=value["tenant_id"], source_id=value["source_id"])
         if type(expires_in) is not int or not 1 <= expires_in <= 300:
             raise ValueError("archive URL lifetime is invalid")
         return self.client.generate_presigned_url(
