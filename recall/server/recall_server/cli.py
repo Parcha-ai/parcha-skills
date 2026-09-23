@@ -1783,7 +1783,8 @@ def main() -> None:
     search_plane_status_parser.add_argument("--overlap-tokens", type=int, default=128)
     search_plane_reconcile_parser = sub.add_parser(
         "search-plane-reconcile",
-        help="Exact namespace-vs-catalog drift; --apply deletes stale rows (counts only)",
+        help="Observe namespace-vs-catalog drift; --apply repairs missing rows; "
+             "stale rows remain unresolved (counts only)",
     )
     search_plane_reconcile_parser.add_argument("--tenant", required=True)
     search_plane_reconcile_parser.add_argument("--apply", action="store_true")

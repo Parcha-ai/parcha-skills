@@ -202,13 +202,14 @@ def search_plane_reconcile(
     delete_rows: int = RECONCILE_DELETE_ROWS,
     projector: Any = None,
 ) -> dict[str, Any]:
-    """Exact drift: namespace ids against the live passage ids in the catalog.
+    """Observe drift across independently paged namespace and catalog reads.
 
-    With ``apply``: ``stale`` rows (in the namespace, not live: a forgotten
-    or replaced passage whose tombstone never landed) are deleted, and
-    ``missing`` passages (live, not in the namespace: inserted behind a
-    running backfill's cursor, so no outbox row carries them) are written
-    through ``projector.upsert_passages``. Counts only, never ids or text.
+    ``stale`` observations are unresolved: concurrent inserts behind the SQL
+    cursor can produce the same observation as a missed tombstone. Only the
+    authoritative outbox/tombstone path may delete rows. With ``apply``, repair
+    ``missing`` passages through ``projector.upsert_passages``, which rereads
+    current authority. Counts only, never ids or text. The legacy ``delete_rows``
+    argument now controls only the repair batch size.
     """
 
     if not isinstance(tenant_id, str) or not tenant_id:
@@ -241,13 +242,11 @@ def search_plane_reconcile(
     present_count = 0
     stale_count = 0
     missing_count = 0
-    deleted = 0
     written = 0
-    # Applying while the namespace is being paged would change the input and
-    # corrupt the exact initial counts. Spool content-free ids to bounded disk,
-    # finish the comparison, then replay idempotent batches.
-    with tempfile.TemporaryFile(mode="w+t", encoding="ascii") as stale_ids, \
-            tempfile.TemporaryFile(mode="w+t", encoding="ascii") as missing_ids:
+    # Finish paging before writes change the namespace being compared. Spool
+    # only missing ids; the full walk and temporary disk use are not bounded
+    # by page_rows. These observations do not represent a shared snapshot.
+    with tempfile.TemporaryFile(mode="w+t", encoding="ascii") as missing_ids:
         while live_id is not None or present_id is not None:
             if present_id is None or (live_id is not None and live_id < present_id):
                 live_count += 1
@@ -258,8 +257,6 @@ def search_plane_reconcile(
             elif live_id is None or present_id < live_id:
                 present_count += 1
                 stale_count += 1
-                if apply:
-                    stale_ids.write(present_id + "\n")
                 present_id = _next_or_none(present_ids)
             else:
                 live_count += 1
@@ -270,11 +267,6 @@ def search_plane_reconcile(
         if apply:
             if missing_count and projector is None:
                 raise ValueError("search plane reconcile needs a projector to write missing passages")
-            stale_ids.seek(0)
-            stale_lines = (value.rstrip("\n") for value in stale_ids)
-            while batch := list(islice(stale_lines, delete_rows)):
-                namespace.write(deletes=batch)
-                deleted += len(batch)
             missing_ids.seek(0)
             missing_lines = (value.rstrip("\n") for value in missing_ids)
             while batch := list(islice(missing_lines, delete_rows)):
@@ -284,15 +276,16 @@ def search_plane_reconcile(
         live_count, present_count, stale_count, missing_count, apply,
     )
     return {
-        "status": "ok",
+        "status": "unresolved" if stale_count else "ok",
         "tenant_id": tenant_id,
         "policy_fingerprint": policy_fingerprint,
         "namespace": namespace_name,
         "live_passages": live_count,
         "namespace_rows": present_count,
         "stale": stale_count,
+        "unresolved_stale": stale_count,
         "missing": missing_count,
         "applied": bool(apply),
-        "deleted": deleted,
+        "deleted": 0,
         "written": written,
     }
