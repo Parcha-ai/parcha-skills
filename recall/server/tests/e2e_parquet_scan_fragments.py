@@ -239,6 +239,8 @@ def assert_forget_read_fence(store, logical, scan, tenant, principal, source, pa
     )
     def selected():
         return retrieval._parquet_shards([source], since=None, until=None)
+    empty_ids = {row['artifact_id'] for row in live_parts(store, tenant, source)
+                 if row['row_count'] == 0}
     before, pending = selected()
     assert len(before) == 4 and pending == 0, (before, pending)
     with store.connect() as connection:
@@ -261,12 +263,18 @@ def assert_forget_read_fence(store, logical, scan, tenant, principal, source, pa
     # Existing packed objects contain this parent. All are withheld, and a
     # new worker build must not read its old logical archive either.
     hidden, pending = selected()
-    assert hidden == [] and pending >= 4, (hidden, pending)
+    assert {r['artifact_id'] for r in hidden} == empty_ids and pending >= 4-len(empty_ids), (hidden, pending)
     candidate = parquet_scan.ScanCandidate(tenant, source, before[0]['bucket_start'],
         generation=1, changed_at=datetime.now(timezone.utc), reason='forget')
     assert document['logical_document_id'] not in {
         row['logical_document_id'] for row in scan._documents(candidate)
     }
+    scan._requeue_missing_document(document)
+    with store.connect() as connection:
+        assert connection.execute(
+            "SELECT reason FROM canonical_evidence_document_queue WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s",
+            (tenant, source, parent),
+        ).fetchone()['reason'] == 'forget'
     logical.seed_backfill(tenant_id=tenant, source_id=source, include_existing=True)
     with store.connect() as connection:
         reason = connection.execute(
@@ -284,7 +292,7 @@ def assert_forget_read_fence(store, logical, scan, tenant, principal, source, pa
             (tenant, source, parent),
         )
     hidden, pending = selected()
-    assert hidden == [] and pending == 4, (hidden, pending)
+    assert {r['artifact_id'] for r in hidden} == empty_ids and pending == 4-len(empty_ids), (hidden, pending)
     with store.connect() as connection:
         connection.execute(
             "UPDATE canonical_evidence_documents SET revision=revision-1 WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s",
@@ -502,7 +510,7 @@ def main() -> None:
             principal_id=principal,
             authorized_sources=(source,),
         )._parquet_shards([source], since=None, until=None)
-        assert pending == 0
+        assert pending == 0, (pending, listing)
         listed = {(row["dataset"], row["shard_index"]) for row in listing}
         assert listed == {(row["dataset"], row["shard_index"]) for row in parts_v2}
         aliases = {
@@ -642,7 +650,7 @@ def main() -> None:
         visible_after_forget, pending_after_forget = BoundCanonicalRetrieval(
             store, tenant_id=tenant, principal_id=principal, authorized_sources=(source,),
         )._parquet_shards([source], since=None, until=None)
-        assert visible_after_forget == []
+        assert all(row['dataset'] == 'actors' for row in visible_after_forget)
         assert pending_after_forget >= 1, pending_after_forget
         forgotten_scan = scan.project_pending(
             tenant_id=tenant, batch_size=4, max_batches=1, compaction_budget=0,

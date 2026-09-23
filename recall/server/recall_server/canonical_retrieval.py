@@ -1460,7 +1460,8 @@ class BoundCanonicalRetrieval:
                 """SELECT tenant_id,source_id,bucket_start,dataset,shard_index,
                           artifact_id,storage_backend,object_key,content_sha256,
                           size_bytes,media_type,encryption,version_id,created_at,
-                          (SELECT count(*) > 0 AND bool_and(
+                          (SELECT (shard.row_count=0 AND count(*)=0)
+                               OR (count(*) > 0 AND bool_and(
                               document.logical_document_id IS NOT NULL
                               AND document.revision=member.revision
                               AND NOT EXISTS (
@@ -1470,7 +1471,7 @@ class BoundCanonicalRetrieval:
                                      AND queued.native_parent_id=document.native_parent_id
                                      AND queued.reason='forget'
                               )
-                           )
+                           ))
                              FROM canonical_parquet_scan_fragment_documents member
                              LEFT JOIN canonical_evidence_documents document
                                ON document.tenant_id=member.tenant_id

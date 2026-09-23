@@ -58,7 +58,7 @@ class UpstreamCompletenessTests(unittest.TestCase):
         self.assertIn('READ ONLY', store.calls[0][0])
 
     def test_pending_units_are_queue_work_and_nonempty_reason_is_truthful(self):
-        row = dict(tenant_id='tenant:test', artifact_id='art_'+'a'*32,
+        row = dict(scan_safe=True, tenant_id='tenant:test', artifact_id='art_'+'a'*32,
             storage_backend='s3', size_bytes=12, media_type='application/vnd.apache.parquet',
             encryption='sse-s3', version_id='r2-sha256-'+'b'*64, created_at='2026-09-23T00:00:00Z',
             source_id='source:test', bucket_start=date(2026,9,1), dataset='documents',

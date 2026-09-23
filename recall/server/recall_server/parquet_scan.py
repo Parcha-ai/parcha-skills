@@ -1198,7 +1198,9 @@ class CanonicalParquetScanProjector:
                    ON CONFLICT(tenant_id,source_id,native_parent_id)
                    DO UPDATE SET
                        generation=canonical_evidence_document_queue.generation+1,
-                       reason='backfill',changed_at=clock_timestamp()""",
+                       reason=CASE WHEN canonical_evidence_document_queue.reason='forget'
+                                   THEN 'forget' ELSE 'backfill' END,
+                       changed_at=clock_timestamp()""",
                 (
                     document["tenant_id"],
                     document["source_id"],
