@@ -1722,6 +1722,16 @@ def main() -> None:
     passage_shadow.add_argument("--tenant", required=True)
     passage_shadow.add_argument("--source", required=True)
     passage_shadow.add_argument("--limit", type=int, default=50)
+    passage_repair = sub.add_parser(
+        "repair-empty-passages",
+        help="dry-run one source's empty passage documents; --apply queues only the inspected batch",
+    )
+    passage_repair.add_argument("--tenant", required=True)
+    passage_repair.add_argument("--source", required=True)
+    passage_repair.add_argument("--limit", type=int, default=25)
+    passage_repair.add_argument("--after", help="logical document cursor from the preceding batch")
+    passage_repair.add_argument("--price-per-mtoken", type=float)
+    passage_repair.add_argument("--apply", action="store_true")
     passage_plan = sub.add_parser(
         "passage-embed-plan",
         help=(
@@ -2395,7 +2405,7 @@ def main() -> None:
                 once=args.once,
             )
         print(json.dumps(result, sort_keys=True))
-    elif args.command == "passage-shadow-diff":
+    elif args.command in {"passage-shadow-diff", "repair-empty-passages"}:
         # The policy per document comes from its stored passage document row;
         # the projector's own policy is only a constructor requirement here.
         projector = CanonicalPassageProjector(
@@ -2404,11 +2414,17 @@ def main() -> None:
             policy=PassagePolicy(target_tokens=1024, overlap_tokens=128),
             bound_tenant_id=args.tenant,
         )
-        result = projector.shadow_diff(
-            tenant_id=args.tenant,
-            source_id=args.source,
-            limit=args.limit,
-        )
+        if args.command == "repair-empty-passages":
+            result = projector.repair_empty(
+                tenant_id=args.tenant, source_id=args.source, limit=args.limit,
+                after=args.after, apply=args.apply, price_per_mtoken=args.price_per_mtoken,
+            )
+        else:
+            result = projector.shadow_diff(
+                tenant_id=args.tenant,
+                source_id=args.source,
+                limit=args.limit,
+            )
         print(json.dumps(result, sort_keys=True))
     elif args.command == "passage-embed-plan":
         with store.connect() as connection:
