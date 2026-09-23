@@ -119,7 +119,8 @@ class ScanStagingConcurrencyTests(unittest.TestCase):
             stack.enter_context(patch('sys.argv', ['stage', *arguments]))
             stack.enter_context(patch('shutil.copyfile', side_effect=lambda src, dst: copy(src, mapped(dst))))
             stack.enter_context(redirect_stderr(self.stderr))
-            exec(compile(script, '<generated-stage>', 'exec'), {})
+            self.stage_namespace = {}
+            exec(compile(script, '<generated-stage>', 'exec'), self.stage_namespace)
 
     def test_four_real_overlapping_tasks_and_readonly_order(self):
         self.stage()

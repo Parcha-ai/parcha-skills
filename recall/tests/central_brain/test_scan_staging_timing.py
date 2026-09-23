@@ -13,31 +13,12 @@ PREFIX = "RECALL_STAGE_TIMING_V1\t"
 
 
 def summary():
-    # Four overlapping one-second lookups: four worker-seconds, one wall-second.
-    value = dict(
-        object_count=4,
-        data_count=4,
-        selected_tool_count=0,
-        other_tool_count=0,
-        missing_count=0,
-        slow_1s_count=4,
-        slow_5s_count=0,
-        slowest_kind=0,
-        setup_us=50_000,
-        wall_us=1_100_000,
-        covered_us=1_050_000,
-        task_max_us=1_000_000,
-    )
+    # Four overlapping one-second lookups: sums are worker time, not wall time.
+    value = dict(object_count=4, slow_1s_count=4, slow_5s_count=0,
+                 task_max_us=1_000_000)
     for phase in ("lookup", "local", "bind", "remount"):
-        value.update(
-            {f"{phase}_{metric}_us": 0 for metric in ("sum", "max", "union", "slowest")}
-        )
-    value.update(
-        lookup_sum_us=4_000_000,
-        lookup_max_us=1_000_000,
-        lookup_union_us=1_000_000,
-        lookup_slowest_us=1_000_000,
-    )
+        value.update({f"{phase}_{metric}_us": 0 for metric in ("sum", "max")})
+    value.update(lookup_sum_us=4_000_000, lookup_max_us=1_000_000)
     return value
 
 
@@ -66,7 +47,9 @@ class StagingTimingTests(unittest.TestCase):
         self.assertIn("stage_ms=2000.000", row)
         self.assertIn("program_ms=2000.000", row)
         self.assertIn("lookup_sum_us=4000000", row)
-        self.assertIn("lookup_union_us=1000000", row)
+        self.assertIn("lookup_max_us=1000000", row)
+        self.assertNotIn("union", row)
+        self.assertEqual(len(summary()), 12)
         self.assertIn("valid=1", row)
 
     def test_invalid_duplicate_and_oversized_summary_unknown_only(self):
@@ -78,13 +61,17 @@ class StagingTimingTests(unittest.TestCase):
         ]
         for key, value in [
             ("object_count", 514),
-            ("missing_count", 5),
-            ("covered_us", 1_200_000),
+            ("slow_1s_count", 5),
+            ("task_max_us", 3_600_000_001),
             ("lookup_max_us", True),
             ("bind_sum_us", -1),
             ("slow_5s_count", 5),
-            ("wall_us", float("nan")),
-            ("lookup_union_us", 4_000_000),
+            ("task_max_us", float("nan")),
+            ("lookup_sum_us", 5_000_000),
+            ("local_max_us", 1_000_001),
+            ("slow_1s_count", 0),
+            ("slow_5s_count", 1),
+            ("covered_us", 1_000_000),
         ]:
             cases.append(json.dumps(dict(summary(), **{key: value})))
         cases.append(
@@ -139,8 +126,6 @@ class StagingTimingTests(unittest.TestCase):
                 self.assertEqual(value["object_count"], len(case.items))
                 self.assertGreaterEqual(value[f"{phase}_sum_us"], 9 * 35_000)
                 self.assertGreaterEqual(value[f"{phase}_max_us"], 35_000)
-                self.assertLessEqual(value["covered_us"], value["wall_us"])
-                self.assertGreaterEqual(value["covered_us"] / value["wall_us"], 0.90)
                 self.assertEqual(case.completed, 9)
                 self.assertLessEqual(case.peak, 4)
                 self.assertEqual(len(case.calls), 18)
@@ -200,13 +185,9 @@ class StagingTimingTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertLess(len(rows[0]), 4096)
         value = json.loads(rows[0][len(PREFIX) :])
-        self.assertEqual(
-            (value["object_count"], value["data_count"], value["missing_count"]),
-            (513, 511, 1),
-        )
-        self.assertEqual(
-            (value["selected_tool_count"], value["other_tool_count"]), (1, 1)
-        )
+        self.assertEqual(value["object_count"], 513)
+        self.assertEqual(set(value), set(summary()))
+        self.assertIn("objects_unavailable\t1", case.stderr.getvalue())
         self.assertEqual(case.completed, 512)
         self.assertLessEqual(case.peak, 4)
         self.assertFalse(any(item.object_key in rows[0] for item in case.items))
@@ -218,7 +199,9 @@ class StagingTimingTests(unittest.TestCase):
         case = fixture.ScanStagingConcurrencyTests()
         case.setUp()
         self.addCleanup(case.doCleanups)
-        case.stage(scan=False, delay=0.001)
+        with patch("time.monotonic_ns", side_effect=AssertionError("non-scan timing")):
+            case.stage(scan=False, delay=0.001)
+        self.assertNotIn("stage_times", case.stage_namespace)
         self.assertNotIn(PREFIX, case.stderr.getvalue())
         self.assertEqual(case.peak, 1)
 
