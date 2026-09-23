@@ -113,6 +113,6 @@ def dimension_status(results: list[ProbeResult]) -> str:
         return "failed"
     if "degraded" in statuses:
         return "degraded"
-    if any(g.passed is False for r in results for g in r.gates):
+    if any(g.passed is not True for r in results for g in r.gates):
         return "degraded"
     return "ok"
