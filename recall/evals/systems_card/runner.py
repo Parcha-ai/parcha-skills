@@ -91,6 +91,20 @@ def build_card(
             "gates_unknown": gates_unknown,
         },
         "dimensions": dimensions,
+        "coverage": {
+            "omitted_dimensions": [name for name in DIMENSIONS if not by_dimension[name]],
+            "skipped_probes": sorted(r.name for r in results if r.status == "skipped"),
+            # Coverage is not a production-readiness verdict: SLOs and sustained
+            # operational evidence still need their own acceptance.
+            "all_probes_verified": (
+                overall == "ok" and gates_unknown == 0
+                and all(by_dimension[name] for name in DIMENSIONS)
+                and not any(r.status == "skipped" for r in results)
+                and {r.name for r in results} == {
+                    probe.name for probes in PROBES.values() for probe in probes
+                }
+            ),
+        },
         "pins": {
             **git_pin(repo_root),
             "python": platform.python_version(),
@@ -257,7 +271,7 @@ def main(argv: list[str] | None = None) -> int:
         card = run_card(args)
         overall = card["overall"]
         print(json.dumps({"status": overall["status"], "gates_passed": overall["gates_passed"], "gates_failed": overall["gates_failed"], "output_dir": args.output_dir}, sort_keys=True))
-        return 0 if overall["status"] != "failed" else 1
+        return 0 if overall["status"] == "ok" and overall["gates_unknown"] == 0 else 1
     if args.command == "summary":
         print(
             summary_from_output_dir(
