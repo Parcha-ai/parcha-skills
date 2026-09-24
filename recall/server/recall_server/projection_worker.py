@@ -200,24 +200,16 @@ def run_projection_worker(
                     elif isinstance(value, int):
                         total[key] = int(total.get(key, 0)) + value
 
-            def publish_ready():
-                nonlocal active_phase, phase_started
-                nonlocal passage_elapsed_ms, search_plane_elapsed_ms
+            search_ticks = 0
+
+            def publish_search():
+                nonlocal active_phase, phase_started, search_ticks
+                nonlocal search_plane_elapsed_ms
                 previous_phase, previous_started = active_phase, phase_started
-                publication_started = clock()
-                if previous_phase == "logical":
+                if previous_phase == "passage":
+                    phase_elapsed["passage_elapsed_ms"] = passage_elapsed_ms + elapsed_ms(previous_started)
+                elif previous_phase == "logical":
                     phase_elapsed["logical_elapsed_ms"] = elapsed_ms(previous_started)
-                active_phase = "passage"
-                phase_started = clock()
-                tick = passages.project_pending(
-                    tenant_id=tenant_id,
-                    batch_size=passage_batch_size,
-                    max_batches=max_batches_per_cycle,
-                    concurrency=passage_concurrency,
-                )
-                passage_elapsed_ms += elapsed_ms(phase_started)
-                phase_elapsed["passage_elapsed_ms"] = passage_elapsed_ms
-                accumulate(projected, tick)
                 active_phase = "search_plane"
                 phase_started = clock()
                 tick = (
@@ -231,9 +223,44 @@ def run_projection_worker(
                 search_plane_elapsed_ms += elapsed_ms(phase_started) if search_plane is not None else 0
                 phase_elapsed["search_plane_elapsed_ms"] = search_plane_elapsed_ms
                 accumulate(searched, tick)
+                search_ticks += 1
+                # Owner phase wall time excludes search callbacks, although
+                # owners can keep preparing and committing during publication.
+                if previous_phase in {"passage", "logical"}:
+                    previous_started += clock() - phase_started
+                if previous_phase == "passage":
+                    # The snapshot above is needed if search fails. Once it
+                    # succeeds, an eventual passage failure adds its whole
+                    # current tick to completed ticks, not to that snapshot.
+                    phase_elapsed["passage_elapsed_ms"] = passage_elapsed_ms
+                elif previous_phase == "logical":
+                    phase_elapsed["logical_elapsed_ms"] = 0
+                active_phase, phase_started = previous_phase, previous_started
+
+            def publish_ready():
+                nonlocal active_phase, phase_started, passage_elapsed_ms
+                previous_phase, previous_started = active_phase, phase_started
+                publication_started = clock()
                 if previous_phase == "logical":
-                    # Phase counters partition coordinator time; logical tasks
-                    # can keep working while this publication tick runs.
+                    phase_elapsed["logical_elapsed_ms"] = elapsed_ms(previous_started)
+                active_phase = "passage"
+                phase_started = clock()
+                before_search_ticks = search_ticks
+                tick = passages.project_pending(
+                    tenant_id=tenant_id,
+                    batch_size=passage_batch_size,
+                    max_batches=max_batches_per_cycle,
+                    concurrency=passage_concurrency,
+                    on_progress=publish_search if search_plane is not None else None,
+                )
+                passage_elapsed_ms += elapsed_ms(phase_started)
+                phase_elapsed["passage_elapsed_ms"] = passage_elapsed_ms
+                accumulate(projected, tick)
+                phase_started = clock()
+                if search_ticks == before_search_ticks:
+                    # Drain pre-existing outbox work even when passages were idle.
+                    publish_search()
+                if previous_phase == "logical":
                     previous_started += clock() - publication_started
                 active_phase, phase_started = previous_phase, previous_started
 
@@ -251,6 +278,7 @@ def run_projection_worker(
                 max_wait_seconds=max_wait_seconds,
                 cleanup_concurrency=cleanup_concurrency,
                 on_progress=publish_ready,
+                on_heartbeat=publish_search if search_plane is not None else None,
             )
             logical_elapsed_ms = elapsed_ms(phase_started)
             phase_elapsed["logical_elapsed_ms"] = logical_elapsed_ms

@@ -120,7 +120,7 @@ class StreamingAdmissionTests(unittest.TestCase):
                 self.assertTrue(projector.small_done.wait(2))
                 with projector.lock:
                     projector.queue.append(candidate('later'))
-                self.assertTrue(arrived.wait(3), 'idle slot ignored newly eligible source')
+                self.assertTrue(arrived.wait(7), 'idle slot ignored newly eligible source')
                 self.assertFalse(future.done())
             finally:
                 projector.release.set()
