@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -332,8 +333,17 @@ class BrainStore:
         with self.connect():
             pass
         assert self._pool is not None
-        self._pool.resize(minimum_size, self.pool_max_size)
-        self._pool.wait(timeout=timeout)
+        # Pool.wait() is a startup gate: on timeout it closes the entire pool,
+        # including a long-running worker's reusable pool. Borrow the desired
+        # capacity instead, so active parents can coexist with publication and
+        # temporary contention leaves the next cycle able to connect.
+        deadline = time.monotonic() + timeout
+        with ExitStack() as connections:
+            for _ in range(minimum_size):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise PoolTimeout("database pool warmup timed out")
+                connections.enter_context(self._pool.connection(timeout=remaining))
 
     def flush_authorization_audit(self) -> int:
         """Force every queued allowed-decision audit row to the database."""
