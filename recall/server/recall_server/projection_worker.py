@@ -424,9 +424,10 @@ def run_projection_worker(
                 "cleanup_failures": int(documents["cleanup_failures"]),
                 "logical_cleanup_completed": int(documents.get("cleanup_completed", 0)),
                 "logical_cleanup_pending": int(documents.get("cleanup_pending", 0)),
-            "logical_failed": int(documents.get("failed", 0)),
-            "logical_backoff": int(documents.get("backoff", 0)),
-            "logical_quarantined": int(documents.get("quarantined", 0)),
+                "logical_source_races": int(documents.get("source_races", 0)),
+                "logical_failed": int(documents.get("failed", 0)),
+                "logical_backoff": int(documents.get("backoff", 0)),
+                "logical_quarantined": int(documents.get("quarantined", 0)),
                 "old_objects_deleted": int(documents.get("old_objects_deleted", 0)),
                 "search_outbox_pending": search_outbox_queued,
                 "cycle_elapsed_ms": elapsed_ms(cycle_started),
@@ -466,7 +467,7 @@ def run_projection_worker(
                 "stale=%s pruned=%s "
                 "cleanup_failures=%s "
                 "logical_cleanup_completed=%s logical_cleanup_pending=%s "
-            "logical_failed=%s logical_backoff=%s logical_quarantined=%s "
+                "logical_source_races=%s logical_failed=%s logical_backoff=%s logical_quarantined=%s "
                 "old_objects_deleted=%s search_outbox_pending=%s "
                 "cycle_elapsed_ms=%s embed_elapsed_ms=%s passage_elapsed_ms=%s "
                 "logical_elapsed_ms=%s parquet_elapsed_ms=%s "
@@ -518,6 +519,7 @@ def run_projection_worker(
                         "cleanup_failures",
                         "logical_cleanup_completed",
                         "logical_cleanup_pending",
+                        "logical_source_races",
                         "logical_failed",
                         "logical_backoff",
                         "logical_quarantined",
