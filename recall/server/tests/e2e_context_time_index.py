@@ -15,6 +15,7 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo
 SERVER = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(SERVER.parent), str(SERVER)]
 from e2e_logical_evidence_projection import insert_record, insert_source  # noqa:E402
+from recall_server import SCHEMA_VERSION  # noqa:E402
 from recall_server.capabilities import probe_database  # noqa:E402
 from recall_server.canonical_retrieval import BoundCanonicalRetrieval  # noqa:E402
 from recall_server.context_time_index import ensure_context_time_index  # noqa:E402
@@ -68,6 +69,8 @@ def main():
                 connection.execute('ANALYZE '+table)
             connection.execute('DROP INDEX canonical_passages_reconcile_idx')
             connection.execute('DELETE FROM schema_migrations WHERE version=70')
+            initial_versions = [row['version'] for row in connection.execute('SELECT version FROM schema_migrations ORDER BY version').fetchall()]
+            assert 71 in initial_versions and 70 not in initial_versions
             connection.execute(sql.SQL('CREATE ROLE {} LOGIN PASSWORD {}').format(sql.Identifier(role), sql.Literal(password)))
             connection.execute(sql.SQL('GRANT USAGE ON SCHEMA public TO {}').format(sql.Identifier(role)))
             connection.execute(sql.SQL('GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA public TO {}').format(sql.Identifier(role)))
@@ -78,7 +81,7 @@ def main():
         app = BrainStore(app_dsn, search_deadline_ms=30000)
         reader = BoundCanonicalRetrieval(app, tenant_id=tenant, principal_id=owner, authorized_sources=(source,))
         receipt = f'recall://{source}/event-0600?rev=1#item=0'
-        assert probe_database(app_dsn, profile='local-fixture')['schema_version'] == 69
+        assert probe_database(app_dsn, profile='local-fixture')['schema_version'] == SCHEMA_VERSION
         assert ensure_context_time_index(app_dsn)['status'] == 'absent'
         denied = ensure_context_time_index(app_dsn, apply=True, timeout_seconds=5)
         assert denied['status'] == 'inspect_required' and denied['error_class'] == 'InsufficientPrivilege', denied
@@ -100,7 +103,7 @@ def main():
         after, new_work = measured_context(app, reader, receipt)
         assert before == after and old_work >= 500 and new_work <= 10, (old_work, new_work)
         assert ensure_context_time_index(dsn, apply=True)['action'] == 'already_ready'
-        assert probe_database(app_dsn, profile='local-fixture')['schema_version'] == 69
+        assert probe_database(app_dsn, profile='local-fixture')['schema_version'] == SCHEMA_VERSION
         with psycopg.connect(dsn, autocommit=True) as admin:
             admin.execute('DROP INDEX CONCURRENTLY public.canonical_events_context_time_idx')
         # A prior writer forces the concurrent build to wait after publishing its
@@ -129,10 +132,10 @@ def main():
         with store.connect() as connection:
             store._migrate_concurrently(connection, (SERVER/'schema/070b_reconcile_passage_ids_concurrent.sql').read_text())
             connection.execute((SERVER/'schema/070_reconcile_passage_ids.sql').read_text())
-        assert probe_database(app_dsn, profile='local-fixture')['schema_version'] == 70
+        assert probe_database(app_dsn, profile='local-fixture')['schema_version'] == SCHEMA_VERSION
         assert reader.session_context(receipt, before=2, after=2) == before
         print(json.dumps(dict(status='pass', old_event_rows=old_work, indexed_event_rows=new_work,
-                              exact_timestamp_and_native_order=True, schema69_and70_unchanged=True,
+                              exact_timestamp_and_native_order=True, required_schema_and_optional70_unchanged=True,
                               least_privilege_build_refused=True, wrong_collation_and_opclass_refused=True,
                               serving_continues_during_build=True,
                               canceled_build_invalid_then_refused=True, explicit_cleanup_then_rebuild=True)))
