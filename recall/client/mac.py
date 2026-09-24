@@ -40,10 +40,9 @@ V2_IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._/@+-]{1,255}\Z")
 MAX_INGEST_BYTES = 8_000_000
 MAX_INGEST_EVENTS = 500
 MAX_CANONICAL_INGEST_EVENTS = 1_000
-# Base64 plus the largest valid identity envelope stays below the server's
-# 12 MiB HTTP boundary. This covers incompressible oversized transcript rows
-# without weakening the request bound.
-MAX_CANONICAL_ARCHIVE_BYTES = 9_000_000
+# Keep small uploads compatible with the original 12 MiB JSON/base64 envelope.
+# Larger payloads use binary transport; this is not an archive size cap.
+JSON_CANONICAL_ARCHIVE_BYTES = 9_000_000
 MAX_CANONICAL_ARCHIVE_ATTEMPTS = 5
 MAX_EXPORT_BYTES = 256_000_000
 MAX_ARCHIVE_MEMBERS = 10_000
@@ -491,7 +490,7 @@ class CanonicalArchiveClient(_CanonicalClient):
     ) -> dict[str, Any]:
         if tenant_id != self.tenant_id or source_id != self.source_id:
             raise PermissionError("canonical archive scope mismatch")
-        if not isinstance(payload, bytes) or len(payload) > MAX_CANONICAL_ARCHIVE_BYTES:
+        if not isinstance(payload, bytes):
             raise ValueError("canonical archive payload is invalid")
         if not isinstance(native_id, str) or not V2_IDENTITY.fullmatch(native_id):
             raise ValueError("canonical archive identity is invalid")
@@ -500,14 +499,29 @@ class CanonicalArchiveClient(_CanonicalClient):
             "principal_id": self.principal_id,
             "source_id": self.source_id,
             "native_id": native_id,
-            "payload_base64": base64.b64encode(payload).decode(),
             "media_type": media_type,
             "created_at": created_at,
         }
+        binary = len(payload) > JSON_CANONICAL_ARCHIVE_BYTES
+        if binary:
+            body["content_sha256"] = hashlib.sha256(payload).hexdigest()
+            request = urllib.request.Request(
+                self.endpoint + "/v2/archive/objects", data=payload, method="POST",
+                headers={
+                    "Authorization": "Bearer " + self.token,
+                    "Content-Type": "application/octet-stream",
+                    "X-Recall-Archive-Metadata": json.dumps(body, separators=(",", ":")),
+                },
+            )
+        else:
+            body["payload_base64"] = base64.b64encode(payload).decode()
         for attempt in range(MAX_CANONICAL_ARCHIVE_ATTEMPTS):
             retryable = False
             last_error = None
             try:
+                if binary:
+                    with open_no_redirect(request, timeout=60) as response:
+                        return json.loads(response.read())
                 return self._request("/v2/archive/objects", body=body)
             except urllib.error.HTTPError as error:
                 last_error = error

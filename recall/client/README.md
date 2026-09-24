@@ -6,7 +6,33 @@ the same versioned envelopes as the Linux collector. It never discovers source
 paths automatically: each supported database, export, or root must be selected
 by the owner, and unsupported application-private stores remain out of scope.
 
-## Build the reproducible macOS bundle
+## Download the macOS bundle
+
+The **Recall macOS** workflow builds an Apple Silicon bundle containing the
+compiled **Recall Brain.app**, collector code and pinned Python runtime. Download
+the `recall-brain-macos-arm64-<commit>` artifact from the successful workflow run
+for the approved release commit. Unzip the artifact, verify its checksum, and
+unpack the tarball:
+
+```bash
+shasum -a 256 -c recall-brain-macos-arm64.tar.gz.sha256
+tar -xzf recall-brain-macos-arm64.tar.gz
+cd recall-brain-macos
+```
+
+The bundle needs macOS 14+ on Apple Silicon; teammates do not need Python or
+Xcode installed. `MANIFEST.json` records the source commit and every packaged
+file. CI checks the extracted app signature and self-test, imports every bundled
+Python module without repository/site packages, and exercises a clean no-load
+installation. CI artifacts expire after 30 days; the release owner should retain
+the exact approved tarball and checksum as release assets.
+
+The current app is ad-hoc signed, not Apple-notarized. The checksum and manifest
+provide integrity checks, not publisher identity or automatic Gatekeeper
+acceptance. A broadly distributed signed/notarized release still needs Apple
+Developer ID signing and a real downloaded-app launch witness.
+
+## Build the reproducible macOS bundle (maintainers)
 
 ```bash
 python3 scripts/build_macos_package.py \
@@ -14,7 +40,10 @@ python3 scripts/build_macos_package.py \
   --output dist/recall-brain-macos.tar.gz
 ```
 
-Two builds from the same tree are byte-identical. `MANIFEST.json` records every
+For a release bundle, pass `--native-app "/path/to/Recall Brain.app"` and
+`--source-revision <full-git-sha>` after building with `client/macos_admin/build.sh`
+on a Mac. Two builds from the same tree, runtime and precompiled app are
+byte-identical. `MANIFEST.json` records every
 bundle file's byte count and SHA-256, and installation stops before changing the
 prefix if any entry or the package closure differs. This is corruption/tamper
 detection, not publisher code signing. The bundle carries its pinned arm64
@@ -32,11 +61,10 @@ current bundle and prepare the sources you want to share without starting them:
 ./install.sh --endpoint https://recall-mcp-parcha.onrender.com \
   --host-id your-unique-mac-name --keychain-service ai.parcha.recall \
   --visibility private --sources claude-code,codex --privacy-mode scrub --no-load
-./macos_admin/build.sh
-open "macos_admin/dist/Recall Brain.app"
+open "Recall Brain.app"
 ```
 
-Building the native utility requires Xcode 16 or newer. In **Recall Brain**,
+In the precompiled **Recall Brain** app,
 check the server address (upgrades retain your previous setting), choose
 **Sign in with browser**, and use that same account. Select the company
 destination and enable Claude Code or
@@ -58,8 +86,8 @@ collector provisioning; this Mac flow adds no shared access key.
 
 After enabling collection, inspect `recall-brain mac-status`, check the company's
 collector heartbeat, and confirm a newly recorded turn is retrievable through
-your own MCP identity. Native verification requires macOS 14+: run
-`client/macos_admin/build.sh`, then exercise browser sign-in, cancellation,
+your own MCP identity. Native release verification requires macOS 14+: launch the downloaded app,
+then exercise browser sign-in, cancellation,
 source enrollment and Keychain-backed collection on that Mac.
 
 Run a content-free inventory before enabling collection:
@@ -160,13 +188,9 @@ creates a source-scoped route. It atomically retains the LaunchAgent while
 binding that collector to the canonical tenant writer; the next resume writes
 raw objects through the configured archive and ACKs only after canonical ingest.
 
-The bundle also carries a SwiftUI member and administrator utility. Build it on an Apple Silicon
-Mac with Xcode 16 or newer:
-
-```bash
-./macos_admin/build.sh
-open "macos_admin/dist/Recall Brain.app"
-```
+The release bundle carries the compiled SwiftUI member and administrator
+utility. Open `Recall Brain.app` from the unpacked bundle. Maintainers rebuilding
+the utility use `macos_admin/build.sh` with Xcode 16 or newer.
 
 The Mac switchboard uses the same `/admin/api/v1` contract as the web UI. It
 stores source credentials and optional administrator keys only in Keychain.
@@ -302,3 +326,10 @@ ChatGPT does not connect directly to a local MCP server. Use an approved remote
 MCP deployment or OpenAI's Secure MCP Tunnel adapter instead; do not reuse a
 local host's source credential for that bridge. See OpenAI's
 [developer mode and MCP documentation](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt).
+
+Canonical archive uploads retain the JSON/base64 wire format for small objects.
+Larger objects use a binary body on the same `/v2/archive/objects` endpoint; the
+server verifies the declared digest and uses the archive store's configured size
+bound. This removes the former 9 MB client transport ceiling without changing
+archive references or source/forget authorization. Deploy the server before
+rolling out collectors that need the binary path.

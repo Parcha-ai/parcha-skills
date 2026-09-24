@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A least-privilege runtime serves schema69 before optional index070 is applied."""
+"""A least-privilege runtime serves required schema before optional index070 is applied."""
 from pathlib import Path
 import json
 import os
@@ -16,6 +16,7 @@ SERVER = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(SERVER.parent), str(SERVER)]
 from e2e_archive_reprojection import fixture  # noqa: E402
 from e2e_logical_source_integrity import TrackedStore  # noqa: E402
+from recall_server import SCHEMA_VERSION  # noqa: E402
 from recall_server.capabilities import CapabilityError, probe_database  # noqa: E402
 from recall_server.canonical_retrieval import BoundCanonicalRetrieval  # noqa: E402
 from recall_server.db import BrainStore  # noqa: E402
@@ -37,6 +38,8 @@ def scenario(admin_dsn, root, retired):
             port = conn.info.port
             conn.execute('DROP INDEX canonical_passages_reconcile_idx')
             conn.execute('DELETE FROM schema_migrations WHERE version=70')
+            initial_versions = [row['version'] for row in conn.execute('SELECT version FROM schema_migrations ORDER BY version')]
+            assert 71 in initial_versions and 70 not in initial_versions
             conn.execute(sql.SQL('CREATE ROLE {} LOGIN PASSWORD {}').format(identifier, sql.Literal(password)))
             conn.execute(sql.SQL('GRANT USAGE ON SCHEMA public TO {}').format(identifier))
             conn.execute(sql.SQL('GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA public TO {}').format(identifier))
@@ -45,7 +48,7 @@ def scenario(admin_dsn, root, retired):
             conn.execute("INSERT INTO canonical_source_grants VALUES(%s,'principal:reprojection',%s,'owner',now())", (tenant, source))
         app_dsn = f'postgresql://{role}:{password}@127.0.0.1:{port}/{database}'
         result = probe_database(app_dsn, profile='local-fixture')
-        assert result['schema_version'] == 69
+        assert result['schema_version'] == SCHEMA_VERSION
         assert result['postgres_vector_plane'] == ('retired' if retired else 'present')
         runtime = BrainStore(app_dsn, search_deadline_ms=30000)
         reader = BoundCanonicalRetrieval(runtime, tenant_id=tenant, principal_id='principal:reprojection', authorized_sources=(source,))
@@ -57,12 +60,13 @@ def scenario(admin_dsn, root, retired):
         with store.connect() as conn:
             # Serving/probing did not apply migrations or create the index.
             assert conn.execute("SELECT to_regclass('canonical_passages_reconcile_idx') AS value").fetchone()['value'] is None
-            assert conn.execute('SELECT max(version) AS n FROM schema_migrations').fetchone()['n'] == 69
+            assert [row['version'] for row in conn.execute('SELECT version FROM schema_migrations ORDER BY version')] == initial_versions
             store._migrate_concurrently(conn, (SERVER/'schema/070b_reconcile_passage_ids_concurrent.sql').read_text())
             conn.execute((SERVER/'schema/070_reconcile_passage_ids.sql').read_text())
             index = conn.execute("SELECT indisvalid,indisready FROM pg_index WHERE indexrelid='canonical_passages_reconcile_idx'::regclass").fetchone()
             assert index['indisvalid'] and index['indisready']
-        assert probe_database(app_dsn, profile='local-fixture')['schema_version'] == 70
+            assert [row['version'] for row in conn.execute('SELECT version FROM schema_migrations ORDER BY version')] == sorted(initial_versions + [70])
+        assert probe_database(app_dsn, profile='local-fixture')['schema_version'] == SCHEMA_VERSION
         assert reads() == before, 'optional index changed exact reads'
         with psycopg.connect(app_dsn) as app:
             try:
@@ -97,7 +101,7 @@ def main():
                             RECALL_TPUF_CLIENT_FACTORY='tests.central_brain.fake_turbopuffer:factory',
                             RECALL_TPUF_FAKE_STATE=str(root/'fake-turbopuffer.json')):
                 scenario(os.environ['RECALL_DATABASE_URL'], root, retired)
-    print(json.dumps(dict(status='pass', schema69_before_index=True, schema70_after_explicit_migration=True,
+    print(json.dumps(dict(status='pass', required_schema_before_index=True, optional70_after_explicit_migration=True,
                           both_search_planes=True, least_privilege_preserved=True, exact_read_pairs=6)))
 
 

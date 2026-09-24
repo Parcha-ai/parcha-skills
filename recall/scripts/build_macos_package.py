@@ -8,6 +8,8 @@ import io
 import json
 import os
 import posixpath
+import plistlib
+import re
 import stat
 import tarfile
 import tempfile
@@ -211,7 +213,39 @@ def application_payloads(source_root: Path, runtime_lock_data: bytes) -> dict[st
     return selected
 
 
-def manifest(payloads: dict[str, Payload], lock: dict[str, Any]) -> bytes:
+def native_app_payloads(app: Path) -> dict[str, Payload]:
+    """Include the compiled app without rebuilding or altering signed bytes."""
+    if app.is_symlink() or not app.is_dir():
+        raise ValueError("native app must be a regular directory, not a symlink")
+    selected = {}
+    for source in sorted(app.rglob("*")):
+        if source.is_symlink():
+            raise ValueError("native app cannot contain symlinks")
+        if source.is_dir():
+            continue
+        if not source.is_file():
+            raise ValueError("native app contains a non-regular file")
+        selected["Recall Brain.app/" + source.relative_to(app).as_posix()] = Payload(
+            data=source.read_bytes(), executable=bool(source.stat().st_mode & 0o111),
+        )
+    prefix = "Recall Brain.app/Contents/"
+    executable = selected.get(prefix + "MacOS/RecallBrainAdmin")
+    if (executable is None or not executable.executable or executable.data is None
+            or executable.data[:8] != MACHO_64_LITTLE_ENDIAN + CPU_TYPE_ARM64_LITTLE_ENDIAN):
+        raise ValueError("native executable must be arm64 Mach-O")
+    info = selected.get(prefix + "Info.plist")
+    if info is None or not info.data:
+        raise ValueError("native app is missing Info.plist")
+    metadata = plistlib.loads(info.data)
+    if (not isinstance(metadata, dict)
+            or metadata.get("CFBundleExecutable") != "RecallBrainAdmin"
+            or metadata.get("CFBundleIdentifier") != "ai.parcha.recall.admin"
+            or prefix + "_CodeSignature/CodeResources" not in selected):
+        raise ValueError("native app identity or signed resources missing")
+    return selected
+
+
+def manifest(payloads: dict[str, Payload], lock: dict[str, Any], *, source_revision: str | None = None) -> bytes:
     entries = []
     for path, payload in sorted(payloads.items()):
         if payload.linkname is not None:
@@ -231,6 +265,10 @@ def manifest(payloads: dict[str, Payload], lock: dict[str, Any]) -> bytes:
         },
         "files": entries,
     }
+    if source_revision is not None:
+        if not re.fullmatch(r"[0-9a-f]{40}", source_revision):
+            raise ValueError("source revision must be a full Git SHA")
+        value["source_revision"] = source_revision
     return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
 
 
@@ -297,13 +335,16 @@ def render_package(payloads: dict[str, Payload]) -> bytes:
     return destination.getvalue()
 
 
-def build(source_root: Path, output: Path, runtime_archive: Path, runtime_lock: Path) -> None:
+def build(source_root: Path, output: Path, runtime_archive: Path, runtime_lock: Path,
+          *, native_app: Path | None = None, source_revision: str | None = None) -> None:
     lock = read_lock(runtime_lock)
     archive_data = runtime_archive.read_bytes()
     verify_artifact(archive_data, lock)
     payloads = application_payloads(source_root, runtime_lock.read_bytes())
     payloads.update(runtime_payloads(archive_data, lock))
-    payloads["MANIFEST.json"] = Payload(data=manifest(payloads, lock))
+    if native_app is not None:
+        payloads.update(native_app_payloads(native_app))
+    payloads["MANIFEST.json"] = Payload(data=manifest(payloads, lock, source_revision=source_revision))
     package = render_package(payloads)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(output.name + ".tmp")
@@ -329,18 +370,22 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--runtime-lock", type=Path)
     parser.add_argument("--runtime-archive", type=Path)
+    parser.add_argument("--native-app", type=Path, help="Precompiled, codesigned arm64 Recall Brain.app")
+    parser.add_argument("--source-revision", help="Exact source Git SHA recorded in the manifest")
     args = parser.parse_args()
     source_root = args.source_root.resolve()
     runtime_lock = (args.runtime_lock or source_root / "client" / "macos" / "RUNTIME_LOCK.json").resolve()
     try:
         lock = read_lock(runtime_lock)
         if args.runtime_archive:
-            build(source_root, args.output, args.runtime_archive.resolve(), runtime_lock)
+            build(source_root, args.output, args.runtime_archive.resolve(), runtime_lock,
+                  native_app=args.native_app, source_revision=args.source_revision)
         else:
             with tempfile.TemporaryDirectory() as temporary:
                 archive = Path(temporary) / "runtime.tar.gz"
                 download_runtime(lock, archive)
-                build(source_root, args.output, archive, runtime_lock)
+                build(source_root, args.output, archive, runtime_lock,
+                      native_app=args.native_app, source_revision=args.source_revision)
     except (OSError, ValueError) as exc:
         parser.exit(1, f"error: {exc}\n")
     print(json.dumps({"output": str(args.output), "sha256": sha256(args.output.read_bytes())}, sort_keys=True))
