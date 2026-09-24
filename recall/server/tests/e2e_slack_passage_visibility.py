@@ -133,6 +133,7 @@ def main():
                 ).fetchone()
             )
         plan = passages.repair_empty(tenant_id=tenant, source_id=source, limit=2)
+        assert passages.repair_empty(tenant_id=tenant, source_id=source, limit=2, concurrency=4) == plan
         assert plan["read_only"] and plan["queued"] == 0
         assert plan["eligible_documents"] == 1 and plan["archive_bytes"] > 0
         assert (
@@ -178,7 +179,7 @@ def main():
             try:
                 with patch.object(passages, "shadow_diff", return_value=inspected):
                     stale = passages.repair_empty(
-                        tenant_id=tenant, source_id=source, limit=2, apply=True
+                        tenant_id=tenant, source_id=source, limit=2, apply=True, concurrency=4
                     )
                 assert stale["eligible_documents"] == 1 and stale["queued"] == 0, (
                     column,
@@ -200,7 +201,7 @@ def main():
                         (original, *scope),
                     )
         queued = passages.repair_empty(
-            tenant_id=tenant, source_id=source, limit=2, apply=True
+            tenant_id=tenant, source_id=source, limit=2, apply=True, concurrency=4
         )
         assert queued["queued"] == 1
         with store.connect() as con:
@@ -210,7 +211,7 @@ def main():
             ).fetchone()
         assert (
             passages.repair_empty(
-                tenant_id=tenant, source_id=source, limit=2, apply=True
+                tenant_id=tenant, source_id=source, limit=2, apply=True, concurrency=4
             )["queued"]
             == 0
         )
