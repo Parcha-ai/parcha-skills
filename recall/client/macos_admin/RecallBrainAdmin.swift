@@ -137,8 +137,11 @@ final class RecallAdminModel: NSObject, ObservableObject, ASWebAuthenticationPre
         super.init()
     }
 
-    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
-        NSApp.keyWindow ?? NSApp.windows.first ?? NSWindow()
+    nonisolated func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        if Thread.isMainThread {
+            return MainActor.assumeIsolated { NSApp.keyWindow ?? NSApp.windows.first ?? NSWindow() }
+        }
+        return DispatchQueue.main.sync { NSApp.keyWindow ?? NSApp.windows.first ?? NSWindow() }
     }
 
     private static func randomToken() throws -> String {
