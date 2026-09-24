@@ -1027,6 +1027,24 @@ order before their idempotent database write. Keep query embedding on the
 ordinary bounded path and raise worker concurrency only within the provider's
 document rate limits.
 
+### Logical admission and early publication
+
+The projection worker admits source-fair batches, with forget work first, while
+previous parents are still preparing. The executor holds at most one additional
+batch beyond its active owners. `--upload-concurrency` bounds active parent work;
+`--logical-batch-size` times `--max-batches-per-cycle` bounds total admissions.
+One coordinator publishes completed parents through passages and search while
+other parents continue. It also keeps the existing cleanup budget per completed
+admission batch. Failed or raced parents wait for the next cycle.
+
+With one batch per cycle, a giant still bounds that cycle's total work. Increasing
+the existing batch budget lets small parents continue through later batches;
+measure backlog change and acknowledged-record search/open freshness before
+claiming recovery. `logical_source_races` reports discarded stale preparations
+separately from `logical_failed`. These settings do not resolve a parent that
+continually changes during its own preparation, or capacity exhausted by giant
+parents in every executor slot.
+
 ### Dedicated passage embedding worker with a daily cap (H5-2/H5-3)
 
 Measured in production (voyage-4, `RECALL_EMBEDDING_WORKERS=4`), the embedding

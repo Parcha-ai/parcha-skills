@@ -10,6 +10,10 @@ from urllib.parse import urlsplit
 from connectors.sdk import ConnectorContractError, ConnectorRecordV2
 
 
+# Bump when visible message capture changes and historical pages need replay.
+SLACK_MESSAGE_CAPTURE_VERSION = 1
+
+
 SLACK_PUBLIC_HISTORY_USER_SCOPES = (
     "channels:history",
     "channels:read",
@@ -267,6 +271,7 @@ def normalize_slack_user(
 
 
 __all__ = [
+    "SLACK_MESSAGE_CAPTURE_VERSION",
     "SLACK_PUBLIC_HISTORY_USER_SCOPES",
     "normalize_slack_message",
     "normalize_slack_user",

@@ -2076,123 +2076,156 @@ class CanonicalLogicalEvidenceProjector:
         cleanup_failures += int(cleanup["failures"])
         cleanup_completed += int(cleanup["completed"])
         cleanup_pending = int(cleanup["pending"])
-        for _ in range(max_batches):
-            candidates = self._pending(
-                tenant_id=tenant_id,
-                limit=batch_size,
-                quiet_seconds=float(quiet_seconds),
-                max_wait_seconds=float(max_wait_seconds),
-            )
-            if not candidates:
-                break
-            worker_count = min(upload_concurrency, len(candidates))
-            # At most 256 identifiers across all parent uploads. Large batches
-            # can simply omit hints; a failed parent does not repeat siblings.
-            hint_limit = min(32, 256 // len(candidates))
-            # One parent owns preparation through commit. A large parent must
-            # not hold successful siblings behind a shard or batch barrier.
-            stopping = threading.Event()
+        # Queue at most one fair batch beyond active owners. The executor can
+        # keep preparing while this coordinator publishes earlier completions.
+        # max_batches still bounds total admissions, including partial batches.
+        worker_count = min(upload_concurrency, batch_size)
+        # Include queued and completed-but-uncollected uploads in the 256-key
+        # hint budget. The coordinator only refills below worker_count futures.
+        hint_limit = min(32, 256 // (batch_size + worker_count - 1))
+        pending = {}
+        remaining_by_batch = {}
+        deferred = set()
+        stopping = threading.Event()
 
-            def project_parent(candidate):
-                try:
-                    (upload,) = self._prepare_batch_and_upload(
-                        (candidate,), hint_limit=hint_limit,
-                    )
-                except Exception as error:
-                    self._mark_failed(candidate, error)
-                    return None, "failed"
-                if stopping.is_set():
-                    if upload is not None:
-                        self._schedule_upload_cleanup([upload])
-                    return None, "cancelled"
-                try:
-                    return upload, self._commit_upload(candidate, upload)
-                except Exception:
-                    # _commit_upload owns cleanup on ordinary commit failure.
-                    raise
-                except BaseException:
-                    if upload is not None:
-                        self._schedule_upload_cleanup([upload])
-                    raise
+        def parent_key(candidate):
+            return candidate.tenant_id, candidate.source_id, candidate.native_parent_id
 
+        def project_parent(candidate):
             try:
-                with ThreadPoolExecutor(
-                    max_workers=worker_count,
-                    thread_name_prefix="recall-logical-evidence",
-                ) as executor:
-                    pending = {
-                        executor.submit(project_parent, candidate): candidate
-                        for candidate in candidates
-                    }
-                    try:
-                        while pending:
-                            completed, _ = wait(pending, return_when=FIRST_COMPLETED)
-                            publish = False
-                            for future in completed:
-                                candidate = pending.pop(future)
-                                upload, status = future.result()
-                                if status == "failed":
-                                    failed += 1
-                                    continue
-                                publish |= status in {"committed", "repaired", "pruned"}
-                                if status == "stale":
-                                    source_races += 1
-                                    continue
-                                if status == "adopted":
-                                    continue
-                                if status == "repaired":
-                                    repaired += 1
-                                    continue
-                                if status == "pruned":
-                                    pruned += 1
-                                    continue
-                                if status != "committed" or upload is None:
-                                    raise LogicalEvidenceError("logical_evidence_state_invalid")
-                                inline_ids = getattr(upload, "inline_document_ids", ())
-                                if any(not isinstance(value, str) or not 1 <= len(value) <= 255
-                                       for value in (candidate.tenant_id, candidate.source_id)):
-                                    inline_ids = ()
-                                for document_id in inline_ids:
-                                    key = (candidate.tenant_id, candidate.source_id, document_id)
-                                    self._committed_body_keys[key] = None
-                                    if len(self._committed_body_keys) > 256:
-                                        del self._committed_body_keys[next(iter(self._committed_body_keys))]
-                                documents += 1
-                                records += upload.prepared.record_count
-                                receipts += upload.prepared.receipt_count
-                                objects += len(upload.all_references)
-                                bytes_uploaded += sum(
-                                    int(reference["size_bytes"]) for reference in upload.all_references
-                                )
-                            # The coordinator is the sole downstream owner.
-                            # Coalesce completions already ready before another
-                            # bounded publication tick; never call from threads.
-                            if publish and on_progress is not None:
-                                on_progress()
-                    except BaseException:
-                        stopping.set()
-                        for future in pending:
-                            future.cancel()
-                        raise
-            except BaseException:
-                # Executor shutdown first settles active tasks: every upload
-                # is either committed or durably queued for cleanup by its owner.
-                self.drain_cleanup(
-                    tenant_id=tenant_id,
-                    limit=5_000,
-                    concurrency=cleanup_concurrency,
+                (upload,) = self._prepare_batch_and_upload(
+                    (candidate,), hint_limit=hint_limit,
                 )
+            except Exception as error:
+                self._mark_failed(candidate, error)
+                return None, "failed"
+            if stopping.is_set():
+                if upload is not None:
+                    self._schedule_upload_cleanup([upload])
+                return None, "cancelled"
+            try:
+                return upload, self._commit_upload(candidate, upload)
+            except Exception:
+                # _commit_upload owns cleanup on ordinary commit failure.
                 raise
-            batches += 1
-            cleanup = self.drain_cleanup(
+            except BaseException:
+                if upload is not None:
+                    self._schedule_upload_cleanup([upload])
+                raise
+
+        def fill_slots(executor):
+            nonlocal batches
+            while len(pending) < worker_count and batches < max_batches:
+                # Keep the SQL's source-fair and forget-first ordering.
+                # Exclude queued as well as running owners. Overscan only by
+                # these identifiers, never by fetching additional body data.
+                excluded = deferred | {parent_key(item[0]) for item in pending.values()}
+                candidates = self._pending(
+                    tenant_id=tenant_id,
+                    limit=batch_size + len(excluded),
+                    quiet_seconds=float(quiet_seconds),
+                    max_wait_seconds=float(max_wait_seconds),
+                )
+                candidates = [c for c in candidates if parent_key(c) not in excluded][:batch_size]
+                if not candidates:
+                    break
+                batches += 1
+                remaining_by_batch[batches] = len(candidates)
+                for candidate in candidates:
+                    future = executor.submit(project_parent, candidate)
+                    pending[future] = candidate, batches
+
+        try:
+            with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="recall-logical-evidence",
+            ) as executor:
+                try:
+                    fill_slots(executor)
+                    while pending:
+                        # A lone giant must not hide newly eligible sources.
+                        # Wake only when there is an idle slot and unused budget;
+                        # this does not extend the admission budget or add a job.
+                        idle_slot = len(pending) < worker_count and batches < max_batches
+                        completed, _ = wait(
+                            pending, timeout=1.0 if idle_slot else None,
+                            return_when=FIRST_COMPLETED,
+                        )
+                        publish = False
+                        cleanup_rounds = 0
+                        for future in completed:
+                            candidate, batch = pending.pop(future)
+                            upload, status = future.result()
+                            remaining_by_batch[batch] -= 1
+                            if remaining_by_batch[batch] == 0:
+                                del remaining_by_batch[batch]
+                                cleanup_rounds += 1
+                            if status in {"failed", "stale", "adopted"}:
+                                # Do not repeatedly prepare a hot or failed parent
+                                # whose queue generation stayed eligible this call.
+                                deferred.add(parent_key(candidate))
+                            if status == "failed":
+                                failed += 1
+                                continue
+                            publish |= status in {"committed", "repaired", "pruned"}
+                            if status == "stale":
+                                source_races += 1
+                                continue
+                            if status == "adopted":
+                                continue
+                            if status == "repaired":
+                                repaired += 1
+                                continue
+                            if status == "pruned":
+                                pruned += 1
+                                continue
+                            if status != "committed" or upload is None:
+                                raise LogicalEvidenceError("logical_evidence_state_invalid")
+                            inline_ids = getattr(upload, "inline_document_ids", ())
+                            if any(not isinstance(value, str) or not 1 <= len(value) <= 255
+                                   for value in (candidate.tenant_id, candidate.source_id)):
+                                inline_ids = ()
+                            for document_id in inline_ids:
+                                key = (candidate.tenant_id, candidate.source_id, document_id)
+                                self._committed_body_keys[key] = None
+                                if len(self._committed_body_keys) > 256:
+                                    del self._committed_body_keys[next(iter(self._committed_body_keys))]
+                            documents += 1
+                            records += upload.prepared.record_count
+                            receipts += upload.prepared.receipt_count
+                            objects += len(upload.all_references)
+                            bytes_uploaded += sum(
+                                int(reference["size_bytes"]) for reference in upload.all_references
+                            )
+                        # Keep parent preparation running during publication. The
+                        # coordinator remains the sole owner of downstream work.
+                        fill_slots(executor)
+                        if publish and on_progress is not None:
+                            on_progress()
+                        for _ in range(cleanup_rounds):
+                            cleanup = self.drain_cleanup(
+                                tenant_id=tenant_id,
+                                limit=5_000,
+                                concurrency=cleanup_concurrency,
+                            )
+                            old_objects_deleted += int(cleanup["deleted"])
+                            cleanup_failures += int(cleanup["failures"])
+                            cleanup_completed += int(cleanup["completed"])
+                            cleanup_pending = int(cleanup["pending"])
+                except BaseException:
+                    stopping.set()
+                    for future in pending:
+                        future.cancel()
+                    raise
+        except BaseException:
+            # Shutdown settles active owners before cleanup. Cancelled queued
+            # parents never uploaded; active uploads committed or were queued to reap.
+            self.drain_cleanup(
                 tenant_id=tenant_id,
                 limit=5_000,
                 concurrency=cleanup_concurrency,
             )
-            old_objects_deleted += int(cleanup["deleted"])
-            cleanup_failures += int(cleanup["failures"])
-            cleanup_completed += int(cleanup["completed"])
-            cleanup_pending = int(cleanup["pending"])
+            raise
         with self.store.connect() as connection:
             counts = connection.execute(
                 """SELECT count(*) AS queued,

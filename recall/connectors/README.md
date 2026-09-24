@@ -234,8 +234,60 @@ python -m connectors.slack_manifest --events https://recall.example.com
 After adding the user scopes to an existing Slack app, reconnect it once so the
 host receives both authorities. The connector then resets its coverage cursor
 to the epoch and replays public history. Stable Slack message IDs make the
-broader replay idempotent, and only the bot token is used to join active public
-channels or receive live events.
+broader replay idempotent. History requests use the user token; existing bot
+joins for automatically discovered active public channels remain in place to
+preserve live Events membership. A join error still blocks the page and leaves
+its checkpoint unchanged. Read permission alone does not establish Events
+coverage.
+
+The workspace connector records discovered channels and their history progress
+in the existing private SQLite spool. Channel history advances only in the
+same transaction as the final page's Brain acknowledgement, after its detected
+threads have also drained. New channels start from epoch. Channels returning
+after an absent discovery cycle start a new baseline; continuously visible
+channels use their own acknowledged watermark. Discovery streams batches of 50
+without retaining the entire inventory in the bounded API cursor.
+
+V3 cursors resume their existing page and time window without restarting the
+workspace. Legacy pages cannot establish a baseline for the current message
+capture version, even if their old scan started at epoch: earlier pages may
+have used a parser that omitted visible content. They finish and acknowledge
+pending work first, then receive a full epoch replay on the next visit. Already
+completed legacy channels also start unverified because the old global
+watermark is not per-channel evidence. The normalizer owns
+`SLACK_MESSAGE_CAPTURE_VERSION`; bumping it invalidates older channel baselines
+without deleting their ledger, queued pages, or acknowledgement hashes. Every
+page in a baseline must use the current capture version. Changed normalized
+content is ingested under the same native message ID; unchanged records dedupe.
+V1/V2 retain their earlier compatibility migration rules.
+Once a V4 cursor is committed, rollback must retain the V4 cursor reader or use
+a forward fix. A V3-only binary cannot resume that cursor; never reset or delete
+the spool to make an older binary run.
+
+Runner doctor and managed-worker successful-page logs report aggregate coverage:
+known channels, baselined/pending counts, channels discovered/scanned in the
+latest enumeration, completed enumeration counts and oldest proven history
+cutoff. Logs identify the installation by SHA-256 and contain no channel IDs,
+message text or API cursors. A successful page or completed discovery cycle is
+not a claim that all messages are searchable; projection has its own backlog.
+An empty successful channel listing is recorded as empty scope, without
+deleting previously ingested data.
+
+Explicit channel selections filter the coverage counts. After a selection
+change, an earlier inventory completion is reported as unknown until that
+selection has been enumerated. Change configured channel lists between completed
+cycles: changing their length/order mid-cycle is not a supported cursor
+transition (a shorter list can fail cursor validation). This change does not
+discard staged pages or rewrite their acknowledgement ownership.
+
+`historical_mutations_verified` remains false. Incremental history does not
+guarantee discovery of a new reply, edit or deletion on a root older than the
+channel watermark. Initial history scans drain detected threads through the
+fixed cutoff. Signed Events can ingest subsequent revisions and tombstones,
+but must be separately configured and witnessed; polling does not assume they
+are enabled. Slack retention, inaccessible/private channels,
+and DMs remain outside the proven public-history scope. No deletion is inferred
+from a message or channel disappearing from a listing.
 
 ### X activity
 
