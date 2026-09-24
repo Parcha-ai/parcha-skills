@@ -1737,11 +1737,29 @@ class Collector:
         if envelope.get("kind") == "tombstone":
             clean = sanitize(envelope["content"])
         else:
-            privacy = self.privacy.apply(envelope["content"])
+            content = envelope["content"]
+            full_digest = None
+            if (
+                isinstance(content, dict)
+                and content.get("contract") == "recall.oversized-projection.v1"
+                and envelope.get("provenance", {}).get("artifact_ref", {}).get("media_type")
+                == "application/vnd.recall.oversized-record+gzip"
+                and isinstance(content.get("full_content_sha256"), str)
+                and re.fullmatch(r"[0-9a-f]{64}", content["full_content_sha256"])
+            ):
+                # Generated archive metadata can contain a Luhn-valid digit run.
+                # Recheck prose (including head/tail and any extra fields), but
+                # do not redact or drop this digest as a financial identifier.
+                full_digest = content["full_content_sha256"]
+                content = {key: value for key, value in content.items()
+                           if key != "full_content_sha256"}
+            privacy = self.privacy.apply(content)
             if privacy.action == "drop":
                 self.db.execute("DELETE FROM outbox WHERE id=?", (row["id"],))
                 return None
             clean = sanitize(privacy.value)
+            if full_digest is not None:
+                clean["full_content_sha256"] = full_digest
         if clean == envelope["content"]:
             return dict(row)
         old_sha = envelope["content_sha256"]

@@ -1858,6 +1858,98 @@ class CollectorTest(unittest.TestCase):
         self.assertIsInstance(json.loads(uncompressed), dict)
         collector.close()
 
+    def test_oversized_digest_survives_privacy_recheck_on_flush(self) -> None:
+        # This actual SHA contains a Luhn-valid digit run. It is metadata,
+        # though the same text in a user's message must still be scrubbed.
+        expected_digest = "ccdc2310ead052a5571e00fb37422ea79f109860cc115d9bd052757124427255"
+        self.assertIn(
+            "[REDACTED:financial_id]",
+            PrivacyPolicy(mode="scrub").apply(expected_digest).value,
+        )
+        transcript = self.root / "session.jsonl"
+        transcript.write_text(json.dumps({
+            "type": "user", "timestamp": "2026-07-12T22:00:00Z",
+            "message": {"content": "safe " + "x" * 6000}, "nonce": 7,
+        }) + "\n")
+        test = self
+        for mode in ("scrub", "drop"):
+            with self.subTest(privacy_mode=mode):
+                archived, ingested = [], []
+
+                class Archive:
+                    def put_raw(self, **kwargs):
+                        archived.append(kwargs)
+                        return test._reference_for(kwargs, kwargs["payload"])
+
+                class Writer:
+                    def ingest(self, events):
+                        ingested.extend(events)
+                        return {
+                            "status": "committed", "inserted": len(events),
+                            "duplicate_events": 0, "replay": False,
+                            "receipts": [
+                                f"recall://{e['source_id']}/{e['native_id']}?rev=1"
+                                for e in events
+                            ],
+                        }
+
+                collector = Collector(
+                    root=self.root, harness="claude", source_id="claude:linux:test",
+                    spool_path=self.spool.with_name(mode + ".db"),
+                    endpoint=self.endpoint, token="test-token-not-a-secret",
+                    archive=Archive(), brain_writer=Writer(), tenant_id="tenant:personal",
+                    privacy=PrivacyPolicy(mode=mode), defer_scan_flush=True,
+                )
+                self.addCleanup(collector.close)
+                with mock.patch("collector.collector.MAX_BATCH_BYTES", 4_000):
+                    collector.scan()
+                    pending = collector.pending_envelopes()
+                    self.assertEqual(len(pending), 1)
+                    self.assertEqual(pending[0]["content"]["full_content_sha256"], expected_digest)
+                    result = collector.flush()
+                self.assertEqual(result["acked"], 1)
+                self.assertEqual(len(ingested), 1)
+                full = next(item for item in archived if item["media_type"].endswith("+gzip"))
+                actual_digest = hashlib.sha256(gzip.decompress(full["payload"])).hexdigest()
+                self.assertEqual(actual_digest, expected_digest)
+                self.assertEqual(ingested[0]["content"]["full_content_sha256"], actual_digest)
+                self.assertEqual(collector.doctor()["committed_files"], 1)
+
+    def test_oversized_privacy_recheck_still_protects_prose_and_requires_archive_type(self) -> None:
+        digest = "ccdc2310ead052a5571e00fb37422ea79f109860cc115d9bd052757124427255"
+        collector = self.collector()
+        self.addCleanup(collector.close)
+        for mode in ("scrub", "drop"):
+            collector.privacy = PrivacyPolicy(mode=mode)
+            for media_type in ("application/x-ndjson", "application/vnd.recall.oversized-record+gzip"):
+                with self.subTest(privacy_mode=mode, media_type=media_type):
+                    # A contract-shaped transcript is not trusted metadata just
+                    # because it spells the generated projection's field names.
+                    envelope = collector._envelope(
+                        self.root / "session.jsonl", mode + media_type,
+                        "transcript_record", {
+                            "contract": "recall.oversized-projection.v1",
+                            "full_content_sha256": digest,
+                            "head": digest, "tail": digest, "extra": digest,
+                        }, "2026-07-12T22:00:00Z", 0, 1,
+                        artifact_ref={"media_type": media_type},
+                    )
+                    collector._queue(self.root / "session.jsonl", envelope, 1)
+                    row = collector.db.execute(
+                        "SELECT * FROM outbox WHERE native_id=?", (envelope["native_id"],),
+                    ).fetchone()
+                    repaired = collector._repair_pending_envelope(row, repair_artifact=False)
+                    if mode == "drop":
+                        self.assertIsNone(repaired)
+                        continue
+                    content = json.loads(repaired["envelope_json"])["content"]
+                    for field in ("head", "tail", "extra"):
+                        self.assertIn("[REDACTED:financial_id]", content[field])
+                    if media_type.endswith("+gzip"):
+                        self.assertEqual(content["full_content_sha256"], digest)
+                    else:
+                        self.assertIn("[REDACTED:financial_id]", content["full_content_sha256"])
+
     def test_archive_reference_for_other_bytes_is_refused(self) -> None:
         (self.root / "session.jsonl").write_text(claude_line("x" * 10_000))
         test = self
