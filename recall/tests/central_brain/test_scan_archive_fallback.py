@@ -12,7 +12,7 @@ import urllib.error
 from recall_server.deep_inspection import AgentExecObject, _agent_exec_command
 
 class ScanArchiveFallbackTests(unittest.TestCase):
-    def bootstrap(self, *, body=b'PAR1synthetic', returned=None, present=False, status=None):
+    def bootstrap(self, *, body=b'PAR1synthetic', returned=None, present=False, status=None, primary_body=None):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
@@ -22,7 +22,7 @@ class ScanArchiveFallbackTests(unittest.TestCase):
         primary = self.root / 'mnt/archil/evidence' / key
         primary.parent.mkdir(parents=True)
         if present:
-            primary.write_bytes(body)
+            primary.write_bytes(body if primary_body is None else primary_body)
         self.fallback = self.root / 'tmp/recall-agent/fallback' / key
         inventory = json.dumps(dict(objects=[dict(object_key=key, content_sha256=digest)],
             datasets={key: 's1/2026-09/documents-part-00000.parquet'},
@@ -43,11 +43,22 @@ class ScanArchiveFallbackTests(unittest.TestCase):
                 raise urllib.error.HTTPError(url, status, 'PRIVATE-CAPABILITY', {}, None)
             return io.BytesIO(body if returned is None else returned)
         original_path = type(self.root)
+        original_resolve, original_is_file = original_path.resolve, original_path.is_file
         def mapped(*args):
             path = original_path(*args)
             return self.root / str(path).lstrip('/') if path.is_absolute() and not path.is_relative_to(self.root) else path
+
+        def no_archil_probe(method):
+            def checked(path, *args, **kwargs):
+                if path.is_relative_to(self.root / 'mnt/archil/evidence'):
+                    raise AssertionError('bootstrap must download selected catalog bytes without probing Archil')
+                return method(path, *args, **kwargs)
+            return checked
+
         with (mock.patch('urllib.request.build_opener') as opener,
               mock.patch('pathlib.Path', side_effect=mapped),
+              mock.patch.object(original_path, 'resolve', no_archil_probe(original_resolve)),
+              mock.patch.object(original_path, 'is_file', no_archil_probe(original_is_file)),
               mock.patch('sys.argv', ['bootstrap', argv[3]]), contextlib.redirect_stderr(self.stderr)):
             opener.return_value.open.side_effect = opened
             exec(compile(argv[2], '<bootstrap>', 'exec'), {})
@@ -61,10 +72,10 @@ class ScanArchiveFallbackTests(unittest.TestCase):
         self.assertEqual(len(self.calls), 2)
         self.assertEqual(self.stderr.getvalue(), '')
 
-    def test_visible_archil_object_never_downloaded(self):
-        self.bootstrap(present=True)
-        self.assertEqual(len(self.calls), 1)
-        self.assertFalse(self.fallback.exists())
+    def test_visible_archil_does_not_skip_verified_catalog_download(self):
+        self.bootstrap(present=True, primary_body=b'stale Archil bytes')
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(self.fallback.read_bytes(), b'PAR1synthetic')
 
     def test_missing_archive_stays_unavailable(self):
         self.bootstrap(status=404)
@@ -85,6 +96,13 @@ class ScanArchiveFallbackTests(unittest.TestCase):
             self.bootstrap(status=403)
         self.assertEqual(caught.exception.code, 66)
         self.assertEqual(self.stderr.getvalue(), '')
+
+    def test_corrupt_download_does_not_fall_back_to_visible_archil(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.bootstrap(present=True, returned=b'x' * len(b'PAR1synthetic'))
+        self.assertEqual(caught.exception.code, 66)
+        self.assertFalse(self.fallback.exists())
+        self.assertNotIn('PRIVATE-CAPABILITY', self.stderr.getvalue())
 
     def test_trusted_catalog_signer_binds_scope_without_head(self):
         from recall_server.archive import S3ArchiveStore, ArchiveNotFound
@@ -108,9 +126,10 @@ class ScanArchiveFallbackTests(unittest.TestCase):
     def test_bootstrap_to_stage_to_result_recovers_or_reports_missing_truthfully(self):
         from tests.central_brain.test_scan_manifest_staging import ScanManifestStagingTests
         from recall_server.deep_inspection import _execution_result
-        for status in (None, 404):
-            with self.subTest(status=status):
-                self.bootstrap(status=status)
+        for present, status in ((False, None), (False, 404), (True, None), (True, 404)):
+            with self.subTest(present=present, status=status):
+                self.bootstrap(status=status, present=present,
+                    primary_body=b'stale Archil bytes' if present and status is None else None)
                 helper = ScanManifestStagingTests()
                 helper.root = self.root
                 helper.objects, helper.mounts, helper.reads, helper.walks = [], [], [], []
@@ -130,8 +149,12 @@ class ScanArchiveFallbackTests(unittest.TestCase):
                 archived_inventory.write_bytes(raw)
                 stderr = helper.stage(inventory=ref, allow_missing=True)
                 result = _execution_result(dict(stdout='[]', stderr=stderr, exitCode=0, timing={}))
-                self.assertEqual(result['complete'], status is None)
-                self.assertEqual(result['objects_unavailable'], int(status == 404))
+                available = status is None or present
+                self.assertEqual(result['complete'], available)
+                self.assertEqual(result['objects_unavailable'], int(not available))
+                staged = self.root / 'tmp/recall-authorized' / helper.data.object_key
+                if available:
+                    self.assertEqual(staged.read_bytes(), b'PAR1synthetic')
                 self.assertFalse(inventory_path.exists())
                 self.assertFalse((self.root / 'tmp/recall-agent/fallback').exists())
                 self.assertNotIn('PRIVATE-CAPABILITY', result['stderr'])

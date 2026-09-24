@@ -427,7 +427,7 @@ RECALL_ARCHIL_REGION=aws-us-west-2
 ```
 
 Give the evidence R2 credential Object Read & Write access to that evidence
-bucket only, then attach only that bucket to the tenant's read-only Archil disk.
+bucket only, then attach only that bucket to the tenant's Archil disk.
 Do not reuse a bucket or disk across personal and company brains. Validate and
 populate it before enabling the MCP tool:
 
@@ -636,8 +636,19 @@ objects and checks mount escapes, normal subprocess/thread behavior, and
 network namespace routes. It does not prove every possible sandbox escape or
 replace a real DuckDB/provider compatibility check.
 
-At execution time Recall mounts only shards inside the caller's tenant/source grants, stages
-that checksum-pinned binary into the networkless sandbox, and verifies every
+At execution time Recall selects only shards inside the caller's tenant/source grants.
+Before network isolation, it downloads those exact catalog objects through signed
+archive URLs with 16 concurrent workers, verifies their sizes and SHA-256 hashes,
+and binds the local files read-only into the authorized view. A missing archive
+object can still be read from Archil; an object absent in both stores is reported
+unavailable. The writable download aliases and signed inventory are removed
+before the caller's program starts. This avoids repeated remote filesystem
+metadata and Parquet footer reads without limiting the selected inventory.
+
+The outer Archil request uses its default mount mode because `readOnly: true`
+fails delegation check-in on teardown; the inner authorized mounts and capability
+drop enforce the caller's read-only boundary. Recall stages the checksum-pinned
+DuckDB binary into that networkless sandbox and verifies every
 emitted `recall://` receipt against current canonical evidence before returning
 it in `opened_receipts`. The caller's agent writes one shell/DuckDB program; no
 second retrieval agent or model credential runs inside Recall.

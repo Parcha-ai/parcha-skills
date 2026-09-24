@@ -599,6 +599,7 @@ materialized_keys={key for key,alias in datasets.items()
 target=pathlib.Path("/tmp/recall-authorized").resolve()
 docs=pathlib.Path("/tmp/recall-docs").resolve()
 dataset_root=pathlib.Path("/tmp/recall-datasets").resolve()
+local_root=pathlib.Path("/tmp/recall-agent/fallback").resolve()
 target.mkdir(mode=0o700,parents=True,exist_ok=True)
 docs.mkdir(mode=0o700,parents=True,exist_ok=True)
 dataset_root.mkdir(mode=0o700,parents=True,exist_ok=True)
@@ -609,17 +610,19 @@ def stage_object(item):
     relative=pathlib.PurePosixPath(item["object_key"])
     if relative.is_absolute() or ".." in relative.parts:
         raise SystemExit(64)
-    src=(source/pathlib.Path(*relative.parts)).resolve()
-    if source not in src.parents:
+    # Catalog-selected downloads are verified before network isolation. Use
+    # their local bytes so Parquet footer reads do not revisit Archil.
+    local=(local_root/pathlib.Path(*relative.parts)).resolve()
+    if local_root not in local.parents:
         raise SystemExit(64)
-    available=src.is_file()
-    if not available and item["object_key"] in datasets:
-        # Only the trusted bootstrap writes this directory, after verifying
-        # exact catalog bytes. It is removed before user code starts.
-        fallback=(pathlib.Path("/tmp/recall-agent/fallback")/pathlib.Path(*relative.parts)).resolve()
-        if fallback.is_file():
-            src=fallback
-            available=True
+    if item["object_key"] in datasets and local.is_file():
+        src=local
+        available=True
+    else:
+        src=(source/pathlib.Path(*relative.parts)).resolve()
+        if source not in src.parents:
+            raise SystemExit(64)
+        available=src.is_file()
     if datasets: looked_up=time.monotonic_ns()//1000
     if not available:
         if allow_missing and item["object_key"] not in tool_keys:
@@ -663,8 +666,9 @@ if datasets:
 else:
     absent=[stage_object(item) for item in items]
 missing={key for key in absent if key is not None}
+staged_keys={item["object_key"] for item in items}-missing
 # Bind mounts retain their inode after unlink. Remove every writable backing
-# alias, including copies no longer needed because Archil became visible.
+# alias before user code starts, including unused local downloads.
 fallback_root=pathlib.Path("/tmp/recall-agent/fallback")
 if fallback_root.exists():
     shutil.rmtree(fallback_root)
@@ -734,8 +738,9 @@ for object_key,alias in datasets.items():
         raise SystemExit(64)
     if object_key in missing:
         continue
-    src=(target/pathlib.Path(object_key)).resolve()
-    if target not in src.parents or not src.is_file():
+    # Staging has already validated and pinned this file before user code.
+    # Require membership rather than probing the Archil-backed mount again.
+    if object_key not in staged_keys:
         raise SystemExit(66)
     dst=(dataset_root/pathlib.Path(alias)).resolve()
     if dataset_root not in dst.parents:
@@ -801,7 +806,8 @@ try:
     inventory=json.loads(raw)
     fallbacks=inventory.get("fallbacks",{})
     if fallbacks:
-        source=pathlib.Path("/mnt/archil/evidence").resolve()
+        # The inventory field retains its wire name, but verified downloads
+        # are preferred; Archil is consulted only when a download returns 404.
         target=pathlib.Path("/tmp/recall-agent/fallback").resolve()
         hashes={item["object_key"]:item["content_sha256"] for item in inventory["objects"]}
         if set(fallbacks)!=set(inventory["datasets"]):
@@ -812,11 +818,6 @@ try:
                     or key not in hashes or type(ref["size_bytes"]) is not int
                     or ref["size_bytes"]<0 or not ref["url"].startswith("https://")):
                 raise ValueError()
-            path=(source/key).resolve()
-            if source not in path.parents:
-                raise ValueError()
-            if path.is_file():
-                return
             dst=target/key
             dst.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
             partial=dst.with_suffix(".partial")
@@ -843,11 +844,11 @@ try:
             except urllib.error.HTTPError as error:
                 if error.code!=404:
                     raise
-                # An object absent in both stores remains unavailable. Stage
-                # reports it through the existing truthful incomplete result.
+                # Stage can still use Archil. An object absent in both stores
+                # remains unavailable in the truthful incomplete result.
             finally:
                 partial.unlink(missing_ok=True)
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        with ThreadPoolExecutor(max_workers=16) as pool:
             list(pool.map(fetch,fallbacks.items()))
 except Exception:
     # A failed download must never print the signed read capability.
