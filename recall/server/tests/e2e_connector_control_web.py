@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import hashlib
+import base64
 import http.client
 import json
 import os
@@ -210,6 +211,28 @@ def login(server, token):
     session = cookie_value(headers, "recall_admin_session")
     csrf = cookie_value(headers, "recall_admin_csrf")
     return session + "; " + csrf, csrf.split("=", 1)[1]
+
+
+def native_login_code(server, identity, verifier="v" * 43):
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    client_state = "s" * 43
+    status, _, _ = request(server, "GET", "/admin/native/login?" + urlencode({
+        "code_challenge": challenge, "state": client_state,
+    }))
+    assert status == 303
+    oauth_state, _ = identity.starts[-1]
+    status, headers, body = request(server, "GET", "/admin/oauth/callback/identity?" + urlencode({
+        "state": oauth_state, "code": "synthetic-authorization-code",
+    }))
+    if status != 303:
+        return status, body
+    callback = urlsplit(dict(headers)["Location"])
+    assert (callback.scheme, callback.netloc, callback.path) == ("ai.parcha.recall", "oauth", "")
+    assert not any(key.lower() == "set-cookie" for key, _ in headers)
+    query = parse_qs(callback.query)
+    assert set(query) == {"code", "state"} and query["state"] == [client_state]
+    assert not any(value.startswith(("rcs_", "rca_", "rcl_")) for values in query.values() for value in values)
+    return status, query["code"][0]
 
 
 def main():
@@ -678,6 +701,46 @@ def main():
                 "permission": "read",
             }
         ]
+        # Existing members sign in directly, without an invitation URL or admin key.
+        status, native_code = native_login_code(server, identity)
+        assert status == 303
+        status, headers, native_session = request(server, "POST", "/admin/api/v1/native/session",
+            body={"code": native_code, "code_verifier": "v" * 43})
+        assert status == 201 and native_session["status"] == "authenticated"
+        member_cookie = cookie_value(headers, "recall_admin_session") + "; " + cookie_value(headers, "recall_admin_csrf")
+        member_csrf = cookie_value(headers, "recall_admin_csrf").split("=", 1)[1]
+        status, _, native_state = request(server, "GET", "/admin/api/v1/state", cookie=member_cookie)
+        assert status == 200 and native_state["principal"]["id"] == company_credential["principal_id"]
+        assert native_state["brains"] == member_state["brains"]
+        status, _, _ = request(server, "POST", "/admin/api/v1/native/session",
+            body={"code": native_code, "code_verifier": "v" * 43})
+        assert status == 400  # Single use.
+        _, wrong_proof_code = native_login_code(server, identity)
+        status, headers, _ = request(server, "POST", "/admin/api/v1/native/session",
+            body={"code": wrong_proof_code, "code_verifier": "x" * 43})
+        assert status == 400 and not any(k.lower() == "set-cookie" for k, _ in headers)
+        _, expired_code = native_login_code(server, identity)
+        with store.connect() as connection:
+            connection.execute("""UPDATE identity_oauth_states
+                SET created_at=now()-interval '2 minutes',expires_at=now()-interval '1 minute'
+                WHERE state_sha256=%s""", (hashlib.sha256(expired_code.encode()).hexdigest(),))
+        assert request(server, "POST", "/admin/api/v1/native/session",
+            body={"code": expired_code, "code_verifier": "v" * 43})[0] == 400
+        # Native identity does not acquire invitation or cross-tenant authority.
+        assert request(server, "POST", "/admin/api/v1/invitations", cookie=member_cookie,
+            csrf=member_csrf, body={"tenant_id": COMPANY,"email":"forbidden@example.com","role":"member"})[0] == 403
+        assert request(server, "POST", "/admin/api/v1/device/installations", cookie=member_cookie,
+            csrf=member_csrf, body={"tenant_id": PERSONAL,"connector_id":"local.codex",
+                "source_id":"codex:mac:forbidden","device_id":"mac-forbidden","privacy_mode":"scrub","selectors":{}})[0] == 403
+        # The existing admin browser login still excludes ordinary members.
+        assert request(server, "GET", "/admin/login")[0] == 303
+        assert request(server, "GET", "/admin/oauth/callback/identity?" + urlencode({
+            "state": identity.starts[-1][0], "code": "synthetic-authorization-code"}))[0] == 403
+        known_identity = identity.identity
+        identity.identity = BrowserIdentity("not-an-enrolled-person", "outsider@example.com", True)
+        assert native_login_code(server, identity)[0] == 403
+        identity.identity = known_identity
+        _, revoked_native_code = native_login_code(server, identity)
         with store.connect() as connection:
             actor = connection.execute(
                 """SELECT actor.actor_id,actor.display_name
@@ -763,6 +826,11 @@ def main():
         )
         assert status == 200 and revoked["status"] == "revoked"
         assert store.authenticate_bearer(member_route["token"], "write") is None
+        assert request(server, "POST", "/admin/api/v1/native/session",
+            body={"code": revoked_native_code, "code_verifier": "v" * 43})[0] == 403
+        assert native_login_code(server, identity)[0] == 403
+        assert request(server, "POST", "/admin/api/v1/device/installations",
+            cookie=member_cookie, csrf=member_csrf, body=member_device)[0] == 403
         status, _, former_member = request(
             server,
             "GET",
@@ -1217,6 +1285,12 @@ def main():
                 "hosted_account_binding_replays": 0,
                 "identity_owner_manual_db_edits": 0,
                 "identity_callback_replays": 0,
+                "native_member_login": "pass",
+                "native_handoff_replays": 0,
+                "native_wrong_verifier_sessions": 0,
+                "native_expired_handoff_sessions": 0,
+                "native_revoked_member_sessions": 0,
+                "native_member_admin_writes": 0,
                 "wrong_email_acceptances": 0,
                 "cross_brain_identity_grants": 0,
                 "revoked_identity_grants": 0,
