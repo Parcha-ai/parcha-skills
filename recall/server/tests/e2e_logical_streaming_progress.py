@@ -97,7 +97,7 @@ class StreamingProgress(ParentProgress):
                             text='Synthetic newly eligible source evidence.', role='user', byte_start=0)
                         mark_logical_evidence_dirty(c, tenant_id=self.tenant, source_id=source,
                             native_ids=[name], reason=reason)
-                self.assertTrue(ready.wait(4), 'new source waited for unrelated giant')
+                self.assertTrue(ready.wait(7), 'new source waited for unrelated giant')
                 self.assertFalse(future.done())
                 self.assertLess(started.index('forget-priority'), started.index('ordinary'))
                 self.assertEqual(started.count('large'), 1)

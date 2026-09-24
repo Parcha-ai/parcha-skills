@@ -5,12 +5,13 @@ from __future__ import annotations
 import time
 import json
 import math
+import threading
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 from .logical_evidence import (
     LogicalEvidenceError,
@@ -37,6 +38,7 @@ from .search_outbox import (
     write_search_tombstones,
 )
 
+PROJECTION_PROGRESS_INTERVAL_SECONDS = 5.0
 MAX_PASSAGE_PROJECTION_BATCH = 1_000
 MAX_PASSAGE_EMBEDDING_BATCH = 5_000
 MAX_PASSAGE_HEADER_BACKFILL_BATCH = 5_000
@@ -1683,6 +1685,7 @@ class CanonicalPassageProjector:
         batch_size: int = 25,
         max_batches: int = 10,
         concurrency: int = 2,
+        on_progress: Callable[[], None] | None = None,
     ) -> dict[str, int | str]:
         tenant_id = self._tenant(tenant_id)
         if (
@@ -1715,59 +1718,77 @@ class CanonicalPassageProjector:
             pending_seconds += time.monotonic() - phase_started
             if not candidates:
                 break
-            phase_started = time.monotonic()
+            stopping = threading.Event()
+            commit_slots = threading.BoundedSemaphore(min(
+                concurrency, len(candidates),
+                max(1, self.store.pool_max_size - 1), PASSAGE_COMMIT_WORKERS,
+            ))
+
+            def project_document(candidate):
+                # The owner releases the prepared body after its own commit;
+                # futures retain scalar results, never a batch of passage text.
+                preparation_started = time.monotonic()
+                try:
+                    prepared = self._prepare(candidate)
+                except LogicalEvidenceError as error:
+                    if str(error) not in {"logical_evidence_not_found", "logical_evidence_unavailable"}:
+                        raise
+                    return {"status": str(error)}, time.monotonic() - preparation_started, 0.0
+                preparation_elapsed = time.monotonic() - preparation_started
+                commit_started = time.monotonic()
+                with commit_slots:
+                    if stopping.is_set():
+                        return {"status": "cancelled"}, preparation_elapsed, 0.0
+                    status = self._commit(prepared)
+                return status, preparation_elapsed, time.monotonic() - commit_started
+
+            requeued_in_batch = unavailable_in_batch = 0
             with ThreadPoolExecutor(
                 max_workers=min(concurrency, len(candidates)),
                 thread_name_prefix="recall-passage-projector",
             ) as executor:
-                futures = [
-                    (candidate, executor.submit(self._prepare, candidate))
-                    for candidate in candidates
-                ]
-                prepared_documents = []
-                requeued_in_batch = 0
-                unavailable_in_batch = 0
-                for candidate, future in futures:
-                    try:
-                        prepared_documents.append(future.result())
-                    except LogicalEvidenceError as error:
-                        if str(error) == "logical_evidence_not_found":
-                            requeued_in_batch += self._requeue_missing(candidate)
-                        elif str(error) == "logical_evidence_unavailable":
-                            unavailable_in_batch += 1
-                        else:
-                            raise
-            prepare_seconds += time.monotonic() - phase_started
-            statuses: list[dict[str, Any]] = []
-            if prepared_documents:
-                phase_started = time.monotonic()
-                with ThreadPoolExecutor(
-                    max_workers=min(
-                        concurrency,
-                        len(prepared_documents),
-                        max(1, self.store.pool_max_size - 1),
-                        PASSAGE_COMMIT_WORKERS,
-                    ),
-                    thread_name_prefix="recall-passage-commit",
-                ) as executor:
-                    statuses = list(
-                        executor.map(self._commit, prepared_documents)
-                    )
-                commit_seconds += time.monotonic() - phase_started
-            for prepared, status in zip(
-                prepared_documents,
-                statuses,
-                strict=True,
-            ):
-                if status["status"] == "stale":
-                    stale += 1
-                    continue
-                documents += 1
-                # ``passages`` counts rows written (inserted), which is what
-                # the churn probe and the worker's idle check consume.
-                passages += int(status["inserted"])
-                deleted += int(status["deleted"])
-                retained += int(status["retained"])
+                futures = {executor.submit(project_document, candidate): candidate for candidate in candidates}
+                next_progress = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
+                try:
+                    while futures:
+                        completed, _ = wait(
+                            futures,
+                            timeout=max(0.0, next_progress - time.monotonic())
+                            if on_progress is not None else None,
+                            return_when=FIRST_COMPLETED,
+                        )
+                        publish = False
+                        for future in completed:
+                            candidate = futures.pop(future)
+                            status, preparation_elapsed, commit_elapsed = future.result()
+                            prepare_seconds += preparation_elapsed
+                            commit_seconds += commit_elapsed
+                            if status["status"] == "logical_evidence_not_found":
+                                # Keep logical requeue on the coordinator's
+                                # reserved pool connection, outside commit owners.
+                                requeued_in_batch += self._requeue_missing(candidate)
+                                continue
+                            if status["status"] == "logical_evidence_unavailable":
+                                unavailable_in_batch += 1
+                                continue
+                            if status["status"] == "stale":
+                                stale += 1
+                                continue
+                            documents += 1
+                            passages += int(status["inserted"])
+                            deleted += int(status["deleted"])
+                            retained += int(status["retained"])
+                            publish = True
+                        # Search publication has one coordinator; preparation
+                        # and commits continue in the bounded executor meanwhile.
+                        if on_progress is not None and (publish or time.monotonic() >= next_progress):
+                            on_progress()
+                            next_progress = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
+                except BaseException:
+                    stopping.set()
+                    for future in futures:
+                        future.cancel()
+                    raise
             requeued += requeued_in_batch
             unavailable += unavailable_in_batch
             batches += 1
@@ -1799,8 +1820,9 @@ class CanonicalPassageProjector:
             "unavailable": unavailable,
             "batches": batches,
             "pending": int(pending),
-            # Wall times include executor joins, connection acquisition and
-            # handled unavailable/missing work. No per-document identifiers.
+            # Prepare/commit are accumulated owner durations and can overlap;
+            # commit includes cap/connection waits. Other phases are coordinator
+            # wall time. No per-document identifiers or passage text are retained.
             "warmup_ms": max(0, round(warmup_seconds * 1000)),
             "pending_ms": max(0, round(pending_seconds * 1000)),
             "prepare_ms": max(0, round(prepare_seconds * 1000)),
