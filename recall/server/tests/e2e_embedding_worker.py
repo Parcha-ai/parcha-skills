@@ -117,8 +117,7 @@ def main() -> None:
         )
 
         # 1. The projection worker with --skip-embedding projects logical and
-        #    passage planes (passages become eligible the cycle after their
-        #    logical document, so two cycles) but never touches the provider.
+        #    ready passages in the same cycle, but never touches the provider.
         cycle = run_projection_worker(
             logical,
             passages,
@@ -131,7 +130,7 @@ def main() -> None:
             upload_concurrency=1,
             passage_concurrency=2,
             interval_seconds=1,
-            max_cycles=2,
+            once=True,
             sleep=lambda _seconds: None,
             skip_embedding=True,
         )
