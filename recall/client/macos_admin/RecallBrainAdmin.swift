@@ -141,7 +141,9 @@ final class RecallAdminModel: NSObject, ObservableObject, ASWebAuthenticationPre
         if Thread.isMainThread {
             return MainActor.assumeIsolated { NSApp.keyWindow ?? NSApp.windows.first ?? NSWindow() }
         }
-        return DispatchQueue.main.sync { NSApp.keyWindow ?? NSApp.windows.first ?? NSWindow() }
+        return DispatchQueue.main.sync {
+            MainActor.assumeIsolated { NSApp.keyWindow ?? NSApp.windows.first ?? NSWindow() }
+        }
     }
 
     private static func randomToken() throws -> String {
