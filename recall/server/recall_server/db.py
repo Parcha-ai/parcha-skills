@@ -1850,6 +1850,8 @@ class BrainStore:
                               CASE
                                 WHEN installation.last_error_code IS NOT NULL
                                   THEN 'degraded'
+                                WHEN installation.execution='source_local'
+                                  THEN 'unknown'
                                 WHEN installation.last_success_at IS NOT NULL
                                   THEN 'ready'
                                 ELSE 'unknown'

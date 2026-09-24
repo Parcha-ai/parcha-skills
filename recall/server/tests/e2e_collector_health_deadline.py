@@ -42,6 +42,19 @@ def scenario(store, dsn):
             VALUES(%s,'tenant','owner','local.codex','source','source_local','enabled','scrub','synthetic')""",
                     (installation,))
 
+    # A successful upload proves transfer, not complete local coverage. Local
+    # installations need a heartbeat before the fleet may label them ready.
+    with store.connect() as con:
+        con.execute("UPDATE connector_installations SET last_success_at=now() WHERE id=%s", (installation,))
+    assert store.fleet_status(["tenant"])[0]["health"] == "unknown"
+    ready = report(1) | {"last_error_code": None}
+    store.record_collector_health(tenant_id="tenant", source_id="source",
+                                  installation_id=installation, report=ready)
+    assert store.fleet_status(["tenant"])[0]["health"] == "ready"
+    with store.connect() as con:
+        con.execute("UPDATE collector_health_reports SET reported_at=now()-interval '3 minutes'")
+    assert store.fleet_status(["tenant"])[0]["health"] == "stale"
+
     def heartbeat(version):
         return store.record_collector_health(tenant_id="tenant", source_id="source",
                                             installation_id=installation, report=report(version))
