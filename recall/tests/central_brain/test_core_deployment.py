@@ -38,6 +38,7 @@ def healthy_snapshot() -> dict:
         "vector_version": "0.8.1",
         "migration_versions": list(range(1, SCHEMA_VERSION + 1)),
         "postgres_vector_plane_present": False,
+        "native_conversation_columns_present": True,
         "ssl_in_use": True,
         "role": {
             "superuser": False,
@@ -159,11 +160,11 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
         # agree with presence of the retired table.
         snapshot = healthy_snapshot()
         snapshot["migration_versions"] = [v for v in range(1, MANDATORY_SCHEMA_VERSION + 1)
-                                          if v != RETIRE_POSTGRES_PLANE_VERSION]
+                                          if v != RETIRE_POSTGRES_PLANE_VERSION] + [71]
         snapshot["postgres_vector_plane_present"] = True
         result = assess_snapshot(snapshot, profile="production")
         self.assertEqual(result["status"], "ready")
-        self.assertEqual(result["schema_version"], MANDATORY_SCHEMA_VERSION)
+        self.assertEqual(result["schema_version"], 71)
         self.assertEqual(result["postgres_vector_plane"], "present")
         retired = assess_snapshot(healthy_snapshot(), profile="production")
         self.assertEqual(retired["schema_version"], SCHEMA_VERSION)
@@ -182,7 +183,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
                     assess_snapshot(snapshot, profile="production")
                 self.assertEqual(raised.exception.code, "schema_drift")
 
-    def test_optional_reconciliation_index_reports_the_actual_schema(self) -> None:
+    def test_feature_binary_refuses_pre_conversation_schema(self) -> None:
         for version in (69, 70):
             for retired in (False, True):
                 with self.subTest(version=version, retired=retired):
@@ -190,9 +191,9 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
                     snapshot['migration_versions'] = [n for n in range(1, version + 1)
                                                        if retired or n != 67]
                     snapshot['postgres_vector_plane_present'] = not retired
-                    result = assess_snapshot(snapshot)
-                    self.assertEqual(result['schema_version'], version)
-                    self.assertEqual(result['postgres_vector_plane'], 'retired' if retired else 'present')
+                    with self.assertRaises(CapabilityError) as raised:
+                        assess_snapshot(snapshot)
+                    self.assertEqual(raised.exception.code, "schema_drift")
 
     def test_native_conversation_compatibility_accepts_only_known_optional_marker(self) -> None:
         for retired in (False, True):
@@ -208,6 +209,14 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
                     result = assess_snapshot(snapshot)
                     self.assertEqual(result["status"], "ready")
                     self.assertEqual(result["schema_version"], 71)
+
+    def test_native_conversation_marker_requires_actual_catalog_columns(self) -> None:
+        for present in (None, False):
+            snapshot = healthy_snapshot()
+            snapshot["native_conversation_columns_present"] = present
+            with self.subTest(present=present), self.assertRaises(CapabilityError) as raised:
+                assess_snapshot(snapshot)
+            self.assertEqual(raised.exception.code, "schema_drift")
 
     def test_native_conversation_marker_cannot_hide_gaps_or_unknown_versions(self) -> None:
         complete = list(range(1, 72))

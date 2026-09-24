@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from contracts.native_conversation import conversation_key
+
+
 import json
 import os
 import re
@@ -298,6 +301,8 @@ def collapse_document_candidates(
                     "logical_document_id": document_id,
                     "revision": row["revision"],
                     "native_parent_id": row["native_parent_id"],
+                    "conversation_id": row.get("conversation_id"),
+                    "conversation_strand_id": row.get("conversation_strand_id"),
                     "first_occurred_at": str(row["first_occurred_at"]),
                     "last_occurred_at": str(row["last_occurred_at"]),
                     "manifest_object_key": row["manifest_object_key"],
@@ -761,7 +766,7 @@ def similar_document_record(row: dict[str, Any], similarity: float) -> dict[str,
     }
 
 
-def group_near_duplicates(
+def _group_similar_documents(
     results: list[dict[str, Any]],
     *,
     threshold: float = NEAR_DUPLICATE_THRESHOLD,
@@ -817,6 +822,58 @@ def group_near_duplicates(
         "near_duplicate_groups": sum(1 for row in kept if row.get("similar_documents")),
         "near_duplicate_threshold": threshold,
     }
+
+
+
+def _conversation_document(row):
+    return {key: row.get(key) for key in (
+        "source_id", "logical_document_id", "native_parent_id", "revision",
+        "manifest_object_key", "manifest_content_sha256", "conversation_strand_id",
+        "first_occurred_at", "last_occurred_at",
+    )}
+
+
+def _group_native_conversation(rows):
+    primary = dict(rows[0])
+    primary["conversation_documents"] = [_conversation_document(row) for row in rows]
+    # Projected ordinals and message-local byte offsets do not prove native
+    # occurrence identity across partial imports. Keep every authorized range.
+    primary["matching_ranges"] = [
+        {**match, **_conversation_document(row)}
+        for row in rows for match in row.get("matching_ranges") or ()
+    ]
+    return primary
+
+
+def group_near_duplicates(results, *, threshold=NEAR_DUPLICATE_THRESHOLD, include_fuzzy=True):
+    """Group proven native conversations; text similarity only handles unknown identity."""
+    native = {}
+    unknown = []
+    positions = {id(row): ordinal for ordinal, row in enumerate(results)}
+    for row in results:
+        key = conversation_key(row.get("conversation_id"))
+        if key is None:
+            unknown.append(row)
+        else:
+            native.setdefault(key, []).append(row)
+    fuzzy, diagnostics = (_group_similar_documents(unknown, threshold=threshold)
+                          if include_fuzzy else (unknown, {}))
+    ordered = [(positions[id(row)], row) for row in fuzzy if id(row) in positions]
+    # Fuzzy primaries are shallow copies: find their original source/document.
+    for row in fuzzy:
+        if id(row) not in positions:
+            members = {row["logical_document_id"], *(item["logical_document_id"]
+                       for item in row.get("similar_documents", ()))}
+            ordered.append((min(index for index, original in enumerate(results)
+                                if original["logical_document_id"] in members), row))
+    for rows in native.values():
+        ordered.append((positions[id(rows[0])], _group_native_conversation(rows)))
+    if native:
+        diagnostics.update({
+            "conversation_documents_folded": sum(len(rows) - 1 for rows in native.values()),
+            "native_conversation_groups": len(native),
+        })
+    return [row for _, row in sorted(ordered, key=lambda item: item[0])], diagnostics
 
 
 def arm_nominated(arm_scores: dict[str, Any], nominate_per_arm: int) -> bool:
@@ -1300,7 +1357,8 @@ class PassageHintRetrieval:
                         LIMIT %s
                        )
                        SELECT top.source_id,top.logical_document_id,
-                              evidence.revision,evidence.native_parent_id,
+                              evidence.revision,evidence.native_parent_id,evidence.conversation_id,
+                              evidence.conversation_strand_id,
                               evidence.first_occurred_at,evidence.last_occurred_at,
                               evidence.manifest_object_key,
                               evidence.manifest_content_sha256,
@@ -1645,7 +1703,8 @@ class PassageHintRetrieval:
                         LIMIT %s
                        )
                        SELECT top.source_id,top.logical_document_id,
-                              evidence.revision,evidence.native_parent_id,
+                              evidence.revision,evidence.native_parent_id,evidence.conversation_id,
+                              evidence.conversation_strand_id,
                               evidence.first_occurred_at,evidence.last_occurred_at,
                               evidence.manifest_object_key,
                               evidence.manifest_content_sha256,
@@ -1965,7 +2024,8 @@ class PassageHintRetrieval:
                                   passage.source_id,
                                   passage.logical_document_id,
                                   evidence.revision,
-                                  evidence.native_parent_id,
+                                  evidence.native_parent_id,evidence.conversation_id,
+                              evidence.conversation_strand_id,
                                   evidence.first_occurred_at,
                                   evidence.last_occurred_at,
                                   evidence.manifest_object_key,
@@ -2453,11 +2513,10 @@ class PassageHintRetrieval:
                 arm_elapsed_ms=arm_elapsed_ms,
                 lexical_query=lexical_query,
             )
-        near_duplicate_diagnostics: dict[str, Any] = {}
-        if near_duplicates_enabled():
-            results, near_duplicate_diagnostics = group_near_duplicates(
-                results, threshold=near_duplicate_threshold(),
-            )
+        results, near_duplicate_diagnostics = group_near_duplicates(
+            results, threshold=near_duplicate_threshold(),
+            include_fuzzy=near_duplicates_enabled(),
+        )
         results = [
             {key: value for key, value in row.items() if key != "nominated"}
             for row in results[:limit]
@@ -2793,7 +2852,8 @@ class PassageHintRetrieval:
                                   passage.source_id,
                                   passage.logical_document_id,
                                   evidence.revision,
-                                  evidence.native_parent_id,
+                                  evidence.native_parent_id,evidence.conversation_id,
+                              evidence.conversation_strand_id,
                                   evidence.first_occurred_at,
                                   evidence.last_occurred_at,
                                   evidence.manifest_object_key,
@@ -2888,7 +2948,8 @@ class PassageHintRetrieval:
                         """SELECT passage.source_id,
                                   passage.logical_document_id,
                                   evidence.revision,
-                                  evidence.native_parent_id,
+                                  evidence.native_parent_id,evidence.conversation_id,
+                              evidence.conversation_strand_id,
                                   evidence.first_occurred_at,
                                   evidence.last_occurred_at,
                                   evidence.manifest_object_key,

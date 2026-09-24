@@ -2102,17 +2102,17 @@ class BoundCanonicalRetrieval:
             receipt = receipts[len(receipts) // 2]
             native_id = urlsplit(receipt).path.lstrip("/")
             results.append({
-                "source_id": document["source_id"],
+                "source_id": selected_range.get("source_id", document["source_id"]),
                 "native_id": native_id,
-                "native_parent_id": document["native_parent_id"],
-                "revision": document["revision"],
-                "occurred_at": document["last_occurred_at"],
+                "native_parent_id": selected_range.get("native_parent_id", document["native_parent_id"]),
+                "revision": selected_range.get("revision", document["revision"]),
+                "occurred_at": selected_range.get("last_occurred_at", document["last_occurred_at"]),
                 "time_basis": "occurred_at",
                 "text": selected_range.get("text", ""),
                 "text_clipped": bool(selected_range.get("text_clipped")),
                 "receipt": receipt,
                 "rank": document["rank"],
-                "logical_document_id": document["logical_document_id"],
+                "logical_document_id": selected_range.get("logical_document_id", document["logical_document_id"]),
                 "reasons": document.get("reasons", ()),
             })
         return {

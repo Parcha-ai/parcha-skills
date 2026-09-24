@@ -61,6 +61,11 @@ SELECT
     ) AS migration_versions,
     pg_catalog.to_regclass('public.canonical_passage_embeddings') IS NOT NULL
         AS postgres_vector_plane_present,
+    (SELECT count(*)=2 FROM pg_catalog.pg_attribute
+      WHERE attrelid=pg_catalog.to_regclass('public.canonical_evidence_documents')
+        AND attname IN ('conversation_id','conversation_strand_id')
+        AND atttypid='text'::regtype AND NOT attisdropped)
+        AS native_conversation_columns_present,
     EXISTS (
         SELECT 1 FROM pg_catalog.pg_stat_ssl
         WHERE pid = pg_catalog.pg_backend_pid() AND ssl
@@ -184,7 +189,8 @@ def assess_snapshot(snapshot: dict[str, Any], profile: str = "production") -> di
                       + ([RECONCILIATION_INDEX_VERSION] if RECONCILIATION_INDEX_VERSION in versions else [])
                       + ([NATIVE_CONVERSATION_SCHEMA_VERSION]
                          if NATIVE_CONVERSATION_SCHEMA_VERSION in versions else []))
-    if versions != expected:
+    if (versions != expected or NATIVE_CONVERSATION_SCHEMA_VERSION not in versions
+            or snapshot.get("native_conversation_columns_present") is not True):
         raise CapabilityError("schema_drift")
     vector_plane_present = snapshot.get("postgres_vector_plane_present")
     if vector_plane_present is not None and bool(vector_plane_present) == retired:
@@ -254,6 +260,7 @@ def probe_database(dsn: str, profile: str = "production") -> dict[str, Any]:
         "vector_version": row["vector_version"],
         "migration_versions": row["migration_versions"],
         "postgres_vector_plane_present": row["postgres_vector_plane_present"],
+        "native_conversation_columns_present": row["native_conversation_columns_present"],
         # Managed Postgres proxies can terminate verified client TLS before the
         # backend, so pg_stat_ssl may truthfully report false on the server-side
         # hop. libpq is authoritative for the connection Recall actually opened.
