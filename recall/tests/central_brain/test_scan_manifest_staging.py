@@ -55,6 +55,8 @@ class ScanManifestStagingTests(unittest.TestCase):
         self.assertEqual(len(arguments), 7)
         original_path, original_copy = type(self.root), shutil.copyfile
         original_read, original_walk = Path.read_text, Path.rglob
+        original_resolve, original_is_file = Path.resolve, Path.is_file
+        self.resolutions, self.file_checks = [], []
 
         def mapped_path(*args):
             path = original_path(*args)
@@ -80,10 +82,20 @@ class ScanManifestStagingTests(unittest.TestCase):
             self.walks.append(path)
             return original_walk(path, *args, **kwargs)
 
+        def resolve(path, *args, **kwargs):
+            self.resolutions.append(path)
+            return original_resolve(path, *args, **kwargs)
+
+        def is_file(path, *args, **kwargs):
+            self.file_checks.append(path)
+            return original_is_file(path, *args, **kwargs)
+
         with ExitStack() as stack:
             stack.enter_context(patch('pathlib.Path', mapped_path))
             stack.enter_context(patch.object(original_path, 'read_text', read))
             stack.enter_context(patch.object(original_path, 'rglob', walk))
+            stack.enter_context(patch.object(original_path, 'resolve', resolve))
+            stack.enter_context(patch.object(original_path, 'is_file', is_file))
             stack.enter_context(patch('subprocess.run', side_effect=mounted))
             stack.enter_context(patch('platform.machine', return_value='x86_64'))
             stack.enter_context(patch('sys.argv', ['stage', *arguments]))
@@ -149,6 +161,36 @@ class ScanManifestStagingTests(unittest.TestCase):
             self.stage(tools={'linux-x86_64': bad})
         self.assertEqual(error.exception.code, 66)
 
+    def test_dataset_alias_reuses_staged_file_without_metadata_reprobe(self):
+        alias = 's1/2026-09/passages-part-00000.parquet'
+        self.stage(datasets={self.data.object_key: alias})
+        staged = self.root / 'tmp/recall-authorized' / self.data.object_key
+        self.assertEqual(self.resolutions.count(staged), 1)
+        self.assertNotIn(staged, self.file_checks)
+        self.assertEqual(staged.read_bytes(), b'PAR1\xffsynthetic parquet')
+        link = self.root / 'tmp/recall-datasets' / alias
+        self.assertEqual(str(link.readlink()), '/mnt/archil/evidence/' + self.data.object_key)
+
+    def test_inventory_dataset_without_admitted_object_refuses_alias(self):
+        alias = 's1/2026-09/passages-part-00000.parquet'
+        self.objects.remove(self.data)
+        ref, _path = self.inventory({self.data.object_key: alias})
+        # The object exists in Archil, but the signed inventory did not admit it.
+        with self.assertRaises(SystemExit) as error:
+            self.stage(inventory=ref)
+        self.assertEqual(error.exception.code, 66)
+        self.assertFalse((self.root / 'tmp/recall-datasets' / alias).is_symlink())
+
+    def test_dataset_source_symlink_escape_still_refuses(self):
+        source = self.root / 'mnt/archil/evidence' / self.data.object_key
+        source.unlink()
+        private = self.root / 'private-data'
+        private.write_bytes(b'private')
+        source.symlink_to(private)
+        with self.assertRaises(SystemExit) as error:
+            self.stage()
+        self.assertEqual(error.exception.code, 64)
+
     def test_scan_still_rejects_invalid_dataset_alias(self):
         with self.assertRaises(SystemExit) as error:
             self.stage(datasets={self.data.object_key: '../unauthorized'})
@@ -179,27 +221,43 @@ class ScanManifestStagingTests(unittest.TestCase):
         self.assertTrue(self.reads)
 
     def test_verified_fallback_stages_and_removes_all_writable_aliases(self):
-        for family in ("documents", "passages"):
-            with self.subTest(family=family):
+        for family, visible in (("documents", False), ("passages", False),
+                                ("documents", True), ("passages", True)):
+            with self.subTest(family=family, visible=visible):
                 # Each family needs a fresh namespace destination.
                 helper = ScanManifestStagingTests()
                 helper.setUp()
                 self.addCleanup(helper.doCleanups)
                 source = helper.root / "mnt/archil/evidence" / helper.data.object_key
                 body = source.read_bytes()
-                source.unlink()
+                if visible:
+                    source.write_bytes(b'stale Archil bytes')
+                else:
+                    source.unlink()
                 fallback = helper.root / "tmp/recall-agent/fallback" / helper.data.object_key
                 fallback.parent.mkdir(parents=True)
                 fallback.write_bytes(body)
                 unused = fallback.parent / "unused"
-                unused.write_bytes(b"bootstrap copy superseded by Archil")
+                unused.write_bytes(b"unused local copy")
                 stderr = helper.stage(datasets={helper.data.object_key:
                     f"s1/2026-09/{family}-part-00000.parquet"}, allow_missing=True)
                 self.assertIn("objects_unavailable\t0", stderr)
                 self.assertEqual((helper.root / "tmp/recall-authorized" / helper.data.object_key).read_bytes(), body)
+                self.assertNotIn(source, helper.resolutions)
+                self.assertNotIn(source, helper.file_checks)
                 self.assertFalse((helper.root / "tmp/recall-agent/fallback").exists())
                 mounts = [call for call in helper.mounts if call[1] == "--bind" and call[2] == str(fallback)]
                 self.assertEqual(len(mounts), int(family == "passages"))
+
+    def test_local_download_symlink_escape_refuses(self):
+        local = self.root / 'tmp/recall-agent/fallback' / self.data.object_key
+        local.parent.mkdir(parents=True)
+        private = self.root / 'private-data'
+        private.write_bytes(b'private')
+        local.symlink_to(private)
+        with self.assertRaises(SystemExit) as error:
+            self.stage()
+        self.assertEqual(error.exception.code, 64)
 
     def test_missing_in_both_stores_keeps_visibility_incomplete(self):
         (self.root / "mnt/archil/evidence" / self.data.object_key).unlink()
