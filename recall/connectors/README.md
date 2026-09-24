@@ -240,6 +240,19 @@ preserve live Events membership. A join error still blocks the page and leaves
 its checkpoint unchanged. Read permission alone does not establish Events
 coverage.
 
+Managed Slack history, replies and user pages request 100 items. If the response
+exceeds the existing 500-record, 8 MB normalized-page, transport-response or
+4096-byte cursor capacity, the connector retries the same uncommitted provider
+position once with 20 items. It never truncates the response or advances the
+checkpoint before ACK. File-count and cursor checks precede attachment downloads;
+the final normalized page still passes the SDK checks. Authentication, rate limits
+and malformed content do not trigger this retry; existing `Retry-After` handling
+remains unchanged. These are work-unit sizes, not limits on channel history.
+Slack's [history](https://docs.slack.dev/reference/methods/conversations.history/)
+and [replies](https://docs.slack.dev/reference/methods/conversations.replies/)
+documentation keeps internal customer-built apps at Tier 3; the separate
+15-object restriction applies to new commercially distributed non-Marketplace apps.
+
 The workspace connector records discovered channels and their history progress
 in the existing private SQLite spool. Channel history advances only in the
 same transaction as the final page's Brain acknowledgement, after its detected

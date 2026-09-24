@@ -11,8 +11,8 @@ from typing import Any, Mapping, Protocol
 
 from connectors.remote_api import RemoteApiError
 from connectors.sdk import (
-    ConnectorContractError, ConnectorPage, ConnectorRecordV2,
-    ConnectorUpstreamError, SOURCE_ID,
+    ConnectorContractError, ConnectorPage, ConnectorPageCapacityError, ConnectorRecordV2,
+    ConnectorUpstreamError, MAX_PAGE_RECORDS, SOURCE_ID,
 )
 from connectors.slack_source import (
     SLACK_MESSAGE_CAPTURE_VERSION, normalize_slack_message, normalize_slack_user,
@@ -95,8 +95,10 @@ def _cursor(value: dict[str, Any]) -> str:
         raw = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
     except (TypeError, ValueError):
         raise ConnectorContractError("slack workspace cursor is invalid") from None
-    if not raw or len(raw.encode()) > 4096:
+    if not raw:
         raise ConnectorContractError("slack workspace cursor is invalid")
+    if len(raw.encode()) > 4096:
+        raise ConnectorPageCapacityError("slack workspace cursor exceeds maximum bytes")
     return raw
 
 
@@ -269,7 +271,7 @@ class SlackWorkspaceConnector:
     def __init__(
         self, *, rail: JsonRail, source_id: str, workspace_id: str,
         owner_user_ids: tuple[str, ...] = (), channel_ids: tuple[str, ...] = (),
-        page_size: int = 20,
+        page_size: int = 100,
     ):
         if not callable(getattr(rail, "request", None)):
             raise ConnectorContractError("remote rail is invalid")
@@ -282,7 +284,7 @@ class SlackWorkspaceConnector:
             or len(channel_ids) > MAX_CONFIGURED_CHANNELS
             or any(not isinstance(item, str) or not item for item in owner_user_ids + channel_ids)
             or len(channel_ids) != len(set(channel_ids))
-            or not 1 <= page_size <= 20
+            or not 1 <= page_size <= 100
         ):
             raise ConnectorContractError("slack workspace configuration is invalid")
         self.rail = rail
@@ -446,6 +448,8 @@ class SlackWorkspaceConnector:
                 response = self.rail.request(operation, query=query)
         except RemoteApiError as error:
             _log_request_failure(operation, "transport", error.code)
+            if error.code == "response_too_large":
+                raise ConnectorPageCapacityError("slack response exceeds maximum bytes") from None
             raise ConnectorUpstreamError("connector_upstream_error") from None
         if not isinstance(response, dict):
             _log_request_failure(operation, "response", "response_invalid")
@@ -455,7 +459,21 @@ class SlackWorkspaceConnector:
 
     def pull(self, cursor: str | None) -> ConnectorPage:
         state = _state(cursor, self.channel_ids, self.public_history)
-        return getattr(self, f"_pull_{state['phase']}")(state)
+        pull = getattr(self, f"_pull_{state['phase']}")
+        if state["phase"] == "discover":
+            return pull(state)
+        if state["phase"] == "history" and state["page"] is None:
+            channel_id, do_not_join = self._channel(state)
+            if not do_not_join:
+                self._request("channels.join", {"channel": channel_id})
+        try:
+            return pull(state, limit=self.page_size)
+        except ConnectorPageCapacityError:
+            if self.page_size <= 20:
+                raise
+            # Refetch the same uncommitted provider position, never truncate a page.
+            # Auth, rate limits and malformed content do not enter this retry path.
+            return pull(state, limit=20)
 
     def _page(self, records: list[ConnectorRecordV2], state: dict[str, Any], more: bool) -> ConnectorPage:
         return ConnectorPage(records=tuple(records), next_cursor=_cursor(state), has_more=more)
@@ -494,8 +512,8 @@ class SlackWorkspaceConnector:
         # failure. Keep its cycle so a returning channel is rebaselined.
         return self._finish_cycle([], state)
 
-    def _pull_users(self, state: dict[str, Any]) -> ConnectorPage:
-        query: dict[str, Any] = {"include_locale": False, "limit": self.page_size}
+    def _pull_users(self, state: dict[str, Any], *, limit: int) -> ConnectorPage:
+        query: dict[str, Any] = {"include_locale": False, "limit": limit}
         if state["page"]:
             query["cursor"] = state["page"]
         response = self._request("users.list", query)
@@ -542,15 +560,13 @@ class SlackWorkspaceConnector:
         channel_id, do_not_join = encoded.rsplit(":", 1)
         return channel_id, do_not_join == "1"
 
-    def _pull_history(self, state: dict[str, Any]) -> ConnectorPage:
-        channel_id, do_not_join = self._channel(state)
-        if not do_not_join and state["page"] is None:
-            self._request("channels.join", {"channel": channel_id})
+    def _pull_history(self, state: dict[str, Any], *, limit: int) -> ConnectorPage:
+        channel_id, _do_not_join = self._channel(state)
         state = {**state, "channel_lower": self._channel_lower(state)}
         if state["page"] is None:
             state["capture_version"] = SLACK_MESSAGE_CAPTURE_VERSION
         query: dict[str, Any] = {
-            "channel": channel_id, "inclusive": True, "limit": self.page_size,
+            "channel": channel_id, "inclusive": True, "limit": limit,
             "latest": _oldest(state["upper"]),
         }
         if state["page"]:
@@ -558,19 +574,11 @@ class SlackWorkspaceConnector:
         elif state["channel_lower"] != EPOCH:
             query["oldest"] = _oldest(state["channel_lower"])
         response = self._request("messages.history", query)
-        records: dict[str, ConnectorRecordV2] = {}
+        messages = _items(response.get("messages"), "messages")
         threads = []
-        for raw in _items(response.get("messages"), "messages"):
+        for raw in messages:
             if not isinstance(raw, dict):
                 raise ConnectorContractError("slack message is invalid")
-            record = normalize_slack_message(
-                workspace_id=self.workspace_id, channel_id=channel_id, value=raw,
-                owner_identifiers=self.owner_user_ids, provenance_surface="api",
-            )
-            record, attachments = self._capture_files(raw, record)
-            records[record.native_id] = record
-            for attachment in attachments:
-                records[attachment.native_id] = attachment
             reply_count = raw.get("reply_count", 0)
             if type(reply_count) is not int or reply_count < 0:
                 raise ConnectorContractError("slack reply count is invalid")
@@ -582,42 +590,59 @@ class SlackWorkspaceConnector:
                 **state, "phase": "threads", "page": next_page,
                 "threads": threads, "thread_index": 0, "thread_page": None,
             }
-            return self._page(list(records.values()), next_state, True)
-        return self._advance_channel(list(records.values()), state, next_page)
+            page = self._page([], next_state, True)
+        else:
+            page = self._advance_channel([], state, next_page)
+        return self._message_page(messages, channel_id, page)
 
-    def _pull_threads(self, state: dict[str, Any]) -> ConnectorPage:
+    def _pull_threads(self, state: dict[str, Any], *, limit: int) -> ConnectorPage:
         channel_id, _do_not_join = self._channel(state)
         thread_ts = state["threads"][state["thread_index"]]
         query: dict[str, Any] = {
-            "channel": channel_id, "inclusive": True, "limit": self.page_size,
+            "channel": channel_id, "inclusive": True, "limit": limit,
             "ts": thread_ts, "latest": _oldest(state["upper"]),
         }
         if state["thread_page"]:
             query["cursor"] = state["thread_page"]
         response = self._request("messages.replies", query)
-        records: dict[str, ConnectorRecordV2] = {}
-        for raw in _items(response.get("messages"), "replies"):
-            if not isinstance(raw, dict):
-                raise ConnectorContractError("slack reply is invalid")
-            record = normalize_slack_message(
-                workspace_id=self.workspace_id, channel_id=channel_id, value=raw,
-                owner_identifiers=self.owner_user_ids, provenance_surface="api",
-            )
+        messages = _items(response.get("messages"), "replies")
+        next_thread_page = _next(response)
+        if next_thread_page:
+            page = self._page([], {
+                **state, "thread_page": next_thread_page,
+            }, True)
+        elif state["thread_index"] + 1 < len(state["threads"]):
+            page = self._page([], {
+                **state, "thread_index": state["thread_index"] + 1, "thread_page": None,
+            }, True)
+        else:
+            page = self._advance_channel([], state, state["page"])
+        return self._message_page(messages, channel_id, page)
+
+    def _message_page(
+        self, messages: list[Any], channel_id: str, page: ConnectorPage,
+    ) -> ConnectorPage:
+        normalized = [normalize_slack_message(
+            workspace_id=self.workspace_id, channel_id=channel_id, value=raw,
+            owner_identifiers=self.owner_user_ids, provenance_surface="api",
+        ) for raw in messages]
+        records = {record.native_id: record for record in normalized}
+        # Validate message bytes and cursor before fetching attachment bodies.
+        ConnectorPage(tuple(records.values()), page.next_cursor, page.has_more)
+        file_count = 0
+        for raw in messages:
+            files = raw.get("files") or []
+            if not isinstance(files, list) or len(files) > 20:
+                raise ConnectorContractError("slack files are invalid")
+            file_count += len(files)
+        if len(records) + file_count > MAX_PAGE_RECORDS:
+            raise ConnectorPageCapacityError("page exceeds maximum record count")
+        for raw, record in zip(messages, normalized):
             record, attachments = self._capture_files(raw, record)
             records[record.native_id] = record
             for attachment in attachments:
                 records[attachment.native_id] = attachment
-        next_thread_page = _next(response)
-        if next_thread_page:
-            return self._page(list(records.values()), {
-                **state, "thread_page": next_thread_page,
-            }, True)
-        index = state["thread_index"] + 1
-        if index < len(state["threads"]):
-            return self._page(list(records.values()), {
-                **state, "thread_index": index, "thread_page": None,
-            }, True)
-        return self._advance_channel(list(records.values()), state, state["page"])
+        return ConnectorPage(tuple(records.values()), page.next_cursor, page.has_more)
 
     def _advance_channel(
         self, records: list[ConnectorRecordV2], state: dict[str, Any],

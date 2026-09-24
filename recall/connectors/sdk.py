@@ -42,6 +42,10 @@ class ConnectorContractError(ValueError):
     pass
 
 
+class ConnectorPageCapacityError(ConnectorContractError):
+    """A provider response exceeds bounded ACK work-unit capacity."""
+
+
 class ConnectorRateLimited(Exception):
     def __init__(self, *, retry_after_seconds: int | float):
         if not isinstance(retry_after_seconds, (int, float)) or retry_after_seconds <= 0:
@@ -431,7 +435,7 @@ class ConnectorPage:
         if not isinstance(self.records, tuple) or not all(isinstance(item, ConnectorRecord) for item in self.records):
             raise ConnectorContractError("page records must be a tuple of ConnectorRecord")
         if len(self.records) > MAX_PAGE_RECORDS:
-            raise ConnectorContractError("page exceeds maximum record count")
+            raise ConnectorPageCapacityError("page exceeds maximum record count")
         if not isinstance(self.next_cursor, str) or not self.next_cursor or len(self.next_cursor) > 4096:
             raise ConnectorContractError("next_cursor is invalid")
         if not isinstance(self.has_more, bool):
@@ -441,7 +445,7 @@ class ConnectorPage:
             raise ConnectorContractError("page contains duplicate native_id")
         page_bytes = sum(len(json.dumps({"content": item.content, "provenance": item.provenance}).encode()) for item in self.records)
         if page_bytes > MAX_PAGE_BYTES:
-            raise ConnectorContractError("page exceeds maximum byte count")
+            raise ConnectorPageCapacityError("page exceeds maximum byte count")
 
 
 class PullConnector(Protocol):

@@ -517,7 +517,7 @@ class ManagedConnectorWorker:
                     10
                     if connector_id == "google.gmail"
                     else 25 if connector_id == "x.activity"
-                    else 20 if connector_id == "slack.messages" else 100
+                    else 100
                 ),
                 "timeout_seconds": 60,
                 "selectors": _selectors(
