@@ -231,6 +231,34 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
                     assess_snapshot(snapshot)
                 self.assertEqual(raised.exception.code, "schema_drift")
 
+    def test_native_conversation_compatibility_accepts_only_known_optional_marker(self) -> None:
+        for retired in (False, True):
+            for reconciliation in (False, True):
+                with self.subTest(retired=retired, reconciliation=reconciliation):
+                    snapshot = healthy_snapshot()
+                    snapshot["migration_versions"] = [n for n in range(1, 70)
+                                                       if retired or n != 67]
+                    if reconciliation:
+                        snapshot["migration_versions"].append(70)
+                    snapshot["migration_versions"].append(71)
+                    snapshot["postgres_vector_plane_present"] = not retired
+                    result = assess_snapshot(snapshot)
+                    self.assertEqual(result["status"], "ready")
+                    self.assertEqual(result["schema_version"], 71)
+
+    def test_native_conversation_marker_cannot_hide_gaps_or_unknown_versions(self) -> None:
+        complete = list(range(1, 72))
+        for versions in ([n for n in complete if n != 69],
+                         [n for n in complete if n != 68],
+                         complete + [72], complete + [71],
+                         complete[:-2] + [71, 70]):
+            with self.subTest(versions=versions):
+                snapshot = healthy_snapshot()
+                snapshot["migration_versions"] = versions
+                with self.assertRaises(CapabilityError) as raised:
+                    assess_snapshot(snapshot)
+                self.assertEqual(raised.exception.code, "schema_drift")
+
     def test_optional_reconciliation_index_does_not_hide_other_schema_drift(self) -> None:
         complete = list(range(1, 71))
         for versions in ([n for n in complete if n != 68],
