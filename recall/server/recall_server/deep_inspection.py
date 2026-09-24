@@ -635,8 +635,8 @@ def stage_object(item):
     dst.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
     if item["object_key"] in materialized_keys:
         # Document catalogs are small metadata files. Materialize them once
-        # so DuckDB's repeated footer/column reads stay local. Other datasets
-        # retain lazy reads; a records count must not copy every record body.
+        # so DuckDB's repeated footer/column reads stay local. Records retain
+        # lazy reads when visible in Archil; a count need not copy every body.
         digest=hashlib.sha256()
         with src.open("rb") as reader,dst.open("xb") as writer:
             while block:=reader.read(1024*1024):
@@ -806,18 +806,27 @@ try:
     inventory=json.loads(raw)
     fallbacks=inventory.get("fallbacks",{})
     if fallbacks:
-        # The inventory field retains its wire name, but verified downloads
-        # are preferred; Archil is consulted only when a download returns 404.
+        # Prefer verified downloads for catalogs and search projections.
+        # Record bodies retain lazy Archil reads when already visible there.
         target=pathlib.Path("/tmp/recall-agent/fallback").resolve()
         hashes={item["object_key"]:item["content_sha256"] for item in inventory["objects"]}
         if set(fallbacks)!=set(inventory["datasets"]):
             raise ValueError()
+        records={key for key,alias in inventory["datasets"].items()
+                 if alias.rsplit("/",1)[-1].startswith("records-part-")}
+        source=pathlib.Path("/mnt/archil/evidence").resolve() if records else None
         def fetch(item):
             key,ref=item
             if (re.fullmatch(r"objects/[0-9a-f]{2}/[0-9a-f]{64}",key) is None
                     or key not in hashes or type(ref["size_bytes"]) is not int
                     or ref["size_bytes"]<0 or not ref["url"].startswith("https://")):
                 raise ValueError()
+            if key in records:
+                path=(source/key).resolve()
+                if source not in path.parents:
+                    raise ValueError()
+                if path.is_file():
+                    return
             dst=target/key
             dst.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
             partial=dst.with_suffix(".partial")

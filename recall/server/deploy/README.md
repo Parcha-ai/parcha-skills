@@ -637,9 +637,12 @@ network namespace routes. It does not prove every possible sandbox escape or
 replace a real DuckDB/provider compatibility check.
 
 At execution time Recall selects only shards inside the caller's tenant/source grants.
-Before network isolation, it downloads those exact catalog objects through signed
-archive URLs with 16 concurrent workers, verifies their sizes and SHA-256 hashes,
-and binds the local files read-only into the authorized view. A missing archive
+Before network isolation, it downloads selected document, passage, and actor
+objects through signed archive URLs with 16 concurrent workers, verifies their
+sizes and SHA-256 hashes,
+and binds the local files read-only into the authorized view. Existing record
+objects retain lazy Archil reads so a records count need not copy raw bodies;
+records missing from Archil use the verified downloader. A missing archive
 object can still be read from Archil; an object absent in both stores is reported
 unavailable. The writable download aliases and signed inventory are removed
 before the caller's program starts. This avoids repeated remote filesystem
