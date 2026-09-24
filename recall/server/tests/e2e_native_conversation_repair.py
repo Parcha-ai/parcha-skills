@@ -188,6 +188,9 @@ class NativeMetadataRepair(unittest.TestCase):
     def test_same_revision_document_hash_race(self):
         self.mutate_pin_during_read('document_content_sha256')
 
+    def test_same_revision_parent_ownership_race(self):
+        self.mutate_pin_during_read('native_parent_id')
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

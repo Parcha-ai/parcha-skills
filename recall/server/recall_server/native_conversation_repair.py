@@ -126,6 +126,7 @@ class NativeConversationRepair:
                     SET conversation_id=%s,conversation_strand_id=%s
                     WHERE evidence.tenant_id=%s AND evidence.source_id=%s
                       AND evidence.logical_document_id=%s AND evidence.revision=%s
+                      AND evidence.native_parent_id=%s
                       AND (evidence.manifest_artifact_id,evidence.manifest_storage_backend,
                            evidence.manifest_object_key,evidence.manifest_content_sha256,
                            evidence.manifest_size_bytes,evidence.manifest_media_type,
@@ -138,7 +139,7 @@ class NativeConversationRepair:
                           AND queue.native_parent_id=evidence.native_parent_id AND queue.reason='forget')''',
                     (identity.conversation_id, identity.strand_id, candidate['tenant_id'],
                      candidate['source_id'], candidate['logical_document_id'], candidate['revision'],
-                     candidate['manifest_artifact_id'], candidate['manifest_storage_backend'],
+                     candidate['native_parent_id'], candidate['manifest_artifact_id'], candidate['manifest_storage_backend'],
                      candidate['manifest_object_key'], candidate['manifest_content_sha256'],
                      candidate['manifest_size_bytes'], candidate['manifest_media_type'],
                      candidate['manifest_encryption'], candidate['manifest_version_id'],
