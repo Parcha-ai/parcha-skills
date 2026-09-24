@@ -290,7 +290,8 @@ def run_projection_worker(
                 scan.project_pending(
                     tenant_id=tenant_id,
                     batch_size=min(4, logical_batch_size),
-                    max_batches=max_batches_per_cycle,
+                    # Give fresh work another turn before queued month catch-up.
+                    max_batches=1 if freshness_busy else max_batches_per_cycle,
                     compaction_budget=0 if freshness_busy else 1,
                 )
                 if scan is not None and parquet_due
