@@ -7,11 +7,12 @@ import io
 import json
 import pickle
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
+import threading
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from itertools import groupby
-from typing import Any
+from typing import Any, Callable
 
 import orjson
 import psycopg
@@ -2016,6 +2017,7 @@ class CanonicalLogicalEvidenceProjector:
         quiet_seconds: float = 0.0,
         max_wait_seconds: float = 0.0,
         cleanup_concurrency: int | None = None,
+        on_progress: Callable[[], None] | None = None,
     ) -> dict[str, int | str]:
         if cleanup_concurrency is None:
             cleanup_concurrency = upload_concurrency
@@ -2084,173 +2086,103 @@ class CanonicalLogicalEvidenceProjector:
             if not candidates:
                 break
             worker_count = min(upload_concurrency, len(candidates))
-            # At most 256 identifiers across all uploads, including individual
-            # retries of a failed shard. Large batches can simply omit hints.
+            # At most 256 identifiers across all parent uploads. Large batches
+            # can simply omit hints; a failed parent does not repeat siblings.
             hint_limit = min(32, 256 // len(candidates))
-            shards: list[list[tuple[int, LogicalGroupCandidate]]] = [
-                [] for _ in range(worker_count)
-            ]
-            shard_loads = [0] * worker_count
-            weighted_candidates = sorted(
-                enumerate(candidates),
-                key=lambda value: (
-                    -value[1].estimated_bytes,
-                    value[0],
-                ),
-            )
-            for index, candidate in weighted_candidates:
-                shard_index = min(
-                    range(worker_count),
-                    key=lambda value: (shard_loads[value], value),
-                )
-                shards[shard_index].append((index, candidate))
-                shard_loads[shard_index] += candidate.estimated_bytes
-            uploads: list[LogicalEvidenceUpload | None] = [None] * len(candidates)
-            successful: list[LogicalEvidenceUpload] = []
-            failed_shards: list[tuple[list[tuple[int, LogicalGroupCandidate]], Exception]] = []
-            skipped: set[int] = set()
-            futures = []
+            # One parent owns preparation through commit. A large parent must
+            # not hold successful siblings behind a shard or batch barrier.
+            stopping = threading.Event()
+
+            def project_parent(candidate):
+                try:
+                    (upload,) = self._prepare_batch_and_upload(
+                        (candidate,), hint_limit=hint_limit,
+                    )
+                except Exception as error:
+                    self._mark_failed(candidate, error)
+                    return None, "failed"
+                if stopping.is_set():
+                    if upload is not None:
+                        self._schedule_upload_cleanup([upload])
+                    return None, "cancelled"
+                try:
+                    return upload, self._commit_upload(candidate, upload)
+                except Exception:
+                    # _commit_upload owns cleanup on ordinary commit failure.
+                    raise
+                except BaseException:
+                    if upload is not None:
+                        self._schedule_upload_cleanup([upload])
+                    raise
+
             try:
                 with ThreadPoolExecutor(
                     max_workers=worker_count,
                     thread_name_prefix="recall-logical-evidence",
                 ) as executor:
-                    futures = [
-                        (
-                            shard,
-                            executor.submit(
-                                self._prepare_batch_and_upload,
-                                tuple(candidate for _, candidate in shard),
-                                hint_limit=hint_limit,
-                            ),
-                        )
-                        for shard in shards
-                    ]
-                    for shard, future in futures:
-                        try:
-                            shard_uploads = future.result()
-                        except Exception as error:
-                            failed_shards.append((shard, error))
-                            continue
-                        for (index, _candidate), upload in zip(
-                            shard,
-                            shard_uploads,
-                            strict=True,
-                        ):
-                            uploads[index] = upload
-                            if upload is not None:
-                                successful.append(upload)
-            except BaseException:
-                interrupted_uploads: list[LogicalEvidenceUpload] = []
-                for _shard, future in futures:
-                    if future.cancelled():
-                        continue
+                    pending = {
+                        executor.submit(project_parent, candidate): candidate
+                        for candidate in candidates
+                    }
                     try:
-                        shard_uploads = future.result()
+                        while pending:
+                            completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+                            publish = False
+                            for future in completed:
+                                candidate = pending.pop(future)
+                                upload, status = future.result()
+                                if status == "failed":
+                                    failed += 1
+                                    continue
+                                publish |= status in {"committed", "repaired", "pruned"}
+                                if status == "stale":
+                                    source_races += 1
+                                    continue
+                                if status == "adopted":
+                                    continue
+                                if status == "repaired":
+                                    repaired += 1
+                                    continue
+                                if status == "pruned":
+                                    pruned += 1
+                                    continue
+                                if status != "committed" or upload is None:
+                                    raise LogicalEvidenceError("logical_evidence_state_invalid")
+                                inline_ids = getattr(upload, "inline_document_ids", ())
+                                if any(not isinstance(value, str) or not 1 <= len(value) <= 255
+                                       for value in (candidate.tenant_id, candidate.source_id)):
+                                    inline_ids = ()
+                                for document_id in inline_ids:
+                                    key = (candidate.tenant_id, candidate.source_id, document_id)
+                                    self._committed_body_keys[key] = None
+                                    if len(self._committed_body_keys) > 256:
+                                        del self._committed_body_keys[next(iter(self._committed_body_keys))]
+                                documents += 1
+                                records += upload.prepared.record_count
+                                receipts += upload.prepared.receipt_count
+                                objects += len(upload.all_references)
+                                bytes_uploaded += sum(
+                                    int(reference["size_bytes"]) for reference in upload.all_references
+                                )
+                            # The coordinator is the sole downstream owner.
+                            # Coalesce completions already ready before another
+                            # bounded publication tick; never call from threads.
+                            if publish and on_progress is not None:
+                                on_progress()
                     except BaseException:
-                        continue
-                    interrupted_uploads.extend(
-                        upload
-                        for upload in shard_uploads
-                        if upload is not None
-                    )
-                self._schedule_upload_cleanup(interrupted_uploads)
+                        stopping.set()
+                        for future in pending:
+                            future.cancel()
+                        raise
+            except BaseException:
+                # Executor shutdown first settles active tasks: every upload
+                # is either committed or durably queued for cleanup by its owner.
                 self.drain_cleanup(
                     tenant_id=tenant_id,
                     limit=5_000,
                     concurrency=cleanup_concurrency,
                 )
                 raise
-            # A failing group must not poison its batch, let alone the
-            # worker: retry the members of a failed multi-group shard one by
-            # one so only the guilty group is backed off; everything else in
-            # the batch commits normally this cycle.
-            for shard, error in failed_shards:
-                if len(shard) == 1:
-                    (index, candidate), = shard
-                    skipped.add(index)
-                    self._mark_failed(candidate, error)
-                    continue
-                for index, candidate in shard:
-                    try:
-                        (upload,) = self._prepare_batch_and_upload(
-                            (candidate,), hint_limit=hint_limit,
-                        )
-                    except Exception as single_error:
-                        skipped.add(index)
-                        self._mark_failed(candidate, single_error)
-                        continue
-                    uploads[index] = upload
-                    if upload is not None:
-                        successful.append(upload)
-            failed += len(skipped)
-            statuses: list[str | None] = [None] * len(candidates)
-            failures: list[Exception] = []
-            with ThreadPoolExecutor(
-                max_workers=worker_count,
-                thread_name_prefix="recall-logical-commit",
-            ) as executor:
-                commit_futures = [
-                    (
-                        index,
-                        executor.submit(
-                            self._commit_upload,
-                            candidate,
-                            upload,
-                        ),
-                    )
-                    for index, (candidate, upload) in enumerate(
-                        zip(candidates, uploads, strict=True)
-                    )
-                    if index not in skipped
-                ]
-                for index, future in commit_futures:
-                    try:
-                        statuses[index] = future.result()
-                    except Exception as error:
-                        failures.append(error)
-            if failures:
-                self.drain_cleanup(
-                    tenant_id=tenant_id,
-                    limit=5_000,
-                    concurrency=cleanup_concurrency,
-                )
-                raise failures[0]
-            for index, (upload, status) in enumerate(
-                zip(uploads, statuses, strict=True)
-            ):
-                if index in skipped:
-                    continue
-                if status == "stale":
-                    source_races += 1
-                    continue
-                if status == "adopted":
-                    continue
-                if status == "repaired":
-                    repaired += 1
-                    continue
-                if status == "pruned":
-                    pruned += 1
-                    continue
-                if status != "committed" or upload is None:
-                    raise LogicalEvidenceError("logical_evidence_state_invalid")
-                candidate = candidates[index]
-                inline_ids = getattr(upload, "inline_document_ids", ())
-                if any(not isinstance(value, str) or not 1 <= len(value) <= 255
-                       for value in (candidate.tenant_id, candidate.source_id)):
-                    inline_ids = ()
-                for document_id in inline_ids:
-                    key = (candidate.tenant_id, candidate.source_id, document_id)
-                    self._committed_body_keys[key] = None
-                    if len(self._committed_body_keys) > 256:
-                        del self._committed_body_keys[next(iter(self._committed_body_keys))]
-                documents += 1
-                records += upload.prepared.record_count
-                receipts += upload.prepared.receipt_count
-                objects += len(upload.all_references)
-                bytes_uploaded += sum(
-                    int(reference["size_bytes"]) for reference in upload.all_references
-                )
             batches += 1
             cleanup = self.drain_cleanup(
                 tenant_id=tenant_id,
