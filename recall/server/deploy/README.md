@@ -1435,6 +1435,53 @@ systemctl --user daemon-reload
 systemctl --user enable --now recall-collector@claude recall-collector@codex
 ```
 
+### Verify team session collection and MCP access
+
+Track each person's device, selected harnesses, latest Brain ACK, latest searchable
+session, and MCP login. An accepted invitation enables access; installing a
+collector enables uploads. Verify both before marking a person ready.
+
+1. **Invite and connect.** The owner invites the exact verified email through
+   `/admin`. The employee accepts and follows the Codex or Claude commands on
+   `/join/<invitation-id>`, which use the company-specific `/mcp/brains/<tenant>`
+   endpoint and the configured OAuth settings. Use each person's own identity.
+2. **Enroll selected session sources.** In the web or Mac switchboard, the employee
+   creates a device route for `local.claude-code` and/or `local.codex`. This uses
+   `POST /admin/api/v1/device/installations` to bind the source to their principal
+   and contributor actor and issue a source-scoped write-only credential. Keep
+   existing source IDs and spools on upgrades. On Linux, fill in every example
+   path and the enrolled tenant/principal/source tuple; the unit explicitly needs
+   `RECALL_PRINCIPAL_ID` and `RECALL_INTERVAL_SECONDS`. On Mac, follow the
+   [client installation instructions](../../client/README.md). Codex collection
+   includes both active and archived rollout roots.
+3. **Verify upload progress.** On Linux, check
+   `systemctl --user status recall-collector@claude recall-collector@codex` and run
+   `python -m collector.cli doctor` with that unit's environment and all arguments
+   from its `watch` invocation, changing only the command. Replace `doctor` with
+   `status` for central source parity; retain the principal and credential arguments.
+   On Mac, use `recall-brain mac-status`. Require advancing ACKs when new sessions
+   exist, complete or progressing scan coverage, draining pending records, and
+   no unexplained dead records. `coverage_percent` counts discovered files in the
+   ledger; neither 100% coverage nor a `ready` label alone proves uploads drained.
+4. **Verify the serving pipeline.** The owner's authenticated
+   `GET /admin/api/v1/state` includes invitations and the source fleet: owner,
+   device, heartbeat, pending/dead counts, last transfer and 24-hour activity.
+   Compare it with the intended roster; people with no source will not appear in
+   fleet rows. Heartbeats older than two minutes are stale. The collector ingress
+   service needs canonical v2/archive configuration and
+   `RECALL_CANONICAL_INGEST_PUBLIC=1` for its archive, ingest, status and health
+   routes. Check logical and passage queues, then `search_projection_outbox` and
+   `python -m recall_server.cli search-plane-status --tenant <tenant>` for search
+   publication. The managed
+   worker runs remote connectors, not local session collectors; its optional
+   projection cycle does not drain turbopuffer. Verify the existing dedicated
+   `projection-worker` or `search-plane-project` owns that drain.
+5. **Prove it from the employee's client.** Search for a recent known session from
+   each selected harness using the employee's authenticated MCP, then open its
+   returned receipt. Record the session timestamp and successful open alongside
+   the upload ACK. Namespace counts and green service health do not replace this
+   check. For live sessions, observe a later upload becoming searchable as well.
+
 Back up and run a blank-database restore proof:
 
 ```bash
