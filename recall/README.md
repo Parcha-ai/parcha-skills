@@ -133,6 +133,12 @@ the rollback setting. Agent-facing details are in
 `skills/recall/references/central-brain.md`; operator docs in `client/`,
 `connectors/`, and `server/deploy/`.
 
+Codex paginated rollout files are collected as separate physical-history
+documents with stable segment IDs. Existing unsuffixed rollout IDs stay unchanged;
+continuations retain their native session ID and exact inherited-prefix metadata
+in provenance. This preserves both histories when a base file continued after a
+pagination checkpoint; it does not flatten them into a guessed conversation order.
+
 ## Requirements
 
 - Python 3.10+ with SQLite FTS5 (included in stock Python on Debian, Ubuntu,

@@ -23,10 +23,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 if __package__:
-    from .codex_identity import resolve_codex_session_identity, stable_codex_record_key
+    from .codex_identity import resolve_codex_session_identity, stable_codex_record_key, stable_codex_segment_key
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from codex_identity import resolve_codex_session_identity, stable_codex_record_key
+    from codex_identity import resolve_codex_session_identity, stable_codex_record_key, stable_codex_segment_key
 
 SCHEMA_VERSION = "4"
 PARSER_VERSION = 1
@@ -1614,6 +1614,8 @@ def session_file_key(path: Path, root: Path, harness: str) -> str:
         identity = resolve_codex_session_identity(path)
         if identity.native_session_id is None:
             raise ValueError("Codex session identity is unavailable")
+        if identity.segment_id is not None:
+            return stable_codex_segment_key(identity.native_session_id, identity.segment_id)
         return stable_codex_record_key(identity.native_session_id)
     relative = str(path.resolve().relative_to(root.resolve()))
     return hashlib.sha256((harness + "\x1f" + relative).encode()).hexdigest()[:24]
