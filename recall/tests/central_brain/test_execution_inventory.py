@@ -45,7 +45,7 @@ class ExecutionInventoryTests(unittest.TestCase):
                 dict(object_key=o.object_key, content_sha256=o.content_sha256)
                 for o in (*objects, tool)])
             self.assertLess(len(kwargs["body"]["command"].encode()), 100_000)
-            self.assertTrue(kwargs["body"]["disks"]["evidence"]["readOnly"])
+            self.assertNotIn("readOnly", kwargs["body"]["disks"]["evidence"])
             return {"success": True, "data": {"stdout": "6000", "stderr": "",
                     "exitCode": 0, "timing": {}}}
         transport.post.side_effect = post
