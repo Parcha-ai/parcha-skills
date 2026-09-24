@@ -68,6 +68,7 @@ class CanonicalEmbeddingPlaneTests(unittest.TestCase):
                    source_id='source:test', privacy_mode='scrub')
         connector = mock.Mock()
         runner = mock.Mock()
+        runner.checkpoints = None
         runner.run_once.return_value = dict(status='committed', acked=2, staged=2, has_more=True)
         with tempfile.TemporaryDirectory() as directory:
             worker = object.__new__(ManagedConnectorWorker)
