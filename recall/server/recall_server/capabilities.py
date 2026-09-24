@@ -5,7 +5,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from . import MANDATORY_SCHEMA_VERSION, RECONCILIATION_INDEX_VERSION, RETIRE_POSTGRES_PLANE_VERSION
+from . import (
+    MANDATORY_SCHEMA_VERSION,
+    NATIVE_CONVERSATION_SCHEMA_VERSION,
+    RECONCILIATION_INDEX_VERSION,
+    RETIRE_POSTGRES_PLANE_VERSION,
+)
 
 
 MIN_POSTGRES_MAJOR = 16
@@ -170,13 +175,15 @@ def assess_snapshot(snapshot: dict[str, Any], profile: str = "production") -> di
     if _version_tuple(vector_version) < MIN_VECTOR_VERSION:
         raise CapabilityError("extension_unsupported")
     versions = list(snapshot.get("migration_versions") or [])
-    # Accept only the known optional retirement and performance migration.
+    # Accept only explicitly known optional migrations; no future-version wildcard.
     # Membership, not the maximum, proves retirement; gaps still fail closed.
     mandatory = [version for version in range(1, MANDATORY_SCHEMA_VERSION + 1)
                  if version != RETIRE_POSTGRES_PLANE_VERSION]
     retired = RETIRE_POSTGRES_PLANE_VERSION in versions
     expected = sorted(mandatory + ([RETIRE_POSTGRES_PLANE_VERSION] if retired else [])
-                      + ([RECONCILIATION_INDEX_VERSION] if RECONCILIATION_INDEX_VERSION in versions else []))
+                      + ([RECONCILIATION_INDEX_VERSION] if RECONCILIATION_INDEX_VERSION in versions else [])
+                      + ([NATIVE_CONVERSATION_SCHEMA_VERSION]
+                         if NATIVE_CONVERSATION_SCHEMA_VERSION in versions else []))
     if versions != expected:
         raise CapabilityError("schema_drift")
     vector_plane_present = snapshot.get("postgres_vector_plane_present")

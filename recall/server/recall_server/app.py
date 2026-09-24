@@ -879,6 +879,25 @@ class Handler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if parsed.path == "/admin/native/login":
+                if self.control_plane is None:
+                    self.send_json(404, {"error": "not found"})
+                    return
+                query = parse_qs(parsed.query, keep_blank_values=True)
+                if set(query) != {"code_challenge", "state"} or any(
+                    len(values) != 1 for values in query.values()
+                ):
+                    self.send_json(400, {"error": "identity_oauth_request_invalid"})
+                    return
+                try:
+                    started = self.control_plane.start_identity_login(
+                        purpose="native", native_challenge=query["code_challenge"][0],
+                        native_state=query["state"][0],
+                    )
+                    self.send_redirect(started["authorization_url"])
+                except ControlError as error:
+                    self.send_json(error.status, {"error": error.code})
+                return
             if parsed.path == "/admin/login":
                 if self.control_plane is None:
                     self.send_json(404, {"error": "not found"})
@@ -1128,6 +1147,26 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlsplit(self.path).path
         if self.hide_non_public_route("POST", path):
+            return
+        if self.admin_web_enabled() and path == "/admin/api/v1/native/session":
+            if self.control_plane is None:
+                self.send_json(503, {"error": "control_plane_unavailable"})
+                return
+            body = self.read_admin_json()
+            if body is None:
+                return
+            if set(body) != {"code", "code_verifier"}:
+                self.send_json(400, {"error": "admin_request_invalid"})
+                return
+            try:
+                browser = self.control_plane.exchange_native_login(**body)
+                self.send_json(201, {
+                    "status": "authenticated", "expires_at": browser["expires_at"],
+                }, [("Set-Cookie", value) for value in admin_session_headers(
+                    browser["session"], browser["csrf"],
+                )])
+            except ControlError as error:
+                self.send_json(error.status, {"error": error.code})
             return
         if self.admin_web_enabled() and path == "/admin/api/v1/session":
             if self.control_plane is None:
