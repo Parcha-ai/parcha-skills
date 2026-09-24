@@ -1128,16 +1128,65 @@ class ControlPlane:
     def identity_oauth_enabled(self) -> bool:
         return self.identity_provider is not None
 
+    def _identity_state(self, context: dict, *, purpose: str, lifetime: int = 600) -> str:
+        token = secrets.token_urlsafe(32)
+        digest = _digest(token)
+        encrypted = self.secret_box.seal(context, purpose=f"{purpose}:{digest}")
+        with self.store.connect() as connection:
+            connection.execute(
+                """INSERT INTO identity_oauth_states(
+                       state_sha256,encrypted_context,encryption_key_id,expires_at
+                   ) VALUES (%s,%s,%s,%s)""",
+                (digest, encrypted, self.secret_box.key_id,
+                 _now() + timedelta(seconds=lifetime)),
+            )
+        return token
+
+    def _consume_identity_state(self, token: str, *, purpose: str) -> dict:
+        if not isinstance(token, str) or not STATE_RE.fullmatch(token):
+            raise ControlError("identity_oauth_callback_invalid", 400)
+        digest = _digest(token)
+        with self.store.connect() as connection:
+            row = connection.execute(
+                """UPDATE identity_oauth_states SET consumed_at=now()
+                   WHERE state_sha256=%s AND consumed_at IS NULL
+                     AND expires_at>now()
+                   RETURNING encrypted_context,encryption_key_id""",
+                (digest,),
+            ).fetchone()
+        if row is None or row["encryption_key_id"] != self.secret_box.key_id:
+            raise ControlError("identity_oauth_callback_invalid", 400)
+        return self.secret_box.open(bytes(row["encrypted_context"]),
+                                    purpose=f"{purpose}:{digest}")
+
+    def exchange_native_login(self, *, code: str, code_verifier: str) -> dict[str, str]:
+        if (not isinstance(code_verifier, str)
+                or not re.fullmatch(r"[A-Za-z0-9_-]{43,128}", code_verifier)):
+            raise ControlError("identity_oauth_callback_invalid", 400)
+        context = self._consume_identity_state(code, purpose="native-login")
+        challenge = base64.urlsafe_b64encode(
+            hashlib.sha256(code_verifier.encode()).digest()).rstrip(b"=").decode()
+        if (set(context) != {"code_challenge", "issuer", "subject_sha256", "principal_id"}
+                or not secrets.compare_digest(context["code_challenge"], challenge)):
+            raise ControlError("identity_oauth_callback_invalid", 400)
+        principal = self._resolve_control_identity(
+            context["issuer"], context["subject_sha256"], member_access=True)
+        if principal is None or principal != context["principal_id"]:
+            raise ControlError("identity_member_forbidden", 403)
+        return self._create_admin_session(principal)
+
     def start_identity_login(
         self,
         *,
         purpose: str,
         invitation_id: str | None = None,
+        native_challenge: str | None = None,
+        native_state: str | None = None,
     ) -> dict[str, str]:
         provider = self.identity_provider
         if provider is None:
             raise ControlError("identity_oauth_unavailable", 404)
-        if purpose not in {"admin", "join"}:
+        if purpose not in {"admin", "join", "native"}:
             raise ControlError("identity_oauth_request_invalid")
         if purpose == "join":
             if invitation_id is None:
@@ -1145,40 +1194,35 @@ class ControlPlane:
             self.invitation_onboarding(invitation_id)
         elif invitation_id is not None:
             raise ControlError("identity_oauth_request_invalid")
-        state = secrets.token_urlsafe(32)
+        if purpose == "native":
+            if (not isinstance(native_challenge, str)
+                    or not re.fullmatch(r"[A-Za-z0-9_-]{43}", native_challenge)
+                    or not isinstance(native_state, str)
+                    or not STATE_RE.fullmatch(native_state)):
+                raise ControlError("identity_oauth_request_invalid")
+        elif native_challenge is not None or native_state is not None:
+            raise ControlError("identity_oauth_request_invalid")
         verifier = secrets.token_urlsafe(64)
         challenge = base64.urlsafe_b64encode(
             hashlib.sha256(verifier.encode()).digest()
         ).rstrip(b"=").decode()
-        context = self.secret_box.seal(
-            {
-                "purpose": purpose,
-                "invitation_id": invitation_id,
-                "code_verifier": verifier,
-            },
-            purpose=f"identity-oauth:{_digest(state)}",
-        )
-        with self.store.connect() as connection:
-            connection.execute(
-                """INSERT INTO identity_oauth_states(
-                       state_sha256,encrypted_context,encryption_key_id,expires_at
-                   ) VALUES (%s,%s,%s,%s)""",
-                (
-                    _digest(state),
-                    context,
-                    self.secret_box.key_id,
-                    _now() + timedelta(minutes=10),
-                ),
-            )
+        context = {
+            "purpose": purpose, "invitation_id": invitation_id, "code_verifier": verifier,
+        }
+        if purpose == "native":
+            context.update(native_challenge=native_challenge, native_state=native_state)
+        state = self._identity_state(context, purpose="identity-oauth")
         return {
             "authorization_url": provider.authorization_url(
                 state=state, code_challenge=challenge
             )
         }
 
-    def _resolve_admin_identity(self, identity: BrowserIdentity) -> str | None:
-        assert self.identity_provider is not None
-        subject_sha256 = _digest(identity.subject)
+    def _resolve_control_identity(
+        self, issuer: str, subject_sha256: str, *, member_access: bool = False,
+    ) -> str | None:
+        permissions = ["owner", "admin", "read"] if member_access else ["owner", "admin"]
+        roles = ["owner", "admin", "member"] if member_access else ["owner", "admin"]
         with self.store.connect() as connection:
             rows = connection.execute(
                 """SELECT DISTINCT binding.principal_id
@@ -1193,9 +1237,9 @@ class ControlPlane:
                     AND membership.principal_id=binding.principal_id
                    WHERE binding.issuer=%s AND binding.subject_sha256=%s
                      AND binding.revoked_at IS NULL
-                     AND access.permission IN ('owner','admin')
-                     AND membership.role IN ('owner','admin')""",
-                (self.identity_provider.canonical_issuer, subject_sha256),
+                     AND access.permission=ANY(%s)
+                     AND membership.role=ANY(%s)""",
+                (issuer, subject_sha256, permissions, roles),
             ).fetchall()
         principals = {row["principal_id"] for row in rows}
         return principals.pop() if len(principals) == 1 else None
@@ -1273,22 +1317,11 @@ class ControlPlane:
             or not 1 <= len(code) <= 4096
         ):
             raise ControlError("identity_oauth_callback_invalid", 400)
-        state_sha256 = _digest(state)
-        with self.store.connect() as connection:
-            row = connection.execute(
-                """UPDATE identity_oauth_states SET consumed_at=now()
-                   WHERE state_sha256=%s AND consumed_at IS NULL
-                     AND expires_at>now()
-                   RETURNING encrypted_context,encryption_key_id""",
-                (state_sha256,),
-            ).fetchone()
-        if row is None or row["encryption_key_id"] != self.secret_box.key_id:
-            raise ControlError("identity_oauth_callback_invalid", 400)
-        context = self.secret_box.open(
-            bytes(row["encrypted_context"]),
-            purpose=f"identity-oauth:{state_sha256}",
-        )
-        if set(context) != {"purpose", "invitation_id", "code_verifier"}:
+        context = self._consume_identity_state(state, purpose="identity-oauth")
+        expected = {"purpose", "invitation_id", "code_verifier"}
+        if context.get("purpose") == "native":
+            expected |= {"native_challenge", "native_state"}
+        if set(context) != expected:
             raise ControlError("identity_oauth_callback_invalid", 400)
         try:
             identity = provider.exchange(
@@ -1300,8 +1333,23 @@ class ControlPlane:
         if email is None or not identity.email_verified:
             raise ControlError("identity_oauth_identity_invalid", 403)
         purpose = context["purpose"]
+        if purpose == "native" and context["invitation_id"] is None:
+            principal = self._resolve_control_identity(
+                provider.canonical_issuer, _digest(identity.subject), member_access=True)
+            if principal is None:
+                raise ControlError("identity_member_forbidden", 403)
+            code = self._identity_state({
+                "code_challenge": context["native_challenge"],
+                "issuer": provider.canonical_issuer,
+                "subject_sha256": _digest(identity.subject),
+                "principal_id": principal,
+            }, purpose="native-login", lifetime=90)
+            return {"status": "authenticated", "redirect": "ai.parcha.recall://oauth?" + urlencode({
+                "code": code, "state": context["native_state"],
+            })}
         if purpose == "admin" and context["invitation_id"] is None:
-            principal_id = self._resolve_admin_identity(identity)
+            principal_id = self._resolve_control_identity(
+                provider.canonical_issuer, _digest(identity.subject))
             if principal_id is None:
                 principal_id = self._claim_bootstrap_owner(identity)
             return {

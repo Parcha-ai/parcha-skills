@@ -1,0 +1,20 @@
+name: Recall macOS
+
+on:
+  pull_request:
+    paths:
+      - 'recall/client/macos_admin/**'
+      - '.github/workflows/recall-macos.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-app:
+    runs-on: macos-14
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - name: Build app and verify native callback contract
+        run: sh recall/client/macos_admin/build.sh "$RUNNER_TEMP/recall-native"

@@ -23,6 +23,45 @@ explicitly selected user LaunchAgent files.
 
 ## Inspect, install, and remove
 
+### Company members on a Mac
+
+After accepting company access through MCP or the invitation page, unpack the
+current bundle and prepare the sources you want to share without starting them:
+
+```bash
+./install.sh --endpoint https://recall-mcp-parcha.onrender.com \
+  --host-id your-unique-mac-name --keychain-service ai.parcha.recall \
+  --visibility private --sources claude-code,codex --privacy-mode scrub --no-load
+./macos_admin/build.sh
+open "macos_admin/dist/Recall Brain.app"
+```
+
+Building the native utility requires Xcode 16 or newer. In **Recall Brain**,
+check the server address (upgrades retain your previous setting), choose
+**Sign in with browser**, and use that same account. Select the company
+destination and enable Claude Code or
+Codex. The app enrolls each source as the signed-in person, stores its write token
+in Keychain, applies the canonical company route, and starts its LaunchAgent.
+An administrator key is not required for this flow.
+
+Sign-in uses the existing server identity provider and callback. A 90-second,
+single-use code returns to the app through `ai.parcha.recall://oauth`; only the
+app's in-memory PKCE verifier can exchange it for a short session. No session or
+collector credential enters the callback URL. Existing company membership is
+checked again at exchange and source enrollment. Invitations, other people's
+sources, and other brains retain their existing permission checks.
+
+The browser sign-in requires the matching server release. It does not provision
+MCP in Claude/Codex: use the invitation page's MCP commands and your own OAuth
+login. On browserless Linux hosts, use the existing per-person, per-source
+collector provisioning; this Mac flow adds no shared access key.
+
+After enabling collection, inspect `recall-brain mac-status`, check the company's
+collector heartbeat, and confirm a newly recorded turn is retrievable through
+your own MCP identity. Native verification requires macOS 14+: run
+`client/macos_admin/build.sh`, then exercise browser sign-in, cancellation,
+source enrollment and Keychain-backed collection on that Mac.
+
 Run a content-free inventory before enabling collection:
 
 ```bash
@@ -121,7 +160,7 @@ creates a source-scoped route. It atomically retains the LaunchAgent while
 binding that collector to the canonical tenant writer; the next resume writes
 raw objects through the configured archive and ACKs only after canonical ingest.
 
-The bundle also carries a SwiftUI owner utility. Build it on an Apple Silicon
+The bundle also carries a SwiftUI member and administrator utility. Build it on an Apple Silicon
 Mac with Xcode 16 or newer:
 
 ```bash
@@ -130,7 +169,8 @@ open "macos_admin/dist/Recall Brain.app"
 ```
 
 The Mac switchboard uses the same `/admin/api/v1` contract as the web UI. It
-stores the owner key and source credentials only in Keychain. Pausing retains
+stores source credentials and optional administrator keys only in Keychain.
+Browser login keeps its short identity session in memory. Pausing retains
 the exact LaunchAgent and checkpoint. Changing a destination atomically revokes
 the prior device route, installs a new write-only source credential, binds the
 retained LaunchAgent to that canonical tenant/principal, and sends subsequent
