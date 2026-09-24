@@ -38,6 +38,7 @@ from .search_outbox import (
     write_search_tombstones,
 )
 
+PROJECTION_PROGRESS_INTERVAL_SECONDS = 5.0
 MAX_PASSAGE_PROJECTION_BATCH = 1_000
 MAX_PASSAGE_EMBEDDING_BATCH = 5_000
 MAX_PASSAGE_HEADER_BACKFILL_BATCH = 5_000
@@ -1747,9 +1748,15 @@ class CanonicalPassageProjector:
                 thread_name_prefix="recall-passage-projector",
             ) as executor:
                 futures = {executor.submit(project_document, candidate): candidate for candidate in candidates}
+                next_progress = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
                 try:
                     while futures:
-                        completed, _ = wait(futures, return_when=FIRST_COMPLETED)
+                        completed, _ = wait(
+                            futures,
+                            timeout=max(0.0, next_progress - time.monotonic())
+                            if on_progress is not None else None,
+                            return_when=FIRST_COMPLETED,
+                        )
                         publish = False
                         for future in completed:
                             candidate = futures.pop(future)
@@ -1774,8 +1781,9 @@ class CanonicalPassageProjector:
                             publish = True
                         # Search publication has one coordinator; preparation
                         # and commits continue in the bounded executor meanwhile.
-                        if publish and on_progress is not None:
+                        if on_progress is not None and (publish or time.monotonic() >= next_progress):
                             on_progress()
+                            next_progress = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
                 except BaseException:
                     stopping.set()
                     for future in futures:

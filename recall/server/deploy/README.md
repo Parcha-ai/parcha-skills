@@ -1027,7 +1027,7 @@ order before their idempotent database write. Keep query embedding on the
 ordinary bounded path and raise worker concurrency only within the provider's
 document rate limits.
 
-### Logical admission and early publication
+### Projection admission and early publication
 
 The projection worker admits source-fair batches, with forget work first, while
 previous parents are still preparing. The executor holds at most one additional
@@ -1044,6 +1044,27 @@ claiming recovery. `logical_source_races` reports discarded stale preparations
 separately from `logical_failed`. These settings do not resolve a parent that
 continually changes during its own preparation, or capacity exhausted by giant
 parents in every executor slot.
+
+Passage projection also commits each ready document independently. Only active
+owners retain prepared passage bodies, and commits retain the existing cap of
+8 or one fewer than the database pool size. A progress callback invokes only the
+same coordinator's search writer, so a slow passage preparation cannot hold a
+ready sibling's search publication behind the batch. Missing/unavailable archives
+still yield to logical recovery after the current batch.
+
+While waiting on busy logical or passage owners, the same coordinator wakes
+every five seconds to publish already committed work, including external repair
+outbox entries. Active publication can take longer than that interval; it is a
+bound on idle waiting, not a search-latency guarantee or another writer.
+Logical idle callbacks drain search only: retrying missing passages there would
+invalidate their already running archive rebuilds. Completed logical parents
+still trigger passage projection followed by search.
+
+`passage_elapsed_ms` remains coordinator wall time excluding search callbacks;
+`search_plane_elapsed_ms` measures those callbacks separately. Passage
+`prepare_ms` and `commit_ms` (also logged with the `passage_` prefix) are summed
+owner durations and can overlap. Commit time includes cap/connection waits;
+they are not additive partitions of total cycle wall time.
 
 ### Dedicated passage embedding worker with a daily cap (H5-2/H5-3)
 

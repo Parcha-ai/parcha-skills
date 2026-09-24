@@ -208,6 +208,8 @@ def run_projection_worker(
                 previous_phase, previous_started = active_phase, phase_started
                 if previous_phase == "passage":
                     phase_elapsed["passage_elapsed_ms"] = passage_elapsed_ms + elapsed_ms(previous_started)
+                elif previous_phase == "logical":
+                    phase_elapsed["logical_elapsed_ms"] = elapsed_ms(previous_started)
                 active_phase = "search_plane"
                 phase_started = clock()
                 tick = (
@@ -222,10 +224,17 @@ def run_projection_worker(
                 phase_elapsed["search_plane_elapsed_ms"] = search_plane_elapsed_ms
                 accumulate(searched, tick)
                 search_ticks += 1
-                # Passage wall time excludes search callbacks, although passage
+                # Owner phase wall time excludes search callbacks, although
                 # owners can keep preparing and committing during publication.
-                if previous_phase == "passage":
+                if previous_phase in {"passage", "logical"}:
                     previous_started += clock() - phase_started
+                if previous_phase == "passage":
+                    # The snapshot above is needed if search fails. Once it
+                    # succeeds, an eventual passage failure adds its whole
+                    # current tick to completed ticks, not to that snapshot.
+                    phase_elapsed["passage_elapsed_ms"] = passage_elapsed_ms
+                elif previous_phase == "logical":
+                    phase_elapsed["logical_elapsed_ms"] = 0
                 active_phase, phase_started = previous_phase, previous_started
 
             def publish_ready():
@@ -269,6 +278,7 @@ def run_projection_worker(
                 max_wait_seconds=max_wait_seconds,
                 cleanup_concurrency=cleanup_concurrency,
                 on_progress=publish_ready,
+                on_heartbeat=publish_search if search_plane is not None else None,
             )
             logical_elapsed_ms = elapsed_ms(phase_started)
             phase_elapsed["logical_elapsed_ms"] = logical_elapsed_ms

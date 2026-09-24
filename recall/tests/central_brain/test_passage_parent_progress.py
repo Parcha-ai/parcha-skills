@@ -140,10 +140,52 @@ class PassageOwnerTests(unittest.TestCase):
 
 
 class WorkerPassageTimingTests(unittest.TestCase):
+    def test_logical_heartbeat_is_search_only_and_excludes_search_wall_time(self):
+        from recall_server.projection_worker import run_projection_worker
+        from tests.central_brain.test_projection_worker import _Logical, _Passages
+        for fail in (False, 'search', 'logical'):
+            with self.subTest(fail=fail):
+                now, calls = [0.0], []
+                class Logical(_Logical):
+                    def project_pending(self, **kwargs):
+                        now[0] += 2
+                        kwargs['on_heartbeat']()
+                        now[0] += 1
+                        if fail == 'logical':
+                            raise RuntimeError('synthetic logical failure after heartbeat')
+                        return super().project_pending(**kwargs)
+                def search():
+                    calls.append('search')
+                    now[0] += 3
+                    if fail == 'search' and calls.count('search') == 2:
+                        raise RuntimeError('synthetic heartbeat timeout')
+                    return dict(status='complete', months=1, rows=1, deleted=0, failed=0)
+                def run():
+                    return run_projection_worker(Logical(calls, work=0), _Passages(calls, work=0),
+                        tenant_id='tenant:test', logical_batch_size=2, passage_batch_size=2,
+                        embedding_batch_size=2, max_batches_per_cycle=1, upload_concurrency=2,
+                        passage_concurrency=2, interval_seconds=1, once=True,
+                        skip_embedding=True, search_plane=search, clock=lambda: now[0])
+                if fail:
+                    with self.assertLogs('recall_server.projection_worker', level='ERROR') as logged:
+                        with self.assertRaises(RuntimeError):
+                            run()
+                    for expected in ('search_plane_elapsed_ms=6000', 'passage_elapsed_ms=0',
+                            'failed_phase=search_plane' if fail == 'search' else 'failed_phase=logical',
+                            'logical_elapsed_ms=2000' if fail == 'search' else 'logical_elapsed_ms=3000'):
+                        self.assertIn(expected, logged.output[0])
+                else:
+                    result = run()
+                    self.assertEqual(result['logical_elapsed_ms'], 3000)
+                    self.assertEqual(result['search_plane_elapsed_ms'], 6000)
+                    self.assertEqual(result['cycle_elapsed_ms'], 9000)
+                self.assertEqual(calls.count('passages'), 1)
+                self.assertEqual(calls.count('search'), 2)
+
     def test_search_callbacks_do_not_recurse_or_count_as_passage_wall_time(self):
         from recall_server.projection_worker import run_projection_worker
         from tests.central_brain.test_projection_worker import _Logical
-        for fail in (False, True):
+        for fail in (False, "search", "passage"):
             with self.subTest(failed_search=fail):
                 now, calls = [0.0], []
                 class Passages:
@@ -152,13 +194,15 @@ class WorkerPassageTimingTests(unittest.TestCase):
                         now[0] += 2
                         kwargs['on_progress']()
                         now[0] += 1
+                        if fail == 'passage':
+                            raise RuntimeError('synthetic passage failure after search')
                         kwargs['on_progress']()
                         now[0] += 4
                         return dict(status='complete', documents=2, passages=2, stale=0)
                 def search():
                     calls.append('search')
                     now[0] += 3
-                    if fail and calls.count('search') == 2:
+                    if fail == 'search' and calls.count('search') == 2:
                         raise RuntimeError('synthetic publication timeout')
                     return dict(status='complete', months=1, rows=1, deleted=0, failed=0)
                 def run():
@@ -171,8 +215,12 @@ class WorkerPassageTimingTests(unittest.TestCase):
                     with self.assertLogs('recall_server.projection_worker', level='ERROR') as logged:
                         with self.assertRaises(RuntimeError):
                             run()
-                    for expected in ('failed_phase=search_plane', 'passage_elapsed_ms=3000',
-                                     'search_plane_elapsed_ms=6000', 'cycle_elapsed_ms=9000'):
+                    expected_fields = (('failed_phase=search_plane', 'passage_elapsed_ms=3000',
+                                        'search_plane_elapsed_ms=6000', 'cycle_elapsed_ms=9000')
+                                       if fail == 'search' else
+                                       ('failed_phase=passage', 'passage_elapsed_ms=3000',
+                                        'search_plane_elapsed_ms=3000', 'cycle_elapsed_ms=6000'))
+                    for expected in expected_fields:
                         self.assertIn(expected, logged.output[0])
                 else:
                     result = run()
@@ -181,7 +229,7 @@ class WorkerPassageTimingTests(unittest.TestCase):
                     self.assertEqual(result['cycle_elapsed_ms'], 13000)
                     self.assertEqual(result['search_plane_rows'], 2)
                 self.assertEqual(calls.count('passages'), 1)
-                self.assertEqual(calls.count('search'), 2)
+                self.assertEqual(calls.count('search'), 1 if fail == 'passage' else 2)
 
 
 if __name__ == '__main__':

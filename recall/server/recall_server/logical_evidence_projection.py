@@ -8,6 +8,7 @@ import json
 import pickle
 import tempfile
 import threading
+import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -42,6 +43,7 @@ DEFAULT_EXCLUDED_STRUCTURAL_TYPES = (
     "turn_context",
 )
 LOG = logging.getLogger(__name__)
+PROJECTION_PROGRESS_INTERVAL_SECONDS = 5.0
 MAX_LOGICAL_EVIDENCE_BATCH_SIZE = 10_000
 # A queued group is retried with exponential backoff (60 s doubling, capped
 # at 6 h) and quarantined after this many failed projection attempts.
@@ -2018,6 +2020,7 @@ class CanonicalLogicalEvidenceProjector:
         max_wait_seconds: float = 0.0,
         cleanup_concurrency: int | None = None,
         on_progress: Callable[[], None] | None = None,
+        on_heartbeat: Callable[[], None] | None = None,
     ) -> dict[str, int | str]:
         if cleanup_concurrency is None:
             cleanup_concurrency = upload_concurrency
@@ -2142,13 +2145,16 @@ class CanonicalLogicalEvidenceProjector:
             ) as executor:
                 try:
                     fill_slots(executor)
+                    next_progress = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
                     while pending:
-                        # A lone giant must not hide newly eligible sources.
-                        # Wake only when there is an idle slot and unused budget;
-                        # this does not extend the admission budget or add a job.
+                        # Also publish already committed outbox work while all
+                        # owners are busy. The same coordinator wakes every five
+                        # seconds; admission still requires a free slot/budget.
                         idle_slot = len(pending) < worker_count and batches < max_batches
                         completed, _ = wait(
-                            pending, timeout=1.0 if idle_slot else None,
+                            pending,
+                            timeout=max(0.0, next_progress - time.monotonic())
+                            if idle_slot or on_heartbeat is not None else None,
                             return_when=FIRST_COMPLETED,
                         )
                         publish = False
@@ -2200,8 +2206,16 @@ class CanonicalLogicalEvidenceProjector:
                         # Keep parent preparation running during publication. The
                         # coordinator remains the sole owner of downstream work.
                         fill_slots(executor)
-                        if publish and on_progress is not None:
-                            on_progress()
+                        if publish:
+                            if on_progress is not None:
+                                on_progress()
+                            next_progress = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
+                        elif time.monotonic() >= next_progress:
+                            # Idle publication must not retry missing passages:
+                            # requeuing them would invalidate this rebuild.
+                            if on_heartbeat is not None:
+                                on_heartbeat()
+                            next_progress = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
                         for _ in range(cleanup_rounds):
                             cleanup = self.drain_cleanup(
                                 tenant_id=tenant_id,
