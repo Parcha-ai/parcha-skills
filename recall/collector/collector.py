@@ -414,6 +414,8 @@ class Collector:
         result: dict[str, list[str]] = {}
         for file_row in self.db.execute("SELECT path FROM files ORDER BY path"):
             path = file_row["path"]
+            if codex_segment_id_from_filename(Path(path)) is not None:
+                continue  # Segment IDs never determine the legacy root's key.
             filename_id = codex_session_id_from_filename(Path(path))
             if filename_id is not None:
                 result.setdefault(filename_id, []).append(path)
@@ -481,40 +483,17 @@ class Collector:
         ).fetchall():
             self._protect_codex_ledger_path(row["path"], scan_id)
 
-    def _codex_segments(self, session_id: str, roots: list[dict], segments: list[dict]) -> list[dict]:
-        """Validate local continuation lineage; never replay inherited bytes."""
-        if not roots:
-            raise CollectorRuntimeError("codex_segment_base_unavailable")
+    def _codex_segments(self, segments: list[dict]) -> list[dict]:
+        """Select physical copies; inherited history is provenance, not a read dependency."""
         copies: dict[str, list[dict]] = {}
         for entry in segments:
             copies.setdefault(entry["identity"].segment_id, []).append(entry)
-        chosen = {session_id: roots[0]}
-        for segment_id, locations in copies.items():
+        selected = []
+        for locations in copies.values():
             if len(locations) > 1 and len({self._content_digest(item["path"]) for item in locations}) > 1:
                 raise CollectorRuntimeError("codex_segment_divergent")
-            chosen[segment_id] = locations[0]
-        for segment_id in copies:
-            visited: set[str] = set()
-            cursor = segment_id
-            while cursor != session_id:
-                if cursor in visited or cursor not in chosen:
-                    raise CollectorRuntimeError("codex_segment_lineage_conflict")
-                visited.add(cursor)
-                identity = chosen[cursor]["identity"]
-                base = chosen.get(identity.history_base_id)
-                if base is None:
-                    raise CollectorRuntimeError("codex_segment_base_unavailable")
-                offset = identity.history_base_offset
-                with base["path"].open("rb") as source:
-                    source.seek(0, os.SEEK_END)
-                    if offset > source.tell():
-                        raise CollectorRuntimeError("codex_segment_base_truncated")
-                    if offset:
-                        source.seek(offset - 1)
-                        if source.read(1) != b"\n":
-                            raise CollectorRuntimeError("codex_segment_base_boundary")
-                cursor = identity.history_base_id
-        return [chosen[segment_id] for segment_id in copies]
+            selected.append(locations[0])
+        return selected
 
     def _rebind_codex_segments(self, session_id: str, segments: list[dict]) -> bool:
         """Move each physical segment's existing ledger, never reset offsets."""
@@ -647,7 +626,7 @@ class Collector:
                         and item["identity"].segment_id is not None]
             candidates = [item for item in candidates if item not in segments]
             try:
-                selected_segments = self._codex_segments(session_id, candidates, segments) if segments else []
+                selected_segments = self._codex_segments(segments)
             except CollectorRuntimeError:
                 conflicts += 1
                 self.db.execute("UPDATE codex_session_locations SET status='identity_conflict' "
@@ -692,7 +671,7 @@ class Collector:
                 self._protect_codex_session(session_id, scan_id)
                 continue
 
-            chosen = candidates[0]
+            chosen = candidates[0] if candidates else selected_segments[0]
             if (
                 len(candidates) == 1
                 and not segments
@@ -754,7 +733,10 @@ class Collector:
             old_path = session["canonical_path"]
             self.db.execute("SAVEPOINT codex_session_rebind")
             try:
-                rebound = (self._rebind_codex_path(old_path, chosen["path_text"])
+                # A rootless session may use a segment as its metadata anchor.
+                # Its physical ledger must never move into a later root file.
+                move_root = bool(candidates) and codex_segment_id_from_filename(Path(old_path)) is None
+                rebound = ((not move_root or self._rebind_codex_path(old_path, chosen["path_text"]))
                            and self._rebind_codex_segments(session_id, selected_segments))
                 if not rebound:
                     self.db.execute("ROLLBACK TO codex_session_rebind")
@@ -778,8 +760,9 @@ class Collector:
                    SET canonical_path=?,lifecycle=?,status='resolved',last_seen_at=?
                    WHERE session_id=?""",
                 (
-                    chosen["path_text"], chosen["lifecycle"], time.time(),
-                    session_id,
+                    (chosen["path_text"] if candidates or codex_segment_id_from_filename(Path(old_path))
+                     else old_path),
+                    chosen["lifecycle"], time.time(), session_id,
                 ),
             )
             self.db.execute(
@@ -791,10 +774,11 @@ class Collector:
                 "UPDATE codex_session_locations SET status='current' WHERE path=?",
                 (chosen["path_text"],),
             )
-            self._codex_path_keys[chosen["path_text"]] = session["record_key"]
+            if candidates:
+                self._codex_path_keys[chosen["path_text"]] = session["record_key"]
+                selected.append(chosen)
             for duplicate in candidates[1:]:
                 self._protect_codex_ledger_path(duplicate["path_text"], scan_id)
-            selected.append(chosen)
             # A base can continue after its inherited prefix. Keep each physical
             # history in its own document; do not invent a flattened turn order.
             for segment in selected_segments:
@@ -804,7 +788,7 @@ class Collector:
                 self._codex_segment_identities[path_text] = segment["identity"]
                 self.db.execute("UPDATE codex_session_locations SET status='current' WHERE path=?", (path_text,))
                 selected.append(segment)
-            duplicate_sessions += int(len(segments) > len(selected_segments) and len(candidates) == 1)
+            duplicate_sessions += int(len(segments) > len(selected_segments) and len(candidates) <= 1)
             for segment in segments:
                 if segment not in selected_segments:
                     self._protect_codex_ledger_path(segment["path_text"], scan_id)

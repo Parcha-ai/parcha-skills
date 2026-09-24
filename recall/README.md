@@ -136,8 +136,8 @@ the rollback setting. Agent-facing details are in
 Codex paginated rollout files are collected as separate physical-history
 documents with stable segment IDs. Existing unsuffixed rollout IDs stay unchanged;
 continuations retain their native session ID and exact inherited-prefix metadata
-in provenance. This preserves both histories when a base file continued after a
-pagination checkpoint; it does not flatten them into a guessed conversation order.
+in provenance, even when the inherited base is unavailable locally. This preserves
+both histories when a base file continued after a pagination checkpoint; it does not flatten them into a guessed conversation order.
 
 ## Requirements
 

@@ -181,46 +181,103 @@ class CodexPaginationTest(unittest.TestCase):
         self.assertEqual(len({row["native_id"] for row in rows}), 8)
         collector.close()
 
-    def test_bad_base_never_ingests_or_tombstones_existing_root(self):
-        for problem in ("missing", "foreign", "offset", "boundary", "cycle"):
-            with self.subTest(problem=problem):
-                root = self.root_file()
-                collector = self.collector()
-                collector.scan()
-                collector.flush()
-                before = collector.db.execute("SELECT count(*) FROM outbox").fetchone()[
-                    0
-                ]
-                base_id = {"missing": NEXT, "foreign": NEXT, "cycle": SEGMENT}.get(
-                    problem, SESSION
-                )
-                if problem == "foreign":
-                    self.root_file(NEXT)
-                offset = (
-                    root.stat().st_size + 1
-                    if problem == "offset"
-                    else 1
-                    if problem == "boundary"
-                    else None
-                )
-                part = self.segment(root, base_id=base_id, offset=offset)
-                scanned = collector.scan()
-                self.assertGreater(scanned["identity_conflicts"], 0)
-                self.assertEqual(scanned["tombstones_queued"], 0)
-                self.assertEqual(
-                    collector.db.execute(
-                        "SELECT count(*) FROM outbox WHERE path=?", (str(part),)
-                    ).fetchone()[0],
-                    0,
-                )
-                self.assertGreaterEqual(
-                    collector.db.execute("SELECT count(*) FROM outbox").fetchone()[0],
-                    before,
-                )
-                collector.close()
-                part.unlink()
-                if problem == "foreign":
-                    (self.active / f"rollout-2026-08-10T00-00-00-{NEXT}.jsonl").unlink()
+    def test_unresolved_history_base_is_provenance_not_an_ingestion_dependency(self):
+        root = self.root_file()
+        collector = self.collector()
+        collector.scan()
+        collector.flush()
+        part = self.segment(root, base_id=NEXT, offset=root.stat().st_size + 123)
+        scanned = collector.scan()
+        self.assertEqual(scanned["identity_conflicts"], 0)
+        self.assertEqual(scanned["records_queued"], 2)
+        self.assertEqual(scanned["tombstones_queued"], 0)
+        records = [
+            json.loads(row[0])
+            for row in collector.db.execute(
+                "SELECT envelope_json FROM outbox WHERE state='pending'"
+            )
+        ]
+        self.assertEqual(
+            {row["provenance"]["codex_history_base"]["thread_id"] for row in records},
+            {NEXT},
+        )
+        self.assertEqual(
+            {
+                row["provenance"]["codex_history_base"]["end_byte_offset"]
+                for row in records
+            },
+            {root.stat().st_size + 123},
+        )
+        self.assertTrue(
+            all(row["provenance"]["original_path"] == str(part) for row in records)
+        )
+        collector.close()
+
+    def test_rootless_segment_then_root_arrival_preserves_both_ledgers(self):
+        root = self.root_file()
+        segment = self.segment(root)
+        root_bytes = root.read_bytes()
+        root.unlink()
+        collector = self.collector()
+        self.assertEqual(collector.scan()["records_queued"], 2)
+        collector.flush()
+        before = [
+            tuple(row)
+            for row in collector.db.execute("SELECT native_id,receipt,path FROM outbox")
+        ]
+        collector.close()
+        root.write_bytes(root_bytes)
+        resumed = self.collector()
+        scanned = resumed.scan()
+        self.assertEqual(scanned["records_queued"], 2)
+        self.assertEqual(scanned["tombstones_queued"], 0)
+        after = [
+            tuple(row)
+            for row in resumed.db.execute(
+                "SELECT native_id,receipt,path FROM outbox WHERE state='acked'"
+            )
+        ]
+        self.assertEqual(after, before)
+        self.assertEqual(
+            resumed.db.execute("SELECT count(*) FROM files").fetchone()[0], 2
+        )
+        self.assertEqual(
+            resumed.db.execute("SELECT count(*) FROM active_records").fetchone()[0], 4
+        )
+        self.assertEqual(resumed.scan()["records_queued"], 0)
+        self.assertEqual(
+            resumed._file_key(segment), session_file_key(segment, self.active, "codex")
+        )
+        resumed.close()
+
+    def test_deleted_root_does_not_block_continuation_append_or_restore(self):
+        root = self.root_file()
+        segment = self.segment(root)
+        root_bytes = root.read_bytes()
+        collector = self.collector()
+        collector.scan()
+        collector.flush()
+        collector.close()
+        root.unlink()
+        with segment.open("a") as target:
+            target.write(
+                _line({"type": "response_item", "payload": {"marker": "continued"}})
+            )
+        resumed = self.collector()
+        scanned = resumed.scan()
+        self.assertEqual(scanned["identity_conflicts"], 0)
+        self.assertEqual(scanned["records_queued"], 1)
+        self.assertEqual(scanned["tombstones_queued"], 2)
+        resumed.flush()
+        restored = self.archived / root.name
+        restored.write_bytes(root_bytes)
+        scanned = resumed.scan()
+        self.assertEqual(scanned["records_queued"], 2)
+        self.assertEqual(scanned["tombstones_queued"], 0)
+        self.assertEqual(
+            resumed.db.execute("SELECT count(*) FROM active_records").fetchone()[0], 5
+        )
+        resumed.close()
 
     def test_bounded_incremental_scans_resume_each_physical_history(self):
         root = self.root_file()
