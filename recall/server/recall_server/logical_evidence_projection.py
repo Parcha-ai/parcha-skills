@@ -2086,8 +2086,8 @@ class CanonicalLogicalEvidenceProjector:
             if not candidates:
                 break
             worker_count = min(upload_concurrency, len(candidates))
-            # At most 256 identifiers across all uploads, including individual
-            # retries of a failed shard. Large batches can simply omit hints.
+            # At most 256 identifiers across all parent uploads. Large batches
+            # can simply omit hints; a failed parent does not repeat siblings.
             hint_limit = min(32, 256 // len(candidates))
             # One parent owns preparation through commit. A large parent must
             # not hold successful siblings behind a shard or batch barrier.
