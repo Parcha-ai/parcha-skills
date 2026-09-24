@@ -523,7 +523,7 @@ class SlackWorkspaceConnector:
 
     def _pull_history(self, state: dict[str, Any]) -> ConnectorPage:
         channel_id, do_not_join = self._channel(state)
-        if not self.public_history and not do_not_join and state["page"] is None:
+        if not do_not_join and state["page"] is None:
             self._request("channels.join", {"channel": channel_id})
         state = {**state, "channel_lower": self._channel_lower(state)}
         query: dict[str, Any] = {

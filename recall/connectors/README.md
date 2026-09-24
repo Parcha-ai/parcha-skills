@@ -234,10 +234,11 @@ python -m connectors.slack_manifest --events https://recall.example.com
 After adding the user scopes to an existing Slack app, reconnect it once so the
 host receives both authorities. The connector then resets its coverage cursor
 to the epoch and replays public history. Stable Slack message IDs make the
-broader replay idempotent. Public history requests use the user token directly;
-they do not require or perform a bot join. The legacy bot-only rail still joins
-before reading history because its authority requires membership. See Slack's
-[history access contract](https://docs.slack.dev/reference/methods/conversations.history/).
+broader replay idempotent. History requests use the user token; existing bot
+joins for automatically discovered active public channels remain in place to
+preserve live Events membership. A join error still blocks the page and leaves
+its checkpoint unchanged. Read permission alone does not establish Events
+coverage.
 
 The workspace connector records discovered channels and their history progress
 in the existing private SQLite spool. Channel history advances only in the
@@ -277,8 +278,7 @@ guarantee discovery of a new reply, edit or deletion on a root older than the
 channel watermark. Initial history scans drain detected threads through the
 fixed cutoff. Signed Events can ingest subsequent revisions and tombstones,
 but must be separately configured and witnessed; polling does not assume they
-are enabled. Removing the join prerequisite also does not subscribe a bot to
-events in unjoined channels. Slack retention, inaccessible/private channels,
+are enabled. Slack retention, inaccessible/private channels,
 and DMs remain outside the proven public-history scope. No deletion is inferred
 from a message or channel disappearing from a listing.
 

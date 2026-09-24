@@ -286,7 +286,7 @@ class SlackSourcePluginTest(unittest.TestCase):
         self.assertEqual(
             [call[1]["json_body"]["channel"] for call in rail.calls
              if call[0] == "channels.join"],
-            [],
+            ["C111"],
         )
         self.assertEqual(
             [call[1]["query"]["channel"] for call in rail.calls
