@@ -3,7 +3,25 @@ name: Recall macOS
 on:
   pull_request:
     paths:
-      - 'recall/client/macos_admin/**'
+      - 'recall/client/**'
+      - 'recall/collector/**'
+      - 'recall/connectors/**'
+      - 'recall/contracts/**'
+      - 'recall/privacy/**'
+      - 'recall/skills/recall/scripts/codex_identity.py'
+      - 'recall/scripts/build_macos_package.py'
+      - 'recall/tests/test_mac_package.py'
+      - '.github/workflows/recall-macos.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'recall/client/**'
+      - 'recall/collector/**'
+      - 'recall/connectors/**'
+      - 'recall/contracts/**'
+      - 'recall/privacy/**'
+      - 'recall/skills/recall/scripts/codex_identity.py'
+      - 'recall/scripts/build_macos_package.py'
       - '.github/workflows/recall-macos.yml'
   workflow_dispatch:
 
@@ -13,8 +31,57 @@ permissions:
 jobs:
   native-app:
     runs-on: macos-14
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
       - name: Build app and verify native callback contract
         run: sh recall/client/macos_admin/build.sh "$RUNNER_TEMP/recall-native"
+      - name: Package the compiled app and pinned runtime
+        run: |
+          python3 recall/scripts/build_macos_package.py \
+            --source-root recall \
+            --native-app "$RUNNER_TEMP/recall-native/Recall Brain.app" \
+            --source-revision "$GITHUB_SHA" \
+            --output "$RUNNER_TEMP/recall-release/recall-brain-macos-arm64.tar.gz"
+          cd "$RUNNER_TEMP/recall-release"
+          shasum -a 256 recall-brain-macos-arm64.tar.gz > recall-brain-macos-arm64.tar.gz.sha256
+      - name: Verify the extracted app and install using only bundled Python
+        run: |
+          mkdir "$RUNNER_TEMP/recall-extracted"
+          tar -xzf "$RUNNER_TEMP/recall-release/recall-brain-macos-arm64.tar.gz" -C "$RUNNER_TEMP/recall-extracted"
+          package="$RUNNER_TEMP/recall-extracted/recall-brain-macos"
+          codesign --verify --deep --strict "$package/Recall Brain.app"
+          "$package/Recall Brain.app/Contents/MacOS/RecallBrainAdmin" --self-test
+          "$package/runtime/bin/python3" -I -B -S - "$package" "$GITHUB_SHA" <<'PY'
+          import importlib, json, pathlib, sys
+          package = pathlib.Path(sys.argv[1])
+          assert json.loads((package / "MANIFEST.json").read_text())["source_revision"] == sys.argv[2]
+          root = package / "lib"
+          sys.path.insert(0, str(root))
+          for path in sorted(root.rglob("*.py")):
+              parts = list(path.relative_to(root).with_suffix("").parts)
+              if parts[-1] == "__init__":
+                  parts.pop()
+              if parts:
+                  importlib.import_module(".".join(parts))
+          PY
+          mkdir -p "$RUNNER_TEMP/recall-fixture/claude" "$RUNNER_TEMP/recall-fixture/codex" "$RUNNER_TEMP/recall-fixture/archive"
+          sh "$package/install.sh" \
+            --prefix "$RUNNER_TEMP/recall-installed" --launch-agents "$RUNNER_TEMP/recall-agents" \
+            --endpoint https://recall-mcp-parcha.onrender.com --host-id ci-synthetic \
+            --keychain-service ai.parcha.recall.ci --visibility private --privacy-mode scrub \
+            --sources claude-code,codex --no-load \
+            --claude-root "$RUNNER_TEMP/recall-fixture/claude" \
+            --codex-root "$RUNNER_TEMP/recall-fixture/codex" \
+            --codex-archive-root "$RUNNER_TEMP/recall-fixture/archive"
+          "$RUNNER_TEMP/recall-installed/bin/recall-brain" mac-status \
+            --prefix "$RUNNER_TEMP/recall-installed" --launch-agents "$RUNNER_TEMP/recall-agents"
+      - name: Upload reviewed bundle and checksum
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: recall-brain-macos-arm64-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/recall-release/recall-brain-macos-arm64.tar.gz
+            ${{ runner.temp }}/recall-release/recall-brain-macos-arm64.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 30

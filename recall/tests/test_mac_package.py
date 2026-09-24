@@ -148,6 +148,58 @@ class MacPackageTest(unittest.TestCase):
             },
         })
 
+    def test_packaged_imports_work_without_repository_or_site_packages(self) -> None:
+        package = self.build("imports.tar.gz")
+        extracted = self.root / "imports"
+        with tarfile.open(package) as archive:
+            archive.extractall(extracted, filter="data")
+        library = extracted / "recall-brain-macos/lib"
+        result = subprocess.run([sys.executable, "-I", "-B", "-S", "-c", """
+import importlib, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+sys.path.insert(0, str(root))
+for path in sorted(root.rglob('*.py')):
+    parts = list(path.relative_to(root).with_suffix('').parts)
+    if parts[-1] == '__init__':
+        parts.pop()
+    if parts:
+        importlib.import_module('.'.join(parts))
+""", str(library)], cwd=self.root, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_prebuilt_native_app_is_manifested_with_runtime_and_revision(self) -> None:
+        app = self.root / "Recall Brain.app"
+        executable = app / "Contents/MacOS/RecallBrainAdmin"
+        executable.parent.mkdir(parents=True)
+        executable.write_bytes(builder.MACHO_64_LITTLE_ENDIAN + builder.CPU_TYPE_ARM64_LITTLE_ENDIAN + b"synthetic")
+        executable.chmod(0o755)
+        (app / "Contents/Info.plist").write_bytes(plistlib.dumps({
+            "CFBundleExecutable": "RecallBrainAdmin", "CFBundleIdentifier": "ai.parcha.recall.admin",
+        }))
+        signature = app / "Contents/_CodeSignature/CodeResources"
+        signature.parent.mkdir()
+        signature.write_bytes(b"synthetic signed resource map")
+        output = self.root / "native.tar.gz"
+        builder.build(RECALL_ROOT, output, self.runtime, self.runtime_lock,
+                      native_app=app, source_revision="a" * 40)
+        with tarfile.open(output) as archive:
+            root = "recall-brain-macos/"
+            manifest = json.load(archive.extractfile(root + "MANIFEST.json"))
+            entries = {entry["path"]: entry for entry in manifest["files"]}
+            name = "Recall Brain.app/Contents/MacOS/RecallBrainAdmin"
+            self.assertEqual(entries[name]["sha256"], hashlib.sha256(executable.read_bytes()).hexdigest())
+            self.assertEqual(manifest["source_revision"], "a" * 40)
+            self.assertTrue(archive.getmember(root + name).mode & 0o111)
+            self.assertIn("Recall Brain.app/Contents/_CodeSignature/CodeResources", entries)
+            self.assertIn("lib/collector/health.py", entries)
+        executable.write_bytes(b"not an arm64 executable")
+        with self.assertRaisesRegex(ValueError, "arm64"):
+            builder.build(RECALL_ROOT, output, self.runtime, self.runtime_lock, native_app=app)
+        executable.unlink()
+        executable.symlink_to(self.runtime_lock)
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            builder.build(RECALL_ROOT, output, self.runtime, self.runtime_lock, native_app=app)
+
     def test_tampered_runtime_is_rejected_before_package_write(self) -> None:
         self.runtime.write_bytes(self.runtime.read_bytes() + b"tampered")
         result = self.build("tampered.tar.gz", check=False)
