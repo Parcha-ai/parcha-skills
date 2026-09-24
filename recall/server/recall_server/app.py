@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import logging
 import os
@@ -1377,22 +1378,44 @@ class Handler(BaseHTTPRequestHandler):
             principal = self.require("write")
             if not principal:
                 return
-            length = self.body_length(MAX_BODY_BYTES)
+            if self.archive_store is None:
+                self.send_json(503, {"error": "canonical archive unavailable"})
+                return
+            binary = self.headers.get_content_type() == "application/octet-stream"
+            length = self.body_length(
+                self.archive_store.maximum_bytes if binary else MAX_BODY_BYTES,
+            )
             if length is None:
                 return
             try:
-                body = json.loads(self.rfile.read(length))
+                if binary:
+                    metadata = self.headers.get_all("X-Recall-Archive-Metadata", [])
+                    if (len(metadata) != 1 or self.headers.get("Transfer-Encoding")
+                            or len(self.headers.get_all("Content-Length", [])) != 1):
+                        raise ValueError("invalid binary archive framing")
+                    body = json.loads(metadata[0])
+                    if not isinstance(body, dict) or set(body) != {
+                        "tenant_id", "principal_id", "source_id", "native_id",
+                        "media_type", "created_at", "content_sha256",
+                    }:
+                        raise ValueError("invalid binary archive metadata")
+                else:
+                    body = json.loads(self.rfile.read(length))
                 authority = self.canonical_authority(principal, body)
                 if authority is None:
                     return
                 tenant_id, principal_id, source_id = authority
-                if self.archive_store is None:
-                    self.send_json(503, {"error": "canonical archive unavailable"})
-                    return
-                payload = base64.b64decode(
-                    body.get("payload_base64", ""),
-                    validate=True,
-                )
+                if binary:
+                    # Authorization precedes reading source bytes. The archive's
+                    # own bound governs transport; no base64 expansion or second cap.
+                    payload = self.rfile.read(length)
+                    if (len(payload) != length
+                            or hashlib.sha256(payload).hexdigest() != body["content_sha256"]):
+                        raise ValueError("binary archive integrity mismatch")
+                else:
+                    payload = base64.b64decode(
+                        body.get("payload_base64", ""), validate=True,
+                    )
                 gateway = CanonicalArchiveGateway(
                     self.store,
                     self.archive_store,
