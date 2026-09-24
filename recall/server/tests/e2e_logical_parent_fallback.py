@@ -20,7 +20,7 @@ from recall_server.logical_evidence_projection import CanonicalLogicalEvidencePr
 
 LEGACY_SHA = '1e4243233b7bc28eb36890105e51b5139b240e49c96b01575a57464be0fd8d23'
 OVERSIZED = 'application/vnd.recall.oversized-record+gzip'
-ROOT = re.compile(r'CROSS JOIN LATERAL jsonb_to_record\(.*?\)\s+(?:AS\s+)?root_fields\(role text,\s*type text,\s*content jsonb\)', re.S)
+ROOT = re.compile(r'CROSS JOIN LATERAL jsonb_to_record\(.*?\)\s+(?:AS\s+)?root_fields\(role text,\s*type text,\s*content jsonb(?:,\s*provenance jsonb)?\)', re.S)
 
 
 def queries():
@@ -29,7 +29,9 @@ def queries():
     # Hints add metadata to the current projection, not the frozen legacy SQL.
     added = 'document.document_id,document.body_location,'
     assert current.count(added) == 1
-    legacy = ROOT.sub('', current.replace(added, 'document.document_id,'))
+    metadata = 'root_fields.provenance AS native_provenance,'
+    assert current.count(metadata) == 1
+    legacy = ROOT.sub('', current.replace(added, 'document.document_id,').replace(metadata, ''))
     for field in ('role', 'type'):
         for nested in ('message', 'payload'):
             legacy = re.sub(r"root_fields\.content\s*#>>\s*'\{" + nested + ',' + field + r"\}'",
@@ -117,9 +119,9 @@ def main():
                     all_rows.append(list(cursor))
             assert len(all_rows[0]) == len(all_rows[1]) == 264
             for old, new in zip(*all_rows, strict=True):
-                assert set(new) == set(old) | {'body_location'}
+                assert set(new) == set(old) | {'body_location', 'native_provenance'}
                 assert new['body_location'] == 'inline'
-            common_rows = [{key: value for key, value in row.items() if key != 'body_location'}
+            common_rows = [{key: value for key, value in row.items() if key not in {'body_location', 'native_provenance'}}
                            for row in all_rows[1]]
             assert digest_rows(all_rows[0]) == digest_rows(common_rows)
             assert {row['source_id'] for row in all_rows[1]} == {source}
