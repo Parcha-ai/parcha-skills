@@ -81,6 +81,21 @@ class ManagedWorkerRecoveryTests(unittest.TestCase):
         self.assertEqual(worker._claim.call_count, 1)
         sleep.assert_not_called()
 
+    def test_successful_coverage_is_logged_and_returned_without_source_content(self):
+        worker, _, sleep = self.runtime([])
+        coverage = {"known_channels": 5, "history_baselined_channels": 2,
+                    "history_baseline_pending_channels": 3,
+                    "historical_mutations_verified": False}
+        worker.run_once = Mock(return_value={
+            "status": "committed", "processed": 1, "committed": 1, "failed": 0,
+            "installation_sha256": "a" * 64, "coverage": coverage,
+        })
+        with self.assertLogs(managed_worker.LOG, level="INFO") as logs:
+            result = self.run_worker(once=True)
+        self.assertEqual(result["coverage"], coverage)
+        self.assertIn('"history_baseline_pending_channels": 3', logs.output[0])
+        sleep.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -30,6 +30,7 @@ class SlackJoinTransportTests(unittest.TestCase):
         self.requests = []
         self.join_error = None
         self.rate_limited = False
+        self.history_error = None
 
     def authority(self, kind):
         path = self.root / kind
@@ -51,7 +52,8 @@ class SlackJoinTransportTests(unittest.TestCase):
             else:
                 payload = {'ok': True, 'channel': {'id': 'C111'}}
         elif parsed.path == '/api/conversations.history':
-            payload = {'ok': True, 'messages': [], 'response_metadata': {'next_cursor': ''}}
+            payload = ({'ok': False, 'error': self.history_error} if self.history_error else
+                       {'ok': True, 'messages': [], 'response_metadata': {'next_cursor': ''}})
         else:
             raise AssertionError('unexpected operation')
         return Response(json.dumps(payload).encode())
@@ -84,11 +86,27 @@ class SlackJoinTransportTests(unittest.TestCase):
         self.assertIsNone(history.data)
         self.assertEqual(parse_qs(urlsplit(history.full_url).query)['channel'], ['C111'])
 
-    def test_public_history_keeps_bot_join_and_user_read_authority(self):
+    def test_public_history_uses_user_authority_without_bot_membership(self):
+        self.join_error = 'missing_scope'
         self.connector(dual=True).pull(self.cursor(public=True))
-        self.assertEqual(len(self.requests), 2)
-        self.assert_join_request(self.requests[0])
-        self.assertEqual(self.requests[1].get_header('Authorization'), 'Bearer synthetic-user')
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(urlsplit(self.requests[0].full_url).path, '/api/conversations.history')
+        self.assertEqual(self.requests[0].get_header('Authorization'), 'Bearer synthetic-user')
+
+    def test_public_history_denied_has_no_bot_fallback_or_checkpoint_advance(self):
+        self.history_error = 'missing_scope'
+        cursor = self.cursor(public=True)
+        runner = ConnectorRunner(connector=self.connector(dual=True), brain=Mock(), spool_path=self.root / 'spool.db')
+        self.addCleanup(runner.close)
+        runner._set_meta('committed_cursor', json.dumps(cursor))
+        runner.db.commit()
+        with self.assertLogs('connectors.slack_workspace', level='WARNING'):
+            with self.assertRaises(ConnectorRunError):
+                runner.run_once()
+        self.assertEqual(runner._cursor(), cursor)
+        self.assertEqual(runner.doctor()['coverage']['history_baselined_channels'], 0)
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.requests[0].get_header('Authorization'), 'Bearer synthetic-user')
 
     def test_failed_join_does_not_advance_real_runner_or_start_history(self):
         self.join_error = 'missing_scope'
