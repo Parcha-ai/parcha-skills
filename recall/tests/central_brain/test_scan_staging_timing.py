@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import subprocess
+import errno
 import hashlib
 import unittest
 from unittest.mock import patch
@@ -156,12 +156,10 @@ class StagingTimingTests(unittest.TestCase):
             case = fixture.ScanStagingConcurrencyTests()
             case.setUp()
             self.addCleanup(case.doCleanups)
-            expected = OSError if failure == "stat" else subprocess.CalledProcessError
-            with self.subTest(failure=failure), self.assertRaises(expected) as raised:
+            with self.subTest(failure=failure), self.assertRaises(OSError) as raised:
                 case.stage(fail=failure, delay=0.01)
             if failure != "stat":
-                self.assertEqual(raised.exception.returncode, 1)
-                self.assertEqual(raised.exception.cmd, ["mount"])
+                self.assertEqual(raised.exception.errno, errno.EPERM)
             self.assertEqual(case.active, 0)
             self.assertNotIn(PREFIX, case.stderr.getvalue())
             self.assertNotIn("objects_ready", case.stderr.getvalue())

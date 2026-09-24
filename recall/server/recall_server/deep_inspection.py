@@ -565,8 +565,27 @@ def _agent_exec_command(
     encoded_duckdb_wrapper = encode(DUCKDB_SCAN_WRAPPER.encode())
     encoded_allow_missing = "1" if allow_missing_objects else "0"
     stage_script = r"""
-import base64,gzip,hashlib,json,pathlib,platform,re,shutil,subprocess,sys,time
+import base64,ctypes,gzip,hashlib,json,os,pathlib,platform,re,shutil,sys,time
 from concurrent.futures import ThreadPoolExecutor
+class MountAttr(ctypes.Structure):
+    _fields_=[("attr_set",ctypes.c_uint64),("attr_clr",ctypes.c_uint64),
+              ("propagation",ctypes.c_uint64),("userns_fd",ctypes.c_uint64)]
+libc=ctypes.CDLL(None,use_errno=True)
+libc.mount.argtypes=[ctypes.c_char_p,ctypes.c_char_p,ctypes.c_char_p,ctypes.c_ulong,ctypes.c_void_p]
+libc.mount.restype=ctypes.c_int
+# Linux x86_64 and arm64 share SYS_mount_setattr=442; older glibc versions
+# do not export its wrapper even when the kernel supports the operation.
+if platform.machine() not in ("x86_64","amd64","aarch64","arm64"):
+    raise SystemExit(69)
+libc.syscall.argtypes=[ctypes.c_long,ctypes.c_int,ctypes.c_char_p,ctypes.c_uint,ctypes.POINTER(MountAttr),ctypes.c_size_t]
+libc.syscall.restype=ctypes.c_long
+# Add RDONLY without clearing inherited nosuid/nodev/noexec/atime attributes.
+# Missing syscall support or either failed operation must stop before user code.
+readonly_attr=MountAttr(1,0,0,0)
+def checked_mount(operation,*args):
+    if operation(*args)!=0:
+        error=ctypes.get_errno()
+        raise OSError(error,os.strerror(error))
 def mark(name):
     print(f"RECALL_EXEC_TIMING_V1\t{name}\t{time.time_ns()//1000}",file=sys.stderr,flush=True)
 mark("stage_start")
@@ -651,9 +670,10 @@ def stage_object(item):
     else:
         dst.touch(mode=0o400,exist_ok=False)
         if datasets: local_ready=time.monotonic_ns()//1000
-        subprocess.run(["mount","--bind",str(src),str(dst)],check=True)
+        checked_mount(libc.mount,os.fsencode(src),os.fsencode(dst),None,4096,None)
         if datasets: bound=time.monotonic_ns()//1000
-        subprocess.run(["mount","-o","remount,bind,ro",str(dst)],check=True)
+        checked_mount(libc.syscall,442,-100,os.fsencode(dst),0,
+                      ctypes.byref(readonly_attr),ctypes.sizeof(readonly_attr))
     if datasets:
         ended=bound if item["object_key"] in materialized_keys else time.monotonic_ns()//1000
         stage_times.append((looked_up-started,local_ready-looked_up,bound-local_ready,ended-bound))
