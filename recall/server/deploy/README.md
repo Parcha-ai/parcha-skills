@@ -342,6 +342,34 @@ similarity remains available only for documents without verified native identity
 No TP reindex is required: the existing canonical authority join owns the
 identity metadata used to group vendor results.
 
+For already acknowledged idle sessions, inspect a source-scoped metadata batch
+using the existing evidence archive configuration and the operator database role:
+
+```bash
+python -m recall_server.native_conversation_repair \
+  --tenant tenant:company --source codex:mac --source codex:linux \
+  --harness codex --limit 100
+# Repeat the same scope with --apply only after reviewing the dry run.
+# Continue with --after SOURCE_ID LOGICAL_DOCUMENT_ID from next_after.
+```
+
+This operation reads hash-verified existing logical parts and current canonical
+header metadata; it does not upload, ingest, rebuild passages or rewrite receipts.
+It stops at the first verified native header and does not audit unread session
+tails. Each fetched part is verified against its stored content hash.
+`archive_bytes_read` reports real bytes fetched. Each update locks the exact live
+header receipts and requires the same catalog revision, full manifest reference and document digest, and no pending
+forget. Revisions, deletions and forgets that win first are left unchanged. A
+lost commit acknowledgement is an error with unknown write outcome, not a reported
+zero-write success; rerunning is idempotent.
+
+`scope_exhausted` describes keyset enumeration after the supplied cursor, not
+identity coverage. Review `unknown`, `unavailable` and `raced` counts. Unknown or
+rewritten native IDs are never guessed. Revisit skipped rows explicitly and verify
+remaining null catalog identities before claiming the historical fleet is covered.
+No source prose or native identity values are printed; output is counts and the
+opaque source/document cursor. `--limit` bounds one resumable batch, not the corpus.
+
 Rollback the reader/worker to the compatibility-only runtime and retain the
 nullable columns and marker. An older exact-70 runtime will reject marker 71;
 dropping metadata or rekeying evidence is not the rollback path.
