@@ -1603,10 +1603,20 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if adapted.webhook is None or adapted.workspace_id is None:
                     raise WebhookError("slack event projection unavailable")
+                # The app subscribes to message.channels. Slack's documented
+                # edit/delete examples omit channel_type, so retain signed
+                # legacy callbacks while rejecting explicit nonpublic types.
+                if adapted.channel_type not in (None, "channel"):
+                    self.send_json(200, {
+                        "status": "accepted", "routes": 0, "replays": 0,
+                        "duplicate_events": 0,
+                    })
+                    return
                 with self.store.connect() as connection:
                     routes = connection.execute(
                         """SELECT installation.source_id,installation.principal_id,
-                                  installation.privacy_mode,installation.tenant_id
+                                  installation.privacy_mode,installation.tenant_id,
+                                  installation.selectors
                              FROM connector_installations installation
                              JOIN provider_connections provider
                                ON provider.id=installation.connection_id
@@ -1621,6 +1631,16 @@ class Handler(BaseHTTPRequestHandler):
                 replayed = 0
                 duplicate_events = 0
                 for route in routes:
+                    selectors = route["selectors"]
+                    if not isinstance(selectors, dict):
+                        continue
+                    channels = selectors.get("channel_ids", [])
+                    if not isinstance(channels, list) or any(
+                        not isinstance(channel, str) or not channel for channel in channels
+                    ):
+                        continue
+                    if channels and adapted.channel_id not in channels:
+                        continue
                     prepared = build_webhook_event(adapted.webhook, {
                         "source_id": route["source_id"],
                         "principal_id": route["principal_id"],
