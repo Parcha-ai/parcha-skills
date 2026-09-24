@@ -87,6 +87,7 @@ jobs:
             e2e_turbopuffer_forget_fence.py \
             e2e_authority_covering_indexes.py \
             e2e_slack_passage_visibility.py \
+            e2e_slack_visible_text_replay.py \
             e2e_connector_host.py \
             e2e_collector_health_deadline.py \
             e2e_integration_activation.py \
