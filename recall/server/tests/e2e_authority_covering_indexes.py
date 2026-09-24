@@ -159,6 +159,7 @@ class AuthorityIndexOperationTest(unittest.TestCase):
                 FROM generate_series(1,2000) AS n;
             CREATE TABLE canonical_evidence_documents(
                 tenant_id text,source_id text,logical_document_id text,
+                conversation_id text,conversation_strand_id text,
                 PRIMARY KEY(tenant_id,source_id,logical_document_id));
             CREATE TABLE canonical_passage_documents(
                 tenant_id text,source_id text,logical_document_id text,policy_fingerprint text,
@@ -176,7 +177,7 @@ class AuthorityIndexOperationTest(unittest.TestCase):
             'bulk-live': ['bulk-receipt-123','bulk-receipt-124','bulk-receipt-125'],
         }
         for passage, refs in receipts.items():
-            self.conn.execute("INSERT INTO canonical_evidence_documents VALUES('t','s',%s)",(passage,))
+            self.conn.execute("INSERT INTO canonical_evidence_documents(tenant_id,source_id,logical_document_id) VALUES('t','s',%s)",(passage,))
             self.conn.execute("INSERT INTO canonical_passage_documents VALUES('t','s',%s,'policy')",(passage,))
             self.conn.execute("INSERT INTO canonical_passages VALUES('t','s',%s,%s,%s,%s,'policy')",
                               (passage,passage,'a'*64,refs))
