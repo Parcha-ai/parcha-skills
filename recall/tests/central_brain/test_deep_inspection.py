@@ -901,7 +901,6 @@ class DeepInspectionContractTests(unittest.TestCase):
             {
                 "evidence": {
                     "disk": "dsk-0123456789abcdef",
-                    "readOnly": True,
                 }
             },
         )

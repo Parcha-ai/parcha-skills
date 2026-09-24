@@ -1250,6 +1250,9 @@ class ArchilDeepInspector:
             )
             if len(command.encode()) > MAX_ARCHIL_COMMAND_BYTES:
                 raise DeepInspectionError("deep_inspector_request_too_large")
+            # Archil readOnly mounts fail delegation check-in at teardown.
+            # _agent_exec_command makes the authorized view read-only and
+            # drops mount privileges before running the user program.
             response = self.transport.post(
                 url=REGION_ENDPOINTS[self.region] + "/api/exec",
                 headers={"Authorization": self.api_key},
@@ -1257,7 +1260,6 @@ class ArchilDeepInspector:
                     "disks": {
                         "evidence": {
                             "disk": self.disk_id,
-                            "readOnly": True,
                         }
                     },
                     "command": command,
@@ -1328,12 +1330,15 @@ class ArchilDeepInspector:
             )
             if len(command.encode()) > MAX_ARCHIL_COMMAND_BYTES:
                 raise DeepInspectionError("deep_inspector_request_too_large")
+            # Archil readOnly mounts fail delegation check-in at teardown.
+            # _agent_exec_command makes the authorized view read-only and
+            # drops mount privileges before running the user program.
             response = self.transport.post(
                 url=REGION_ENDPOINTS[self.region] + "/api/exec",
                 headers={"Authorization": self.api_key},
                 body={
                     "disks": {
-                        "evidence": {"disk": self.disk_id, "readOnly": True}
+                        "evidence": {"disk": self.disk_id}
                     },
                     "command": command,
                 },
