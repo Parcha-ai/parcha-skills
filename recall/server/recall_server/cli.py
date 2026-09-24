@@ -1732,6 +1732,8 @@ def main() -> None:
     passage_repair.add_argument("--after", help="logical document cursor from the preceding batch")
     passage_repair.add_argument("--price-per-mtoken", type=float)
     passage_repair.add_argument("--apply", action="store_true")
+    passage_repair.add_argument("--concurrency", type=int, default=1,
+                                help="Concurrent read-only document comparisons; default: 1")
     passage_plan = sub.add_parser(
         "passage-embed-plan",
         help=(
@@ -2419,6 +2421,7 @@ def main() -> None:
             result = projector.repair_empty(
                 tenant_id=args.tenant, source_id=args.source, limit=args.limit,
                 after=args.after, apply=args.apply, price_per_mtoken=args.price_per_mtoken,
+                concurrency=args.concurrency,
             )
         else:
             result = projector.shadow_diff(

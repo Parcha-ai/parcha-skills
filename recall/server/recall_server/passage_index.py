@@ -1357,6 +1357,7 @@ class CanonicalPassageProjector:
         limit: int = 50,
         _empty_only: bool = False,
         _after: str | None = None,
+        _concurrency: int = 1,
     ) -> dict[str, Any]:
         """Read-only parity gate: recompute passages and compare with the rows.
 
@@ -1379,6 +1380,7 @@ class CanonicalPassageProjector:
             or isinstance(limit, bool)
             or not isinstance(limit, int)
             or not 1 <= limit <= MAX_PASSAGE_PROJECTION_BATCH
+            or type(_concurrency) is not int or not 1 <= _concurrency <= 32
         ):
             raise ValueError("passage shadow diff scope is invalid")
         with self.store.connect() as connection:
@@ -1460,17 +1462,7 @@ class CanonicalPassageProjector:
             existing.setdefault(row["logical_document_id"], {})[
                 row["passage_id"]
             ] = tuple(row["receipts"])
-        documents = []
-        totals = {
-            "documents": 0,
-            "documents_stale": 0,
-            "documents_policy_mismatch": 0,
-            "passages_existing": 0,
-            "passages_recomputed": 0,
-            "ids_shared": 0,
-            "receipt_set_equal": 0,
-        }
-        for logical_document_id in sorted(grouped):
+        def compare_document(logical_document_id: str) -> dict[str, Any]:
             values = grouped[logical_document_id]
             first = values[0]
             stored = existing.get(logical_document_id, {})
@@ -1488,18 +1480,14 @@ class CanonicalPassageProjector:
                 # will catch it up. Comparing would measure the append, not
                 # the id function.
                 report["status"] = "stale"
-                totals["documents_stale"] += 1
-                documents.append(report)
-                continue
+                return report
             policy = PassagePolicy(
                 target_tokens=int(first["target_tokens"]),
                 overlap_tokens=int(first["overlap_tokens"]),
             )
             if policy.fingerprint != str(first["policy_fingerprint"]).strip():
                 report["status"] = "policy_mismatch"
-                totals["documents_policy_mismatch"] += 1
-                documents.append(report)
-                continue
+                return report
             candidate = PassageCandidate(
                 tenant_id=first["tenant_id"],
                 source_id=first["source_id"],
@@ -1552,12 +1540,38 @@ class CanonicalPassageProjector:
                 "ids_shared": len(shared),
                 "receipt_set_equal": receipt_set_equal,
             })
-            totals["documents"] += 1
-            totals["passages_existing"] += len(stored)
-            totals["passages_recomputed"] += len(recomputed)
-            totals["ids_shared"] += len(shared)
-            totals["receipt_set_equal"] += int(receipt_set_equal)
-            documents.append(report)
+            return report
+
+        # Each task releases its prepared bodies before returning metadata.
+        # Catalog leases are already closed; no queue write occurs until every
+        # comparison succeeds. map preserves document-ID report order.
+        document_ids = sorted(grouped)
+        if _concurrency == 1 or len(document_ids) < 2:
+            documents = [compare_document(doc) for doc in document_ids]
+        else:
+            with ThreadPoolExecutor(
+                max_workers=min(_concurrency, len(document_ids)),
+                thread_name_prefix="recall-passage-shadow",
+            ) as executor:
+                documents = list(executor.map(compare_document, document_ids))
+        totals = {
+            "documents": 0,
+            "documents_stale": 0,
+            "documents_policy_mismatch": 0,
+            "passages_existing": 0,
+            "passages_recomputed": 0,
+            "ids_shared": 0,
+            "receipt_set_equal": 0,
+        }
+        for report in documents:
+            if report["status"] == "stale":
+                totals["documents_stale"] += 1
+            elif report["status"] == "policy_mismatch":
+                totals["documents_policy_mismatch"] += 1
+            else:
+                totals["documents"] += 1
+                for key in ("passages_existing", "passages_recomputed", "ids_shared", "receipt_set_equal"):
+                    totals[key] += int(report[key])
         return {
             "status": "ok",
             "tenant_id": tenant_id,
@@ -1580,6 +1594,7 @@ class CanonicalPassageProjector:
         after: str | None = None,
         apply: bool = False,
         price_per_mtoken: float | None = None,
+        concurrency: int = 1,
     ) -> dict[str, Any]:
         """Plan one source's empty-projection repair; optionally queue that batch.
 
@@ -1593,6 +1608,7 @@ class CanonicalPassageProjector:
             or not isinstance(source_id, str) or not source_id
             or type(limit) is not int or not 1 <= limit <= MAX_PASSAGE_PROJECTION_BATCH
             or type(apply) is not bool
+            or type(concurrency) is not int or not 1 <= concurrency <= 32
             or (after is not None and (
                 not isinstance(after, str) or LOGICAL_DOCUMENT_ID_RE.fullmatch(after) is None
             ))
@@ -1604,7 +1620,7 @@ class CanonicalPassageProjector:
             raise ValueError("empty passage repair scope is invalid")
         report = self.shadow_diff(
             tenant_id=tenant_id, source_id=source_id, limit=limit,
-            _empty_only=True, _after=after,
+            _empty_only=True, _after=after, _concurrency=concurrency,
         )
         documents = report["documents"]
         eligible = [doc for doc in documents
