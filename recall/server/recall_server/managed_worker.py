@@ -681,6 +681,17 @@ class ManagedConnectorWorker:
                 max_batches=self.embedding_max_batches,
             )
             has_more = bool(result.get("has_more", False))
+            coverage = {}
+            if runner.checkpoints is not None:
+                try:
+                    coverage = {
+                        "coverage": runner.doctor()["coverage"],
+                        "installation_sha256": hashlib.sha256(str(row["id"]).encode()).hexdigest(),
+                    }
+                except Exception as error:
+                    # Reporting cannot turn an ACKed page into failed ingestion.
+                    LOG.warning("managed coverage unavailable type=%s", type(error).__name__)
+                    coverage = {"coverage_error_code": "coverage_unavailable"}
             self._finish(
                 row["id"],
                 success=True,
@@ -696,6 +707,7 @@ class ManagedConnectorWorker:
                 "staged": int(result.get("staged", 0)),
                 "embedded": int(embedding.get("processed", 0)),
                 "has_more": has_more,
+                **coverage,
             }
         except Exception as error:
             code = self._safe_error(error)
@@ -784,6 +796,11 @@ def run_managed_worker(
             LOG.error("managed connector cycle failed type=%s", type(error).__name__)
             time.sleep(interval_seconds)
             continue
+        if "coverage" in result:
+            LOG.info("managed connector coverage %s", json.dumps({
+                "installation_sha256": result["installation_sha256"],
+                "coverage": result["coverage"],
+            }, sort_keys=True))
         projection: dict[str, int | str] = {
             "status": "disabled",
             "logical_documents": 0,
@@ -831,6 +848,7 @@ def run_managed_worker(
                 "committed": committed,
                 "failed": failed,
                 "projection_failures": projection_failures,
+                **({"coverage": result["coverage"]} if "coverage" in result else {}),
                 **{
                     key: value
                     for key, value in projection.items()

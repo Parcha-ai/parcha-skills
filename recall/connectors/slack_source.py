@@ -13,6 +13,7 @@ from connectors.sdk import ConnectorContractError, ConnectorRecordV2
 # Increment when provider replay is required to recover previously omitted content.
 SLACK_MESSAGE_CAPTURE_VERSION = 2
 
+
 SLACK_PUBLIC_HISTORY_USER_SCOPES = (
     "channels:history",
     "channels:read",
