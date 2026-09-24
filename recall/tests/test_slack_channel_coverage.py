@@ -9,7 +9,7 @@ from unittest.mock import Mock
 from uuid import UUID
 
 from connectors.sdk import ConnectorContractError, ConnectorPage, ConnectorRunner, ConnectorRunError
-from connectors.slack_source import normalize_slack_message
+from connectors.slack_source import SLACK_MESSAGE_CAPTURE_VERSION, normalize_slack_message
 from connectors.slack_workspace import SlackWorkspaceConnector
 from test_connector_sdk import FakeBrain
 from test_slack_source_plugin import Rail, slack_response
@@ -203,6 +203,103 @@ class SlackChannelCoverageTests(unittest.TestCase):
         r.run_once()
         self.assertEqual(r.doctor()["coverage"]["history_baselined_channels"], 0)
         self.assertEqual(r.doctor()["pending_pages"], 0)
+
+    def test_partial_legacy_epoch_scan_replays_under_current_capture_version(self):
+        for phase, page in (("history", "old-page"), ("threads", None)):
+            with self.subTest(phase=phase):
+                self.path = self.path.with_name(f"legacy-{phase}.db")
+                r = self.runner()
+                before = {"v": 3, "coverage": "public", "phase": phase, "page": page,
+                          "discovery_page": None, "channels": ["COLD:0"], "configured_index": 0,
+                          "channel_index": 0, "threads": ["1784332800.000100"] if phase == "threads" else [],
+                          "thread_index": 0, "thread_page": None,
+                          "watermark": "1970-01-01T00:00:00Z", "upper": "2026-09-23T00:00:00Z",
+                          "cycle": 0, "found": True}
+                r._set_meta("committed_cursor", json.dumps(json.dumps(before)))
+                r.db.commit()
+                self.rail.add("messages.replies" if phase == "threads" else "messages.history", slack_response([]))
+                r.run_once()
+                self.assertEqual(r.doctor()["coverage"]["history_baselined_channels"], 0)
+                self.cycle(r, ["COLD"])
+                self.assertNotIn("oldest", self.histories()[-1])
+                self.assertEqual(r.doctor()["coverage"]["history_baselined_channels"], 1)
+
+    def test_new_capture_version_invalidates_old_baseline_without_resetting_spool(self):
+        r = self.runner()
+        self.cycle(r, ["CONE"])
+        with patch("connectors.slack_workspace.SLACK_MESSAGE_CAPTURE_VERSION", SLACK_MESSAGE_CAPTURE_VERSION + 1):
+            r = self.runner()
+            self.assertEqual(r.doctor()["coverage"]["history_baselined_channels"], 0)
+            self.assertEqual(r.doctor()["coverage"]["history_baseline_pending_channels"], 1)
+            self.assertEqual(r.doctor()["coverage"]["capture_version"], SLACK_MESSAGE_CAPTURE_VERSION + 1)
+            self.cycle(r, ["CONE"])
+            self.assertNotIn("oldest", self.histories()[-1])
+            self.assertEqual(r.doctor()["coverage"]["history_baselined_channels"], 1)
+
+    def test_pending_old_capture_first_page_acks_before_full_replay(self):
+        r = self.runner()
+        self.rail.add("users.list", {"ok": True, "members": []})
+        self.discovery(["CONE"])
+        self.rail.add("messages.history", slack_response([{
+            "ts": "1784332800.000100", "user": "U111", "text": "Old capture",
+        }]))
+        r.run_once()
+        r.run_once()
+        self.brain.fail_after_commit = True
+        with self.assertRaises(ConnectorRunError):
+            r.run_once()
+        calls = len(self.rail.calls)
+        with patch("connectors.slack_workspace.SLACK_MESSAGE_CAPTURE_VERSION", SLACK_MESSAGE_CAPTURE_VERSION + 1):
+            r = self.runner()
+            r.run_once()
+            self.assertEqual(len(self.rail.calls), calls)
+            self.assertEqual(r.doctor()["pending_pages"], 0)
+            self.assertEqual(r.doctor()["coverage"]["history_baselined_channels"], 0)
+            self.cycle(r, ["CONE"])
+            self.assertNotIn("oldest", self.histories()[-1])
+            self.assertEqual(r.doctor()["coverage"]["history_baselined_channels"], 1)
+
+    def test_pending_v3_first_middle_last_pages_ack_then_recover_same_native_message(self):
+        for position, prior_page, next_page in (("first", None, "middle"),
+                                                ("middle", "middle", "last"),
+                                                ("last", "last", None)):
+            with self.subTest(position=position):
+                self.path = self.path.with_name(f"pending-v3-{position}.db")
+                self.brain = FakeBrain()
+                r = self.runner()
+                before = {"v": 3, "coverage": "public", "phase": "history", "page": prior_page,
+                          "discovery_page": None, "channels": ["COLD:0"], "configured_index": 0,
+                          "channel_index": 0, "threads": [], "thread_index": 0, "thread_page": None,
+                          "watermark": "1970-01-01T00:00:00Z", "upper": "2026-09-23T00:00:00Z",
+                          "cycle": 0, "found": True}
+                after = {**before, "page": next_page}
+                if next_page is None:
+                    after.update(phase="users", channels=[], cycle=1, found=False,
+                                 watermark=before["upper"], upper="2026-09-24T00:00:00Z")
+                raw = {"ts": "1784332800.000100", "user": "U111", "text": ""}
+                record = normalize_slack_message(workspace_id="T123", channel_id="COLD", value=raw)
+                cursor = json.dumps(before)
+                r._set_meta("committed_cursor", json.dumps(cursor))
+                r.db.commit()
+                r._stage(ConnectorPage(records=(record,), next_cursor=json.dumps(after),
+                                       has_more=next_page is not None), cursor)
+                calls = len(self.rail.calls)
+                r = self.runner()
+                r.run_once()
+                self.assertEqual(len(self.rail.calls), calls)
+                if next_page is not None:
+                    self.rail.add("messages.history", slack_response([]))
+                    r.run_once()
+                self.assertEqual(r.doctor()["coverage"]["history_baselined_channels"], 0)
+                self.rail.add("users.list", {"ok": True, "members": []})
+                self.discovery(["COLD"])
+                self.rail.add("messages.history", slack_response([{**raw, "text": "Recovered visible content"}]))
+                for _ in range(3):
+                    r.run_once()
+                self.assertNotIn("oldest", self.histories()[-1])
+                self.assertEqual(r.doctor()["coverage"]["history_baselined_channels"], 1)
+                self.assertEqual(len(self.brain.events), 2)
+                self.assertEqual(len({key[1] for key in self.brain.events}), 1)
 
     def test_thread_replies_must_be_acked_before_channel_history_is_baselined(self):
         r = self.runner()

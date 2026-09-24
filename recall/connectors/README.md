@@ -249,10 +249,17 @@ channels use their own acknowledged watermark. Discovery streams batches of 50
 without retaining the entire inventory in the bounded API cursor.
 
 V3 cursors resume their existing page and time window without restarting the
-workspace. A partial legacy time window cannot establish a historical baseline:
-that channel remains pending until its next epoch scan. Already completed
-legacy channels also start unverified because the old global watermark is not
-per-channel evidence. V1/V2 retain their earlier compatibility migration rules.
+workspace. Legacy pages cannot establish a baseline for the current message
+capture version, even if their old scan started at epoch: earlier pages may
+have used a parser that omitted visible content. They finish and acknowledge
+pending work first, then receive a full epoch replay on the next visit. Already
+completed legacy channels also start unverified because the old global
+watermark is not per-channel evidence. The normalizer owns
+`SLACK_MESSAGE_CAPTURE_VERSION`; bumping it invalidates older channel baselines
+without deleting their ledger, queued pages, or acknowledgement hashes. Every
+page in a baseline must use the current capture version. Changed normalized
+content is ingested under the same native message ID; unchanged records dedupe.
+V1/V2 retain their earlier compatibility migration rules.
 Once a V4 cursor is committed, rollback must retain the V4 cursor reader or use
 a forward fix. A V3-only binary cannot resume that cursor; never reset or delete
 the spool to make an older binary run.

@@ -14,7 +14,9 @@ from connectors.sdk import (
     ConnectorContractError, ConnectorPage, ConnectorRecordV2,
     ConnectorUpstreamError, SOURCE_ID,
 )
-from connectors.slack_source import normalize_slack_message, normalize_slack_user
+from connectors.slack_source import (
+    SLACK_MESSAGE_CAPTURE_VERSION, normalize_slack_message, normalize_slack_user,
+)
 from connectors.attachment_extract import extract_attachment_text
 
 
@@ -105,6 +107,7 @@ def _initial_state(
     return {
         "v": 4,
         "channel_lower": None,
+        "capture_version": SLACK_MESSAGE_CAPTURE_VERSION,
         "coverage": "public" if public_history else "member",
         "phase": "users",
         "page": None,
@@ -212,11 +215,11 @@ def _state(
     # Keep an in-flight V3 page and its original time window. It may not have
     # started at epoch, so finishing it must not certify an unknown baseline.
     if isinstance(value, dict) and value.get("v") == 3 and set(value) == v2_expected | {"coverage"}:
-        value = {**value, "v": 4, "channel_lower": (
+        value = {**value, "v": 4, "capture_version": 0, "channel_lower": (
             value["watermark"] if (value["phase"] == "history" and value["page"])
             or value["phase"] == "threads" else None
         )}
-    expected = v2_expected | {"coverage", "channel_lower"}
+    expected = v2_expected | {"coverage", "channel_lower", "capture_version"}
     expected_coverage = "public" if public_history else "member"
     if (
         not isinstance(value, dict) or set(value) != expected or value.get("v") != 4
@@ -234,6 +237,7 @@ def _state(
         or type(value.get("thread_index")) is not int
         or not 0 <= value["thread_index"] <= len(value["threads"])
         or type(value.get("cycle")) is not int or value["cycle"] < 0
+        or type(value.get("capture_version")) is not int or value["capture_version"] < 0
         or type(value.get("found")) is not bool
         or any(value.get(key) is not None and not isinstance(value[key], str)
                for key in ("page", "discovery_page", "thread_page"))
@@ -304,6 +308,7 @@ class SlackWorkspaceConnector:
         db.execute("""CREATE TABLE IF NOT EXISTS slack_channel_coverage(
             workspace_id TEXT NOT NULL, authority TEXT NOT NULL, channel_id TEXT NOT NULL,
             last_seen_cycle INTEGER NOT NULL, history_through TEXT, scanned_cycle INTEGER,
+            capture_version INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(workspace_id,authority,channel_id))""")
         db.execute("""CREATE TABLE IF NOT EXISTS slack_discovery_coverage(
             workspace_id TEXT NOT NULL, authority TEXT NOT NULL,
@@ -321,11 +326,11 @@ class SlackWorkspaceConnector:
         if self._checkpoint_db is not None:
             channel, _ = self._channel(state)
             row = self._checkpoint_db.execute(
-                """SELECT history_through FROM slack_channel_coverage
+                """SELECT history_through,capture_version FROM slack_channel_coverage
                    WHERE workspace_id=? AND authority=? AND channel_id=?""",
                 (*self._scope, channel),
             ).fetchone()
-            if row and row[0]:
+            if row and row[0] and row[1] == SLACK_MESSAGE_CAPTURE_VERSION:
                 return row[0]
         # No proven channel baseline. A global workspace watermark is not proof
         # that this channel was ever visited. Standalone pulls safely replay.
@@ -365,24 +370,31 @@ class SlackWorkspaceConnector:
                          or self._channel(after)[0] != channel)
             if completed:
                 lower = self._channel_lower(before)
+                capture_version = (after["capture_version"]
+                    if before["phase"] == "history" and before["page"] is None
+                    else before["capture_version"])
                 # A staged pre-upgrade page was fetched under the old global
                 # window, even when its previous cursor had no page token.
                 # New pulls produce V4 and choose the per-channel lower bound.
                 if json.loads(current).get("v") == 3:
                     lower = before["watermark"]
-                prior = db.execute("""SELECT history_through FROM slack_channel_coverage
+                    capture_version = 0
+                prior = db.execute("""SELECT history_through,capture_version FROM slack_channel_coverage
                     WHERE workspace_id=? AND authority=? AND channel_id=?""",
                     (*self._scope, channel)).fetchone()
-                contiguous = lower == EPOCH or (prior and prior[0] and
+                contiguous = lower == EPOCH or (prior and prior[0]
+                    and prior[1] == SLACK_MESSAGE_CAPTURE_VERSION and
                     datetime.fromisoformat(lower.replace("Z", "+00:00")) <=
                     datetime.fromisoformat(prior[0].replace("Z", "+00:00")))
                 db.execute("""INSERT INTO slack_channel_coverage
-                    (workspace_id,authority,channel_id,last_seen_cycle,history_through,scanned_cycle)
-                    VALUES (?,?,?,?,?,?) ON CONFLICT(workspace_id,authority,channel_id)
+                    (workspace_id,authority,channel_id,last_seen_cycle,history_through,scanned_cycle,capture_version)
+                    VALUES (?,?,?,?,?,?,?) ON CONFLICT(workspace_id,authority,channel_id)
                     DO UPDATE SET last_seen_cycle=excluded.last_seen_cycle,
-                      history_through=excluded.history_through,scanned_cycle=excluded.scanned_cycle""",
+                      history_through=excluded.history_through,scanned_cycle=excluded.scanned_cycle,
+                      capture_version=excluded.capture_version""",
                     (*self._scope, channel, before["cycle"],
-                     before["upper"] if contiguous else None, before["cycle"]))
+                     before["upper"] if contiguous and capture_version == SLACK_MESSAGE_CAPTURE_VERSION else None,
+                     before["cycle"], capture_version))
         if after["cycle"] > before["cycle"]:
             db.execute("""UPDATE slack_discovery_coverage
                 SET completed_cycle=?,completed_cycles=completed_cycles+1,
@@ -399,12 +411,19 @@ class SlackWorkspaceConnector:
             completed_cycles,completed_channels,started_selection,completed_selection
             FROM slack_discovery_coverage WHERE workspace_id=? AND authority=?""", self._scope).fetchone()
         selected = " AND channel_id IN (" + ",".join("?" for _ in self.channel_ids) + ")" if self.channel_ids else ""
-        counts = self._checkpoint_db.execute("""SELECT count(*),
+        counts = self._checkpoint_db.execute("""WITH channels AS (
+            SELECT last_seen_cycle,
+                CASE WHEN capture_version=? THEN history_through END AS history_through,
+                CASE WHEN capture_version=? THEN scanned_cycle END AS scanned_cycle
+            FROM slack_channel_coverage WHERE workspace_id=? AND authority=?""" + selected + """)
+            SELECT count(*),
             count(history_through),sum(CASE WHEN last_seen_cycle=? THEN 1 ELSE 0 END),
             sum(CASE WHEN scanned_cycle=? THEN 1 ELSE 0 END), min(history_through)
-            FROM slack_channel_coverage WHERE workspace_id=? AND authority=?""" + selected,
-            (discovery[0], discovery[0], *self._scope, *self.channel_ids)).fetchone()
+            FROM channels""",
+            (SLACK_MESSAGE_CAPTURE_VERSION, SLACK_MESSAGE_CAPTURE_VERSION,
+             *self._scope, *self.channel_ids, discovery[0], discovery[0])).fetchone()
         return {
+            "capture_version": SLACK_MESSAGE_CAPTURE_VERSION,
             "scope": "public_channels" if self.public_history else "bot_accessible_public_channels",
             "selection": "configured_channels" if self.channel_ids else "workspace_discovery",
             "known_channels": counts[0], "history_baselined_channels": counts[1],
@@ -464,6 +483,7 @@ class SlackWorkspaceConnector:
         next_page = _next(response)
         state = {
             **state, "channels": channels, "channel_index": 0, "channel_lower": None,
+            "capture_version": SLACK_MESSAGE_CAPTURE_VERSION,
             "discovery_page": next_page, "found": state["found"] or bool(channels),
         }
         if channels:
@@ -503,6 +523,7 @@ class SlackWorkspaceConnector:
             **state,
             "phase": "history",
             "channel_lower": None,
+            "capture_version": SLACK_MESSAGE_CAPTURE_VERSION,
             "channels": [
                 f"{item}:{1 if self.public_history else 0}"
                 for item in self.channel_ids[start:stop]
@@ -526,6 +547,8 @@ class SlackWorkspaceConnector:
         if not do_not_join and state["page"] is None:
             self._request("channels.join", {"channel": channel_id})
         state = {**state, "channel_lower": self._channel_lower(state)}
+        if state["page"] is None:
+            state["capture_version"] = SLACK_MESSAGE_CAPTURE_VERSION
         query: dict[str, Any] = {
             "channel": channel_id, "inclusive": True, "limit": self.page_size,
             "latest": _oldest(state["upper"]),
@@ -611,6 +634,7 @@ class SlackWorkspaceConnector:
                 **state, "phase": "history", "page": None,
                 "channel_index": index, "threads": [], "thread_index": 0,
                 "thread_page": None, "channel_lower": None,
+                "capture_version": SLACK_MESSAGE_CAPTURE_VERSION,
             }, True)
         if self.channel_ids and state["configured_index"] < len(self.channel_ids):
             return self._page(records, self._configured_batch(state), True)
@@ -619,6 +643,7 @@ class SlackWorkspaceConnector:
                 **state, "phase": "discover", "page": None, "channels": [],
                 "channel_index": 0, "threads": [], "thread_index": 0,
                 "thread_page": None, "channel_lower": None,
+                "capture_version": SLACK_MESSAGE_CAPTURE_VERSION,
             }, True)
         return self._finish_cycle(records, state)
 
