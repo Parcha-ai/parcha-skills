@@ -302,3 +302,10 @@ ChatGPT does not connect directly to a local MCP server. Use an approved remote
 MCP deployment or OpenAI's Secure MCP Tunnel adapter instead; do not reuse a
 local host's source credential for that bridge. See OpenAI's
 [developer mode and MCP documentation](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt).
+
+Canonical archive uploads retain the JSON/base64 wire format for small objects.
+Larger objects use a binary body on the same `/v2/archive/objects` endpoint; the
+server verifies the declared digest and uses the archive store's configured size
+bound. This removes the former 9 MB client transport ceiling without changing
+archive references or source/forget authorization. Deploy the server before
+rolling out collectors that need the binary path.
