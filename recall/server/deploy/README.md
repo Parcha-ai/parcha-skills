@@ -280,11 +280,14 @@ ledger are all still there, and the embedding worker resumes where it stopped). 
 rebuilt, if ever needed, with `search-outbox-seed` plus a drain.
 
 The production database gate requires a standard PostgreSQL URL with
-`sslmode=verify-full` and an explicit trust root. Schema migrations 1 through 70
+`sslmode=verify-full` and an explicit trust root. Schema migrations 1 through 71
 are supported: versions through 69 are required except optional migration 67,
 which retires the Postgres vector plane and is applied explicitly from the
-turbopuffer plane. Migration 70 adds only a reconciliation performance index;
-serving accepts both schema 69 and 70 and reports the actual recorded version.
+turbopuffer plane. Migration 70 adds only an optional reconciliation performance
+index. The native conversation feature requires migration 71 and the two actual
+text columns on `canonical_evidence_documents`; its readiness check fails closed
+before serving if either is absent. The earlier compatibility-only runtime accepts
+71 optionally while still running on 69 or 70.
 Optional [search authority indexes](../operations/README.md) are applied explicitly
 without changing those schema versions or restarting workers.
 The gate also requires
@@ -302,6 +305,46 @@ compatible runtime as the rollback floor: older exact-69 capability checks rejec
 a database recording 70. Serving never applies migrations. The generic `migrate`
 command still applies 70 and its concurrent companion; a recorded marker alone
 does not prove that a concurrently built index finished successfully.
+
+### Native conversation rollout (71)
+
+1. Deploy the compatibility-only runtime to **all** readers and workers before
+   applying 71. That runtime accepts the known optional marker but neither reads
+   nor writes the new fields. It is the rollback floor after the migration.
+2. Apply `071_native_conversations.sql` explicitly through the existing migration
+   owner. It adds nullable text columns without defaults, indexes, table rewrites,
+   source changes, or receipt changes. Verify the recorded marker and both columns.
+3. Deploy the feature reader and logical worker, then the collector provenance
+   update. New native metadata is retained during thinning. Existing original
+   native headers also work when a queued document is projected again; a
+   same-content repair fills metadata without rebuilding passages or revising the
+   immutable document.
+4. Verify a real authorized copied session and continuation produce one result,
+   all unique matching ranges remain source-qualified, a genuine fork stays
+   separate, and denying or forgetting one source removes only that member.
+   Re-run the unchanged serving quality/latency gates before acceptance.
+
+Identity is tenant- and harness-bound native UUID metadata, not a permission.
+Search first authorizes the existing candidate head, hydrates and reranks it,
+then groups its known conversations. The best-ranked member determines group rank;
+copy count adds no score. `conversation_documents` and each `matching_ranges`
+entry carry source/document/revision pointers. Every matching range is retained, including equal text at equal projected
+positions: those coordinates do not prove native occurrence identity across
+partial imports. This deduplicates conversation results, not individual turns. Segment and Claude subagent strands remain explicit;
+this does not invent a flattened history or inherited segment order.
+
+Historical catalog rows start with null identity and stay unknown until their
+next projection or an explicitly scoped metadata backfill. Do not enqueue a
+full-corpus body rebuild merely to fill these fields. Measure known/unknown
+coverage before claiming corpus-wide deduplication. Unknown rewritten native
+UUIDs are not inferred from matching text, paths or timestamps. Existing fuzzy
+similarity remains available only for documents without verified native identity.
+No TP reindex is required: the existing canonical authority join owns the
+identity metadata used to group vendor results.
+
+Rollback the reader/worker to the compatibility-only runtime and retain the
+nullable columns and marker. An older exact-70 runtime will reject marker 71;
+dropping metadata or rekeying evidence is not the rollback path.
 
 `--profile local-fixture` is a visibly non-production exception restricted to a
 loopback PostgreSQL fixture. It never reports production readiness.

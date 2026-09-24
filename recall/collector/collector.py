@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any
 
 from skills.recall.scripts.codex_identity import (
+    MAX_IDENTITY_BYTES,
+    MAX_IDENTITY_RECORDS,
     codex_session_id_from_filename,
     codex_segment_id_from_filename,
     stable_codex_segment_key,
@@ -22,6 +24,7 @@ from skills.recall.scripts.codex_identity import (
     resolve_codex_session_identity,
     stable_codex_record_key,
 )
+from contracts.native_conversation import native_conversation
 from privacy.policy import PrivacyPolicy, summarize_receipts
 from privacy.transport import open_no_redirect, retry_delay_seconds
 
@@ -205,6 +208,7 @@ class Collector:
         self.defer_scan_flush = defer_scan_flush
         self._codex_path_keys: dict[str, str] = {}
         self._codex_segment_identities: dict[str, Any] = {}
+        self._native_conversation_cache: dict[str, Any] = {}
         self.shard_count = 1
         self.shard_index = 0
         self.spool_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -820,6 +824,37 @@ class Collector:
         self.db.commit()
         return [item["path"] for item in selected]
 
+    def _native_conversation(self, path: Path):
+        key = str(path)
+        if key not in self._native_conversation_cache:
+            identity = None
+            remaining = MAX_IDENTITY_BYTES
+            try:
+                stream = path.open("rb")
+            except OSError:
+                # The already-read record remains ingestible if the file moved.
+                # Optional identity is unknown; do not invent it from the path.
+                return None
+            with stream:
+                for _ in range(MAX_IDENTITY_RECORDS):
+                    line = stream.readline(remaining + 1)
+                    if not line or len(line) > remaining:
+                        break
+                    remaining -= len(line)
+                    try:
+                        record = json.loads(line)
+                    except (ValueError, UnicodeDecodeError):
+                        continue
+                    identity = native_conversation(
+                        record, harness=self.harness,
+                        segment_id=codex_segment_id_from_filename(path)
+                        if self.harness == "codex" else None,
+                    )
+                    if identity is not None:
+                        break
+            self._native_conversation_cache[key] = identity
+        return self._native_conversation_cache[key]
+
     def _envelope(self, path: Path, native_id: str, kind: str, content: Any,
                   occurred_at: str, start: int, end: int,
                   artifact_ref: dict[str, Any] | None = None,
@@ -851,6 +886,10 @@ class Collector:
                     "end_ordinal_exclusive": identity.history_base_ordinal,
                 },
             })
+        if kind != "tombstone":
+            conversation = self._native_conversation(path)
+            if conversation is not None:
+                provenance["native_conversation"] = conversation.provenance()
         if artifact_ref is not None:
             provenance["artifact_ref"] = artifact_ref
         if artifact_member is not None:
@@ -1141,6 +1180,7 @@ class Collector:
     def scan(self) -> dict:
         """Run one bounded, resumable scan slice and publish content-free health."""
 
+        self._native_conversation_cache.clear()
         self._set_meta("running_started_epoch", str(time.time()))
         self.db.commit()
         try:

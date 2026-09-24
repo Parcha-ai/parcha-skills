@@ -17,6 +17,8 @@ from typing import Any, Callable
 import orjson
 import psycopg
 
+from contracts.native_conversation import NativeConversationConflict, projected_conversation
+
 from .actor_attribution import actor_links
 from .canonical_text import MAX_CANONICAL_TEXT_BYTES, canonical_text_chunks
 from .logical_archive_bodies import ArchivedBodyLookup
@@ -90,6 +92,8 @@ class _LocatedUpload(LogicalEvidenceUpload):
     # or parent-sized Python list survives alongside the immutable upload.
     body_locators: _LocatorSpool | None = None
     inline_document_ids: tuple[str, ...] = ()
+    conversation_id: str | None = None
+    conversation_strand_id: str | None = None
 
 
 def _close_body_locators(upload):
@@ -430,7 +434,7 @@ class CanonicalLogicalEvidenceProjector:
                 actor_links=attributed,
             )
 
-    def _record_stream(self, cursor: Any, *, locate=None):
+    def _record_stream(self, cursor: Any, *, locate=None, observe_identity=None):
         next_ordinal = 0
         for row in cursor:
             _validate_source_body(row)
@@ -449,6 +453,8 @@ class CanonicalLogicalEvidenceProjector:
                 structural_roles,
                 canonical_content,
             ) = _parsed_structural_values(text)
+            if observe_identity is not None:
+                observe_identity(canonical_content, row.get("native_provenance"))
             if not parsed:
                 structural_types = tuple(row["fallback_type_values"])
                 structural_roles = tuple(row["fallback_role_values"])
@@ -731,6 +737,7 @@ class CanonicalLogicalEvidenceProjector:
         input_spool = None
         body_locators: dict[int, _LocatorSpool] = {}
         inline_document_ids: dict[int, tuple[str, ...]] = {}
+        conversations = {}
         transferred = False
         try:
             input_spool = tempfile.TemporaryFile(mode="w+b")
@@ -800,7 +807,7 @@ class CanonicalLogicalEvidenceProjector:
                               document.document_id,document.body_location,
                               event.tenant_id,event.source_id,
                               event.event_id,event.native_id,event.kind,
-                              event.occurred_at,
+                              event.occurred_at,root_fields.provenance AS native_provenance,
                               jsonb_build_array(
                                       root_fields.role,
                                       root_fields.type,
@@ -869,7 +876,7 @@ class CanonicalLogicalEvidenceProjector:
                                   THEN event.canonical_redacted
                                   ELSE '{}'::jsonb END
                              ELSE '{}'::jsonb END
-                         ) AS root_fields(role text,type text,content jsonb)
+                         ) AS root_fields(role text,type text,content jsonb,provenance jsonb)
                          JOIN LATERAL (
                               SELECT count(*)::integer AS chunk_count,
                                      jsonb_agg(jsonb_build_object(
@@ -972,10 +979,23 @@ class CanonicalLogicalEvidenceProjector:
                             inline_ids[document_id] = None
                         yield row
 
+                def observe_identity(record, provenance):
+                    # The first explicit native header/retained identity owns this
+                    # physical document. Later resume metadata cannot rekey it.
+                    if ordinal not in conversations:
+                        try:
+                            identity = projected_conversation(record, provenance)
+                        except NativeConversationConflict:
+                            conversations[ordinal] = None
+                            return
+                        if identity is not None:
+                            conversations[ordinal] = identity
+
                 final_start = spool.tell()
                 locations = body_locators[ordinal] = _LocatorSpool()
                 try:
-                    for record in self._record_stream(resolved_rows(), locate=locations.append):
+                    for record in self._record_stream(resolved_rows(), locate=locations.append,
+                                                      observe_identity=observe_identity):
                         spool.write(record.encode(source_id=candidate.source_id))
                 finally:
                     if lookup is not None:
@@ -1013,6 +1033,8 @@ class CanonicalLogicalEvidenceProjector:
                 upload = _LocatedUpload(
                     **vars(upload), body_locators=body_locators[ordinal],
                     inline_document_ids=inline_document_ids[ordinal],
+                    conversation_id=conversations[ordinal].conversation_id if conversations.get(ordinal) is not None else None,
+                    conversation_strand_id=conversations[ordinal].strand_id if conversations.get(ordinal) is not None else None,
                 )
                 uploads[ordinal] = upload
                 completed.append(upload)
@@ -1499,6 +1521,18 @@ class CanonicalLogicalEvidenceProjector:
                         == prepared.document_content_sha256
                     and same_parts
                 ):
+                    connection.execute(
+                        """UPDATE canonical_evidence_documents
+                              SET conversation_id=%s,conversation_strand_id=%s
+                            WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s
+                              AND (conversation_id,conversation_strand_id)
+                                  IS DISTINCT FROM (%s,%s)""",
+                        (getattr(upload, "conversation_id", None),
+                         getattr(upload, "conversation_strand_id", None),
+                         candidate.tenant_id, candidate.source_id, candidate.native_parent_id,
+                         getattr(upload, "conversation_id", None),
+                         getattr(upload, "conversation_strand_id", None)),
+                    )
                     if locator_changes:
                         # The manifest is unchanged, but newly filled positions
                         # must revisit enabled retirement progress. Lock order
@@ -1587,10 +1621,10 @@ class CanonicalLogicalEvidenceProjector:
                            manifest_encryption,manifest_version_id,
                            document_content_sha256,record_count,receipt_count,
                            part_count,first_occurred_at,last_occurred_at,
-                           source_updated_at,created_at
+                           source_updated_at,created_at,conversation_id,conversation_strand_id
                        ) VALUES (
                            %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                           %s,%s,%s,%s,%s,%s,%s,%s
+                           %s,%s,%s,%s,%s,%s,%s,%s,%s,%s
                        )
                        ON CONFLICT(tenant_id,source_id,native_parent_id)
                        DO UPDATE SET
@@ -1613,7 +1647,9 @@ class CanonicalLogicalEvidenceProjector:
                            part_count=excluded.part_count,
                            first_occurred_at=excluded.first_occurred_at,
                            last_occurred_at=excluded.last_occurred_at,
-                           source_updated_at=excluded.source_updated_at
+                           source_updated_at=excluded.source_updated_at,
+                           conversation_id=excluded.conversation_id,
+                           conversation_strand_id=excluded.conversation_strand_id
                        WHERE canonical_evidence_documents.logical_document_id
                              =excluded.logical_document_id
                          AND canonical_evidence_documents.revision
@@ -1641,6 +1677,8 @@ class CanonicalLogicalEvidenceProjector:
                         prepared.last_occurred_at,
                         candidate.source_updated_at,
                         manifest_reference["created_at"],
+                        getattr(upload, "conversation_id", None),
+                        getattr(upload, "conversation_strand_id", None),
                     ),
                 )
                 if committed.rowcount != 1:

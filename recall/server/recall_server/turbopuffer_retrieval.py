@@ -394,7 +394,8 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
                     connection,
                     """WITH selected AS MATERIALIZED (
                             SELECT passage.tenant_id,passage.source_id,passage.passage_id,
-                                   passage.logical_document_id,passage.text_sha256,passage.receipts
+                                   passage.logical_document_id,passage.text_sha256,passage.receipts,
+                                   evidence.conversation_id,evidence.conversation_strand_id
                               FROM canonical_passages passage
                               JOIN canonical_passage_documents projected
                                 USING(tenant_id,source_id,logical_document_id,policy_fingerprint)
@@ -422,14 +423,16 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
                                AND document.is_current AND document.deleted_at IS NULL
                         )
                         SELECT selected.tenant_id,selected.source_id,selected.passage_id,
-                               selected.logical_document_id,selected.text_sha256
+                               selected.logical_document_id,selected.text_sha256,
+                               selected.conversation_id,selected.conversation_strand_id
                           FROM selected
                           CROSS JOIN LATERAL unnest(selected.receipts) AS receipt(value)
                           LEFT JOIN live_receipts live
                             ON live.tenant_id=selected.tenant_id
                            AND live.source_id=selected.source_id AND live.value=receipt.value
                          GROUP BY selected.tenant_id,selected.source_id,selected.passage_id,
-                                  selected.logical_document_id,selected.text_sha256
+                                  selected.logical_document_id,selected.text_sha256,
+                                  selected.conversation_id,selected.conversation_strand_id
                         HAVING bool_and(live.value IS NOT NULL)""",
                     (self.tenant_id, self.sources, self.policy_fingerprint, ids),
                     deadline_at,
@@ -444,6 +447,11 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
         allowed = {identity(row) for row in authoritative
                    if row.get("tenant_id") == self.tenant_id
                    and row.get("source_id") in self.sources}
+        catalog_identity = {
+            (row.get("source_id"), row.get("logical_document_id")): (
+                row.get("conversation_id"), row.get("conversation_strand_id"))
+            for row in authoritative if identity(row) in allowed
+        }
         live = set()
         for _name, _weight, rows in legs:
             rows[:] = [row for row in rows if identity(row) in allowed]
@@ -456,6 +464,12 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
             (row.get("source_id"), row.get("logical_document_id"), item.get("passage_id")) in live
             for item in row["matching_ranges"]
         )]
+        for row in results:
+            conversation, strand = catalog_identity.get(
+                (row.get("source_id"), row.get("logical_document_id")), (None, None))
+            # Vendor attributes are not the native identity owner.
+            row["conversation_id"] = conversation
+            row["conversation_strand_id"] = strand
         return {"authority_status": status,
                 "authority_rejected": len(set(ids) - {key[2] for key in live}),
                 "authority_elapsed_ms": round((time.monotonic() - started) * 1000, 3)}
