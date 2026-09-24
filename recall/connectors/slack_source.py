@@ -10,6 +10,9 @@ from urllib.parse import urlsplit
 from connectors.sdk import ConnectorContractError, ConnectorRecordV2
 
 
+# Increment when provider replay is required to recover previously omitted content.
+SLACK_MESSAGE_CAPTURE_VERSION = 2
+
 SLACK_PUBLIC_HISTORY_USER_SCOPES = (
     "channels:history",
     "channels:read",
@@ -80,6 +83,164 @@ def _text(value: Any) -> str:
         return ""
     encoded = value.encode(errors="replace")[:MAX_TEXT_BYTES]
     return encoded.decode(errors="ignore")
+
+
+def _message_text(event: dict[str, Any]) -> tuple[str, list[str]]:
+    """Read visible Slack prose, not arbitrary strings from interactive payloads.
+
+    Blocks replace notification text; attachment fallback replaces missing card
+    prose. Repeated visible blocks/fields remain repeated occurrences. Size
+    enforcement belongs to the record contract, never silent text clipping.
+    """
+    omissions: set[str] = set()
+
+    def string(value: Any) -> str:
+        return value if isinstance(value, str) else ""
+
+    def lines(values: Iterable[str]) -> str:
+        return "\n".join(value for value in values if value)
+
+    def items(value: Any) -> list[Any]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        omissions.add("unsupported_slack_blocks")
+        return []
+
+    def render(value: Any) -> str:
+        if not isinstance(value, dict):
+            omissions.add("unsupported_slack_blocks")
+            return ""
+        kind = value.get("type")
+        if kind in {"text", "plain_text", "mrkdwn", "markdown"}:
+            return string(value.get("text"))
+        if kind == "section":
+            return lines(
+                [
+                    render(value["text"]) if value.get("text") else "",
+                    *[render(item) for item in items(value.get("fields"))],
+                    render(value["accessory"]) if value.get("accessory") else "",
+                ]
+            )
+        if kind == "header":
+            return render(value.get("text"))
+        if kind in {"rich_text", "rich_text_list", "context", "actions"}:
+            return lines(render(item) for item in items(value.get("elements")))
+        if kind in {"rich_text_section", "rich_text_quote", "rich_text_preformatted"}:
+            return "".join(render(item) for item in items(value.get("elements")))
+        if kind == "table":
+            return lines(
+                " | ".join(render(cell) for cell in items(row))
+                for row in items(value.get("rows"))
+            )
+        if kind in {"button", "workflow_button"}:
+            return render(value.get("text"))
+        if kind == "image":
+            omissions.add("image_bytes")
+            return lines(
+                [
+                    render(value["title"]) if value.get("title") else "",
+                    string(value.get("alt_text")),
+                ]
+            )
+        if kind == "link":
+            url, label = string(value.get("url")), string(value.get("text"))
+            return f"<{url}|{label}>" if url and label else (url or label)
+        if kind in {"user", "channel", "usergroup"}:
+            identifier = string(
+                value.get(
+                    {
+                        "user": "user_id",
+                        "channel": "channel_id",
+                        "usergroup": "usergroup_id",
+                    }[kind]
+                )
+            )
+            prefix = {"user": "@", "channel": "#", "usergroup": "!subteam^"}[kind]
+            return f"<{prefix}{identifier}>" if identifier else ""
+        if kind == "emoji":
+            name = string(value.get("name"))
+            return f":{name}:" if name else ""
+        if kind == "broadcast":
+            name = string(value.get("range"))
+            return f"<!{name}>" if name else ""
+        if kind == "date":
+            timestamp, format_text = value.get("timestamp"), string(value.get("format"))
+            if type(timestamp) is int and format_text:
+                url = string(value.get("url"))
+                fallback = string(value.get("fallback"))
+                return (
+                    f"<!date^{timestamp}^{format_text}"
+                    + (f"^{url}" if url else "")
+                    + (f"|{fallback}" if fallback else "")
+                    + ">"
+                )
+            omissions.add("unsupported_slack_blocks")
+            return string(value.get("fallback"))
+        if kind == "divider":
+            return ""
+        omissions.add("unsupported_slack_blocks")
+        return ""
+
+    def blocks(value: Any) -> str:
+        if not isinstance(value, list):
+            if value is not None:
+                omissions.add("unsupported_slack_blocks")
+            return ""
+        return lines(render(item) for item in value)
+
+    top = blocks(event.get("blocks")) or string(event.get("text"))
+    parts = [top]
+    cards = event.get("attachments") or []
+    if not isinstance(cards, list):
+        omissions.add("unsupported_slack_attachments")
+        cards = []
+    for card in cards:
+        if not isinstance(card, dict):
+            omissions.add("unsupported_slack_attachments")
+            continue
+        if card.get("image_url") or card.get("thumb_url"):
+            omissions.add("image_bytes")
+        body = [string(card.get("pretext")), string(card.get("author_name"))]
+        visible_blocks = blocks(card.get("blocks"))
+        if visible_blocks:
+            body.append(visible_blocks)
+        else:
+            title, title_link = (
+                string(card.get("title")),
+                string(card.get("title_link")),
+            )
+            body.extend(
+                [
+                    f"<{title_link}|{title}>" if title and title_link else title,
+                    string(card.get("text")),
+                ]
+            )
+            for field in items(card.get("fields")):
+                if isinstance(field, dict):
+                    body.append(
+                        ": ".join(
+                            item
+                            for item in (
+                                string(field.get("title")),
+                                string(field.get("value")),
+                            )
+                            if item
+                        )
+                    )
+                else:
+                    omissions.add("unsupported_slack_attachments")
+        body.append(string(card.get("footer")))
+        visible = lines(body)
+        if visible:
+            parts.append(visible)
+        else:
+            fallback = string(card.get("fallback"))
+            # Top-level text sometimes repeats the exact card notification fallback.
+            if fallback != top:
+                parts.append(fallback)
+    return lines(parts), sorted(omissions)
 
 
 def _https(value: Any) -> str | None:
@@ -180,6 +341,7 @@ def normalize_slack_message(
             else "inbound"
         )
     attachments = _attachments(event.get("files"))
+    message_text, omissions = _message_text(event)
     content: dict[str, Any] = {
         "kind": "communication_message.v1",
         "content_fidelity": "complete",
@@ -189,7 +351,7 @@ def normalize_slack_message(
         "message_id": native_id,
         "sent_at": sent_at,
         "surface": "slack",
-        "text": _text(event.get("text")),
+        "text": message_text,
     }
     if author_id:
         content["author_id"] = author_id
@@ -202,8 +364,10 @@ def normalize_slack_message(
         content["edited_at"] = edited_at
     if attachments:
         content["attachments"] = attachments
+        omissions.append("attachment_bytes")
+    if omissions:
         content["content_fidelity"] = "partial"
-        content["content_omissions"] = ["attachment_bytes"]
+        content["content_omissions"] = sorted(set(omissions))
     permalink = _https(event.get("permalink"))
     if permalink:
         content["source_url"] = permalink
@@ -267,6 +431,7 @@ def normalize_slack_user(
 
 
 __all__ = [
+    "SLACK_MESSAGE_CAPTURE_VERSION",
     "SLACK_PUBLIC_HISTORY_USER_SCOPES",
     "normalize_slack_message",
     "normalize_slack_user",
