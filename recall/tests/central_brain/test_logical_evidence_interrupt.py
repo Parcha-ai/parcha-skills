@@ -40,6 +40,7 @@ class InterruptingProjector(CanonicalLogicalEvidenceProjector):
             "turn_context",
         )
         self.retention_profile = "conversation-useful-v1"
+        self._prefer_recent_admission = False
         self.upload = SimpleNamespace(
             all_references=(
                 {
