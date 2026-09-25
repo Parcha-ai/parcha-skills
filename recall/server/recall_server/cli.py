@@ -2590,7 +2590,7 @@ def main() -> None:
             search_projector = TurbopufferProjector(
                 store, search_settings, client=_search_plane_client(search_settings),
             )
-            search_plane = lambda: search_projector.drain(  # noqa: E731
+            search_plane = lambda: search_projector.drain_quantum(  # noqa: E731
                 tenant_id=args.tenant,
                 max_months=args.search_plane_months_per_cycle,
             )
