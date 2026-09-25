@@ -210,7 +210,7 @@ class NotificationPriority(unittest.TestCase):
         corrected = self.queue(native)
         with self.store.connect() as connection:
             current_before = connection.execute('SELECT document_id FROM canonical_documents WHERE is_current').fetchone()['document_id']
-        self.assertEqual(post_slack(self.server, raw, retry='old-revision')[0], 200)
+        self.assertEqual(post_slack(self.server, raw, retry='3')[0], 200)
         self.assertEqual(self.queue(native)['generation'], corrected['generation'])
         with self.store.connect() as connection:
             self.assertEqual(connection.execute('SELECT document_id FROM canonical_documents WHERE is_current').fetchone()['document_id'], current_before)
@@ -292,7 +292,7 @@ class NotificationPriority(unittest.TestCase):
         with self.store.connect() as connection:
             connection.execute('UPDATE canonical_evidence_document_queue SET notification_queued_at=NULL')
             before = connection.execute('SELECT * FROM canonical_evidence_document_queue').fetchall()
-        status, _ = post_slack(self.server, raw, retry='forgotten')
+        status, _ = post_slack(self.server, raw, retry='1')
         self.assertEqual(status, 409)
         with self.store.connect() as connection:
             self.assertEqual(connection.execute('SELECT * FROM canonical_evidence_document_queue').fetchall(), before)
