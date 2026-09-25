@@ -2,6 +2,7 @@
 """Signed notifications must publish while the same source replays history."""
 from pathlib import Path
 import hashlib
+import json
 import os
 import tempfile
 import threading
@@ -131,6 +132,9 @@ class NotificationPriority(unittest.TestCase):
                   AND document.deleted_at IS NULL AND chunk.deleted_at IS NULL''',
                 (TENANT, SLACK_SOURCE, native)).fetchone()['receipt']
         self.history(10, 10)  # Later arrival, older provider time, same source.
+        before_admission = {str(mode): [c.native_parent_id == native.replace('slack:', 'slack-thread:', 1)
+            for c in self.logical._pending(tenant_id=TENANT, limit=2, prefer_recent=mode)]
+            for mode in (False, True)}
         result = self.logical.project_pending(batch_size=1, max_batches=2,
             upload_concurrency=1, on_progress=self.publish)
         self.assertEqual(result['documents'], 2)
@@ -144,9 +148,28 @@ class NotificationPriority(unittest.TestCase):
                 (TENANT, SLACK_SOURCE)).fetchone()['n']
         self.assertEqual(old_published, 1, 'oldest history must retain progress')
         self.assertGreater(remaining, 0, 'proof requires an unfinished history backlog')
-        hits = self.retrieval.search('notification sapphire rendezvous',
-            lexical_query='notification sapphire rendezvous', since=None, until=None,
-            limit=10)['results']
+        response = self.retrieval.search('notification sapphire rendezvous',
+            lexical_query='notification sapphire rendezvous', since=None, until=None, limit=10)
+        hits = response['results']
+        with self.store.connect() as connection:
+            stage = connection.execute('''SELECT
+              (SELECT count(*) FROM canonical_evidence_documents WHERE tenant_id=%s AND source_id=%s
+                AND native_parent_id=%s) AS logical,
+              (SELECT count(*) FROM canonical_passages WHERE tenant_id=%s AND source_id=%s
+                AND %s=ANY(receipts)) AS passages''',
+                (TENANT, SLACK_SOURCE, native.replace('slack:', 'slack-thread:', 1),
+                 TENANT, SLACK_SOURCE, receipt)).fetchone()
+        print('notification-stage-proof ' + json.dumps({
+            'admission_target_flags': before_admission, 'logical_result': result,
+            'target_still_queued': self.queue(native) is not None, **stage,
+            'vendor_rows': len(self.retrieval.namespace.rows),
+            'target_vendor_rows': sum(receipt in row.get('receipts', ())
+                for row in self.retrieval.namespace.rows.values()),
+            'search_diagnostics': response.get('diagnostics'),
+            'search_results': len(hits),
+            'result_receipt_counts': [len(item.get('receipts', ())) for hit in hits
+                for item in hit['matching_ranges']],
+        }, default=str), flush=True)
         self.assertTrue(any(receipt in item.get('receipts', ()) for hit in hits
             for item in hit['matching_ranges']),
             'signed live notification was stranded behind later historical replay')
@@ -316,8 +339,8 @@ class NotificationPriority(unittest.TestCase):
         self.assertEqual(status, 400)
         webhook = self.store.create_collector_token('synthetic-notify', 'synthetic:webhook', ['webhook'],
             tenant_id=TENANT, principal_id=OWNER, webhook_privacy_mode='scrub')['token']
-        reader = self.store.create_collector_token('synthetic-reader', 'synthetic:webhook', ['read'],
-            tenant_id=TENANT, principal_id=OWNER)['token']
+        reader = self.store.create_collector_token('synthetic-reader', None, ['read'],
+            principal_id=OWNER)['token']
         self.assertEqual(post_json(self.server, '/webhooks/v1/events', reader, body())[0], 401)
         self.assertEqual(post_json(self.server, '/webhooks/v1/events', webhook,
             {**body(), 'notification': True})[0], 400)
