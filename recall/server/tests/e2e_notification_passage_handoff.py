@@ -4,11 +4,10 @@ import time
 import unittest
 from unittest.mock import patch
 
-from recall_server.logical_evidence_projection import mark_logical_evidence_dirty
-
 from e2e_notification_priority import (
     NotificationPriority, TENANT, SLACK_SOURCE, SLACK_WORKSPACE, post_slack, slack_event,
 )
+from recall_server.logical_evidence_projection import mark_logical_evidence_dirty
 
 
 class NotificationPassageHandoff(NotificationPriority):
