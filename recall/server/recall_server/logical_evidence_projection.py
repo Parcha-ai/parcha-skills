@@ -971,8 +971,17 @@ class CanonicalLogicalEvidenceProjector:
             # Worker-only checkpoint: direct corpus audits can prepare groups
             # without queued work. Stop obsolete workers before archive reads,
             # re-encoding or uploads; the final commit CAS remains authoritative.
+            checkpoint = None
             if require_current_queue:
                 self._check_candidate_current(candidates[0])
+                next_current_check = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
+
+                def checkpoint():
+                    nonlocal next_current_check
+                    if time.monotonic() >= next_current_check:
+                        self._check_candidate_current(candidates[0])
+                        next_current_check = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
+
             # Archive recovery and oversized raw restoration run only after
             # the input cursor and its pool connection have been released.
             for ordinal, start, end in input_ranges:
@@ -984,6 +993,8 @@ class CanonicalLogicalEvidenceProjector:
                 def resolved_rows():
                     nonlocal lookup
                     while input_spool.tell() < end:
+                        if checkpoint is not None:
+                            checkpoint()
                         row = pickle.load(input_spool)
                         try:
                             _validate_source_body(row)
@@ -995,6 +1006,7 @@ class CanonicalLogicalEvidenceProjector:
                                     manifest=pins.get(ordinal),
                                     parts=pinned_parts.get(ordinal, ()),
                                     reference=self._reference,
+                                    checkpoint=checkpoint,
                                 )
                             row = lookup.restore(row)
                             _validate_source_body(row)
@@ -1011,7 +1023,11 @@ class CanonicalLogicalEvidenceProjector:
                 locations = body_locators[ordinal] = _LocatorSpool()
                 try:
                     for record in self._record_stream(resolved_rows(), locate=locations.append):
+                        if checkpoint is not None:
+                            checkpoint()
                         spool.write(record.encode(source_id=candidate.source_id))
+                    if checkpoint is not None:
+                        checkpoint()
                 finally:
                     if lookup is not None:
                         lookup.close()
