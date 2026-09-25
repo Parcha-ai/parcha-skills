@@ -509,11 +509,11 @@ class CanonicalLogicalEvidenceProjector:
         With a quiet period, a group is ready only once it has not changed for
         `quiet_seconds`, or has been waiting longer than `max_wait_seconds`
         since it first entered the queue. Forget and backfill never wait.
-        Admit one ready group per source before another source's second group;
-        forget takes precedence and retains oldest-first order. Normal groups
-        use oldest-first order unless this is a recent-change admission round.
-        Join archive size estimates only after the
-        bounded admission, so a bulk backfill cannot monopolize the batch.
+        Give each source's ready head a floor, then share residual admission
+        by eligible backlog. Forget takes precedence and retains its existing
+        ordering. Normal groups use oldest-first order unless this is a
+        recent-change round. The floor applies before the coordinator excludes
+        in-flight work. Join archive size estimates only after bounded admission.
         """
         with self.store.connect() as connection:
             rows = connection.execute(
@@ -548,12 +548,18 @@ class CanonicalLogicalEvidenceProjector:
                                                 THEN changed_at END DESC,
                                            first_queued_at,
                                            native_parent_id
-                              ) AS source_position
+                              ) AS source_position,
+                              count(*) OVER (PARTITION BY tenant_id,source_id)
+                                  AS source_backlog
                          FROM eligible
                    ), admitted AS MATERIALIZED (
                        SELECT * FROM ranked
-                        ORDER BY admission_priority,source_position,first_queued_at,
-                                 tenant_id,source_id,native_parent_id
+                        ORDER BY admission_priority,
+                                 CASE WHEN admission_priority=0 THEN source_position
+                                      WHEN source_position=1 THEN 0 ELSE 1 END,
+                                 CASE WHEN admission_priority>0 AND source_position>1
+                                      THEN source_position::numeric/source_backlog ELSE 0 END,
+                                 first_queued_at,tenant_id,source_id,native_parent_id
                         LIMIT %s
                    )
                    SELECT queue.tenant_id,queue.source_id,
@@ -583,7 +589,11 @@ class CanonicalLogicalEvidenceProjector:
                                      =evidence.logical_document_id
                                  AND part.revision=evidence.revision
                      ) evidence_size ON true
-                    ORDER BY queue.admission_priority,queue.source_position,
+                    ORDER BY queue.admission_priority,
+                             CASE WHEN queue.admission_priority=0 THEN queue.source_position
+                                  WHEN queue.source_position=1 THEN 0 ELSE 1 END,
+                             CASE WHEN queue.admission_priority>0 AND queue.source_position>1
+                                  THEN queue.source_position::numeric/queue.source_backlog ELSE 0 END,
                              queue.first_queued_at,queue.tenant_id,
                              queue.source_id,queue.native_parent_id""",
                 (
