@@ -1898,22 +1898,6 @@ class ControlPlane:
     def state(self, principal_id: str) -> dict[str, Any]:
         brains = self._brain_rows(principal_id)
         with self.store.connect() as connection:
-            managed_tenants = [
-                row["tenant_id"]
-                for row in connection.execute(
-                    """SELECT access.tenant_id
-                         FROM brain_access_grants access
-                         JOIN brain_spaces space USING(tenant_id)
-                         JOIN brain_memberships membership
-                           ON membership.organization_id=space.organization_id
-                          AND membership.principal_id=access.principal_id
-                        WHERE access.principal_id=%s
-                          AND access.permission IN ('owner','admin')
-                          AND membership.role IN ('owner','admin')
-                        ORDER BY access.tenant_id""",
-                    (principal_id,),
-                ).fetchall()
-            ]
             installations = connection.execute(
                 """SELECT installation.id,installation.tenant_id,
                           installation.connector_id,installation.source_id,
@@ -1970,8 +1954,28 @@ class ControlPlane:
             "catalog": sorted(catalog, key=lambda value: value["connector_id"]),
             "connections": connections,
             "installations": installations,
-            "fleet": self.store.fleet_status(managed_tenants),
         }
+
+    def fleet(self, principal_id: str) -> dict[str, Any]:
+        """Load optional statistics for brains this principal administers."""
+        with self.store.connect() as connection:
+            managed_tenants = [
+                row["tenant_id"]
+                for row in connection.execute(
+                    """SELECT access.tenant_id
+                         FROM brain_access_grants access
+                         JOIN brain_spaces space USING(tenant_id)
+                         JOIN brain_memberships membership
+                           ON membership.organization_id=space.organization_id
+                          AND membership.principal_id=access.principal_id
+                        WHERE access.principal_id=%s
+                          AND access.permission IN ('owner','admin')
+                          AND membership.role IN ('owner','admin')
+                        ORDER BY access.tenant_id""",
+                    (principal_id,),
+                ).fetchall()
+            ]
+        return {"fleet": self.store.fleet_status(managed_tenants)}
 
     def create_device_installation(
         self,

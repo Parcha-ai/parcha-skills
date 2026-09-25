@@ -1,5 +1,8 @@
 const $ = (selector) => document.querySelector(selector);
-const state = { data: null };
+const state = { data: null, ready: false, version: 0, authRequired: false };
+let loading = null;
+let fleetLoadingVersion = null;
+const REQUEST_TIMEOUT_MS = 15000;
 const googleLabels = {
   "google.gmail": "Gmail",
   "google.calendar": "Calendar",
@@ -15,14 +18,33 @@ function cookie(name) {
 async function api(path, options = {}) {
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
   if (options.method && options.method !== "GET") headers["X-Recall-CSRF"] = cookie("recall_admin_csrf");
-  const response = await fetch(path, { credentials: "same-origin", ...options, headers });
-  const payload = await response.json();
-  if (!response.ok) {
-    const error = new Error(payload.error || "request_failed");
-    error.status = response.status;
+  const controller = new AbortController();
+  let timedOut = false;
+  // A timed-out write may already have committed; keep mutation behavior unchanged.
+  const timer = !options.method || options.method === "GET"
+    ? window.setTimeout(() => { timedOut = true; controller.abort(); }, REQUEST_TIMEOUT_MS)
+    : null;
+  try {
+    const response = await fetch(path, { credentials: "same-origin", ...options, headers, signal: controller.signal });
+    let payload;
+    try { payload = await response.json(); }
+    catch (_error) {
+      const error = new Error(`Invalid server response (HTTP ${response.status}).`);
+      error.status = response.status;
+      throw error;
+    }
+    if (!response.ok) {
+      const error = new Error(typeof payload?.error === "string" ? payload.error : "request_failed");
+      error.status = response.status;
+      throw error;
+    }
+    return payload;
+  } catch (error) {
+    if (timedOut) throw new Error("Request timed out. Please retry.");
     throw error;
+  } finally {
+    if (timer !== null) window.clearTimeout(timer);
   }
-  return payload;
 }
 
 function toast(message) {
@@ -382,7 +404,6 @@ function render() {
   renderGoogle();
   renderSlack();
   renderCatalog();
-  renderFleet();
   renderInstallations();
   $(".pulse").classList.add("ready");
   $("#system-label").textContent = "CONTROL PLANE / READY";
@@ -390,6 +411,7 @@ function render() {
 
 $("#invite-form").addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (!state.ready) return;
   try {
     const invitation = await api("/admin/api/v1/invitations", {
       method: "POST",
@@ -418,6 +440,7 @@ $("#invite-form").addEventListener("submit", async (event) => {
 $("#invite-brain").addEventListener("change", renderInviteEndpoint);
 
 $("#copy-invite-endpoint").addEventListener("click", async () => {
+  if (!state.ready) return;
   const value = $("#invite-endpoint").value;
   if (!value) return;
   try {
@@ -430,6 +453,7 @@ $("#copy-invite-endpoint").addEventListener("click", async () => {
 });
 
 $("#invitation-list").addEventListener("click", async (event) => {
+  if (!state.ready) return;
   const button = event.target.closest("button[data-invitation-id]");
   if (!button || button.disabled) return;
   if (!window.confirm("Remove this company-brain access immediately?")) return;
@@ -445,26 +469,106 @@ $("#invitation-list").addEventListener("click", async (event) => {
   }
 });
 
+function bootstrapStatus(message, { loading: busy = false, auth = false } = {}) {
+  state.ready = false;
+  state.data = null;
+  state.authRequired = auth;
+  $("#admin-controls").disabled = true;
+  $("#admin-controls").setAttribute("aria-busy", String(busy));
+  $(".pulse").classList.remove("ready");
+  $("#system-label").textContent = busy ? "CONTROL PLANE / LOADING" : "CONTROL PLANE / UNAVAILABLE";
+  $("#bootstrap-status").hidden = false;
+  $("#bootstrap-message").textContent = message;
+  $("#bootstrap-retry").disabled = busy;
+  $("#bootstrap-retry").textContent = auth ? "Sign in" : "Retry";
+}
+
+function showAuth() {
+  if (!$("#auth-dialog").open) $("#auth-dialog").showModal();
+}
+
 async function loadAuthMethods() {
+  $("#auth-retry").disabled = true;
   try {
     const methods = await api("/admin/api/v1/auth-methods");
+    if (!methods || typeof methods.oauth !== "boolean") throw new Error("Invalid sign-in options.");
     $("#oauth-login").hidden = !methods.oauth;
     $("#oauth-copy").hidden = !methods.oauth;
     $("#legacy-login").open = !methods.oauth;
-  } catch (_error) {
+    $("#auth-error").textContent = "";
+  } catch (error) {
     $("#legacy-login").open = true;
+    $("#auth-error").textContent = `Could not load sign-in options: ${error.message}`;
+  } finally {
+    $("#auth-retry").disabled = false;
   }
 }
 
-async function load() {
+async function loadFleet() {
+  if (!state.ready || fleetLoadingVersion === state.version) return;
+  const version = state.version;
+  fleetLoadingVersion = version;
+  $("#fleet-status").hidden = false;
+  $("#fleet-message").textContent = "Loading ingestion status…";
+  $("#fleet-retry").disabled = true;
+  $("#fleet-summary").replaceChildren();
+  $("#fleet-list").replaceChildren();
   try {
-    state.data = await api("/admin/api/v1/state");
-    render();
+    const payload = await api("/admin/api/v1/fleet");
+    if (version !== state.version || !state.ready) return;
+    if (!payload || !Array.isArray(payload.fleet)) throw new Error("Invalid ingestion status response.");
+    state.data.fleet = payload.fleet;
+    renderFleet();
+    $("#fleet-status").hidden = true;
   } catch (error) {
-    if (error.status === 401) $("#auth-dialog").showModal();
-    else toast(`Could not load: ${error.message}`);
+    if (version !== state.version || !state.ready) return;
+    $("#fleet-message").textContent = `Ingestion status unavailable: ${error.message}`;
+  } finally {
+    if (version === state.version) {
+      fleetLoadingVersion = null;
+      $("#fleet-retry").disabled = false;
+    }
   }
 }
+
+function load() {
+  if (loading) return loading;
+  state.version += 1;
+  bootstrapStatus("Loading destinations and connections…", { loading: true });
+  loading = (async () => {
+    try {
+      const data = await api("/admin/api/v1/state");
+      if (!data || !["brains", "providers", "connections", "catalog", "installations"].every(key => Array.isArray(data[key]))) {
+        throw new Error("Invalid admin state response. Please retry.");
+      }
+      state.data = data;
+      render();
+      state.ready = true;
+      $("#admin-controls").disabled = false;
+      $("#admin-controls").setAttribute("aria-busy", "false");
+      $("#bootstrap-status").hidden = true;
+      void loadFleet();
+    } catch (error) {
+      bootstrapStatus(error.status === 401
+        ? "Sign in to load your destinations and connections."
+        : `Could not load destinations and connections: ${error.message}`, { auth: error.status === 401 });
+      if (error.status === 401) showAuth();
+    } finally {
+      loading = null;
+    }
+  })();
+  return loading;
+}
+
+$("#bootstrap-retry").addEventListener("click", () => {
+  if (state.authRequired) { void loadAuthMethods(); showAuth(); }
+  else void load();
+});
+$("#auth-retry").addEventListener("click", loadAuthMethods);
+$("#fleet-retry").addEventListener("click", loadFleet);
+$("#auth-dialog").addEventListener("cancel", () => {
+  window.setTimeout(() => $("#bootstrap-retry").focus(), 0);
+});
 
 $("#auth-form").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -485,6 +589,7 @@ $("#auth-form").addEventListener("submit", async (event) => {
 
 $("#google-form").addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (!state.ready) return;
   const routes = [...document.querySelectorAll(".route-row")]
     .filter((row) => row.querySelector("input").checked)
     .map((row) => ({
@@ -520,6 +625,7 @@ $("#google-form").addEventListener("submit", async (event) => {
 
 $("#slack-form").addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (!state.ready) return;
   if (!$("#slack-enabled").checked) return toast("Switch Slack on first.");
   const tenantId = $("#slack-brain").value;
   const brain = state.data.brains.find((item) => item.tenant_id === tenantId);
@@ -546,6 +652,7 @@ $("#slack-form").addEventListener("submit", async (event) => {
 });
 
 $("#installation-list").addEventListener("click", async (event) => {
+  if (!state.ready) return;
   const button = event.target.closest("button[data-action]");
   if (!button) return;
   if (
@@ -565,6 +672,7 @@ $("#installation-list").addEventListener("click", async (event) => {
 });
 
 $("#google-connection").addEventListener("click", async (event) => {
+  if (!state.ready) return;
   const button = event.target.closest("button[data-connection-id]");
   if (!button) return;
   if (!window.confirm("Disconnect Google and revoke every dependent route?")) return;
@@ -581,6 +689,7 @@ $("#google-connection").addEventListener("click", async (event) => {
 });
 
 $("#slack-connection").addEventListener("click", async (event) => {
+  if (!state.ready) return;
   const button = event.target.closest("button[data-connection-id]");
   if (!button || !window.confirm("Disconnect Slack and revoke its route?")) return;
   try {
@@ -602,4 +711,5 @@ $("#google-auth-provider").addEventListener("change", () => {
 
 const oauth = new URLSearchParams(window.location.search).get("oauth");
 if (oauth === "connected") history.replaceState({}, "", "/admin");
-loadAuthMethods().then(load);
+void loadAuthMethods();
+void load();

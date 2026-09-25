@@ -1843,8 +1843,10 @@ class BrainStore:
             for value in tenant_ids
         ):
             raise ValueError("fleet tenant scope is invalid")
+        deadline_at = time.monotonic() + 5.0
         with self.connect() as conn:
-            rows = conn.execute(
+            rows = self._execute_bounded(
+                conn,
                 """SELECT source.tenant_id,source.source_id,
                           source.owner_principal_id,
                           COALESCE(actor.display_name,source.owner_principal_id)
@@ -1935,6 +1937,7 @@ class BrainStore:
                            COALESCE(installation.device_id,source.source_id),
                            source.source_id""",
                 (tenant_ids,),
+                deadline_at,
             ).fetchall()
         return [dict(row) for row in rows]
 

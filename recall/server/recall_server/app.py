@@ -17,6 +17,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from psycopg_pool import PoolTimeout
+from psycopg.errors import QueryCanceled
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 from .admin_web import (
@@ -982,6 +983,17 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 except ControlError as error:
                     self.send_json(error.status, {"error": error.code})
+                return
+            if parsed.path == "/admin/api/v1/fleet":
+                principal = self.admin_principal()
+                if principal is None:
+                    return
+                try:
+                    self.send_json(200, self.control_plane.fleet(principal["principal_id"]))
+                except ControlError as error:
+                    self.send_json(error.status, {"error": error.code})
+                except (QueryCanceled, SearchDeadlineExceeded):
+                    self.send_json(503, {"error": "fleet_unavailable"})
                 return
             if parsed.path == "/admin/oauth/callback/google":
                 if self.control_plane is None:

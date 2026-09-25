@@ -14,6 +14,9 @@ import sys
 import threading
 from http.server import ThreadingHTTPServer
 from urllib.parse import parse_qs, urlencode, urlsplit
+from unittest.mock import patch
+
+import psycopg
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -352,6 +355,8 @@ def main():
         assert b"Transferred / 24h" in script
         status, _, denied = request(server, "GET", "/admin/api/v1/state")
         assert status == 401 and denied["error"] == "admin_session_invalid"
+        status, _, denied = request(server, "GET", "/admin/api/v1/fleet")
+        assert status == 401 and denied["error"] == "admin_session_invalid"
         status, _, denied = request(
             server,
             "POST",
@@ -379,10 +384,50 @@ def main():
         assert SECRET_CANARY not in rendered
         assert "token_sha256" not in rendered
         assert initial["invitations"] == []
-        assert initial["fleet"] == []
+        assert "fleet" not in initial
         assert request(
-            server, "GET", "/admin/api/v1/state", cookie=outsider_cookie
+            server, "GET", "/admin/api/v1/fleet", cookie=owner_cookie
         )[2]["fleet"] == []
+        assert request(
+            server, "GET", "/admin/api/v1/fleet", cookie=outsider_cookie
+        )[2]["fleet"] == []
+
+        # Statistics failure does not block core state or the real scoped OAuth
+        # start path. No provider network request is made by this fake provider.
+        with patch.object(store, "fleet_status", side_effect=psycopg.errors.QueryCanceled(SECRET_CANARY)), \
+                patch.dict(control.providers, {"slack": FakeGoogle()}):
+            status, _, unavailable = request(
+                server, "GET", "/admin/api/v1/fleet", cookie=owner_cookie
+            )
+            assert status == 503 and unavailable == {"error": "fleet_unavailable"}
+            status, _, usable = request(
+                server, "GET", "/admin/api/v1/state", cookie=owner_cookie
+            )
+            assert status == 200 and len(usable["brains"]) == 2
+            assert "fleet" not in usable
+            slack_start = {"provider": "slack", "routes": [{
+                "connector_id": "slack.messages", "tenant_id": COMPANY,
+                "privacy_mode": "scrub", "selectors": {},
+            }]}
+            status, _, denied = request(
+                server, "POST", "/admin/api/v1/oauth/start", body=slack_start,
+                cookie=owner_cookie,
+            )
+            assert status == 403 and denied["error"] == "admin_csrf_invalid"
+            status, _, started_slack = request(
+                server, "POST", "/admin/api/v1/oauth/start", body=slack_start,
+                cookie=owner_cookie, csrf=owner_csrf,
+            )
+            assert status == 201 and started_slack["authorization_url"].startswith("https://")
+            status, _, denied = request(
+                server, "POST", "/admin/api/v1/oauth/start", body={
+                    "provider": "slack", "routes": [{
+                        **slack_start["routes"][0], "tenant_id": PERSONAL,
+                    }],
+                },
+                cookie=outsider_cookie, csrf=outsider_csrf,
+            )
+            assert status == 403 and denied["error"] == "oauth_brain_forbidden"
 
         invitation_body = {
             "tenant_id": COMPANY,
@@ -942,8 +987,11 @@ def main():
                 (PERSONAL, device_body["source_id"], digest),
             )
         owner_fleet = request(
-            server, "GET", "/admin/api/v1/state", cookie=owner_cookie
+            server, "GET", "/admin/api/v1/fleet", cookie=owner_cookie
         )[2]["fleet"]
+        assert request(
+            server, "GET", "/admin/api/v1/fleet", cookie=outsider_cookie
+        )[2]["fleet"] == []
         device_health = next(
             item for item in owner_fleet
             if item["source_id"] == device_body["source_id"]
