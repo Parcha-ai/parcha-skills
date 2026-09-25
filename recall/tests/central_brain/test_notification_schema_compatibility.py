@@ -15,6 +15,7 @@ class NotificationSchemaCompatibility(unittest.TestCase):
         reconciliation=True,
         conversation=False,
         notification=True,
+        passage=True,
     ):
         snapshot = healthy_snapshot()
         snapshot["migration_versions"] = [n for n in range(1, 70) if retired or n != 67]
@@ -22,6 +23,7 @@ class NotificationSchemaCompatibility(unittest.TestCase):
             (reconciliation, 70),
             (conversation, 71),
             (notification, 72),
+            (passage, 73),
         ):
             if enabled:
                 snapshot["migration_versions"].append(version)
@@ -29,8 +31,8 @@ class NotificationSchemaCompatibility(unittest.TestCase):
         return snapshot
 
     def test_notification_marker_is_optional_and_independent_of_other_optionals(self):
-        for retired, reconciliation, conversation, notification in itertools.product(
-            (False, True), repeat=4
+        for retired, reconciliation, conversation, notification, passage in itertools.product(
+            (False, True), repeat=5
         ):
             with self.subTest(
                 retired=retired,
@@ -43,6 +45,7 @@ class NotificationSchemaCompatibility(unittest.TestCase):
                     reconciliation=reconciliation,
                     conversation=conversation,
                     notification=notification,
+                    passage=passage,
                 )
                 try:
                     result = assess_snapshot(snapshot)
@@ -57,14 +60,14 @@ class NotificationSchemaCompatibility(unittest.TestCase):
                 )
 
     def test_marker_cannot_hide_missing_mandatory_or_unknown_versions(self):
-        complete = list(range(1, 73))
+        complete = list(range(1, 74))
         for versions in (
             [n for n in complete if n != 68],
             [n for n in complete if n != 69],
-            complete + [73],
-            list(range(1, 71)) + [73],
+            complete + [74],
+            list(range(1, 71)) + [74],
             complete + [72],
-            complete[:-2] + [72, 71],
+            complete[:-3] + [72, 71, 73],
             [0] + complete,
         ):
             with self.subTest(versions=versions):

@@ -1536,7 +1536,7 @@ class CanonicalLogicalEvidenceProjector:
                     ("logical-evidence\x1f" + prepared.logical_document_id,),
                 )
                 queued = connection.execute(
-                    """SELECT generation,changed_at
+                    """SELECT generation,changed_at,notification_queued_at
                          FROM canonical_evidence_document_queue
                         WHERE tenant_id=%s AND source_id=%s
                           AND native_parent_id=%s
@@ -1630,6 +1630,18 @@ class CanonicalLogicalEvidenceProjector:
                             connection,
                             (manifest_reference,),
                         )
+                    # Read the stamp from the locked queue, not admission:
+                    # a signed duplicate can promote it without a generation change.
+                    connection.execute(
+                        """UPDATE canonical_passage_projection_queue
+                              SET notification_queued_at=least(notification_queued_at,%s)
+                            WHERE tenant_id=%s AND source_id=%s
+                              AND logical_document_id=%s AND revision=%s
+                              AND %s::timestamptz IS NOT NULL""",
+                        (queued["notification_queued_at"], prepared.tenant_id,
+                         prepared.source_id, prepared.logical_document_id,
+                         current["revision"], queued["notification_queued_at"]),
+                    )
                     deleted = connection.execute(
                         """DELETE FROM canonical_evidence_document_queue
                             WHERE tenant_id=%s AND source_id=%s
@@ -1844,9 +1856,9 @@ class CanonicalLogicalEvidenceProjector:
                 connection.execute(
                     """INSERT INTO canonical_passage_projection_queue(
                            tenant_id,source_id,logical_document_id,revision,
-                           generation,reason,changed_at
+                           generation,reason,changed_at,notification_queued_at
                        ) VALUES (%s,%s,%s,%s,1,'logical-update',
-                                 clock_timestamp())
+                                 clock_timestamp(),%s)
                        ON CONFLICT(
                            tenant_id,source_id,logical_document_id
                        )
@@ -1855,12 +1867,16 @@ class CanonicalLogicalEvidenceProjector:
                            generation=
                                canonical_passage_projection_queue.generation+1,
                            reason='logical-update',
+                           notification_queued_at=least(
+                               canonical_passage_projection_queue.notification_queued_at,
+                               excluded.notification_queued_at),
                            changed_at=clock_timestamp()""",
                     (
                         prepared.tenant_id,
                         prepared.source_id,
                         prepared.logical_document_id,
                         prepared.revision,
+                        queued["notification_queued_at"],
                     ),
                 )
                 ranges = [

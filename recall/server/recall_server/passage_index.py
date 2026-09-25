@@ -454,6 +454,7 @@ class CanonicalPassageProjector:
         self.logical_projection = logical_projection
         self.policy = policy
         self.bound_tenant_id = bound_tenant_id
+        self._prefer_notification_admission = False
         runtime = getattr(store, "semantic_runtime", None)
         bind = getattr(runtime, "bind_passage_coverage_probe", None)
         if callable(bind) and not getattr(
@@ -590,7 +591,9 @@ class CanonicalPassageProjector:
                           part.version_id AS part_version_id,
                           part.created_at AS part_created_at
                      FROM (
-                           SELECT candidate_queue.*,(
+                           SELECT candidate_queue.*,
+                                CASE WHEN %s THEN candidate_queue.notification_queued_at
+                                END AS notification_priority,(
                                 candidate_queue.changed_at <
                                 clock_timestamp()-interval '5 minutes'
                             ) AS aged_priority,(
@@ -610,7 +613,8 @@ class CanonicalPassageProjector:
                                   candidate_queue
                             WHERE (%s::text IS NULL
                                    OR candidate_queue.tenant_id=%s)
-                            ORDER BY aged_priority DESC,estimated_bytes,
+                            ORDER BY notification_priority ASC NULLS LAST,
+                              aged_priority DESC,estimated_bytes,
                               candidate_queue.changed_at,
                               candidate_queue.tenant_id,
                               candidate_queue.source_id,
@@ -629,11 +633,12 @@ class CanonicalPassageProjector:
                       AND part.logical_document_id
                           =evidence.logical_document_id
                       AND part.revision=evidence.revision
-                    ORDER BY queue.aged_priority DESC,queue.estimated_bytes,
+                    ORDER BY queue.notification_priority ASC NULLS LAST,
+                             queue.aged_priority DESC,queue.estimated_bytes,
                              queue.changed_at,queue.tenant_id,
                              queue.source_id,queue.logical_document_id,
                              part.part_ordinal""",
-                (tenant_id, tenant_id, limit),
+                (self._prefer_notification_admission, tenant_id, tenant_id, limit),
             ).fetchall()
         grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
         for row in rows:
@@ -1722,6 +1727,8 @@ class CanonicalPassageProjector:
             pending_seconds += time.monotonic() - phase_started
             if not candidates:
                 break
+            # Persist across worker callbacks; empty rounds spend no history turn.
+            self._prefer_notification_admission = not self._prefer_notification_admission
             stopping = threading.Event()
             commit_slots = threading.BoundedSemaphore(min(
                 concurrency, len(candidates),

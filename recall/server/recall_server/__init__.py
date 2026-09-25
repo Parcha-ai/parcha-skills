@@ -1,6 +1,6 @@
 """Recall central BrainStore service."""
 
-SCHEMA_VERSION = 72
+SCHEMA_VERSION = 73
 # H3-e': migration 067 drops the Postgres vector/tsvector plane (passage
 # embeddings, the embedding ledger, canonical_passages.search_vector). It is
 # destructive, so ``migrate`` applies it only when asked to retire the plane
@@ -14,5 +14,6 @@ NATIVE_CONVERSATION_SCHEMA_VERSION = 71
 # Additive notification-priority queue column, required by its projection reader.
 # Capability checks also accept the previous schema during ordered rollout.
 NOTIFICATION_PRIORITY_SCHEMA_VERSION = 72
+PASSAGE_NOTIFICATION_SCHEMA_VERSION = 73
 MANDATORY_SCHEMA_VERSION = 69
 PROJECTOR_VERSION = 3

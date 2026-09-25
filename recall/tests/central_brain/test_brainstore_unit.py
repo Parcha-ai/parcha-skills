@@ -440,7 +440,7 @@ class SchemaMigrationContractTest(unittest.TestCase):
         ).casefold()
         self.assertIn("schema migrations 1 through 70", guide)
         if SCHEMA_VERSION == 72:
-            self.assertIn("latest shipped migration is 72", guide)
+            self.assertIn("latest shipped migration is 73", guide)
             self.assertIn("migration 71 remains optional", guide)
         self.assertIn("refresh runtime grants after every migration", guide)
         self.assertIn("on all tables in schema public", guide)

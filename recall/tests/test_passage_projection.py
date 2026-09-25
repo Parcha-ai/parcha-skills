@@ -830,7 +830,8 @@ class PassageProjectionTests(unittest.TestCase):
                 if "FROM canonical_evidence_document_queue" in normalized:
                     if normalized.startswith("DELETE"):
                         return Result(rowcount=1)
-                    return Result(one={"generation": 3, "changed_at": changed_at})
+                    return Result(one={"generation": 3, "changed_at": changed_at,
+                                       "notification_queued_at": None})
                 if normalized.startswith("SELECT revision,source_updated_at"):
                     return Result(one={
                         "revision": 1,
