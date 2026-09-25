@@ -767,6 +767,25 @@ roles, source grants, and revocation. The access token must have the exact
 `RECALL_MCP_RESOURCE_URI` audience, a `read` scope, and a provider-verified email
 for first-time invitation acceptance.
 
+For Codex and Claude clients using Client ID Metadata Documents (CIMD), enable
+CIMD on the Descope MCP server and approve the exact domains `chatgpt.com` and
+`claude.ai`. Preserve other existing approved domains and settings; do not replace
+the policy with `*`. On September 25, 2026, a fresh Codex login failed with
+`E074132` because only `claude.ai` was approved. Adding exact `chatgpt.com` allowed
+the authorization request to reach login. That probe did not complete user login.
+
+The policy is `cimdSettings.domainPolicies.policies`, with entries such as
+`{"domainPattern":"chatgpt.com","enabled":true}` and `cimdSettings.enabled=true`.
+For an operator-managed API change, load the existing server with
+`POST /v1/mgmt/mcp/server/load` (`{"id":"<server-id>"}`), retain the complete
+server object, and change only the intended domain entry before
+`POST /v1/mgmt/mcp/server/update` (`{"server": <complete-server-object>}`). Reload
+and verify the exact delta. Descope's update requires every field to preserve;
+see its [approved-domain settings](https://docs.descope.com/agentic-identity-hub/core-components/mcp-servers/settings)
+and [management API](https://docs.descope.com/agentic-identity-hub/core-components/mcp-servers/management).
+Client trust permits registration, not access to a company brain: user login,
+invitation acceptance, scope, audience, and Recall source grants still apply.
+
 To turn Descope's standard MCP consent flow into the branded Recall experience,
 name the flow `recall-mcp-user-consent` and run the setup-only operator script:
 
@@ -834,7 +853,7 @@ only one login. Browser identity also offers an optional pre-activation path. Se
 [`docs/authorization-v1.md`](../../docs/authorization-v1.md) for the policy,
 generic OIDC contract, and revocation semantics.
 
-If the authorization server does not support dynamic client registration,
+If the authorization server supports neither CIMD nor dynamic client registration,
 pre-register a public PKCE client for Codex and configure both values below.
 The callback URL must match Codex's localhost callback for the brain-specific
 MCP URL. Recall then renders a single `codex mcp add` command with the public
@@ -1564,10 +1583,16 @@ collector enables uploads. Verify both before marking a person ready.
    projection cycle does not drain turbopuffer. Verify the existing dedicated
    `projection-worker` or `search-plane-project` owns that drain.
 5. **Prove it from the employee's client.** Search for a recent known session from
-   each selected harness using the employee's authenticated MCP, then open its
-   returned receipt. Record the session timestamp and successful open alongside
-   the upload ACK. Namespace counts and green service health do not replace this
-   check. For live sessions, observe a later upload becoming searchable as well.
+   each selected harness after completing a fresh browser login with the employee's
+   own identity and successfully listing MCP tools. Open the search result's
+   returned receipt. Record the client, fresh-login result, session timestamp,
+   successful search/open, and upload ACK. A configured URL, successful login-page
+   redirect, existing credential health, or another person's successful connection
+   does not prove new-user onboarding. For live sessions, observe a later upload
+   becoming searchable as well. If Codex runs on Greppy while the browser runs on
+   the employee's laptop, forward the exact loopback callback port to Greppy and
+   keep that login process running; the callback must reach the client that started
+   the flow. Do not share authorization URLs or credentials between people.
 
 Back up and run a blank-database restore proof:
 
