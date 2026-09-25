@@ -13,6 +13,8 @@ from datetime import datetime
 from io import BytesIO
 from typing import Any, Callable, Iterable, Iterator
 
+import psycopg
+
 from .logical_evidence import (
     LogicalEvidenceError,
     LogicalEvidenceProjectionStore,
@@ -1739,7 +1741,12 @@ class CanonicalPassageProjector:
                 with commit_slots:
                     if stopping.is_set():
                         return {"status": "cancelled"}, preparation_elapsed, 0.0
-                    status = self._commit(prepared)
+                    try:
+                        status = self._commit(prepared)
+                    except psycopg.errors.LockNotAvailable:
+                        # _commit has rolled back and released its locks. Keep
+                        # the unchanged queue for retry without aborting siblings.
+                        status = {"status": "stale"}
                 return status, preparation_elapsed, time.monotonic() - commit_started
 
             requeued_in_batch = unavailable_in_batch = 0
