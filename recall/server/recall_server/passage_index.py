@@ -590,15 +590,10 @@ class CanonicalPassageProjector:
                           part.version_id AS part_version_id,
                           part.created_at AS part_created_at
                      FROM (
-                           SELECT *
-                             FROM canonical_passage_projection_queue
-                                  candidate_queue
-                            WHERE (%s::text IS NULL
-                                   OR candidate_queue.tenant_id=%s)
-                            ORDER BY (
+                           SELECT candidate_queue.*,(
                                 candidate_queue.changed_at <
                                 clock_timestamp()-interval '5 minutes'
-                            ) DESC,(
+                            ) AS aged_priority,(
                                 SELECT coalesce(sum(size_part.size_bytes),0)
                                   FROM canonical_evidence_document_parts
                                        size_part
@@ -610,7 +605,13 @@ class CanonicalPassageProjector:
                                            candidate_queue.logical_document_id
                                    AND size_part.revision=
                                            candidate_queue.revision
-                            ),candidate_queue.changed_at,
+                            ) AS estimated_bytes
+                             FROM canonical_passage_projection_queue
+                                  candidate_queue
+                            WHERE (%s::text IS NULL
+                                   OR candidate_queue.tenant_id=%s)
+                            ORDER BY aged_priority DESC,estimated_bytes,
+                              candidate_queue.changed_at,
                               candidate_queue.tenant_id,
                               candidate_queue.source_id,
                               candidate_queue.logical_document_id
@@ -628,7 +629,8 @@ class CanonicalPassageProjector:
                       AND part.logical_document_id
                           =evidence.logical_document_id
                       AND part.revision=evidence.revision
-                    ORDER BY queue.changed_at,queue.tenant_id,
+                    ORDER BY queue.aged_priority DESC,queue.estimated_bytes,
+                             queue.changed_at,queue.tenant_id,
                              queue.source_id,queue.logical_document_id,
                              part.part_ordinal""",
                 (tenant_id, tenant_id, limit),
