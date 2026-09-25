@@ -1084,6 +1084,19 @@ Logical idle callbacks drain search only: retrying missing passages there would
 invalidate their already running archive rebuilds. Completed logical parents
 still trigger passage projection followed by search.
 
+The worker's persistent search projector returns to that coordinator after one
+catalog page or tombstone batch. Unfinished months rotate across callbacks;
+`--search-plane-months-per-cycle` bounds active claims. One-shot search drains
+use the same implementation but continue until their claimed months finish.
+Rotation is fair among admitted claims; a new month waits for an active slot.
+Only complete months advance the watermark and acknowledge their generation;
+restart replays unfinished months safely. Each page retains the existing writer
+concurrency, byte limits, pacer and retry budget. A page can still take longer
+than five seconds. Paused months retain metadata and exact captured tombstone
+IDs, not page bodies; metadata memory remains proportional to those IDs.
+Month timing logs mark these runs `cooperative=1`: `month_ms` includes time spent
+between callbacks, while the worker's search phase reports callback wall time.
+
 `passage_elapsed_ms` remains coordinator wall time excluding search callbacks;
 `search_plane_elapsed_ms` measures those callbacks separately. Passage
 `prepare_ms` and `commit_ms` (also logged with the `passage_` prefix) are summed
