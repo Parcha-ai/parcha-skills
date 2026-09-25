@@ -75,6 +75,7 @@ jobs:
             e2e_pool_warmup.py \
             e2e_logical_parent_fallback.py \
             e2e_cleanup_transaction_waves.py \
+            e2e_cleanup_reference_indexes.py \
             e2e_archive_reprojection.py \
             e2e_v2_lifecycle.py \
             e2e_bulk_manifest.py \

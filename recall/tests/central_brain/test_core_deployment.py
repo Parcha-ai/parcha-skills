@@ -214,7 +214,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
         complete = list(range(1, 72))
         for versions in ([n for n in complete if n != 69],
                          [n for n in complete if n != 68],
-                         complete + [74], complete + [71],
+                         complete + [75], complete + [71],
                          complete[:-2] + [71, 70]):
             with self.subTest(versions=versions):
                 snapshot = healthy_snapshot()
@@ -227,7 +227,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
         complete = list(range(1, 71))
         for versions in ([n for n in complete if n != 68],
                          [n for n in complete if n != 69],
-                         complete + [74], complete + [70],
+                         complete + [75], complete + [70],
                          complete[:-2] + [70, 69]):
             with self.subTest(versions=versions):
                 snapshot = healthy_snapshot()
