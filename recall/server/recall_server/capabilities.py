@@ -9,6 +9,7 @@ from . import (
     MANDATORY_SCHEMA_VERSION,
     NATIVE_CONVERSATION_SCHEMA_VERSION,
     NOTIFICATION_PRIORITY_SCHEMA_VERSION,
+    PASSAGE_NOTIFICATION_SCHEMA_VERSION,
     RECONCILIATION_INDEX_VERSION,
     RETIRE_POSTGRES_PLANE_VERSION,
 )
@@ -186,7 +187,9 @@ def assess_snapshot(snapshot: dict[str, Any], profile: str = "production") -> di
                       + ([NATIVE_CONVERSATION_SCHEMA_VERSION]
                          if NATIVE_CONVERSATION_SCHEMA_VERSION in versions else [])
                       + ([NOTIFICATION_PRIORITY_SCHEMA_VERSION]
-                         if NOTIFICATION_PRIORITY_SCHEMA_VERSION in versions else []))
+                         if NOTIFICATION_PRIORITY_SCHEMA_VERSION in versions else [])
+                      + ([PASSAGE_NOTIFICATION_SCHEMA_VERSION]
+                         if PASSAGE_NOTIFICATION_SCHEMA_VERSION in versions else []))
     if versions != expected:
         raise CapabilityError("schema_drift")
     vector_plane_present = snapshot.get("postgres_vector_plane_present")

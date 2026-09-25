@@ -285,11 +285,14 @@ are supported: versions through 69 are required except optional migration 67,
 which retires the Postgres vector plane and is applied explicitly from the
 turbopuffer plane. Migration 70 adds only a reconciliation performance index;
 serving accepts both schema 69 and 70 and reports the actual recorded version.
-The latest shipped migration is 72; migration 71 remains optional and reserved
+The latest shipped migration is 73; migration 71 remains optional and reserved
 for native-conversation metadata. Migration 72 adds nullable
 `canonical_evidence_document_queue.notification_queued_at`, with no default,
 index, or historical reclassification. Apply it before deploying the notification
 priority reader; compatibility checks explicitly accept the reserved 71 gap.
+Migration 73 adds the same nullable stamp to `canonical_passage_projection_queue`;
+apply it before deploying the passage handoff reader. Neither migration
+reclassifies historical work.
 
 Webhook ingestion retains the same structured canonical JSON as managed
 history, so typed messages remain visible when their author is unresolved.
@@ -306,6 +309,14 @@ notification priority. Forget, quiet/max-wait, retry, source, and currentness ga
 remain in force. This prioritizes new trusted notifications; existing unstamped
 work remains ordinary backlog, and the scheduling policy alone does not prove a
 15-minute freshness guarantee.
+
+Logical commits carry the actual locked queue stamp into passage work, including
+unchanged-content repair of already queued passages. Later history preserves the
+earliest pending stamp. Passage admission alternates ordinary aged/size rounds
+with notification FIFO rounds across worker callbacks, so notifications can
+advance before an aged backlog drains while history still progresses. Repair
+does not recreate completed passage work; revision and generation checks remain
+unchanged. This does not prioritize already completed logical work retroactively.
 
 Optional [search authority indexes](../operations/README.md) are applied explicitly
 without changing those schema versions or restarting workers.

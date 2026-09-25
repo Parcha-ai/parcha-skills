@@ -68,7 +68,7 @@ def main():
                 connection.execute('ANALYZE '+table)
             connection.execute('DROP INDEX canonical_passages_reconcile_idx')
             # Isolate the historical 069→070 proof from later optional markers.
-            connection.execute('DELETE FROM schema_migrations WHERE version IN (70,71,72)')
+            connection.execute('DELETE FROM schema_migrations WHERE version IN (70,71,72,73)')
             connection.execute(sql.SQL('CREATE ROLE {} LOGIN PASSWORD {}').format(sql.Identifier(role), sql.Literal(password)))
             connection.execute(sql.SQL('GRANT USAGE ON SCHEMA public TO {}').format(sql.Identifier(role)))
             connection.execute(sql.SQL('GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA public TO {}').format(sql.Identifier(role)))
