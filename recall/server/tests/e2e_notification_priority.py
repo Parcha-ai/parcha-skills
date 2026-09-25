@@ -207,6 +207,13 @@ class NotificationPriority(unittest.TestCase):
             self.assertEqual(promoted[field], before[field], field)
         self.history(60, 1, text='Synthetic later historical correction.')
         self.assertEqual(self.queue(native)['notification_queued_at'], promoted['notification_queued_at'])
+        corrected = self.queue(native)
+        with self.store.connect() as connection:
+            current_before = connection.execute('SELECT document_id FROM canonical_documents WHERE is_current').fetchone()['document_id']
+        self.assertEqual(post_slack(self.server, raw, retry='old-revision')[0], 200)
+        self.assertEqual(self.queue(native)['generation'], corrected['generation'])
+        with self.store.connect() as connection:
+            self.assertEqual(connection.execute('SELECT document_id FROM canonical_documents WHERE is_current').fetchone()['document_id'], current_before)
         self.logical.project_pending(batch_size=1, max_batches=1, upload_concurrency=1)
         self.assertIsNone(self.queue(native))
         with self.store.connect() as connection:
@@ -245,8 +252,8 @@ class NotificationPriority(unittest.TestCase):
         candidates = self.logical._pending(tenant_id=TENANT, limit=10, prefer_recent=True,
             quiet_seconds=90, max_wait_seconds=600)
         self.assertEqual([c.native_parent_id for c in candidates], [history['native_parent_id'],
-            f'slack:{SLACK_WORKSPACE}:C0E2E:1700000111.000100',
-            f'slack:{SLACK_WORKSPACE}:C0E2E:1700000115.000100'])
+            f'slack-thread:{SLACK_WORKSPACE}:C0E2E:1700000111.000100',
+            f'slack-thread:{SLACK_WORKSPACE}:C0E2E:1700000115.000100'])
         with self.assertRaisesRegex(LogicalEvidenceError, 'logical_evidence_tenant_not_configured'):
             self.logical.project_pending(tenant_id='synthetic:foreign')
 
@@ -273,6 +280,23 @@ class NotificationPriority(unittest.TestCase):
         self.assertEqual((queued['reason'], queued['attempts']), ('forget', 0))
         self.assertEqual(queued['notification_queued_at'], stamped['notification_queued_at'])
         self.assertGreater(queued['generation'], stamped['generation'])
+
+    def test_forgotten_notification_cannot_be_promoted_or_resurrected(self):
+        raw = self.notify(130, 'Synthetic forgotten notification.')
+        native = f'slack:{SLACK_WORKSPACE}:C0E2E:1700000130.000100'
+        self.plane.forget({'contract': 'recall.forget-request.v1', 'schema_version': 1,
+            'tenant_id': TENANT, 'principal_id': OWNER, 'source_id': SLACK_SOURCE,
+            'target_receipt': f'recall://{SLACK_SOURCE}/{native}?rev=1#item=0',
+            'mode': 'explicit_forget', 'reason': 'owner_requested',
+            'requested_at': '2026-09-25T00:00:00Z', 'idempotency_key': 'synthetic-notification-forget'})
+        with self.store.connect() as connection:
+            connection.execute('UPDATE canonical_evidence_document_queue SET notification_queued_at=NULL')
+            before = connection.execute('SELECT * FROM canonical_evidence_document_queue').fetchall()
+        status, _ = post_slack(self.server, raw, retry='forgotten')
+        self.assertEqual(status, 409)
+        with self.store.connect() as connection:
+            self.assertEqual(connection.execute('SELECT * FROM canonical_evidence_document_queue').fetchall(), before)
+            self.assertEqual(connection.execute('SELECT count(*) AS n FROM canonical_documents WHERE is_current AND deleted_at IS NULL').fetchone()['n'], 0)
 
     def test_public_json_and_provenance_cannot_request_notification_priority(self):
         token = self.store.create_collector_token('synthetic-canonical', SLACK_SOURCE, ['write'],
