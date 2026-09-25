@@ -663,6 +663,11 @@ class CanonicalPassageProjector:
                 (recent, after_tenant, after_tenant, after_source,
                  tenant_id, tenant_id, recent, limit),
             ).fetchall()
+        # The turn belongs to admission, not successful metadata hydration.
+        # A truly empty queue spends no turn; an invalid head must not suppress
+        # the next recent/history mode indefinitely.
+        if rows:
+            self._prefer_notification_admission = not recent
         # Hydration can fail for an admitted key. Keep its source turn moving,
         # but retain that queue row for repair; missing metadata is never ACKed.
         ordinary = [row for row in rows if row["admission_priority"] == 1]
@@ -1758,8 +1763,6 @@ class CanonicalPassageProjector:
             pending_seconds += time.monotonic() - phase_started
             if not candidates:
                 break
-            # Persist across worker callbacks; empty rounds spend no history turn.
-            self._prefer_notification_admission = not self._prefer_notification_admission
             stopping = threading.Event()
             commit_slots = threading.BoundedSemaphore(min(
                 concurrency, len(candidates),

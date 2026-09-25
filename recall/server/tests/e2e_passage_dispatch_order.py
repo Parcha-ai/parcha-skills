@@ -58,6 +58,7 @@ class PassageDispatch(ParentProgress):
                     (minutes, self.tenant, self.ids[parent]))
 
     def candidates(self, limit=3):
+        self.passages._prefer_notification_admission = False
         return self.passages._pending(tenant_id=self.tenant, limit=limit)
 
     def test_same_age_class_small_slack_publishes_before_two_held_giants(self):

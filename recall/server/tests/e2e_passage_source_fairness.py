@@ -82,9 +82,11 @@ class PassageSourceFairness(SetAdmission):
         first=self.projector._pending(tenant_id='a',limit=1)
         self.assertEqual([r.logical_document_id for r in first],['first-notification'])
         self.ack(first)
+        self.projector._prefer_notification_admission=True
         second=self.projector._pending(tenant_id='a',limit=1)
         self.assertEqual([r.logical_document_id for r in second],['second-notification'])
         self.ack(second)
+        self.projector._prefer_notification_admission=True
         fallback=self.projector._pending(tenant_id='a',limit=10)
         self.assertEqual(len({r.source_id for r in fallback}),10)
 
@@ -108,18 +110,29 @@ class PassageSourceFairness(SetAdmission):
         self.add('bad-oldest',[],age=90000)
         self.add('healthy-middle',[100],age=600)
         self.add('healthy-recent',[200],age=10)
-        self.assertEqual(self.projector._pending(tenant_id='a',limit=1),())
-        self.projector._prefer_notification_admission=True
-        recent=self.projector._pending(tenant_id='a',limit=1)
-        self.assertEqual([r.logical_document_id for r in recent],['healthy-recent'])
-        self.ack(recent)
-        self.projector._prefer_notification_admission=False
-        # No silent ACK or invented retry scheduler: the bad oldest remains its
-        # source's normal head. Continuous arrivals can still delay middle history.
-        self.assertEqual(self.projector._pending(tenant_id='a',limit=1),())
-        self.projector._prefer_notification_admission=True
-        self.assertEqual([r.logical_document_id for r in self.projector._pending(tenant_id='a',limit=1)],['healthy-middle'])
-        self.assertEqual(self.connection.execute('SELECT count(*) AS n FROM canonical_passage_projection_queue').fetchone()['n'],2)
+        self.projector.store.pool_max_size=4
+        attempted=[]
+        def prepare(candidate):
+            attempted.append(candidate.logical_document_id)
+            return candidate
+        def commit(candidate):
+            self.ack([candidate])
+            return {'status':'complete','inserted':1,'deleted':0,'retained':0}
+        with patch.object(self.projector,'_prepare',prepare),patch.object(self.projector,'_commit',commit):
+            # Use the actual coordinator, which must advance even when hydration
+            # returned no candidate from a nonempty admitted turn.
+            for _ in range(4):
+                self.projector.project_pending(tenant_id='a',batch_size=1,max_batches=1,concurrency=1)
+        self.assertEqual(attempted,['healthy-recent','healthy-middle'])
+        remaining=self.connection.execute('SELECT logical_document_id FROM canonical_passage_projection_queue').fetchall()
+        self.assertEqual([r['logical_document_id'] for r in remaining],['bad-oldest'])
+        # No silent ACK/retry scheduler: under endless fresh arrivals the bad
+        # oldest can still delay middle history within its own source.
+
+    def test_empty_queue_does_not_advance_mode_or_source_cursor(self):
+        self.projector.project_pending(tenant_id='a',batch_size=1,max_batches=1,concurrency=1)
+        self.assertFalse(self.projector._prefer_notification_admission)
+        self.assertEqual(self.projector._ordinary_source_cursor,{False:None,True:None})
 
     def test_notification_prefix_and_residual_advance_only_last_ordinary_source(self):
         for source in ('a','b','c'):
@@ -129,6 +142,7 @@ class PassageSourceFairness(SetAdmission):
         self.projector._prefer_notification_admission=True
         self.assertEqual([r.logical_document_id for r in self.projector._pending(tenant_id='a',limit=1)],['notification'])
         self.assertIsNone(self.projector._ordinary_source_cursor[True])
+        self.projector._prefer_notification_admission=True
         rows=self.projector._pending(tenant_id='a',limit=6)
         self.assertEqual(rows[0].logical_document_id,'notification')
         self.assertEqual({r.source_id for r in rows[1:]},{'a','b','c'})
@@ -136,6 +150,7 @@ class PassageSourceFairness(SetAdmission):
         self.assertIsNone(self.projector._ordinary_source_cursor[False])
         self.ack(rows)
         self.add('late-source',[1],source='d',age=100)
+        self.projector._prefer_notification_admission=True
         self.assertEqual([r.source_id for r in self.projector._pending(tenant_id='a',limit=1)],['d'])
 
     def test_missing_metadata_rotates_without_acknowledging_invalid_queue(self):
@@ -145,6 +160,7 @@ class PassageSourceFairness(SetAdmission):
             self.add('valid',[10000],source=f's-{n:02}',age=800)
         first=self.projector._pending(tenant_id='a',limit=10)
         self.assertEqual(first,())
+        self.projector._prefer_notification_admission=False
         second=self.projector._pending(tenant_id='a',limit=10)
         self.assertEqual({r.source_id for r in second},{'s-10','s-11','s-12'})
         self.assertEqual(self.connection.execute('SELECT count(*) AS n FROM canonical_passage_projection_queue').fetchone()['n'],13)
