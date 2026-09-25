@@ -317,8 +317,9 @@ def run_projection_worker(
             scanned = (
                 scan.project_pending(
                     tenant_id=tenant_id,
-                    batch_size=min(4, logical_batch_size),
-                    # Give fresh work another turn before queued month catch-up.
+                    batch_size=1 if freshness_busy else min(4, logical_batch_size),
+                    # Return to fresh admission after one complete source-month
+                    # while busy; each build retains its existing lease and CAS.
                     max_batches=1 if freshness_busy else max_batches_per_cycle,
                     compaction_budget=0 if freshness_busy else 1,
                 )
