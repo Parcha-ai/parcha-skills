@@ -40,6 +40,9 @@ class NotificationPriority(unittest.TestCase):
             'RECALL_AUTH_REQUIRED': '1', 'RECALL_HTTP_PROFILE': 'public-edge',
             'RECALL_TRUST_TAILSCALE_HEADERS': '0',
             'RECALL_SLACK_SIGNING_SECRET': SLACK_SECRET,
+            'RECALL_SLACK_CLIENT_ID': 'synthetic-client',
+            'RECALL_SLACK_CLIENT_SECRET': 'synthetic-client-secret',
+            'RECALL_SLACK_REDIRECT_URI': 'https://recall.example/admin/oauth/callback/slack',
             'RECALL_LEGACY_INGEST_TENANT_ID': TENANT,
             'RECALL_LEGACY_WRITES': '0', 'RECALL_LEGACY_READS': '0',
         })
