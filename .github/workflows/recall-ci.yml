@@ -58,6 +58,7 @@ jobs:
             e2e_committed_body_keys.py \
             e2e_logical_source_integrity.py \
             e2e_logical_source_fairness.py \
+            e2e_logical_backlog_admission.py \
             e2e_logical_parent_progress.py \
             e2e_passage_parent_progress.py \
             e2e_passage_lock_contention.py \
