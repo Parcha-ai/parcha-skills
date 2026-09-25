@@ -26,6 +26,7 @@ def main():
         connection.execute("""CREATE TEMP TABLE canonical_evidence_document_queue (
             tenant_id text, source_id text, native_parent_id text,
             generation bigint DEFAULT 1, reason text DEFAULT 'ingest',
+            notification_queued_at timestamptz,
             changed_at timestamptz DEFAULT now()-interval '1 hour',
             first_queued_at timestamptz DEFAULT now()-interval '1 hour',
             attempts integer DEFAULT 0, next_attempt_at timestamptz,
