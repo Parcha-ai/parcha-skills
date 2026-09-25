@@ -28,6 +28,10 @@ class FakeStore:
 
 
 class InterruptingProjector(CanonicalLogicalEvidenceProjector):
+    def _check_candidate_current(self, candidate):
+        # Scheduler-only fake; real queue authority is covered by PostgreSQL tests.
+        return None
+
     def __init__(self) -> None:
         self.store = FakeStore()
         self.projection = None
@@ -110,6 +114,7 @@ class LogicalEvidenceInterruptTests(TestCase):
                             "revision": 3,
                             "estimated_records": 42,
                             "estimated_bytes": 84,
+                            "admission_priority": 1,
                         }
                     ]
                 )

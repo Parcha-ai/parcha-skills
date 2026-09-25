@@ -25,6 +25,10 @@ class ParentProgressTests(unittest.TestCase):
         blocked, release, committed = threading.Event(), threading.Event(), threading.Event()
 
         class Projector(CanonicalLogicalEvidenceProjector):
+            def _check_candidate_current(self, candidate):
+                # Scheduler-only fake; real queue authority is covered by PostgreSQL tests.
+                return None
+
             def _pending(self, **kwargs):
                 return [LogicalGroupCandidate('tenant:test', 'source:test', name,
                     datetime.now(timezone.utc), 1, 1, estimated_bytes=size)

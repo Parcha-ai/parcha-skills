@@ -62,6 +62,11 @@ class LogicalGroupCandidate:
     revision: int
     estimated_records: int = 1
     estimated_bytes: int = 1
+    admission_priority: int = 1
+
+
+class _LogicalWorkSuperseded(Exception):
+    """A worker's captured queue state no longer owns this preparation."""
 
 
 class _LocatorSpool:
@@ -554,7 +559,7 @@ class CanonicalLogicalEvidenceProjector:
                    SELECT queue.tenant_id,queue.source_id,
                           queue.native_parent_id,
                           queue.changed_at AS source_updated_at,
-                          queue.generation,
+                          queue.generation,queue.admission_priority,
                           COALESCE(evidence.revision,0)+1 AS revision,
                           COALESCE(evidence.record_count,1)
                               AS estimated_records,
@@ -600,6 +605,7 @@ class CanonicalLogicalEvidenceProjector:
                 revision=int(row["revision"]),
                 estimated_records=max(1, int(row["estimated_records"])),
                 estimated_bytes=max(1, int(row["estimated_bytes"])),
+                admission_priority=int(row["admission_priority"]),
             )
             for row in rows
         ]
@@ -727,13 +733,27 @@ class CanonicalLogicalEvidenceProjector:
             " quarantined" if attempts >= MAX_LOGICAL_ATTEMPTS else "",
         )
 
+    def _check_candidate_current(self, candidate: LogicalGroupCandidate) -> None:
+        with self.store.connect() as connection:
+            queued = connection.execute(
+                """SELECT generation,changed_at
+                     FROM canonical_evidence_document_queue
+                    WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s""",
+                (candidate.tenant_id, candidate.source_id, candidate.native_parent_id),
+            ).fetchone()
+        if (queued is None or queued["generation"] != candidate.generation
+                or queued["changed_at"] != candidate.source_updated_at):
+            raise _LogicalWorkSuperseded
+
     def _prepare_batch_and_upload(
         self,
         candidates: tuple[LogicalGroupCandidate, ...],
-        *, hint_limit: int = 32,
+        *, hint_limit: int = 32, require_current_queue: bool = False,
     ) -> list[LogicalEvidenceUpload | None]:
         if not candidates:
             return []
+        if require_current_queue and len(candidates) != 1:
+            raise ValueError("queue currentness checkpoint requires one worker parent")
         uploads: list[LogicalEvidenceUpload | None] = [None] * len(candidates)
         completed: list[LogicalEvidenceUpload] = []
         spool = tempfile.TemporaryFile(mode="w+b")
@@ -948,6 +968,11 @@ class CanonicalLogicalEvidenceProjector:
                             # accepted as input from another process or source.
                             pickle.dump(dict(row), input_spool, protocol=5)
                         input_ranges.append((ordinal, start, input_spool.tell()))
+            # Worker-only checkpoint: direct corpus audits can prepare groups
+            # without queued work. Stop obsolete workers before archive reads,
+            # re-encoding or uploads; the final commit CAS remains authoritative.
+            if require_current_queue:
+                self._check_candidate_current(candidates[0])
             # Archive recovery and oversized raw restoration run only after
             # the input cursor and its pool connection have been released.
             for ordinal, start, end in input_ranges:
@@ -1028,6 +1053,10 @@ class CanonicalLogicalEvidenceProjector:
                 completed.append(upload)
             transferred = True
             return uploads
+        except _LogicalWorkSuperseded:
+            # The checkpoint precedes every upload. There is nothing to reap;
+            # finally still closes the SQL/input spools and local locators.
+            raise
         except Exception:
             for upload in completed:
                 self._schedule_cleanup(upload.cleanup_references)
@@ -2102,11 +2131,14 @@ class CanonicalLogicalEvidenceProjector:
         def parent_key(candidate):
             return candidate.tenant_id, candidate.source_id, candidate.native_parent_id
 
-        def project_parent(candidate):
+        def prepare_parent(candidate):
             try:
+                self._check_candidate_current(candidate)
                 (upload,) = self._prepare_batch_and_upload(
-                    (candidate,), hint_limit=hint_limit,
+                    (candidate,), hint_limit=hint_limit, require_current_queue=True,
                 )
+            except _LogicalWorkSuperseded:
+                return None, "stale"
             except Exception as error:
                 self._mark_failed(candidate, error)
                 return None, "failed"
@@ -2123,6 +2155,29 @@ class CanonicalLogicalEvidenceProjector:
                 if upload is not None:
                     self._schedule_upload_cleanup([upload])
                 raise
+
+        def owner_log(message, *args):
+            try:
+                LOG.info(message, *args)
+            except Exception:
+                # Diagnostics must never change upload or commit ownership.
+                pass
+
+        def project_parent(candidate):
+            started = time.monotonic()
+            identity = hashlib.sha256(json.dumps(parent_key(candidate)).encode()).hexdigest()
+            status = "error"
+            owner_log("logical owner started parent_sha256=%s estimated_bytes=%s estimated_records=%s",
+                      identity, candidate.estimated_bytes, candidate.estimated_records)
+            try:
+                result = prepare_parent(candidate)
+                status = result[1]
+                return result
+            finally:
+                owner_log("logical owner completed parent_sha256=%s estimated_bytes=%s "
+                          "estimated_records=%s elapsed_ms=%s status=%s",
+                          identity, candidate.estimated_bytes, candidate.estimated_records,
+                          max(0, round((time.monotonic() - started) * 1000)), status)
 
         def fill_slots(executor):
             nonlocal batches
@@ -2141,6 +2196,10 @@ class CanonicalLogicalEvidenceProjector:
                 candidates = [c for c in candidates if parent_key(c) not in excluded][:batch_size]
                 if not candidates:
                     break
+                # Reorder only the already admitted finite set. Sorting the
+                # overscanned SQL rows first would change which parents enter.
+                # Stable ties retain source/age order; forget still goes first.
+                candidates.sort(key=lambda c: (c.admission_priority, c.estimated_bytes))
                 # Share capacity across calls, including one-slot rounds.
                 # Recent means changed canonical state; replay competes too.
                 # Empty scans do not consume a turn. A new process starts old.
