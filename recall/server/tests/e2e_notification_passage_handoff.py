@@ -79,8 +79,9 @@ class NotificationPassageHandoff(NotificationPriority):
 
     def queue_repair(self):
         with self.store.connect() as connection:
-            mark_logical_evidence_dirty(connection, tenant_id=TENANT, source_id=SLACK_SOURCE,
-                native_ids=[self.native], reason='backfill')
+            self.assertEqual(mark_logical_evidence_dirty(connection,
+                tenant_id=TENANT, source_id=SLACK_SOURCE,
+                native_ids=[self.native], reason='ingest'), 1)
 
     def test_oldest_logical_round_carries_locked_stamp_and_history_cannot_demote_it(self):
         before = self.queue(self.native)['notification_queued_at']
