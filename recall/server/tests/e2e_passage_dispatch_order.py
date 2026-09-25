@@ -93,7 +93,7 @@ class PassageDispatch(ParentProgress):
         self.assertEqual([c.logical_document_id for c in candidates],
             [self.ids['small'], self.ids['large-two'], self.ids['large']])
         self.assertEqual({c.logical_document_id for c in self.candidates(limit=2)},
-            {self.ids['small'], self.ids['large-two']})
+            {self.ids['small'], self.ids['large']})  # Oldest head per source, then cost dispatch.
         for candidate in candidates:
             self.passages._prepare(candidate)  # Real decoder validates multipart order/hashes.
 

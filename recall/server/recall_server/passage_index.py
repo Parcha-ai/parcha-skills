@@ -455,6 +455,11 @@ class CanonicalPassageProjector:
         self.policy = policy
         self.bound_tenant_id = bound_tenant_id
         self._prefer_notification_admission = False
+        # Separate history/recent turns; fixed-size process-local state. Advance
+        # on admission, so an unavailable source cannot retain the first turn.
+        self._ordinary_source_cursor: dict[bool, tuple[str, str] | None] = {
+            False: None, True: None,
+        }
         runtime = getattr(store, "semantic_runtime", None)
         bind = getattr(runtime, "bind_passage_coverage_probe", None)
         if callable(bind) and not getattr(
@@ -565,11 +570,60 @@ class CanonicalPassageProjector:
         tenant_id: str | None,
         limit: int,
     ) -> tuple[PassageCandidate, ...]:
+        recent = self._prefer_notification_admission
+        cursor = self._ordinary_source_cursor[recent]
+        after_tenant, after_source = cursor if cursor is not None else (None, None)
         with self.store.connect() as connection:
             rows = connection.execute(
-                """SELECT queue.tenant_id,queue.source_id,
+                """WITH eligible AS MATERIALIZED (
+                       SELECT candidate_queue.*,
+                              CASE WHEN %s AND notification_queued_at IS NOT NULL
+                                   THEN 0 ELSE 1 END AS admission_priority,
+                              CASE WHEN %s::text IS NULL OR (tenant_id,source_id)>
+                                        (%s::text,%s::text) THEN 0 ELSE 1 END AS source_wrap
+                         FROM canonical_passage_projection_queue candidate_queue
+                        WHERE (%s::text IS NULL OR tenant_id=%s)
+                   ), ranked AS (
+                       SELECT eligible.*,
+                              row_number() OVER (
+                                  PARTITION BY tenant_id,source_id,admission_priority
+                                  ORDER BY CASE WHEN %s THEN changed_at END DESC,
+                                           changed_at,logical_document_id
+                              ) AS source_position,
+                              count(*) OVER (
+                                  PARTITION BY tenant_id,source_id,admission_priority
+                              ) AS source_backlog
+                         FROM eligible
+                   ), admitted AS MATERIALIZED (
+                       SELECT * FROM ranked
+                        ORDER BY admission_priority,
+                                 CASE WHEN admission_priority=0
+                                      THEN notification_queued_at END,
+                                 CASE WHEN source_position=1 THEN 0 ELSE 1 END,
+                                 CASE WHEN source_position=1 THEN source_wrap END,
+                                 CASE WHEN source_position=1 THEN tenant_id END,
+                                 CASE WHEN source_position=1 THEN source_id END,
+                                 CASE WHEN source_position>1
+                                      THEN source_position::numeric/source_backlog END,
+                                 changed_at,tenant_id,source_id,logical_document_id
+                        LIMIT %s
+                   ), queue AS (
+                       SELECT admitted.*,
+                              dense_rank() OVER (
+                                  ORDER BY source_wrap,tenant_id,source_id
+                              ) AS source_turn
+                         FROM admitted
+                   )
+                   SELECT queue.tenant_id,queue.source_id,
                           queue.logical_document_id,queue.revision,
                           queue.generation,queue.changed_at,
+                          queue.admission_priority,queue.source_turn,
+                          CASE WHEN queue.admission_priority=0
+                               THEN queue.notification_queued_at END AS notification_priority,
+                          (queue.changed_at<clock_timestamp()-interval '5 minutes') AS aged_priority,
+                          coalesce(sum(part.size_bytes) OVER (
+                              PARTITION BY queue.tenant_id,queue.source_id,queue.logical_document_id
+                          ),0) AS estimated_bytes,
                           evidence.document_content_sha256,
                           evidence.manifest_artifact_id,
                           evidence.manifest_storage_backend,
@@ -590,57 +644,35 @@ class CanonicalPassageProjector:
                           part.encryption AS part_encryption,
                           part.version_id AS part_version_id,
                           part.created_at AS part_created_at
-                     FROM (
-                           SELECT candidate_queue.*,
-                                CASE WHEN %s THEN candidate_queue.notification_queued_at
-                                END AS notification_priority,(
-                                candidate_queue.changed_at <
-                                clock_timestamp()-interval '5 minutes'
-                            ) AS aged_priority,
-                                coalesce(sum(size_part.size_bytes),0)
-                                    AS estimated_bytes
-                             FROM canonical_passage_projection_queue
-                                  candidate_queue
-                             LEFT JOIN canonical_evidence_document_parts size_part
-                               ON size_part.tenant_id=candidate_queue.tenant_id
-                              AND size_part.source_id=candidate_queue.source_id
-                              AND size_part.logical_document_id=
-                                      candidate_queue.logical_document_id
-                              AND size_part.revision=candidate_queue.revision
-                            WHERE (%s::text IS NULL
-                                   OR candidate_queue.tenant_id=%s)
-                            GROUP BY candidate_queue.tenant_id,
-                                     candidate_queue.source_id,
-                                     candidate_queue.logical_document_id
-                            ORDER BY notification_priority ASC NULLS LAST,
-                              aged_priority DESC,estimated_bytes,
-                              candidate_queue.changed_at,
-                              candidate_queue.tenant_id,
-                              candidate_queue.source_id,
-                              candidate_queue.logical_document_id
-                            LIMIT %s
-                     ) queue
-                     JOIN canonical_evidence_documents evidence
+                     FROM queue
+                     LEFT JOIN canonical_evidence_documents evidence
                        ON evidence.tenant_id=queue.tenant_id
                       AND evidence.source_id=queue.source_id
-                      AND evidence.logical_document_id
-                          =queue.logical_document_id
+                      AND evidence.logical_document_id=queue.logical_document_id
                       AND evidence.revision=queue.revision
-                     JOIN canonical_evidence_document_parts part
+                     LEFT JOIN canonical_evidence_document_parts part
                        ON part.tenant_id=evidence.tenant_id
                       AND part.source_id=evidence.source_id
-                      AND part.logical_document_id
-                          =evidence.logical_document_id
+                      AND part.logical_document_id=evidence.logical_document_id
                       AND part.revision=evidence.revision
-                    ORDER BY queue.notification_priority ASC NULLS LAST,
-                             queue.aged_priority DESC,queue.estimated_bytes,
+                    ORDER BY notification_priority ASC NULLS LAST,
+                             aged_priority DESC,estimated_bytes,
                              queue.changed_at,queue.tenant_id,
                              queue.source_id,queue.logical_document_id,
                              part.part_ordinal""",
-                (self._prefer_notification_admission, tenant_id, tenant_id, limit),
+                (recent, after_tenant, after_tenant, after_source,
+                 tenant_id, tenant_id, recent, limit),
             ).fetchall()
+        # Hydration can fail for an admitted key. Keep its source turn moving,
+        # but retain that queue row for repair; missing metadata is never ACKed.
+        ordinary = [row for row in rows if row["admission_priority"] == 1]
+        if ordinary:
+            last = max(ordinary, key=lambda row: row["source_turn"])
+            self._ordinary_source_cursor[recent] = (last["tenant_id"], last["source_id"])
         grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
         for row in rows:
+            if row["manifest_artifact_id"] is None or row["part_ordinal"] is None:
+                continue
             key = (
                 row["tenant_id"],
                 row["source_id"],
