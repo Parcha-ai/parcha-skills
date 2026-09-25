@@ -296,8 +296,8 @@ existing logical work at ingress. Alternating notification rounds admit those
 parents FIFO within each source before ordinary recent changes; oldest rounds
 retain backlog and other-source progress. Dispatch preserves notification FIFO
 within the admitted batch. Historical replay cannot replace the original stamp.
-A duplicate can promote an already queued parent, but cannot recreate completed
-work or alter its generation. Public canonical JSON and provenance do not grant
+Priority-only duplicate promotion updates an already queued parent without
+creating work or altering its generation. Public canonical JSON and provenance do not grant
 notification priority. Forget, quiet/max-wait, retry, source, and currentness gates
 remain in force. This prioritizes new trusted notifications; existing unstamped
 work remains ordinary backlog, and the scheduling policy alone does not prove a
