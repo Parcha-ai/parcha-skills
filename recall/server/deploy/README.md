@@ -285,6 +285,24 @@ are supported: versions through 69 are required except optional migration 67,
 which retires the Postgres vector plane and is applied explicitly from the
 turbopuffer plane. Migration 70 adds only a reconciliation performance index;
 serving accepts both schema 69 and 70 and reports the actual recorded version.
+The latest shipped migration is 72; migration 71 remains optional and reserved
+for native-conversation metadata. Migration 72 adds nullable
+`canonical_evidence_document_queue.notification_queued_at`, with no default,
+index, or historical reclassification. Apply it before deploying the notification
+priority reader; compatibility checks explicitly accept the reserved 71 gap.
+
+Verified Slack Events and authenticated, source-scoped generic webhooks stamp
+existing logical work at ingress. Alternating notification rounds admit those
+parents FIFO within each source before ordinary recent changes; oldest rounds
+retain backlog and other-source progress. Dispatch preserves notification FIFO
+within the admitted batch. Historical replay cannot replace the original stamp.
+A duplicate can promote an already queued parent, but cannot recreate completed
+work or alter its generation. Public canonical JSON and provenance do not grant
+notification priority. Forget, quiet/max-wait, retry, source, and currentness gates
+remain in force. This prioritizes new trusted notifications; existing unstamped
+work remains ordinary backlog, and the scheduling policy alone does not prove a
+15-minute freshness guarantee.
+
 Optional [search authority indexes](../operations/README.md) are applied explicitly
 without changing those schema versions or restarting workers.
 The gate also requires

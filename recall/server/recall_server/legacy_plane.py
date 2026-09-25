@@ -225,6 +225,7 @@ class LegacyIngestBridge:
         raw_payload: bytes | None = None,
         media_type: str = "application/json",
         connector_id: str | None = None,
+        notification: bool = False,
     ) -> tuple[dict[str, Any], bool]:
         """Commit ``events`` and return ``(acknowledgement, replay)``.
 
@@ -240,6 +241,7 @@ class LegacyIngestBridge:
                     raw_payload=raw_payload,
                     media_type=media_type,
                     connector_id=connector_id,
+                    notification=notification,
                 )
             return self.store.ingest(idempotency_key, events)
         if not idempotency_key or len(idempotency_key) > 200:
@@ -252,6 +254,7 @@ class LegacyIngestBridge:
             raw_payload=raw_payload,
             media_type=media_type,
             connector_id=connector_id,
+            notification=notification,
         )
         return acknowledgement, acknowledgement["replay"]
 
@@ -263,6 +266,7 @@ class LegacyIngestBridge:
         raw_payload: bytes | None,
         media_type: str,
         connector_id: str | None = None,
+        notification: bool = False,
     ) -> dict[str, Any]:
         if not isinstance(events, list) or not events:
             raise ValueError("empty ingest batch")
@@ -314,6 +318,7 @@ class LegacyIngestBridge:
                             text_redacted=_text_summary(envelope),
                             _connection=connection,
                             _history=history,
+                            **({"_notification": True} if notification else {}),
                         )
                     )
         return {
