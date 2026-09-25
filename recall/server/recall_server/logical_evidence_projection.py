@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from itertools import groupby
+from time import perf_counter as _phase_clock
 from typing import Any, Callable
 
 import orjson
@@ -56,7 +57,7 @@ LOGICAL_BACKOFF_CAP_SECONDS = 6 * 3600
 @contextmanager
 def _phase_timing(phase: str):
     """Operation wall time; unsuccessful calls omit unknown result counts."""
-    started = time.perf_counter()
+    started = _phase_clock()
     succeeded = False
     counts: dict[str, int] = {}
     try:
@@ -68,7 +69,7 @@ def _phase_timing(phase: str):
                              ("completed", "deleted", "failures", "pending")
                              if succeeded and key in counts)
             LOG.info("logical phase timing phase=%s elapsed_ms=%s succeeded=%s%s",
-                     phase, max(0, round((time.perf_counter() - started) * 1000)),
+                     phase, max(0, round((_phase_clock() - started) * 1000)),
                      int(succeeded), suffix)
         except Exception:  # Diagnostic failures must not change owning behavior.
             pass

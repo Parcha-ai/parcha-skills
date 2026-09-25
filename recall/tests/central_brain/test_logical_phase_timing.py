@@ -35,7 +35,7 @@ class LogicalPhaseTimingTests(unittest.TestCase):
             return True
         projector = CanonicalLogicalEvidenceProjector(store, SimpleNamespace(delete_reference=delete),
             bound_tenant_id='tenant:synthetic')
-        with patch(MODULE+'.time.perf_counter', clock), self.assertLogs(MODULE, level='INFO') as log:
+        with patch(MODULE+'._phase_clock', clock), self.assertLogs(MODULE, level='INFO') as log:
             result = projector.drain_cleanup()
         self.assertEqual(result['completed'], 1)
         self.assertEqual(store.acknowledged, ['artifact'])
@@ -52,7 +52,7 @@ class LogicalPhaseTimingTests(unittest.TestCase):
                 clock.advance(.25)
                 raise error
         projector = CanonicalLogicalEvidenceProjector(BrokenStore(), None, bound_tenant_id='tenant:synthetic')
-        with patch(MODULE+'.time.perf_counter', clock), self.assertLogs(MODULE, level='INFO') as log:
+        with patch(MODULE+'._phase_clock', clock), self.assertLogs(MODULE, level='INFO') as log:
             with self.assertRaises(RuntimeError) as raised:
                 projector.drain_cleanup()
         self.assertIs(raised.exception, error)
@@ -74,7 +74,7 @@ class LogicalPhaseTimingTests(unittest.TestCase):
                 clock.advance(.013)
             return original(query, values)
         projector.store.execute = execute
-        with patch(MODULE+'.time.perf_counter', clock), self.assertLogs(MODULE, level='INFO') as log:
+        with patch(MODULE+'._phase_clock', clock), self.assertLogs(MODULE, level='INFO') as log:
             result = projector.project_pending(batch_size=1, max_batches=1, upload_concurrency=1)
         self.assertEqual(result['documents'], 0)
         self.assertEqual(len(log.output), 2)
@@ -89,7 +89,7 @@ class LogicalPhaseTimingTests(unittest.TestCase):
                 clock.advance(.019)
                 raise error
         projector = Probe([])
-        with patch(MODULE+'.time.perf_counter', clock), self.assertLogs(MODULE, level='INFO') as log:
+        with patch(MODULE+'._phase_clock', clock), self.assertLogs(MODULE, level='INFO') as log:
             with self.assertRaises(RuntimeError) as raised:
                 projector.project_pending(batch_size=1, max_batches=1, upload_concurrency=1)
         self.assertIs(raised.exception, error)
@@ -114,7 +114,7 @@ class LogicalPhaseTimingTests(unittest.TestCase):
             clock.advance(.031)
             raise error
         projector.store.execute = execute
-        with patch(MODULE+'.time.perf_counter', clock), self.assertLogs(MODULE, level='INFO') as log:
+        with patch(MODULE+'._phase_clock', clock), self.assertLogs(MODULE, level='INFO') as log:
             with self.assertRaises(RuntimeError) as raised:
                 projector.project_pending(batch_size=1, max_batches=1, upload_concurrency=1)
         self.assertIs(raised.exception, error)
