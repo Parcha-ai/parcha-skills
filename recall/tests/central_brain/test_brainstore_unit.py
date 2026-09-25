@@ -96,17 +96,21 @@ class SchemaMigrationContractTest(unittest.TestCase):
                 path.read_text(),
                 rf"schema_migrations\(version\) VALUES \({version}\)",
             )
-        # A *_concurrent.sql companion runs statement by statement in
-        # autocommit right after its numbered migration: same version prefix
-        # plus a letter, sorted after it, no transaction control, no
+        # Concurrent companions run statement by statement in autocommit.
+        # Existing companions follow their marker; 074 builds its indexes
+        # before the marker validates them. No transaction control, no
         # dollar-quoted bodies, and it never records a version of its own.
         for path in companions:
             prefix = path.name.split("_", 1)[0]
-            self.assertRegex(prefix, r"^\d{3}[a-z]$")
+            if path.name == "074_cleanup_reference_indexes_concurrent.sql":
+                self.assertEqual(prefix, "074")
+                self.assertLess(every.index(path), every.index(migrations[versions.index(74)]))
+            else:
+                self.assertRegex(prefix, r"^\d{3}[a-z]$")
+                self.assertLess(
+                    every.index(migrations[versions.index(int(prefix[:3]))]), every.index(path)
+                )
             self.assertIn(int(prefix[:3]), versions)
-            self.assertLess(
-                every.index(migrations[versions.index(int(prefix[:3]))]), every.index(path)
-            )
             text = path.read_text()
             self.assertNotIn("$$", text)
             self.assertNotIn("schema_migrations", text)
@@ -439,8 +443,8 @@ class SchemaMigrationContractTest(unittest.TestCase):
             (SERVER / "deploy" / "README.md").read_text().split()
         ).casefold()
         self.assertIn("schema migrations 1 through 70", guide)
-        if SCHEMA_VERSION == 72:
-            self.assertIn("latest shipped migration is 73", guide)
+        if SCHEMA_VERSION >= 72:
+            self.assertIn(f"latest shipped migration is {SCHEMA_VERSION}", guide)
             self.assertIn("migration 71 remains optional", guide)
         self.assertIn("refresh runtime grants after every migration", guide)
         self.assertIn("on all tables in schema public", guide)
