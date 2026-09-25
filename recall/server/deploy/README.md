@@ -899,19 +899,35 @@ Create the Slack app **from a manifest**, paste that JSON, then copy the app's
 client ID, client secret, and signing secret into the deployment secret manager.
 After the deployment is healthy, generate the final manifest with
 `python -m connectors.slack_manifest --events https://<public-host>` and update
-the app from that manifest; Slack can now verify the signed Events URL. No Slack
-token is copied into Recall—the owner completes installation from the Recall
-switchboard and the resulting bot token is encrypted server-side.
+the app from that manifest; Slack can now verify the signed Events URL. The owner
+completes installation from the Recall switchboard; Recall exchanges the OAuth
+code and encrypts both bot and user tokens server-side.
 
 Register `https://<public-host>/webhooks/v1/slack` as the Events API request URL
-and subscribe to `message.channels`, `message.groups`, `message.im`, and
-`message.mpim`. The bundled source requests only its declared bot scopes,
-discovers all public channels plus private channels to which it was invited,
-joins public channels, paginates full history and thread replies through a fixed
-cycle upper bound, reconciles users and verified emails, and consumes signed
-edits/deletions live. API polling remains the repair path if events are delayed.
+and subscribe only to `message.channels`, as the generated manifest specifies.
+The user grant requests `channels:history`, `channels:read`, and `files:read`.
+Polling discovers active and archived public channels and reads their history
+and thread replies through a fixed cycle upper bound. Private channels and DMs
+are outside this connector's scope. Existing bot joins for discovered active
+public channels preserve Events membership; signed Events capture subsequent
+edits and deletions. An inventory count alone does not prove full history or
+Events coverage. See [channel coverage and polling limits](../../connectors/README.md#work-apis).
+
+To upgrade a legacy bot-only connection, open `https://<public-host>/admin` as
+the same Recall principal that owns the existing Slack installation. In the
+Slack card, explicitly select the existing company brain, leave Slack enabled,
+and click **Authorize Slack**. The destination selector defaults to a personal
+brain when one exists; it does not preserve the existing Slack route. Select the
+same Slack workspace and approve the requested user scopes. Do not disconnect
+first. Reauthorizing the same principal, brain, and connector preserves the
+source ID and spool; another principal or destination creates another source.
+Pending pages finish their acknowledgement before the expanded public scope
+starts an epoch replay with the same native message IDs. Verify the resulting
+coverage report says `public_channels` and then observe its per-channel baseline
+progress; reconnecting alone is not a completeness claim.
+
 Files served directly from Slack's private file host are downloaded with the
-same bot authority, bounded at 64 MiB, archived as raw artifacts, and projected
+user authority, bounded at 64 MiB, archived as raw artifacts, and projected
 as stable `document.v1` records; supported text/PDF/Office bodies become
 searchable. A rejected redirect, oversized file, or unavailable binary remains
 an explicit `attachment_bytes` omission on the parent message and is repaired
