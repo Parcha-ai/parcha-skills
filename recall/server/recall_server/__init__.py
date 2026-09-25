@@ -11,5 +11,8 @@ RECONCILIATION_INDEX_VERSION = 70
 # Compatibility is deployed before the additive conversation metadata migration.
 # It remains optional until the feature starts reading the new columns.
 NATIVE_CONVERSATION_SCHEMA_VERSION = 71
+# Compatibility for the planned additive notification-priority queue column.
+# This marker remains optional; no feature or migration is enabled here.
+NOTIFICATION_PRIORITY_SCHEMA_VERSION = 72
 MANDATORY_SCHEMA_VERSION = 69
 PROJECTOR_VERSION = 3
