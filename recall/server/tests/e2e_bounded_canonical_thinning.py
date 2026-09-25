@@ -89,25 +89,27 @@ class Thinning(unittest.TestCase):
         self.assertEqual(self.thinner.thin(batch_size=10)['documents'], 1)
 
     def test_queued_then_ready_and_arrivals_both_sides_of_cursor(self):
-        values = sorted((self.insert(str(i))[1], str(i)) for i in range(8))
-        for _, suffix in values:
+        # Reserve real hash-key extremes before inserting the middle. Randomly
+        # searching for a key above the maximum of eight initial keys can fail
+        # even after 1000 tries; fixture construction must guarantee both sides.
+        values = sorted((
+            'doc_' + hashlib.sha256(('document:' + self.suffix_prefix + str(i)).encode()).hexdigest()[:32],
+            str(i),
+        ) for i in range(10))
+        self.assertEqual(len({doc for doc, _ in values}), 10)
+        (behind, behind_suffix), (above, above_suffix) = values[0], values[-1]
+        for expected_doc, suffix in values[1:-1]:
+            self.assertEqual(self.insert(suffix)[1], expected_doc)
             self.queue(suffix)
         # Small local window exercises the same owner wrap with multiple calls.
         self.thinner.WINDOW_SIZE = 2
         self.assertEqual(self.thinner.thin(batch_size=1)['documents'], 0)
         old_after, high = self.thinner._after[1], self.thinner._through[1]
-        behind = above = None
-        for i in range(1000):
-            suffix = 'arrival:' + str(i)
-            doc = 'doc_' + hashlib.sha256(('document:' + self.suffix_prefix + suffix).encode()).hexdigest()[:32]
-            if behind is None and doc < old_after:
-                self.insert(suffix); behind = doc
-            if above is None and doc > high:
-                self.insert(suffix); above = doc
-            if behind and above:
-                break
-        self.assertIsNotNone(behind)
-        self.assertIsNotNone(above)
+        self.assertLess(behind, old_after)
+        self.assertLessEqual(old_after, high)
+        self.assertLess(high, above)
+        self.assertEqual(self.insert(behind_suffix)[1], behind)
+        self.assertEqual(self.insert(above_suffix)[1], above)
         with self.store.connect() as c:
             c.execute('DELETE FROM canonical_evidence_document_queue WHERE tenant_id=%s',
                       (self.tenant,))
