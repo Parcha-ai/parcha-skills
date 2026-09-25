@@ -182,6 +182,58 @@ class BacklogAdmission(unittest.TestCase):
             },
         )
 
+    def test_balanced_backlogs_keep_stable_interleaving(self):
+        for source in ("source:a", "source:b", "source:c"):
+            self.add(source, 10)
+        for recent in (False, True):
+            rows = self.pending(9, recent=recent)
+            ordinals = (10, 9, 8) if recent else (1, 2, 3)
+            self.assertEqual(
+                [(r.source_id, r.native_parent_id) for r in rows],
+                [
+                    (source, f"parent-{number:06d}")
+                    for number in ordinals
+                    for source in ("source:a", "source:b", "source:c")
+                ],
+            )
+
+    def test_inflight_head_exclusion_preserves_bound_and_peer_drain(self):
+        self.add("source:dominant", 31)
+        self.add("source:peer", 3)
+        first = self.pending(2)
+        excluded = {(r.tenant_id, r.source_id, r.native_parent_id) for r in first}
+        # Match the coordinator's existing overscan -> exclusion -> slice seam.
+        # The floor protects eligible SQL heads; an already-running peer head
+        # can be excluded and does not imply a new peer in this actual batch.
+        rows = [
+            r
+            for r in self.pending(5 + len(excluded))
+            if (r.tenant_id, r.source_id, r.native_parent_id) not in excluded
+        ][:5]
+        self.assertEqual(len(rows), 5)
+        selected = {(r.tenant_id, r.source_id, r.native_parent_id) for r in rows}
+        self.assertTrue(selected.isdisjoint(excluded))
+        self.assertEqual(len(selected), 5)
+        seen = excluded | selected
+        for identity in seen:
+            self.connection.execute(
+                """DELETE FROM canonical_evidence_document_queue
+                WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s""",
+                identity,
+            )
+        while rows := self.pending(5):
+            for row in rows:
+                identity = (row.tenant_id, row.source_id, row.native_parent_id)
+                self.assertNotIn(identity, seen)
+                seen.add(identity)
+                self.connection.execute(
+                    """DELETE FROM canonical_evidence_document_queue
+                    WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s""",
+                    identity,
+                )
+        self.assertEqual(len(seen), 34)
+        self.assertEqual(sum(source == "source:peer" for _, source, _ in seen), 3)
+
     def test_finite_work_drains_and_small_sources_receive_their_floor(self):
         self.add("source:dominant", 31)
         self.add("source:peer", 3)
