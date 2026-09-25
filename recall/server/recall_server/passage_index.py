@@ -596,23 +596,22 @@ class CanonicalPassageProjector:
                                 END AS notification_priority,(
                                 candidate_queue.changed_at <
                                 clock_timestamp()-interval '5 minutes'
-                            ) AS aged_priority,(
-                                SELECT coalesce(sum(size_part.size_bytes),0)
-                                  FROM canonical_evidence_document_parts
-                                       size_part
-                                 WHERE size_part.tenant_id=
-                                           candidate_queue.tenant_id
-                                   AND size_part.source_id=
-                                           candidate_queue.source_id
-                                   AND size_part.logical_document_id=
-                                           candidate_queue.logical_document_id
-                                   AND size_part.revision=
-                                           candidate_queue.revision
-                            ) AS estimated_bytes
+                            ) AS aged_priority,
+                                coalesce(sum(size_part.size_bytes),0)
+                                    AS estimated_bytes
                              FROM canonical_passage_projection_queue
                                   candidate_queue
+                             LEFT JOIN canonical_evidence_document_parts size_part
+                               ON size_part.tenant_id=candidate_queue.tenant_id
+                              AND size_part.source_id=candidate_queue.source_id
+                              AND size_part.logical_document_id=
+                                      candidate_queue.logical_document_id
+                              AND size_part.revision=candidate_queue.revision
                             WHERE (%s::text IS NULL
                                    OR candidate_queue.tenant_id=%s)
+                            GROUP BY candidate_queue.tenant_id,
+                                     candidate_queue.source_id,
+                                     candidate_queue.logical_document_id
                             ORDER BY notification_priority ASC NULLS LAST,
                               aged_priority DESC,estimated_bytes,
                               candidate_queue.changed_at,
