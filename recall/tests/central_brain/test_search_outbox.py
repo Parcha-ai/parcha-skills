@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+from tests.schema_versions import expected_schema_versions  # noqa: E402
 from recall_server import SCHEMA_VERSION
 from recall_server.logical_evidence_projection import (
     CanonicalLogicalEvidenceProjector,
@@ -276,7 +277,7 @@ class WritersTest(unittest.TestCase):
 
 class MigrationTest(unittest.TestCase):
     def test_schema_066_creates_outbox_tombstones_and_shards(self) -> None:
-        self.assertEqual(SCHEMA_VERSION, 70)
+        self.assertEqual(SCHEMA_VERSION, max(expected_schema_versions()))
         sql = (SCHEMA / "066_search_projection_outbox.sql").read_text()
         self.assertIn("CREATE TABLE IF NOT EXISTS search_projection_outbox", sql)
         self.assertIn("CREATE TABLE IF NOT EXISTS search_projection_tombstones", sql)

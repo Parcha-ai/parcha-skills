@@ -16,6 +16,7 @@ RECALL = Path(__file__).resolve().parents[2]
 SERVER = RECALL / "server"
 sys.path.insert(0, str(SERVER))
 
+from tests.schema_versions import expected_schema_versions  # noqa: E402
 from recall_server import MANDATORY_SCHEMA_VERSION, RETIRE_POSTGRES_PLANE_VERSION, SCHEMA_VERSION  # noqa: E402
 from recall_server.capabilities import (  # noqa: E402
     CAPABILITY_SQL,
@@ -36,7 +37,7 @@ def healthy_snapshot() -> dict:
     return {
         "server_version_num": 170000,
         "vector_version": "0.8.1",
-        "migration_versions": list(range(1, SCHEMA_VERSION + 1)),
+        "migration_versions": expected_schema_versions(),
         "postgres_vector_plane_present": False,
         "ssl_in_use": True,
         "role": {
@@ -170,7 +171,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
         self.assertEqual(retired["postgres_vector_plane"], "retired")
         # 067 recorded but the table still there, or absent with the table gone.
         for versions, present in (
-            (list(range(1, SCHEMA_VERSION + 1)), True),
+            (expected_schema_versions(), True),
             ([v for v in range(1, MANDATORY_SCHEMA_VERSION + 1)
               if v != RETIRE_POSTGRES_PLANE_VERSION], False),
         ):
@@ -213,7 +214,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
         complete = list(range(1, 72))
         for versions in ([n for n in complete if n != 69],
                          [n for n in complete if n != 68],
-                         complete + [72], complete + [71],
+                         complete + [73], complete + [71],
                          complete[:-2] + [71, 70]):
             with self.subTest(versions=versions):
                 snapshot = healthy_snapshot()
@@ -226,7 +227,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
         complete = list(range(1, 71))
         for versions in ([n for n in complete if n != 68],
                          [n for n in complete if n != 69],
-                         complete + [72], complete + [70],
+                         complete + [73], complete + [70],
                          complete[:-2] + [70, 69]):
             with self.subTest(versions=versions):
                 snapshot = healthy_snapshot()

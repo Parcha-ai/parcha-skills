@@ -28,6 +28,7 @@ except ModuleNotFoundError:
     sys.modules["psycopg"] = psycopg
     sys.modules["psycopg.rows"] = psycopg_rows
 
+from tests.schema_versions import expected_schema_versions  # noqa: E402
 from recall_server import SCHEMA_VERSION
 from recall_server import cli as server_cli
 from recall_server.actor_attribution import (
@@ -88,7 +89,8 @@ class SchemaMigrationContractTest(unittest.TestCase):
         ]
         migrations = [path for path in every if path not in companions]
         versions = [int(path.name.split("_", 1)[0]) for path in migrations]
-        self.assertEqual(versions, list(range(1, SCHEMA_VERSION + 1)))
+        self.assertEqual(versions, expected_schema_versions())
+        self.assertEqual(max(versions), SCHEMA_VERSION)
         for version, path in zip(versions, migrations, strict=True):
             self.assertRegex(
                 path.read_text(),
@@ -103,7 +105,7 @@ class SchemaMigrationContractTest(unittest.TestCase):
             self.assertRegex(prefix, r"^\d{3}[a-z]$")
             self.assertIn(int(prefix[:3]), versions)
             self.assertLess(
-                every.index(migrations[int(prefix[:3]) - 1]), every.index(path)
+                every.index(migrations[versions.index(int(prefix[:3]))]), every.index(path)
             )
             text = path.read_text()
             self.assertNotIn("$$", text)
@@ -436,7 +438,10 @@ class SchemaMigrationContractTest(unittest.TestCase):
         guide = " ".join(
             (SERVER / "deploy" / "README.md").read_text().split()
         ).casefold()
-        self.assertIn(f"schema migrations 1 through {SCHEMA_VERSION}", guide)
+        self.assertIn("schema migrations 1 through 70", guide)
+        if SCHEMA_VERSION == 72:
+            self.assertIn("latest shipped migration is 72", guide)
+            self.assertIn("migration 71 remains optional", guide)
         self.assertIn("refresh runtime grants after every migration", guide)
         self.assertIn("on all tables in schema public", guide)
         self.assertIn("on all sequences in schema public", guide)
