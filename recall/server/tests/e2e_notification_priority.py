@@ -54,7 +54,7 @@ class NotificationPriority(unittest.TestCase):
         self.writer = _DirectCanonicalWriter(self.plane, tenant_id=TENANT, principal_id=OWNER)
         for name, value in [('store', self.store), ('archive_store', self.archive),
                             ('canonical_plane', self.plane)]:
-            override = patch.object(Handler, name, value)
+            override = patch.object(Handler, name, value, create=True)
             override.start()
             self.addCleanup(override.stop)
         self.store.legacy_ingest_bridge = LegacyIngestBridge(self.store, self.plane, self.archive)
