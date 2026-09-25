@@ -296,6 +296,7 @@ class CanonicalLogicalEvidenceProjector:
         self.retention_profile = retention_profile
         self.cursor_fetch_rows = cursor_fetch_rows
         self._committed_body_keys: dict[tuple[str, str, str], None] = {}
+        self._prefer_recent_admission = False
 
     def _take_committed_body_keys(self) -> tuple[tuple[str, str, str], ...]:
         keys = tuple(self._committed_body_keys)
@@ -496,6 +497,7 @@ class CanonicalLogicalEvidenceProjector:
         limit: int,
         quiet_seconds: float = 0.0,
         max_wait_seconds: float = 0.0,
+        prefer_recent: bool = False,
     ) -> list[LogicalGroupCandidate]:
         """Queued groups ready to project.
 
@@ -503,7 +505,9 @@ class CanonicalLogicalEvidenceProjector:
         `quiet_seconds`, or has been waiting longer than `max_wait_seconds`
         since it first entered the queue. Forget and backfill never wait.
         Admit one ready group per source before another source's second group;
-        forget takes precedence. Join archive size estimates only after the
+        forget takes precedence and retains oldest-first order. Normal groups
+        use oldest-first order unless this is a recent-change admission round.
+        Join archive size estimates only after the
         bounded admission, so a bulk backfill cannot monopolize the batch.
         """
         with self.store.connect() as connection:
@@ -534,7 +538,10 @@ class CanonicalLogicalEvidenceProjector:
                        SELECT eligible.*,
                               row_number() OVER (
                                   PARTITION BY tenant_id,source_id
-                                  ORDER BY admission_priority,first_queued_at,
+                                  ORDER BY admission_priority,
+                                           CASE WHEN %s AND admission_priority>0
+                                                THEN changed_at END DESC,
+                                           first_queued_at,
                                            native_parent_id
                               ) AS source_position
                          FROM eligible
@@ -579,6 +586,7 @@ class CanonicalLogicalEvidenceProjector:
                     MAX_LOGICAL_ATTEMPTS,
                     quiet_seconds, quiet_seconds,
                     max_wait_seconds, max_wait_seconds,
+                    prefer_recent,
                     limit,
                 ),
             ).fetchall()
@@ -2119,7 +2127,7 @@ class CanonicalLogicalEvidenceProjector:
         def fill_slots(executor):
             nonlocal batches
             while len(pending) < worker_count and batches < max_batches:
-                # Keep the SQL's source-fair and forget-first ordering.
+                # Both modes keep the SQL's source-fair and forget-first ordering.
                 # Exclude queued as well as running owners. Overscan only by
                 # these identifiers, never by fetching additional body data.
                 excluded = deferred | {parent_key(item[0]) for item in pending.values()}
@@ -2128,10 +2136,15 @@ class CanonicalLogicalEvidenceProjector:
                     limit=batch_size + len(excluded),
                     quiet_seconds=float(quiet_seconds),
                     max_wait_seconds=float(max_wait_seconds),
+                    prefer_recent=self._prefer_recent_admission,
                 )
                 candidates = [c for c in candidates if parent_key(c) not in excluded][:batch_size]
                 if not candidates:
                     break
+                # Share capacity across calls, including one-slot rounds.
+                # Recent means changed canonical state; replay competes too.
+                # Empty scans do not consume a turn. A new process starts old.
+                self._prefer_recent_admission = not self._prefer_recent_admission
                 batches += 1
                 remaining_by_batch[batches] = len(candidates)
                 for candidate in candidates:

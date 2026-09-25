@@ -1045,6 +1045,14 @@ separately from `logical_failed`. These settings do not resolve a parent that
 continually changes during its own preparation, or capacity exhausted by giant
 parents in every executor slot.
 
+Logical admission alternates oldest-first and recently changed-first rounds,
+retaining forget priority, debounce/max-wait gates and source round-robin in both.
+The next mode belongs to the projector, survives cycle boundaries and changes
+only after nonempty admission; restart begins oldest-first. Even one-slot rounds
+therefore share capacity between history and recent changes. Recent means the
+queue's canonical change time, not event time: historical replay competes for
+those slots too. This does not guarantee freshness when arrivals exceed capacity.
+
 Passage projection also commits each ready document independently. Only active
 owners retain prepared passage bodies, and commits retain the existing cap of
 8 or one fewer than the database pool size. A progress callback invokes only the

@@ -35,7 +35,14 @@ class StreamingProgress(ParentProgress):
             result = self.writer.drain(tenant_id=self.tenant, max_months=4)
             hits = self.retrieval.search('smalltinyfinalmarker', lexical_query='smalltinyfinalmarker',
                 since=None, until=None, limit=10)['results']
-            if any(final_receipt in item.get('receipts', ()) and 'smalltinyfinalmarker' in item['text']
+            # Recent-change admission may publish the last-created parent first.
+            # Signal only once every tiny parent has committed, retaining the
+            # proof that all later batches finish before the giant releases.
+            with self.store.connect() as c:
+                count = c.execute('''SELECT count(*) AS n FROM canonical_evidence_documents
+                    WHERE tenant_id=%s AND source_id=%s''',
+                    (self.tenant,self.sources['small'])).fetchone()['n']
+            if count == 5 and any(final_receipt in item.get('receipts', ()) and 'smalltinyfinalmarker' in item['text']
                    for row in hits for item in row['matching_ranges']):
                 complete.set()
             return result
