@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from itertools import groupby
@@ -50,6 +51,27 @@ MAX_LOGICAL_EVIDENCE_BATCH_SIZE = 10_000
 MAX_LOGICAL_ATTEMPTS = 8
 LOGICAL_BACKOFF_BASE_SECONDS = 60
 LOGICAL_BACKOFF_CAP_SECONDS = 6 * 3600
+
+
+@contextmanager
+def _phase_timing(phase: str):
+    """Operation wall time; unsuccessful calls omit unknown result counts."""
+    started = time.perf_counter()
+    succeeded = False
+    counts: dict[str, int] = {}
+    try:
+        yield counts
+        succeeded = True
+    finally:
+        try:
+            suffix = "".join(f" {key}={counts[key]}" for key in
+                             ("completed", "deleted", "failures", "pending")
+                             if succeeded and key in counts)
+            LOG.info("logical phase timing phase=%s elapsed_ms=%s succeeded=%s%s",
+                     phase, max(0, round((time.perf_counter() - started) * 1000)),
+                     int(succeeded), suffix)
+        except Exception:  # Diagnostic failures must not change owning behavior.
+            pass
 
 
 @dataclass(frozen=True)
@@ -1349,6 +1371,21 @@ class CanonicalLogicalEvidenceProjector:
         limit: int = 500,
         concurrency: int = 1,
     ) -> dict[str, int | str]:
+        with _phase_timing("cleanup") as counts:
+            result = self._drain_cleanup(
+                tenant_id=tenant_id, limit=limit, concurrency=concurrency,
+            )
+            counts.update({key: int(result[key]) for key in
+                           ("completed", "deleted", "failures", "pending")})
+            return result
+
+    def _drain_cleanup(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int = 500,
+        concurrency: int = 1,
+    ) -> dict[str, int | str]:
         if (
             not 1 <= limit <= 5_000
             or isinstance(concurrency, bool)
@@ -2256,13 +2293,14 @@ class CanonicalLogicalEvidenceProjector:
                 # Exclude queued as well as running owners. Overscan only by
                 # these identifiers, never by fetching additional body data.
                 excluded = deferred | {parent_key(item[0]) for item in pending.values()}
-                candidates = self._pending(
-                    tenant_id=tenant_id,
-                    limit=batch_size + len(excluded),
-                    quiet_seconds=float(quiet_seconds),
-                    max_wait_seconds=float(max_wait_seconds),
-                    prefer_recent=self._prefer_recent_admission,
-                )
+                with _phase_timing("pending"):
+                    candidates = self._pending(
+                        tenant_id=tenant_id,
+                        limit=batch_size + len(excluded),
+                        quiet_seconds=float(quiet_seconds),
+                        max_wait_seconds=float(max_wait_seconds),
+                        prefer_recent=self._prefer_recent_admission,
+                    )
                 candidates = [c for c in candidates if parent_key(c) not in excluded][:batch_size]
                 if not candidates:
                     break
@@ -2387,7 +2425,7 @@ class CanonicalLogicalEvidenceProjector:
                 concurrency=cleanup_concurrency,
             )
             raise
-        with self.store.connect() as connection:
+        with _phase_timing("count"), self.store.connect() as connection:
             counts = connection.execute(
                 """SELECT count(*) AS queued,
                           count(*) FILTER (
