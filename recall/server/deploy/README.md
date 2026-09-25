@@ -291,6 +291,10 @@ for native-conversation metadata. Migration 72 adds nullable
 index, or historical reclassification. Apply it before deploying the notification
 priority reader; compatibility checks explicitly accept the reserved 71 gap.
 
+Webhook ingestion retains the same structured canonical JSON as managed
+history, so typed messages remain visible when their author is unresolved.
+This does not rewrite previously flattened canonical bodies.
+
 Verified Slack Events and authenticated, source-scoped generic webhooks stamp
 existing logical work at ingress. Alternating notification rounds admit those
 parents FIFO within each source before ordinary recent changes; oldest rounds

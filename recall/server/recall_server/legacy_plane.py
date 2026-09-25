@@ -172,23 +172,6 @@ def _redacted_text(envelope: Mapping[str, Any]) -> str:
     )
 
 
-def _text_summary(envelope: Mapping[str, Any]) -> str:
-    """Search text for one canonical document.
-
-    Typed connector records (webhooks) expose a ``text`` field; everything else
-    keeps the compact JSON body, exactly like ``CanonicalPlane.ingest_batch``.
-    """
-    content = envelope.get("content")
-    if (
-        envelope.get("kind") == "connector_record"
-        and isinstance(content, dict)
-        and isinstance(content.get("text"), str)
-        and content["text"]
-    ):
-        return content["text"]
-    return _redacted_text(envelope)
-
-
 class LegacyIngestBridge:
     """Route v1 envelope writes onto the canonical plane.
 
@@ -315,7 +298,7 @@ class LegacyIngestBridge:
                             connector_id=event_connector_id,
                             artifact_ref=artifact,
                             envelope=envelope,
-                            text_redacted=_text_summary(envelope),
+                            text_redacted=_redacted_text(envelope),
                             _connection=connection,
                             _history=history,
                             **({"_notification": True} if notification else {}),
