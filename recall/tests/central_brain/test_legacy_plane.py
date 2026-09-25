@@ -225,7 +225,7 @@ class FakeCanonicalPlane:
     def prepare_history(self, **kwargs):
         return nullcontext(None)
 
-    def ingest_document(self, *, tenant_id, principal_id, connector_id, artifact_ref, envelope, text_redacted, _connection=None, _history=None):
+    def ingest_document(self, *, tenant_id, principal_id, connector_id, artifact_ref, envelope, text_redacted, _connection=None, _history=None, _notification=False):
         self.documents.append({
             "tenant_id": tenant_id,
             "principal_id": principal_id,
