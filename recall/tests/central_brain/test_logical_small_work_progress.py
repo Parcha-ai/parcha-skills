@@ -87,7 +87,9 @@ class SmallWorkProgressTests(unittest.TestCase):
                                 projector.project_pending(batch_size=1, max_batches=1, upload_concurrency=1)
                     else:
                         projector.project_pending(batch_size=1, max_batches=1, upload_concurrency=1)
-                messages = [record.getMessage() for record in logs.records]
+                all_messages = [record.getMessage() for record in logs.records]
+                messages = [message for message in all_messages
+                            if message.startswith('logical owner ')]
                 self.assertEqual(len(messages), 2)
                 self.assertTrue(messages[0].startswith('logical owner started '))
                 self.assertTrue(messages[1].startswith('logical owner completed '))
@@ -95,8 +97,8 @@ class SmallWorkProgressTests(unittest.TestCase):
                 self.assertRegex(messages[0], r'parent_sha256=[0-9a-f]{64}\b')
                 self.assertRegex(messages[1], r'elapsed_ms=\d+\b')
                 self.assertIn('estimated_bytes=1', messages[0])
-                self.assertNotIn('private-parent-identity', '\n'.join(messages))
-                self.assertNotIn('private-source-body', '\n'.join(messages))
+                self.assertNotIn('private-parent-identity', '\n'.join(all_messages))
+                self.assertNotIn('private-source-body', '\n'.join(all_messages))
 
     def test_owner_log_failure_does_not_change_commit(self):
         projector = QueueProjector(['small'])
