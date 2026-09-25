@@ -35,6 +35,7 @@ class NotificationPriority(unittest.TestCase):
         self.store.migrate()
         with self.store.connect() as connection:
             connection.execute(LEGACY_TRUNCATE)
+        self.addCleanup(self.clear_fixture)
         seed_slack_route(self.store)
         environment = patch.dict(os.environ, {
             'RECALL_AUTH_REQUIRED': '1', 'RECALL_HTTP_PROFILE': 'public-edge',
@@ -77,6 +78,10 @@ class NotificationPriority(unittest.TestCase):
         self.retrieval = TurbopufferHintRetrieval(self.store, tenant_id=TENANT,
             sources=[SLACK_SOURCE], policy_fingerprint=DEFAULT_PASSAGE_POLICY.fingerprint,
             settings=settings, client=client)
+
+    def clear_fixture(self):
+        with self.store.connect() as connection:
+            connection.execute(LEGACY_TRUNCATE)
 
     def history(self, start, count):
         events = []
