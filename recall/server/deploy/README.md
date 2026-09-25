@@ -1090,7 +1090,10 @@ catalog page or tombstone batch. Unfinished months rotate across callbacks;
 use the same implementation but continue until their claimed months finish.
 Rotation is fair among admitted claims; a new month waits for an active slot.
 Only complete months advance the watermark and acknowledge their generation;
-restart replays unfinished months safely. Each page retains the existing writer
+restart replays unfinished months when writers for that namespace do not overlap.
+Claims do not fence separate worker processes; use the
+[Render worker cutover procedure](worker-cutover.md) for deployments and rollbacks.
+Each page retains the existing writer
 concurrency, byte limits, pacer and retry budget. A page can still take longer
 than five seconds. Paused months retain metadata and exact captured tombstone
 IDs, not page bodies; metadata memory remains proportional to those IDs.
