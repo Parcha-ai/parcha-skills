@@ -11,7 +11,7 @@ import json
 import sqlite3
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .canonical_text import canonical_text_chunks
 from .logical_evidence import LogicalEvidenceError, MAX_PART_BYTES
@@ -46,7 +46,8 @@ class ArchivedBodyLookup:
             self.bodies.close()
         self.directory.cleanup()
 
-    def load(self, projection, *, candidate, manifest, parts, reference):
+    def load(self, projection, *, candidate, manifest, parts, reference,
+             checkpoint: Callable[[], None] | None = None):
         if (not manifest or not parts or len(parts) != manifest["part_count"]
                 or manifest["tenant_id"] != candidate.tenant_id
                 or manifest["source_id"] != candidate.source_id
@@ -58,6 +59,8 @@ class ArchivedBodyLookup:
         segment_index = 0
         start = 0
         for part_ordinal, part in enumerate(parts):
+            if checkpoint is not None:
+                checkpoint()
             if (part["part_ordinal"] != part_ordinal
                     or part["first_record_ordinal"] != ordinal
                     or part["tenant_id"] != candidate.tenant_id
@@ -73,6 +76,8 @@ class ArchivedBodyLookup:
             digest.update(payload)
             part_receipts = 0
             for line in io.BytesIO(payload):
+                if checkpoint is not None:
+                    checkpoint()
                 record = decode_logical_record(line, source_id=candidate.source_id)
                 if record.ordinal != ordinal:
                     raise _invalid()
