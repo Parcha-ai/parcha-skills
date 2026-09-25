@@ -1107,9 +1107,9 @@ class OptionalCompactionYieldsTests(unittest.TestCase):
                        "logical_documents", "passage_documents"):
             with self.subTest(signal=signal):
                 scan, result = self.run_cycles([{signal: 1}])
-                self.assertEqual(scan.built, ["source:ready", "source:later"])
+                self.assertEqual(scan.built, ["source:ready"])
                 self.assertEqual(getattr(scan, "compaction_sweeps", []), [])
-                self.assertEqual(result["parquet_shards"], 2)
+                self.assertEqual(result["parquet_shards"], 1)
                 self.assertEqual(result["parquet_contended"], 1)
 
     def test_idle_runs_queued_work_and_existing_one_candidate_sweep(self):
@@ -1120,13 +1120,13 @@ class OptionalCompactionYieldsTests(unittest.TestCase):
 
     def test_idle_after_busy_restores_optional_maintenance(self):
         scan, _result = self.run_cycles([{"logical_documents": 1}, {}])
-        self.assertEqual(scan.built, ["source:ready", "source:later",
+        self.assertEqual(scan.built, ["source:ready",
                                       "source:ready", "source:later", "source:maintenance"])
         self.assertEqual(scan.compaction_sweeps, [("tenant:company:test", 1)])
 
     def test_busy_queued_rebuilds_keep_cycle_cadence(self):
         scan, _result = self.run_cycles([{"logical_pending": 1}] * 4, every=2)
-        self.assertEqual(scan.built, ["source:ready", "source:later"] * 2)
+        self.assertEqual(scan.built, ["source:ready"] * 2)
         self.assertEqual(getattr(scan, "compaction_sweeps", []), [])
 
 
@@ -1198,22 +1198,22 @@ class ParquetFreshnessQuantumTests(unittest.TestCase):
                        "passage_pending", "passage_documents"):
             with self.subTest(signal=signal):
                 scan, _ = self.run_cycles(signal=signal)
-                self.assertEqual(len(scan.committed), 4)
-                self.assertEqual(scan.queue, scan.original[4:])
-                self.assertEqual(scan.committed, scan.original[:4])
+                self.assertEqual(len(scan.committed), 1)
+                self.assertEqual(scan.queue, scan.original[1:])
+                self.assertEqual(scan.committed, scan.original[:1])
                 self.assertEqual(getattr(scan, "compaction_sweeps", []), [])
 
     def test_retained_months_drain_on_later_busy_turns(self):
-        scan, remaining = self.run_cycles(signal="logical_pending", cycles=5)
-        self.assertEqual(remaining, [20, 16, 12, 8, 4])
+        scan, remaining = self.run_cycles(signal="logical_pending", cycles=20)
+        self.assertEqual(remaining, list(range(20, 0, -1)))
         self.assertEqual(scan.committed, scan.original)
         self.assertEqual(scan.queue, [])
 
     def test_busy_cadence_is_preserved_with_larger_logical_budget(self):
         scan, remaining = self.run_cycles(signal="logical_pending", cycles=4, every=2)
-        self.assertEqual(remaining, [20, 20, 16, 16])
-        self.assertEqual(scan.committed, scan.original[:8])
-        self.assertEqual(scan.queue, scan.original[8:])
+        self.assertEqual(remaining, [20, 20, 19, 19])
+        self.assertEqual(scan.committed, scan.original[:2])
+        self.assertEqual(scan.queue, scan.original[2:])
 
     def test_idle_retains_configured_catchup_budget(self):
         scan, _ = self.run_cycles(signal="idle")
