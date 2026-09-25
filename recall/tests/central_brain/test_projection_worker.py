@@ -1128,3 +1128,95 @@ class OptionalCompactionYieldsTests(unittest.TestCase):
         scan, _result = self.run_cycles([{"logical_pending": 1}] * 4, every=2)
         self.assertEqual(scan.built, ["source:ready", "source:later"] * 2)
         self.assertEqual(getattr(scan, "compaction_sweeps", []), [])
+
+
+class ParquetFreshnessQuantumTests(unittest.TestCase):
+    """The real scan loop yields between queued months, without dropping work."""
+
+    def run_cycles(self, *, signal, cycles=1, every=1):
+        from dataclasses import replace
+        from datetime import date
+        from tests.central_brain.test_parquet_scan import _WindowProbe, _candidate
+
+        calls = []
+        remaining_at_logical_turn = []
+
+        class Scan(_WindowProbe):
+            def __init__(self):
+                super().__init__()
+                self.queue = [replace(_candidate(), bucket_start=date(2025 + n // 12, n % 12 + 1, 1))
+                              for n in range(20)]
+                self.original = list(self.queue)
+                self.committed = []
+                self.turn_bounds = []
+
+            def project_pending(self, **kwargs):
+                self.turn_bounds.append(kwargs)
+                return super().project_pending(**kwargs)
+
+            def _pending(self, *, tenant_id, limit):
+                return self.queue[:limit]
+
+            def _commit(self, candidate, upload):
+                self.queue.remove(candidate)
+                self.committed.append(candidate)
+                return "committed"
+
+        scan = Scan()
+
+        class Logical(_Logical):
+            def project_pending(self, **kwargs):
+                remaining_at_logical_turn.append(len(scan.queue))
+                self.asserted_budget = kwargs["max_batches"]
+                row = super().project_pending(**kwargs)
+                if signal.startswith("logical_"):
+                    row[signal.removeprefix("logical_")] = 1
+                return row
+
+        class Passages(_Passages):
+            def project_pending(self, **kwargs):
+                row = super().project_pending(**kwargs)
+                if signal.startswith("passage_"):
+                    row[signal.removeprefix("passage_")] = 1
+                return row
+
+        logical = Logical(calls, work=0)
+        run_projection_worker(
+            logical, Passages(calls, work=0), scan,
+            tenant_id="tenant:company:test", logical_batch_size=100,
+            passage_batch_size=100, embedding_batch_size=64,
+            max_batches_per_cycle=10, upload_concurrency=1,
+            passage_concurrency=1, interval_seconds=1,
+            max_cycles=cycles, parquet_every_cycles=every,
+            sleep=lambda _: None,
+        )
+        self.assertEqual(logical.asserted_budget, 10)
+        return scan, remaining_at_logical_turn
+
+    def test_large_logical_budget_yields_scan_after_one_busy_batch(self):
+        for signal in ("logical_pending", "logical_waiting", "logical_documents",
+                       "passage_pending", "passage_documents"):
+            with self.subTest(signal=signal):
+                scan, _ = self.run_cycles(signal=signal)
+                self.assertEqual(len(scan.committed), 4)
+                self.assertEqual(scan.queue, scan.original[4:])
+                self.assertEqual(scan.committed, scan.original[:4])
+                self.assertEqual(getattr(scan, "compaction_sweeps", []), [])
+
+    def test_retained_months_drain_on_later_busy_turns(self):
+        scan, remaining = self.run_cycles(signal="logical_pending", cycles=5)
+        self.assertEqual(remaining, [20, 16, 12, 8, 4])
+        self.assertEqual(scan.committed, scan.original)
+        self.assertEqual(scan.queue, [])
+
+    def test_busy_cadence_is_preserved_with_larger_logical_budget(self):
+        scan, remaining = self.run_cycles(signal="logical_pending", cycles=4, every=2)
+        self.assertEqual(remaining, [20, 20, 16, 16])
+        self.assertEqual(scan.committed, scan.original[:8])
+        self.assertEqual(scan.queue, scan.original[8:])
+
+    def test_idle_retains_configured_catchup_budget(self):
+        scan, _ = self.run_cycles(signal="idle")
+        self.assertGreater(len(scan.committed), 4)
+        self.assertEqual(scan.turn_bounds, [dict(tenant_id="tenant:company:test",
+            batch_size=4, max_batches=10, compaction_budget=1)])
