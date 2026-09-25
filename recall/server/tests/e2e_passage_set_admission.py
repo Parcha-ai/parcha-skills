@@ -77,15 +77,29 @@ class SetAdmission(unittest.TestCase):
 
     def oracle(self, tenant, limit, notified):
         rows = [r for r in self.expected if tenant is None or r['key'][0] == tenant]
-        def priority(r):
-            stamp = r['notification'] if notified else None
-            return (stamp is None, stamp or self.now, not (r['changed'] < self.now-timedelta(minutes=5)),
-                    r['size'], r['changed'], *r['key'])
-        # Missing evidence/parts consume admission capacity, just as the original inner LIMIT.
-        return [r for r in sorted(rows, key=priority)[:limit] if r['visible']]
+        # Independent admission oracle: notification FIFO, one chronological
+        # head per source, then proportional residuals. Rotation is tested in
+        # e2e_passage_source_fairness; these cases begin with an unset cursor.
+        notifications=sorted((r for r in rows if notified and r['notification'] is not None),
+                             key=lambda r:(r['notification'],r['changed'],r['key']))
+        ordinary=[r for r in rows if r not in notifications]
+        sources={key:sorted((r for r in ordinary if r['key'][:2]==key),
+                           key=lambda r:((-r['changed'].timestamp() if notified else r['changed'].timestamp()),r['key'][2]))
+                 for key in {r['key'][:2] for r in ordinary}}
+        heads=[sources[key][0] for key in sorted(sources)]
+        residual=sorted(((position/len(group),r) for group in sources.values()
+                         for position,r in enumerate(group,1) if position>1),
+                        key=lambda pair:(pair[0],pair[1]['changed'],pair[1]['key']))
+        admitted=(notifications+heads+[r for _,r in residual])[:limit]
+        def dispatch(r):
+            stamp=r['notification'] if notified else None
+            return (stamp is None,stamp or self.now,not(r['changed']<self.now-timedelta(minutes=5)),
+                    r['size'],r['changed'],*r['key'])
+        return [r for r in sorted(admitted,key=dispatch) if r['visible']]
 
     def assert_selection(self, *, tenant, limit, notified):
         self.projector._prefer_notification_admission = notified
+        self.projector._ordinary_source_cursor[notified] = None
         got = self.projector._pending(tenant_id=tenant, limit=limit)
         expected = self.oracle(tenant, limit, notified)
         self.assertEqual([(r.tenant_id,r.source_id,r.logical_document_id) for r in got],
@@ -122,6 +136,8 @@ class SetAdmission(unittest.TestCase):
         for limit in (1,2,3,4,10):
             for notified in (False,True):
                 self.assert_selection(tenant='a',limit=limit,notified=notified)
+        self.projector._prefer_notification_admission=False
+        self.projector._ordinary_source_cursor[False]=None
         self.assertEqual(self.projector._pending(tenant_id='a',limit=3), ())
 
     def test_70000_queue_scoring_avoids_per_parent_subplans(self):
@@ -147,7 +163,7 @@ class SetAdmission(unittest.TestCase):
                      if isinstance(v,str) and 'SELECT queue.tenant_id' in v)
         repetitions = []
         for notified in (False,True):
-            params=(notified,'scale','scale',10)
+            params=(notified,None,None,None,'scale','scale',notified,10)
             # Warm reads, then retain actual plan attribution without a fragile time threshold.
             self.connection.execute(query,params).fetchall()
             result=self.connection.execute('EXPLAIN(ANALYZE,BUFFERS,FORMAT JSON) '+query,params).fetchone()['QUERY PLAN'][0]

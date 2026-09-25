@@ -58,6 +58,7 @@ class PassageDispatch(ParentProgress):
                     (minutes, self.tenant, self.ids[parent]))
 
     def candidates(self, limit=3):
+        self.passages._prefer_notification_admission = False
         return self.passages._pending(tenant_id=self.tenant, limit=limit)
 
     def test_same_age_class_small_slack_publishes_before_two_held_giants(self):
@@ -93,7 +94,7 @@ class PassageDispatch(ParentProgress):
         self.assertEqual([c.logical_document_id for c in candidates],
             [self.ids['small'], self.ids['large-two'], self.ids['large']])
         self.assertEqual({c.logical_document_id for c in self.candidates(limit=2)},
-            {self.ids['small'], self.ids['large-two']})
+            {self.ids['small'], self.ids['large']})  # Oldest head per source, then cost dispatch.
         for candidate in candidates:
             self.passages._prepare(candidate)  # Real decoder validates multipart order/hashes.
 

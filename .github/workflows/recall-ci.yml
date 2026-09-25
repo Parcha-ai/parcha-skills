@@ -67,6 +67,7 @@ jobs:
             e2e_passage_parent_progress.py \
             e2e_passage_dispatch_order.py \
             e2e_passage_set_admission.py \
+            e2e_passage_source_fairness.py \
             e2e_passage_lock_contention.py \
             e2e_logical_streaming_progress.py \
             e2e_logical_admission_sharing.py \

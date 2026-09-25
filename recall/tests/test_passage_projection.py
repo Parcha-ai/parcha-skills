@@ -1254,7 +1254,8 @@ class PassageProjectionTests(unittest.TestCase):
         self.assertIn("ON CONFLICT(tenant_id,source_id,logical_document_id)", seed)
         self.assertIn("DO NOTHING", seed)
         self.assertNotIn("generation+1", seed)
-        self.assertIn("sum(size_part.size_bytes)", pending)
+        self.assertIn("sum(part.size_bytes)", pending)
+        self.assertLess(pending.index("LIMIT %s"), pending.index("LEFT JOIN canonical_evidence_document_parts"))
         self.assertIn("interval '5 minutes'", pending)
 
     def test_embedding_backfill_shards_by_stable_passage_identity(self) -> None:
