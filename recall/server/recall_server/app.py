@@ -1658,6 +1658,7 @@ class Handler(BaseHTTPRequestHandler):
                             "source_id": route["source_id"],
                         },
                         raw_payload=raw,
+                        notification=True,
                     )
                     committed += 1
                     replayed += int(replay)
@@ -1717,6 +1718,7 @@ class Handler(BaseHTTPRequestHandler):
                     [prepared.event],
                     principal=principal,
                     raw_payload=raw,
+                    notification=True,
                 )
                 receipts = acknowledgement.get("receipts")
                 if not isinstance(receipts, list) or len(receipts) != 1:

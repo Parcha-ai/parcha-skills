@@ -23,6 +23,7 @@ from .canonical_text import (
 from .logical_evidence_projection import (
     OVERSIZED_MEDIA_TYPE,
     mark_logical_evidence_dirty,
+    mark_logical_notification_pending,
 )
 from .projectors import item_receipt, validate_envelope
 
@@ -465,6 +466,7 @@ class CanonicalPlane:
         text_redacted: str,
         _connection: Any | None = None,
         _history: Any = None,
+        _notification: bool = False,
     ) -> dict[str, Any]:
         self._validate_host_identity(tenant_id, principal_id, envelope.get("source_id"))
         if not isinstance(connector_id, str) or not IDENTITY_RE.fullmatch(connector_id):
@@ -603,6 +605,10 @@ class CanonicalPlane:
                             source_id=source_id,
                             native_ids=[native_id],
                             reason="ingest",
+                        )
+                    if _notification:
+                        mark_logical_notification_pending(
+                            conn, tenant_id=tenant_id, source_id=source_id, event_id=event_id,
                         )
                     return {
                         "status": "committed",
@@ -753,6 +759,10 @@ class CanonicalPlane:
                     native_ids=affected_native_ids,
                     reason="ingest",
                 )
+                if _notification:
+                    mark_logical_notification_pending(
+                        conn, tenant_id=tenant_id, source_id=source_id, event_id=event_id,
+                    )
                 conn.execute(
                     """INSERT INTO canonical_audit_events(
                            tenant_id,source_id,audit_id,operation,status,

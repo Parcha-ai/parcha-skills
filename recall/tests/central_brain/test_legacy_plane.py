@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 
+import hashlib
 import json
 import os
 import unittest
@@ -331,10 +332,58 @@ class LegacyIngestBridgeTest(unittest.TestCase):
         self.assertEqual(document["principal_id"], "synthetic-owner")
         self.assertEqual(document["connector_id"], "custom.webhook")
         self.assertEqual(document["envelope"]["provenance"]["artifact_ref"], document["artifact_ref"])
-        self.assertEqual(document["text_redacted"], "safe text")
+        self.assertEqual(document["text_redacted"], json.dumps(event["content"], sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False))
+        self.assertEqual(json.loads(document["text_redacted"])["kind"], "communication_message.v1")
         self.assertIs(document["connection"], self.store.connection)
         # The caller's envelope is not mutated by the canonical projection.
         self.assertNotIn("artifact_ref", event["provenance"])
+
+    def test_webhook_type_survives_bridge_for_unknown_and_known_authors(self) -> None:
+        from recall_server.actor_attribution import ActorLink
+        from recall_server.logical_evidence import LogicalEvidenceRecord
+        from recall_server.passage_projection import visible_messages
+
+        bridge = LegacyIngestBridge(self.store, self.plane, self.archive)
+        event = self.envelope()
+        acknowledgement, _ = bridge.ingest("typed-webhook", [event], principal=None)
+        document = self.plane.documents[0]
+        for links in ((), (ActorLink("actor_0123456789abcdef0123456789abcdef", "author"),)):
+            with self.subTest(author_known=bool(links)):
+                record = LogicalEvidenceRecord(ordinal=0, event_native_id=event["native_id"],
+                    event_kind=event["kind"], occurred_at=event["occurred_at"], roles=(),
+                    receipts=tuple(acknowledgement["receipts"]), segment_ordinal=0,
+                    segment_count=1, text=document["text_redacted"], actor_links=links)
+                messages = visible_messages((record,))
+                self.assertEqual(len(messages), 1)
+                self.assertEqual(messages[0].text, "safe text")
+                self.assertEqual(messages[0].actor_links, links)
+                self.assertEqual(messages[0].receipts, record.receipts)
+
+    def test_unrelated_typed_text_does_not_invent_message_visibility(self) -> None:
+        from recall_server.logical_evidence import LogicalEvidenceRecord
+        from recall_server.passage_projection import visible_messages
+
+        event = self.envelope()
+        event["content"] = {"kind": "document.v1", "content_fidelity": "complete",
+            "document_id": "synthetic-doc", "mime_type": "text/plain", "name": "Synthetic",
+            "text": "Synthetic unrelated content."}
+        event["content_sha256"] = hashlib.sha256(legacy_plane.canonical_json(event["content"])).hexdigest()
+        bridge = LegacyIngestBridge(self.store, self.plane, self.archive)
+        acknowledgement, _ = bridge.ingest("untyped-webhook", [event], principal=None)
+        record = LogicalEvidenceRecord(ordinal=0, event_native_id=event["native_id"],
+            event_kind=event["kind"], occurred_at=event["occurred_at"], roles=(),
+            receipts=tuple(acknowledgement["receipts"]), segment_ordinal=0, segment_count=1,
+            text=self.plane.documents[0]["text_redacted"])
+        self.assertEqual(visible_messages((record,)), ())
+
+    def test_bridge_tombstone_stays_empty(self) -> None:
+        event = self.envelope()
+        event["kind"] = "tombstone"
+        event["content"] = {"target_native_id": event["native_id"]}
+        event["content_sha256"] = hashlib.sha256(legacy_plane.canonical_json(event["content"])).hexdigest()
+        LegacyIngestBridge(self.store, self.plane, self.archive).ingest(
+            "deleted-webhook", [event], principal=None)
+        self.assertEqual(self.plane.documents[0]["text_redacted"], "")
 
     def test_replay_reports_one_duplicate_event_and_the_same_receipt(self) -> None:
         bridge = LegacyIngestBridge(self.store, self.plane, self.archive)

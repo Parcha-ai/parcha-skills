@@ -63,6 +63,7 @@ class LogicalGroupCandidate:
     estimated_records: int = 1
     estimated_bytes: int = 1
     admission_priority: int = 1
+    notification_queued_at: datetime | None = None
 
 
 class _LogicalWorkSuperseded(Exception):
@@ -139,6 +140,23 @@ def mark_logical_evidence_dirty(
                            THEN 'forget' ELSE excluded.reason END,
                changed_at=clock_timestamp()""",
         (reason, tenant_id, source_id, native_ids),
+    )
+    return max(0, result.rowcount)
+
+
+def mark_logical_notification_pending(
+    connection: Any, *, tenant_id: str, source_id: str, event_id: str,
+) -> int:
+    """Promote existing work after trusted ingress; never create or invalidate it."""
+    result = connection.execute(
+        """UPDATE canonical_evidence_document_queue queue
+              SET notification_queued_at=clock_timestamp()
+             FROM canonical_events event
+            WHERE event.tenant_id=%s AND event.source_id=%s AND event.event_id=%s
+              AND queue.tenant_id=event.tenant_id AND queue.source_id=event.source_id
+              AND queue.native_parent_id=coalesce(event.native_parent_id,event.native_id)
+              AND queue.notification_queued_at IS NULL""",
+        (tenant_id, source_id, event_id),
     )
     return max(0, result.rowcount)
 
@@ -512,15 +530,18 @@ class CanonicalLogicalEvidenceProjector:
         Give each source's ready head a floor, then share residual admission
         by eligible backlog. Forget takes precedence and retains its existing
         ordering. Normal groups use oldest-first order unless this is a
-        recent-change round. The floor applies before the coordinator excludes
-        in-flight work. Join archive size estimates only after bounded admission.
+        recent-change round. Recent rounds prioritize trusted notifications FIFO,
+        then fall back to recent changes. Oldest rounds retain every source's
+        admission floor before in-flight exclusion. Join archive size estimates
+        only after bounded admission.
         """
         with self.store.connect() as connection:
             rows = connection.execute(
                 """WITH eligible AS MATERIALIZED (
                        SELECT queue.*,
-                              CASE WHEN queue.reason='forget' THEN 0 ELSE 1 END
-                                  AS admission_priority
+                              CASE WHEN queue.reason='forget' THEN 0
+                                   WHEN %s AND queue.notification_queued_at IS NOT NULL THEN 1
+                                   ELSE 2 END AS admission_priority
                          FROM canonical_evidence_document_queue queue
                          WHERE (%s::text IS NULL OR queue.tenant_id=%s)
                            AND queue.attempts<%s
@@ -544,7 +565,9 @@ class CanonicalLogicalEvidenceProjector:
                               row_number() OVER (
                                   PARTITION BY tenant_id,source_id
                                   ORDER BY admission_priority,
-                                           CASE WHEN %s AND admission_priority>0
+                                           CASE WHEN admission_priority=1
+                                                THEN notification_queued_at END,
+                                           CASE WHEN %s AND admission_priority>1
                                                 THEN changed_at END DESC,
                                            first_queued_at,
                                            native_parent_id
@@ -566,6 +589,8 @@ class CanonicalLogicalEvidenceProjector:
                           queue.native_parent_id,
                           queue.changed_at AS source_updated_at,
                           queue.generation,queue.admission_priority,
+                          CASE WHEN queue.admission_priority=1
+                               THEN queue.notification_queued_at END AS notification_queued_at,
                           COALESCE(evidence.revision,0)+1 AS revision,
                           COALESCE(evidence.record_count,1)
                               AS estimated_records,
@@ -597,6 +622,7 @@ class CanonicalLogicalEvidenceProjector:
                              queue.first_queued_at,queue.tenant_id,
                              queue.source_id,queue.native_parent_id""",
                 (
+                    prefer_recent,
                     tenant_id, tenant_id,
                     MAX_LOGICAL_ATTEMPTS,
                     quiet_seconds, quiet_seconds,
@@ -616,6 +642,7 @@ class CanonicalLogicalEvidenceProjector:
                 estimated_records=max(1, int(row["estimated_records"])),
                 estimated_bytes=max(1, int(row["estimated_bytes"])),
                 admission_priority=int(row["admission_priority"]),
+                notification_queued_at=row.get("notification_queued_at"),
             )
             for row in rows
         ]
@@ -2208,7 +2235,8 @@ class CanonicalLogicalEvidenceProjector:
         def fill_slots(executor):
             nonlocal batches
             while len(pending) < worker_count and batches < max_batches:
-                # Both modes keep the SQL's source-fair and forget-first ordering.
+                # Oldest rounds retain source floors; notification rounds keep
+                # forget first, then notification FIFO, then recent fallback.
                 # Exclude queued as well as running owners. Overscan only by
                 # these identifiers, never by fetching additional body data.
                 excluded = deferred | {parent_key(item[0]) for item in pending.values()}
@@ -2224,10 +2252,15 @@ class CanonicalLogicalEvidenceProjector:
                     break
                 # Reorder only the already admitted finite set. Sorting the
                 # overscanned SQL rows first would change which parents enter.
-                # Stable ties retain source/age order; forget still goes first.
-                candidates.sort(key=lambda c: (c.admission_priority, c.estimated_bytes))
+                # Preserve notification FIFO through dispatch; cost ordering is
+                # only for ordinary work. Forget still goes first.
+                candidates.sort(key=lambda c: (
+                    c.admission_priority,
+                    c.notification_queued_at or datetime.max.replace(tzinfo=timezone.utc),
+                    c.estimated_bytes,
+                ))
                 # Share capacity across calls, including one-slot rounds.
-                # Recent means changed canonical state; replay competes too.
+                # Notification/recent rounds alternate with oldest backlog.
                 # Empty scans do not consume a turn. A new process starts old.
                 self._prefer_recent_admission = not self._prefer_recent_admission
                 batches += 1
