@@ -16,6 +16,7 @@ RECALL = Path(__file__).resolve().parents[2]
 SERVER = RECALL / "server"
 sys.path.insert(0, str(SERVER))
 
+from tests.schema_versions import expected_schema_versions  # noqa: E402
 from recall_server import MANDATORY_SCHEMA_VERSION, RETIRE_POSTGRES_PLANE_VERSION, SCHEMA_VERSION  # noqa: E402
 from recall_server.capabilities import (  # noqa: E402
     CAPABILITY_SQL,
@@ -36,7 +37,7 @@ def healthy_snapshot() -> dict:
     return {
         "server_version_num": 170000,
         "vector_version": "0.8.1",
-        "migration_versions": list(range(1, SCHEMA_VERSION + 1)),
+        "migration_versions": expected_schema_versions(),
         "postgres_vector_plane_present": False,
         "ssl_in_use": True,
         "role": {
@@ -170,7 +171,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
         self.assertEqual(retired["postgres_vector_plane"], "retired")
         # 067 recorded but the table still there, or absent with the table gone.
         for versions, present in (
-            (list(range(1, SCHEMA_VERSION + 1)), True),
+            (expected_schema_versions(), True),
             ([v for v in range(1, MANDATORY_SCHEMA_VERSION + 1)
               if v != RETIRE_POSTGRES_PLANE_VERSION], False),
         ):

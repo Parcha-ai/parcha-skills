@@ -36,7 +36,8 @@ def scenario(admin_dsn, root, retired):
         with store.connect() as conn:
             port = conn.info.port
             conn.execute('DROP INDEX canonical_passages_reconcile_idx')
-            conn.execute('DELETE FROM schema_migrations WHERE version=70')
+            # Isolate the historical 069→070 proof from later optional markers.
+            conn.execute('DELETE FROM schema_migrations WHERE version IN (70,71,72)')
             conn.execute(sql.SQL('CREATE ROLE {} LOGIN PASSWORD {}').format(identifier, sql.Literal(password)))
             conn.execute(sql.SQL('GRANT USAGE ON SCHEMA public TO {}').format(identifier))
             conn.execute(sql.SQL('GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA public TO {}').format(identifier))
