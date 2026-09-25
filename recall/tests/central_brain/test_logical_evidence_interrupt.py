@@ -110,6 +110,7 @@ class LogicalEvidenceInterruptTests(TestCase):
                             "revision": 3,
                             "estimated_records": 42,
                             "estimated_bytes": 84,
+                            "admission_priority": 1,
                         }
                     ]
                 )
