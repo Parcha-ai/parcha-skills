@@ -23,7 +23,7 @@ restart as a shortcut.
 Use the Render API under `https://api.render.com/v1` with existing authorized
 credentials. Keep credentials and private state out of the repository and logs.
 Let `SERVICE` denote the projection worker service ID. One operator/controller
-owns the whole transition; exclude concurrent manual deploys and repair writers.
+owns the whole transition; exclude concurrent manual deploys and other writers to the search namespace.
 
 1. Read `GET /services/SERVICE`, `/deploys`, `/instances`, `/jobs` and `/env-vars`.
    Handle pagination rather than assuming the first page is complete. Require
@@ -48,7 +48,7 @@ Use an unquoted standard-library command that imports no Recall code and binds
 only inside the container:
 
 ```sh
-python -u -m http.server 8789 --bind 127.0.0.1
+python -u -m http.server 8789 --bind 127.0.0.1 --directory /nonexistent-recall-cutover
 ```
 
 PATCH only the command via this request shape, encoding the command as a JSON
@@ -72,8 +72,7 @@ the startup marker `Serving HTTP on 127.0.0.1 port 8789` on that exact
 instance label. The deploy ID, start time and new instance ID identify the
 transition; the message itself is not unique. This proves the command override
 actually ran the inert process, including with a Docker ENTRYPOINT. Avoid inline `python -c` quoting that the
-platform may parse differently. Configuration
-alone is insufficient. Record two matching instance/marker observations at least
+platform may parse differently. Configuration alone is insufficient. Record two matching instance/marker observations at least
 10 seconds apart. Do not advance while any old writer remains.
 
 ## Stage 2: restore the command and deploy the candidate
