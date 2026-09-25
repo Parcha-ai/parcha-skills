@@ -1069,6 +1069,14 @@ therefore share capacity between history and recent changes. Recent means the
 queue's canonical change time, not event time: historical replay competes for
 those slots too. This does not guarantee freshness when arrivals exceed capacity.
 
+Within each admitted batch, forget work still starts first; other work starts in
+estimated-byte order with stable ties. The selected parents do not change. Workers
+reject superseded queue snapshots before preparation and after SQL input capture,
+before archive recovery or upload; the final commit fence still applies. This
+saves obsolete work but cannot preempt a running giant or guarantee progress for
+a continuously changing parent. Content-free `logical owner started/completed`
+logs report the parent hash, size estimates, elapsed time and final status.
+
 Passage projection also commits each ready document independently. Only active
 owners retain prepared passage bodies, and commits retain the existing cap of
 8 or one fewer than the database pool size. A progress callback invokes only the

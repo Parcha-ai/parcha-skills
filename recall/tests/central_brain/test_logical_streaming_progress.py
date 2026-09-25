@@ -17,6 +17,10 @@ def candidate(name):
 
 
 class QueueProjector(CanonicalLogicalEvidenceProjector):
+    def _check_candidate_current(self, candidate):
+        # Scheduler-only fake; real queue authority is covered by PostgreSQL tests.
+        return None
+
     def __init__(self, names):
         super().__init__(Store(), None, bound_tenant_id='tenant:test')
         self.queue = [candidate(name) for name in names]

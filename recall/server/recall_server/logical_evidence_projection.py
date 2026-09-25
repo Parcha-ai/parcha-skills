@@ -65,6 +65,10 @@ class LogicalGroupCandidate:
     admission_priority: int = 1
 
 
+class _LogicalWorkSuperseded(Exception):
+    """A worker's captured queue state no longer owns this preparation."""
+
+
 class _LocatorSpool:
     """Private, replayable metadata stream; RAM does not grow with the parent."""
 
@@ -729,13 +733,27 @@ class CanonicalLogicalEvidenceProjector:
             " quarantined" if attempts >= MAX_LOGICAL_ATTEMPTS else "",
         )
 
+    def _check_candidate_current(self, candidate: LogicalGroupCandidate) -> None:
+        with self.store.connect() as connection:
+            queued = connection.execute(
+                """SELECT generation,changed_at
+                     FROM canonical_evidence_document_queue
+                    WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s""",
+                (candidate.tenant_id, candidate.source_id, candidate.native_parent_id),
+            ).fetchone()
+        if (queued is None or queued["generation"] != candidate.generation
+                or queued["changed_at"] != candidate.source_updated_at):
+            raise _LogicalWorkSuperseded
+
     def _prepare_batch_and_upload(
         self,
         candidates: tuple[LogicalGroupCandidate, ...],
-        *, hint_limit: int = 32,
+        *, hint_limit: int = 32, require_current_queue: bool = False,
     ) -> list[LogicalEvidenceUpload | None]:
         if not candidates:
             return []
+        if require_current_queue and len(candidates) != 1:
+            raise ValueError("queue currentness checkpoint requires one worker parent")
         uploads: list[LogicalEvidenceUpload | None] = [None] * len(candidates)
         completed: list[LogicalEvidenceUpload] = []
         spool = tempfile.TemporaryFile(mode="w+b")
@@ -950,6 +968,11 @@ class CanonicalLogicalEvidenceProjector:
                             # accepted as input from another process or source.
                             pickle.dump(dict(row), input_spool, protocol=5)
                         input_ranges.append((ordinal, start, input_spool.tell()))
+            # Worker-only checkpoint: direct corpus audits can prepare groups
+            # without queued work. Stop obsolete workers before archive reads,
+            # re-encoding or uploads; the final commit CAS remains authoritative.
+            if require_current_queue:
+                self._check_candidate_current(candidates[0])
             # Archive recovery and oversized raw restoration run only after
             # the input cursor and its pool connection have been released.
             for ordinal, start, end in input_ranges:
@@ -1030,6 +1053,10 @@ class CanonicalLogicalEvidenceProjector:
                 completed.append(upload)
             transferred = True
             return uploads
+        except _LogicalWorkSuperseded:
+            # The checkpoint precedes every upload. There is nothing to reap;
+            # finally still closes the SQL/input spools and local locators.
+            raise
         except Exception:
             for upload in completed:
                 self._schedule_cleanup(upload.cleanup_references)
@@ -2106,9 +2133,12 @@ class CanonicalLogicalEvidenceProjector:
 
         def prepare_parent(candidate):
             try:
+                self._check_candidate_current(candidate)
                 (upload,) = self._prepare_batch_and_upload(
-                    (candidate,), hint_limit=hint_limit,
+                    (candidate,), hint_limit=hint_limit, require_current_queue=True,
                 )
+            except _LogicalWorkSuperseded:
+                return None, "stale"
             except Exception as error:
                 self._mark_failed(candidate, error)
                 return None, "failed"

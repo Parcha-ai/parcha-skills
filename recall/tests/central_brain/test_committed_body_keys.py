@@ -294,6 +294,7 @@ class PublicationTests(unittest.TestCase):
                 )
                 cleanup = dict(deleted=0, failures=0, completed=0, pending=0)
                 with (
+                    patch.object(p, "_check_candidate_current", return_value=None),
                     patch.object(p, "_pending", return_value=[c]),
                     patch.object(p, "_prepare_batch_and_upload", return_value=[u]),
                     patch.object(p, "drain_cleanup", return_value=cleanup),
@@ -336,6 +337,7 @@ class PublicationTests(unittest.TestCase):
             inline_document_ids=("document",),
         )
         with (
+            patch.object(p, "_check_candidate_current", return_value=None),
             patch.object(p, "_pending", return_value=[candidate]),
             patch.object(p, "_prepare_batch_and_upload", return_value=[upload]),
             patch.object(p, "_commit_upload", return_value="committed"),
@@ -368,7 +370,8 @@ class PublicationTests(unittest.TestCase):
         ]
         budgets = []
 
-        def prepare(candidates, *, hint_limit):
+        def prepare(candidates, *, hint_limit, require_current_queue):
+            self.assertTrue(require_current_queue)
             budgets.append((len(candidates), hint_limit))
             if candidates[0].native_parent_id == "130":
                 raise RuntimeError("synthetic parent error")
@@ -381,6 +384,7 @@ class PublicationTests(unittest.TestCase):
             ]
 
         with (
+            patch.object(p, "_check_candidate_current", return_value=None),
             patch.object(p, "_pending", return_value=rows),
             patch.object(p, "_prepare_batch_and_upload", side_effect=prepare),
             patch.object(p, "_commit_upload", return_value="committed"),
