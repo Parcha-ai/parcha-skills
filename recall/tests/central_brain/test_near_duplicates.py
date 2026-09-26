@@ -1,4 +1,4 @@
-"""Near-duplicate documents fold into the best-ranked copy after the reranker."""
+"""Only similar documents with a shared source and native parent may fold."""
 
 from __future__ import annotations
 
@@ -75,6 +75,8 @@ class GroupTests(unittest.TestCase):
             _result("d", COPIED + " Then I opened the transcript.", rank=0.6, first="2026-05-01T22:15:00Z"),
             _result("e", "", rank=0.5),
         ]
+        for index in (0, 1, 3):
+            results[index]["native_parent_id"] = "shared-session"
         kept, diagnostics = group_near_duplicates(results)
         # The group sits at rank 1; "d" continued latest, so it leads it.
         self.assertEqual([row["logical_document_id"][5] for row in kept], ["d", "c", "e"])
@@ -96,16 +98,52 @@ class GroupTests(unittest.TestCase):
 
     def test_ties_on_the_end_time_keep_the_best_ranked_member(self) -> None:
         results = [_result("a", COPIED, rank=0.9), _result("b", "Sure. " + COPIED, rank=0.8)]
+        for row in results:
+            row["native_parent_id"] = "shared-session"
         kept, _ = group_near_duplicates(results)
         self.assertEqual([row["logical_document_id"][5] for row in kept], ["a"])
         self.assertEqual([item["logical_document_id"][5] for item in kept[0]["similar_documents"]], ["b"])
 
     def test_short_or_empty_leading_text_never_groups(self) -> None:
         results = [_result("a", "short text here", rank=0.9), _result("b", "short text here", rank=0.8), _result("c", "", rank=0.7), _result("d", "", rank=0.6)]
+        for row in results:
+            row["native_parent_id"] = "shared-session"
         kept, diagnostics = group_near_duplicates(results)
         self.assertEqual(len(kept), 4)
         self.assertEqual(diagnostics["near_duplicates_folded"], 0)
 
+
+    def test_identical_independent_messages_keep_rank_and_own_receipts(self) -> None:
+        results = [_result("a", COPIED, rank=0.9),
+                   _result("b", COPIED, rank=0.8, first="2026-05-02T00:00:00Z")]
+        for row in results:
+            row["source_id"] = "slack:workspace"
+        kept, diagnostics = group_near_duplicates(results)
+        self.assertEqual(kept, results)
+        self.assertEqual(kept[0]["matching_ranges"], results[0]["matching_ranges"])
+        self.assertEqual(diagnostics["near_duplicates_folded"], 0)
+
+    def test_unknown_or_different_identity_never_folds(self) -> None:
+        for field in ("source_id", "native_parent_id"):
+            for value in (None, "", "   ", [], {}, 1, True, "different"):
+                with self.subTest(field=field, value=value):
+                    rows = [_result("a", COPIED, rank=0.9), _result("b", COPIED, rank=0.8)]
+                    rows[1]["native_parent_id"] = rows[0]["native_parent_id"]
+                    rows[1][field] = value
+                    self.assertEqual(group_near_duplicates(rows)[0], rows)
+                    if value != "different":
+                        rows[0][field] = value
+                        self.assertEqual(group_near_duplicates(rows)[0], rows)
+            rows = [_result("a", COPIED, rank=0.9), _result("b", COPIED, rank=0.8)]
+            for row in rows:
+                row["native_parent_id"] = "shared-session"
+                del row[field]
+            self.assertEqual(group_near_duplicates(rows)[0], rows)
+
+    def test_shared_parent_in_different_source_families_is_not_a_copy(self) -> None:
+        rows = [_result("a", COPIED, rank=0.9), _result("b", COPIED, rank=0.8)]
+        rows[1].update(source_id="claude:linux:m", native_parent_id=rows[0]["native_parent_id"])
+        self.assertEqual(group_near_duplicates(rows)[0], rows)
 
 class SearchGroupsTests(unittest.TestCase):
     class _Store(ActorRecordingStore):
@@ -114,7 +152,7 @@ class SearchGroupsTests(unittest.TestCase):
         temporal_hints = None
         query_clauses = False
 
-    def _retrieval(self):
+    def _retrieval(self, *, independent=False):
         retrieval = PassageHintRetrieval(
             self._Store(), tenant_id="tenant:test", sources=["codex:linux:test"], policy_fingerprint="fp-policy",
         )
@@ -122,6 +160,15 @@ class SearchGroupsTests(unittest.TestCase):
         for document, score, text in (("a", 0.95, COPIED), ("b", 0.90, "Sure. " + COPIED), ("c", 0.85, "the deploy failed because the migration lock timed out on the worker tonight")):
             row = candidate(document, "dense", score)
             row["text_redacted"] = text
+            if document in ("a", "b"):
+                if independent:
+                    row["source_id"] = "slack:workspace"
+                    row["text_redacted"] = COPIED
+                    row["receipts"] = [f"recall://slack:workspace/{document}?rev=1#item=0"]
+                    if document == "b":
+                        row["last_occurred_at"] = "2026-08-02T00:10:00Z"
+                else:
+                    row["native_parent_id"] = "shared-session"
             rows.append(row)
         retrieval._dense_candidates = lambda query, **kwargs: (rows, "ok", "ann", None)
         retrieval._lexical_candidates = lambda query, **kwargs: ([], "ok")
@@ -136,6 +183,17 @@ class SearchGroupsTests(unittest.TestCase):
         self.assertEqual([item["logical_document_id"][5] for item in response["results"][0]["similar_documents"]], ["b"])
         self.assertEqual(response["diagnostics"]["near_duplicates_folded"], 1)
         self.assertEqual(response["diagnostics"]["near_duplicate_groups"], 1)
+
+    def test_search_keeps_exact_top_receipt_before_later_identical_message(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            response = self._retrieval(independent=True).search(
+                "inline status messages for custom tools", lexical_query="inline status",
+                since=None, until=None, limit=10,
+            )
+        self.assertEqual([row["logical_document_id"][5] for row in response["results"]], ["a", "b", "c"])
+        self.assertEqual(response["results"][0]["matching_ranges"][0]["receipts"],
+                         ["recall://slack:workspace/a?rev=1#item=0"])
+        self.assertEqual(response["diagnostics"]["near_duplicates_folded"], 0)
 
     def test_switch_off_restores_every_document(self) -> None:
         with mock.patch.dict(os.environ, {"RECALL_SEARCH_NEAR_DUPLICATES": "off"}):

@@ -697,17 +697,11 @@ FOCUS_WINDOW_MIN_GAIN = 2
 RERANK_FOCUS_WINDOW = False
 
 
-# H3 follow-up: near-duplicate documents. Codex sessions carry copied
-# history (forks, sub-agent rollouts, re-runs): on the live namespace
-# 23% of the dense candidates share their text hash with a passage in
-# another document, and for one validation question five copies of one
-# session held ranks 1-5 above the answer. After the reranker, on the
-# hydrated text, a document whose leading passage shares most of its
-# word 5-gram shingles with a higher-ranked document folds into it as a
-# "similar document" (ids, source, times, receipts: enough to open it),
-# so the caller reads each piece of evidence once and the slots below
-# go to distinct documents. ``RECALL_SEARCH_NEAR_DUPLICATES=off``
-# disables; the threshold is the shingle Jaccard similarity.
+# Similar text is only a grouping signal within the same known source and
+# native parent. Independent messages must keep their own rank and receipts.
+# Cross-parent copied histories need explicit conversation identity before
+# they can safely fold; that identity is not deployed here. The existing
+# shingle threshold still applies, and RECALL_SEARCH_NEAR_DUPLICATES=off disables.
 NEAR_DUPLICATE_SHINGLE = 5
 NEAR_DUPLICATE_THRESHOLD = 0.6
 _SHINGLE_WORD_RE = re.compile(r"[a-z0-9_]+")
@@ -766,15 +760,12 @@ def group_near_duplicates(
     *,
     threshold: float = NEAR_DUPLICATE_THRESHOLD,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Fold documents whose leading passage duplicates a higher-ranked one.
+    """Fold similar passages only within one known source/native parent.
 
-    A group takes the position of its best-ranked member; the member that
-    continued latest (``last_occurred_at``, ties to the best rank) is the
-    primary and carries the others under ``similar_documents``. Among
-    copies of one piece of history the continuation that ran longest is
-    the most complete one (live: three validation answers were the latest
-    member of their group, never the best-ranked copy). A document with no
-    leading text, or too short for a shingle, never groups.
+    Text similarity alone does not identify a conversation or message. Unknown
+    or different identities stay separate even when their text is identical.
+    Within a known identity, the group keeps its best-ranked position and the
+    latest continuation carries the other members under ``similar_documents``.
     """
 
     groups: list[list[dict[str, Any]]] = []
@@ -785,8 +776,13 @@ def group_near_duplicates(
         signature = text_shingles((ranges[0].get("text") or "") if ranges else "")
         group_index = None
         best = 0.0
-        if signature:
+        source_id, native_parent_id = row.get("source_id"), row.get("native_parent_id")
+        if signature and all(isinstance(value, str) and value.strip() for value in (source_id, native_parent_id)):
             for index, other in enumerate(signatures):
+                representative = groups[index][0]
+                if (representative.get("source_id") != source_id
+                        or representative.get("native_parent_id") != native_parent_id):
+                    continue
                 similarity = shingle_similarity(signature, other)
                 if similarity >= threshold and similarity > best:
                     group_index, best = index, similarity
