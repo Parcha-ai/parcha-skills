@@ -42,6 +42,8 @@ jobs:
       - run: python -m pip install -r server/requirements.txt bandit pip-audit "ruff==0.15.18"
       - name: Notification passage handoff regression
         run: python server/tests/e2e_notification_passage_handoff.py
+      - name: Independent message receipt regression
+        run: python server/tests/e2e_identity_qualified_duplicates.py
       - name: Notification publication regression
         run: python server/tests/e2e_notification_priority.py
       - run: npm test
