@@ -20,6 +20,13 @@ class DeleteBatchTests(unittest.TestCase):
         catalog.enqueue(JULY, reason="forget")
         projector, client = _projector(catalog, batch_rows=32, tokens_per_minute=0,
                                        **kwargs)
+        def settle():
+            # Each fixture owns its paused generators. Their finally logs must
+            # not arrive during an unrelated later test's logging assertion.
+            for _, steps, _ in list(projector._quantum_months):
+                steps.close()
+            projector._quantum_months.clear()
+        self.addCleanup(settle)
         namespace = client.namespace(SETTINGS.namespace(TENANT))
         namespace.write(upsert_rows=[dict(id=ids[0], text="synthetic")])
         namespace.writes.clear()
