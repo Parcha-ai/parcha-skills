@@ -20,8 +20,9 @@ Rate limits (turbopuffer's native-embedding limit is 1024 requests and 2M
 tokens per minute per organisation, HTTP 429 ``RateLimitError``) back off
 1 s, 2 s, 4 s ... capped at 60 s and retry the same batch, for at most
 ``RATE_LIMIT_BUDGET_SECONDS`` per month; the batch is never dropped. Writes
-are clamped to ``max_batch_bytes`` of row payload as well as ``batch_rows``
-(the per-namespace ingest limit is 32 MB/s).
+of upserts are clamped to ``max_batch_bytes`` of row payload as well as
+``batch_rows`` (the per-namespace ingest limit is 32 MB/s). Explicit deletes
+use the same byte budget for the ID array, independently of embedding rows.
 
 Nothing here logs passage text or the API key; failures carry the error
 class only.
@@ -156,6 +157,28 @@ def byte_bounded_batches(rows: list[dict[str, Any]], *, max_rows: int, max_bytes
     if current:
         batches.append(current)
     return batches
+
+
+def delete_id_batches(ids: list[str], *, max_bytes: int) -> Iterator[list[str]]:
+    """Bound explicit deletes by JSON-array bytes, not embedding row count.
+
+    Include brackets, commas and conservative ASCII-escaped string encoding.
+    The captured ID list remains the authority for the final month ACK.
+    """
+    batch: list[str] = []
+    size = 2  # Opening and closing array brackets.
+    for identifier in ids:
+        encoded_size = len(json.dumps(identifier, ensure_ascii=True).encode("utf-8"))
+        if encoded_size + 2 > max_bytes:
+            # Canonical passage IDs fit even the minimum configured budget.
+            raise ValueError("search plane delete ID exceeds batch bytes")
+        if batch and size + 1 + encoded_size > max_bytes:
+            yield batch
+            batch, size = [], 2
+        size += encoded_size + int(bool(batch))
+        batch.append(identifier)
+    if batch:
+        yield batch
 
 
 def is_rate_limit(error: BaseException) -> bool:
@@ -607,8 +630,7 @@ class TurbopufferProjector:
                 tombstones = self.tombstone_ids(connection, claim)
                 connection.commit()
             rate_reported = 0
-            for start in range(0, len(tombstones), self.batch_rows):
-                batch = tombstones[start:start + self.batch_rows]
+            for batch in delete_id_batches(tombstones, max_bytes=self.max_batch_bytes):
                 try:
                     self._write(namespace, budget, timing=timing, deletes=batch)
                 except Exception as error:  # noqa: BLE001 - class checked below
