@@ -182,6 +182,77 @@ class ReadAheadTests(unittest.TestCase):
         self.assertTrue(all(r() is None for r in refs))
         self.assertEqual(reader.reserved_bytes, 0)
 
+    def test_small_part_window_reserves_waiting_and_consuming_bodies(self):
+        from recall_server.parquet_scan import _PartReadAhead
+
+        release_first = threading.Event()
+        waiting_full = threading.Event()
+        consuming = threading.Event()
+        release_owner = threading.Event()
+        finished = []
+        refs = []
+        lock = threading.Lock()
+        errors = []
+        part_bytes = 256 * 1024
+
+        class Body:
+            def __init__(self):
+                self.data = bytearray(part_bytes)
+
+        class Archive:
+            def read_raw(self, part):
+                if part["artifact_id"] == "raw:document:0":
+                    if not release_first.wait(3):
+                        raise AssertionError("test first release missing")
+                value = Body()
+                with lock:
+                    refs.append(weakref.ref(value))
+                    finished.append(part["artifact_id"])
+                    if len(finished) == 31:
+                        waiting_full.set()
+                return value
+
+        parts = [_month_document(f"document:{i}")["parts"][0] for i in range(40)]
+        for part in parts:
+            part["size_bytes"] = part_bytes
+        reader = _PartReadAhead(Archive(), parts)
+
+        def consume():
+            try:
+                with reader:
+                    body = reader(parts[0])
+                    consuming.set()
+                    if not release_owner.wait(3):
+                        raise AssertionError("test owner release missing")
+                    del body
+            except BaseException as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=consume)
+        thread.start()
+        try:
+            self.assertTrue(waiting_full.wait(2),
+                            "small reads did not fill the byte-bounded window")
+            self.assertEqual(len(finished), 31)
+            self.assertEqual(reader.reserved_bytes, 8 * 1024 * 1024)
+            release_first.set()
+            self.assertTrue(consuming.wait(2))
+            self.assertEqual(len(reader.pending), 31)
+            self.assertEqual(reader.consuming_bytes, part_bytes)
+            self.assertEqual(reader.reserved_bytes, 8 * 1024 * 1024)
+            self.assertEqual(sum(ref() is not None for ref in refs), 32)
+            self.assertEqual(len(finished), 32,
+                             "a later part escaped the reserved payload window")
+        finally:
+            release_first.set()
+            release_owner.set()
+            thread.join(4)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        gc.collect()
+        self.assertTrue(all(ref() is None for ref in refs))
+        self.assertEqual(reader.reserved_bytes, 0)
+
     def test_oversized_part_uses_original_owner_path_after_drain(self):
         from recall_server.parquet_scan import _PartReadAhead
 
