@@ -247,8 +247,39 @@ class _MonthTiming:
         finally:
             elapsed = time.monotonic() - started
             with self.lock:
-                self.values[phase][0] += elapsed
-                self.values[phase][1] += 1
+                value = self.values.setdefault(phase, [0.0, 0])
+                value[0] += elapsed
+                value[1] += 1
+
+    def snapshot(self) -> dict[str, tuple[float, int]]:
+        with self.lock:
+            return {phase: (elapsed, count) for phase, (elapsed, count) in self.values.items()}
+
+    def add_since(self, other: _MonthTiming, previous: dict[str, tuple[float, int]]) -> None:
+        # next() has settled all page writers before returning/raising. Copy
+        # numeric deltas only; a paused claim never lends page bodies here.
+        for phase, (elapsed, count) in other.snapshot().items():
+            old_elapsed, old_count = previous[phase]
+            self.values[phase][0] += elapsed - old_elapsed
+            self.values[phase][1] += count - old_count
+
+    def log_quantum(self, result: dict[str, int | str] | None, concurrency: int) -> None:
+        phases = ("claim", "catalog", "page", "pacer", "sdk", "backoff", "commit", "pending")
+        outcome = result or {}
+        LOG.info(
+            "search plane quantum timing returned=%s quantum_ms=%s "
+            "claim_ms=%s claim_calls=%s catalog_ms=%s catalog_calls=%s "
+            "page_ms=%s page_calls=%s pacer_ms=%s pacer_calls=%s "
+            "sdk_ms=%s sdk_calls=%s backoff_ms=%s backoff_calls=%s "
+            "commit_ms=%s commit_calls=%s pending_ms=%s pending_calls=%s "
+            "reported_rows=%s reported_deleted=%s months=%s failed=%s concurrency=%s",
+            int(result is not None), round((time.monotonic() - self.started) * 1000),
+            *(value for phase in phases
+              for elapsed, count in [self.values.get(phase, (0.0, 0))]
+              for value in (round(elapsed * 1000), count)),
+            *(int(outcome.get(key, 0)) for key in ("rows", "deleted", "months", "failed")),
+            concurrency,
+        )
 
     def log(self, succeeded: bool, concurrency: int, *, cooperative: bool = False) -> None:
         LOG.info(
@@ -309,7 +340,7 @@ class TurbopufferProjector:
         self.page_rows = self.batch_rows * concurrency
         self._client = client
         self._quantum_tenant: str | None = None
-        self._quantum_months: deque[tuple[dict[str, Any], Generator[dict[str, Any], None, None]]] = deque()
+        self._quantum_months: deque[tuple[dict[str, Any], Generator[dict[str, Any], None, None], _MonthTiming]] = deque()
 
     @property
     def client(self) -> Any:
@@ -554,14 +585,15 @@ class TurbopufferProjector:
                 return sum(executor.map(write_batch, batches))
         return sum(write_batch(batch) for batch in batches)
 
-    def _month_steps(self, claim: dict[str, Any], *, cooperative: bool = False) -> Generator[dict[str, Any], None, None]:
+    def _month_steps(self, claim: dict[str, Any], *, cooperative: bool = False, timing: _MonthTiming | None = None) -> Generator[dict[str, Any], None, None]:
         """One page/delete batch per step; acknowledge only a complete month.
 
         Paused state retains metadata and exact captured tombstone IDs, never
         passage bodies or open database connections. Tombstone/part metadata
         remains proportional to the month; this is not a fixed RSS bound.
         """
-        timing = _MonthTiming()
+        timing = timing or _MonthTiming()
+        timing.started = time.monotonic()  # Month wall starts on first advancement.
         succeeded = False
         try:
             tenant_id = claim["tenant_id"]
@@ -630,6 +662,19 @@ class TurbopufferProjector:
         return result
 
     def drain_quantum(self, *, tenant_id: str, max_months: int) -> dict[str, int | str]:
+        """Report active call work even when its claim remains unfinished."""
+        timing = _MonthTiming()
+        result = None
+        try:
+            result = self._drain_quantum(tenant_id=tenant_id, max_months=max_months, timing=timing)
+            return result
+        finally:
+            try:
+                timing.log_quantum(result, self.write_concurrency)
+            except Exception:  # noqa: BLE001 - diagnostics must preserve the outcome
+                pass
+
+    def _drain_quantum(self, *, tenant_id: str, max_months: int, timing: _MonthTiming) -> dict[str, int | str]:
         """Advance one page then return to the worker's sole coordinator.
 
         The worker owns this projector for one tenant and process lifetime.
@@ -640,9 +685,9 @@ class TurbopufferProjector:
         if self._quantum_tenant is not None and self._quantum_tenant != tenant_id:
             raise ValueError("search plane quantum tenant changed")
         self._quantum_tenant = tenant_id
-        active = {(claim["source_id"], claim["month"]) for claim, _ in self._quantum_months}
+        active = {(claim["source_id"], claim["month"]) for claim, _, _ in self._quantum_months}
         if len(active) < max_months:
-            with self.store.connect() as connection:
+            with timing.measure("claim"), self.store.connect() as connection:
                 claims = self.claim_months(connection, tenant_id=tenant_id, limit=max_months + len(active))
                 connection.commit()
             for claim in claims:
@@ -650,14 +695,20 @@ class TurbopufferProjector:
                     break
                 key = (claim["source_id"], claim["month"])
                 if key not in active:
-                    self._quantum_months.append((claim, self._month_steps(claim, cooperative=True)))
+                    month_timing = _MonthTiming()
+                    steps = self._month_steps(claim, cooperative=True, timing=month_timing)
+                    self._quantum_months.append((claim, steps, month_timing))
                     active.add(key)
         result: dict[str, int | str] = dict(status="complete", months=0, rows=0,
             deleted=0, failed=0, requeued=0, rate_limited=0, pending=0)
         if self._quantum_months:
-            claim, steps = self._quantum_months.popleft()
+            claim, steps, month_timing = self._quantum_months.popleft()
+            previous = month_timing.snapshot()
             try:
-                step = next(steps)
+                try:
+                    step = next(steps)
+                finally:
+                    timing.add_since(month_timing, previous)
             except Exception as error:  # noqa: BLE001 - retain the outbox for replay
                 steps.close()
                 result["failed"] = 1
@@ -671,8 +722,8 @@ class TurbopufferProjector:
                     result["months"] = 1
                     result["requeued"] = int(not step["retired"])
                 else:
-                    self._quantum_months.append((claim, steps))
-        with self.store.connect() as connection:
+                    self._quantum_months.append((claim, steps, month_timing))
+        with timing.measure("pending"), self.store.connect() as connection:
             result["pending"] = int(connection.execute(
                 "SELECT count(*) AS count FROM search_projection_outbox WHERE tenant_id=%s",
                 (tenant_id,),
