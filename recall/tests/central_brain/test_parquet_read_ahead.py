@@ -1,6 +1,7 @@
 """Archive latency overlap without changing the sequential Parquet owner."""
 
 import copy
+from contextlib import nullcontext
 import gc
 import hashlib
 import weakref
@@ -88,7 +89,7 @@ class ReadAheadTests(unittest.TestCase):
             def _persist_part_bounds(self, bounds):
                 self.seen_bounds.extend(bounds)
 
-        documents = [_month_document(f"document:{i}") for i in range(12)]
+        documents = [_month_document(f"document:{i}") for i in range(40)]
         for document in documents:
             document["actor_links"] = [
                 dict(actor_id="actor:test", display_name="A", relation="speaker")
@@ -110,7 +111,7 @@ class ReadAheadTests(unittest.TestCase):
             context = (
                 mock.patch("recall_server.parquet_scan._PartReadAhead", Serial)
                 if serial
-                else mock.patch("recall_server.parquet_scan.PART_READ_AHEAD_TASKS", 8)
+                else nullcontext()
             )
             with (
                 context,
@@ -374,7 +375,7 @@ class ReadAheadTests(unittest.TestCase):
                 with reader:
                     reader(parts[0])
                     raise KeyboardInterrupt
-        self.assertLessEqual(len(reads), 8)
+        self.assertLessEqual(len(reads), 32)
         self.assertEqual(reader.pending, __import__("collections").deque())
         self.assertTrue(
             all(not thread.is_alive() for thread in reader.executor._threads)

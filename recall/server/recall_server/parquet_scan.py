@@ -146,7 +146,7 @@ def _preserved_fragment_rows(
 
 
 
-PART_READ_AHEAD_TASKS = 8
+PART_READ_AHEAD_TASKS = 32
 PART_READ_AHEAD_BYTES = 8 * 1024 * 1024
 
 
