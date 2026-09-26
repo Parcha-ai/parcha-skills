@@ -44,6 +44,76 @@ PART_TIME_BOUND_CHECKPOINT = 128
 LOG = logging.getLogger(__name__)
 
 
+class _ScanStreamTiming:
+    """Owner-wall counters; project includes read wait and sinks may upload.
+
+    Only scalar counters survive calls. Progress is checked between operations,
+    so five seconds is a logging cadence, never a deadline on a blocked call.
+    """
+
+    def __init__(self):
+        self.started = self.last_log = time.perf_counter()
+        self.seconds = dict.fromkeys(("preserve", "passage", "read", "project"), 0.0)
+        self.calls = dict.fromkeys(self.seconds, 0)
+        self.failed = False
+        self.finished = False
+
+    @contextmanager
+    def measure(self, phase):
+        started = time.perf_counter()
+        try:
+            yield
+        except BaseException:
+            self.failed = True
+            raise
+        finally:
+            self.seconds[phase] += time.perf_counter() - started
+            self.calls[phase] += 1
+            self.report()
+
+    def call(self, phase, function, *args, **kwargs):
+        with self.measure(phase):
+            return function(*args, **kwargs)
+
+    def passages(self, iterable):
+        iterator = iter(iterable)
+        try:
+            while True:
+                # Exhaustion is normal, and its final fetch time still counts.
+                with self.measure("passage"):
+                    passage = next(iterator, None)
+                if passage is None:
+                    return
+                yield passage
+        finally:
+            close = getattr(iterator, "close", None)
+            if close is not None:
+                close()
+
+    def report(self, *, finished=False, upload_ms=-1):
+        if self.finished:
+            return
+        now = time.perf_counter()
+        if not finished and now - self.last_log < 5.0:
+            return
+        self.last_log = now
+        self.finished = finished
+        try:
+            LOG.info(
+                "parquet stage timing finished=%s failed=%s elapsed_ms=%s "
+                "preserve_ms=%s preserve_calls=%s passage_ms=%s passage_calls=%s "
+                "read_ms=%s read_calls=%s project_ms=%s project_calls=%s upload_ms=%s",
+                int(finished), int(self.failed), round((now - self.started) * 1000),
+                round(self.seconds["preserve"] * 1000), self.calls["preserve"],
+                round(self.seconds["passage"] * 1000), self.calls["passage"],
+                round(self.seconds["read"] * 1000), self.calls["read"],
+                round(self.seconds["project"] * 1000), self.calls["project"],
+                upload_ms,
+            )
+        except Exception:
+            pass
+
+
 class ParquetScanError(RuntimeError):
     """Content-free projection failure."""
 
@@ -1748,11 +1818,13 @@ class CanonicalParquetScanProjector:
         first = last = None
         discovered_bounds: list[PartTimeBound] = []
         removed = tuple(sorted(victims))
+        timing = _ScanStreamTiming()
         try:
-            first, last = self._preserve_rows(
+            first, last = timing.call(
+                "preserve", self._preserve_rows,
                 candidate, catalog, victims, rewrite, documents, upload
             )
-            for passage in self._passages(candidate, sorted(members)):
+            for passage in timing.passages(self._passages(candidate, sorted(members))):
                 upload.add(
                     "passages",
                     self._passage_row(candidate, passage),
@@ -1765,8 +1837,8 @@ class CanonicalParquetScanProjector:
                     member = members[document["logical_document_id"]]
                     upload.claim("documents", member)
                     links = document.get("actor_links") or []
-                    projected = self._project_document(
-                        candidate,
+                    projected = timing.call(
+                        "project", self._project_document, candidate,
                         document,
                         bucket_start=bucket_start,
                         bucket_end=bucket_end,
@@ -1778,7 +1850,7 @@ class CanonicalParquetScanProjector:
                             "actors", row, member=member
                         ),
                         collect=False,
-                        read_part=read_part,
+                        read_part=lambda part: timing.call("read", read_part, part),
                     )
                     discovered_bounds.extend(projected.part_bounds)
                     if projected.record_count == 0:
@@ -1879,6 +1951,7 @@ class CanonicalParquetScanProjector:
                 documents_rewritten=len(rewrite_documents),
             )
         except Exception as error:
+            timing.failed = True
             try:
                 upload.abort()
             except Exception:
@@ -1886,8 +1959,11 @@ class CanonicalParquetScanProjector:
             if isinstance(error, _DerivedFragmentUnavailable) and not _rebuild:
                 # One canonical rebuild, after staged objects are handed to
                 # cleanup. Never retry transport, ownership or publication errors.
+                timing.report(finished=True, upload_ms=upload.upload_ms)
                 return self._build(candidate, _rebuild=True)
             raise
+        finally:
+            timing.report(finished=True, upload_ms=upload.upload_ms)
         finished = time.perf_counter()
         LOG.info(
             "parquet build documents=%s rewritten=%s dirty=%s passages=%s records=%s "
