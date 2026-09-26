@@ -121,19 +121,19 @@ class QuantumTests(unittest.TestCase):
         self.assertEqual(catalog.outbox, {})
 
     def test_tombstone_batches_yield_and_only_exact_captured_ids_finish(self):
-        catalog, projector, client = self.fixture()
-        ids = ['psg_' + digit * 32 for digit in ('a', 'b', 'c')]
+        catalog, projector, client = self.fixture(max_batch_bytes=1024)
+        ids = [f"psg_{index:032x}" for index in range(30)]
         catalog.tombstones = [dict(source_id=SOURCE, passage_id=value, month=JULY) for value in ids]
         client.namespace(SETTINGS.namespace(TENANT)).write(
             upsert_rows=[dict(id=ids[0], text='synthetic tombstone target')])
         first = quantum(projector)
-        self.assertEqual((first['deleted'], first['rows'], first['months']), (2, 0, 0))
-        self.assertEqual(len(catalog.tombstones), 3)
+        self.assertEqual((first['deleted'], first['rows'], first['months']), (26, 0, 0))
+        self.assertEqual(len(catalog.tombstones), 30)
         late = 'psg_' + 'd' * 32
         catalog.tombstones.append(dict(source_id=SOURCE, passage_id=late, month=JULY))
         catalog.enqueue(JULY, generation=2, reason='forget')
         second = quantum(projector)
-        self.assertEqual((second['deleted'], second['rows']), (1, 0))
+        self.assertEqual((second['deleted'], second['rows']), (4, 0))
         for _ in range(3):
             quantum(projector)
         self.assertEqual([row['passage_id'] for row in catalog.tombstones], [late])
