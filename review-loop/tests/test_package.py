@@ -62,6 +62,17 @@ class ReviewLoopPackageTest(unittest.TestCase):
         self.assertFalse((SKILL.parent / "references" / "gitlab-api.md").exists())
         self.assertIn("## Provenance", (ROOT / "README.md").read_text())
 
+    def test_pr_comments_are_edited_in_place(self):
+        text = SKILL.read_text()
+        reference = (SKILL.parent / "references" / "graphql-queries.md").read_text()
+        self.assertIn("Keep it to the mention", text)
+        self.assertIn("`OUTDATED`", text)
+        self.assertIn("`<!-- agent-sticky:review-loop -->`", text)
+        self.assertIn("## Sticky comments edited in place", reference)
+        self.assertIn("--method PATCH", reference)
+        self.assertIn("minimizeComment", reference)
+        self.assertIn("Do not use `gh pr comment --edit-last`", reference)
+
 
 if __name__ == "__main__":
     unittest.main()

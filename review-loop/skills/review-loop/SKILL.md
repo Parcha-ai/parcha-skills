@@ -120,7 +120,13 @@ through GraphQL, never assume a reply resolved anything.
   `greptile` (case-insensitive). If its state is `PENDING` or `IN_PROGRESS`, do not post; wait
   for it.
 - The trigger comment text is configurable; the default is `@greptile-apps review`. Post it at
-  most once per push.
+  most once per push. Keep it to the mention: the reason for the re-review belongs in the
+  thread replies, which Greptile reads, not in the trigger. A trigger must be a new comment;
+  do not rely on an edited comment to start a review.
+- After the triggered review finishes (the summary's `updated_at` is later than the trigger),
+  collapse this identity's earlier trigger comments with the GraphQL `minimizeComment`
+  mutation, classifier `OUTDATED`. Never collapse the latest trigger or another author's
+  comment, and never delete a trigger. See `references/graphql-queries.md`.
 - Poll the check run at 10-second intervals for up to 10 minutes. A check run that has only
   just appeared but is still `PENDING` or `IN_PROGRESS` is not a result: wait for a terminal
   `conclusion` AND for the summary comment's `updated_at` to move past the trigger time before
@@ -178,5 +184,9 @@ End with this table. Print it even when the loop stops early.
 | Remaining | N, then one line each: `path:line` and a short quote |
 | Final Greptile score | X/5, or "not installed" |
 | Stop reason | exit criterion met, max iterations, timeout, red gate, auth failure |
+
+The report goes to the caller. Do not post it as a new PR comment. A caller that wants it on
+the PR edits one comment marked `<!-- agent-sticky:review-loop -->` in place, using the upsert
+recipe in `references/graphql-queries.md`.
 
 Write the report and every reply through `unslop` before posting.

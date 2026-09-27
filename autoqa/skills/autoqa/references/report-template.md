@@ -1,8 +1,10 @@
 # autoqa report template
 
 ```markdown
+<!-- agent-sticky:autoqa-report -->
 # autoqa report — <repo> @ <branch/commit> on <instance>
 
+**Head:** `<full 40-hex commit under test>`
 **Date:** <iso date>  **Instance:** <url>  **Evidence:** <evidence dir>
 
 ## Bottom line
@@ -65,4 +67,41 @@ remains.
 ## Instance health after run
 
 <health check output; anything restarted and re-verified>
+
+<details><summary>Earlier heads</summary>
+
+- `<short sha>` <iso time> <verdict>
+
+</details>
 ```
+
+The first line is the marker a caller uses to find this report on a pull request and edit it
+in place. `Head:` names the commit the verdicts belong to; a reader checks it against the PR
+head instead of trusting the comment's timestamp. `Earlier heads` keeps one line per earlier
+run of the same PR, newest first, at most ten; omit the block on the first run.
+
+## Publishing to a pull request
+
+Edit the existing report comment; create one only when none exists. `BOT_LOGIN` is the
+authenticated `gh` identity (`gh api graphql -f query='{viewer{login}}' --jq .data.viewer.login`).
+
+```bash
+MARKER="<!-- agent-sticky:autoqa-report -->"
+COMMENT_ID="$(gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100" \
+  --jq ".[] | select(.user.login == \"$BOT_LOGIN\" and (.body | startswith(\"$MARKER\"))) | .id" \
+  | head -n1)"
+
+if [ -n "$COMMENT_ID" ]; then
+  gh api --method PATCH "repos/$REPO/issues/comments/$COMMENT_ID" \
+    -F body=@autoqa-report.md --jq .html_url
+else
+  gh pr comment "$PR" -R "$REPO" --body-file autoqa-report.md
+fi
+```
+
+- Search every page right before writing; an ID read earlier may be stale.
+- `-F body=@file` reads the body from the file. Never pass a multi-line body inline.
+- Do not use `gh pr comment --edit-last`: it edits the identity's latest comment of any kind,
+  which may be a review trigger or a thread answer.
+- An edit sends no notification. When a result needs a person's attention, reach them
+  through the caller's notify path, not a second PR comment.
