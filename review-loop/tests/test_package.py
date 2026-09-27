@@ -72,6 +72,9 @@ class ReviewLoopPackageTest(unittest.TestCase):
         self.assertIn("--method PATCH", reference)
         self.assertIn("minimizeComment", reference)
         self.assertIn("Do not use `gh pr comment --edit-last`", reference)
+        self.assertIn("Freshness guard", reference)
+        self.assertIn("IN($ROSTER[])", reference)
+        self.assertIn("including older prose triggers", text)
 
 
 if __name__ == "__main__":

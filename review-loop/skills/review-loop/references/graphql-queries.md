@@ -98,15 +98,25 @@ gh api --paginate "repos/{owner}/{repo}/issues/<PR_NUMBER>/comments?per_page=100
 
 A top-level comment that reports state (a QA report, a merge summary, this loop's report)
 exists once per pull request and kind. Its first line is `<!-- agent-sticky:<kind> -->`.
-Find it and edit it; create it only when none exists. `BOT_LOGIN` is the authenticated
-identity (`gh api graphql -f query='{viewer{login}}' --jq .data.viewer.login`).
+Find it and edit it; create it only when none exists. The comment belongs to the PR, not
+to the agent that wrote it: `ROSTER` is the JSON list of agent identities that may own it, so
+an agent that takes over a PR edits the existing comment. It defaults to the authenticated
+identity alone (`BOT_LOGIN`, from `gh api graphql -f query='{viewer{login}}' --jq
+.data.viewer.login`). `HEAD_SHA` is the commit the body describes.
 
 ```bash
+ROSTER="${ROSTER:-[\"$BOT_LOGIN\"]}"
 MARKER="<!-- agent-sticky:$KIND -->"
+
+# Freshness guard: never write a body for a head the PR has moved past.
+PR_HEAD="$(gh pr view <PR_NUMBER> --json headRefOid --jq .headRefOid)"
+[ "$HEAD_SHA" = "$PR_HEAD" ] || { echo "stale: body is for $HEAD_SHA, PR head is $PR_HEAD"; exit 1; }
+
 { printf '%s\n' "$MARKER"; cat "$BODY_FILE"; } > "$BODY_FILE.sticky"
 
+# The oldest matching comment is the canonical one.
 COMMENT_ID="$(gh api --paginate "repos/{owner}/{repo}/issues/<PR_NUMBER>/comments?per_page=100" \
-  --jq ".[] | select(.user.login == \"$BOT_LOGIN\" and (.body | startswith(\"$MARKER\"))) | .id" \
+  --jq ".[] | select((.user.login | IN($ROSTER[])) and (.body | startswith(\"$MARKER\"))) | .id" \
   | head -n1)"
 
 if [ -n "$COMMENT_ID" ]; then
@@ -118,22 +128,31 @@ fi
 ```
 
 - Search every page right before writing. Do not reuse an ID read earlier.
-- If a create races another writer and two comments carry this identity's marker, keep the
-  oldest, copy the newer body into it, and delete the newer one with
-  `gh api --method DELETE "repos/{owner}/{repo}/issues/comments/<id>"`. Delete only this
-  identity's own comments.
+- Verify after every write: list the matching comments again and re-read the PR head.
+  - If the head moved, stop; the writer for the new head owns the next update.
+  - If more than one matching comment exists (two writers created at once), the oldest stays
+    and must carry the body whose `Head:` equals the PR head; copy it in if needed. Delete
+    this identity's own extras with
+    `gh api --method DELETE "repos/{owner}/{repo}/issues/comments/<id>"` and collapse other
+    identities' extras as `OUTDATED`. Never delete another account's comment.
+  - If the oldest comment's `Head:` is not the PR head, a concurrent writer replaced a
+    current body with a stale one; rewrite it once with this body.
+- If an edit of another identity's comment is refused, create this identity's own and
+  collapse the other as `OUTDATED`.
 - Do not use `gh pr comment --edit-last`: it edits the identity's latest comment of any kind,
   which may be a trigger.
 - An edit notifies nobody. Do not add an `@mention` to an edit and expect it to notify.
 
 ## Collapse earlier trigger comments
 
-After the triggered review finishes, minimize this identity's earlier `@greptile-apps`
-comments as outdated. The last line of the list is the latest trigger, which stays visible:
+After the triggered review finishes, minimize the earlier triggers as outdated. A trigger is
+any comment by the roster that mentions `@greptile-apps` and is not a sticky, so older prose
+triggers (`@greptile-apps please review again …`) are included. The last line of the list is
+the latest trigger, which stays visible:
 
 ```bash
 gh api --paginate "repos/{owner}/{repo}/issues/<PR_NUMBER>/comments?per_page=100" \
-  --jq ".[] | select(.user.login == \"$BOT_LOGIN\" and (.body | startswith(\"@greptile-apps\"))) | .node_id" \
+  --jq ".[] | select((.user.login | IN($ROSTER[])) and (.body | test(\"@greptile-apps\")) and (.body | startswith(\"<!-- agent-sticky:\") | not)) | .node_id" \
   | sed '$d' \
   | while read -r NODE_ID; do
       gh api graphql -f id="$NODE_ID" -f query='

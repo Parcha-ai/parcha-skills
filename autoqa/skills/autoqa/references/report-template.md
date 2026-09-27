@@ -84,11 +84,19 @@ run of the same PR, newest first, at most ten; omit the block on the first run.
 
 Edit the existing report comment; create one only when none exists. `BOT_LOGIN` is the
 authenticated `gh` identity (`gh api graphql -f query='{viewer{login}}' --jq .data.viewer.login`).
+`ROSTER` is the JSON list of agent identities that may own the report, so an agent that takes
+over a PR edits the report another agent posted. It defaults to this identity alone.
+`HEAD_SHA` is the commit the report describes.
 
 ```bash
+ROSTER="${ROSTER:-[\"$BOT_LOGIN\"]}"
 MARKER="<!-- agent-sticky:autoqa-report -->"
+
+PR_HEAD="$(gh pr view "$PR" -R "$REPO" --json headRefOid --jq .headRefOid)"
+[ "$HEAD_SHA" = "$PR_HEAD" ] || { echo "stale: report is for $HEAD_SHA, PR head is $PR_HEAD"; exit 1; }
+
 COMMENT_ID="$(gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100" \
-  --jq ".[] | select(.user.login == \"$BOT_LOGIN\" and (.body | startswith(\"$MARKER\"))) | .id" \
+  --jq ".[] | select((.user.login | IN($ROSTER[])) and (.body | startswith(\"$MARKER\"))) | .id" \
   | head -n1)"
 
 if [ -n "$COMMENT_ID" ]; then
@@ -99,7 +107,10 @@ else
 fi
 ```
 
-- Search every page right before writing; an ID read earlier may be stale.
+- Never write a report for a head the PR has moved past; the guard above refuses it.
+- Search every page right before writing; an ID read earlier may be stale. The oldest
+  matching comment is the report; after writing, list again and follow the race rule in
+  `review-loop`'s query reference if more than one exists.
 - `-F body=@file` reads the body from the file. Never pass a multi-line body inline.
 - Do not use `gh pr comment --edit-last`: it edits the identity's latest comment of any kind,
   which may be a review trigger or a thread answer.

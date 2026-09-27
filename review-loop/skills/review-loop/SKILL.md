@@ -124,9 +124,11 @@ through GraphQL, never assume a reply resolved anything.
   thread replies, which Greptile reads, not in the trigger. A trigger must be a new comment;
   do not rely on an edited comment to start a review.
 - After the triggered review finishes (the summary's `updated_at` is later than the trigger),
-  collapse this identity's earlier trigger comments with the GraphQL `minimizeComment`
-  mutation, classifier `OUTDATED`. Never collapse the latest trigger or another author's
-  comment, and never delete a trigger. See `references/graphql-queries.md`.
+  collapse the earlier trigger comments by the caller's agent identities with the GraphQL
+  `minimizeComment` mutation, classifier `OUTDATED`. A trigger is any such comment that
+  mentions `@greptile-apps`, including older prose triggers. Never collapse the latest
+  trigger or a human's comment, and never delete a trigger. See
+  `references/graphql-queries.md`.
 - Poll the check run at 10-second intervals for up to 10 minutes. A check run that has only
   just appeared but is still `PENDING` or `IN_PROGRESS` is not a result: wait for a terminal
   `conclusion` AND for the summary comment's `updated_at` to move past the trigger time before
