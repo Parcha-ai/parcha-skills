@@ -204,6 +204,12 @@ modality, result, witness path), the Before / After table for changed rows, fail
 can act on. The Before / After table is written so a caller can lift it into a PR body once
 the images are published.
 
+When a caller publishes the report to a pull request, the PR keeps one report comment. Find
+the comment that starts with `<!-- agent-sticky:autoqa-report -->` and edit it for the new
+head, moving the previous verdict into `Earlier heads`; create it only when none exists. Never
+post a second report. The upsert recipe is at the end of
+[references/report-template.md](references/report-template.md).
+
 Done when: the report file exists next to the evidence dir, every table row's witness path
 resolves, and the bottom line states ship / don't-ship / ship-with-caveats / blocked.
 

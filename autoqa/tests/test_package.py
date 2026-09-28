@@ -44,6 +44,15 @@ class AutoqaPackageTest(unittest.TestCase):
         self.assertIn("Changed behavior + seams (Recommended)", text)
         self.assertIn("Stateful/destructive cases", text)
 
+    def test_report_is_one_pr_comment_edited_in_place(self):
+        text = SKILL.read_text()
+        template = (SKILL.parent / "references" / "report-template.md").read_text()
+        self.assertIn("Never\npost a second report", text)
+        self.assertTrue(template.split("```markdown\n", 1)[1].startswith("<!-- agent-sticky:autoqa-report -->\n"))
+        self.assertIn("**Head:**", template)
+        self.assertIn("Earlier heads", template)
+        self.assertIn("--method PATCH", template)
+
 
 if __name__ == "__main__":
     unittest.main()
