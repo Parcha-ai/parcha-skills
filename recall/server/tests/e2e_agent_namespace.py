@@ -90,6 +90,23 @@ print(json.dumps(dict(checks=checks,caps=caps,ordinary_shell_and_threads=True,ne
 PY
 """
 
+FLAGS_PROGRAM = r"""python3 - <<'PY'
+import errno,json,pathlib
+path=pathlib.Path('/tmp/recall-authorized')/ALLOWED
+rows=[line.split() for line in pathlib.Path('/proc/self/mountinfo').read_text().splitlines()]
+actual=next(set(row[5].split(',')) for row in rows if row[4]==str(path))
+assert actual==EXPECTED_FLAGS,(actual,EXPECTED_FLAGS)
+assert path.read_bytes()==b'synthetic-allowed'
+try:
+ with path.open('ab') as stream:stream.write(b'UNEXPECTED-WRITE')
+except OSError as error:
+ assert error.errno==errno.EROFS,error
+else:
+ raise AssertionError('write succeeded')
+print(json.dumps(dict(flags=sorted(actual),write_errno=errno.EROFS)))
+PY
+"""
+
 
 def main():
     if os.geteuid() != 0:
@@ -117,6 +134,22 @@ def main():
             allowed = put(b"synthetic-allowed")
             private = put(b"synthetic-private")
             tool = put(b'#!/bin/sh\nprintf "1\\n"\n')
+
+            def execute(command, source_options=None):
+                prelude = (
+                    "set -eu\nmount --make-rprivate /\n"
+                    "mount -t tmpfs tmpfs /docs\nmount -t tmpfs tmpfs /datasets\n"
+                    "mount -t tmpfs tmpfs /mnt\nmkdir -p /mnt/archil/evidence\n"
+                    "mount --bind " + shlex.quote(str(evidence)) + " /mnt/archil/evidence\n"
+                    + ("mount -o " + shlex.quote('remount,bind,' + source_options)
+                       + " /mnt/archil/evidence\n" if source_options else "")
+                    + "mount -t tmpfs tmpfs /tmp\n"
+                )
+                return subprocess.run(
+                    ["unshare", "--mount", "--fork", "bash", "-s"],
+                    input=prelude + command, text=True, capture_output=True, timeout=60,
+                )
+
             results = []
             for scan in (False, True):
                 program = PROGRAM.replace("ALLOWED", repr(allowed.object_key)).replace(
@@ -129,22 +162,31 @@ def main():
                     tool_objects={"linux-x86_64": tool, "linux-arm64": tool} if scan else None,
                     allow_missing_objects=scan,
                 )
-                prelude = (
-                    "set -eu\nmount --make-rprivate /\n"
-                    "mount -t tmpfs tmpfs /docs\nmount -t tmpfs tmpfs /datasets\n"
-                    "mount -t tmpfs tmpfs /mnt\nmkdir -p /mnt/archil/evidence\n"
-                    "mount --bind " + shlex.quote(str(evidence)) + " /mnt/archil/evidence\n"
-                    "mount -t tmpfs tmpfs /tmp\n"
-                )
-                result = subprocess.run(
-                    ["unshare", "--mount", "--fork", "bash", "-s"],
-                    input=prelude + command, text=True, capture_output=True, timeout=60,
-                )
+                result = execute(command)
                 assert result.returncode == 0, (scan, result.stdout, result.stderr)
                 proof = json.loads(result.stdout)
                 assert proof["checks"] == 15
                 results.append({"scan": scan, **proof})
-        print(json.dumps({"status": "pass", "synthetic_only": True, "results": results}))
+            flag_results = []
+            for options in (
+                'rw,nosuid,nodev,noexec,relatime',
+                'ro,nosuid,nodev,noexec,relatime',
+                'rw,nosuid,nodev,noexec,noatime,nodiratime',
+                'rw,nosuid,nodev,noexec,strictatime',
+                'rw,nosuid,nodev,noexec,relatime,nosymfollow',
+            ):
+                # mountinfo represents strictatime by absence of the other modes.
+                expected = (set(options.split(',')) - {'rw', 'strictatime'}) | {'ro'}
+                program = FLAGS_PROGRAM.replace('ALLOWED', repr(allowed.object_key)).replace('EXPECTED_FLAGS', repr(expected))
+                command = _agent_exec_command(
+                    program=program, objects=(allowed,), document_aliases={},
+                    record_spans={}, routing_receipts={}, timeout_seconds=30,
+                )
+                result = execute(command, options)
+                assert result.returncode == 0, (options, result.stdout, result.stderr)
+                flag_results.append({'source': options, **json.loads(result.stdout)})
+        print(json.dumps({"status": "pass", "synthetic_only": True, "results": results,
+                          "inherited_flags": flag_results}))
     finally:
         for path in reversed(made):
             path.rmdir()

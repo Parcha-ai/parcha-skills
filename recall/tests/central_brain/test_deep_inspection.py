@@ -920,7 +920,8 @@ class DeepInspectionContractTests(unittest.TestCase):
             "mount --rbind /tmp/recall-authorized /mnt/archil/evidence",
             command,
         )
-        self.assertIn('subprocess.run(["mount","--bind"', command)
+        self.assertIn('checked_mount(libc.mount,', command)
+        self.assertIn('checked_mount(libc.syscall,442,', command)
         self.assertIn("hashlib.sha256", command)
         self.assertIn("shutil.copyfile", command)
         self.assertIn("env -i HOME=/tmp", command)
