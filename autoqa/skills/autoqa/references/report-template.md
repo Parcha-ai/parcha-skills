@@ -78,7 +78,9 @@ remains.
 The first line is the marker a caller uses to find this report on a pull request and edit it
 in place. `Head:` names the commit the verdicts belong to; a reader checks it against the PR
 head instead of trusting the comment's timestamp. `Earlier heads` keeps one line per earlier
-run of the same PR, newest first, at most ten; omit the block on the first run.
+run of the same PR, newest first, at most ten. The publisher maintains it when it edits the
+PR comment, and a repository helper may rebuild it; a report that is not yet published omits
+it.
 
 ## Publishing to a pull request
 
