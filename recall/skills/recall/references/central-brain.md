@@ -40,8 +40,9 @@ searching unrelated credential stores or rendering secret values.
 
 With no central configuration, every command behaves exactly as the local engine in `SKILL.md`.
 Setting `RECALL_URL` selects the tailnet central service for read commands (`search`, `show`,
-`related`, and `doctor`) and enables deliberate writes (`put` and `delete`). The same flags and output shapes remain valid, and every displayed remote
-hit includes its resolvable receipt on the `WHY` line.
+`related`, and `doctor`) and enables deliberate writes (`put` and `delete`). Every displayed remote
+hit includes its resolvable receipt on the `WHY` line. Local and legacy REST flags remain available;
+MCP commands honor the server's published contract.
 
 Use an explicit `/mcp` suffix for a public or managed MCP endpoint, for example
 `RECALL_URL=https://recall.example.com/mcp`. The skill then calls the scoped
@@ -49,6 +50,20 @@ Use an explicit `/mcp` suffix for a public or managed MCP endpoint, for example
 `recall_forget` tools directly; `doctor` uses MCP ping. `session-export` has no
 MCP tool and fails closed. A URL without `/mcp` preserves the legacy REST
 transport.
+
+For MCP search, `--harness claude` and `--harness codex` select the corresponding
+source connector. This constraint intersects `--source-id`, `--source-family`,
+`--source-alias`, and the caller's authorized sources. MCP search does not expose
+working-directory or branch filters: `--cwd` and `--branch` fail before a request
+instead of silently widening the search.
+
+Hosted `show <receipt>` opens one exact record. The CLI omits neutral defaults and
+checks the advertised schema only when `--tail`, `--around`, or `--prompts` is
+requested. Legacy MCP servers can retain those modifiers. Canonical MCP servers
+reject them with guidance to use `recall_session_context` for neighboring records
+or `recall_exec` for a full-session window. A receipt's neighbors are not equivalent
+to the final turns of its session or a timestamp window, so the CLI does not
+substitute one for the other.
 
 ### Direct MCP retrieval
 

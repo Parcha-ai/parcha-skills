@@ -242,6 +242,70 @@ def _mcp_time_bound(value):
     return value
 
 
+def _mcp_roundtrip(base: str, message: dict) -> dict:
+    headers = remote_headers()
+    headers["Accept"] = "application/json, text/event-stream"
+    headers["MCP-Protocol-Version"] = MCP_PROTOCOL_VERSION
+    request = urllib.request.Request(
+        base,
+        data=json.dumps(message, sort_keys=True).encode(),
+        method="POST",
+        headers=headers,
+    )
+    try:
+        with _open_remote(
+            request,
+            timeout=float(
+                os.environ.get("RECALL_TIMEOUT", str(DEFAULT_REMOTE_TIMEOUT_SECONDS))
+            ),
+        ) as response:
+            rendered = _read_remote_object(response)
+    except urllib.error.HTTPError as exc:
+        exc.read(MAX_REMOTE_RESPONSE_BYTES + 1)
+        raise RemoteRecallError(f"HTTP {exc.code}: MCP request failed") from exc
+    except (OSError, urllib.error.URLError, json.JSONDecodeError, ValueError) as exc:
+        raise RemoteRecallError(type(exc).__name__) from exc
+
+    error = rendered.get("error")
+    if isinstance(error, dict):
+        code = error.get("code")
+        raise RemoteRecallError(f"MCP {code}: tool call failed")
+    if rendered.get("id") != message["id"] or not isinstance(rendered.get("result"), dict):
+        raise RemoteRecallError("MCP response is invalid")
+    return rendered["result"]
+
+
+def _mcp_show_arguments(base: str, arguments: dict) -> dict:
+    # Neutral defaults are omitted on both canonical and legacy MCP servers.
+    arguments = {
+        key: value for key, value in arguments.items()
+        if not ((key == "tail" and value == 0) or (key == "prompts" and value is False))
+    }
+    modifiers = set(arguments) - {"target"}
+    if not modifiers:
+        return arguments
+    # Only an explicit window/role request needs discovery. Canonical show opens
+    # one exact receipt; its contract cannot stand in for a whole-session tail.
+    catalog = _mcp_roundtrip(base, {
+        "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {},
+    })
+    tools = catalog.get("tools")
+    schemas = [
+        tool.get("inputSchema") for tool in tools
+        if isinstance(tool, dict) and tool.get("name") == "recall_show"
+    ] if isinstance(tools, list) else []
+    if len(schemas) != 1 or not isinstance(schemas[0], dict) or not isinstance(schemas[0].get("properties"), dict):
+        raise RemoteRecallError("MCP did not advertise a usable recall_show schema")
+    unsupported = modifiers - set(schemas[0]["properties"])
+    if unsupported:
+        flags = ", ".join("--" + name for name in sorted(unsupported))
+        raise RemoteRecallError(
+            f"This MCP recall_show does not support {flags}; use recall_session_context "
+            "for receipt neighbors or recall_exec for a full-session window"
+        )
+    return arguments
+
+
 def _mcp_call(base: str, method: str, path: str, body: dict | None) -> dict:
     if path == "/v1/session-export":
         raise RemoteRecallError("session export is not available over MCP")
@@ -301,6 +365,24 @@ def _mcp_call(base: str, method: str, path: str, body: dict | None) -> dict:
                 key: _mcp_time_bound(value) if key in {"since", "until"} else value
                 for key, value in filters.items()
             }
+            if path == "/v1/search":
+                filters = arguments["filters"]
+                unsupported = set(filters) & {"cwd", "branch"}
+                if unsupported:
+                    flags = ", ".join("--" + name for name in sorted(unsupported))
+                    raise RemoteRecallError(
+                        f"MCP search does not support {flags}; use --source-id, "
+                        "--source-family, or --source-alias for an exact source constraint"
+                    )
+                harness = filters.pop("harness", None)
+                if harness is not None:
+                    if harness not in {"claude", "codex"}:
+                        raise RemoteRecallError("MCP --harness must be claude or codex")
+                    if filters.get("source_connector", harness) != harness:
+                        raise RemoteRecallError("MCP harness and source_connector filters conflict")
+                    filters["source_connector"] = harness
+        if path == "/v1/show":
+            arguments = _mcp_show_arguments(base, arguments)
         message = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -310,36 +392,7 @@ def _mcp_call(base: str, method: str, path: str, body: dict | None) -> dict:
     else:
         raise RemoteRecallError("unsupported MCP operation")
 
-    headers = remote_headers()
-    headers["Accept"] = "application/json, text/event-stream"
-    headers["MCP-Protocol-Version"] = MCP_PROTOCOL_VERSION
-    request = urllib.request.Request(
-        base,
-        data=json.dumps(message, sort_keys=True).encode(),
-        method="POST",
-        headers=headers,
-    )
-    try:
-        with _open_remote(
-            request,
-            timeout=float(
-                os.environ.get("RECALL_TIMEOUT", str(DEFAULT_REMOTE_TIMEOUT_SECONDS))
-            ),
-        ) as response:
-            rendered = _read_remote_object(response)
-    except urllib.error.HTTPError as exc:
-        exc.read(MAX_REMOTE_RESPONSE_BYTES + 1)
-        raise RemoteRecallError(f"HTTP {exc.code}: MCP request failed") from exc
-    except (OSError, urllib.error.URLError, json.JSONDecodeError, ValueError) as exc:
-        raise RemoteRecallError(type(exc).__name__) from exc
-
-    error = rendered.get("error")
-    if isinstance(error, dict):
-        code = error.get("code")
-        raise RemoteRecallError(f"MCP {code}: tool call failed")
-    if rendered.get("id") != message["id"] or not isinstance(rendered.get("result"), dict):
-        raise RemoteRecallError("MCP response is invalid")
-    result = rendered["result"]
+    result = _mcp_roundtrip(base, message)
     if message["method"] == "ping":
         return {"status": "ok", "transport": "mcp"}
     structured = result.get("structuredContent")
