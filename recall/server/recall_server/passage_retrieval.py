@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -29,6 +30,7 @@ from .passage_representations import FINGERPRINT_RE, VECTOR_COLUMNS
 from .rerank import (
     DEFAULT_RERANK_BLEND,
     DEFAULT_RERANK_MIN_BUDGET_SECONDS,
+    MAX_CANDIDATES_CEILING,
     RerankUnavailable,
 )
 from .temporal_hints import (
@@ -2531,9 +2533,10 @@ class PassageHintRetrieval:
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Rerank the fused passage pool; on any shortfall keep the fused order.
 
-        Contract: the provider receives the query plus the redacted text of at
-        most ``runtime.max_candidates`` passages (the runtime truncates each to
-        its configured width). Statuses: ``ok`` (scores applied, or nothing to
+        Contract: the provider receives the query plus available redacted
+        matching passages from the admitted document pool, up to the provider
+        input ceiling. Each passage retains the runtime's configured width.
+        Statuses: ``ok`` (scores applied, or nothing to
         send), ``skipped-budget`` (less than the minimum budget remained after
         the arms), ``unavailable`` (``RerankUnavailable``; fused order kept).
         ``arm_elapsed_ms["rerank"]`` is set only when the provider was called
@@ -2553,6 +2556,14 @@ class PassageHintRetrieval:
         if remaining < min_budget:
             diagnostics["rerank_status"] = "skipped-budget"
             return results, diagnostics
+        # The document budget was applied before hydration. Score its matching
+        # passages too, so an arbitrary first range cannot hide better evidence.
+        # Keep the expanded passage capacity local to this request.
+        runtime = copy.copy(runtime)
+        runtime.max_candidates = min(
+            MAX_CANDIDATES_CEILING,
+            max(int(runtime.max_candidates), sum(len(row.get("matching_ranges") or ()) for row in results)),
+        )
         # The provider reads at most ``max_doc_chars`` of each passage; send
         # the passage's context line (source, time, people) followed by the
         # text (the query-densest window when RERANK_FOCUS_WINDOW is on).
