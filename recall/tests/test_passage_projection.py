@@ -1453,14 +1453,17 @@ class PassageProjectionTests(unittest.TestCase):
                 "text_redacted": passage, "score": score,
             }
 
-        for sparse_scale in (1.0, 1000.0):
-            with self.subTest(sparse_scale=sparse_scale):
-                result = collapse_document_candidates((
+        for sparse_scale, reverse_arms in ((1.0, False), (1000.0, False), (1000.0, True)):
+            with self.subTest(sparse_scale=sparse_scale, reverse_arms=reverse_arms):
+                legs = (
                     ("dense", 0.65, [row("best-dense", 0.9), row("lexical", 0.8)]),
                     ("passage-lexical", 0.1, [row("lexical", 30.0)]),
                     ("sparse-exact", 0.25, [row("lexical", 16 * sparse_scale),
                                            row("best-dense", 10 * sparse_scale)]),
-                ), limit=1)[0]
+                )
+                result = collapse_document_candidates(
+                    tuple(reversed(legs)) if reverse_arms else legs, limit=1,
+                )[0]
                 ranges = result["matching_ranges"]
                 self.assertEqual(ranges[0]["passage_id"], "best-dense")
                 self.assertEqual(ranges[0]["kind"], "dense")
