@@ -1438,6 +1438,37 @@ class PassageProjectionTests(unittest.TestCase):
         k_only = next(r for r in only_sparse if r["logical_document_id"][5] == "k")["matching_ranges"]
         self.assertEqual([item["kind"] for item in k_only], ["sparse-exact"])
 
+    def test_shared_passage_keeps_strongest_prose_arm_before_reranking(self) -> None:
+        # Sparse scores must not relabel dense evidence as an exact-only range.
+        # In production that sent a weaker lexical passage to the reranker and
+        # moved a gold document from fused rank 2 to final rank 24.
+        def row(passage: str, score: float) -> dict:
+            return {
+                "source_id": "source:test", "logical_document_id": "ldoc_target",
+                "revision": 1, "native_parent_id": "session:test",
+                "first_occurred_at": "2026-07-27", "last_occurred_at": "2026-07-27",
+                "manifest_object_key": "key", "manifest_content_sha256": "hash",
+                "passage_id": passage, "passage_ordinal": 0, "spans": [],
+                "receipts": [f"recall://source:test/{passage}?rev=1#item=0"],
+                "text_redacted": passage, "score": score,
+            }
+
+        for sparse_scale in (1.0, 1000.0):
+            with self.subTest(sparse_scale=sparse_scale):
+                result = collapse_document_candidates((
+                    ("dense", 0.65, [row("best-dense", 0.9), row("lexical", 0.8)]),
+                    ("passage-lexical", 0.1, [row("lexical", 30.0)]),
+                    ("sparse-exact", 0.25, [row("lexical", 16 * sparse_scale),
+                                           row("best-dense", 10 * sparse_scale)]),
+                ), limit=1)[0]
+                ranges = result["matching_ranges"]
+                self.assertEqual(ranges[0]["passage_id"], "best-dense")
+                self.assertEqual(ranges[0]["kind"], "dense")
+                self.assertEqual(len({r["passage_id"] for r in ranges}), len(ranges))
+                from recall_server.passage_retrieval import select_rerank_candidates
+                self.assertEqual(select_rerank_candidates([result], max_candidates=1),
+                                 [(0, "best-dense")])
+
     def test_hybrid_ranges_preserve_passage_pointer_when_sparse_scores_crowd(
         self,
     ) -> None:

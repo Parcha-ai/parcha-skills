@@ -325,7 +325,11 @@ def collapse_document_candidates(
                 or row.get("receipt")
                 or f"{leg_name}:{rank}"
             )
-            prior = value["_ranges"].get(range_key)
+            # Raw scores are comparable only within an arm. Preserve each
+            # arm's evidence until selection; BM25 must not relabel a dense
+            # passage as exact-only and hide it from the reranker.
+            arm_range_key = (leg_name, range_key)
+            prior = value["_ranges"].get(arm_range_key)
             if prior is None or float(row["score"]) > float(prior["score"]):
                 text, clipped = bounded_search_text(row["text_redacted"])
                 hint = {
@@ -352,7 +356,7 @@ def collapse_document_candidates(
                         str(row["passage_first_occurred_at"]),
                         str(row["passage_last_occurred_at"]),
                     ]
-                value["_ranges"][range_key] = hint
+                value["_ranges"][arm_range_key] = hint
     if window_boost is not None:
         since, until, factor = window_boost
         # Convex min-max gives an arm's weakest document 0.0, and a document
@@ -400,19 +404,27 @@ def collapse_document_candidates(
         )
     results = []
     for value in ranked:
+        arm_scores = value.pop("_arm_scores")
+        kinds = sorted(
+            ("dense", "passage-lexical", "sparse-exact"),
+            key=lambda kind: (
+                kind == "sparse-exact",
+                -float((arm_scores.get(kind) or {}).get("normalized", 0.0)),
+            ),
+        )
         ordered_ranges = sorted(
-            value.pop("_ranges").items(),
+            ((key, item) for (_kind, key), item in value.pop("_ranges").items()),
             key=lambda pair: (pair[1]["score"], pair[1]["kind"]),
             reverse=True,
         )
         selected_range_keys: set[str] = set()
         ranges = []
-        for kind in ("dense", "passage-lexical", "sparse-exact"):
+        for kind in kinds:
             selected = next(
                 (
                     (key, item)
                     for key, item in ordered_ranges
-                    if item["kind"] == kind
+                    if item["kind"] == kind and key not in selected_range_keys
                 ),
                 None,
             )
@@ -426,7 +438,6 @@ def collapse_document_candidates(
             if key not in selected_range_keys:
                 selected_range_keys.add(key)
                 ranges.append(item)
-        arm_scores = value.pop("_arm_scores")
         # The strongest evidence leads: the range from the arm where this
         # document scored best (its normalized leg score), not a fixed arm
         # order. The reranker judges most documents by their first range
