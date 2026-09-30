@@ -173,6 +173,16 @@ class PrecapScriptTest(unittest.TestCase):
         self.assertEqual(report["unpredicted"], ["unrelated/noise.txt"])
         self.assertEqual(report["scope"], ["unrelated/"])
 
+    def test_drift_scope_stops_at_path_boundaries(self):
+        (self.tmp / "greet.py.orig").write_text("backup\n")
+        (self.tmp / "docs2").mkdir()
+        (self.tmp / "docs2" / "x.md").write_text("x\n")
+        report = json.loads(self.run_cli("drift", str(self.precap_path), "--json").stdout)
+        self.assertNotIn("greet.py.orig", report["unpredicted"])
+        self.assertEqual(report["out_of_scope"], 2)
+        report = json.loads(self.run_cli("drift", str(self.precap_path), "--json", "--scope", "docs").stdout)
+        self.assertEqual(report["unpredicted"], [])
+
     def test_grounding_that_does_not_exist_fails(self):
         text = self.precap_path.read_text().replace("`greet.py:3` (parser definition)", "`nope/greet.py:3`")
         self.precap_path.write_text(text)
