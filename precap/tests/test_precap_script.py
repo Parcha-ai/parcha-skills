@@ -235,6 +235,21 @@ class PrecapScriptTest(unittest.TestCase):
         report = json.loads(result.stdout)
         self.assertIn("test_greet.py", report["touched"])
 
+    def test_drift_matches_paths_git_would_quote(self):
+        (self.tmp / "docs" / "caf\u00e9.md").write_text("committed\n")
+        subprocess.run(["git", "add", "-A"], cwd=self.tmp, check=True)
+        subprocess.run(["git", "commit", "-qm", "accent"], cwd=self.tmp, check=True)
+        (self.tmp / "docs" / "json guide.md").write_text("uncommitted\n")
+        text = self.precap_path.read_text().replace(
+            "- `docs/json.md` (new): usage note",
+            "- `docs/json guide.md` (new): usage note\n- `docs/caf\u00e9.md` (new): accent",
+        )
+        self.precap_path.write_text(text)
+        result = self.run_cli("drift", str(self.precap_path), "--json")
+        report = json.loads(result.stdout)
+        self.assertEqual(report["touched"], ["docs/caf\u00e9.md", "docs/json guide.md"])
+        self.assertEqual(report["unpredicted"], [])
+
     def test_drift_without_base_fails_closed(self):
         text = self.precap_path.read_text().replace("Base: main\n", "")
         self.precap_path.write_text(text)
