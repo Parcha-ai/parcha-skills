@@ -75,6 +75,64 @@ class SelectedAuthorityTests(unittest.TestCase):
         self.assertEqual(queried, [{row['id'] for row in vendors.values()}])
         self.assertNotIn(vendors[4]['id'], {row['passage_id'] for _,_,rows in legs for row in rows})
 
+    def test_authority_binds_exact_selected_source_passage_pairs_once(self):
+        # The same passage is nominated by several arms. Its lookup should
+        # use its source-qualified key once, without scanning every passage
+        # belonging to every source this principal may read.
+        for debug in (False, True):
+            with self.subTest(debug=debug):
+                retrieval, store, _, vendors, legs, results, _ = self.fixture()
+                retrieval.sources.append('codex:authorized:unused')
+                calls = []
+                original = store._execute_bounded
+                def observe(connection, sql, values, deadline):
+                    calls.append(values)
+                    return original(connection, sql, values, deadline)
+                store._execute_bounded = observe
+                retrieval._authorize_ranges(results, legs,
+                    deadline_at=time.monotonic()+5, include_arms=debug)
+                self.assertEqual(len(calls), 1)
+                values = calls[0]
+                self.assertEqual(len(values), 5)
+                self.assertEqual(values[:3],
+                    (fixtures.TENANT, retrieval.sources, 'fp-policy'))
+                expected = sorted((vendors[i]['source_id'], vendors[i]['id'])
+                    for i in ((1, 2, 3, 4) if debug else (1, 2, 3)))
+                self.assertEqual(list(zip(values[3], values[4])), expected)
+                self.assertEqual(len(values[3]), len(values[4]))
+
+    def test_same_passage_id_in_two_allowed_sources_keeps_both_authority_keys(self):
+        # Passage IDs alone are not the catalog primary key. A collision
+        # must retain each requested source, including sources whose rows
+        # share a passage ID with an earlier arm.
+        retrieval, store, _, vendors, legs, results, _ = self.fixture()
+        second_source = 'codex:authorized:second'
+        retrieval.sources.append(second_source)
+        other = dict(legs[0][2][0], source_id=second_source,
+            logical_document_id='ldoc_'+'f'*32)
+        legs[0][2].append(other)
+        results.append(dict(other, matching_ranges=[dict(other)]))
+        canonical = [dict(row, tenant_id=fixtures.TENANT)
+            for _, _, rows in legs for row in rows]
+        calls = []
+        def execute(connection, sql, values, deadline):
+            calls.append(values)
+            return SimpleNamespace(fetchall=lambda: canonical)
+        store._execute_bounded = execute
+        diagnostics = retrieval._authorize_ranges(results, legs,
+            deadline_at=time.monotonic()+5)
+        self.assertEqual(diagnostics['authority_status'], 'ok')
+        self.assertEqual(len(calls), 1)
+        values = calls[0]
+        self.assertEqual(len(values), 5)
+        expected = sorted([(vendors[i]['source_id'], vendors[i]['id'])
+            for i in (1, 2, 3)] + [(second_source, vendors[1]['id'])])
+        self.assertEqual(list(zip(values[3], values[4])), expected)
+        self.assertEqual(len(values[3]), len(values[4]))
+        self.assertEqual(values[4].count(vendors[1]['id']), 2)
+        self.assertEqual(len(results), 4)
+        self.assertIn(other, legs[0][2])
+
     def test_existing_selected_results_identical_to_full_arm_validation(self):
         snapshots = []
         for debug in (False,True):

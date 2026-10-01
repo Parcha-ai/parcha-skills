@@ -378,6 +378,15 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
         )
         ids = sorted({row["passage_id"] for row in candidates
                       if isinstance(row.get("passage_id"), str)})
+        selected_ids = set(ids)
+        # The catalog key includes source_id. Independent source and ID
+        # arrays probe their cross product, although the arms already give
+        # us each exact key. Keep every relevant arm identity, including
+        # collisions across sources; the canonical grant filter still applies.
+        requested = sorted({(row["source_id"], row["passage_id"])
+                            for _name, _weight, rows in legs for row in rows
+                            if row.get("passage_id") in selected_ids
+                            and isinstance(row.get("source_id"), str)})
         if not ids:
             results.clear()
             for _name, _weight, rows in legs:
@@ -402,7 +411,9 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
                                 USING(tenant_id,source_id,logical_document_id)
                              WHERE passage.tenant_id=%s AND passage.source_id=ANY(%s)
                                AND passage.policy_fingerprint=%s
-                               AND passage.passage_id=ANY(%s)
+                               AND (passage.source_id,passage.passage_id) IN (
+                                   SELECT * FROM unnest(%s::text[],%s::text[])
+                               )
                                AND cardinality(passage.receipts)>0
                         ), requested_receipts AS MATERIALIZED (
                             SELECT DISTINCT selected.tenant_id,selected.source_id,receipt.value
@@ -431,7 +442,9 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
                          GROUP BY selected.tenant_id,selected.source_id,selected.passage_id,
                                   selected.logical_document_id,selected.text_sha256
                         HAVING bool_and(live.value IS NOT NULL)""",
-                    (self.tenant_id, self.sources, self.policy_fingerprint, ids),
+                    (self.tenant_id, self.sources, self.policy_fingerprint,
+                     [source for source, _passage in requested],
+                     [passage for _source, passage in requested]),
                     deadline_at,
                 ).fetchall()
         except SearchDeadlineExceeded:
