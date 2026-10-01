@@ -29,6 +29,15 @@ BUILD = f'''CREATE UNIQUE INDEX CONCURRENTLY {NEW}
     INCLUDE(source_id,document_id,deleted_at)'''
 
 
+def authority_params(query, tenant, allowed_sources, pairs):
+    """Exercise either production binding while the paired lookup is introduced."""
+    sources = [source for source, _passage in pairs]
+    passages = [passage for _source, passage in pairs]
+    if query.count('%s') == 4:
+        return tenant, allowed_sources, 'policy', passages
+    return tenant, allowed_sources, 'policy', sources, passages
+
+
 class AuthorityIndexOperationTest(unittest.TestCase):
     def setUp(self):
         self.dsn = os.environ['RECALL_DATABASE_URL']
@@ -186,7 +195,7 @@ class AuthorityIndexOperationTest(unittest.TestCase):
                       and node.value.startswith('WITH selected AS MATERIALIZED')]
         self.assertEqual(len(statements),1)
         query = statements[0]
-        params = ('t',['s'],'policy',list(receipts))
+        params = authority_params(query, 't', ['s'], [('s', passage) for passage in receipts])
         before = self.conn.execute(query,params).fetchall()
         self.assertEqual({row['passage_id'] for row in before},{'live-retired','bulk-live'})
         self.apply()
@@ -209,6 +218,102 @@ class AuthorityIndexOperationTest(unittest.TestCase):
             self.assertEqual(node['Node Type'],'Index Only Scan',(name,node))
             self.assertEqual(node['Heap Fetches'],0,(name,node))
             self.assertGreater(node['Actual Loops'],0,(name,node))
+
+    def create_authority_catalog(self):
+        self.conn.execute('''
+            CREATE TABLE canonical_evidence_documents(
+                tenant_id text,source_id text,logical_document_id text,
+                PRIMARY KEY(tenant_id,source_id,logical_document_id));
+            CREATE TABLE canonical_passage_documents(
+                tenant_id text,source_id text,logical_document_id text,policy_fingerprint text,
+                PRIMARY KEY(tenant_id,source_id,logical_document_id));
+            CREATE TABLE canonical_passages(
+                tenant_id text,source_id text,logical_document_id text,passage_id text,
+                text_sha256 text,receipts text[],policy_fingerprint text,
+                PRIMARY KEY(tenant_id,source_id,passage_id));
+        ''')
+        module = ast.parse((SERVER/'recall_server/turbopuffer_retrieval.py').read_text())
+        statements = [node.value for node in ast.walk(module)
+                      if isinstance(node, ast.Constant) and isinstance(node.value, str)
+                      and node.value.startswith('WITH selected AS MATERIALIZED')]
+        self.assertEqual(len(statements), 1)
+        return statements[0]
+
+    def insert_authority_passage(self, passage, receipts, *, tenant='t', source='s',
+                                 evidence=True, projected=True, policy='policy',
+                                 projected_policy='policy'):
+        if evidence:
+            self.conn.execute('INSERT INTO canonical_evidence_documents VALUES(%s,%s,%s)',
+                              (tenant, source, passage))
+        if projected:
+            self.conn.execute('INSERT INTO canonical_passage_documents VALUES(%s,%s,%s,%s)',
+                              (tenant, source, passage, projected_policy))
+        self.conn.execute('INSERT INTO canonical_passages VALUES(%s,%s,%s,%s,%s,%s,%s)',
+                          (tenant, source, passage, passage, 'a'*64, receipts, policy))
+
+    def test_authority_receipt_and_projection_refusals_preserved(self):
+        query = self.create_authority_catalog()
+        cases = {
+            'live': (['r1'], {}),
+            'retired-body': (['r2'], {}),
+            'duplicate-receipts': (['r1', 'r1'], {}),
+            'null-member': (['r1', None], {}),
+            'null-array': (None, {}),
+            'empty-array': ([], {}),
+            'missing-receipt': (['r1', 'missing'], {}),
+            'deleted-chunk': (['r1', 'r5'], {}),
+            'old-document': (['r3'], {}),
+            'deleted-document': (['r4'], {}),
+            'missing-evidence': (['r1'], {'evidence': False}),
+            'missing-projected': (['r1'], {'projected': False}),
+            'stale-policy': (['r1'], {'policy': 'old-policy'}),
+            'mismatched-projection-policy': (['r1'], {'projected_policy': 'old-policy'}),
+            'foreign-tenant': (['r1'], {'tenant': 'foreign'}),
+            'foreign-source-receipt': (['r1'], {'source': 'other'}),
+        }
+        pairs = []
+        for passage, (receipts, options) in cases.items():
+            self.insert_authority_passage(passage, receipts, **options)
+            pairs.append((options.get('source', 's'), passage))
+        rows = self.conn.execute(query, authority_params(query, 't', ['s', 'other'], pairs)).fetchall()
+        self.assertEqual({(row['source_id'], row['passage_id'], row['text_sha256']) for row in rows},
+                         {('s', passage, 'a'*64)
+                          for passage in ('live', 'retired-body', 'duplicate-receipts')})
+        # The live chunk can disappear while a stale passage remains. Its
+        # current receipt must not be inferred from the surviving projection.
+        self.conn.execute("DELETE FROM canonical_chunks WHERE tenant_id='t' AND receipt='r1'")
+        rows = self.conn.execute(query, authority_params(query, 't', ['s', 'other'], pairs)).fetchall()
+        self.assertEqual({row['passage_id'] for row in rows}, {'retired-body'})
+
+    def test_authority_checks_only_requested_source_passage_pairs(self):
+        query = self.create_authority_catalog()
+        self.conn.execute('''
+            INSERT INTO canonical_documents VALUES
+                ('t','other','live',true,NULL), ('t','denied','live',true,NULL);
+            INSERT INTO canonical_chunks(tenant_id,source_id,chunk_id,document_id,receipt)
+                VALUES ('t','other','c-other','live','r-other'),
+                       ('t','denied','c-denied','live','r-denied');
+        ''')
+        self.insert_authority_passage('collision', ['r1'])
+        self.insert_authority_passage('collision', ['r-other'], source='other')
+        self.insert_authority_passage('collision', ['r-denied'], source='denied')
+        self.insert_authority_passage('collision', ['r1'], tenant='foreign')
+        self.insert_authority_passage('other-selected', ['r-other'], source='other')
+        self.insert_authority_passage('only-other', ['r-other'], source='other')
+        # Both sources are authorized, but only the explicit source/ID pair
+        # is selected. Repeated arm hits must not duplicate the result. A
+        # spoofed source for an otherwise real ID cannot authorize its owner.
+        pairs = [('s', 'collision'), ('s', 'collision'), ('other', 'other-selected'),
+                 ('s', 'only-other'), ('denied', 'collision')]
+        rows = self.conn.execute(query, authority_params(query, 't', ['s', 'other'], pairs)).fetchall()
+        self.assertEqual(sorted((row['source_id'], row['passage_id']) for row in rows),
+                         [('other', 'other-selected'), ('s', 'collision')])
+        # Requesting both real pairs must retain both, despite the shared ID.
+        rows = self.conn.execute(query, authority_params(
+            query, 't', ['s', 'other'], [('s', 'collision'), ('other', 'collision')],
+        )).fetchall()
+        self.assertEqual(sorted((row['source_id'], row['passage_id']) for row in rows),
+                         [('other', 'collision'), ('s', 'collision')])
 
     def test_wrong_covering_definition_refuses_and_retains_old_constraint(self):
         self.conn.execute(f'CREATE UNIQUE INDEX {NEW} ON canonical_chunks(tenant_id,receipt) INCLUDE(document_id)')
