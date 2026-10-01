@@ -1414,7 +1414,7 @@ retries on the query path and never logs query text, passage text, or the bearer
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `RECALL_RERANK_PROTOCOL` | `off` | `voyage`, `cohere`, or `off`. |
-| `RECALL_RERANK_MODEL` | `rerank-2.5` (voyage) / `rerank-v3.5` (cohere) | Provider model label. |
+| `RECALL_RERANK_MODEL` | `rerank-3` (voyage) / `rerank-v3.5` (cohere) | Provider model label. Set `rerank-2.5` explicitly to roll back Voyage. |
 | `RECALL_RERANK_URL` | provider endpoint | `https://api.voyageai.com/v1/rerank` or `https://api.cohere.com/v2/rerank`. |
 | `RECALL_RERANK_APPROVED_URL` | unset | Required when `RECALL_RERANK_URL` is not the provider default; must match exactly. |
 | `RECALL_RERANK_KEY_FILE` | unset | Owner-only (`0600`), non-symlink bearer file. Mutually exclusive with the variable below. |

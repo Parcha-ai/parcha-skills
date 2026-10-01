@@ -47,11 +47,11 @@ class FakeTransport:
         return self.payload
 
 
-def voyage_payload(*rows):
+def voyage_payload(*rows, model="rerank-3"):
     return {
         "object": "list",
         "data": [{"index": i, "relevance_score": s} for i, s in rows],
-        "model": "rerank-2.5",
+        "model": model,
         "usage": {"total_tokens": 1},
     }
 
@@ -238,7 +238,7 @@ class RerankRuntimeContractTest(unittest.TestCase):
         result = self.runtime("voyage", voyage).rerank("query", docs)
         self.assertEqual(result, [(0, 0.9), (1, 0.5), (2, 0.1)])
         body = voyage.calls[0]["body"]
-        self.assertEqual(body["model"], "rerank-2.5")
+        self.assertEqual(body["model"], "rerank-3")
         self.assertEqual(body["documents"], docs)
         self.assertEqual(body["top_k"], 3)
         self.assertTrue(body["truncation"])
@@ -370,6 +370,21 @@ class RerankRuntimeContractTest(unittest.TestCase):
 
     # -- factory -------------------------------------------------------------
 
+    def test_factory_explicit_legacy_voyage_model_remains_available(self) -> None:
+        transport = FakeTransport(voyage_payload((0, 0.9), model="rerank-2.5"))
+        env = {
+            "RECALL_RERANK_PROTOCOL": "voyage",
+            "RECALL_RERANK_MODEL": "rerank-2.5",
+            "RECALL_RERANK_KEY_ENV": "RERANK_TEST_KEY",
+            "RERANK_TEST_KEY": "sk-test",
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            runtime = build_rerank_runtime(transport=transport)
+            result = runtime.rerank("query", ["document"])
+        self.assertEqual(result, [(0, 0.9)])
+        self.assertEqual(transport.calls[0]["body"]["model"], "rerank-2.5")
+        self.assertEqual((runtime.max_candidates, runtime.max_doc_chars), (50, 2000))
+
     def test_factory_returns_none_when_off_and_runtime_when_configured(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertIsNone(build_rerank_runtime())
@@ -392,7 +407,7 @@ class RerankRuntimeContractTest(unittest.TestCase):
             runtime = build_rerank_runtime()
         self.assertIsInstance(runtime, RerankRuntime)
         self.assertEqual(runtime.protocol, "voyage")
-        self.assertEqual(runtime.model, "rerank-2.5")
+        self.assertEqual(runtime.model, "rerank-3")
         self.assertEqual(runtime.url, PROVIDERS["voyage"]["url"])
         self.assertEqual(runtime.timeout_seconds, DEFAULT_TIMEOUT_SECONDS)
         self.assertEqual(runtime.max_candidates, DEFAULT_MAX_CANDIDATES)

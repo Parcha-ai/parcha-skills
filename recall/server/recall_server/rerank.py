@@ -37,7 +37,7 @@ MAX_RERANK_KEY_BYTES = 4096
 PROVIDERS: dict[str, dict[str, str]] = {
     "voyage": {
         "url": "https://api.voyageai.com/v1/rerank",
-        "model": "rerank-2.5",
+        "model": "rerank-3",
     },
     "cohere": {
         "url": "https://api.cohere.com/v2/rerank",
