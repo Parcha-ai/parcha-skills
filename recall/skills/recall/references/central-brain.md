@@ -59,11 +59,20 @@ agent. Recall does not call another model or return a synthesized answer:
    source, and UTC time boundaries. Reformulate or split the search when that
    improves recall; do not treat rank one as the answer.
 2. For exact facts, open a returned `recall://` receipt with `recall_show` or
-   `recall_session_context`.
+   `recall_session_context`. `recall_show` accepts only `target` and opens that
+   record. With the CLI, use `python3 scripts/recall.py show '<recall://receipt>'`.
+   Local file paths, session numbers, `--tail`, `--around`, and `--prompts` are
+   not supported by canonical Brain show. For neighboring events, call the
+   `recall_session_context` MCP tool with `target`, `before`, and `after`
+   (0–20 each). This is a neighborhood around the receipt, not the session tail.
 3. For synthesis over full or large documents, pass only returned
    `logical_document_id` values to `recall_exec`. Use the read-only shell,
    `recall-scan`, Python, `jq`, and ordinary text tools freely inside its bounded,
    networkless sandbox.
+   Use this path when you need the full session's final state or prompts;
+   request the relevant records explicitly rather than assuming one receipt
+   contains the full session. A show response that exceeds the transport limit
+   can also be opened through these context or document tools.
 4. Cite only receipts returned in `opened_receipts`. State a gap when the opened
    evidence is insufficient; search snippets alone are pointers, not proof.
 

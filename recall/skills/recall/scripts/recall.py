@@ -336,7 +336,33 @@ def _mcp_call(base: str, method: str, path: str, body: dict | None) -> dict:
     error = rendered.get("error")
     if isinstance(error, dict):
         code = error.get("code")
-        raise RemoteRecallError(f"MCP {code}: tool call failed")
+        code = code if type(code) is int and -32768 <= code <= 32767 else "unknown"
+        detail = "tool call failed"
+        # Only fixed, known protocol messages select fixed guidance. Never
+        # render arbitrary server text, error data, targets or credentials.
+        if path == "/v1/show":
+            server_message = error.get("message")
+            if code == -32602 and server_message == "receipt not found":
+                detail = "receipt not found or not accessible; search again and open a returned receipt"
+            elif code == -32603 and server_message == "tool result exceeds limit":
+                detail = (
+                    "show result is too large; use the recall_session_context MCP tool for "
+                    "nearby events, or recall_exec for a returned logical_document_id"
+                )
+            elif code == -32602 and server_message == "tool arguments rejected":
+                if not str(arguments.get("target", "")).startswith("recall://"):
+                    detail = (
+                        "remote Brain show needs a recall:// receipt returned by search; "
+                        "use show <recall://receipt> without session flags"
+                    )
+                elif arguments.get("around") is not None or arguments.get("tail", 0) != 0 or arguments.get("prompts"):
+                    detail = (
+                        "remote Brain show accepts a receipt only; use show <recall://receipt> "
+                        "without --tail, --around or --prompts. Use the recall_session_context "
+                        "MCP tool for nearby events; these flags operate on a local session, "
+                        "not a remote session tail"
+                    )
+        raise RemoteRecallError(f"MCP {code}: {detail}")
     if rendered.get("id") != message["id"] or not isinstance(rendered.get("result"), dict):
         raise RemoteRecallError("MCP response is invalid")
     result = rendered["result"]
@@ -618,7 +644,7 @@ def run_transport(args) -> int:
         try:
             output, _metadata = remote_execute(args)
         except RemoteRecallError as exc:
-            print(f"remote recall unavailable: {exc}", file=sys.stderr)
+            print(f"remote recall request failed: {exc}", file=sys.stderr)
             return 2
         print(output, end="")
         return 0
@@ -628,7 +654,7 @@ def run_transport(args) -> int:
         try:
             output, metadata = remote_execute(args)
         except RemoteRecallError as exc:
-            print(f"remote recall unavailable: {exc}", file=sys.stderr)
+            print(f"remote recall request failed: {exc}", file=sys.stderr)
             return 2
         if args.command == "search" and os.environ.get("RECALL_REMOTE_TRACE"):
             append_private_jsonl(Path(os.environ["RECALL_REMOTE_TRACE"]), {
