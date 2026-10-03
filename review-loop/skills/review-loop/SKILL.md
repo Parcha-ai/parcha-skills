@@ -1,6 +1,6 @@
 ---
 name: review-loop
-description: Drive every reviewer thread on a GitHub pull request to zero unresolved in bounded iterations. Covers bot reviewers such as Greptile and Devin and human reviewers. Fetches every inline comment, review, and issue comment, fixes what is actionable, replies, resolves bot threads through GraphQL, re-requests review once per push, and ends with a fixed-format report. Use when the user says "review loop", "address the review comments", "get this PR to zero unresolved", "greploop", or "make Greptile happy".
+description: Drive every reviewer thread on a GitHub pull request to zero unresolved, iterating until the exit criterion is met. Covers bot reviewers such as Greptile and Devin and human reviewers. Fetches every inline comment, review, and issue comment, fixes what is actionable, replies, resolves bot threads through GraphQL, re-requests review once per push, and ends with a fixed-format report. Use when the user says "review loop", "address the review comments", "get this PR to zero unresolved", "greploop", or "make Greptile happy".
 license: MIT
 compatibility: Requires git and an authenticated gh CLI. Greptile and Devin sections apply only when those apps are installed on the repository.
 metadata:
@@ -11,7 +11,7 @@ metadata:
 # Review loop
 
 This skill has one job: take a GitHub PR with open review threads and drive every thread, from
-every reviewer, to zero unresolved, in a bounded number of iterations, then report what it did
+every reviewer, to zero unresolved, iterating until the target is met, then report what it did
 in a fixed format. It does not QA the running application; that is `autoqa`'s job. It does not
 decide whether the diff is safe beyond what reviewers raised; that is `blast-radius`'s job. It
 does not merge, and it does not mint credentials.
@@ -24,7 +24,7 @@ does not merge, and it does not mint credentials.
 | PR number | no | The PR for the current branch (`gh pr view`) |
 | Target (`open-for-review`, `review-clean`, or `merge-ready`) | no | `review-clean` |
 | Trigger comment text | no | `@greptile-apps review` |
-| `--max-iterations N` | no | 3 |
+| `--max-iterations N` | no | None (no cap). Set only when the caller wants a hard stop |
 | Gate command | no | None. The caller or the repository supplies the command that runs tests and lint (for example the repo's `make check`); the skill only says where in the loop it runs |
 | Base-branch sync | no | None. The caller or repository supplies the rebase or merge policy; the skill says where it runs |
 
@@ -33,8 +33,9 @@ never mints, reads, or stores tokens. If `gh auth status` fails, stop and report
 
 ## Iteration
 
-Repeat at most `--max-iterations` times; the default is 3, and a caller raises it only for a
-stated reason. Each iteration:
+Repeat until the target in step 9 is met. There is no iteration cap by default; a caller may
+pass `--max-iterations` to impose one. The loop still stops on timeout, a red gate it cannot
+fix, an auth failure, or a stall (see "Stop on stall"). Each iteration:
 
 1. Sync with the base branch if the caller supplied a sync policy. Run the gate command when
    the head changed or no exact-head result exists. Reuse valid exact-head evidence. A red
@@ -59,8 +60,8 @@ stated reason. Each iteration:
    For `open-for-review`, require a non-draft PR and focused proof. Automated review may
    remain pending.
 
-If the cap is reached with threads still open, stop and report them; do not start another
-iteration.
+If the caller set `--max-iterations` and the cap is reached with threads still open, stop and
+report them; do not start another iteration.
 
 ## Fetching everything
 
@@ -172,6 +173,13 @@ If a poll for review results times out, stop the loop and report the timeout. Ne
 with stale or missing review results, and never count a thread as resolved because the reviewer
 did not answer.
 
+## Stop on stall
+
+Stop and report when two consecutive iterations end with no code change and the only open
+items are ones already answered as informational or false positive. Re-triggering a reviewer
+that keeps repeating an answered point does not make progress. List those items under
+"Remaining" for a human.
+
 ## Report
 
 End with this table. Print it even when the loop stops early.
@@ -179,13 +187,13 @@ End with this table. Print it even when the loop stops early.
 | Field | Value |
 |---|---|
 | Repository / PR | `owner/repo#N` |
-| Iterations | N of max M |
+| Iterations | N (of max M, when a cap was set) |
 | Threads found (per reviewer) | Greptile N, Devin N, humans N |
 | Resolved this run | N |
 | Replied, left open for a human | N |
 | Remaining | N, then one line each: `path:line` and a short quote |
 | Final Greptile score | X/5, or "not installed" |
-| Stop reason | exit criterion met, max iterations, timeout, red gate, auth failure |
+| Stop reason | exit criterion met, stall, max iterations (when set), timeout, red gate, auth failure |
 
 The report goes to the caller. Do not post it as a new PR comment. A caller that wants it on
 the PR edits one comment marked `<!-- agent-sticky:review-loop -->` in place, using the upsert
