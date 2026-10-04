@@ -195,6 +195,7 @@ class ArchivedChunkReadTests(unittest.TestCase):
                 "canonical_redacted": row["canonical_redacted"],
             },
             "chunks": row["chunks"],
+            "opened_receipts": [receipt("anchor", ordinal) for ordinal in range(5)],
         })
         read.assert_called_once()
         self.assertFalse(self.store.body_queries)
@@ -210,6 +211,12 @@ class ArchivedChunkReadTests(unittest.TestCase):
             ],
             "anchor_receipt": self.store.target,
             "bounds": {"before": 2, "after": 1},
+            "opened_receipts": [
+                receipt("before-a", 0), receipt("before-a", 1),
+                receipt("before-b", 0), receipt("before-b", 1),
+                receipt("anchor", 1), receipt("anchor", 2), receipt("anchor", 3),
+                receipt("after", 0), receipt("after", 1),
+            ],
         })
         self.assertFalse(self.store.body_queries)
 
@@ -217,6 +224,19 @@ class ArchivedChunkReadTests(unittest.TestCase):
         with self.reader(return_value=self.store.archived()):
             actual = self.retrieval.session_context(self.store.target, before=0, after=0)
         self.assertEqual(actual["events"], [context_event(self.store.anchor, self.store.anchor["chunks"][1:4])])
+        self.assertEqual(actual["opened_receipts"], [
+            receipt("anchor", 1), receipt("anchor", 2), receipt("anchor", 3),
+        ])
+
+    def test_inline_reads_publish_only_returned_chunk_receipts(self):
+        self.retrieval.chunk_body_archive = None
+        shown = self.retrieval.show(self.store.old_target)
+        context = self.retrieval.session_context(self.store.old_target, before=0, after=0)
+        self.assertEqual(shown["opened_receipts"], [receipt("anchor", ordinal) for ordinal in range(5)])
+        self.assertEqual(context["opened_receipts"], [
+            receipt("anchor", 1), receipt("anchor", 2), receipt("anchor", 3),
+        ])
+        self.assertNotIn(self.store.old_target, shown["opened_receipts"])
 
     def test_missing_archive_catalog_falls_back_to_live_postgres_body(self):
         with self.reader(return_value={}):

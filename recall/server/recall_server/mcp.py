@@ -504,7 +504,8 @@ ALL_READ_TOOLS = (
         "name": "recall_session_context",
         "description": (
             "Expand one recall:// receipt inside its authorized source session "
-            "in occurrence-time order."
+            "in occurrence-time order. opened_receipts lists only returned chunks; "
+            "text may be clipped. Use recall_show for a full record."
         ),
         "inputSchema": {
             "type": "object",
@@ -595,6 +596,10 @@ READ_TOOLS = tuple(
 )
 CANONICAL_SHOW_TOOL = {
     **next(tool for tool in READ_TOOLS if tool["name"] == "recall_show"),
+    "description": (
+        "Open one authorized canonical record from a recall:// receipt. Returns "
+        "its chunks and opened_receipts. Use recall_session_context for neighboring records."
+    ),
     "inputSchema": {
         "type": "object",
         "properties": {"target": {"type": "string"}},

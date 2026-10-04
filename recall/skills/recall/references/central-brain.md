@@ -73,8 +73,11 @@ agent. Recall does not call another model or return a synthesized answer:
    request the relevant records explicitly rather than assuming one receipt
    contains the full session. A show response that exceeds the transport limit
    can also be opened through these context or document tools.
-4. Cite only receipts returned in `opened_receipts`. State a gap when the opened
-   evidence is insufficient; search snippets alone are pointers, not proof.
+4. The record and document tools return `opened_receipts` for the evidence they
+   actually return. Cite only those receipts and claims supported by the returned
+   text. Context responses may clip text; open the full record when needed. State
+   a gap when the opened evidence is insufficient; search snippets alone are
+   pointers, not proof.
 
 This keeps planning and semantic judgment in the capable agent the user already
 chose while Recall remains a small authorization, retrieval, execution, and

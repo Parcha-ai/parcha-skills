@@ -3210,18 +3210,17 @@ class BoundCanonicalRetrieval:
             self._hydrate_chunk_rows(
                 selected_chunks, text_key="text", deadline_at=_deadline_at,
             )
+        events = [self._context_event(row) for row in previous + [anchor] + following]
         return {
             "session": {
                 "source_id": anchor["source_id"],
                 "native_parent_id": parent,
                 "time_basis": "occurred_at",
             },
-            "events": [
-                self._context_event(row)
-                for row in previous + [anchor] + following
-            ],
+            "events": events,
             "anchor_receipt": anchor["resolved_receipt"],
             "bounds": {"before": before, "after": after},
+            "opened_receipts": [chunk["receipt"] for event in events for chunk in event["chunks"]],
         }
 
     @staticmethod
@@ -4337,6 +4336,7 @@ class BoundCanonicalRetrieval:
                 "canonical_redacted": row["canonical_redacted"],
             },
             "chunks": chunks,
+            "opened_receipts": [chunk["receipt"] for chunk in chunks],
         }
 
     def related(
