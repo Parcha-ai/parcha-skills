@@ -59,8 +59,17 @@ agent. Recall does not call another model or return a synthesized answer:
    source, and UTC time boundaries. Reformulate or split the search when that
    improves recall; do not treat rank one as the answer.
 2. For exact facts, open a returned `recall://` receipt with `recall_show` or
-   `recall_session_context`. `recall_show` accepts only `target` and opens that
-   record. With the CLI, use `python3 scripts/recall.py show '<recall://receipt>'`.
+   `recall_session_context`. A string `target` opens that record. To open all
+   source records behind a matching passage, pass `target` as an object copied
+   from the hit: `source_id`, `logical_document_id`, `revision`,
+   `manifest_content_sha256`, and `passage_id`. Do not guess which receipt
+   corresponds to which span. Follow `next_cursor` with the same target until
+   `complete` is true; `page_bytes` optionally controls the encoded response
+   size (default 32768). Chunks carry receipt, ordinal, character and UTF-8 byte
+   offsets, and completion flags, so even long records open without clipping.
+   This returns source records behind the passage, not reconstructed passage
+   text. A stale locator or continuation fails; search again for current pins.
+   Cite only returned `opened_receipts`. With the CLI, use `python3 scripts/recall.py show '<recall://receipt>'`.
    Local file paths, session numbers, `--tail`, `--around`, and `--prompts` are
    not supported by canonical Brain show. For neighboring events, call the
    `recall_session_context` MCP tool with `target`, `before`, and `after`

@@ -4161,18 +4161,11 @@ class BoundCanonicalRetrieval:
             },
         }
 
-    def passage_metadata(
+    def _passage_rows(
         self, *, source_id: str, logical_document_id: str, revision: int,
-        manifest_content_sha256: str, passage_ids: list[str], cursor: str | None = None,
-    ) -> dict[str, Any]:
-        """Page stored coordinates for at most two exact, frozen passages.
-
-        Metadata is a routing hint, never opened citation authority. No passage
-        prose is selected. Every page rechecks current authorization and pins;
-        historical manifests that have advanced remain unavailable.
-        """
-        from .mcp import _encoded_result_size
-
+        manifest_content_sha256: str, passage_ids: list[str], deadline_at: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Load exact current passage coordinates without paging or prose."""
         def require(ok: bool) -> None:
             if not ok:
                 raise ValueError("passage_metadata_unavailable")
@@ -4184,7 +4177,6 @@ class BoundCanonicalRetrieval:
         require(isinstance(passage_ids, list) and 1 <= len(passage_ids) <= 2)
         require(all(isinstance(p, str) and re.fullmatch(r"psg_[0-9a-f]{32}", p) for p in passage_ids))
         require(len(set(passage_ids)) == len(passage_ids))
-        require(cursor is None or (isinstance(cursor, str) and re.fullmatch(r"[0-9a-f]{64}:[01]:[0-9]{1,6}:[0-9]{1,6}", cursor) is not None))
         with self.store.connect() as connection:
             rows = self.store._execute_bounded(
                 connection,
@@ -4199,6 +4191,14 @@ class BoundCanonicalRetrieval:
                       AND passage.logical_document_id=%s AND passage.revision=%s
                       AND evidence.manifest_content_sha256=%s
                       AND passage.passage_id=ANY(%s)
+                      AND projected.source_document_sha256=evidence.document_content_sha256
+                      AND NOT EXISTS (
+                          SELECT 1 FROM canonical_evidence_document_queue pending
+                          WHERE pending.tenant_id=evidence.tenant_id
+                            AND pending.source_id=evidence.source_id
+                            AND pending.native_parent_id=evidence.native_parent_id
+                            AND pending.reason='forget'
+                      )
                       AND NOT EXISTS (
                           SELECT 1 FROM unnest(passage.receipts) AS wanted(receipt)
                           WHERE NOT EXISTS (
@@ -4220,10 +4220,26 @@ class BoundCanonicalRetrieval:
                           )
                       )""",
                 (self.tenant_id, source_id, logical_document_id, revision, manifest_content_sha256, passage_ids),
-                time.monotonic() + 5.0,
+                deadline_at if deadline_at is not None else time.monotonic() + 5.0,
             ).fetchall()
         require(len(rows) == len(passage_ids) and {r['passage_id'] for r in rows} == set(passage_ids))
         ordered = [next(r for r in rows if r['passage_id'] == p) for p in passage_ids]
+        return ordered
+
+    def passage_metadata(
+        self, *, source_id: str, logical_document_id: str, revision: int,
+        manifest_content_sha256: str, passage_ids: list[str], cursor: str | None = None,
+    ) -> dict[str, Any]:
+        """Page exact stored coordinates; metadata is not opened evidence."""
+        from .mcp import _encoded_result_size
+
+        def require(ok):
+            if not ok:
+                raise ValueError("passage_metadata_unavailable")
+
+        require(cursor is None or (isinstance(cursor, str) and re.fullmatch(r"[0-9a-f]{64}:[01]:[0-9]{1,6}:[0-9]{1,6}", cursor) is not None))
+        ordered = self._passage_rows(source_id=source_id, logical_document_id=logical_document_id,
+            revision=revision, manifest_content_sha256=manifest_content_sha256, passage_ids=passage_ids)
         pins = dict(source_id=source_id, logical_document_id=logical_document_id, revision=revision,
                     manifest_content_sha256=manifest_content_sha256, passage_ids=passage_ids)
 
@@ -4278,15 +4294,184 @@ class BoundCanonicalRetrieval:
         require(bool(part['spans'] or part['receipts']) and _encoded_result_size(result) <= 16_384)
         return result
 
+    def _show_passage(self, target, *, cursor=None, page_bytes=None):
+        """Open source events selected by stored passage receipts, not hint text."""
+        from .mcp import MAX_MCP_RESPONSE_BYTES, SEARCH_RESULT_BUDGET_BYTES, _encoded_result_size
+        from .chunk_bodies import MAX_DOCUMENTS
+
+        def require(ok):
+            if not ok:
+                raise ValueError("passage source records unavailable for exact pins")
+
+        require(set(target) == {'source_id', 'logical_document_id', 'revision',
+                                'manifest_content_sha256', 'passage_id'})
+        page_bytes = 32_768 if page_bytes is None else page_bytes
+        require(type(page_bytes) is int and 0 < page_bytes <= MAX_MCP_RESPONSE_BYTES)
+        # Reuse the MCP envelope reserve; a larger requested page still paginates.
+        page_bytes = min(page_bytes, SEARCH_RESULT_BUDGET_BYTES)
+        require(cursor is None or (isinstance(cursor, str) and
+                re.fullmatch(r'[0-9a-f]{64}:[0-9]+:[0-9]+', cursor) is not None))
+        deadline = time.monotonic() + self.store.search_deadline_ms / 1000
+
+        def snapshot():
+            metadata = self._passage_rows(
+                **{k: v for k, v in target.items() if k != 'passage_id'},
+                passage_ids=[target['passage_id']], deadline_at=deadline)[0]
+            receipts = metadata['receipts']
+            require(isinstance(receipts, list) and bool(receipts))
+            with self.store.connect() as connection:
+                rows = self.store._execute_bounded(connection, """
+                    WITH selected_events AS (
+                        SELECT DISTINCT document_id FROM canonical_chunks
+                        WHERE tenant_id=%s AND source_id=%s AND receipt=ANY(%s)
+                          AND deleted_at IS NULL
+                    )
+                    SELECT chunk.source_id,chunk.document_id,chunk.ordinal,
+                           chunk.receipt,chunk.text_sha256,document.native_id,
+                           document.revision,event.kind,event.occurred_at,event.observed_at
+                    FROM canonical_chunks chunk
+                    JOIN selected_events USING(document_id)
+                    JOIN canonical_documents document USING(tenant_id,source_id,document_id)
+                    JOIN canonical_events event USING(tenant_id,source_id,event_id)
+                    WHERE chunk.tenant_id=%s AND chunk.source_id=%s
+                      AND chunk.deleted_at IS NULL AND document.is_current
+                      AND document.deleted_at IS NULL AND NOT event.is_tombstone
+                      AND NOT EXISTS (SELECT 1 FROM canonical_chunks removed
+                          WHERE removed.tenant_id=document.tenant_id
+                            AND removed.source_id=document.source_id
+                            AND removed.document_id=document.document_id
+                            AND removed.deleted_at IS NOT NULL)
+                      AND NOT EXISTS (
+                          SELECT 1 FROM canonical_events later
+                          WHERE later.tenant_id=document.tenant_id
+                            AND later.source_id=document.source_id
+                            AND later.native_id=document.native_id
+                            AND later.revision>document.revision AND later.is_tombstone)
+                      AND EXISTS (SELECT 1 FROM brain_access_grants
+                          WHERE tenant_id=chunk.tenant_id AND principal_id=%s
+                            AND permission IN ('owner','admin','read'))
+                      AND EXISTS (SELECT 1 FROM canonical_source_grants
+                          WHERE tenant_id=chunk.tenant_id AND source_id=chunk.source_id
+                            AND principal_id=%s AND permission IN ('owner','read'))
+                    ORDER BY chunk.document_id,chunk.ordinal
+                    """, (self.tenant_id, target['source_id'], receipts,
+                          self.tenant_id, target['source_id'], self.principal_id,
+                          self.principal_id), deadline).fetchall()
+            by_receipt = {r['receipt']: r for r in rows}
+            require(len(by_receipt) == len(rows) and set(receipts) <= by_receipt.keys())
+            event_order = list(dict.fromkeys(by_receipt[r]['document_id'] for r in receipts))
+            require(all(r['document_id'] in event_order for r in rows))
+            event_rank = {document: rank for rank, document in enumerate(event_order)}
+            rows.sort(key=lambda r: (event_rank[r['document_id']], r['ordinal']))
+            for row in rows:
+                for key in ('occurred_at', 'observed_at'):
+                    row[key] = _timestamp(row[key])
+            selection = hashlib.sha256(json.dumps(
+                [target, metadata, rows], sort_keys=True, ensure_ascii=False,
+                separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+            return selection, rows
+
+        selection, rows = snapshot()
+        index, offset = 0, 0
+        if cursor is not None:
+            pin, position, start = cursor.split(':')
+            require(pin == selection)
+            index, offset = int(position), int(start)
+        require(index < len(rows))
+        result = {'target': dict(target), 'scope': 'source_records_behind_passage',
+                  'selection_sha256': selection, 'chunks': [], 'opened_receipts': [],
+                  'next_cursor': None, 'complete': False}
+
+        def advance(position, start):
+            result['next_cursor'] = (f'{selection}:{position}:{start}'
+                                     if position < len(rows) else None)
+            result['complete'] = result['next_cursor'] is None
+
+        def fragment(row, text, start, end):
+            return {**row, 'text': text[start:end], 'content_start': start,
+                    'content_end': end, 'content_length': len(text),
+                    'byte_start': len(text[:start].encode()),
+                    'byte_end': len(text[:end].encode()),
+                    'byte_length': len(text.encode()),
+                    'content_complete': start == 0 and end == len(text)}
+
+        # Metadata alone bounds how many chunks could fit this response. Hydrate
+        # that page in one batch; the archive reader coalesces shared objects.
+        batch = []
+        documents = set()
+        for row in rows[index:]:
+            if row['document_id'] not in documents and len(documents) == MAX_DOCUMENTS:
+                break
+            documents.add(row['document_id'])
+            result['chunks'].append(fragment(row, '', 0, 0))
+            result['opened_receipts'].append(row['receipt'])
+            advance(index, offset)
+            if _encoded_result_size(result) > page_bytes:
+                break
+            batch.append(dict(row))
+        result['chunks'], result['opened_receipts'] = [], []
+        require(bool(batch))
+        if self.chunk_body_archive is None:
+            with self.store.connect() as connection:
+                bodies = self.store._execute_bounded(connection,
+                    """SELECT receipt,text_redacted AS text FROM canonical_chunks
+                       WHERE tenant_id=%s AND source_id=%s AND receipt=ANY(%s)
+                         AND deleted_at IS NULL""",
+                    (self.tenant_id, target['source_id'], [r['receipt'] for r in batch]),
+                    deadline).fetchall()
+            texts = {r['receipt']: r['text'] for r in bodies}
+            for row in batch:
+                row['text'] = texts.get(row['receipt'])
+        else:
+            self._hydrate_chunk_rows(batch, text_key='text', deadline_at=deadline)
+        for row in batch:
+            text = row.pop('text')
+            require(isinstance(text, str) and hashlib.sha256(text.encode()).hexdigest() == row['text_sha256'])
+            require(0 <= offset < len(text) or offset == 0 == len(text))
+            result['opened_receipts'].append(row['receipt'])
+            result['chunks'].append(fragment(row, text, offset, offset))
+            low, high = offset, len(text)
+            while low < high:
+                end = (low + high + 1) // 2
+                result['chunks'][-1] = fragment(row, text, offset, end)
+                advance(index + 1, 0) if end == len(text) else advance(index, end)
+                if _encoded_result_size(result) <= page_bytes:
+                    low = end
+                else:
+                    high = end - 1
+            result['chunks'][-1] = fragment(row, text, offset, low)
+            advance(index + 1, 0) if low == len(text) else advance(index, low)
+            if (low == offset and text) or _encoded_result_size(result) > page_bytes:
+                result['chunks'].pop()
+                result['opened_receipts'].pop()
+                advance(index, offset)
+                break
+            if low < len(text):
+                break
+            index, offset = index + 1, 0
+        require(bool(result['chunks']) and _encoded_result_size(result) <= page_bytes)
+        require(snapshot()[0] == selection)
+        if time.monotonic() >= deadline:
+            raise SearchDeadlineExceeded()
+        return result
+
     def show(
         self,
-        target: str,
+        target: str | dict[str, Any],
         *,
         around: str | None = None,
         tail: int = 0,
         prompts: bool = False,
         authorized_source: Any = None,
+        cursor: str | None = None,
+        page_bytes: int | None = None,
     ) -> dict[str, Any] | None:
+        if isinstance(target, dict):
+            if around is not None or tail != 0 or prompts:
+                raise ValueError("unsupported passage show request")
+            return self._show_passage(target, cursor=cursor, page_bytes=page_bytes)
+        if cursor is not None or page_bytes is not None:
+            raise ValueError("pagination requires a passage locator")
         if (
             not isinstance(target, str)
             or not target.startswith("recall://")
