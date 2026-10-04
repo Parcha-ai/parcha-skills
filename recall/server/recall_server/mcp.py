@@ -597,12 +597,29 @@ READ_TOOLS = tuple(
 CANONICAL_SHOW_TOOL = {
     **next(tool for tool in READ_TOOLS if tool["name"] == "recall_show"),
     "description": (
-        "Open one authorized canonical record from a recall:// receipt. Returns "
-        "its chunks and opened_receipts. Use recall_session_context for neighboring records."
+        "Open a receipt, or all source records behind a search passage by copying its "
+        "source_id, logical_document_id, revision, manifest_content_sha256 and passage_id "
+        "into target. Passage responses paginate full source chunks; follow next_cursor "
+        "until complete. Cite only opened_receipts. This does not reconstruct passage text."
     ),
     "inputSchema": {
         "type": "object",
-        "properties": {"target": {"type": "string"}},
+        "properties": {
+            "target": {"oneOf": [{"type": "string"}, {
+                "type": "object", "additionalProperties": False,
+                "required": ["source_id", "logical_document_id", "revision",
+                             "manifest_content_sha256", "passage_id"],
+                "properties": {
+                    "source_id": {"type": "string"},
+                    "logical_document_id": {"type": "string"},
+                    "revision": {"type": "integer", "minimum": 1},
+                    "manifest_content_sha256": {"type": "string"},
+                    "passage_id": {"type": "string"},
+                },
+            }]},
+            "cursor": {"type": "string"},
+            "page_bytes": {"type": "integer", "minimum": 1, "maximum": MAX_MCP_RESPONSE_BYTES},
+        },
         "required": ["target"],
         "additionalProperties": False,
     },
@@ -1058,6 +1075,22 @@ def _call_tool(
         except (ValueError, TypeError):
             raise McpProtocolError(-32602, "passage metadata unavailable for exact pins") from None
     if name == "recall_show":
+        if isinstance(arguments.get("target"), dict):
+            _reject_extra(arguments, frozenset({"target", "cursor", "page_bytes"}))
+            if not hasattr(store, "_show_passage"):
+                raise McpProtocolError(-32602, "passage opening requires canonical retrieval")
+            target = dict(arguments["target"])
+            target["revision"] = _integer(target.get("revision"), "revision", default=0, minimum=1)
+            options = {"target": target}
+            if "cursor" in arguments:
+                options["cursor"] = _string(arguments["cursor"], "cursor")
+            if "page_bytes" in arguments:
+                options["page_bytes"] = _integer(arguments["page_bytes"], "page_bytes",
+                    default=32_768, minimum=1, maximum=MAX_MCP_RESPONSE_BYTES)
+            try:
+                return store.show(**options)
+            except (ValueError, TypeError):
+                raise McpProtocolError(-32602, "passage source records unavailable for exact pins") from None
         _reject_extra(arguments, frozenset({"target", "around", "tail", "prompts"}))
         target = _string(arguments.get("target"), "target")
         around = (
