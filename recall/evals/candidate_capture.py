@@ -317,12 +317,13 @@ class CandidateCapture:
 
     def _call(self, client, spec, prefix):
         encoded = base64.b64encode(gzip.compress(json.dumps(spec, separators=(',', ':')).encode(), mtime=0)).decode()
-        helpers = ''
         if any('policy_fingerprint' in p for p in spec['passages']) or any('provenance' in span for p in spec['passages'] for span in p['spans']):
-            source = '\n'.join(inspect.getsource(f) for f in (_v5_id, _v5_content, _v5_session, _v5_visible_source, _v5_policy, _span_shape))
+            source = '\n'.join(inspect.getsource(f) for f in (_v5_id, _v5_content, _v5_session, _v5_visible_source, _v5_policy, _span_shape, _read_page, _page_stdout))
             packed = base64.b64encode(gzip.compress(source.encode(), mtime=0)).decode()
-            helpers = f"exec(gzip.decompress(base64.b64decode('{packed}')))\n"
-        program = "python3 - <<'RECALL_CAPTURE'\nfrom pathlib import Path\nimport json, base64, gzip\n" + helpers + inspect.getsource(_read_page) + '\n' + inspect.getsource(_page_stdout) + f"\nSPEC = '{encoded}'\nprint(_page_stdout(_read_page(Path('/docs/d1'), json.loads(gzip.decompress(base64.b64decode(SPEC))))), end='')\nRECALL_CAPTURE"
+            reader = f"exec(gzip.decompress(base64.b64decode('{packed}')))\n"
+        else:
+            reader = inspect.getsource(_read_page) + '\n' + inspect.getsource(_page_stdout)
+        program = "python3 - <<'RECALL_CAPTURE'\nfrom pathlib import Path\nimport json, base64, gzip\n" + reader + f"\nSPEC = '{encoded}'\nprint(_page_stdout(_read_page(Path('/docs/d1'), json.loads(gzip.decompress(base64.b64decode(SPEC))))), end='')\nRECALL_CAPTURE"
         _require(len(program.encode()) <= 16000, 'capture_program_bound')
         args = {'targets': [{'logical_document_id': spec['logical_document_id'], 'alias': 'd1'}], 'program': program, 'timeout_seconds': 30}
         with self.lock:

@@ -1,7 +1,10 @@
 """A new span field must never self-certify native provenance."""
 from __future__ import annotations
 
+import base64
 import copy
+import gzip
+import inspect
 import dataclasses
 import json
 import tempfile
@@ -21,7 +24,7 @@ DOC = 'ldoc_' + 'a' * 32
 TIME = '2026-07-12T12:28:55.939Z'
 
 
-def mount_v5(root, *, conflict=False, segmented=False):
+def mount_v5(root, *, conflict=False, segmented=False, message_count=1):
     contents = [
         {'type': 'session_meta', 'payload': {'id': 'child', 'forked_from_id': 'parent',
             'source': {'subagent': {'thread_spawn': {'parent_thread_id': 'parent'}}}}},
@@ -30,6 +33,15 @@ def mount_v5(root, *, conflict=False, segmented=False):
                         {'type': 'reasoning', 'text': 'NEVER EMIT THIS'},
                         {'type': 'output_text', 'text': 'Later distinct status.'}]}},
     ]
+    if message_count > 1:
+        template = contents[1]
+        contents = [contents[0]]
+        for index in range(message_count):
+            content = copy.deepcopy(template)
+            content['payload']['id'] = 'msg-' + digest(str(index).encode())
+            content['payload']['content'] = [{'type': 'output_text',
+                'text': f'Evidence item {index}: ' + digest(f'body-{index}'.encode())}]
+            contents.append(content)
     if conflict:
         contents.append({'type': 'session_meta', 'payload': {'id': 'other-child', 'forked_from_id': 'other'}})
     records = []
@@ -39,7 +51,7 @@ def mount_v5(root, *, conflict=False, segmented=False):
         for segment, part in enumerate(parts):
             records.append(LogicalEvidenceRecord(
                 ordinal=len(records), event_native_id=f'event-{index}', event_kind='codex_record',
-                occurred_at=TIME, roles=('assistant',) if index == 1 else (),
+                occurred_at=TIME, roles=('assistant',) if content.get('type') == 'response_item' else (),
                 receipts=(f'recall://{SOURCE}/event-{index}?rev=1#item=0',) if segment == 0 else (),
                 segment_ordinal=segment, segment_count=len(parts), text=part))
     messages = projection.visible_messages(records, policy=projection.PROVENANCE_PASSAGE_POLICY)
@@ -60,7 +72,7 @@ def mount_v5(root, *, conflict=False, segmented=False):
            'matching_ranges': [{'passage_id': p.passage_id, 'text': p.text,
                'text_sha256': p.text_sha256, 'policy_fingerprint': p.policy_fingerprint,
                'spans': [dataclasses.asdict(s) for s in p.spans], 'receipts': list(p.receipts)} for p in passages]}
-    return hit, messages[0].text
+    return hit, passages[0].text
 
 
 class NativeCaptureTests(unittest.TestCase):
@@ -98,8 +110,11 @@ class NativeCaptureTests(unittest.TestCase):
         span['passage_byte_end'] += offset
         first['spans'].append(span)
         hit['matching_ranges'] = [first]
-        row, _ = self.capture(hit)
+        row, client = self.capture(hit)
         self.assertTrue(row['complete_selected_passages'], row)
+        for _, args, _ in client.calls:
+            self.assertIn(inspect.getsource(capture._read_page), args['program'])
+            self.assertNotIn('exec(gzip.decompress', args['program'])
         self.assertEqual(row['text'], 'Café 🧠 shipped.\nNext action.')
         self.assertEqual(len(row['source_evidence'][0]['spans']), 2)
         self.assertTrue(all('provenance' not in span for span in row['source_evidence'][0]['spans']))
@@ -116,6 +131,21 @@ class NativeCaptureTests(unittest.TestCase):
         self.assertEqual(span['event_native_id'], 'event-1')
         self.assertIsNone(span['provenance']['original_occurred_at'])
         self.assertEqual(len(client.calls), 2)
+
+    def test_large_v5_provenance_program_keeps_execution_limit_and_exact_output(self):
+        hit, expected = mount_v5(self.mount, message_count=50)
+        self.assertEqual(len(hit['matching_ranges']), 1)
+        self.assertEqual(len(hit['matching_ranges'][0]['spans']), 50)
+        row, client = self.capture(hit)
+        self.assertEqual(row.get('text'), expected, row)
+        self.assertTrue(row['complete_selected_passages'])
+        self.assertTrue(all(len(args['program'].encode()) <= 16000 for _, args, _ in client.calls))
+        expected_source = '\n'.join(inspect.getsource(function) for function in (
+            capture._v5_id, capture._v5_content, capture._v5_session, capture._v5_visible_source,
+            capture._v5_policy, capture._span_shape, capture._read_page, capture._page_stdout))
+        for _, args, _ in client.calls:
+            packed = args['program'].split("exec(gzip.decompress(base64.b64decode('", 1)[1].split("'", 1)[0]
+            self.assertEqual(gzip.decompress(base64.b64decode(packed)).decode(), expected_source)
 
     def test_native_metadata_forgery_fails_before_source_prose(self):
         hit, _ = mount_v5(self.mount)
