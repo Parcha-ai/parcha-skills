@@ -31,6 +31,96 @@ def _require(ok: bool, code: str = 'capture_invalid') -> None:
         raise EvaluationInputError(code)
 
 
+def _v5_id(value):
+    import re
+    return value if isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9:._/@+=-]{0,511}', value) else None
+
+
+def _v5_content(text):
+    import json
+    def reject_constant(value):
+        raise ValueError('nonfinite_json')
+    try:
+        value = json.loads(text, parse_constant=reject_constant)
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _v5_session(content):
+    payload = content.get('payload')
+    if content.get('type') != 'session_meta' or not isinstance(payload, dict):
+        return None, None
+    session = _v5_id(payload.get('id'))
+    source = payload.get('source')
+    subagent = source.get('subagent') if isinstance(source, dict) else None
+    spawn = subagent.get('thread_spawn') if isinstance(subagent, dict) else None
+    parents = [payload[k] for k in ('forked_from_id', 'parent_thread_id') if k in payload]
+    if isinstance(spawn, dict) and 'parent_thread_id' in spawn:
+        parents.append(spawn['parent_thread_id'])
+    valid = [_v5_id(value) for value in parents]
+    parent = valid[0] if valid and all(value == valid[0] for value in valid) else None
+    return session, parent if session and parent != session else None
+
+
+def _v5_visible_source(text):
+    import json
+    content = _v5_content(text)
+    if not content:
+        return text
+    result = [None]; pending = [(result, 0, content)]
+    while pending:
+        parent, key, value = pending.pop()
+        if isinstance(value, dict):
+            if value.get('type') in ('reasoning', 'agent_reasoning', 'thinking', 'redacted_thinking') or value.get('channel') == 'analysis':
+                parent[key] = None; continue
+            copied = {}; parent[key] = copied
+            pending.extend((copied, name, child) for name, child in value.items())
+        elif isinstance(value, list):
+            copied = [None] * len(value); parent[key] = copied
+            pending.extend((copied, index, child) for index, child in enumerate(value))
+        else:
+            parent[key] = value
+    return json.dumps(result[0], ensure_ascii=False)
+
+
+def _v5_policy(policy):
+    import hashlib
+    return policy == hashlib.sha256(b'recall.lossless-message-passage.v5:native-provenance\0' + b'1024\0' + b'128').hexdigest()
+
+
+def _span_shape(span, policy=None):
+    from datetime import datetime
+    fields = {'record_ordinal', 'record_count', 'source_byte_start', 'source_byte_end', 'passage_byte_start', 'passage_byte_end'}
+    if not isinstance(span, dict) or not fields <= set(span):
+        return False
+    if 'provenance' not in span:
+        return not _v5_policy(policy) and set(span) <= fields | {'message_index'} and all(type(v) is int and v >= 0 for v in span.values())
+    contract = 'recall.lossless-message-passage.v5:native-provenance'
+    if not _v5_policy(policy):
+        return False
+    if set(span) - (fields | {'message_index', 'provenance'}) or not all(type(v) is int and v >= 0 for k, v in span.items() if k != 'provenance'):
+        return False
+    value = span['provenance']
+    if not isinstance(value, dict) or set(value) != {'native_session_id', 'fork_parent_session_id', 'native_message_id', 'record_type', 'serialized_at', 'visible_text_sha256', 'original_occurred_at', 'contract'}:
+        return False
+    if value['contract'] != contract or value['original_occurred_at'] is not None:
+        return False
+    if any(v is not None and _v5_id(v) != v for k, v in value.items() if k in {'native_session_id', 'fork_parent_session_id', 'native_message_id', 'record_type'}):
+        return False
+    digest = value['visible_text_sha256']; timestamp = value['serialized_at']
+    if not isinstance(digest, str) or len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
+        return False
+    if not isinstance(timestamp, str) or len(timestamp) > 64:
+        return False
+    try:
+        if datetime.fromisoformat(timestamp.replace('Z', '+00:00')).tzinfo is None:
+            return False
+    except ValueError:
+        return False
+    return value['fork_parent_session_id'] is None or (value['native_session_id'] is not None and value['fork_parent_session_id'] != value['native_session_id'])
+
+
 def _read_page(root, spec):
     """Executed unchanged inside recall_exec; returns only the requested page."""
     import hashlib
@@ -81,18 +171,45 @@ def _read_page(root, spec):
         require(manifest['native_parent_sha256'] == hashlib.sha256(spec['native_parent_id'].encode()).hexdigest(), 'native_parent_mismatch')
         needed = {o for p in spec['passages'] for s in p['spans'] for o in range(s['record_ordinal'], s['record_ordinal'] + s['record_count'])}
         require(0 < len(needed) <= 2000, 'selected_record_bound')
-        records = {}
-        for part in manifest['parts']:
-            if not any(part['first_record_ordinal'] <= o <= part['last_record_ordinal'] for o in needed):
+        v5 = any('policy_fingerprint' in p for p in spec['passages']) or any('provenance' in span for p in spec['passages'] for span in p['spans'])
+        if v5:
+            require(all('provenance' in span and _span_shape(span, p.get('policy_fingerprint')) for p in spec['passages'] for span in p['spans']), 'native_provenance_mismatch')
+        records = {}; session = (None, None); conflict = False; pending = []; scanned = 0
+        for part_index, part in enumerate(manifest['parts']):
+            if not v5 and not any(part['first_record_ordinal'] <= o <= part['last_record_ordinal'] for o in needed):
                 continue
             raw = (root / ('part-%05d.jsonl' % part['ordinal'])).read_bytes()
             require(hashlib.sha256(raw).hexdigest() == part['content_sha256'], 'part_hash_mismatch')
+            if v5:
+                require(part['ordinal'] == part_index and part['first_record_ordinal'] == scanned, 'native_provenance_mismatch')
             for i, line in enumerate(raw.splitlines()):
                 ordinal = part['first_record_ordinal'] + i
-                if ordinal in needed:
+                if v5 or ordinal in needed:
                     record = json.loads(line)
+                if v5:
+                    require(record['ordinal'] == scanned and type(record['segment_count']) is int and record['segment_count'] > 0, 'native_provenance_mismatch')
+                    first = pending[0] if pending else record
+                    require(record['segment_ordinal'] == len(pending) and all(record[k] == first[k] for k in ('segment_count', 'event_native_id', 'event_kind', 'occurred_at', 'roles')), 'native_provenance_mismatch')
+                    require(record.get('actor_links', []) == first.get('actor_links', []) and (not pending or not record['receipts']), 'native_provenance_mismatch')
+                    pending.append(record); scanned += 1
+                    if len(pending) == first['segment_count']:
+                        content = _v5_content(''.join(body(r) for r in pending))
+                        if content.get('type') == 'session_meta':
+                            identity = _v5_session(content)
+                            if first['ordinal'] == 0:
+                                session = identity
+                            elif identity != session:
+                                conflict = True
+                        pending = []
+                if ordinal in needed:
                     require(record['ordinal'] == ordinal and ordinal not in records, 'record_ordinal_mismatch')
                     records[ordinal] = record
+            if v5:
+                require(scanned == part['last_record_ordinal'] + 1, 'native_provenance_mismatch')
+        if v5:
+            require(not pending and scanned == manifest['record_count'], 'native_provenance_mismatch')
+            if conflict:
+                session = (None, None)
         require(set(records) == needed, 'required_record_missing')
         groups, identities = {}, set()
         for passage in spec['passages']:
@@ -106,6 +223,16 @@ def _read_page(root, spec):
                 require(all(r['segment_ordinal'] == i and r['segment_count'] == count and r['event_native_id'] == first['event_native_id'] for i, r in enumerate(group)), 'segment_identity_mismatch')
                 text = ''.join(body(r) for r in group)
                 groups[ordinal] = (first, text)
+                if v5:
+                    raw_visible = visible(_v5_visible_source(text))
+                    content = _v5_content(text); payload = content.get('payload')
+                    payload = payload if isinstance(payload, dict) else {}
+                    expected = {'native_session_id': session[0], 'fork_parent_session_id': session[1],
+                        'native_message_id': _v5_id(payload.get('id')) if content.get('type') == 'response_item' and payload.get('type') == 'message' else None,
+                        'record_type': _v5_id(content.get('type')), 'serialized_at': first['occurred_at'],
+                        'visible_text_sha256': hashlib.sha256(raw_visible.encode()).hexdigest(),
+                        'original_occurred_at': None, 'contract': 'recall.lossless-message-passage.v5:native-provenance'}
+                    require(span['provenance'] == expected, 'native_provenance_mismatch')
                 if spec['source_id'].startswith('claude:'):
                     native = json.loads(text)
                     require(isinstance(native, dict) and isinstance(native.get('sessionId'), str), 'native_identity_unavailable')
@@ -126,7 +253,7 @@ def _read_page(root, spec):
             parts, receipts = [], []
             for si, span in enumerate(passage['spans']):
                 first, original = groups[span['record_ordinal']]
-                raw = visible(original).encode()
+                raw = visible(_v5_visible_source(original) if v5 else original).encode()
                 start, end = span['source_byte_start'], span['source_byte_end']
                 require(0 <= start < end <= len(raw), 'source_span_out_of_bounds')
                 text = raw[start:end].decode(); parts.append(text); receipts.extend(first['receipts'])
@@ -139,6 +266,8 @@ def _read_page(root, spec):
             for span, part in zip(passage['spans'], parts):
                 require(text.encode()[span['passage_byte_start']:span['passage_byte_end']].decode() == part, 'passage_coordinate_mismatch')
             require(set(receipts) == set(passage['receipts']), 'selected_receipt_mismatch')
+            if v5:
+                require(hashlib.sha256(text.encode()).hexdigest() == passage['text_sha256'], 'native_provenance_mismatch')
             summaries.append({'passage_id': passage['passage_id'], 'bytes': len(text.encode()), 'sha256': hashlib.sha256(text.encode()).hexdigest()})
         cursor = spec['cursor']
         require(type(cursor) is int and 0 <= cursor < len(fragments), 'pagination_invalid')
@@ -152,7 +281,7 @@ def _read_page(root, spec):
         return result
     except (ValueError, KeyError, TypeError, OSError, IndexError, UnicodeError) as error:
         # Do not echo provider text, file contents or JSON decoder details.
-        codes = {'manifest_advanced_or_mismatch', 'logical_identity_mismatch', 'native_parent_mismatch', 'part_hash_mismatch', 'nonvisible_role', 'nonvisible_content', 'native_identity_ambiguous', 'native_identity_changed', 'native_identity_unavailable', 'source_span_out_of_bounds', 'passage_coordinate_mismatch', 'selected_receipt_mismatch'}
+        codes = {'native_provenance_mismatch', 'manifest_advanced_or_mismatch', 'logical_identity_mismatch', 'native_parent_mismatch', 'part_hash_mismatch', 'nonvisible_role', 'nonvisible_content', 'native_identity_ambiguous', 'native_identity_changed', 'native_identity_unavailable', 'source_span_out_of_bounds', 'passage_coordinate_mismatch', 'selected_receipt_mismatch'}
         return {'error': str(error) if type(error) is ValueError and str(error) in codes else 'source_verification_failed'}
 
 
@@ -188,7 +317,13 @@ class CandidateCapture:
 
     def _call(self, client, spec, prefix):
         encoded = base64.b64encode(gzip.compress(json.dumps(spec, separators=(',', ':')).encode(), mtime=0)).decode()
-        program = "python3 - <<'RECALL_CAPTURE'\nfrom pathlib import Path\nimport json, base64, gzip\n" + inspect.getsource(_read_page) + '\n' + inspect.getsource(_page_stdout) + f"\nSPEC = '{encoded}'\nprint(_page_stdout(_read_page(Path('/docs/d1'), json.loads(gzip.decompress(base64.b64decode(SPEC))))), end='')\nRECALL_CAPTURE"
+        if any('policy_fingerprint' in p for p in spec['passages']) or any('provenance' in span for p in spec['passages'] for span in p['spans']):
+            source = '\n'.join(inspect.getsource(f) for f in (_v5_id, _v5_content, _v5_session, _v5_visible_source, _v5_policy, _span_shape, _read_page, _page_stdout))
+            packed = base64.b64encode(gzip.compress(source.encode(), mtime=0)).decode()
+            reader = f"exec(gzip.decompress(base64.b64decode('{packed}')))\n"
+        else:
+            reader = inspect.getsource(_read_page) + '\n' + inspect.getsource(_page_stdout)
+        program = "python3 - <<'RECALL_CAPTURE'\nfrom pathlib import Path\nimport json, base64, gzip\n" + reader + f"\nSPEC = '{encoded}'\nprint(_page_stdout(_read_page(Path('/docs/d1'), json.loads(gzip.decompress(base64.b64decode(SPEC))))), end='')\nRECALL_CAPTURE"
         _require(len(program.encode()) <= 16000, 'capture_program_bound')
         args = {'targets': [{'logical_document_id': spec['logical_document_id'], 'alias': 'd1'}], 'program': program, 'timeout_seconds': 30}
         with self.lock:
@@ -211,7 +346,7 @@ class CandidateCapture:
             else:
                 _require(len(records) == 1, 'capture_payload_invalid')
             if payload.get('error'):
-                _require(payload['error'] in {'manifest_advanced_or_mismatch', 'logical_identity_mismatch', 'native_parent_mismatch', 'part_hash_mismatch', 'nonvisible_role', 'nonvisible_content', 'native_identity_ambiguous', 'native_identity_changed', 'native_identity_unavailable', 'source_span_out_of_bounds', 'passage_coordinate_mismatch', 'selected_receipt_mismatch', 'source_verification_failed'}, 'capture_payload_invalid')
+                _require(payload['error'] in {'native_provenance_mismatch', 'manifest_advanced_or_mismatch', 'logical_identity_mismatch', 'native_parent_mismatch', 'part_hash_mismatch', 'nonvisible_role', 'nonvisible_content', 'native_identity_ambiguous', 'native_identity_changed', 'native_identity_unavailable', 'source_span_out_of_bounds', 'passage_coordinate_mismatch', 'selected_receipt_mismatch', 'source_verification_failed'}, 'capture_payload_invalid')
                 receipt['payload'] = payload
                 raise EvaluationInputError(payload['error'])
             fields = {'manifest_sha256', 'revision', 'family'}
@@ -266,9 +401,8 @@ class CandidateCapture:
                     _require(type(part[key]) is int and 0 <= part[key] <= 1_000_000, 'capture_metadata_invalid')
                 _require(0 < part['total_spans'] <= 128 and 0 < part['total_receipts'] <= 8192, 'capture_metadata_bound')
                 _require(isinstance(part['spans'], list) and isinstance(part['receipts'], list) and bool(part['spans'] or part['receipts']), 'capture_metadata_invalid')
-                span_fields = {'record_ordinal', 'record_count', 'source_byte_start', 'source_byte_end', 'passage_byte_start', 'passage_byte_end'}
                 for span in part['spans']:
-                    _require(isinstance(span, dict) and span_fields <= set(span) <= span_fields | {'message_index'} and all(type(v) is int and v >= 0 for v in span.values()), 'capture_metadata_invalid')
+                    _require(_span_shape(span, part['policy_fingerprint']), 'capture_metadata_invalid')
                 _require(all(isinstance(r, str) and len(r) <= 2048 and receipt_source(r) == args['source_id'] for r in part['receipts']), 'capture_source_mismatch')
                 if current is None:
                     current = {k: part[k] for k in headers}; current.update(spans=[], receipts=[])
@@ -317,18 +451,27 @@ class CandidateCapture:
         for passage in ranges:
             _require(isinstance(passage.get('text'), str) and bool(passage['text']), 'capture_missing_metadata')
             _require(isinstance(passage.get('passage_id'), str) and re.fullmatch(r'psg_[0-9a-f]{30,32}', passage['passage_id']) is not None)
+            native = _v5_policy(passage.get('policy_fingerprint')) or any('provenance' in s for s in passage.get('spans') or ())
             available = passage.get('spans') and passage.get('receipts') and not passage.get('spans_omitted') and not passage.get('receipts_truncated')
+            if native:
+                available = available and passage.get('policy_fingerprint') and passage.get('text_sha256')
             if not available and allow_missing:
                 spec['passages'].append({'passage_id': passage['passage_id']})
                 continue
             _require(available, 'capture_missing_metadata')
             _require(all(receipt_source(r) == spec['source_id'] for r in passage['receipts']), 'capture_source_mismatch')
             fields = ('record_ordinal', 'record_count', 'source_byte_start', 'source_byte_end', 'passage_byte_start', 'passage_byte_end')
-            spans = [{k: s[k] for k in fields} for s in passage['spans']]
-            _require(len(spans) <= 128 and all(type(v) is int and v >= 0 for s in spans for v in s.values()))
+            if native:
+                _require(all('provenance' in s and _span_shape(s, passage.get('policy_fingerprint')) for s in passage['spans']), 'capture_metadata_invalid')
+                _require(isinstance(passage.get('text_sha256'), str) and re.fullmatch(r'[0-9a-f]{64}', passage['text_sha256']) is not None, 'capture_metadata_invalid')
+            spans = [{k: s[k] for k in (*fields, 'provenance') if k in s} if native else {k: s[k] for k in fields} for s in passage['spans']]
+            _require(len(spans) <= 128 and all(type(v) is int and v >= 0 for s in spans for k, v in s.items() if k != 'provenance'))
             _require(all(0 < s['record_count'] <= 2000 and s['source_byte_start'] < s['source_byte_end'] and s['passage_byte_start'] < s['passage_byte_end'] for s in spans))
             _require(isinstance(passage['passage_id'], str) and re.fullmatch(r'psg_[0-9a-f]{30,32}', passage['passage_id']) is not None)
-            spec['passages'].append({'passage_id': passage['passage_id'], 'spans': spans, 'receipts': passage['receipts']})
+            selected = {'passage_id': passage['passage_id'], 'spans': spans, 'receipts': passage['receipts']}
+            if native:
+                selected.update({k: passage[k] for k in ('policy_fingerprint', 'text_sha256')})
+            spec['passages'].append(selected)
         _require(len({p['passage_id'] for p in spec['passages']}) == len(spec['passages']))
         return spec
 
