@@ -804,7 +804,7 @@ class CanonicalPassageProjector:
                         verify_canonical=False,
                     )
 
-        messages = visible_messages(records())
+        messages = visible_messages(records(), policy=policy)
         passages = (
             build_passages(
                 tenant_id=candidate.tenant_id,

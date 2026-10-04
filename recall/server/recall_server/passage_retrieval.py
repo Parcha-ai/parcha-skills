@@ -27,6 +27,7 @@ from .fusion import (
     leg_document_scores,
 )
 from .passage_representations import FINGERPRINT_RE, VECTOR_COLUMNS
+from .passage_projection import NativeMessageProvenance
 from .rerank import (
     DEFAULT_RERANK_BLEND,
     DEFAULT_RERANK_MIN_BUDGET_SECONDS,
@@ -912,6 +913,24 @@ def focus_window(text: str, terms: list[str], width: int) -> str:
     return text[best_start:best_start + width]
 
 
+def fork_time_provenance(spans: object) -> dict[str, Any] | None:
+    """Qualify time only when the projected source has explicit fork lineage."""
+    if not isinstance(spans, (list, tuple)):
+        return None
+    for span in spans:
+        provenance = span.get("provenance") if isinstance(span, dict) else None
+        if not isinstance(provenance, dict):
+            continue
+        try:
+            value = NativeMessageProvenance(**provenance)
+            value.validate()
+        except (TypeError, ValueError):
+            continue
+        if value.fork_parent_session_id is not None:
+            return {"basis": "fork_serialization", "original_occurred_at": None}
+    return None
+
+
 def rerank_context(row: dict[str, Any]) -> str:
     """The passage's stored contextual header, or a minimal source/time line.
 
@@ -922,9 +941,13 @@ def rerank_context(row: dict[str, Any]) -> str:
     first day.
     """
 
+    qualifier = (
+        "time basis: fork serialization (may include replayed history); original event time unknown\n"
+        if fork_time_provenance(row.get("spans")) else ""
+    )
     header = row.get("header_redacted")
     if isinstance(header, str) and header.strip():
-        return header.strip()
+        return qualifier + header.strip()
     source = str(row.get("source_id") or "").strip()
     when = str(row.get("passage_first_occurred_at") or row.get("first_occurred_at") or "")
     lines = []
@@ -932,7 +955,7 @@ def rerank_context(row: dict[str, Any]) -> str:
         lines.append(f"source: {source}")
     if when[:10]:
         lines.append(f"when: {when[:10]}")
-    return "\n".join(lines)
+    return qualifier + "\n".join(lines)
 
 
 def rerank_document(row: dict[str, Any], terms: list[str], width: int) -> str:
@@ -2420,6 +2443,11 @@ class PassageHintRetrieval:
         if hydrate_diagnostics is not None:
             arm_elapsed_ms["hydrate"] = round((time.monotonic() - hydrate_started) * 1000, 3)
             temporal_diagnostics.update(hydrate_diagnostics)
+        for row in results:
+            for hint in row.get("matching_ranges") or ():
+                provenance = fork_time_provenance(hint.get("spans"))
+                if provenance is not None:
+                    hint["time_provenance"] = provenance
         if window_boost is not None:
             temporal_diagnostics["temporal_boosted"] = sum(
                 1 for row in results if "temporal_boost" in row
