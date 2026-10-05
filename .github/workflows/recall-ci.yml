@@ -56,6 +56,7 @@ jobs:
         run: |
           for test in \
             e2e_brainstore.py \
+            e2e_source_status_index_order.py \
             e2e_v2_canonical_plane.py \
             e2e_binary_archive.py \
             e2e_storage_legacy_cut.py \

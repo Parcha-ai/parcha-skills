@@ -894,7 +894,7 @@ class CanonicalPlane:
                               native_id,native_parent_id,revision,is_tombstone
                        FROM canonical_events
                        WHERE tenant_id=%s AND source_id=%s
-                       ORDER BY native_id,revision DESC
+                       ORDER BY native_id DESC,revision DESC
                    ), expected AS (
                        SELECT native_id,native_parent_id,revision
                        FROM latest WHERE NOT is_tombstone
