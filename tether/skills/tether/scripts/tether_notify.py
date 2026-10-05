@@ -728,8 +728,8 @@ def _apply_tether_setup(plan: dict | None) -> None:
 def _restore_tether_setup(plan: dict) -> None:
     if not plan["applied"]:
         return
-    current, _mode = _read_tether_config(plan["path"])
-    if current == plan["original"]:
+    current, mode = _read_tether_config(plan["path"])
+    if current == plan["original"] and mode == plan["mode"]:
         plan["applied"] = False  # Atomic write failed before replacing the file.
         return
     if current != plan["payload"]:

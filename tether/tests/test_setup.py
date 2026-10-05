@@ -180,6 +180,19 @@ class WorkspaceSetupTest(unittest.TestCase):
         self.assertEqual(self.run_setup(command)[0], 7)
         self.assertFalse(self.path.exists())
 
+    def test_failed_setup_restores_mode_when_owned_values_already_match(self):
+        original = b'active = true\nteam_id = "T012ABCDEF"\n'
+        self.write(original, 0o640)
+        self.args.no_restart = False
+        def command(argv):
+            if argv[1:] == ["gateway", "restart"]:
+                self.assertEqual(self.path.read_bytes(), original)
+                self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
+            return 0 if argv[1:] == ["gateway", "setup"] else 7
+        self.assertEqual(self.run_setup(command)[0], 7)
+        self.assertEqual(self.path.read_bytes(), original)
+        self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o640)
+
     def test_failure_before_config_apply_preserves_original(self):
         original = b'active = false\nteam_id = "TEXISTING"\n'
         self.write(original)
