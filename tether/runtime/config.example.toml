@@ -1,16 +1,21 @@
 # Optional non-secret overrides. By default Tether reuses Hermes's
 # SLACK_HOME_CHANNEL and SLACK_ALLOWED_USERS settings.
 config_version = 1
+# Optional portable colleague manifest. Relative paths resolve from this
+# config file's directory. TETHER_TEAM_CONFIG overrides this path.
+# No manifest means a neutral collaboration contract, without a private roster.
+team_config = ""
 default_channel = ""
 # Empty means every explicitly allowlisted Hermes operator may reply.
 default_owner = ""
+# Setup writes active=true and the actual workspace ID supplied by --team-id.
+# Slack member IDs in the team manifest do not replace this workspace identity.
+active = false
 team_id = ""
 allowed_users = []
-# Schema migration remains blocked until these non-secret identity fields are
-# set explicitly for this Hermes instance. Do not infer them from a pane or
-# ambient process environment.
-persona_id = ""
-policy_generation = 0
+# Non-secret runtime identity; the team manifest's self selection is context.
+persona_id = "primary"
+policy_generation = 1
 
 native_timeout_seconds = 1800
 # Slack is a coordination surface, not a run log. These are writing targets,

@@ -62,8 +62,8 @@ jobs:
           python -m pip install --disable-pip-version-check
           "bandit==1.8.6"
           "ruff==0.15.18"
-      - run: ruff check tether/runtime tether/skills/tether/scripts tether/tests
-      - run: bandit -q -r tether/runtime tether/skills/tether/scripts
+      - run: ruff check tether/runtime tether/skills/tether/scripts tether/scripts tether/tests
+      - run: bandit -q -r tether/runtime tether/skills/tether/scripts tether/scripts
       - run: python -m py_compile tether/runtime/plugin_next/__init__.py
       - run: python -m py_compile tether/runtime/plugin_next/active.py
       - run: python -m py_compile tether/runtime/plugin_next/admission.py
@@ -73,6 +73,8 @@ jobs:
       - run: python -m py_compile tether/runtime/plugin_next/store.py
       - run: python -m py_compile tether/runtime/plugin_next/session_driver.py
       - run: python -m py_compile tether/runtime/plugin_next/notices.py
+      - run: python -m py_compile tether/runtime/plugin_next/team.py
+      - run: python -m py_compile tether/runtime/plugin_next/demo.py
       - run: python -m py_compile tether/skills/tether/scripts/tether_notify.py
       - run: npm ci --ignore-scripts --no-audit --no-fund
         working-directory: tether

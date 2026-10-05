@@ -361,6 +361,21 @@ config="$XDG_CONFIG_HOME/tether/config.toml"
 [[ -f "$slack_protocol" ]] || fail "tarball install omitted a plugin module"
 python3 -m py_compile "$slack_protocol"
 [[ -f "$config" ]] || fail "tarball install did not create config"
+"$launcher" demo --json >"$TEST_ROOT/installed-demo.json"
+python3 - "$TEST_ROOT/installed-demo.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    result = json.load(handle)
+assert result["ok"] and result["simulated"]
+assert result["artifact"]["initial_review"]["passed"] is False
+assert result["artifact"]["final_review"]["passed"] is True
+assert result["checks"]["human_followup_preserves_owner"]
+assert result["checks"]["temporary_files_removed"]
+assert result["task_outcome"]["completed_tasks"] == 1
+assert result["task_outcome"]["completed_transport_attempts"] == 5
+PY
 set +e
 "$launcher" doctor >"$TEST_ROOT/installed-doctor.out" 2>&1
 doctor_rc=$?

@@ -1,22 +1,14 @@
-"""Tether gateway plugin — public Hermes seams only, shadow mode.
+"""Tether's Hermes plugin: admission, exact-session continuation and local tools.
 
-register(ctx) wires exactly four things, every one a documented public API:
+The configured active slice claims bound Slack messages before normal agent
+dispatch, queues native work and exposes an owner-local broker. Hooks also
+record admission decisions and register a portable collaboration prompt.
+Optional host interfaces are detected individually; older hosts can omit a
+prompt or tool interface, but that is not a guarantee of full compatibility.
 
-- ``pre_gateway_dispatch`` observer: evaluates Tether's strict admission for
-  each inbound event, journals the decision durably, and in this release
-  ALWAYS returns None (shadow). It never raises into the gateway and never
-  blocks traffic Tether does not own.
-- ``hermes tether`` CLI subcommand: shadow journal status as JSON.
-- ``ctx.on_unload`` (when the host offers it): closes the journal.
-- Nothing else. No private attribute of any Hermes object is touched; all
-  optional context surfaces are feature-detected with hasattr so the plugin
-  loads unchanged on Hermes 0.19.0 (v2026.7.20) through current main.
-
-Admission needs exactly two things: the workspace and the authorized owner
-set. Both resolve the way the deployed broker resolves them — Tether's own
-config merged with Hermes's explicit SLACK_ALLOWED_USERS /
-GATEWAY_ALLOWED_USERS allowlists — so observing the shadow never requires
-changing config the running broker would reject.
+Platform operations currently include direct Slack egress. Task/context and
+native-session integrations have additional host requirements. Workspace and
+authorized humans come from Tether config plus explicit Hermes allowlists.
 """
 
 from __future__ import annotations
@@ -36,6 +28,7 @@ from . import admission
 from . import active as active_module
 from . import broker as broker_module
 from . import notices
+from . import team as team_module
 from .slack_egress import SlackEgress
 from .journal import DurableJournal
 
@@ -174,27 +167,12 @@ def _event_files(event: Any) -> list[dict[str, str]]:
     return files
 
 
-_TEAM_MD_PATH = Path(__file__).resolve().parent / "team.md"
-_TEAM_MD_HEADER_END = "-->"
+def _team_prompt_section_text(team: team_module.TeamManifest | None = None) -> str:
+    """Portable roster plus the same collaboration contract native turns receive."""
+    return team_module.render_team(team if team is not None else team_module.load_team(_config_path()))
 
 
-def _team_prompt_section_text() -> str | None:
-    """Team-layer body for the system prompt, or None if team.md is absent/unreadable.
-
-    Strips the leading tether-managed HTML comment header (meaningful only to
-    the humans editing the source file, not to a model reading its own prompt).
-    """
-    try:
-        raw = _TEAM_MD_PATH.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    if raw.lstrip().startswith("<!--") and _TEAM_MD_HEADER_END in raw:
-        raw = raw.split(_TEAM_MD_HEADER_END, 1)[1]
-    text = raw.strip()
-    return text or None
-
-
-def _register_team_prompt_section(ctx: Any) -> None:
+def _register_team_prompt_section(ctx: Any, team: team_module.TeamManifest | None = None) -> None:
     """Register the team layer as a native Hermes system-prompt section.
 
     Replaces the old ``tether team apply`` splice into each agent's SOUL.md:
@@ -207,10 +185,7 @@ def _register_team_prompt_section(ctx: Any) -> None:
     if not callable(register_section):
         logger.debug("tether: host has no register_system_prompt_section; team layer not injected")
         return
-    text = _team_prompt_section_text()
-    if not text:
-        logger.warning("tether: team.md missing or empty; team prompt section not registered")
-        return
+    text = _team_prompt_section_text(team)
     try:
         register_section("tether.team", text, position="after_memory")
         logger.warning("tether: registered team system prompt section (%d chars)", len(text))
@@ -221,10 +196,10 @@ def _register_team_prompt_section(ctx: Any) -> None:
 def register(ctx: Any) -> None:
     home = _hermes_home()
     logger.info("tether: register() entered")
-    _register_team_prompt_section(ctx)
-    journal = DurableJournal(home / "plugin-data" / "tether")
     settings = load_settings()
     active_settings = active_module.load_active_settings(_config_path())
+    _register_team_prompt_section(ctx, active_settings.team)
+    journal = DurableJournal(home / "plugin-data" / "tether")
     store_db = home / "plugin-data" / "tether" / "tether.db"
     bindings = BindingIndex(store_db, ttl_seconds=0.0)
     domain_bindings = bindings
