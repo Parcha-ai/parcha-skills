@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import pathlib
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -102,7 +103,11 @@ class TetherCliTest(unittest.TestCase):
             **os.environ,
             "HOME": str(self.home),
             "XDG_DATA_HOME": str(self.root / "data"),
+            "XDG_STATE_HOME": str(self.home / ".local" / "state"),
+            "XDG_CONFIG_HOME": str(self.root / "config"),
             "HERMES_HOME": str(self.root / "hermes"),
+            "TETHER_HERDR": "off",
+            "PYTHONDONTWRITEBYTECODE": "1",
         }
         for key in (
             "TETHER_BROKER_SOCKET",
@@ -137,6 +142,7 @@ class TetherCliTest(unittest.TestCase):
         input_text: str | None = None,
         pass_fds: tuple[int, ...] = (),
         timeout: float = 4,
+        cli_path: pathlib.Path = CLI,
     ) -> subprocess.CompletedProcess[str]:
         env = dict(self.base_env)
         if socket_path is not None:
@@ -144,7 +150,7 @@ class TetherCliTest(unittest.TestCase):
         if extra_env:
             env.update(extra_env)
         return subprocess.run(
-            ["node", str(CLI), *arguments],
+            ["node", str(cli_path), *arguments],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -182,6 +188,8 @@ class TetherCliTest(unittest.TestCase):
             plugin / "session_driver.py": 0o600,
             plugin / "notices.py": 0o600,
             plugin / "herdr.py": 0o600,
+            plugin / "demo.py": 0o600,
+            plugin / "team.py": 0o600,
             plugin / "team.md": 0o600,
             plugin / "plugin.yaml": 0o644,
             local_bin / "tether": 0o700,
@@ -237,6 +245,203 @@ class TetherCliTest(unittest.TestCase):
         manifest.write_text(metadata + rows, encoding="utf-8")
         manifest.chmod(0o600)
         return manifest, candidates
+
+    def setup_child_fixtures(self) -> tuple[pathlib.Path, pathlib.Path]:
+        """Exercise the real CLI with counted offline installer/notifier children."""
+        package = self.root / "source"
+        copied_cli = package / "bin" / "tether.js"
+        copied_cli.parent.mkdir(parents=True)
+        copied_cli.write_bytes(CLI.read_bytes())
+        (package / "package.json").write_text('{"version":"0.4.0"}\n')
+        skill = package / "skills" / "tether" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("Fixture skill, no gateway.\n")
+        log = self.root / "child-calls.jsonl"
+        self.base_env["TETHER_TEST_CHILD_LOG"] = str(log)
+
+        def child(label: str) -> str:
+            return (
+                "#!/usr/bin/env python3\nimport json, os, sys\n"
+                "with open(os.environ['TETHER_TEST_CHILD_LOG'], 'a') as stream:\n"
+                f"    stream.write(json.dumps([{label!r}, *sys.argv[1:]]) + '\\n')\n"
+                "sys.exit(int(os.environ.get('TETHER_TEST_INSTALL_EXIT', '0')) "
+                f"if {label!r} == 'installer' else 0)\n"
+            )
+
+        installer = package / "install.sh"
+        installer.write_text(child("installer"))
+        installer.chmod(0o700)
+        notifier = self.root / "data" / "tether" / "tether_notify.py"
+        notifier.parent.mkdir(parents=True)
+        notifier.write_text(child("notifier"))
+        return copied_cli, log
+
+    def tree_snapshot(self) -> dict[str, str]:
+        return {
+            str(path.relative_to(self.root)): (
+                hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else "directory"
+            )
+            for path in self.root.rglob("*")
+        }
+
+    def test_setup_help_never_runs_children_or_changes_files(self) -> None:
+        cli, log = self.setup_child_fixtures()
+        before = self.tree_snapshot()
+        for flag in ("--help", "-h"):
+            with self.subTest(flag=flag):
+                result = self.run_cli("setup", flag, cli_path=cli)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("--non-interactive", result.stdout)
+                self.assertIn("--no-restart", result.stdout)
+                self.assertIn("--team-id T012ABCDEF", result.stdout)
+                self.assertIn("existing configured IDs", result.stdout)
+                self.assertNotIn("--herdr", result.stdout)
+                self.assertFalse(log.exists())
+                self.assertEqual(self.tree_snapshot(), before)
+
+    def test_invalid_setup_options_never_run_children_or_change_files(self) -> None:
+        cli, log = self.setup_child_fixtures()
+        before = self.tree_snapshot()
+        invalid = (
+            ("--herdr",), ("--harness=unsupported",), ("--harness",),
+            ("--harness=codex", "--both"), ("--codex", "--claude-code"),
+            ("--non-interactive", "--non-interactive"), ("--no-restart=false",),
+            ("--harness=codex", "--harness=both"), ("unexpected-positional",),
+            ("--team-id",), ("--team-id=",), ("--team-id", "T1"),
+            ("--team-id", "t012ABCDEF"), ("--team-id", "U012ABCDEF"),
+            ("--team-id", "T012 ABC"), ("--team-id", "T" + "A" * 32),
+            ("--team-id=T012ABCDEF", "--team-id=T012ABCDEF"),
+        )
+        for arguments in invalid:
+            with self.subTest(arguments=arguments):
+                result = self.run_cli("setup", *arguments, cli_path=cli)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse(log.exists())
+                self.assertEqual(self.tree_snapshot(), before)
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "setup refuses root")
+    def test_setup_validates_and_forwards_harness_and_notifier_flags(self) -> None:
+        cli, log = self.setup_child_fixtures()
+        for selection, harness in (
+            (("--codex",), "codex"), (("--claude-code",), "claude-code"),
+            (("--both",), "both"), (("--harness=auto",), "auto"),
+            (("--harness", "both"), "both"),
+        ):
+            with self.subTest(selection=selection):
+                log.unlink(missing_ok=True)
+                result = self.run_cli(
+                    "setup", *selection, "--non-interactive", "--no-restart", cli_path=cli,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    [json.loads(line) for line in log.read_text().splitlines()],
+                    [["installer", "install", f"--harness={harness}"],
+                     ["notifier", "setup", "--non-interactive", "--no-restart"]],
+                )
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "setup refuses root")
+    def test_setup_forwards_workspace_only_to_notifier(self) -> None:
+        cli, log = self.setup_child_fixtures()
+        for arguments, workspace in (
+            (("--team-id", "T012ABCDEF"), "T012ABCDEF"),
+            (("--team-id=T99",), "T99"),
+        ):
+            with self.subTest(arguments=arguments):
+                log.unlink(missing_ok=True)
+                result = self.run_cli("setup", "--both", *arguments, cli_path=cli)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    [json.loads(line) for line in log.read_text().splitlines()],
+                    [["installer", "install", "--harness=both"],
+                     ["notifier", "setup", "--team-id", workspace]],
+                )
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "setup refuses root")
+    def test_failed_setup_install_never_runs_notifier(self) -> None:
+        cli, log = self.setup_child_fixtures()
+        result = self.run_cli("setup", "--both", cli_path=cli,
+                              extra_env={"TETHER_TEST_INSTALL_EXIT": "7"})
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual([json.loads(line) for line in log.read_text().splitlines()],
+                         [["installer", "install", "--harness=both"]])
+
+    def test_help_advertises_demo_and_omits_unshipped_schema(self) -> None:
+        result = self.run_cli("--help")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("tether demo [--json]", result.stdout)
+        self.assertNotIn("tether schema", result.stdout)
+        for flag in ("--help", "-h"):
+            result = self.run_cli("demo", flag)
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("offline", result.stdout)
+
+    def test_demo_runs_without_an_installed_runtime(self) -> None:
+        result = self.run_cli("demo", "--json", timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["schema"], "tether-offline-demo/v1")
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["simulated"])
+        self.assertEqual(payload["actual_model_calls"], 0)
+        self.assertEqual(payload["actual_slack_calls"], 0)
+        self.assertEqual(payload["native_processes"], 0)
+        human = self.run_cli("demo", timeout=10)
+        self.assertEqual(human.returncode, 0, human.stderr)
+        self.assertIn("Offline simulation", human.stdout)
+        self.assertFalse((self.root / "hermes").exists())
+        self.assertFalse((self.root / "data").exists())
+
+    def test_standalone_installed_cli_runs_adjacent_plugin_demo(self) -> None:
+        cli = self.home / ".local" / "bin" / "tether"
+        cli.parent.mkdir(parents=True)
+        cli.write_bytes(CLI.read_bytes())
+        plugin = self.root / "hermes" / "plugins" / "tether"
+        shutil.copytree(PACKAGE_ROOT / "runtime" / "plugin_next", plugin,
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        before = self.tree_snapshot()
+        result = self.run_cli("demo", "--json", cli_path=cli, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(result.stdout)["ok"])
+        self.assertEqual(self.tree_snapshot(), before)
+        self.assertFalse((self.root / "data").exists())
+
+    def test_demo_invalid_flags_do_not_start_python(self) -> None:
+        result = self.run_cli("demo", "--socket=unexpected",
+                              extra_env={"PYTHON_BIN": str(self.root / "nonexistent-python")})
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Unknown option", result.stderr)
+
+    def test_demo_team_config_uses_custom_names_with_simulated_computers(self) -> None:
+        manifest = self.root / "custom team.toml"
+        manifest.write_text(
+            'version = 1\nself = "ada"\n'
+            '[[colleagues]]\nid = "lin"\nname = "Lin"\nrole = "Reviewer"\n'
+            'slack_id = "U11111111"\ncomputer = "never-launch-this-computer"\n'
+            '[[colleagues]]\nid = "ada"\nname = "Ada"\nrole = "Engineer"\n'
+            'slack_id = "U22222222"\ncomputer = "also-never-launch-this-computer"\n',
+        )
+        before = self.tree_snapshot()
+        result = self.run_cli("demo", "--json", "--team-config", str(manifest), timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["simulated"])
+        self.assertEqual(payload["colleagues"], {"implementer": "Ada", "reviewer": "Lin"})
+        self.assertEqual(payload["actual_model_calls"], 0)
+        self.assertEqual(payload["actual_slack_calls"], 0)
+        self.assertEqual(payload["native_processes"], 0)
+        self.assertNotIn("U11111111", result.stdout)
+        self.assertNotIn("U22222222", result.stdout)
+        self.assertEqual(self.tree_snapshot(), before)
+
+    def test_missing_installed_demo_returns_a_typed_error_without_installing(self) -> None:
+        cli = self.home / ".local" / "bin" / "tether"
+        cli.parent.mkdir(parents=True)
+        cli.write_bytes(CLI.read_bytes())
+        before = self.tree_snapshot()
+        result = self.run_cli("demo", "--json", cli_path=cli)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(json.loads(result.stderr)["code"], "demo_unavailable")
+        self.assertEqual(self.tree_snapshot(), before)
 
     def test_malformed_response_is_a_nonzero_protocol_error(self) -> None:
         with FakeBroker(self.root, lambda _request: b"{not-json}\n") as broker:
@@ -737,7 +942,7 @@ class TetherCliTest(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertIn("ok broker socket is private", payload["checks"])
         self.assertIn(
-            "ok managed install integrity verified (21 files; harness=codex)",
+            "ok managed install integrity verified (23 files; harness=codex)",
             payload["checks"],
         )
         self.assertEqual(payload["status"]["protocol_version"], 6)
@@ -875,7 +1080,7 @@ class TetherCliTest(unittest.TestCase):
             result = self.run_cli("doctor", socket_path=broker.path)
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn(
-            "ok managed install integrity verified (28 files; harness=both)",
+            "ok managed install integrity verified (30 files; harness=both)",
             result.stdout,
         )
 

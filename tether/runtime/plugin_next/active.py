@@ -1,14 +1,13 @@
-"""Active slice: bound Slack thread -> schema-18 turn -> exact-turn driver -> reply.
+"""Bound conversations, durable turn scheduling and native-session operations.
 
-This is the one path that makes an agent a coworker instead of a notifier.
-Everything durable lives in the domain database (single writer: this plugin);
-every terminal outcome is a fenced driver receipt; the reply leaves through
-whatever egress callable the host hands us (Hermes ``send_message``), never a
-Slack SDK of our own.
+The Store owns bindings and attempts. SessionDriver continues their native
+computers; egress sends results and notices. Several broker operations also
+use the plugin's direct Slack client. Task ownership and platform receipts are
+separate from an execution attempt's terminal state.
 
-The scheduler is a plain daemon thread. ``reap`` blocks on the harness process
-for up to ``native_timeout_seconds``, so it must never run on the gateway's
-event loop.
+The scheduler runs in a daemon thread; blocking native execution must stay
+off the gateway event loop. Hermes and native prompts share team.py's
+portable collaboration context.
 """
 
 from __future__ import annotations
@@ -28,6 +27,7 @@ from typing import Any, Callable
 
 from .broker import BrokerRefused
 from .herdr import Herdr, HerdrError, agent_name_for
+from . import team as team_module
 
 
 logger = logging.getLogger("hermes_plugins.tether_next.active")
@@ -326,6 +326,7 @@ class ActiveSettings:
     done_emoji: str = "white_check_mark"
     fail_emoji: str = "warning"
     blocked_emoji: str = "raised_hand"
+    team: team_module.TeamManifest = field(default_factory=team_module.TeamManifest)
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -344,6 +345,7 @@ def load_active_settings(path: Path) -> ActiveSettings:
         return int(value) if isinstance(value, int) and not isinstance(value, bool) else default
 
     return ActiveSettings(
+        team=team_module.load_team(path),
         enabled=bool(raw.get("active", False)),
         claude_binary=str(raw.get("claude_binary") or "claude"),
         claude_resume_args=strings("claude_resume_args"),
@@ -408,6 +410,8 @@ def compose_prompt(context: dict[str, Any], settings: ActiveSettings, launcher: 
         f"{os.uname().nodename}). New messages arrived in the Slack thread bound to this "
         "session:",
         "",
+        team_module.render_team(settings.team),
+        "",
     ]
     for turn in context["turns"]:
         payload: dict[str, Any] = {}
@@ -432,12 +436,13 @@ def compose_prompt(context: dict[str, Any], settings: ActiveSettings, launcher: 
         "Reply contract: whatever you print is posted verbatim into the thread by Tether. Do "
         "not call tether reply/post/notify, do not mention bridge ids or reply keys, do not "
         "write 'Reply to' headers or any note to your operator; the thread is your reader. "
-        "Your message is only the reply: start it with the <@USERID> of the person you answer, "
-        "no preamble, no account of what you just did or thought. Lead with the answer, then "
+        "Your message is only the reply. Mention the recipient when their actual Slack user ID is known. "
+        "No preamble, hidden reasoning or tool-by-tool narration. Lead with the answer, then "
         "evidence. If you cannot do part of it, say so in one clause and do the rest; do not "
         "offer a menu of options.",
-        f"Reply in at most {max(settings.max_reply_sentences, 3)} short sentences, as a colleague: "
-        "no meta-narration, no restating the question. Mention people as <@USERID>. If the "
+        f"Keep routine replies within {max(settings.max_reply_sentences, 3)} short sentences; "
+        "give more detail when the human requests it or the answer requires it. "
+        "No meta-narration, no restating the question. Mention people as <@USERID>. If the "
         "messages need no reply from you, respond with exactly NO_REPLY.",
     ]
     return "\n".join(lines)

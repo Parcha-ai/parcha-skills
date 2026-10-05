@@ -32,7 +32,6 @@ const runtimeHome = path.join(dataHome, "tether");
 const installedInstaller = path.join(runtimeHome, "install.sh");
 const notifier = path.join(runtimeHome, "tether_notify.py");
 const installedRuntime = path.join(process.env.HERMES_HOME || path.join(home, ".hermes"), "plugins", "tether", "store.py");
-const installedSchemaOrchestrator = path.join(runtimeHome, "schema_orchestrator.py");
 const stateHome = path.join(
   process.env.XDG_STATE_HOME || path.join(home, ".local", "state"),
   "tether-installer",
@@ -190,6 +189,8 @@ function expectedManagedTargetModes(metadata) {
     [path.join(pluginRoot, "session_driver.py"), 0o600],
     [path.join(pluginRoot, "notices.py"), 0o600],
     [path.join(pluginRoot, "herdr.py"), 0o600],
+    [path.join(pluginRoot, "demo.py"), 0o600],
+    [path.join(pluginRoot, "team.py"), 0o600],
     [path.join(pluginRoot, "team.md"), 0o600],
     [path.join(pluginRoot, "plugin.yaml"), 0o644],
     [path.join(localBin, "tether"), 0o700],
@@ -395,6 +396,8 @@ function writeJson(stream, value) {
 
 function printHelp(command = "") {
   const commandHelp = {
+    setup: "tether setup [--harness=auto|codex|claude-code|both | --codex | --claude-code | --both] [--team-id T012ABCDEF] [--non-interactive] [--no-restart]\nSupply your Slack workspace ID for fresh interactive setup; existing configured IDs are reused.\nWorkspace IDs start with T and contain 2–31 uppercase letters or digits after it.",
+    demo: "tether demo [--json] [--team-config PATH]\nRun a simulated colleague workflow offline; no Slack credentials, model, or gateway required.\nTeam config supplies display names only; Slack IDs and computers remain simulated.",
     status: "tether status [--json] [--socket PATH] [--timeout-ms MS]",
     doctor: "tether doctor [--json] [--socket PATH] [--timeout-ms MS]",
     identity: "tether identity [--json] [--socket PATH] [--timeout-ms MS]",
@@ -410,7 +413,6 @@ function printHelp(command = "") {
     unresolved: "tether unresolved [--team ID] [--json]",
     history: "tether history [--channel ID] [--limit N] [--team ID]",
     thread: "tether thread --channel ID --thread-ts TS [--limit N] [--team ID]",
-    schema: "tether schema status [--json]",
   };
   if (command && commandHelp[command]) {
     process.stdout.write(`${commandHelp[command]}\n`);
@@ -419,12 +421,12 @@ function printHelp(command = "") {
   process.stdout.write(`Tether ${readVersion()}
 
 Usage:
-  tether setup [--harness=codex|claude-code|both]
+  tether setup [--harness=auto|codex|claude-code|both] [--team-id T012ABCDEF] [--non-interactive] [--no-restart]
+  tether demo [--json] [--team-config PATH]
   tether install|upgrade [installer options]
   tether rollback|uninstall [--dry-run] [--restart]
   tether doctor|status|identity|maintenance [--json]
   tether notify|reply|attach|rebind|close|unbind|post|spawn|history|thread [options]
-  tether schema status [--json]
   tether unresolved [options]
   tether version
 
@@ -485,6 +487,63 @@ function parseOptions(argv, definitions) {
     result[name] = value;
   }
   return result;
+}
+
+function setupArguments(argv) {
+  const options = parseOptions(argv.map((argument) => argument === "-h" ? "--help" : argument), {
+    help: { type: "flag" },
+    harness: { type: "value" },
+    codex: { type: "flag" },
+    "claude-code": { type: "flag" },
+    both: { type: "flag" },
+    "non-interactive": { type: "flag" },
+    "no-restart": { type: "flag" },
+    "team-id": { type: "value" },
+  });
+  const aliases = ["codex", "claude-code", "both"].filter((name) => options[name]);
+  if (aliases.length + Number(options.harness !== undefined) > 1) {
+    throw new CliError("Choose one harness using --harness, --codex, --claude-code, or --both.");
+  }
+  const harness = options.harness || aliases[0];
+  if (harness && !["auto", "codex", "claude-code", "both"].includes(harness)) {
+    throw new CliError("Unsupported harness. Choose auto, codex, claude-code, or both.");
+  }
+  if (options["team-id"] !== undefined && !/^T[A-Z0-9]{2,31}$/.test(options["team-id"])) {
+    throw new CliError("--team-id must be a Slack workspace ID starting with T followed by 2–31 uppercase letters or digits (for example T012ABCDEF).");
+  }
+  return {
+    help: options.help === true,
+    install: harness ? [`--harness=${harness}`] : [],
+    notifier: [
+      ...["non-interactive", "no-restart"].filter((name) => options[name]).map((name) => `--${name}`),
+      ...(options["team-id"] ? ["--team-id", options["team-id"]] : []),
+    ],
+  };
+}
+
+function runDemo(argv) {
+  const options = parseOptions(argv.map((argument) => argument === "-h" ? "--help" : argument), {
+    help: { type: "flag" },
+    json: { type: "flag" },
+    "team-config": { type: "value" },
+  });
+  if (options.help) {
+    printHelp("demo");
+    return 0;
+  }
+  const script = packagePayloadAvailable()
+    ? path.join(packageRoot, "runtime", "plugin_next", "demo.py")
+    : path.join(process.env.HERMES_HOME || path.join(home, ".hermes"), "plugins", "tether", "demo.py");
+  if (!fs.existsSync(script)) {
+    throw new CliError("Offline demo is unavailable in this Tether package. Use a release that includes the demo.", EXIT_USAGE, "demo_unavailable");
+  }
+  return runChild(
+    process.env.PYTHON_BIN || "python3",
+    [script, ...(options.json ? ["--json"] : []),
+      ...(options["team-config"] ? ["--team-config", options["team-config"]] : [])],
+    CHILD_TIMEOUT_MS,
+    { ...process.env, TETHER_HERDR: "off", PYTHONDONTWRITEBYTECODE: "1" },
+  );
 }
 
 function requireOption(options, name) {
@@ -1481,10 +1540,21 @@ async function main() {
     return 0;
   }
 
+  if (command === "demo") return runDemo(argv);
+  if (command === "setup") {
+    const args = setupArguments(argv);
+    if (args.help) {
+      printHelp("setup");
+      return 0;
+    }
+    assertNonRoot(command);
+    if (packagePayloadAvailable()) {
+      const installed = runChild(packageInstaller, ["install", ...args.install], LIFECYCLE_TIMEOUT_MS);
+      if (installed !== 0) return installed;
+    }
+    return runNotifier("setup", args.notifier, {}, LIFECYCLE_TIMEOUT_MS);
+  }
   assertNonRoot(command);
-
-
-
   if (command === "install" || command === "upgrade") {
     if (!packagePayloadAvailable()) {
       throw new CliError(
@@ -1514,26 +1584,6 @@ async function main() {
       LIFECYCLE_TIMEOUT_MS,
     );
     return completed;
-  }
-
-  if (command === "setup") {
-    const installArgs = argv.filter((argument) =>
-      argument.startsWith("--harness=") ||
-      ["--both", "--codex", "--claude-code"].includes(argument)
-    );
-    const setupArgs = argv.filter((argument) =>
-      !installArgs.includes(argument)
-    );
-    if (packagePayloadAvailable()) {
-      const installed = runChild(
-        packageInstaller,
-        ["install", ...installArgs],
-        LIFECYCLE_TIMEOUT_MS,
-      );
-      if (installed !== 0) return installed;
-    }
-    const configured = runNotifier("setup", setupArgs, {}, LIFECYCLE_TIMEOUT_MS);
-    return configured;
   }
 
   return runBrokerCommand(command, argv);

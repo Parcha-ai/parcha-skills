@@ -1,118 +1,72 @@
-# Tether Compatibility
+# Tether compatibility
 
-## Supported release boundary
+## Source runtime
 
-Tether `0.3.0-beta.1` supports:
+The source package and plugin are version `0.4.0`. The runtime server supports
+Linux x86-64/arm64, Python 3.11–3.14 and Node.js 22 or 24. Native continuation
+supports Claude Code and Codex; optional Herdr placements use its CLI contract.
+The offline demo requires Python and Node only.
 
-- Linux on x86-64 or arm64;
-- Python 3.11, 3.12, 3.13, or 3.14;
-- a maintained Node.js LTS release: 22 or 24; and
-- Hermes Agent exactly 0.19.0, tested at commit
-  `b9ba7c78e41b5d187e2c8fb446655c4b71c42aa5`.
+Hermes is not bundled. Setup requires its plugin enable/disable commands,
+configuration commands, Slack manifest/setup flow and gateway lifecycle
+commands. Runtime integration uses the plugin dispatch hooks and detects
+optional system-prompt, native-context and tool-registration surfaces.
+These requirements describe the code's integration boundary; they are not a
+claim that every stock Hermes release passed an end-to-end Slack journey.
 
-Hermes is not bundled. Tether validates the exact Hermes version and required
-Slack adapter call signatures at startup and in `tether doctor`. Unsupported
-versions fail closed.
+The previous documentation pinned Hermes 0.19.0 and an exact clean checkout.
+This source's plugin uses capability detection rather than enforcing that
+version/commit pin. Run `tether doctor` and verify a real outbound root and
+inbound reply against your chosen host. Doctor's egress authentication result
+is not proof that Socket Mode ingress or task collaboration works.
 
-Hermes must be loaded from the exact tested Git commit in a clean checkout.
-Tracked changes, non-ignored untracked files, and ignored Python overlays in
-Hermes source trees fail closed, even when they are outside the Slack adapter.
+macOS/Windows runtime servers, a remote client and the Grep computer adapter
+remain roadmap work. A terminal or runtime being recognized does not prove
+native continuation support for it.
 
-The installer refuses non-Linux hosts. Native Herdr and Zellij continuation
-depend on Linux `/proc` identity and Unix-domain sockets. Herdr protocol 19 is
-supported and tested with Herdr 0.8.0. Headless runs can publish
-with an explicit `--run-id`; stock pi sessions cannot be resumed natively.
+## Persistent state
 
-## Binding and database upgrade
+The session runtime stores endpoints, bindings, turns, attempts and thread
+origins in `HERMES_HOME/plugin-data/tether/tether.db`. Store construction
+creates the current tables and the runtime can import active bindings from
+legacy `domain.db`. It does not implement the old documented schema-17/18
+upgrade orchestrator. There is no `tether schema` CLI command in this package.
 
-This source tree uses BindingV3 and SQLite schema 17.
+Stop the gateway before backing up runtime data. Use SQLite backup or preserve
+the database and its WAL/SHM files together. Keep the code revision with the
+backup. Installer rollback restores managed code and plugin state; it does
+not reverse database changes or external Slack effects.
 
-A BindingV3 record contains a concrete source, one delivery endpoint, and a
-monotonic generation. Rebind and close increment the generation. Legacy or
-incomplete native bindings become `rebind_required`; Tether never guesses a
-replacement process or session.
+Existing bindings identify an exact session and conversation. A rebind is an
+intentional replacement and advances the generation. Tether must not guess a
+replacement session after a stale identity or ambiguous turn.
 
-BindingV3 adds a Herdr live endpoint. It pins the private session socket,
-protocol, terminal and pane IDs, occupant-bound agent name, official native
-session reference, and Linux process incarnation. BindingV1 and BindingV2
-records remain readable and are canonicalized to BindingV3.
+## CLI and package
 
-Herdr 0.8.0 live handoff can replace its internal terminal ID without replacing
-the terminal process. Tether keeps the binding only when the named occupant,
-native session, and process incarnation still match; process replacement still
-requires an explicit rebind.
+CLI and broker use protocol 6. The package includes the Hermes plugin, CLI,
+instruction skills, examples, offline demo and documentation. It does not
+include the previously advertised `herdr-plugin` cockpit package.
 
-At startup, the Store:
+`setup` accepts a harness selection, `--team-id`, `--non-interactive` and
+`--no-restart`. A fresh interactive setup needs its actual workspace ID; an
+existing valid config `team_id` can be reused. Setup activates the instance
+for that workspace before restarting the gateway.
+The old advertised `setup --herdr` option is unsupported. Help and invalid
+setup arguments are handled before any installation or configuration change.
+Use `setup --help` for the actual command contract.
 
-1. rejects a database whose `PRAGMA user_version` is newer than 17;
-2. opens an immediate migration transaction;
-3. applies additive schema migrations and binding backfills;
-4. preserves multiple thread bindings for one endpoint and indexes their shared serialization key;
-5. writes schema version 17; and
-6. recovers attempts that are proven not to have started external I/O.
+The installed CLI locates `demo.py` in the managed Hermes plugin directory;
+the source CLI uses its package payload. New modules are included in the
+installer and managed-file manifest together so rollback can restore them.
 
-The installer snapshots managed code and Hermes plugin state, not the
-database. Before upgrading an important host:
+## Configuration
 
-1. Stop Hermes.
-2. Back up `bridges.db` with SQLite's backup command, or copy it with any
-   `-wal` and `-shm` sidecars as one set.
-3. Record the Tether version with the backup.
-4. Upgrade and start Hermes.
-5. Run `tether doctor`, then test one outbound root and one Socket Mode reply.
+The optional version-1 team manifest is prompt context. `TETHER_TEAM_CONFIG`
+overrides config.toml's `team_config`. No configured path means a neutral
+collaboration contract; malformed explicit configuration produces an error.
+Computer preferences do not select models or change attached sessions.
 
-Code rollback does not downgrade schema 17. If an older runtime cannot read the
-database, restore the backup created for that runtime.
-
-## Slack compatibility
-
-Slack Events API delivery through Hermes Socket Mode is the authoritative
-ingress path. Tether's `conversations.replies` poller is best-effort recovery,
-not a substitute. It may be rate-limited or unavailable to bot tokens for
-channel threads depending on token type, scopes, and channel membership.
-
-Tether distinguishes two thread types:
-
-- a thread whose root was posted by Tether has durable local root ownership;
-- an existing thread explicitly attached or rebound by a trusted local client
-  has a durable claim fenced to that binding generation.
-
-Both permit unmentioned replies from allowlisted humans. Peer bots remain
-mention-gated, and unclaimed existing threads still fail closed.
-
-## CLI compatibility
-
-The CLI and local broker must both use broker protocol 6. Tether rejects older
-and unknown newer protocols; upgrade the package and installed runtime
-together.
-
-The `parcha.tether` plugin requires Herdr 0.8.0 or newer within protocol 19.
-The beta supports Herdr-managed Codex and Claude Code agents on Linux. Other
-recognized agents remain visible in Herdr but cannot be bound by Tether.
-
-Use `--text-stdin` or `--text-fd FD` for notification and reply text.
-Deprecated `--text` remains accepted for compatibility but exposes text in
-process arguments and emits a warning.
-
-Configured word, character, and sentence limits are soft writing targets. They
-do not reject a complete response. The hard transport limit is 35,000
-characters.
-
-The read-only operator recovery command in this release is:
-
-```bash
-tether unresolved [--team T12345678]
-```
-
-The legacy same-UID `tether resolve` mutation is disabled until an
-OS-distinguishable operator authority channel is active.
-
-## Credential compatibility
-
-Hermes and Tether must run as the same dedicated non-root Unix user. The broker
-rejects UID 0 and local peers with another UID.
-
-Native Codex and Claude Code authentication may use normal user configuration
-or an administrator-controlled `credential_command`. Tether validates the
-helper path, non-writable ancestors, ownership, mode, file type, and bounded
-allowlisted output before use.
+Keep explicit operator and trusted-bot allowlists in the host/runtime settings.
+The team roster grants no permission. Same-UID local processes share the
+broker's authority boundary. Model and account authentication remain the
+native computer's configuration, not a Slack credential supplied by the CLI.

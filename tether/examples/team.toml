@@ -1,0 +1,24 @@
+# Copy this file into your instance configuration directory and replace the
+# example names, roles and project references. No credentials belong here.
+version = 1
+self = "engineer"
+
+[[projects]]
+id = "sample"
+ref = "./sample-repository"
+
+[[colleagues]]
+id = "engineer"
+name = "Engineer"
+role = "Implement changes, verify the result, and own follow-through."
+computer = "claude-code"
+projects = ["sample"]
+# slack_id = "U01234567" # Your colleague's actual Slack member ID.
+
+[[colleagues]]
+id = "reviewer"
+name = "Reviewer"
+role = "Inspect artifacts, reproduce edge cases, and report actionable findings."
+computer = "codex"
+projects = ["sample"]
+# slack_id = "U07654321"

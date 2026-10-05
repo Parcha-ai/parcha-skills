@@ -125,12 +125,9 @@ generation, so allowlisted humans may continue it without mentioning the bot.
 Peer bots remain mention-gated. An intentional replacement must use `rebind`.
 
 
-When `parcha.tether` is installed, use `Tether: Open cockpit` for the focused
-Codex or Claude Code pane. The cockpit can create or attach a Slack thread,
-rebind the intended replacement agent, detach, run doctor, and inspect
-uncertain work. A selected or Ctrl-clicked Slack thread link opens a review
-step; it never attaches automatically. Treat plugin context only as a hint and
-let Tether revalidate the exact live endpoint.
+The current package supports CLI attachment and optional runtime Herdr
+placement. It does not ship the previously advertised Herdr cockpit package.
+Use the session-aware CLI rather than assuming a plugin action exists.
 
 ## Operate safely
 

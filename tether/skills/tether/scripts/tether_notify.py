@@ -11,7 +11,9 @@ import stat
 # Hermes is invoked with a fixed argv list, never a shell.
 import subprocess  # nosec B404
 import sys
+import tempfile
 import time
+import tomllib
 import urllib.parse
 from collections.abc import Sequence
 from pathlib import Path
@@ -407,6 +409,7 @@ def build_parser() -> argparse.ArgumentParser:
     setup = sub.add_parser("setup")
     setup.add_argument("--non-interactive", action="store_true")
     setup.add_argument("--no-restart", action="store_true")
+    setup.add_argument("--team-id", help="Slack workspace ID (T...), or reuse the configured team_id")
     return parser
 
 
@@ -593,7 +596,149 @@ def _restore_setup(hermes: str, snapshot: dict[str, object]) -> bool:
         if result:
             print(f"Setup rollback could not restore the {name} plugin.", file=sys.stderr)
             ok = False
+    plan = snapshot.get("tether_config")
+    if plan is not None:
+        try:
+            _restore_tether_setup(plan)
+        except (OSError, RuntimeError) as error:
+            print(f"Setup rollback could not restore Tether config: {_safe_error(error)}", file=sys.stderr)
+            ok = False
     return ok
+
+
+def _tether_config_path() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))).expanduser() / "tether/config.toml"
+
+
+def _read_tether_config(path: Path) -> tuple[bytes | None, int]:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None, 0o600
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+            raise RuntimeError("Tether config must be a regular file owned by your user")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            data = handle.read(65537)
+        if len(data) > 65536:
+            raise RuntimeError("Tether config exceeds 64 KiB; shorten it before setup")
+        return data, stat.S_IMODE(info.st_mode)
+    finally:
+        os.close(descriptor)
+
+
+def _config_values(data: bytes) -> dict:
+    try:
+        return tomllib.loads(data.decode("utf-8"))
+    except (UnicodeError, tomllib.TOMLDecodeError) as error:
+        raise RuntimeError("Tether config is invalid UTF-8 TOML; fix its syntax before setup") from error
+
+
+def _patch_owned_setting(text: str, key: str, value: object) -> str:
+    """Preserve comments/tables; accept a replacement only after semantic proof.
+
+    Looking at all matching lines also handles unrelated multiline strings and
+    nested fields with the same spelling: neither is a valid top-level change.
+    """
+    before = _config_values(text.encode())
+    expected = {**before, key: value}
+    literal = "true" if value is True else json.dumps(value)
+    if key not in before:
+        result = f"{key} = {literal}\n" + text
+        if _config_values(result.encode()) == expected:
+            return result
+    pattern = re.compile(r"([ \t]*(?:" + re.escape(key) + r'|"' + re.escape(key)
+        + r'"|\'' + re.escape(key) + r"')[ \t]*=[ \t]*)(.*?)(\r?\n)?")
+    lines = text.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        match = pattern.fullmatch(line)
+        if not match:
+            continue
+        # A # inside a quoted string is data, including in a workspace value
+        # that is being replaced. Preserve only the actual inline comment.
+        quote, escaped, comment = None, False, ""
+        for offset, character in enumerate(match[2]):
+            if escaped:
+                escaped = False
+            elif quote == '"' and character == "\\":
+                escaped = True
+            elif quote:
+                if character == quote:
+                    quote = None
+            elif character in "\"'":
+                quote = character
+            elif character == "#":
+                comment = match[2][:offset][len(match[2][:offset].rstrip()):] + match[2][offset:]
+                break
+        replacement = match[1] + literal + comment + (match[3] or "")
+        candidate = "".join([*lines[:index], replacement, *lines[index + 1:]])
+        try:
+            if _config_values(candidate.encode()) == expected:
+                return candidate
+        except RuntimeError:
+            continue
+    raise RuntimeError(f"Cannot preserve Tether config while updating {key}; use a single-line top-level setting")
+
+
+def _plan_tether_setup(args: argparse.Namespace) -> dict | None:
+    requested = getattr(args, "team_id", None)
+    if args.non_interactive and requested is None:
+        return None  # Manifest generation alone does not claim runtime readiness.
+    path = _tether_config_path()
+    original, mode = _read_tether_config(path)
+    raw = _config_values(original or b"")
+    workspace = requested if requested is not None else raw.get("team_id")
+    if not isinstance(workspace, str) or not re.fullmatch(r"T[A-Z0-9]{2,31}", workspace):
+        raise RuntimeError("A valid Slack workspace ID is required. Run `tether setup --team-id T012ABCDEF`, "
+                           "or set a valid team_id in ~/.config/tether/config.toml")
+    text = (original or b"").decode("utf-8")
+    text = _patch_owned_setting(text, "active", True)
+    text = _patch_owned_setting(text, "team_id", workspace)
+    if len(text.encode()) > 65536:
+        raise RuntimeError("Updated Tether config would exceed 64 KiB; shorten it before setup")
+    return {"path": path, "original": original, "mode": mode, "payload": text.encode(), "applied": False}
+
+
+def _atomic_config(path: Path, payload: bytes, mode: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, temporary = tempfile.mkstemp(prefix=".tether-setup-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            os.fchmod(handle.fileno(), mode)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _apply_tether_setup(plan: dict | None) -> None:
+    if plan is None:
+        return
+    current, _mode = _read_tether_config(plan["path"])
+    if current != plan["original"]:
+        raise RuntimeError("Tether config changed during setup; retry without overwriting the newer configuration")
+    plan["applied"] = True
+    _atomic_config(plan["path"], plan["payload"], 0o600)
+
+
+def _restore_tether_setup(plan: dict) -> None:
+    if not plan["applied"]:
+        return
+    current, mode = _read_tether_config(plan["path"])
+    if current == plan["original"] and mode == plan["mode"]:
+        plan["applied"] = False  # Atomic write failed before replacing the file.
+        return
+    if current != plan["payload"]:
+        raise RuntimeError("Tether config changed after setup wrote it; preserve the newer file and restore active/team_id manually")
+    if plan["original"] is None:
+        plan["path"].unlink()
+    else:
+        _atomic_config(plan["path"], plan["original"], plan["mode"])
+    plan["applied"] = False
 
 
 class _SetupFailure(Exception):
@@ -603,6 +748,11 @@ class _SetupFailure(Exception):
 
 
 def run_setup(args: argparse.Namespace) -> int:
+    try:
+        plan = _plan_tether_setup(args)
+    except (OSError, RuntimeError) as error:
+        print(f"Tether setup stopped before making changes: {_safe_error(error)}", file=sys.stderr)
+        return 2
     hermes = _find_hermes()
     if not hermes:
         print(
@@ -613,6 +763,7 @@ def run_setup(args: argparse.Namespace) -> int:
         return 2
     try:
         snapshot = _snapshot_setup(hermes)
+        snapshot["tether_config"] = plan
     except KeyboardInterrupt:
         print("Tether setup was interrupted before making changes.", file=sys.stderr)
         return 130
@@ -637,7 +788,13 @@ def run_setup(args: argparse.Namespace) -> int:
             )
             if result.returncode:
                 raise _SetupFailure(result.returncode)
-            print("Slack manifest generated. Run `hermes gateway setup`, then `tether doctor`.")
+            _apply_tether_setup(plan)
+            if plan is None:
+                print("Slack manifest generated. Finish Slack app configuration, then run "
+                      "`tether setup --team-id <workspace-id>` to enable Tether.")
+            else:
+                print("Slack manifest generated. Finish Slack configuration with `hermes gateway setup`, "
+                      "then start or restart your Hermes gateway and run `tether doctor`.")
             return 0
 
         print("Tether will now open Hermes's Slack setup. It generates the current app manifest,")
@@ -645,6 +802,12 @@ def run_setup(args: argparse.Namespace) -> int:
         result = _run_hermes([hermes, "gateway", "setup"], SETUP_TIMEOUT_SECONDS)
         if result.returncode:
             raise _SetupFailure(result.returncode)
+        _apply_tether_setup(plan)
+
+        if args.no_restart:
+            print("Tether configuration is saved. Start or restart your Hermes gateway, "
+                  "then run `tether doctor` to check it is ready.")
+            return 0
 
         if not args.no_restart:
             restarted = _run_hermes([hermes, "gateway", "restart"], SERVICE_TIMEOUT_SECONDS)
