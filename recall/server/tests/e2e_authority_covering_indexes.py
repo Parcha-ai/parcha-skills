@@ -168,6 +168,9 @@ class AuthorityIndexOperationTest(unittest.TestCase):
                 FROM generate_series(1,2000) AS n;
             CREATE TABLE canonical_evidence_documents(
                 tenant_id text,source_id text,logical_document_id text,
+                revision integer NOT NULL DEFAULT 1,
+                manifest_object_key text NOT NULL DEFAULT 'objects/test',
+                manifest_content_sha256 text NOT NULL DEFAULT repeat('a',64),
                 PRIMARY KEY(tenant_id,source_id,logical_document_id));
             CREATE TABLE canonical_passage_documents(
                 tenant_id text,source_id text,logical_document_id text,policy_fingerprint text,
@@ -223,6 +226,9 @@ class AuthorityIndexOperationTest(unittest.TestCase):
         self.conn.execute('''
             CREATE TABLE canonical_evidence_documents(
                 tenant_id text,source_id text,logical_document_id text,
+                revision integer NOT NULL DEFAULT 1,
+                manifest_object_key text NOT NULL DEFAULT 'objects/test',
+                manifest_content_sha256 text NOT NULL DEFAULT repeat('a',64),
                 PRIMARY KEY(tenant_id,source_id,logical_document_id));
             CREATE TABLE canonical_passage_documents(
                 tenant_id text,source_id text,logical_document_id text,policy_fingerprint text,
