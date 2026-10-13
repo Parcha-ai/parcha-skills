@@ -285,7 +285,7 @@ are supported: versions through 69 are required except optional migration 67,
 which retires the Postgres vector plane and is applied explicitly from the
 turbopuffer plane. Migration 70 adds only a reconciliation performance index;
 serving accepts both schema 69 and 70 and reports the actual recorded version.
-The latest shipped migration is 76; migration 71 remains optional and reserved
+The latest shipped migration is 78; migration 71 remains optional and reserved
 for native-conversation metadata. Migration 72 adds nullable
 `canonical_evidence_document_queue.notification_queued_at`, with no default,
 index, or historical reclassification. Apply it before deploying the notification
@@ -314,6 +314,22 @@ before applying it; applying the migration does not approve any source. The
 [future retirement policy](../../docs/architecture/2026-10-13-future-retirement-policy.md)
 describes bounded baseline capture, exact reviewed activation, revocation and
 reconciliation. Automatic enrollment does not itself schedule clearing.
+
+Migration 77 adds ownership for suppressed raw Slack revisions and durable raw
+artifact deletion fences. Deploy binaries accepting 75, 76 and 77 to MCP,
+projection and managed workers before migration; refresh runtime grants after
+migration and before enabling historical Slack reconciliation. Startup still
+accepts mandatory schema 69. Without 77, suppressed Slack messages fail closed;
+the shared-artifact lifetime guarantee begins when 77 is present. The fence is
+prospective, not proof that artifacts forgotten by older releases are covered.
+Do not roll back to an older forget implementation after suppression starts.
+See [Slack deletion and raw lifetime](../../docs/architecture/2026-10-13-slack-terminal-deletion.md).
+
+Migration 78 adds bounded retirement scheduling metadata to the existing policy
+row and requires 76. Deploy compatible binaries before applying it. Projection
+workers default to `--retirement off`; the
+[worker retirement runbook](../../docs/architecture/2026-10-13-retirement-worker.md)
+covers exact-parent crash recovery, activation, metrics and rollback.
 
 Webhook ingestion retains the same structured canonical JSON as managed
 history, so typed messages remain visible when their author is unresolved.

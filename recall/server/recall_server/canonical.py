@@ -300,6 +300,70 @@ class CanonicalArchiveGateway:
                 )
 
 
+def _slack_terminal_ack(source_id: str, native_id: str, revision: int) -> dict[str, Any]:
+    # duplicate_events includes an already-terminal native identity. The subset
+    # diagnostic distinguishes it from an exact content-hash replay.
+    return {'status': 'committed', 'inserted': 0, 'duplicate_events': 1,
+            'suppressed_deleted_events': 1, 'revision': revision,
+            'receipt': f'recall://{source_id}/{native_id}?rev={revision}#item=0', 'replay': True}
+
+
+def _lock_artifacts(connection, tenant_id: str, source_id: str, artifact_ids) -> None:
+    keys = sorted({f"v2-artifact\x1f{tenant_id}\x1f{source_id}\x1f{artifact}" for artifact in artifact_ids})
+    if keys:
+        connection.execute("""SELECT pg_advisory_xact_lock(hashtextextended(value,0))
+            FROM unnest(%s::text[]) AS keys(value) ORDER BY value""", (keys,)).fetchall()
+
+
+def _artifact_fence_available(connection) -> bool:
+    return connection.execute(
+        "SELECT to_regclass('public.canonical_artifact_forget_tombstones') IS NOT NULL AS present"
+    ).fetchone()["present"]
+
+
+def _guard_artifact_admission(connection, tenant_id: str, source_id: str, artifact_ids) -> None:
+    _lock_artifacts(connection, tenant_id, source_id, artifact_ids)
+    if _artifact_fence_available(connection) and connection.execute(
+        """SELECT 1 FROM canonical_artifact_forget_tombstones
+           WHERE tenant_id=%s AND source_id=%s AND artifact_id=ANY(%s) LIMIT 1""",
+        (tenant_id, source_id, list(artifact_ids)),
+    ).fetchone():
+        raise CanonicalLifecycleError("canonical_artifact_forgotten")
+
+
+def _suppressed_ownership_available(connection) -> bool:
+    return connection.execute(
+        "SELECT to_regclass('public.canonical_suppressed_artifact_owners') IS NOT NULL AS present"
+    ).fetchone()["present"]
+
+
+def _audit_slack_suppression(connection, *, tenant_id, source_id, rows):
+    if not rows:
+        return
+    if not _suppressed_ownership_available(connection):
+        raise CanonicalLifecycleError("slack_deletion_schema_required")
+    connection.execute("""INSERT INTO canonical_suppressed_artifact_owners(
+        tenant_id,source_id,identity_sha256,artifact_id)
+        SELECT %s,%s,row.identity_sha256,row.artifact_id
+        FROM jsonb_to_recordset(%s::jsonb) AS row(identity_sha256 char(64),artifact_id text)
+        ON CONFLICT DO NOTHING""", (tenant_id, source_id, json.dumps([
+            {"identity_sha256": identity, "artifact_id": artifact_id}
+            for event_id, identity, size, artifact_id in rows
+        ])))
+    connection.execute('''INSERT INTO canonical_audit_events(
+        tenant_id,source_id,audit_id,operation,status,subject_sha256,item_count,byte_count)
+        SELECT %s,%s,row.audit_id,'ingest.slack_suppressed_deleted','success',
+               row.subject_sha256,1,row.byte_count
+        FROM jsonb_to_recordset(%s::jsonb) AS row(
+            audit_id text,subject_sha256 char(64),byte_count bigint)
+        ON CONFLICT(tenant_id,source_id,audit_id) DO NOTHING''',
+        (tenant_id, source_id, json.dumps([
+            {'audit_id': _opaque('audit', tenant_id, source_id, event_id, 'slack-terminal'),
+             'subject_sha256': identity, 'byte_count': size}
+            for event_id, identity, size, artifact_id in rows
+        ])))
+
+
 class CanonicalPlane:
     """Tenant-aware v2 canonical ingest and crash-resumable authoritative forget."""
 
@@ -535,6 +599,7 @@ class CanonicalPlane:
                 ).fetchone()
                 if forgotten:
                     raise CanonicalLifecycleError("canonical_identity_forgotten")
+                _guard_artifact_admission(conn, tenant_id, source_id, [artifact["artifact_id"]])
                 conn.execute(
                     """INSERT INTO raw_artifacts(
                            tenant_id,source_id,artifact_id,storage_backend,object_key,
@@ -620,6 +685,16 @@ class CanonicalPlane:
                         ),
                         "replay": True,
                     }
+                if connector_id == "slack.messages" and native_id.startswith("slack:") and not is_tombstone:
+                    terminal = conn.execute(
+                        """SELECT max(revision) AS revision FROM canonical_events
+                           WHERE tenant_id=%s AND source_id=%s AND native_id=%s AND is_tombstone""",
+                        (tenant_id, source_id, native_id),
+                    ).fetchone()["revision"]
+                    if terminal is not None:
+                        _audit_slack_suppression(conn, tenant_id=tenant_id, source_id=source_id,
+                            rows=[(event_id, identity_sha256, artifact["size_bytes"], artifact["artifact_id"])])
+                        return _slack_terminal_ack(source_id, native_id, int(terminal))
                 row = conn.execute(
                     """SELECT COALESCE(max(revision),0)+1 AS revision
                        FROM canonical_events
@@ -846,6 +921,8 @@ class CanonicalPlane:
             "duplicate_events": sum(result["duplicate_events"] for result in results),
             "receipts": [result["receipt"] for result in results],
             "replay": all(result["replay"] for result in results),
+            **({"suppressed_deleted_events": sum(result.get("suppressed_deleted_events", 0) for result in results)}
+               if any(result.get("suppressed_deleted_events") for result in results) else {}),
         }
 
     def source_status(
@@ -1181,6 +1258,7 @@ class CanonicalPlane:
                 if forgotten:
                     raise CanonicalLifecycleError("canonical_identity_forgotten")
 
+                _guard_artifact_admission(connection, tenant_id, source_id, list(artifacts))
                 artifact_rows = [
                     {
                         key: artifact[key]
@@ -1253,7 +1331,7 @@ class CanonicalPlane:
                         raise CanonicalLifecycleError("canonical_artifact_conflict")
 
                 prior_events = connection.execute(
-                    """SELECT native_id,content_sha256,revision
+                    """SELECT native_id,content_sha256,revision,is_tombstone
                        FROM canonical_events
                        WHERE tenant_id=%s AND source_id=%s
                          AND native_id=ANY(%s)""",
@@ -1264,12 +1342,17 @@ class CanonicalPlane:
                     for row in prior_events
                 }
                 max_revision: dict[str, int] = {}
+                terminal_revisions: dict[str, int] = {}
                 for row in prior_events:
+                    if row["is_tombstone"]:
+                        terminal_revisions[row["native_id"]] = max(
+                            terminal_revisions.get(row["native_id"], 0), int(row["revision"]))
                     max_revision[row["native_id"]] = max(
                         max_revision.get(row["native_id"], 0),
                         int(row["revision"]),
                     )
                 new_rows: list[dict[str, Any]] = []
+                suppressed = []
                 results: list[dict[str, Any]] = []
                 for item in prepared:
                     prior_revision = exact_prior.get(
@@ -1289,6 +1372,12 @@ class CanonicalPlane:
                             }
                         )
                         continue
+                    terminal = terminal_revisions.get(item["native_id"])
+                    if (terminal is not None and item["connector_id"] == "slack.messages"
+                            and item["native_id"].startswith("slack:") and not item["is_tombstone"]):
+                        suppressed.append((item["event_id"], item["identity_sha256"], item["artifact"]["size_bytes"], item["artifact"]["artifact_id"]))
+                        results.append(_slack_terminal_ack(source_id, item["native_id"], terminal))
+                        continue
                     revision = max_revision.get(item["native_id"], 0) + 1
                     item["revision"] = revision
                     item["receipt"] = (
@@ -1305,6 +1394,7 @@ class CanonicalPlane:
                         }
                     )
 
+                _audit_slack_suppression(connection, tenant_id=tenant_id, source_id=source_id, rows=suppressed)
                 if new_rows:
                     affected_native_ids = [item["native_id"] for item in new_rows]
                     if is_tombstone_batch:
@@ -1541,14 +1631,15 @@ class CanonicalPlane:
                     source_id=source_id,
                     events=(
                         (item["event_id"], item["connector_id"], item["event"])
-                        for item in prepared
+                        for item, result in zip(prepared, results, strict=True)
+                        if not result.get("suppressed_deleted_events")
                     ),
                     identity_index=self.actor_identity_index,
                 )
                 duplicate_native_ids = [
                     item["native_id"]
                     for item, result in zip(prepared, results, strict=True)
-                    if result["duplicate_events"]
+                    if result["duplicate_events"] and not result.get("suppressed_deleted_events")
                 ]
                 if inserted_actor_links and duplicate_native_ids:
                     mark_logical_evidence_dirty(
@@ -1564,6 +1655,8 @@ class CanonicalPlane:
             "duplicate_events": sum(result["duplicate_events"] for result in results),
             "receipts": [result["receipt"] for result in results],
             "replay": all(result["replay"] for result in results),
+            **({"suppressed_deleted_events": sum(result.get("suppressed_deleted_events", 0) for result in results)}
+               if any(result.get("suppressed_deleted_events") for result in results) else {}),
         }
 
     def _archive_references(
@@ -1574,25 +1667,49 @@ class CanonicalPlane:
         source_id: str,
         native_ids: list[str],
     ) -> list[dict[str, Any]]:
+        identities = [_identity_sha256(tenant_id, source_id, native) for native in native_ids]
+        owners = _suppressed_ownership_available(conn)
+        suppression_candidates = """UNION SELECT artifact_id
+            FROM canonical_suppressed_artifact_owners
+            WHERE tenant_id=%(tenant)s AND source_id=%(source)s
+              AND identity_sha256=ANY(%(identities)s)""" if owners else ""
+        suppression_retained = """AND NOT EXISTS (
+            SELECT 1 FROM canonical_suppressed_artifact_owners retained
+            WHERE retained.tenant_id=artifact.tenant_id AND retained.source_id=artifact.source_id
+              AND retained.artifact_id=artifact.artifact_id
+              AND NOT(retained.identity_sha256=ANY(%(identities)s))
+              AND NOT EXISTS(SELECT 1 FROM forget_tombstones forgotten
+                WHERE forgotten.tenant_id=retained.tenant_id AND forgotten.source_id=retained.source_id
+                  AND forgotten.target_identity_sha256=retained.identity_sha256))""" if owners else ""
+        candidates = conn.execute(f"""SELECT DISTINCT artifact_id FROM canonical_events
+            WHERE tenant_id=%(tenant)s AND source_id=%(source)s AND native_id=ANY(%(natives)s)
+            {suppression_candidates}""", {"tenant": tenant_id, "source": source_id,
+                                          "natives": native_ids, "identities": identities}).fetchall()
+        _lock_artifacts(conn, tenant_id, source_id, [row["artifact_id"] for row in candidates])
         rows = conn.execute(
-            """SELECT DISTINCT artifact.tenant_id,artifact.source_id,
-                       artifact.artifact_id,artifact.storage_backend,artifact.object_key,
-                       artifact.content_sha256,artifact.size_bytes,artifact.media_type,
-                       artifact.encryption,artifact.version_id,artifact.created_at
-               FROM canonical_events event
-               JOIN raw_artifacts artifact
-                 USING(tenant_id,source_id,artifact_id)
-               WHERE event.tenant_id=%s AND event.source_id=%s
-                 AND event.native_id=ANY(%s)
-                 AND NOT EXISTS (
-                     SELECT 1 FROM canonical_events retained
-                     WHERE retained.tenant_id=event.tenant_id
-                       AND retained.source_id=event.source_id
-                       AND retained.artifact_id=event.artifact_id
-                       AND NOT (retained.native_id=ANY(%s))
-                 )
-               ORDER BY artifact.artifact_id""",
-            (tenant_id, source_id, native_ids, native_ids),
+            f"""WITH candidates AS (
+                SELECT DISTINCT artifact_id FROM canonical_events
+                WHERE tenant_id=%(tenant)s AND source_id=%(source)s AND native_id=ANY(%(natives)s)
+                {suppression_candidates})
+            SELECT artifact.tenant_id,artifact.source_id,artifact.artifact_id,
+                   artifact.storage_backend,artifact.object_key,artifact.content_sha256,
+                   artifact.size_bytes,artifact.media_type,artifact.encryption,
+                   artifact.version_id,artifact.created_at
+            FROM raw_artifacts artifact JOIN candidates USING(artifact_id)
+            WHERE artifact.tenant_id=%(tenant)s AND artifact.source_id=%(source)s
+              AND NOT EXISTS (
+                SELECT 1 FROM canonical_events retained
+                WHERE retained.tenant_id=artifact.tenant_id AND retained.source_id=artifact.source_id
+                  AND retained.artifact_id=artifact.artifact_id
+                  AND NOT(retained.native_id=ANY(%(natives)s))
+                  AND NOT EXISTS(SELECT 1 FROM forget_tombstones forgotten
+                    WHERE forgotten.tenant_id=retained.tenant_id AND forgotten.source_id=retained.source_id
+                      AND forgotten.target_identity_sha256=encode(sha256(convert_to(
+                        retained.tenant_id || chr(31) || retained.source_id || chr(31) || retained.native_id,
+                        'UTF8')),'hex')))
+              {suppression_retained}
+            ORDER BY artifact.artifact_id""",
+            {"tenant": tenant_id, "source": source_id, "natives": native_ids, "identities": identities},
         ).fetchall()
         return [
             {
@@ -1675,6 +1792,16 @@ class CanonicalPlane:
                          AND chunk.receipt=%s""",
                     (tenant_id, source_id, value["target_receipt"]),
                 ).fetchone()
+                if target is None and native_id.startswith("slack:"):
+                    target = conn.execute(
+                        """SELECT event.native_id FROM canonical_events event
+                           JOIN canonical_ingest_jobs job USING(tenant_id,source_id,job_id)
+                           WHERE event.tenant_id=%s AND event.source_id=%s AND event.native_id=%s
+                             AND event.is_tombstone AND job.connector_id='slack.messages'
+                             AND 'recall://' || event.source_id || '/' || event.native_id ||
+                                 '?rev=' || event.revision || '#item=0'=%s""",
+                        (tenant_id, source_id, native_id, value["target_receipt"]),
+                    ).fetchone()
                 if target is None or target["native_id"] != native_id:
                     raise CanonicalLifecycleError("forget_target_not_found")
                 native_ids = _linked_native_ids(
@@ -1758,23 +1885,16 @@ class CanonicalPlane:
                        WHERE tenant_id=%s AND source_id=%s AND native_id=ANY(%s)""",
                     (value["requested_at"], tenant_id, source_id, native_ids),
                 )
+                if _artifact_fence_available(conn):
+                    conn.execute("""INSERT INTO canonical_artifact_forget_tombstones(
+                        tenant_id,source_id,artifact_id)
+                        SELECT %s,%s,value FROM unnest(%s::text[]) AS ids(value)
+                        ON CONFLICT DO NOTHING""",
+                        (tenant_id, source_id, [reference["artifact_id"] for reference in references]))
                 conn.execute(
-                    """UPDATE raw_artifacts artifact
-                       SET state='deleting'
-                       FROM canonical_events event
-                       WHERE artifact.tenant_id=event.tenant_id
-                         AND artifact.source_id=event.source_id
-                         AND artifact.artifact_id=event.artifact_id
-                         AND event.tenant_id=%s AND event.source_id=%s
-                         AND event.native_id=ANY(%s) AND artifact.state='live'
-                         AND NOT EXISTS (
-                             SELECT 1 FROM canonical_events retained
-                             WHERE retained.tenant_id=event.tenant_id
-                               AND retained.source_id=event.source_id
-                               AND retained.artifact_id=event.artifact_id
-                               AND NOT (retained.native_id=ANY(%s))
-                         )""",
-                    (tenant_id, source_id, native_ids, native_ids),
+                    """UPDATE raw_artifacts SET state='deleting'
+                       WHERE tenant_id=%s AND source_id=%s AND artifact_id=ANY(%s) AND state='live'""",
+                    (tenant_id, source_id, [reference["artifact_id"] for reference in references]),
                 )
                 mark_logical_evidence_dirty(
                     conn,
@@ -1864,6 +1984,10 @@ class CanonicalPlane:
                                    AND evidence.native_parent_id=progress.native_parent_id)""",
                         (tenant_id, source_id, forgotten_parents),
                     )
+                if _suppressed_ownership_available(conn):
+                    conn.execute("""DELETE FROM canonical_suppressed_artifact_owners
+                        WHERE tenant_id=%s AND source_id=%s AND identity_sha256=ANY(%s)""",
+                        (tenant_id, source_id, identity_hashes))
                 artifact_ids = [reference["artifact_id"] for reference in references]
                 if artifact_ids:
                     conn.execute(

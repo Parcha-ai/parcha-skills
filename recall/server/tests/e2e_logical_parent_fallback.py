@@ -2,6 +2,7 @@
 """Exact fallback/record parity and bounded TOAST work for the parent cursor."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict
 import hashlib
 import itertools
@@ -11,6 +12,7 @@ from pathlib import Path
 import re
 import sys
 import uuid
+from types import SimpleNamespace
 
 SERVER = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(SERVER), str(SERVER.parent)]
@@ -24,8 +26,33 @@ ROOT = re.compile(r'CROSS JOIN LATERAL jsonb_to_record\(.*?\)\s+(?:AS\s+)?root_f
 
 
 def queries():
-    current = next(value for value in CanonicalLogicalEvidenceProjector._prepare_batch_and_upload.__code__.co_consts
-                   if isinstance(value, str) and 'fallback_role_values' in value)
+    # Capture the real multi-parent query; its SQL may be composed from static
+    # fragments rather than stored in one Python bytecode string constant.
+    captured = []
+    class Captured(BaseException):
+        pass
+    def capture(query, params):
+        captured.append(query)
+        raise Captured()
+    @contextmanager
+    def cursor(**kwargs):
+        assert kwargs['name'] == 'logical_evidence_batch_stream'
+        yield SimpleNamespace(execute=capture)
+    @contextmanager
+    def connect():
+        yield SimpleNamespace(
+            execute=lambda *args: SimpleNamespace(fetchall=lambda: []),
+            cursor=cursor,
+        )
+    projector = CanonicalLogicalEvidenceProjector(SimpleNamespace(connect=connect), None)
+    candidates = tuple(SimpleNamespace(tenant_id='tenant:fixture', source_id='source:fixture',
+                       native_parent_id=parent) for parent in ('first', 'second'))
+    try:
+        projector._prepare_batch_and_upload(candidates)
+    except Captured:
+        pass
+    assert len(captured) == 1
+    current = captured[0]
     # Hints add metadata to the current projection, not the frozen legacy SQL.
     added = 'document.document_id,document.body_location,'
     assert current.count(added) == 1

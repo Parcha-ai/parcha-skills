@@ -8,14 +8,14 @@ from tests.central_brain.test_core_deployment import healthy_snapshot
 
 class CleanupIndexSchemaTests(unittest.TestCase):
     def test_optional_markers_preserve_policy_detachment_dependency(self):
-        for retired, *optional in itertools.product((False, True), repeat=8):
+        for retired, *optional in itertools.product((False, True), repeat=10):
             with self.subTest(retired=retired, optional=optional):
                 snapshot = healthy_snapshot()
                 versions = [n for n in range(1, 70) if retired or n != 67]
-                versions += [version for enabled, version in zip(optional, range(70, 77)) if enabled]
+                versions += [version for enabled, version in zip(optional, range(70, 79)) if enabled]
                 snapshot['migration_versions'] = versions
                 snapshot['postgres_vector_plane_present'] = not retired
-                if 76 in versions and 75 not in versions:
+                if (76 in versions and 75 not in versions) or (78 in versions and 76 not in versions):
                     with self.assertRaises(CapabilityError):
                         assess_snapshot(snapshot)
                     continue
@@ -23,9 +23,9 @@ class CleanupIndexSchemaTests(unittest.TestCase):
                 self.assertEqual(result['schema_version'], max(versions))
                 self.assertEqual(result['status'], 'ready')
 
-    def test_76_cannot_hide_unknown_gaps_duplicates_or_reordering(self):
-        complete = list(range(1, 77))
-        for versions in (complete + [77], [n for n in complete if n != 68],
+    def test_78_cannot_hide_unknown_gaps_duplicates_or_reordering(self):
+        complete = list(range(1, 79))
+        for versions in (complete + [79], [n for n in complete if n != 68],
                          [n for n in complete if n != 69], complete + [74],
                          complete[:-2] + [74, 73]):
             with self.subTest(versions=versions):
