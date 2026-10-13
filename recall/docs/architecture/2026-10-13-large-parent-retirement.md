@@ -93,7 +93,8 @@ Short synchronous rounds reserve one quarter of their budget for each finishing
 phase. The existing cooperative stop hook leaves uncommitted rows intact; slow
 or failed commits still retain their original unknown-outcome classification. This is evidence
 for one committed parent, not a universal completion guarantee. The invocation
-still clears at most 64 MiB; its existing 8 MiB/5-second commit bounds remain.
+now clears at most 512 MiB; its existing 8 MiB/5-second commit bounds remain.
+The prior 64 MiB measurements above remain the comparison baseline.
 Repeated full proofs and one-minute parent cooldown affect throughput.
 
 Before activation, check the worker's memory allowance against the measured
@@ -101,3 +102,38 @@ Before activation, check the worker's memory allowance against the measured
 connection. Use the separately reviewed worker cutover procedure, then witness
 actual clearing, foreground latency and replication lag. No production drain
 rate or physical storage reduction is claimed from the read-only measurement.
+
+## Clearing more after the same proof
+
+Changing only the invocation clear budget from 64 to 512 MiB let the same local
+512 MiB parent finish in one proof and 64 original eight-MiB transactions:
+
+| Measurement | 512 MiB invocation budget |
+| --- | ---: |
+| Active retirement wall time | 15.813 seconds |
+| Archive bytes read | 538,875,922 |
+| Child CPU time | 6.962 seconds |
+| Peak child memory | 81,796 KiB |
+| Foreground SQL probes / p95 | 245 / 3.408 ms |
+| Foreground publication | 88.7 ms |
+| Maximum SQL connections | 1 |
+| Failed parents / unknown outcomes | 0 / 0 |
+
+Setup took 97.6 seconds; the full measurement took 115.0 seconds. This was a local
+synthetic run, not a production throughput result. A retained 72 MiB integration
+case first stopped at the old 64 MiB limit, then cleared the parent in one proof
+through the actual child after the constructor change.
+
+The production canary remains limited to the existing enabled source policy,
+one child, the 180-second deadline and the existing commit/proof owners. Before
+activation, record the worker memory, public read/search health and replication
+lag. Observe the exact durable parent intent and cleared/archive counters over
+complete rounds; inspect unknown outcomes, foreground latency and memory during
+proof and clearing. Admit the larger budget only with replication lag at most
+10 seconds and the reviewed headroom checks satisfied. Stop further rounds if
+those gates fail, child memory exhausts the measured margin, or unknown outcomes
+repeat. A partial round is valid progress, not proof of convergence.
+
+Rollback restores the 64 MiB child constructor via the existing worker cutover.
+It does not reset consent, epochs, archive locators or committed progress. The
+synchronous maintenance default remains 64 MiB; no global operator limit changes.
