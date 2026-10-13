@@ -56,7 +56,9 @@ gets at most one second and retains a margin to commit its cursor. Full-parent
 proof and transport deadlines remain active, SDK retries remain disabled for
 maintenance archive reads. The existing SQL pool has a separate five-second
 connection wait, so saturation can extend wall time beyond the round deadline.
-Clearing stops when its invocation byte budget
+Archive transport also retains its existing cooperative deadline limitations
+around DNS and a continuously streaming response. Late results are rejected;
+these bounds are not a strict wall-clock interrupt. Clearing stops when its invocation byte budget
 cannot fit another whole document. Limits bound a scheduling round, not stored
 evidence or which parents may eventually be proved.
 
