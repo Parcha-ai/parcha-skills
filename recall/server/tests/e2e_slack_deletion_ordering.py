@@ -2,7 +2,6 @@
 """Real PG/archive checks for Slack deletes, delayed revisions, and identity scope."""
 from __future__ import annotations
 
-import json
 from concurrent.futures import ThreadPoolExecutor
 from http.server import ThreadingHTTPServer
 import threading
@@ -254,7 +253,6 @@ class SlackDeletionOrdering(unittest.TestCase):
         first = self.ingest(self.root, path='document')
         peer = self.ingest(self.reply, path='prepare')
         with self.store.connect() as connection:
-            artifact = connection.execute('SELECT artifact_id FROM canonical_events WHERE tenant_id=%s AND source_id=%s', (self.tenant, self.source)).fetchone()['artifact_id']
             original = self.plane._archive_references(connection, tenant_id=self.tenant,
                 source_id=self.source, native_ids=['slack:T123:C123:' + self.root['ts']])[0]
         peer['artifact_ref'] = original
