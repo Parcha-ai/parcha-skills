@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 from datetime import datetime, timezone
 import gzip
 import hashlib
@@ -26,6 +27,7 @@ from .canonical_thinning import (
 )
 from .storage_retirement import retire_chunk_search_index, retire_chunk_search_vector
 from .retirement_maintenance import RetirementMaintenance
+from .retirement_supervisor import RetirementSupervisor
 from .capabilities import CapabilityError, probe_database
 from .control import ControlPlane, SecretBox
 from .db import BrainStore, SearchPlaneSchemaError
@@ -1862,7 +1864,7 @@ def main() -> None:
     )
     projection_worker.add_argument(
         "--retirement-seconds", type=float, default=10,
-        help="work budget per retirement round; busy rounds use at most five seconds of budget",
+        help="work budget per retirement invocation; once mode uses at most five seconds while busy",
     )
     projection_worker.add_argument("--once", action="store_true")
     search_plane_project = sub.add_parser(
@@ -2593,9 +2595,13 @@ def main() -> None:
         body_thinner = CanonicalBodyThinner(store, tenant_id=args.tenant)
         retirement = None
         if args.retirement == "on":
-            retirement = RetirementMaintenance(store,
-                build_evidence_archive_store(deadline_reads=True),
-                tenant_id=args.tenant, enabled=True, seconds=args.retirement_seconds)
+            if args.once:
+                retirement = RetirementMaintenance(store,
+                    build_evidence_archive_store(deadline_reads=True),
+                    tenant_id=args.tenant, enabled=True, seconds=args.retirement_seconds)
+            else:
+                retirement = RetirementSupervisor(store.dsn,
+                    tenant_id=args.tenant, seconds=args.retirement_seconds)
         # H3-b: one client for the life of the process; the phase is skipped
         # entirely (search_plane=None) when turbopuffer is not configured.
         search_settings = _search_plane_settings(args.search_plane)
@@ -2608,41 +2614,42 @@ def main() -> None:
                 tenant_id=args.tenant,
                 max_months=args.search_plane_months_per_cycle,
             )
-        print(
-            json.dumps(
-                run_projection_worker(
-                    logical,
-                    passages,
-                    scan,
-                    tenant_id=args.tenant,
-                    logical_batch_size=args.logical_batch_size,
-                    passage_batch_size=args.passage_batch_size,
-                    embedding_batch_size=args.embedding_batch_size,
-                    max_batches_per_cycle=args.max_batches_per_cycle,
-                    upload_concurrency=args.upload_concurrency,
-                    passage_concurrency=args.passage_concurrency,
-                    interval_seconds=args.interval_seconds,
-                    once=args.once,
-                    quiet_seconds=args.quiet_seconds,
-                    max_wait_seconds=args.max_wait_seconds,
-                    parquet_every_cycles=args.parquet_every_cycles,
-                    parquet_max_wait_seconds=args.parquet_max_wait_seconds,
-                    cleanup_concurrency=args.cleanup_concurrency,
-                    skip_embedding=args.skip_embedding,
-                    search_plane=search_plane,
-                    retirement_maintainer=(lambda busy: retirement.cycle(busy=busy)) if retirement else None,
-                    body_thinner=lambda busy: body_thinner.thin(
-                        committed_keys=logical._take_committed_body_keys(),
-                        batch_size=(
-                            args.thin_busy_batch_size
-                            if busy
-                            else args.thin_batch_size
+        with retirement if args.retirement == "on" and not args.once else nullcontext():
+            print(
+                json.dumps(
+                    run_projection_worker(
+                        logical,
+                        passages,
+                        scan,
+                        tenant_id=args.tenant,
+                        logical_batch_size=args.logical_batch_size,
+                        passage_batch_size=args.passage_batch_size,
+                        embedding_batch_size=args.embedding_batch_size,
+                        max_batches_per_cycle=args.max_batches_per_cycle,
+                        upload_concurrency=args.upload_concurrency,
+                        passage_concurrency=args.passage_concurrency,
+                        interval_seconds=args.interval_seconds,
+                        once=args.once,
+                        quiet_seconds=args.quiet_seconds,
+                        max_wait_seconds=args.max_wait_seconds,
+                        parquet_every_cycles=args.parquet_every_cycles,
+                        parquet_max_wait_seconds=args.parquet_max_wait_seconds,
+                        cleanup_concurrency=args.cleanup_concurrency,
+                        skip_embedding=args.skip_embedding,
+                        search_plane=search_plane,
+                        retirement_maintainer=(lambda busy: retirement.cycle(busy=busy)) if retirement else None,
+                        body_thinner=lambda busy: body_thinner.thin(
+                            committed_keys=logical._take_committed_body_keys(),
+                            batch_size=(
+                                args.thin_busy_batch_size
+                                if busy
+                                else args.thin_batch_size
+                            ),
                         ),
                     ),
-                ),
-                sort_keys=True,
+                    sort_keys=True,
+                )
             )
-        )
     elif args.command == "search-plane-project":
         # H3-b: drain the outbox until it is empty (or one cycle with --once).
         # Counts only; never the key, never passage text.

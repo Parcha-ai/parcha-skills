@@ -5,6 +5,8 @@ from pathlib import Path
 import sys
 import os
 import threading
+import subprocess
+import json
 import time
 import unittest
 from unittest.mock import patch
@@ -17,6 +19,7 @@ import e2e_retirement_policy as policy_tests
 from recall_server import retirement_maintenance as maintenance
 from recall_server import retirement_policy as policy
 from recall_server import retirement_runner as runner
+from recall_server.retirement_supervisor import RetirementSupervisor
 from recall_server.chunk_retirement import ChunkRetirementError, set_parent_retirement_enabled, retire_parent_chunks
 from recall_server.parent_chunk_proof import parent_retirement_plan
 
@@ -50,6 +53,210 @@ class MaintenanceTests(unittest.TestCase):
     def policy_state(self):
         with self.store.connect() as c:
             return c.execute('SELECT * FROM canonical_retirement_source_policy WHERE tenant_id=%s AND source_id=%s', self.key[:2]).fetchone()
+
+    def test_catalog_budget_uses_exact_parts_and_preserves_proof(self):
+        self.activate()
+        self.ready()
+        result = self.worker(catalog_archive_budget=True, seconds=60,
+            max_archive_bytes=64*1024**3).cycle(busy=False)
+        self.assertEqual(result['cleared_documents'], 2)
+        self.assertEqual(result['failed_parents'], 0)
+        self.assertTrue(self.state()['enabled'])
+
+    def test_catalog_budget_refuses_replaced_parent_before_archive(self):
+        self.activate()
+        self.ready()
+        original = runner._claim
+        def claim_then_replace(*args, **kwargs):
+            found = original(*args, **kwargs)
+            if found is not None:
+                self.replace()
+            return found
+        with patch.object(runner, '_claim', side_effect=claim_then_replace):
+            result = self.worker(catalog_archive_budget=True, seconds=60,
+                max_archive_bytes=64*1024**3).cycle(busy=False)
+        self.assertEqual(result['cleared_documents'], 0)
+        self.assertEqual(result['archive_gets'], 0)
+        self.assertFalse(self.state()['enabled'])
+
+    def child(self, seconds=60):
+        root = Path(self.root.name)
+        script = """import sys,time
+from pathlib import Path
+from recall_server import retirement_process as process
+from recall_server.archive import FilesystemArchiveStore
+root,objects=map(Path,sys.argv[1:3])
+class PausedArchive:
+    def __init__(self):
+        self.archive=FilesystemArchiveStore(objects,namespace_key=b'r'*32)
+        self.first=True
+    def read_raw(self,reference):
+        if self.first:
+            self.first=False;(root/'proof-ready').touch()
+            while not (root/'proof-release').exists():time.sleep(.005)
+        return self.archive.read_raw(reference)
+process.build_evidence_archive_store=lambda **kw:PausedArchive()
+process.main()
+"""
+        def launch(configuration):
+            child = subprocess.Popen([sys.executable, '-c', script, str(root),
+                str(self.archive.delegate.root)], stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            return child
+        supervisor = RetirementSupervisor(self.store.dsn, tenant_id=self.tenant,
+            seconds=seconds, launch=launch)
+        self.addCleanup(supervisor.close)
+        self.assertEqual(supervisor.cycle(busy=True)['status'], 'running')
+        deadline = time.monotonic()+15
+        while not (root/'proof-ready').exists():
+            self.assertIsNone(supervisor.child.poll(), 'retirement child exited before proof')
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.01)
+        return supervisor
+
+    def finish_child(self, supervisor):
+        (Path(self.root.name)/'proof-release').touch()
+        deadline = time.monotonic()+supervisor.seconds+10
+        while supervisor.child.poll() is None:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.01)
+        return supervisor.cycle(busy=True)
+
+    def test_child_proof_holds_one_idle_connection_and_foreground_progresses(self):
+        self.activate()
+        self.ready()
+        supervisor = self.child()
+        with self.store.connect() as c:
+            connections=c.execute("""SELECT state,xact_start FROM pg_stat_activity
+                WHERE datname=current_database() AND application_name='recall-retirement'""").fetchall()
+        self.assertEqual(len(connections),1)
+        self.assertEqual(connections[0]['state'],'idle')
+        self.assertIsNone(connections[0]['xact_start'])
+        for _ in range(25):
+            self.assertEqual(supervisor.cycle(busy=True)['status'],'running')
+            with self.store.connect() as c:
+                self.assertEqual(c.execute('SELECT 1 AS n').fetchone()['n'],1)
+        report=self.finish_child(supervisor)
+        self.assertEqual(report['cleared_documents'],2)
+        self.assertGreater(report['peak_rss_kib'],0)
+
+    def test_child_owner_revocation_during_proof_cannot_clear(self):
+        self.activate()
+        self.ready()
+        supervisor=self.child()
+        with self.store.connect() as c:
+            c.execute('DELETE FROM canonical_source_grants WHERE tenant_id=%s AND source_id=%s',self.key[:2])
+        report=self.finish_child(supervisor)
+        self.assertEqual(report['cleared_documents'],0)
+        self.assertEqual(self.state()['cumulative_cleared_documents'],0)
+
+    def test_child_catalog_replacement_during_proof_preserves_detached_hold(self):
+        self.activate()
+        self.ready()
+        supervisor=self.child()
+        self.replace()
+        held=self.state()
+        report=self.finish_child(supervisor)
+        self.assertEqual(report['cleared_documents'],0)
+        self.assertEqual(self.state(),held)
+        self.assertFalse(held['enabled'])
+
+    def test_killed_child_intent_is_reconciled_by_fresh_proof(self):
+        self.activate()
+        self.ready()
+        supervisor=self.child()
+        self.assertIsNotNone(self.policy_state()['maintenance_intent'])
+        supervisor.child.kill()
+        supervisor.child.wait(timeout=2)
+        self.assertTrue(supervisor.cycle(busy=True)['commit_outcome_unknown'])
+        self.ready()
+        recovered=self.worker(catalog_archive_budget=True,seconds=60,
+            max_archive_bytes=64*1024**3).cycle(busy=False)
+        self.assertEqual(recovered['reconciled_intents'],1)
+        self.assertEqual(recovered['cleared_documents'],2)
+
+    @unittest.skipUnless(os.environ.get('RECALL_LARGE_RETIREMENT_TEST') == '1',
+                         'explicit 512MiB resource measurement')
+    def test_512mib_parent_makes_bounded_progress_until_complete(self):
+        from e2e_logical_evidence_projection import insert_record
+        from recall_server.logical_evidence import LogicalEvidenceProjectionStore
+        from recall_server.logical_evidence_projection import (
+            CanonicalLogicalEvidenceProjector, mark_logical_evidence_dirty)
+        self.activate()
+        set_parent_retirement_enabled(self.store, **self.target, enabled=False)
+        started = time.monotonic()
+        # Compressible synthetic SQL bodies; archive bytes and proof are real.
+        # One record is generated at a time; no 512MiB Python collection.
+        for ordinal in range(128):
+            text = f'{ordinal:08d}' + 'x' * (4*1024**2-8)
+            with self.store.connect() as c:
+                insert_record(c, tenant=self.tenant, source=self.source,
+                    parent='large-parent', native=f'large-{ordinal:04d}',
+                    text=text, role='assistant', byte_start=ordinal*10)
+        with self.store.connect() as c:
+            mark_logical_evidence_dirty(c, tenant_id=self.tenant, source_id=self.source,
+                native_ids=['large-0000'], reason='ingest')
+        projector = CanonicalLogicalEvidenceProjector(self.store,
+            LogicalEvidenceProjectionStore(self.archive), bound_tenant_id=self.tenant,
+            raw_archive=self.archive)
+        published = projector.project_pending(tenant_id=self.tenant,
+            batch_size=1, max_batches=1, upload_concurrency=1)
+        self.assertEqual(published['failed'], 0, published)
+        self.assertTrue(self.parent_state('large-parent')['enabled'])
+        setup_seconds = time.monotonic()-started
+        reports = []
+        for round_number in range(9):
+            self.ready()
+            for name in ('proof-ready', 'proof-release'):
+                (Path(self.root.name)/name).unlink(missing_ok=True)
+            supervisor = self.child(seconds=180)
+            # Actual foreground publication can commit while proof is outside SQL.
+            if round_number == 0:
+                foreground = self.publish('concurrent-small', 'concurrent-small-parent')
+                self.assertEqual(foreground['failed'], 0, foreground)
+            (Path(self.root.name)/'proof-release').touch()
+            foreground_queries = 0
+            foreground_latencies = []
+            foreground_publication_seconds = None
+            max_connections = 0
+            deadline = time.monotonic()+190
+            while supervisor.child.poll() is None:
+                self.assertLess(time.monotonic(), deadline)
+                foreground_started = time.monotonic()
+                with self.store.connect() as c:
+                    count = c.execute("""SELECT count(*) AS n FROM pg_stat_activity
+                        WHERE datname=current_database()
+                        AND application_name='recall-retirement'""").fetchone()['n']
+                foreground_latencies.append((time.monotonic()-foreground_started)*1000)
+                if round_number == 0 and foreground_queries == 0:
+                    foreground_started = time.monotonic()
+                    published = self.publish('during-proof', 'during-proof-parent')
+                    self.assertEqual(published['failed'], 0, published)
+                    foreground_publication_seconds = time.monotonic()-foreground_started
+                max_connections = max(max_connections, count)
+                foreground_queries += 1
+                time.sleep(.05)
+            report = supervisor.cycle(busy=True)
+            print(json.dumps(dict(measurement='512mib_round', round=round_number, report=report)), flush=True)
+            self.assertFalse(report['commit_outcome_unknown'], report)
+            self.assertGreater(report['cleared_utf8_bytes'], 0, report)
+            self.assertLessEqual(report['cleared_utf8_bytes'], 64*1024**2)
+            self.assertGreater(report['archive_bytes'], 512*1024**2)
+            self.assertLess(report['peak_rss_kib'], 512*1024)
+            self.assertLessEqual(max_connections, 1)
+            latency_p95 = sorted(foreground_latencies)[int((len(foreground_latencies)-1)*.95)]
+            self.assertLess(latency_p95, 250)
+            reports.append(dict(report, foreground_queries=foreground_queries,
+                foreground_query_p95_ms=latency_p95,
+                foreground_publication_seconds=foreground_publication_seconds,
+                max_connections=max_connections))
+            if self.parent_state('large-parent')['status'] == 'complete':
+                break
+        current = self.parent_state('large-parent')
+        self.assertEqual(current['status'], 'complete', current)
+        self.assertEqual(current['cumulative_cleared_utf8_bytes'], 512*1024**2)
+        print(json.dumps(dict(measurement='512mib_retirement',
+            setup_seconds=setup_seconds, rounds=reports)), flush=True)
 
     def test_no_policy_and_disabled_worker_do_no_archive_or_claim_work(self):
         before = self.state()
