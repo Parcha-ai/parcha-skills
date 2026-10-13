@@ -52,3 +52,8 @@ class RetirementCliTests(unittest.TestCase):
         constructor.return_value.cycle.assert_called_once_with(busy=True)
         constructor.return_value.__enter__.assert_called_once()
         constructor.return_value.__exit__.assert_called_once()
+
+
+    def test_continuous_default_allows_measured_hosted_parent_proof(self):
+        mocked, _ = self.invoke(['--retirement', 'on'], once=False)
+        self.assertEqual(mocked['RetirementSupervisor'].call_args.kwargs['seconds'],180)

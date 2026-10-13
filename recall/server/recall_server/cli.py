@@ -1863,7 +1863,7 @@ def main() -> None:
         help="run bounded retirement for explicitly approved source policies (requires schema 078)",
     )
     projection_worker.add_argument(
-        "--retirement-seconds", type=float, default=10,
+        "--retirement-seconds", type=float, default=180,
         help="work budget per retirement invocation; once mode uses at most five seconds while busy",
     )
     projection_worker.add_argument("--once", action="store_true")

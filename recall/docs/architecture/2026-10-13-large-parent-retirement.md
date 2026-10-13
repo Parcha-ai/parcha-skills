@@ -77,10 +77,22 @@ RECALL_LARGE_RETIREMENT_TEST=1 PYTHONPATH=recall:recall/server \
   MaintenanceTests.test_512mib_parent_makes_bounded_progress_until_complete
 ```
 
-The worker's existing default budget is still ten seconds. This is insufficient
-for the measured large parent and is not a production convergence claim. Before
-activation, use an exact hosted read-only proof to measure R2/SQL timing, choose
-an explicit work budget, and check foreground latency and replication lag while
-clearing. The separately reviewed worker cutover procedure still applies. The
-existing one-minute parent cooldown and worker polling cadence also affect the
-achievable drain rate.
+An exact production read-only proof of a committed 590,450,307-byte parent
+(138 parts, 46,602 records) completed in 132.474 seconds: 47.051 seconds of
+archive reads, 71.981 seconds across 29 SQL leases, and 21.048 CPU seconds.
+Peak child memory was 252,052 KiB; at most one SQL connection was leased, and no
+SQL lease overlapped archive body reads. The unchanged verifier found 46,567
+eligible documents containing 341,760,838 UTF-8 bytes. It retained 35 oversized
+and 7,537 structural exclusions. The probe cleared nothing.
+
+The continuous worker defaults to a 180-second child work budget, leaving about
+47 seconds beyond that witnessed proof for bounded clearing. This is evidence
+for one committed parent, not a universal completion guarantee. The invocation
+still clears at most 64 MiB; its existing 8 MiB/5-second commit bounds remain.
+Repeated full proofs and one-minute parent cooldown affect throughput.
+
+Before activation, check the worker's memory allowance against the measured
+246 MiB child plus its foreground publisher, and allow one additional database
+connection. Use the separately reviewed worker cutover procedure, then witness
+actual clearing, foreground latency and replication lag. No production drain
+rate or physical storage reduction is claimed from the read-only measurement.
