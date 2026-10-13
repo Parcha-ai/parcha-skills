@@ -100,9 +100,12 @@ class EarlySupersession(ParentProgress):
             @itersize.setter
             def itersize(inner, value): inner.actual.itersize = value
             def execute(inner, sql, params):
-                inner.owner.large = 'large' in params[3]
                 return inner.actual.execute(sql, params)
-            def __iter__(inner): return iter(inner.actual)
+            def __iter__(inner):
+                for row in inner.actual:
+                    if row['source_id'] == self.sources['large']:
+                        inner.owner.large = True
+                    yield row
         class Connection:
             def __init__(inner, actual): inner.actual, inner.large = actual, False
             def __getattr__(inner, name): return getattr(inner.actual, name)
