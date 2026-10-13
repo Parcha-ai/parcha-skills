@@ -719,6 +719,9 @@ class DeepInspectionContractTests(unittest.TestCase):
                 return False
 
             def executemany(self, _sql, values):
+                if 'canonical_evidence_cleanup_queue' in _sql:
+                    self.store.cleanup.extend(values)
+                    return
                 self.store.bulk_writes += 1
                 for value in values:
                     self.store.stored[(value[0], value[1], value[2])] = {
@@ -749,6 +752,9 @@ class DeepInspectionContractTests(unittest.TestCase):
                     return Rows(list(self.store.stored.values()))
                 raise AssertionError("unexpected projector query")
 
+            def transaction(self):
+                return self
+
             def cursor(self):
                 return Cursor(self.store)
 
@@ -764,6 +770,7 @@ class DeepInspectionContractTests(unittest.TestCase):
             bulk_writes = 0
             pending_sql = ""
             stored = {}
+            cleanup = []
 
             def connect(self):
                 return Connection(self)
@@ -783,6 +790,8 @@ class DeepInspectionContractTests(unittest.TestCase):
                 with self.lock:
                     self.active -= 1
                 return {
+                    "tenant_id": tenant_id,
+                    "source_id": source_id,
                     "artifact_id": "art_" + document_id.removeprefix("doc_"),
                     "storage_backend": "s3",
                     "object_key": "objects/aa/" + document_id.removeprefix("doc_"),
@@ -837,7 +846,8 @@ class DeepInspectionContractTests(unittest.TestCase):
                 max_batches=1,
                 upload_concurrency=2,
             )
-        self.assertEqual(len(projection.deleted), 2)
+        self.assertEqual(projection.deleted, [])
+        self.assertEqual(len(store.cleanup), 2)
 
     def test_archil_rejects_untrusted_identifiers(self):
         with self.assertRaises(DeepInspectionError):

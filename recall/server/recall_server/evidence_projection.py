@@ -481,11 +481,7 @@ class CanonicalEvidenceProjector:
                         continue
                     if reference not in references:
                         references.append(reference)
-                for reference in references:
-                    try:
-                        self.projection.delete(reference)
-                    except Exception:
-                        pass
+                self._schedule_cleanup(references)
                 raise
 
             values = []
@@ -569,11 +565,7 @@ class CanonicalEvidenceProjector:
                                 "evidence_projection_conflict"
                             )
             except Exception:
-                for reference in references:
-                    try:
-                        self.projection.delete(reference)
-                    except Exception:
-                        pass
+                self._schedule_cleanup(references)
                 raise
             processed += len(entries)
             batches += 1
@@ -582,6 +574,15 @@ class CanonicalEvidenceProjector:
             "processed": processed,
             "batches": batches,
         }
+
+    def _schedule_cleanup(self, references):
+        # Upload success does not confer deletion authority: another publisher
+        # may already own this same deterministic object. Use the shared queue.
+        from .logical_evidence_projection import CanonicalLogicalEvidenceProjector
+        if references:
+            with self.store.connect() as connection, connection.transaction():
+                CanonicalLogicalEvidenceProjector._enqueue_cleanup(
+                    connection, tuple(references))
 
     def references_for_receipts(
         self,
