@@ -92,6 +92,19 @@ class MaintenanceTests(unittest.TestCase):
         second = self.worker().cycle(busy=False)
         self.assertEqual(second['cleared_documents'], 2, second)
 
+    def test_parent_above_archive_budget_remains_eligible_and_can_clear_with_sufficient_budget(self):
+        self.activate()
+        self.ready()
+        first = self.worker(max_archive_bytes=1).cycle(busy=False)
+        self.assertEqual(first['cleared_documents'], 0, first)
+        self.assertEqual(first['failed_parents'], 1, first)
+        self.assertFalse(self.archive.reads)
+        self.assertTrue(self.state()['enabled'])
+        self.assertEqual(self.state()['cumulative_cleared_documents'], 0)
+        self.ready()
+        second = self.worker().cycle(busy=False)
+        self.assertEqual(second['cleared_documents'], 2, second)
+
     def test_disabled_policy_keeps_finite_consent_but_does_not_enroll_future(self):
         self.activate()
         policy.set_policy_enabled(self.store, scope=self.scope,

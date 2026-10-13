@@ -84,3 +84,20 @@ latency, database headroom/replication lag and archive read costs within bounds.
 Long projection phases still delay the next reachable maintenance boundary.
 Historical revision hydration and physical database downsizing remain separate
 work; this change makes no claim that either is complete.
+
+## Large-parent admission remains open
+
+The default 256 MiB archive budget cannot prove a parent whose committed parts
+exceed that size. Repeating the same round will not fix this. The worker retains
+its enabled consent and SQL bodies, but does not yet choose a larger budget for
+it. The five-second busy budget can also repeatedly defer a smaller slow parent.
+
+A follow-up must schedule an aged large parent even while ingestion stays busy,
+select one exact eligible parent, and derive a sufficient archive budget from
+its committed part inventory. The existing proof streams bodies and uses a
+bounded metadata spool; archive volume does not require the same amount of RAM.
+Measure the whole-parent proof time before choosing a longer maintenance quantum.
+If that time exceeds the agreed freshness budget, this synchronous loop cannot
+satisfy both constraints. Keep that cohort on the existing finite-job owner
+until a separate scheduling change is reviewed. Acceptance must cover every
+parent-size cohort, not merely a positive aggregate drain rate.
