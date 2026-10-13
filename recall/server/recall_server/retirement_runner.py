@@ -458,6 +458,7 @@ def run_retirement(
     deadline_at=None,
     should_stop=None,
     before_parent=None,
+    parent_limits_for=None,
 ):
     """Sequential enabled-only maintenance; fresh whole-parent proof once per claim."""
     limits = RunnerLimits() if limits is None else limits
@@ -471,6 +472,8 @@ def run_retirement(
         and not callable(should_stop)
         or before_parent is not None
         and not callable(before_parent)
+        or parent_limits_for is not None
+        and not callable(parent_limits_for)
     ):
         _invalid()
     deadline_at = _parent_deadline(deadline_at)
@@ -536,6 +539,9 @@ def run_retirement(
             # any archive read or clearing. A failed observer stops this call.
             before_parent(candidate)
         try:
+            selected_limits = parent_limits if parent_limits_for is None else parent_limits_for(candidate)
+            if not isinstance(selected_limits, ParentRetirementLimits):
+                raise ChunkRetirementError("parent_retirement_limits_invalid")
             result = retire_parent_chunks(
                 store,
                 meter,
@@ -545,10 +551,10 @@ def run_retirement(
                 apply=True,
                 reviewed_plan=parent_retirement_plan(key, candidate["manifest"]),
                 limits=replace(
-                    parent_limits,
-                    max_clear_bytes=min(parent_limits.max_clear_bytes, remaining_bytes),
+                    selected_limits,
+                    max_clear_bytes=min(selected_limits.max_clear_bytes, remaining_bytes),
                     max_archive_bytes=min(
-                        parent_limits.max_archive_bytes, remaining_archive
+                        selected_limits.max_archive_bytes, remaining_archive
                     ),
                 ),
                 deadline_at=deadline_at,
