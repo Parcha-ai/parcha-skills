@@ -56,6 +56,11 @@ class ArchivedResolveTests(unittest.TestCase):
             return Result([self.event] if self.event else [])
         if 'FROM canonical_chunks chunk' in sql:
             return Result(self.items)
+        if 'FROM canonical_evidence_objects evidence' in sql:
+            self.assertIn('evidence.tenant_id=%s', sql)
+            self.assertIn('evidence.source_id=ANY(%s)', sql)
+            self.assertEqual(values[:2], (TENANT, [SOURCE]))
+            return Result([])  # This historical inline fixture has no archive catalog.
         raise AssertionError('scoped canonical request reached legacy SQL')
 
     def read(self, **kwargs):
