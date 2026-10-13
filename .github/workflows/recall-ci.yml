@@ -52,6 +52,8 @@ jobs:
       - run: ruff check . --select E9,F,PLE
       - run: bandit -q -lll -r . -x tests,server/tests
       - run: pip-audit -r server/requirements.txt
+      - name: Retired job-index lifecycle (isolated PostgreSQL 17)
+        run: bash server/tests/run_job_status_index_fixture.sh
       - name: Fresh-PostgreSQL end-to-end suite
         run: |
           for test in \
