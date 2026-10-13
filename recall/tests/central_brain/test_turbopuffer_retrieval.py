@@ -114,7 +114,43 @@ class ArmTests(unittest.TestCase):
         self.assertEqual(clauses[4], ("actor_keys", "ContainsAny", ["author:a1"]))
         self.assertEqual(scope_filters(sources=["s1"], policy_fingerprint="fp", since=None, until=None, actor_ids=["a1"], actor_relations=None)[-1], ("actor_ids", "ContainsAny", ["a1"]))
 
-    def test_dense_arm_embeds_nothing_locally_and_dedupes_texts(self) -> None:
+    def test_identical_dense_text_keeps_independent_authority_and_receipts(self) -> None:
+        from types import SimpleNamespace
+        # The index can retain a stale row after canonical deletion. Identical
+        # text in another session does not inherit that row's authority decision.
+        for reject_first in (True, False):
+            with self.subTest(reject_first=reject_first):
+                client = FakeTurbopuffer()
+                namespace = client.namespace(SETTINGS.namespace(TENANT))
+                passages = [
+                    catalog_passage(1, "same evidence", ldoc="ldoc_" + "1" * 32),
+                    catalog_passage(2, "same evidence", ldoc="ldoc_" + "2" * 32),
+                ]
+                for index, passage in enumerate(passages):
+                    passage["native_parent_id"] = f"independent-parent-{index}"
+                namespace.write(upsert_rows=[passage_row(p) for p in passages])
+                retrieval, store = self._retrieval(client)
+                store.query_clauses = False
+                store.rerank_runtime = None
+                execute = store._execute_bounded
+                def authority(connection, sql, values, deadline):
+                    rows = execute(connection, sql, values, deadline)
+                    if "cardinality(passage.receipts)>0" in sql and reject_first:
+                        return SimpleNamespace(fetchall=lambda: [r for r in rows.fetchall() if r["passage_id"] != passages[0]["passage_id"]])
+                    return rows
+                store._execute_bounded = authority
+                # Dense-only query: lexical cannot mask a lost ANN candidate.
+                response = retrieval.search("semantic question", lexical_query="", since=None, until=None, limit=10)
+                results = response["results"]
+                expected = passages[1:] if reject_first else passages
+                self.assertEqual({r["logical_document_id"] for r in results}, {p["logical_document_id"] for p in expected})
+                for row in results:
+                    original = next(p for p in expected if p["logical_document_id"] == row["logical_document_id"])
+                    self.assertEqual(row["matching_ranges"][0]["receipts"], original["receipts"])
+                    self.assertEqual(row["matching_ranges"][0]["text"], "same evidence")
+                self.assertEqual(response["diagnostics"]["authority_rejected"], int(reject_first))
+
+    def test_dense_arm_embeds_nothing_locally_and_preserves_identities(self) -> None:
         client = FakeTurbopuffer()
         ns = self._seed(client)
         retrieval, _ = self._retrieval(client)
@@ -129,12 +165,12 @@ class ArmTests(unittest.TestCase):
         # The arm reads catalog attributes only: no bodies over the wire.
         self.assertEqual(set(ns.queries[-1]["include_attributes"]), set(plane_retrieval.CATALOG_ATTRIBUTES))
         self.assertFalse(set(ns.queries[-1]["include_attributes"]) & set(plane_retrieval.BODY_ATTRIBUTES))
-        # Only the authorized source; the two identical texts (same hash) collapse to one row.
+        # Only the authorized source; identical text keeps both independent identities.
         self.assertTrue(all(row["source_id"] == "codex:linux:test" for row in rows))
         self.assertEqual(rows[0]["logical_document_id"], LDOC)
         hashes = [r["text_sha256"] for r in rows]
-        self.assertEqual(len(hashes), len(set(hashes)))
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(set(hashes)), 2)
+        self.assertEqual(len(rows), 3)
         self.assertEqual(rows[0]["text_redacted"], "")  # the body arrives with hydration
         self.assertGreater(rows[0]["score"], rows[-1]["score"])
 

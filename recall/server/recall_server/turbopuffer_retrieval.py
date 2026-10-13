@@ -151,23 +151,6 @@ def parse_spans(raw: Any) -> list[Any]:
     return list(raw or [])
 
 
-def dedupe_texts(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep the first (best) row per distinct passage text, as the dense SQL did.
-
-    Catalog-only rows carry the text hash, which identifies the text as well.
-    """
-
-    seen: set[str] = set()
-    kept = []
-    for row in rows:
-        key = row.get("text_sha256") or row["passage_id"]
-        if key in seen:
-            continue
-        seen.add(key)
-        kept.append(row)
-    return kept
-
-
 DEFAULT_WINDOW_BUDGET_MS = 1500
 
 
@@ -303,7 +286,9 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
             if mapped is not None:
                 rows.append(mapped)
         rows.sort(key=lambda row: -row["score"])
-        return dedupe_texts(rows), "ok", "turbopuffer-ann", None
+        # Text equality does not establish receipt authority or session identity.
+        # Keep each candidate until its own canonical receipts are checked.
+        return rows, "ok", "turbopuffer-ann", None
 
     def _lexical_candidates(
         self,
