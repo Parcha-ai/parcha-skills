@@ -352,11 +352,17 @@ def _slack_terminal_ack(source_id: str, native_id: str, revision: int) -> dict[s
             'receipt': f'recall://{source_id}/{native_id}?rev={revision}#item=0', 'replay': True}
 
 
-def _lock_artifacts(connection, tenant_id: str, source_id: str, artifact_ids) -> None:
+def _lock_artifacts(connection, tenant_id: str, source_id: str, artifact_ids, *, wait=True) -> bool:
     keys = sorted({f"v2-artifact\x1f{tenant_id}\x1f{source_id}\x1f{artifact}" for artifact in artifact_ids})
-    if keys:
+    if not keys:
+        return True
+    if wait:
         connection.execute("""SELECT pg_advisory_xact_lock(hashtextextended(value,0))
             FROM unnest(%s::text[]) AS keys(value) ORDER BY value""", (keys,)).fetchall()
+        return True
+    rows = connection.execute("""SELECT pg_try_advisory_xact_lock(hashtextextended(value,0)) AS locked
+        FROM unnest(%s::text[]) AS keys(value) ORDER BY value""", (keys,)).fetchall()
+    return all(row['locked'] for row in rows)
 
 
 def _artifact_fence_available(connection) -> bool:
