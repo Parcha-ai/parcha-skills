@@ -34,11 +34,20 @@ class Store:
     def execute(self, query, values=()):
         if 'SELECT queue.*' in query:
             assert self.in_transaction and 'FOR UPDATE SKIP LOCKED' in query
-            assert all(name in query for name in ('canonical_evidence_documents', 'canonical_evidence_document_parts', 'canonical_parquet_scan_shards'))
             excluded = set(zip(*values[2:5])) if len(values) == 6 else set()
             rows = [row for row in self.rows.values()
                     if (row['tenant_id'], row['source_id'], row['artifact_id']) not in excluded]
             return SimpleNamespace(fetchall=lambda: rows[:values[-1]])
+        if 'pg_try_advisory_xact_lock' in query:
+            assert self.in_transaction
+            return SimpleNamespace(fetchall=lambda: [{'locked': True} for _ in values[0]])
+        if 'SELECT target.*' in query:
+            assert self.in_transaction
+            assert all(name in query for name in ('canonical_evidence_documents',
+                'canonical_evidence_document_parts', 'canonical_parquet_scan_shards',
+                'canonical_evidence_objects', 'raw_artifacts'))
+            return SimpleNamespace(fetchall=lambda: [row for row in self.rows.values()
+                if row['artifact_id'] in values[2] and not row['removable']])
         if 'WITH completed(' in query:
             for key in values[2]:
                 self.acknowledged.append(key)

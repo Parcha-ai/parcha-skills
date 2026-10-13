@@ -1400,6 +1400,37 @@ class CanonicalLogicalEvidenceProjector:
                            ("completed", "deleted", "failures", "pending")})
             return result
 
+    @staticmethod
+    def _live_cleanup_references(connection, rows):
+        if not rows:
+            return set()
+        live = connection.execute("""SELECT target.*
+            FROM unnest(%s::text[],%s::text[],%s::text[])
+                AS target(tenant_id,source_id,artifact_id)
+            WHERE EXISTS (
+                SELECT 1 FROM canonical_evidence_documents document
+                WHERE document.tenant_id=target.tenant_id AND document.source_id=target.source_id
+                  AND document.manifest_artifact_id=target.artifact_id
+                UNION ALL
+                SELECT 1 FROM canonical_evidence_document_parts part
+                WHERE part.tenant_id=target.tenant_id AND part.source_id=target.source_id
+                  AND part.artifact_id=target.artifact_id
+                UNION ALL
+                SELECT 1 FROM canonical_parquet_scan_shards shard
+                WHERE shard.tenant_id=target.tenant_id AND shard.source_id=target.source_id
+                  AND shard.artifact_id=target.artifact_id
+                UNION ALL
+                SELECT 1 FROM canonical_evidence_objects evidence
+                WHERE evidence.tenant_id=target.tenant_id AND evidence.source_id=target.source_id
+                  AND evidence.artifact_id=target.artifact_id
+                UNION ALL
+                SELECT 1 FROM raw_artifacts raw
+                WHERE raw.tenant_id=target.tenant_id AND raw.source_id=target.source_id
+                  AND raw.artifact_id=target.artifact_id
+            )""", ([r['tenant_id'] for r in rows], [r['source_id'] for r in rows],
+                    [r['artifact_id'] for r in rows])).fetchall()
+        return {(r['tenant_id'],r['source_id'],r['artifact_id']) for r in live}
+
     def _drain_cleanup(
         self,
         *,
@@ -1423,27 +1454,7 @@ class CanonicalLogicalEvidenceProjector:
             with self.store.connect() as connection:
                 with connection.transaction():
                     rows = connection.execute(
-                        """SELECT queue.*,
-                                  NOT EXISTS (
-                                      SELECT 1
-                                        FROM canonical_evidence_documents document
-                                       WHERE document.tenant_id=queue.tenant_id
-                                         AND document.source_id=queue.source_id
-                                         AND document.manifest_artifact_id
-                                             =queue.artifact_id
-                                      UNION ALL
-                                      SELECT 1
-                                        FROM canonical_evidence_document_parts part
-                                       WHERE part.tenant_id=queue.tenant_id
-                                         AND part.source_id=queue.source_id
-                                         AND part.artifact_id=queue.artifact_id
-                                      UNION ALL
-                                      SELECT 1
-                                        FROM canonical_parquet_scan_shards shard
-                                       WHERE shard.tenant_id=queue.tenant_id
-                                         AND shard.source_id=queue.source_id
-                                         AND shard.artifact_id=queue.artifact_id
-                                  ) AS removable
+                        """SELECT queue.*
                              FROM canonical_evidence_cleanup_queue queue
                             WHERE (%s::text IS NULL OR queue.tenant_id=%s)
                               AND NOT EXISTS (
@@ -1473,16 +1484,20 @@ class CanonicalLogicalEvidenceProjector:
                         (row["tenant_id"], row["source_id"], row["artifact_id"])
                         for row in rows
                     )
-                    protected = [
-                        row
-                        for row in rows
-                        if row["removable"] is not True
-                    ]
-                    removable = [
-                        row
-                        for row in rows
-                        if row["removable"] is True
-                    ]
+                    # Queue locks precede artifact locks here; never wait on an
+                    # admission owner that may itself need this queue row.
+                    from .canonical import _lock_artifacts
+                    rows = [row for row in rows if _lock_artifacts(
+                        connection, row['tenant_id'], row['source_id'],
+                        [row['artifact_id']], wait=False)]
+                    # Read current references AFTER taking the artifact locks.
+                    # An earlier statement snapshot could miss a writer that
+                    # committed immediately before the lock was acquired.
+                    live = self._live_cleanup_references(connection, rows)
+                    protected = [row for row in rows if (
+                        row['tenant_id'],row['source_id'],row['artifact_id']) in live]
+                    removable = [row for row in rows if (
+                        row['tenant_id'],row['source_id'],row['artifact_id']) not in live]
                     references = [
                         self._reference(row)
                         for row in removable
