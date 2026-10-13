@@ -21,8 +21,12 @@ same-manifest repair updates an existing passage notification but does not inser
 a missing queue item. Neither path repairs this inactive receipt defect.
 
 `CanonicalPassageProjector.requeue_receipt_repair()` accepts one frozen stale
-witness and queues the existing passage publisher. It checks the exact source
-owner and grant, catalog creation identity, revision, content and manifest,
+witness and queues the existing passage publisher. It requires the exact source
+owner and owner grant, or an explicit source grant plus the existing company-admin
+predicate from `ControlPlane._brain_admin`. That predicate requires both the
+organization membership and the tenant permission to be owner/admin. A source
+read grant alone never permits maintenance. Shared locks preserve those grants
+through queue commit. The method also checks catalog creation identity, revision, content and manifest,
 current passage policy, passage text hash, and receipt-array digest. Shared row
 locks keep the selected source/grant/catalog stable during admission. A pending
 logical or passage projection, changed catalog, clean witness, or policy mismatch
@@ -33,7 +37,9 @@ Normal `_prepare`/`_commit`, archive verification, generation fences, and search
 receipt liveness remain the authorities. Retirement markers are untouched.
 The retained PostgreSQL regression follows same-revision queue admission through
 the actual publisher and checks retained passage identity, refreshed receipts,
-zero passage inserts/deletes, and zero additional vendor writes.
+zero passage inserts/deletes, and zero additional vendor writes. Additional cases
+cover admin admission, role/access/source revocation before admission, and
+concurrent revocation blocked until the queue transaction ends.
 
 This is one maintenance method, not a background repair policy or new runtime
 operator. Private one-off plan/observation packets read exact scoped metadata;
@@ -42,7 +48,11 @@ execution. No permanent repair CLI or separate receipt-writing owner is added.
 
 ## Supervised two-parent lifecycle
 
-1. Read and freeze one positive witness per parent, with the original inventory
+1. Resolve the acting principal through the existing credential owner, then
+   verify its current source/admin authority. A read-scoped credential establishes
+   identity; the supervised operator is separately authorized to do maintenance.
+   Never substitute the source owner's identity. Read and freeze one positive
+   witness per parent, with the original inventory
    hash and complete current catalog proof. Review those plans before admission.
 2. Bind the exact package body, invocation nonce, deployment, and fleet checkpoint
    to create-once durable intent. Launch once through the existing guarded

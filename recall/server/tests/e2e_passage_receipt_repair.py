@@ -3,7 +3,11 @@
 import hashlib
 import json
 import unittest
+from unittest.mock import patch
+
+import psycopg
 from e2e_retained_passage_receipts import RetainedPassageReceipts
+from recall_server.control import ControlError, ControlPlane
 
 
 class Repair(RetainedPassageReceipts):
@@ -72,6 +76,118 @@ class Repair(RetainedPassageReceipts):
             stale_receipts=len(receipts),
         )
         return dict(plan, proof_sha256=self.digest(plan))
+
+    def company_admin_plan(self):
+        target = self.corrupt_old_receipt()
+        plan = self.plan(target)
+        self.admin = self.principal + ":admin"
+        self.organization = self.tenant + ":org"
+        self.store.provision_brain(
+            organization_id=self.organization,
+            organization_kind="company",
+            display_name="Receipt fixture",
+            tenant_id=self.tenant,
+            brain_kind="company",
+            slug="company",
+            owner_principal_id=self.admin,
+        )
+        with self.store.connect() as c:
+            c.execute(
+                "UPDATE brain_memberships SET role='admin' WHERE organization_id=%s AND principal_id=%s",
+                (self.organization, self.admin),
+            )
+            c.execute(
+                "UPDATE brain_access_grants SET permission='admin' WHERE tenant_id=%s AND principal_id=%s",
+                (self.tenant, self.admin),
+            )
+            c.execute(
+                "INSERT INTO canonical_source_grants(tenant_id,principal_id,source_id,permission) VALUES(%s,%s,%s,'read') ON CONFLICT DO NOTHING",
+                (self.tenant, self.admin, self.source),
+            )
+        plan["principal_id"] = self.admin
+        plan["proof_sha256"] = self.digest(
+            {k: v for k, v in plan.items() if k != "proof_sha256"}
+        )
+        return plan
+
+    def test_company_admin_with_exact_source_grant_can_queue(self):
+        plan = self.company_admin_plan()
+        result = self.passages.requeue_receipt_repair(
+            plan=plan, principal_id=self.admin
+        )
+        self.assertEqual(result["status"], "queued")
+
+    def test_read_grant_does_not_replace_current_company_admin_authority(self):
+        plan = self.company_admin_plan()
+        for table, column, key, value in [
+            ("brain_memberships", "role", "organization_id", self.organization),
+            ("brain_access_grants", "permission", "tenant_id", self.tenant),
+            ("canonical_source_grants", None, "tenant_id", self.tenant),
+        ]:
+            with self.subTest(table=table), self.store.connect() as c, c.transaction():
+                # Separate connection commits the revocation before admission.
+                if column:
+                    downgrade = "member" if column == "role" else "read"
+                    c.execute(
+                        f"UPDATE {table} SET {column}=%s WHERE {key}=%s AND principal_id=%s",
+                        (downgrade, value, self.admin),
+                    )
+                else:
+                    c.execute(
+                        "DELETE FROM canonical_source_grants WHERE tenant_id=%s AND source_id=%s AND principal_id=%s",
+                        (self.tenant, self.source, self.admin),
+                    )
+            with self.assertRaises((ControlError, ValueError)):
+                self.passages.requeue_receipt_repair(plan=plan, principal_id=self.admin)
+            with self.store.connect() as c:
+                if column:
+                    c.execute(
+                        f"UPDATE {table} SET {column}='admin' WHERE {key}=%s AND principal_id=%s",
+                        (value, self.admin),
+                    )
+                else:
+                    c.execute(
+                        "INSERT INTO canonical_source_grants(tenant_id,principal_id,source_id,permission) VALUES(%s,%s,%s,'read')",
+                        (self.tenant, self.admin, self.source),
+                    )
+        with self.store.connect() as c:
+            self.assertEqual(
+                c.execute(
+                    "SELECT count(*) AS n FROM canonical_passage_projection_queue WHERE tenant_id=%s",
+                    (self.tenant,),
+                ).fetchone()["n"],
+                0,
+            )
+
+    def test_admin_membership_and_grants_are_locked_through_queue_commit(self):
+        plan = self.company_admin_plan()
+        original = ControlPlane._brain_admin
+        checked = []
+
+        def authorize(*args, **kwargs):
+            result = original(*args, **kwargs)
+            for table, key, value in [
+                ("brain_memberships", "organization_id", self.organization),
+                ("brain_access_grants", "tenant_id", self.tenant),
+                ("canonical_source_grants", "tenant_id", self.tenant),
+            ]:
+                with self.store.connect() as revoker:
+                    revoker.execute("SET lock_timeout='100ms'")
+                    with self.assertRaises(psycopg.errors.LockNotAvailable):
+                        revoker.execute(
+                            f"DELETE FROM {table} WHERE {key}=%s AND principal_id=%s",
+                            (value, self.admin),
+                        )
+                    revoker.rollback()
+                checked.append(table)
+            return result
+
+        with patch.object(ControlPlane, "_brain_admin", side_effect=authorize):
+            result = self.passages.requeue_receipt_repair(
+                plan=plan, principal_id=self.admin
+            )
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(len(checked), 3)
 
     def test_same_revision_repair_uses_publisher_without_vendor_writes(self):
         target = self.corrupt_old_receipt()

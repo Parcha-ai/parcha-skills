@@ -1668,6 +1668,8 @@ class CanonicalPassageProjector:
         No receipt/body writes or provider calls. The regular publisher owns repair.
         Existing pending work is never overwritten or inferred to be our outcome.
         """
+        from .control import ControlPlane
+
         unsigned = {key: value for key, value in plan.items() if key != "proof_sha256"}
         proof = hashlib.sha256(
             json.dumps(
@@ -1697,7 +1699,8 @@ class CanonicalPassageProjector:
                    evidence.manifest_content_sha256,evidence.manifest_object_key,evidence.manifest_version_id,
                    projected.revision AS projected_revision,projected.policy_fingerprint,
                    projected.source_document_sha256,passage.revision AS passage_revision,
-                   passage.text_sha256,passage.receipts
+                   passage.text_sha256,passage.receipts,
+                   source.owner_principal_id,grant_row.permission AS source_permission
               FROM canonical_evidence_documents evidence
               JOIN canonical_passage_documents projected USING(tenant_id,source_id,logical_document_id)
               JOIN canonical_passages passage USING(tenant_id,source_id,logical_document_id)
@@ -1705,7 +1708,7 @@ class CanonicalPassageProjector:
               JOIN canonical_source_grants grant_row USING(tenant_id,source_id)
              WHERE evidence.tenant_id=%s AND evidence.source_id=%s
                AND evidence.logical_document_id=%s AND passage.passage_id=%s
-               AND source.owner_principal_id=%s AND grant_row.principal_id=%s AND grant_row.permission='owner'
+               AND grant_row.principal_id=%s
              FOR SHARE OF source,grant_row,evidence,projected,passage NOWAIT""",
                 (
                     tenant,
@@ -1713,11 +1716,21 @@ class CanonicalPassageProjector:
                     target["logical_document_id"],
                     target["passage_id"],
                     principal_id,
-                    principal_id,
                 ),
             ).fetchone()
             if row is None:
                 raise ValueError("source_or_catalog_unavailable")
+            source_owner = row.pop("owner_principal_id")
+            source_permission = row.pop("source_permission")
+            if source_owner != principal_id or source_permission != "owner":
+                # A source read grant alone never permits maintenance. Reuse the
+                # company's existing admin predicate, locked until queue commit.
+                self.store._set_statement_deadline(
+                    connection, min(deadline, time.monotonic() + 5)
+                )
+                ControlPlane._brain_admin(
+                    connection, principal_id=principal_id, tenant_id=tenant, lock=True
+                )
             receipts = row.pop("receipts")
             if dict(row) != plan["catalog"]:
                 raise ValueError("catalog_changed")
