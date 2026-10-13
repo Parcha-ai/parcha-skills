@@ -663,6 +663,7 @@ class ConnectorRunner:
         deduplicated = 0
         archived = 0
         forgotten = 0
+        acknowledgeable = []
         for record in page.records:
             was_forgotten = False
             was_deduplicated = False
@@ -729,6 +730,8 @@ class ConnectorRunner:
                 dropped += int(not was_forgotten and not was_deduplicated)
             else:
                 events.append(event)
+            if event is not None or was_deduplicated:
+                acknowledgeable.append(record)
         privacy = summarize_receipts(receipts, self.privacy.mode)
         with self.db:
             page_id = self.db.execute(
@@ -739,6 +742,9 @@ class ConnectorRunner:
                 "INSERT INTO outbox(page_id,envelope_json,state) VALUES (?,?,'pending')",
                 [(page_id, json.dumps(event, sort_keys=True, separators=(",", ":"))) for event in events],
             )
+            stage_checkpoint = getattr(self.checkpoints, "stage_checkpoint", None)
+            if callable(stage_checkpoint):
+                stage_checkpoint(page.next_cursor, tuple(acknowledgeable))
             if not events:
                 self._commit_page(page_id, page.next_cursor)
         return {
