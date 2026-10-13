@@ -7,12 +7,13 @@ import unittest
 from unittest.mock import Mock, patch
 
 sys.path[:0] = [
+    str(Path(__file__).resolve().parents[1]),
     str(Path(__file__).resolve().parents[2]),
     str(Path(__file__).resolve().parents[2] / "server"),
 ]
 from recall_server import retirement_enrollment as enrollment
 from recall_server.db import SearchDeadlineExceeded
-from test_retirement_campaign import plan
+from central_brain.test_retirement_campaign import plan
 
 
 class EnrollmentTests(unittest.TestCase):
