@@ -35,7 +35,7 @@ CATALOG_ATTRIBUTES = (
     "doc_first_occurred_at", "doc_last_occurred_at", "manifest_object_key",
     "manifest_content_sha256", "text_sha256",
 )
-BODY_ATTRIBUTES = ("receipts", "spans", "header", TEXT_ATTRIBUTE)
+BODY_ATTRIBUTES = ("spans", "header", TEXT_ATTRIBUTE)
 ROW_ATTRIBUTES = CATALOG_ATTRIBUTES + BODY_ATTRIBUTES
 HYDRATE_BATCH_IDS = 200
 LEXICAL_LIMIT = 400
@@ -403,7 +403,9 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
                     connection,
                     """WITH selected AS MATERIALIZED (
                             SELECT passage.tenant_id,passage.source_id,passage.passage_id,
-                                   passage.logical_document_id,passage.text_sha256,passage.receipts
+                                   passage.logical_document_id,passage.text_sha256,passage.receipts,
+                                   evidence.revision,evidence.manifest_object_key,
+                                   evidence.manifest_content_sha256
                               FROM canonical_passages passage
                               JOIN canonical_passage_documents projected
                                 USING(tenant_id,source_id,logical_document_id,policy_fingerprint)
@@ -433,14 +435,18 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
                                AND document.is_current AND document.deleted_at IS NULL
                         )
                         SELECT selected.tenant_id,selected.source_id,selected.passage_id,
-                               selected.logical_document_id,selected.text_sha256
+                               selected.logical_document_id,selected.text_sha256,selected.receipts,
+                               selected.revision,selected.manifest_object_key,
+                               selected.manifest_content_sha256
                           FROM selected
                           CROSS JOIN LATERAL unnest(selected.receipts) AS receipt(value)
                           LEFT JOIN live_receipts live
                             ON live.tenant_id=selected.tenant_id
                            AND live.source_id=selected.source_id AND live.value=receipt.value
                          GROUP BY selected.tenant_id,selected.source_id,selected.passage_id,
-                                  selected.logical_document_id,selected.text_sha256
+                                  selected.logical_document_id,selected.text_sha256,selected.receipts,
+                                  selected.revision,selected.manifest_object_key,
+                                  selected.manifest_content_sha256
                         HAVING bool_and(live.value IS NOT NULL)""",
                     (self.tenant_id, self.sources, self.policy_fingerprint,
                      [source for source, _passage in requested],
@@ -454,14 +460,18 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
         def identity(row):
             return (row.get("source_id"), row.get("logical_document_id"),
                     row.get("passage_id"), row.get("text_sha256"))
-        allowed = {identity(row) for row in authoritative
+        allowed = {identity(row): row for row in authoritative
                    if row.get("tenant_id") == self.tenant_id
                    and row.get("source_id") in self.sources}
-        live = set()
+        locator_fields = ("revision", "manifest_object_key", "manifest_content_sha256")
+        live = {}
         for _name, _weight, rows in legs:
             rows[:] = [row for row in rows if identity(row) in allowed]
-            live.update((row["source_id"], row["logical_document_id"], row["passage_id"])
-                        for row in rows)
+            for row in rows:
+                canonical = allowed[identity(row)]
+                row["receipts"] = list(canonical["receipts"])
+                row.update({field: canonical[field] for field in locator_fields})
+                live[(row["source_id"], row["logical_document_id"], row["passage_id"])] = canonical
         # A collapsed document can carry metadata from any of its selected
         # ranges. Drop the whole collapsed row if any range lost authority;
         # never preserve a forgotten range's receipts, title, or body.
@@ -469,6 +479,11 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
             (row.get("source_id"), row.get("logical_document_id"), item.get("passage_id")) in live
             for item in row["matching_ranges"]
         )]
+        for row in results:
+            for item in row["matching_ranges"]:
+                canonical = live[(row["source_id"], row["logical_document_id"], item["passage_id"])]
+                item["receipts"] = list(canonical["receipts"])
+                row.update({field: canonical[field] for field in locator_fields})
         return {"authority_status": status,
                 "authority_rejected": len(set(ids) - {key[2] for key in live}),
                 "authority_elapsed_ms": round((time.monotonic() - started) * 1000, 3)}
@@ -485,7 +500,7 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
 
         The arms returned catalog rows; the ranges that survived the
         collapse (and the leg rows behind them, which the reranker reads)
-        get text, spans, receipts, and header here: one ``id In`` query per
+        get text, spans, and header here: one ``id In`` query per
         ``HYDRATE_BATCH_IDS`` ids, ordered by id so the plane reads them in
         one sweep. A shortfall leaves the affected ranges bodiless
         (``hydrate_status`` says so) rather than dropping the result.
@@ -531,14 +546,13 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
                 if not isinstance(text, str):
                     continue
                 spans = parse_spans(_value(item, "spans"))
-                receipts = list(_value(item, "receipts") or ())
                 header = _value(item, "header") or None
                 bounded, clipped = bounded_search_text(text)
                 for hint in wanted[passage_id]:
-                    hint.update({"text": bounded, "text_clipped": clipped, "spans": spans, "receipts": receipts})
+                    hint.update({"text": bounded, "text_clipped": clipped, "spans": spans})
                 for row in leg_rows.get(passage_id, ()):
                     row.update({
-                        "text_redacted": text, "spans": spans, "receipts": receipts, "header_redacted": header,
+                        "text_redacted": text, "spans": spans, "header_redacted": header,
                     })
                 hydrated += 1
         if hydrated < len(ids) and status == "ok":
