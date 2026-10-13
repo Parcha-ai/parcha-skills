@@ -32,6 +32,18 @@ Continuous execution stays outside ingestion. Reuse the current supervisor, dura
 
 Before policy implementation, prove fresh approved enrollment, revoked/off policy refusal, exact catalog rebind, disabled/restore preservation, publication rollback, absent-row baseline exclusions and fair source rotation under real concurrent transactions. Retain the runner, full-parent proof, native-lock, history and finite campaign tests. No automatic future enrollment is enabled by this prerequisite.
 
+### Deployment and migration order
+
+Finish the current finite enrollment/clear invocation before changing its serving commit or owner hashes. Its pinned remote body must not span a deployment. Record the terminal result or reconcile an unknown outcome first.
+
+Deploy code that explicitly accepts optional075 to MCP, the ingestion worker and the managed-connector worker before applying the migration. Verify each service's actual deployed commit and readiness against the still-existing schema, rather than assuming a shared deploy changed all services. The new forget cleanup is compatible with schema069: its null-catalog predicate matches no row before075. The rebind API fails closed while075 is absent. New deployments must not automatically run075 before older running services have been upgraded.
+
+Refresh the supervisor's reviewed code pins only after those releases are healthy: `retirement_runner.py` changes for the rebind API; `chunk_retirement.py` and `parent_chunk_proof.py` retain their existing hashes. Rebuild body hashes and durable intent with the actual selected commit. Do not reuse an old launch intent with substituted code.
+
+Then apply075 as a separate, reviewed migration with a short lock timeout and bounded statement timeout after a fresh database headroom/replica-lag check. Its progress-table FK/constraint changes take locks; a timeout rolls back the migration and is not permission to increase deadlines. Confirm marker075, nullable catalog FK, detachment trigger and source FK, then run read-only readiness and ledger checks before another bounded clear invocation. No automatic future enrollment is enabled here.
+
+After075, rollback must retain optional075 compatibility on every service. Redeploying an older binary that rejects migration075 can make readiness fail. Stop claims/rebinds if necessary; do not reverse the migration, erase held intent, or restore cascading catalog deletion as a rollback shortcut.
+
 ### Measured drain rate
 
 The first production quantum cleared 10 parents, 4,045 documents, 4,199 chunks and 14,277,687 UTF-8 bytes in 44.104 seconds, with zero failures or unknown outcomes. That is 0.309 MiB/s of logical body clearing and 91.7 documents/s. Twenty-two commits averaged 184 documents; the existing batch ceiling is 256. Whole-parent proof is performed once and its verified spool feeds the bounded commits; it is not repeated for each SQL batch.
