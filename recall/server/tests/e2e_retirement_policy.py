@@ -136,6 +136,18 @@ class PolicyTests(unittest.TestCase):
                 reviewed_plan=plan, expected_scope_epoch=self.state()['scope_epoch'])
         self.assertFalse(self.state()['enabled'])
 
+    def test_transaction_opened_before_seal_but_inserted_after_is_baseline(self):
+        with self.store.connect() as c, c.transaction():
+            # Establish a database transaction before sealing, but insert only
+            # afterward. Admission's DEFAULT now() must preserve its old start.
+            c.execute('SELECT now()')
+            self.activate()
+            insert_record(c, tenant=self.tenant, source=self.source, parent='late-insert-parent',
+                          native='late-insert-event', text='late insertion', role='user', byte_start=110)
+        self.repair('late-insert-event')
+        self.assertEqual(self.parent_state('late-insert-parent')['status'], 'baseline')
+        self.assertFalse(self.parent_state('late-insert-parent')['enabled'])
+
     def test_parent_admitted_during_capture_is_baseline_before_seal(self):
         policy.start_policy(self.store, scope=self.scope)
         with self.store.connect() as c:
