@@ -7,6 +7,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import (
     CLEANUP_REFERENCE_INDEX_VERSION,
+    SUPPRESSED_ARTIFACT_SCHEMA_VERSION,
     MANDATORY_SCHEMA_VERSION,
     NATIVE_CONVERSATION_SCHEMA_VERSION,
     NOTIFICATION_PRIORITY_SCHEMA_VERSION,
@@ -198,7 +199,9 @@ def assess_snapshot(snapshot: dict[str, Any], profile: str = "production") -> di
                       + ([RETIREMENT_DETACHMENT_VERSION]
                          if RETIREMENT_DETACHMENT_VERSION in versions else [])
                       + ([RETIREMENT_POLICY_VERSION]
-                         if RETIREMENT_POLICY_VERSION in versions else []))
+                         if RETIREMENT_POLICY_VERSION in versions else [])
+                      + ([SUPPRESSED_ARTIFACT_SCHEMA_VERSION]
+                         if SUPPRESSED_ARTIFACT_SCHEMA_VERSION in versions else []))
     if (RETIREMENT_POLICY_VERSION in versions
             and RETIREMENT_DETACHMENT_VERSION not in versions):
         raise CapabilityError("schema_drift")

@@ -197,6 +197,10 @@ class ManagedWorkerComposioTests(unittest.TestCase):
             worker.remote_rails = {"slack.messages": stale_bot_only_rail}
             row = {
                 "id": "synthetic-slack-installation",
+                "connection_id": "synthetic-slack-connection",
+                "revision": 1,
+                "provider_subject_id": "T123:U111",
+                "granted_scopes": ["channels:history", "channels:read"],
                 "connector_id": "slack.messages",
                 "provider": "slack",
                 "source_id": "synthetic:slack:public-history",
@@ -227,6 +231,26 @@ class ManagedWorkerComposioTests(unittest.TestCase):
             self.assertEqual(
                 spool, worker.spool_root / "synthetic-slack-installation.db",
             )
+
+            original_epoch = connector.reconciliation_epoch
+            for field, value in [("connection_id", "replacement-connection"),
+                                 ("revision", 2), ("provider_subject_id", "T123:U222"),
+                                 ("granted_scopes", ["channels:history"])]:
+                alternate_private = root / field
+                alternate_private.mkdir(mode=0o700)
+                other, _ = worker._build_default({**row, field: value}, {
+                    "bot_access_token": "synthetic-bot-authority",
+                    "user_access_token": "synthetic-user-authority",
+                }, alternate_private)
+                self.assertNotEqual(other.reconciliation_epoch, original_epoch)
+            rotated_private = root / "rotated"
+            rotated_private.mkdir(mode=0o700)
+            rotated, _ = worker._build_default({**row, "granted_scopes": list(reversed(row["granted_scopes"]))}, {
+                "bot_access_token": "synthetic-rotated-bot-authority",
+                "user_access_token": "synthetic-rotated-user-authority",
+            }, rotated_private)
+            self.assertEqual(rotated.reconciliation_epoch, original_epoch)
+            self.assertTrue(rotated.reconciliation_enabled)
 
             second_private = root / "incomplete-authority"
             second_private.mkdir(mode=0o700)
