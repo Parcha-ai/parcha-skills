@@ -150,6 +150,9 @@ def run_projection_worker(
     last_busy_thin_cycle: int | None = None
     last_busy_thin_started = 0.0
     last_retirement_started = clock() - 30.0
+    # A child can finish before a later publication phase fails. Carry its
+    # observed counters until a successful cycle records them exactly once.
+    retired = {"status": "disabled" if retirement_maintainer is None else "deferred"}
 
     def elapsed_ms(started: float) -> int:
         return max(0, int(round((clock() - started) * 1000)))
@@ -208,6 +211,20 @@ def run_projection_worker(
                     elif isinstance(value, int):
                         total[key] = int(total.get(key, 0)) + value
 
+            def maintain_retirement(busy):
+                nonlocal last_retirement_started, active_phase, phase_started
+                now = clock()
+                if retirement_maintainer is None or now - last_retirement_started < 30.0:
+                    return
+                previous_phase, previous_started = active_phase, phase_started
+                active_phase, phase_started = "retirement", now
+                last_retirement_started = now
+                accumulate(retired, retirement_maintainer(busy))
+                phase_elapsed["retirement_elapsed_ms"] += elapsed_ms(now)
+                if previous_phase in {"passage", "logical"}:
+                    previous_started += clock() - now
+                active_phase, phase_started = previous_phase, previous_started
+
             search_ticks = 0
 
             def publish_search():
@@ -244,6 +261,11 @@ def run_projection_worker(
                 elif previous_phase == "logical":
                     phase_elapsed["logical_elapsed_ms"] = 0
                 active_phase, phase_started = previous_phase, previous_started
+
+            def heartbeat():
+                if search_plane is not None:
+                    publish_search()
+                maintain_retirement(True)
 
             def publish_ready():
                 nonlocal active_phase, phase_started, passage_elapsed_ms
@@ -286,7 +308,7 @@ def run_projection_worker(
                 max_wait_seconds=max_wait_seconds,
                 cleanup_concurrency=cleanup_concurrency,
                 on_progress=publish_ready,
-                on_heartbeat=publish_search if search_plane is not None else None,
+                on_heartbeat=heartbeat if search_plane is not None or retirement_maintainer is not None else None,
             )
             logical_elapsed_ms = elapsed_ms(phase_started)
             phase_elapsed["logical_elapsed_ms"] = logical_elapsed_ms
@@ -381,13 +403,7 @@ def run_projection_worker(
                 last_busy_thin_started = phase_started
             thin_elapsed_ms = elapsed_ms(phase_started)
             phase_elapsed["thin_elapsed_ms"] = thin_elapsed_ms
-            active_phase = "retirement"
-            phase_started = clock()
-            retired = {"status": "disabled" if retirement_maintainer is None else "deferred"}
-            if retirement_maintainer is not None and phase_started - last_retirement_started >= 30.0:
-                last_retirement_started = phase_started
-                retired = retirement_maintainer(thin_busy)
-            phase_elapsed["retirement_elapsed_ms"] = elapsed_ms(phase_started)
+            maintain_retirement(thin_busy)
             active_phase = "outbox"
             phase_started = clock()
             # H3-a: source-months waiting for the Lance writer, one cheap
@@ -498,6 +514,7 @@ def run_projection_worker(
                 "retirement_elapsed_ms": phase_elapsed["retirement_elapsed_ms"],
             }
             record_cycle(result)
+            retired = {"status": "disabled" if retirement_maintainer is None else "deferred"}
             LOG.info(
                 "projection cycle status=%s documents=%s logical_repaired=%s "
                 "logical_pending=%s logical_waiting=%s records=%s "

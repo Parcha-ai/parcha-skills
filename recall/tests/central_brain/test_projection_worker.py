@@ -1263,3 +1263,98 @@ class RetirementWorkerTests(unittest.TestCase):
         self.assertEqual(invocations, [(110.0, True), (140.0, True)])
         self.assertEqual(calls.count('logical'), 5)
         self.assertEqual(result['status'], 'pending')
+
+
+class RetirementHeartbeatTests(unittest.TestCase):
+    def test_long_logical_batch_services_retirement_and_keeps_all_results(self):
+        calls, invocations = [], []
+        clock = _FakeClock()
+        class Logical(_Logical):
+            def project_pending(inner, **kwargs):
+                heartbeat = kwargs['on_heartbeat']
+                for _ in range(10):
+                    clock.advance(10)
+                    heartbeat()
+                    calls.append('foreground')
+                self.assertEqual(len(invocations), 4)
+                return super().project_pending(**kwargs)
+        def retire(busy):
+            self.assertTrue(busy)
+            invocations.append(clock())
+            return dict(status='running' if len(invocations) % 2 else 'bounded',
+                cleared_documents=0 if len(invocations) % 2 else 3,
+                cleared_utf8_bytes=0 if len(invocations) % 2 else 321,
+                archive_bytes=0 if len(invocations) % 2 else 1000,
+                commit_outcome_unknown=len(invocations)==2)
+        result=run_projection_worker(Logical(calls,pending=100),_Passages(calls),
+            tenant_id='tenant:company:test',logical_batch_size=5,passage_batch_size=5,
+            embedding_batch_size=64,max_batches_per_cycle=1,upload_concurrency=1,
+            passage_concurrency=1,interval_seconds=5,retirement_maintainer=retire,
+            clock=clock,once=True)
+        self.assertEqual(invocations,[110,140,170,200])
+        self.assertEqual(calls.count('foreground'),10)
+        self.assertEqual(result['retirement_cleared_documents'],6)
+        self.assertEqual(result['retirement_cleared_utf8_bytes'],642)
+        self.assertEqual(result['retirement_archive_bytes'],2000)
+        self.assertEqual(result['retirement_unknown'],1)
+
+    def test_completed_child_counters_survive_later_publication_failure(self):
+        calls=[]
+        clock=_FakeClock()
+        class Logical(_Logical):
+            def project_pending(inner, **kwargs):
+                kwargs['on_heartbeat']()
+                if not calls:
+                    calls.append('failed')
+                    raise RuntimeError('synthetic publication failure')
+                return super().project_pending(**kwargs)
+        def retire(busy):
+            return dict(status='bounded',cleared_documents=3,cleared_utf8_bytes=321)
+        result=run_projection_worker(Logical(calls,pending=100),_Passages([]),
+            tenant_id='tenant:company:test',logical_batch_size=5,passage_batch_size=5,
+            embedding_batch_size=64,max_batches_per_cycle=1,upload_concurrency=1,
+            passage_concurrency=1,interval_seconds=5,retirement_maintainer=retire,
+            clock=clock,max_cycles=2,sleep=lambda _:None)
+        self.assertEqual(result['retirement_cleared_documents'],3)
+
+
+    def test_existing_heartbeat_launches_and_reaps_supervisor_before_logical_return(self):
+        import io
+        import json
+        from recall_server.retirement_supervisor import RetirementSupervisor
+        calls,children=[],[]
+        clock=_FakeClock()
+        class Child:
+            stdin=None
+            returncode=0
+            def __init__(self):
+                self.done=False
+                self.stdout=io.BytesIO(json.dumps(dict(status='bounded',cleared_documents=2,
+                    cleared_utf8_bytes=456)).encode())
+            def poll(self):
+                return 0 if self.done else None
+        def launch(_configuration):
+            child=Child();children.append(child);return child
+        supervisor=RetirementSupervisor('synthetic',tenant_id='tenant:company:test',launch=launch)
+        class Logical(_Logical):
+            def project_pending(inner,**kwargs):
+                heartbeat=kwargs['on_heartbeat']
+                heartbeat()
+                self.assertEqual(len(children),1)
+                for _ in range(5):
+                    clock.advance(1);heartbeat()
+                self.assertEqual(len(children),1)
+                children[0].done=True
+                clock.advance(25);heartbeat()
+                self.assertIsNone(supervisor.child)
+                self.assertTrue(children[0].stdout.closed)
+                return super().project_pending(**kwargs)
+        result=run_projection_worker(Logical(calls,pending=100),_Passages(calls),
+            tenant_id='tenant:company:test',logical_batch_size=5,passage_batch_size=5,
+            embedding_batch_size=64,max_batches_per_cycle=1,upload_concurrency=1,
+            passage_concurrency=1,interval_seconds=5,
+            retirement_maintainer=lambda busy:supervisor.cycle(busy=busy),
+            clock=clock,once=True)
+        self.assertEqual(result['retirement_cleared_documents'],2)
+        self.assertEqual(len(children),1)
+        supervisor.close()

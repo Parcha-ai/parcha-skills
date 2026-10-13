@@ -9,6 +9,10 @@ main loop polls it without waiting for proof. The child owns at most one SQL
 connection and releases every SQL lease before archive reads. It uses the same
 policy, parent ledger, claim epoch, proof and clear owners. There is no new queue,
 service, table or source of permission. `--once` retains the synchronous path.
+Existing logical publication heartbeats and the end-of-cycle boundary share a
+30-second retirement cadence. A long logical batch therefore launches and reaps
+the child before returning. Completed-child counters accumulate across heartbeats
+and survive a later failed publication cycle until they can be reported.
 
 For each claimed parent, a read-only snapshot checks the exact catalogue identity
 and sums its committed part sizes. That sum supplies the proof's archive budget.
@@ -19,7 +23,8 @@ separate verifier review, not an ingestion rejection or silent truncation.
 The child has its own wall-clock alarm, including when its supervisor dies.
 SIGTERM shuts down and reaps the child. A failed kill/wait retains ownership, so
 another invocation cannot overlap accidentally. Missing or malformed output is
-an unknown outcome. Existing durable intent and epoch reconciliation observe
+an unknown outcome. Child failures expose only a bounded error class and phase,
+never raw exception text or connection credentials. Existing durable intent and epoch reconciliation observe
 committed progress before a fresh proof; a process exit never proves commitment.
 
 ## Witnessed local measurements
