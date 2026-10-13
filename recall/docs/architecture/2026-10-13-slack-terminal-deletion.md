@@ -55,7 +55,11 @@ must also recognize concurrently shipped optional migrations 075 and 076 before
 those migrations are applied. Rolling back the fence to an older binary after
 suppression begins is unsafe: old forget code cannot see suppressed raw owners.
 
-The artifact fence is tenant/source scoped. Old schemas retain their existing
+The artifact fence is tenant/source scoped. Its source foreign key uses the same
+default NO ACTION behavior as native forget tombstones: the durable fence survives
+raw deletion and prevents deleting its source registry row. Only suppression-owner
+links cascade when their raw registry row is removed. No source-registry erase API
+is added. Old schemas retain their existing
 behavior until 077 exists; starting an old-schema process is not proof of the new
 artifact deletion guarantee. Tests demonstrate admission-before-forget preserves
 shared raw, forget-before-admission rejects the waiting owner, a fully forgotten
