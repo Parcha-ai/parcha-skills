@@ -285,7 +285,7 @@ are supported: versions through 69 are required except optional migration 67,
 which retires the Postgres vector plane and is applied explicitly from the
 turbopuffer plane. Migration 70 adds only a reconciliation performance index;
 serving accepts both schema 69 and 70 and reports the actual recorded version.
-The latest shipped migration is 74; migration 71 remains optional and reserved
+The latest shipped migration is 75; migration 71 remains optional and reserved
 for native-conversation metadata. Migration 72 adds nullable
 `canonical_evidence_document_queue.notification_queued_at`, with no default,
 index, or historical reclassification. Apply it before deploying the notification
@@ -299,6 +299,14 @@ reference checks. Its concurrent companion runs before the marker; the marker
 refuses missing, invalid, or mismatched index definitions. Serving remains
 compatible without these performance indexes. Production application roles do
 not create them; an operator builds and verifies all three before recording 74.
+
+Migration 75 preserves disabled/restored retirement intent across catalog deletion.
+Deploy code that accepts optional 75 to MCP, projection and managed workers before
+applying it. Finish pinned maintenance jobs first, and use the
+[projection worker cutover](worker-cutover.md) to prevent overlapping writers.
+The [retirement implementation review](../../docs/architecture/2026-10-13-continuous-retirement-implementation-review.md)
+records hash updates, bounded migration checks and rollback compatibility.
+Future-parent automatic enrollment remains disabled.
 
 Webhook ingestion retains the same structured canonical JSON as managed
 history, so typed messages remain visible when their author is unresolved.
