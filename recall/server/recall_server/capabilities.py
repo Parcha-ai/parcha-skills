@@ -14,6 +14,7 @@ from . import (
     PASSAGE_NOTIFICATION_SCHEMA_VERSION,
     RECONCILIATION_INDEX_VERSION,
     RETIRE_POSTGRES_PLANE_VERSION,
+    RETIREMENT_DETACHMENT_VERSION,
 )
 
 
@@ -194,6 +195,8 @@ def assess_snapshot(snapshot: dict[str, Any], profile: str = "production") -> di
                          if PASSAGE_NOTIFICATION_SCHEMA_VERSION in versions else [])
                       + ([CLEANUP_REFERENCE_INDEX_VERSION]
                          if CLEANUP_REFERENCE_INDEX_VERSION in versions else [])
+                      + ([RETIREMENT_DETACHMENT_VERSION]
+                         if RETIREMENT_DETACHMENT_VERSION in versions else [])
                       + ([SUPPRESSED_ARTIFACT_SCHEMA_VERSION]
                          if SUPPRESSED_ARTIFACT_SCHEMA_VERSION in versions else []))
     if versions != expected:

@@ -1,7 +1,8 @@
 """Bounded maintenance for an explicitly enrolled, surviving parent cohort.
 
 This is invocation-local scheduling over schema069, not a second proof or queue.
-Catalog deletion also deletes its ledger: ordinary runs never enroll replacements.
+Schema075 retains detached intent after catalog deletion. Ordinary runs never
+enroll or rebind replacements; rebind requires a fresh explicit owner review.
 """
 
 from collections import Counter
@@ -140,8 +141,7 @@ def plan_cohort(store, *, scope, after=None, limit=100, deadline_at=None):
     return plan
 
 
-def enroll_cohort(store, *, scope, reviewed_plan, deadline_at=None):
-    """Insert this reviewed existing page only. Never reset or enable a ledger row."""
+def _reviewed_parents(scope, reviewed_plan):
     if not isinstance(scope, RetirementScope) or not isinstance(reviewed_plan, dict):
         _invalid()
     unsigned = {k: v for k, v in reviewed_plan.items() if k != "proof_sha256"}
@@ -172,6 +172,12 @@ def enroll_cohort(store, *, scope, reviewed_plan, deadline_at=None):
         or len(set(keys)) != len(keys)
     ):
         _invalid()
+    return parents
+
+
+def enroll_cohort(store, *, scope, reviewed_plan, deadline_at=None):
+    """Insert this reviewed existing page only. Never reset or enable a ledger row."""
+    parents = _reviewed_parents(scope, reviewed_plan)
     deadline_at = min(_parent_deadline(deadline_at), time.monotonic() + 5)
     inserted = 0
     with store.connect() as connection, connection.transaction():
@@ -199,6 +205,48 @@ def enroll_cohort(store, *, scope, reviewed_plan, deadline_at=None):
         inserted_parents=inserted,
         preserved_parents=len(parents) - inserted,
     )
+
+
+def rebind_detached_parent(
+    store, *, scope, reviewed_plan, expected_scope_epoch, deadline_at=None,
+):
+    """Explicitly authorize one replacement catalog; never undo disable/restore."""
+    parents = _reviewed_parents(scope, reviewed_plan)
+    if (len(parents) != 1 or type(expected_scope_epoch) is not int
+            or expected_scope_epoch < 1):
+        _invalid()
+    plan = parents[0]
+    key = scope.tenant_id, plan['source_id'], plan['native_parent_id']
+    deadline_at = min(_parent_deadline(deadline_at), time.monotonic() + 5)
+    with store.connect() as connection, connection.transaction():
+        _authorize(store, connection, scope, deadline_at)
+        schema = store._execute_bounded(connection,
+            'SELECT 1 FROM schema_migrations WHERE version=75', (), deadline_at).fetchone()
+        if schema is None:
+            raise ChunkRetirementError('retirement_rebind_schema_required')
+        catalog = read_parent_catalog(store, connection, key, deadline_at, lock=True)
+        if _cohort_entry(catalog['manifest']) != plan:
+            raise ChunkRetirementError('retirement_cohort_changed')
+        # Preserve the established catalog-then-ledger lock order. A concurrent
+        # restore/disable wins through its status and epoch, never a last write.
+        store._execute_bounded(connection, '''SELECT 1
+            FROM canonical_chunk_retirement_progress
+            WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s
+            FOR UPDATE NOWAIT''', key, deadline_at).fetchone()
+        updated = store._execute_bounded(connection, '''
+            UPDATE canonical_chunk_retirement_progress
+            SET logical_document_id=%s,enabled=true,status='pending',
+                scope_epoch=scope_epoch+1,manifest_artifact_id=NULL,
+                last_record_ordinal=-1,updated_at=clock_timestamp()
+            WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s
+              AND logical_document_id IS NULL AND NOT enabled
+              AND status='detached' AND scope_epoch=%s
+            RETURNING scope_epoch''',
+            (catalog['manifest']['logical_document_id'], *key, expected_scope_epoch),
+            deadline_at).fetchone()
+        if updated is None:
+            raise ChunkRetirementError('retirement_rebind_refused')
+    return dict(status='rebound', scope_epoch=updated['scope_epoch'])
 
 
 _ELIGIBLE = """progress.tenant_id=%s AND progress.source_id=ANY(%s) AND progress.enabled

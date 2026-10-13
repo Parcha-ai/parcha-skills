@@ -1956,11 +1956,34 @@ class CanonicalPlane:
                        WHERE tenant_id=%s AND source_id=%s AND native_id=ANY(%s)""",
                     (tenant_id, source_id, native_ids),
                 )
-                conn.execute(
+                forgotten_events = conn.execute(
                     """DELETE FROM canonical_events
-                       WHERE tenant_id=%s AND source_id=%s AND native_id=ANY(%s)""",
+                       WHERE tenant_id=%s AND source_id=%s AND native_id=ANY(%s)
+                       RETURNING COALESCE(native_parent_id,native_id) AS native_parent_id""",
                     (tenant_id, source_id, native_ids),
-                )
+                ).fetchall()
+                forgotten_parents = sorted({row["native_parent_id"] for row in forgotten_events})
+                if forgotten_parents:
+                    # Catalog removal retains operator intent across partial forget.
+                    # Drop that metadata only after this owner has removed the last
+                    # event and catalog; permanent forget tombstones still deny replay.
+                    conn.execute(
+                        """DELETE FROM canonical_chunk_retirement_progress progress
+                           WHERE progress.tenant_id=%s AND progress.source_id=%s
+                             AND progress.native_parent_id=ANY(%s)
+                             AND progress.logical_document_id IS NULL AND NOT progress.enabled
+                             AND NOT EXISTS (
+                                 SELECT 1 FROM canonical_events event
+                                 WHERE event.tenant_id=progress.tenant_id
+                                   AND event.source_id=progress.source_id
+                                   AND COALESCE(event.native_parent_id,event.native_id)=progress.native_parent_id)
+                             AND NOT EXISTS (
+                                 SELECT 1 FROM canonical_evidence_documents evidence
+                                 WHERE evidence.tenant_id=progress.tenant_id
+                                   AND evidence.source_id=progress.source_id
+                                   AND evidence.native_parent_id=progress.native_parent_id)""",
+                        (tenant_id, source_id, forgotten_parents),
+                    )
                 if _suppressed_ownership_available(conn):
                     conn.execute("""DELETE FROM canonical_suppressed_artifact_owners
                         WHERE tenant_id=%s AND source_id=%s AND identity_sha256=ANY(%s)""",
