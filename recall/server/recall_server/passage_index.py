@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import time
 import json
 import math
@@ -1654,6 +1655,143 @@ class CanonicalPassageProjector:
             ),
             "documents": documents,
         }
+
+    def requeue_receipt_repair(
+        self,
+        *,
+        plan: dict[str, Any],
+        principal_id: str,
+        deadline_at: float | None = None,
+    ) -> dict[str, Any]:
+        """Queue an exact current projection with a proven stale receipt witness.
+
+        No receipt/body writes or provider calls. The regular publisher owns repair.
+        Existing pending work is never overwritten or inferred to be our outcome.
+        """
+        from .control import ControlPlane
+
+        unsigned = {key: value for key, value in plan.items() if key != "proof_sha256"}
+        proof = hashlib.sha256(
+            json.dumps(
+                unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ).encode()
+        ).hexdigest()
+        if plan.get("proof_sha256") != proof:
+            raise ValueError("plan_digest")
+        tenant = self._tenant(plan["tenant_id"])
+        if (
+            plan["contract"] != "recall.passage-receipt-repair.v1"
+            or plan["principal_id"] != principal_id
+        ):
+            raise ValueError("plan_scope")
+        target = plan["target"]
+        deadline = min(deadline_at or time.monotonic() + 15, time.monotonic() + 15)
+        with self.store.connect() as connection, connection.transaction():
+
+            def query(sql, args):
+                return self.store._execute_bounded(
+                    connection, sql, args, min(deadline, time.monotonic() + 5)
+                )
+
+            row = query(
+                """SELECT evidence.native_parent_id,evidence.revision,
+                   evidence.created_at::text AS catalog_created_at,evidence.document_content_sha256,
+                   evidence.manifest_content_sha256,evidence.manifest_object_key,evidence.manifest_version_id,
+                   projected.revision AS projected_revision,projected.policy_fingerprint,
+                   projected.source_document_sha256,passage.revision AS passage_revision,
+                   passage.text_sha256,passage.receipts,
+                   source.owner_principal_id,grant_row.permission AS source_permission
+              FROM canonical_evidence_documents evidence
+              JOIN canonical_passage_documents projected USING(tenant_id,source_id,logical_document_id)
+              JOIN canonical_passages passage USING(tenant_id,source_id,logical_document_id)
+              JOIN canonical_sources source USING(tenant_id,source_id)
+              JOIN canonical_source_grants grant_row USING(tenant_id,source_id)
+             WHERE evidence.tenant_id=%s AND evidence.source_id=%s
+               AND evidence.logical_document_id=%s AND passage.passage_id=%s
+               AND grant_row.principal_id=%s
+             FOR SHARE OF source,grant_row,evidence,projected,passage NOWAIT""",
+                (
+                    tenant,
+                    target["source_id"],
+                    target["logical_document_id"],
+                    target["passage_id"],
+                    principal_id,
+                ),
+            ).fetchone()
+            if row is None:
+                raise ValueError("source_or_catalog_unavailable")
+            source_owner = row.pop("owner_principal_id")
+            source_permission = row.pop("source_permission")
+            if source_owner != principal_id or source_permission != "owner":
+                # A source read grant alone never permits maintenance. Reuse the
+                # company's existing admin predicate, locked until queue commit.
+                self.store._set_statement_deadline(
+                    connection, min(deadline, time.monotonic() + 5)
+                )
+                ControlPlane._brain_admin(
+                    connection, principal_id=principal_id, tenant_id=tenant, lock=True
+                )
+            receipts = row.pop("receipts")
+            if dict(row) != plan["catalog"]:
+                raise ValueError("catalog_changed")
+            if (
+                row["policy_fingerprint"] != self.policy.fingerprint
+                or row["revision"] != row["projected_revision"]
+                or row["revision"] != row["passage_revision"]
+                or row["document_content_sha256"] != row["source_document_sha256"]
+            ):
+                raise ValueError("projection_not_current")
+            receipt_digest = hashlib.sha256(
+                json.dumps(
+                    receipts, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+                ).encode()
+            ).hexdigest()
+            if (
+                not receipts
+                or receipt_digest != plan["witness_receipt_digest"]
+            ):
+                raise ValueError("witness_changed")
+            pending = query(
+                """SELECT
+                EXISTS(SELECT 1 FROM canonical_evidence_document_queue WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s) OR
+                EXISTS(SELECT 1 FROM canonical_passage_projection_queue WHERE tenant_id=%s AND source_id=%s AND logical_document_id=%s) AS pending""",
+                (
+                    tenant,
+                    target["source_id"],
+                    row["native_parent_id"],
+                    tenant,
+                    target["source_id"],
+                    target["logical_document_id"],
+                ),
+            ).fetchone()["pending"]
+            if pending:
+                raise ValueError("projection_pending")
+            stale = query(
+                """SELECT count(*) AS count FROM unnest(%s::text[]) receipt(value)
+                WHERE NOT EXISTS(SELECT 1 FROM canonical_chunks chunk JOIN canonical_documents document
+                     ON document.tenant_id=chunk.tenant_id AND document.source_id=chunk.source_id
+                    AND document.document_id=chunk.document_id
+                    WHERE chunk.tenant_id=%s AND chunk.source_id=%s AND chunk.receipt=receipt.value
+                      AND chunk.deleted_at IS NULL AND document.is_current AND document.deleted_at IS NULL)""",
+                (receipts, tenant, target["source_id"]),
+            ).fetchone()["count"]
+            if stale != plan["stale_receipts"] or stale <= 0:
+                raise ValueError("witness_changed")
+            inserted = query(
+                """INSERT INTO canonical_passage_projection_queue(
+                tenant_id,source_id,logical_document_id,revision,generation,reason,changed_at)
+                VALUES(%s,%s,%s,%s,1,'backfill',clock_timestamp())
+                ON CONFLICT(tenant_id,source_id,logical_document_id) DO NOTHING""",
+                (
+                    tenant,
+                    target["source_id"],
+                    target["logical_document_id"],
+                    row["revision"],
+                ),
+            )
+            if inserted.rowcount != 1:
+                raise ValueError("projection_pending")
+        return {"status": "queued", "proof_sha256": proof, "repair_complete": False}
 
     def repair_empty(
         self,
