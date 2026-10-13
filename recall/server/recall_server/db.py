@@ -2949,16 +2949,13 @@ class BrainStore:
         if canonical is not None:
             event, items = canonical["event"], canonical["items"]
             if chunk_body_archive is not None:
-                from .chunk_bodies import ChunkBodyError
                 from .chunk_hydration import hydrate_chunk_rows
 
-                # Old revisions are deliberately retained inline. The logical
-                # archive and its fallback eligibility describe current records.
-                historical = [item for item in items if not item["is_current"]]
-                if any(not isinstance(item["text_redacted"], str)
-                       or hashlib.sha256(item["text_redacted"].encode()).hexdigest() != item["text_sha256"]
-                       for item in historical):
-                    raise ChunkBodyError("archived_chunk_body_unavailable")
+                from .historical_hydration import hydrate_historical_rows
+
+                hydrate_historical_rows(self, chunk_body_archive,
+                    [item for item in items if not item['is_current']],
+                    tenant_id=event['tenant_id'], source_ids=(source_id,), deadline_at=deadline_at)
                 hydrate_chunk_rows(
                     self, chunk_body_archive, [item for item in items if item["is_current"]],
                     tenant_id=event["tenant_id"], source_ids=(source_id,), deadline_at=deadline_at,
