@@ -1334,7 +1334,9 @@ class RetirementHeartbeatTests(unittest.TestCase):
             def poll(self):
                 return 0 if self.done else None
         def launch(_configuration):
-            child=Child();children.append(child);return child
+            child = Child()
+            children.append(child)
+            return child
         supervisor=RetirementSupervisor('synthetic',tenant_id='tenant:company:test',launch=launch)
         class Logical(_Logical):
             def project_pending(inner,**kwargs):
@@ -1342,10 +1344,12 @@ class RetirementHeartbeatTests(unittest.TestCase):
                 heartbeat()
                 self.assertEqual(len(children),1)
                 for _ in range(5):
-                    clock.advance(1);heartbeat()
+                    clock.advance(1)
+                    heartbeat()
                 self.assertEqual(len(children),1)
                 children[0].done=True
-                clock.advance(25);heartbeat()
+                clock.advance(25)
+                heartbeat()
                 self.assertIsNone(supervisor.child)
                 self.assertTrue(children[0].stdout.closed)
                 return super().project_pending(**kwargs)
