@@ -152,7 +152,9 @@ process.main()
         def launch(configuration):
             child = subprocess.Popen([sys.executable, '-c', script, str(root),
                 str(self.archive.delegate.root)], stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                env=dict(os.environ, PYTHONPATH=os.pathsep.join((
+                    str(SERVER.parent), str(SERVER), os.environ.get('PYTHONPATH', '')))))
             return child
         supervisor = RetirementSupervisor(self.store.dsn, tenant_id=self.tenant,
             seconds=seconds, launch=launch)
