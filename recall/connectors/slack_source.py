@@ -320,9 +320,9 @@ def normalize_slack_message(
         event = value.get("message")
         if not isinstance(event, dict):
             raise ConnectorContractError("slack changed message is invalid")
-        edited = event.get("edited")
-        if isinstance(edited, dict):
-            edited_at = slack_time(edited.get("ts"))
+    edited = event.get("edited")
+    if isinstance(edited, dict):
+        edited_at = slack_time(edited.get("ts"))
     timestamp = _slack_ts(event.get("ts"), "message timestamp")
     sent_at = slack_time(timestamp)
     thread_timestamp = event.get("thread_ts") or timestamp
