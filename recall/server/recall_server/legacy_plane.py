@@ -312,6 +312,8 @@ class LegacyIngestBridge:
             ),
             "receipts": [result["receipt"] for result in results],
             "replay": all(result["replay"] for result in results),
+            **({"suppressed_deleted_events": sum(result.get("suppressed_deleted_events", 0) for result in results)}
+               if any(result.get("suppressed_deleted_events") for result in results) else {}),
         }
 
 
