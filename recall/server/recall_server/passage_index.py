@@ -1063,6 +1063,29 @@ class CanonicalPassageProjector:
                             revision_stale,
                         ),
                     )
+                # Stable passage IDs cover text and spans, not receipts. A
+                # canonical metadata revision can replace a receipt without
+                # changing the visible body or its embedding input.
+                retained_ids = set(diff.retained)
+                retained_receipts = [
+                    {"passage_id": passage.passage_id,
+                     "receipts": list(passage.receipts)}
+                    for passage in prepared.passages
+                    if passage.passage_id in retained_ids
+                ]
+                if retained_receipts:
+                    connection.execute(
+                        """UPDATE canonical_passages passage
+                              SET receipts=current.receipts
+                             FROM jsonb_to_recordset(%s::jsonb)
+                                  AS current(passage_id text,receipts text[])
+                            WHERE passage.tenant_id=%s AND passage.source_id=%s
+                              AND passage.logical_document_id=%s
+                              AND passage.passage_id=current.passage_id
+                              AND passage.receipts IS DISTINCT FROM current.receipts""",
+                        (json.dumps(retained_receipts), candidate.tenant_id,
+                         candidate.source_id, candidate.logical_document_id),
+                    )
                 if retained_unheaded:
                     self._write_headers(
                         connection,
