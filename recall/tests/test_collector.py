@@ -211,6 +211,114 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(collector.discover(), [newer, older])
         collector.close()
 
+    def test_busy_newest_file_does_not_starve_history_across_restart(self) -> None:
+        older = self.root / "a-history.jsonl"
+        newer = self.root / "z-live.jsonl"
+        older.write_text(claude_line("older evidence"))
+        newer.write_text(claude_line("live opener") + claude_line("live backlog"))
+        os.utime(older, ns=(1_000_000_000, 1_000_000_000))
+        for cycle in range(2):
+            with newer.open("a") as output:
+                output.write(claude_line(f"live append {cycle}"))
+            os.utime(newer, ns=(10_000_000_000 + cycle, 10_000_000_000 + cycle))
+            collector = self.collector()
+            collector.max_scan_records = 1
+            result = collector.scan()
+            self.assertLessEqual(result["records_queued"], 1)
+            collector.flush()
+            collector.close()
+        delivered = [event for batch in AckServer.received for event in batch["events"]]
+        self.assertIn("older evidence", [event["content"]["message"]["content"] for event in delivered])
+        self.assertEqual({event["source_id"] for event in delivered}, {"claude:linux:test"})
+
+    def test_large_history_backlog_keeps_live_appends_within_two_scan_slices(self) -> None:
+        for index in range(8):
+            history = self.root / f"a-history-{index}.jsonl"
+            history.write_text("".join(claude_line(f"history {index} record {record}") for record in range(10)))
+            os.utime(history, ns=(1_000_000_000 + index, 1_000_000_000 + index))
+        live = self.root / "z-live.jsonl"
+        collector = self.collector()
+        collector.max_scan_records = 4
+        for cycle in range(5):
+            with live.open("a") as output:
+                output.write(claude_line(f"live {cycle}"))
+            os.utime(live, ns=(10_000_000_000 + cycle, 10_000_000_000 + cycle))
+            scan = collector.scan()
+            self.assertLessEqual(scan["records_queued"], 4)
+            collector.flush()
+            delivered = [event["content"]["message"]["content"] for batch in AckServer.received for event in batch["events"]]
+            if cycle % 2 == 0:
+                for earlier in range(cycle + 1):
+                    self.assertIn(f"live {earlier}", delivered)
+        self.assertTrue(any(text.startswith("history ") for text in delivered))
+        collector.close()
+
+    def test_fair_scan_survives_renamed_cursor_and_mtime_changes_without_false_deletion(self) -> None:
+        first = self.root / "a-history.jsonl"
+        waiting = self.root / "b-history.jsonl"
+        live = self.root / "z-live.jsonl"
+        first.write_text(claude_line("first history") + claude_line("first continuation"))
+        waiting.write_text(claude_line("waiting history"))
+        live.write_text("".join(claude_line(f"live {index}") for index in range(6)))
+        os.utime(first, ns=(1_000_000_000, 1_000_000_000))
+        os.utime(waiting, ns=(2_000_000_000, 2_000_000_000))
+        os.utime(live, ns=(10_000_000_000, 10_000_000_000))
+        collector = self.collector()
+        collector.max_scan_records = 1
+        for _ in range(2):
+            collector.scan()
+            collector.flush()
+        first_event = next(event for batch in AckServer.received for event in batch["events"] if event["content"].get("message", {}).get("content") == "first history")
+        first.rename(self.root / "c-renamed.jsonl")
+        os.utime(waiting, ns=(3_000_000_000, 3_000_000_000))
+        collector.close()
+        collector = self.collector()
+        collector.max_scan_records = 1
+        for _ in range(2):
+            scan = collector.scan()
+            self.assertLessEqual(scan["records_queued"] + scan["tombstones_queued"], 1)
+            collector.flush()
+        delivered = [event for batch in AckServer.received for event in batch["events"]]
+        self.assertIn("waiting history", [event["content"].get("message", {}).get("content") for event in delivered])
+        self.assertFalse(any(event["kind"] == "tombstone" for event in delivered))
+        for _ in range(20):
+            scan = collector.scan()
+            collector.flush()
+            if scan["scan_complete"]:
+                break
+        self.assertTrue(scan["scan_complete"])
+        tombstones = [event for batch in AckServer.received for event in batch["events"] if event["kind"] == "tombstone"]
+        self.assertEqual([event["content"]["target_native_id"] for event in tombstones], [first_event["native_id"]])
+        collector.close()
+
+    def test_time_budget_rotates_to_history_without_raising_record_limit(self) -> None:
+        older = self.root / "a-history.jsonl"
+        newest = self.root / "z-live.jsonl"
+        older.write_text(claude_line("old first") + claude_line("old second"))
+        newest.write_text(claude_line("live first") + claude_line("live second"))
+        os.utime(older, ns=(1_000_000_000, 1_000_000_000))
+        os.utime(newest, ns=(2_000_000_000, 2_000_000_000))
+        collector = self.collector()
+        collector.max_scan_records = 100
+        collector.max_scan_seconds = 0.1
+        elapsed = [0.0]
+        apply_privacy = collector.privacy.apply
+
+        def spend_scan_budget(value):
+            result = apply_privacy(value)
+            elapsed[0] += 0.2
+            return result
+
+        for _ in range(2):
+            with mock.patch("collector.collector.time.monotonic", side_effect=lambda: elapsed[0]), mock.patch.object(collector.privacy, "apply", side_effect=spend_scan_budget):
+                scan = collector.scan()
+            self.assertFalse(scan["scan_complete"])
+            self.assertEqual(scan["records_queued"], 1)
+            collector.flush()
+        delivered = [event["content"]["message"]["content"] for batch in AckServer.received for event in batch["events"]]
+        self.assertEqual(delivered, ["live first", "old first"])
+        collector.close()
+
     def test_committed_cursor_waits_for_ack_and_survives_restart(self) -> None:
         transcript = self.root / "session.jsonl"
         transcript.write_text(claude_line("first") + claude_line("second"))
@@ -1857,6 +1965,98 @@ class CollectorTest(unittest.TestCase):
         )
         self.assertIsInstance(json.loads(uncompressed), dict)
         collector.close()
+
+    def test_oversized_digest_survives_privacy_recheck_on_flush(self) -> None:
+        # This actual SHA contains a Luhn-valid digit run. It is metadata,
+        # though the same text in a user's message must still be scrubbed.
+        expected_digest = "ccdc2310ead052a5571e00fb37422ea79f109860cc115d9bd052757124427255"
+        self.assertIn(
+            "[REDACTED:financial_id]",
+            PrivacyPolicy(mode="scrub").apply(expected_digest).value,
+        )
+        transcript = self.root / "session.jsonl"
+        transcript.write_text(json.dumps({
+            "type": "user", "timestamp": "2026-07-12T22:00:00Z",
+            "message": {"content": "safe " + "x" * 6000}, "nonce": 7,
+        }) + "\n")
+        test = self
+        for mode in ("scrub", "drop"):
+            with self.subTest(privacy_mode=mode):
+                archived, ingested = [], []
+
+                class Archive:
+                    def put_raw(self, **kwargs):
+                        archived.append(kwargs)
+                        return test._reference_for(kwargs, kwargs["payload"])
+
+                class Writer:
+                    def ingest(self, events):
+                        ingested.extend(events)
+                        return {
+                            "status": "committed", "inserted": len(events),
+                            "duplicate_events": 0, "replay": False,
+                            "receipts": [
+                                f"recall://{e['source_id']}/{e['native_id']}?rev=1"
+                                for e in events
+                            ],
+                        }
+
+                collector = Collector(
+                    root=self.root, harness="claude", source_id="claude:linux:test",
+                    spool_path=self.spool.with_name(mode + ".db"),
+                    endpoint=self.endpoint, token="test-token-not-a-secret",
+                    archive=Archive(), brain_writer=Writer(), tenant_id="tenant:personal",
+                    privacy=PrivacyPolicy(mode=mode), defer_scan_flush=True,
+                )
+                self.addCleanup(collector.close)
+                with mock.patch("collector.collector.MAX_BATCH_BYTES", 4_000):
+                    collector.scan()
+                    pending = collector.pending_envelopes()
+                    self.assertEqual(len(pending), 1)
+                    self.assertEqual(pending[0]["content"]["full_content_sha256"], expected_digest)
+                    result = collector.flush()
+                self.assertEqual(result["acked"], 1)
+                self.assertEqual(len(ingested), 1)
+                full = next(item for item in archived if item["media_type"].endswith("+gzip"))
+                actual_digest = hashlib.sha256(gzip.decompress(full["payload"])).hexdigest()
+                self.assertEqual(actual_digest, expected_digest)
+                self.assertEqual(ingested[0]["content"]["full_content_sha256"], actual_digest)
+                self.assertEqual(collector.doctor()["committed_files"], 1)
+
+    def test_oversized_privacy_recheck_still_protects_prose_and_requires_archive_type(self) -> None:
+        digest = "ccdc2310ead052a5571e00fb37422ea79f109860cc115d9bd052757124427255"
+        collector = self.collector()
+        self.addCleanup(collector.close)
+        for mode in ("scrub", "drop"):
+            collector.privacy = PrivacyPolicy(mode=mode)
+            for media_type in ("application/x-ndjson", "application/vnd.recall.oversized-record+gzip"):
+                with self.subTest(privacy_mode=mode, media_type=media_type):
+                    # A contract-shaped transcript is not trusted metadata just
+                    # because it spells the generated projection's field names.
+                    envelope = collector._envelope(
+                        self.root / "session.jsonl", mode + media_type,
+                        "transcript_record", {
+                            "contract": "recall.oversized-projection.v1",
+                            "full_content_sha256": digest,
+                            "head": digest, "tail": digest, "extra": digest,
+                        }, "2026-07-12T22:00:00Z", 0, 1,
+                        artifact_ref={"media_type": media_type},
+                    )
+                    collector._queue(self.root / "session.jsonl", envelope, 1)
+                    row = collector.db.execute(
+                        "SELECT * FROM outbox WHERE native_id=?", (envelope["native_id"],),
+                    ).fetchone()
+                    repaired = collector._repair_pending_envelope(row, repair_artifact=False)
+                    if mode == "drop":
+                        self.assertIsNone(repaired)
+                        continue
+                    content = json.loads(repaired["envelope_json"])["content"]
+                    for field in ("head", "tail", "extra"):
+                        self.assertIn("[REDACTED:financial_id]", content[field])
+                    if media_type.endswith("+gzip"):
+                        self.assertEqual(content["full_content_sha256"], digest)
+                    else:
+                        self.assertIn("[REDACTED:financial_id]", content["full_content_sha256"])
 
     def test_archive_reference_for_other_bytes_is_refused(self) -> None:
         (self.root / "session.jsonl").write_text(claude_line("x" * 10_000))

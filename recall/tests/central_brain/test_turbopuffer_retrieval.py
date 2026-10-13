@@ -85,9 +85,10 @@ class ArmTests(unittest.TestCase):
                 return original_execute(connection, sql, values, deadline)
             from types import SimpleNamespace
             namespace = client.namespace(SETTINGS.namespace(TENANT))
+            requested = set(zip(values[3], values[4]))
             rows = [dict(row, tenant_id=TENANT, passage_id=row["id"])
                     for row in namespace.rows.values()
-                    if row["id"] in values[3] and row["source_id"] in values[1]]
+                    if (row["source_id"], row["id"]) in requested and row["source_id"] in values[1]]
             return SimpleNamespace(fetchall=lambda: rows)
         store._execute_bounded = canonical_authority
         return TurbopufferHintRetrieval(

@@ -49,9 +49,10 @@ class MonthTimingTest(unittest.TestCase):
             'succeeded', 'month_ms', 'catalog_ms', 'catalog_calls', 'page_ms', 'page_calls',
             'commit_ms', 'commit_calls',
             'pacer_ms', 'pacer_calls', 'sdk_ms', 'sdk_calls', 'backoff_ms',
-            'backoff_calls', 'concurrency',
+            'backoff_calls', 'concurrency', 'cooperative',
         })
         self.assertIn(fields.pop('succeeded'), {'0', '1'})
+        self.assertEqual(fields.pop('cooperative'), '0')
         self.assertTrue(all(value.isdecimal() for value in fields.values()))
         return {key: int(value) for key, value in fields.items()}
 

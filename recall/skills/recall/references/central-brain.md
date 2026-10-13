@@ -59,13 +59,34 @@ agent. Recall does not call another model or return a synthesized answer:
    source, and UTC time boundaries. Reformulate or split the search when that
    improves recall; do not treat rank one as the answer.
 2. For exact facts, open a returned `recall://` receipt with `recall_show` or
-   `recall_session_context`.
+   `recall_session_context`. A string `target` opens that record. To open all
+   source records behind a matching passage, pass `target` as an object copied
+   from the hit: `source_id`, `logical_document_id`, `revision`,
+   `manifest_content_sha256`, and `passage_id`. Do not guess which receipt
+   corresponds to which span. Follow `next_cursor` with the same target until
+   `complete` is true; `page_bytes` optionally controls the encoded response
+   size (default 32768). Chunks carry receipt, ordinal, character and UTF-8 byte
+   offsets, and completion flags, so even long records open without clipping.
+   This returns source records behind the passage, not reconstructed passage
+   text. A stale locator or continuation fails; search again for current pins.
+   Cite only returned `opened_receipts`. With the CLI, use `python3 scripts/recall.py show '<recall://receipt>'`.
+   Local file paths, session numbers, `--tail`, `--around`, and `--prompts` are
+   not supported by canonical Brain show. For neighboring events, call the
+   `recall_session_context` MCP tool with `target`, `before`, and `after`
+   (0–20 each). This is a neighborhood around the receipt, not the session tail.
 3. For synthesis over full or large documents, pass only returned
    `logical_document_id` values to `recall_exec`. Use the read-only shell,
    `recall-scan`, Python, `jq`, and ordinary text tools freely inside its bounded,
    networkless sandbox.
-4. Cite only receipts returned in `opened_receipts`. State a gap when the opened
-   evidence is insufficient; search snippets alone are pointers, not proof.
+   Use this path when you need the full session's final state or prompts;
+   request the relevant records explicitly rather than assuming one receipt
+   contains the full session. A show response that exceeds the transport limit
+   can also be opened through these context or document tools.
+4. The record and document tools return `opened_receipts` for the evidence they
+   actually return. Cite only those receipts and claims supported by the returned
+   text. Context responses may clip text; open the full record when needed. State
+   a gap when the opened evidence is insufficient; search snippets alone are
+   pointers, not proof.
 
 This keeps planning and semantic judgment in the capable agent the user already
 chose while Recall remains a small authorization, retrieval, execution, and

@@ -87,6 +87,15 @@ python3 scripts/recall.py search "<what the user said>" [filters]
 
 ## Read the best-supported hit
 
+For the remote Brain, open a returned receipt with `recall_show` using only
+`target`, or `python3 scripts/recall.py show '<recall://receipt>'`. It opens that
+record, not the entire session. Use the `recall_session_context` MCP tool for
+neighboring events and `recall_exec` with returned `logical_document_id` values
+for full-document inspection. See [the central Brain guide](references/central-brain.md).
+
+The file paths and `--prompts`, `--around`, and `--tail` examples below are for
+local sessions. Do not append those flags to a remote Brain receipt.
+
 Check the `WHY` line on the top few results first. Matches on only generic words
 are weak evidence. Prefer a result whose `WHY` includes an identifier, phrase,
 or exact-entity match rather than selecting rank 1 automatically.
@@ -112,6 +121,10 @@ by overlap and recency. Use it at session start when the user references prior
 work without naming it.
 
 ## Outcome playbooks
+
+These file-based playbooks are for local sessions. For the remote Brain, use
+receipt-only `recall_show`, then the context or document tools described above;
+do not treat one opened receipt as the full session's final state.
 
 **Find / verify:** search → `show --around` the matched timestamp → answer
 with evidence. This usually requires two commands.

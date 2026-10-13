@@ -5,12 +5,15 @@ from __future__ import annotations
 import time
 import json
 import math
+import threading
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
+
+import psycopg
 
 from .logical_evidence import (
     LogicalEvidenceError,
@@ -37,6 +40,7 @@ from .search_outbox import (
     write_search_tombstones,
 )
 
+PROJECTION_PROGRESS_INTERVAL_SECONDS = 5.0
 MAX_PASSAGE_PROJECTION_BATCH = 1_000
 MAX_PASSAGE_EMBEDDING_BATCH = 5_000
 MAX_PASSAGE_HEADER_BACKFILL_BATCH = 5_000
@@ -450,6 +454,12 @@ class CanonicalPassageProjector:
         self.logical_projection = logical_projection
         self.policy = policy
         self.bound_tenant_id = bound_tenant_id
+        self._prefer_notification_admission = False
+        # Separate history/recent turns; fixed-size process-local state. Advance
+        # on admission, so an unavailable source cannot retain the first turn.
+        self._ordinary_source_cursor: dict[bool, tuple[str, str] | None] = {
+            False: None, True: None,
+        }
         runtime = getattr(store, "semantic_runtime", None)
         bind = getattr(runtime, "bind_passage_coverage_probe", None)
         if callable(bind) and not getattr(
@@ -560,11 +570,60 @@ class CanonicalPassageProjector:
         tenant_id: str | None,
         limit: int,
     ) -> tuple[PassageCandidate, ...]:
+        recent = self._prefer_notification_admission
+        cursor = self._ordinary_source_cursor[recent]
+        after_tenant, after_source = cursor if cursor is not None else (None, None)
         with self.store.connect() as connection:
             rows = connection.execute(
-                """SELECT queue.tenant_id,queue.source_id,
+                """WITH eligible AS MATERIALIZED (
+                       SELECT candidate_queue.*,
+                              CASE WHEN %s AND notification_queued_at IS NOT NULL
+                                   THEN 0 ELSE 1 END AS admission_priority,
+                              CASE WHEN %s::text IS NULL OR (tenant_id,source_id)>
+                                        (%s::text,%s::text) THEN 0 ELSE 1 END AS source_wrap
+                         FROM canonical_passage_projection_queue candidate_queue
+                        WHERE (%s::text IS NULL OR tenant_id=%s)
+                   ), ranked AS (
+                       SELECT eligible.*,
+                              row_number() OVER (
+                                  PARTITION BY tenant_id,source_id,admission_priority
+                                  ORDER BY CASE WHEN %s THEN changed_at END DESC,
+                                           changed_at,logical_document_id
+                              ) AS source_position,
+                              count(*) OVER (
+                                  PARTITION BY tenant_id,source_id,admission_priority
+                              ) AS source_backlog
+                         FROM eligible
+                   ), admitted AS MATERIALIZED (
+                       SELECT * FROM ranked
+                        ORDER BY admission_priority,
+                                 CASE WHEN admission_priority=0
+                                      THEN notification_queued_at END,
+                                 CASE WHEN source_position=1 THEN 0 ELSE 1 END,
+                                 CASE WHEN source_position=1 THEN source_wrap END,
+                                 CASE WHEN source_position=1 THEN tenant_id END,
+                                 CASE WHEN source_position=1 THEN source_id END,
+                                 CASE WHEN source_position>1
+                                      THEN source_position::numeric/source_backlog END,
+                                 changed_at,tenant_id,source_id,logical_document_id
+                        LIMIT %s
+                   ), queue AS (
+                       SELECT admitted.*,
+                              dense_rank() OVER (
+                                  ORDER BY source_wrap,tenant_id,source_id
+                              ) AS source_turn
+                         FROM admitted
+                   )
+                   SELECT queue.tenant_id,queue.source_id,
                           queue.logical_document_id,queue.revision,
                           queue.generation,queue.changed_at,
+                          queue.admission_priority,queue.source_turn,
+                          CASE WHEN queue.admission_priority=0
+                               THEN queue.notification_queued_at END AS notification_priority,
+                          (queue.changed_at<clock_timestamp()-interval '5 minutes') AS aged_priority,
+                          coalesce(sum(part.size_bytes) OVER (
+                              PARTITION BY queue.tenant_id,queue.source_id,queue.logical_document_id
+                          ),0) AS estimated_bytes,
                           evidence.document_content_sha256,
                           evidence.manifest_artifact_id,
                           evidence.manifest_storage_backend,
@@ -585,52 +644,40 @@ class CanonicalPassageProjector:
                           part.encryption AS part_encryption,
                           part.version_id AS part_version_id,
                           part.created_at AS part_created_at
-                     FROM (
-                           SELECT *
-                             FROM canonical_passage_projection_queue
-                                  candidate_queue
-                            WHERE (%s::text IS NULL
-                                   OR candidate_queue.tenant_id=%s)
-                            ORDER BY (
-                                candidate_queue.changed_at <
-                                clock_timestamp()-interval '5 minutes'
-                            ) DESC,(
-                                SELECT coalesce(sum(size_part.size_bytes),0)
-                                  FROM canonical_evidence_document_parts
-                                       size_part
-                                 WHERE size_part.tenant_id=
-                                           candidate_queue.tenant_id
-                                   AND size_part.source_id=
-                                           candidate_queue.source_id
-                                   AND size_part.logical_document_id=
-                                           candidate_queue.logical_document_id
-                                   AND size_part.revision=
-                                           candidate_queue.revision
-                            ),candidate_queue.changed_at,
-                              candidate_queue.tenant_id,
-                              candidate_queue.source_id,
-                              candidate_queue.logical_document_id
-                            LIMIT %s
-                     ) queue
-                     JOIN canonical_evidence_documents evidence
+                     FROM queue
+                     LEFT JOIN canonical_evidence_documents evidence
                        ON evidence.tenant_id=queue.tenant_id
                       AND evidence.source_id=queue.source_id
-                      AND evidence.logical_document_id
-                          =queue.logical_document_id
+                      AND evidence.logical_document_id=queue.logical_document_id
                       AND evidence.revision=queue.revision
-                     JOIN canonical_evidence_document_parts part
+                     LEFT JOIN canonical_evidence_document_parts part
                        ON part.tenant_id=evidence.tenant_id
                       AND part.source_id=evidence.source_id
-                      AND part.logical_document_id
-                          =evidence.logical_document_id
+                      AND part.logical_document_id=evidence.logical_document_id
                       AND part.revision=evidence.revision
-                    ORDER BY queue.changed_at,queue.tenant_id,
+                    ORDER BY notification_priority ASC NULLS LAST,
+                             aged_priority DESC,estimated_bytes,
+                             queue.changed_at,queue.tenant_id,
                              queue.source_id,queue.logical_document_id,
                              part.part_ordinal""",
-                (tenant_id, tenant_id, limit),
+                (recent, after_tenant, after_tenant, after_source,
+                 tenant_id, tenant_id, recent, limit),
             ).fetchall()
+        # The turn belongs to admission, not successful metadata hydration.
+        # A truly empty queue spends no turn; an invalid head must not suppress
+        # the next recent/history mode indefinitely.
+        if rows:
+            self._prefer_notification_admission = not recent
+        # Hydration can fail for an admitted key. Keep its source turn moving,
+        # but retain that queue row for repair; missing metadata is never ACKed.
+        ordinary = [row for row in rows if row["admission_priority"] == 1]
+        if ordinary:
+            last = max(ordinary, key=lambda row: row["source_turn"])
+            self._ordinary_source_cursor[recent] = (last["tenant_id"], last["source_id"])
         grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
         for row in rows:
+            if row["manifest_artifact_id"] is None or row["part_ordinal"] is None:
+                continue
             key = (
                 row["tenant_id"],
                 row["source_id"],
@@ -1357,6 +1404,7 @@ class CanonicalPassageProjector:
         limit: int = 50,
         _empty_only: bool = False,
         _after: str | None = None,
+        _concurrency: int = 1,
     ) -> dict[str, Any]:
         """Read-only parity gate: recompute passages and compare with the rows.
 
@@ -1379,6 +1427,7 @@ class CanonicalPassageProjector:
             or isinstance(limit, bool)
             or not isinstance(limit, int)
             or not 1 <= limit <= MAX_PASSAGE_PROJECTION_BATCH
+            or type(_concurrency) is not int or not 1 <= _concurrency <= 32
         ):
             raise ValueError("passage shadow diff scope is invalid")
         with self.store.connect() as connection:
@@ -1460,17 +1509,7 @@ class CanonicalPassageProjector:
             existing.setdefault(row["logical_document_id"], {})[
                 row["passage_id"]
             ] = tuple(row["receipts"])
-        documents = []
-        totals = {
-            "documents": 0,
-            "documents_stale": 0,
-            "documents_policy_mismatch": 0,
-            "passages_existing": 0,
-            "passages_recomputed": 0,
-            "ids_shared": 0,
-            "receipt_set_equal": 0,
-        }
-        for logical_document_id in sorted(grouped):
+        def compare_document(logical_document_id: str) -> dict[str, Any]:
             values = grouped[logical_document_id]
             first = values[0]
             stored = existing.get(logical_document_id, {})
@@ -1488,18 +1527,14 @@ class CanonicalPassageProjector:
                 # will catch it up. Comparing would measure the append, not
                 # the id function.
                 report["status"] = "stale"
-                totals["documents_stale"] += 1
-                documents.append(report)
-                continue
+                return report
             policy = PassagePolicy(
                 target_tokens=int(first["target_tokens"]),
                 overlap_tokens=int(first["overlap_tokens"]),
             )
             if policy.fingerprint != str(first["policy_fingerprint"]).strip():
                 report["status"] = "policy_mismatch"
-                totals["documents_policy_mismatch"] += 1
-                documents.append(report)
-                continue
+                return report
             candidate = PassageCandidate(
                 tenant_id=first["tenant_id"],
                 source_id=first["source_id"],
@@ -1552,12 +1587,38 @@ class CanonicalPassageProjector:
                 "ids_shared": len(shared),
                 "receipt_set_equal": receipt_set_equal,
             })
-            totals["documents"] += 1
-            totals["passages_existing"] += len(stored)
-            totals["passages_recomputed"] += len(recomputed)
-            totals["ids_shared"] += len(shared)
-            totals["receipt_set_equal"] += int(receipt_set_equal)
-            documents.append(report)
+            return report
+
+        # Each task releases its prepared bodies before returning metadata.
+        # Catalog leases are already closed; no queue write occurs until every
+        # comparison succeeds. map preserves document-ID report order.
+        document_ids = sorted(grouped)
+        if _concurrency == 1 or len(document_ids) < 2:
+            documents = [compare_document(doc) for doc in document_ids]
+        else:
+            with ThreadPoolExecutor(
+                max_workers=min(_concurrency, len(document_ids)),
+                thread_name_prefix="recall-passage-shadow",
+            ) as executor:
+                documents = list(executor.map(compare_document, document_ids))
+        totals = {
+            "documents": 0,
+            "documents_stale": 0,
+            "documents_policy_mismatch": 0,
+            "passages_existing": 0,
+            "passages_recomputed": 0,
+            "ids_shared": 0,
+            "receipt_set_equal": 0,
+        }
+        for report in documents:
+            if report["status"] == "stale":
+                totals["documents_stale"] += 1
+            elif report["status"] == "policy_mismatch":
+                totals["documents_policy_mismatch"] += 1
+            else:
+                totals["documents"] += 1
+                for key in ("passages_existing", "passages_recomputed", "ids_shared", "receipt_set_equal"):
+                    totals[key] += int(report[key])
         return {
             "status": "ok",
             "tenant_id": tenant_id,
@@ -1580,6 +1641,7 @@ class CanonicalPassageProjector:
         after: str | None = None,
         apply: bool = False,
         price_per_mtoken: float | None = None,
+        concurrency: int = 1,
     ) -> dict[str, Any]:
         """Plan one source's empty-projection repair; optionally queue that batch.
 
@@ -1593,6 +1655,7 @@ class CanonicalPassageProjector:
             or not isinstance(source_id, str) or not source_id
             or type(limit) is not int or not 1 <= limit <= MAX_PASSAGE_PROJECTION_BATCH
             or type(apply) is not bool
+            or type(concurrency) is not int or not 1 <= concurrency <= 32
             or (after is not None and (
                 not isinstance(after, str) or LOGICAL_DOCUMENT_ID_RE.fullmatch(after) is None
             ))
@@ -1604,7 +1667,7 @@ class CanonicalPassageProjector:
             raise ValueError("empty passage repair scope is invalid")
         report = self.shadow_diff(
             tenant_id=tenant_id, source_id=source_id, limit=limit,
-            _empty_only=True, _after=after,
+            _empty_only=True, _after=after, _concurrency=concurrency,
         )
         documents = report["documents"]
         eligible = [doc for doc in documents
@@ -1667,6 +1730,7 @@ class CanonicalPassageProjector:
         batch_size: int = 25,
         max_batches: int = 10,
         concurrency: int = 2,
+        on_progress: Callable[[], None] | None = None,
     ) -> dict[str, int | str]:
         tenant_id = self._tenant(tenant_id)
         if (
@@ -1699,59 +1763,82 @@ class CanonicalPassageProjector:
             pending_seconds += time.monotonic() - phase_started
             if not candidates:
                 break
-            phase_started = time.monotonic()
+            stopping = threading.Event()
+            commit_slots = threading.BoundedSemaphore(min(
+                concurrency, len(candidates),
+                max(1, self.store.pool_max_size - 1), PASSAGE_COMMIT_WORKERS,
+            ))
+
+            def project_document(candidate):
+                # The owner releases the prepared body after its own commit;
+                # futures retain scalar results, never a batch of passage text.
+                preparation_started = time.monotonic()
+                try:
+                    prepared = self._prepare(candidate)
+                except LogicalEvidenceError as error:
+                    if str(error) not in {"logical_evidence_not_found", "logical_evidence_unavailable"}:
+                        raise
+                    return {"status": str(error)}, time.monotonic() - preparation_started, 0.0
+                preparation_elapsed = time.monotonic() - preparation_started
+                commit_started = time.monotonic()
+                with commit_slots:
+                    if stopping.is_set():
+                        return {"status": "cancelled"}, preparation_elapsed, 0.0
+                    try:
+                        status = self._commit(prepared)
+                    except psycopg.errors.LockNotAvailable:
+                        # _commit has rolled back and released its locks. Keep
+                        # the unchanged queue for retry without aborting siblings.
+                        status = {"status": "stale"}
+                return status, preparation_elapsed, time.monotonic() - commit_started
+
+            requeued_in_batch = unavailable_in_batch = 0
             with ThreadPoolExecutor(
                 max_workers=min(concurrency, len(candidates)),
                 thread_name_prefix="recall-passage-projector",
             ) as executor:
-                futures = [
-                    (candidate, executor.submit(self._prepare, candidate))
-                    for candidate in candidates
-                ]
-                prepared_documents = []
-                requeued_in_batch = 0
-                unavailable_in_batch = 0
-                for candidate, future in futures:
-                    try:
-                        prepared_documents.append(future.result())
-                    except LogicalEvidenceError as error:
-                        if str(error) == "logical_evidence_not_found":
-                            requeued_in_batch += self._requeue_missing(candidate)
-                        elif str(error) == "logical_evidence_unavailable":
-                            unavailable_in_batch += 1
-                        else:
-                            raise
-            prepare_seconds += time.monotonic() - phase_started
-            statuses: list[dict[str, Any]] = []
-            if prepared_documents:
-                phase_started = time.monotonic()
-                with ThreadPoolExecutor(
-                    max_workers=min(
-                        concurrency,
-                        len(prepared_documents),
-                        max(1, self.store.pool_max_size - 1),
-                        PASSAGE_COMMIT_WORKERS,
-                    ),
-                    thread_name_prefix="recall-passage-commit",
-                ) as executor:
-                    statuses = list(
-                        executor.map(self._commit, prepared_documents)
-                    )
-                commit_seconds += time.monotonic() - phase_started
-            for prepared, status in zip(
-                prepared_documents,
-                statuses,
-                strict=True,
-            ):
-                if status["status"] == "stale":
-                    stale += 1
-                    continue
-                documents += 1
-                # ``passages`` counts rows written (inserted), which is what
-                # the churn probe and the worker's idle check consume.
-                passages += int(status["inserted"])
-                deleted += int(status["deleted"])
-                retained += int(status["retained"])
+                futures = {executor.submit(project_document, candidate): candidate for candidate in candidates}
+                next_progress = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
+                try:
+                    while futures:
+                        completed, _ = wait(
+                            futures,
+                            timeout=max(0.0, next_progress - time.monotonic())
+                            if on_progress is not None else None,
+                            return_when=FIRST_COMPLETED,
+                        )
+                        publish = False
+                        for future in completed:
+                            candidate = futures.pop(future)
+                            status, preparation_elapsed, commit_elapsed = future.result()
+                            prepare_seconds += preparation_elapsed
+                            commit_seconds += commit_elapsed
+                            if status["status"] == "logical_evidence_not_found":
+                                # Keep logical requeue on the coordinator's
+                                # reserved pool connection, outside commit owners.
+                                requeued_in_batch += self._requeue_missing(candidate)
+                                continue
+                            if status["status"] == "logical_evidence_unavailable":
+                                unavailable_in_batch += 1
+                                continue
+                            if status["status"] == "stale":
+                                stale += 1
+                                continue
+                            documents += 1
+                            passages += int(status["inserted"])
+                            deleted += int(status["deleted"])
+                            retained += int(status["retained"])
+                            publish = True
+                        # Search publication has one coordinator; preparation
+                        # and commits continue in the bounded executor meanwhile.
+                        if on_progress is not None and (publish or time.monotonic() >= next_progress):
+                            on_progress()
+                            next_progress = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
+                except BaseException:
+                    stopping.set()
+                    for future in futures:
+                        future.cancel()
+                    raise
             requeued += requeued_in_batch
             unavailable += unavailable_in_batch
             batches += 1
@@ -1783,8 +1870,9 @@ class CanonicalPassageProjector:
             "unavailable": unavailable,
             "batches": batches,
             "pending": int(pending),
-            # Wall times include executor joins, connection acquisition and
-            # handled unavailable/missing work. No per-document identifiers.
+            # Prepare/commit are accumulated owner durations and can overlap;
+            # commit includes cap/connection waits. Other phases are coordinator
+            # wall time. No per-document identifiers or passage text are retained.
             "warmup_ms": max(0, round(warmup_seconds * 1000)),
             "pending_ms": max(0, round(pending_seconds * 1000)),
             "prepare_ms": max(0, round(prepare_seconds * 1000)),

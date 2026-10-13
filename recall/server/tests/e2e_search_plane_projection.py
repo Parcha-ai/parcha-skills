@@ -405,8 +405,9 @@ def main() -> None:
         assert gone["diagnostics"]["search_plane"] == "turbopuffer", gone["diagnostics"]
         assert document_id not in {row["logical_document_id"] for row in gone["results"]}, gone["results"]
 
-        # 7. the projection worker runs the phase after parquet and reports
-        # it in its cycle result; without a search plane the phase is skipped.
+        # 7. the worker first drains the empty seeded months, then immediately
+        # publishes the surviving current records rebuilt by logical projection.
+        # Each tick retains its month budget; the cycle sums both ticks.
         with store.connect() as connection:
             with connection.transaction():
                 assert seed_search_outbox(connection, tenant_id=tenant) == 2
@@ -416,11 +417,29 @@ def main() -> None:
             passage_concurrency=1, interval_seconds=1, once=True,
             skip_embedding=True, sleep=lambda _seconds: None,
         )
+        worker_ticks = []
+
+        def publish_ready():
+            result = drain(2)
+            worker_ticks.append(result)
+            return result
+
         worker_result = run_projection_worker(
-            logical, passages, scan, search_plane=lambda: drain(2), **worker_kwargs,
+            logical, passages, scan, search_plane=publish_ready, **worker_kwargs,
         )
-        assert worker_result["search_plane_months"] == 2, worker_result
-        assert worker_result["search_plane_rows"] == 0, worker_result
+        assert [tick["months"] for tick in worker_ticks] == [2, 1], worker_ticks
+        assert worker_ticks[0]["rows"] == 0, worker_ticks
+        rebuilt_live = live_passages(store, tenant)
+        assert rebuilt_live, "surviving records were not rebuilt"
+        assert worker_result["search_plane_months"] == 3, worker_result
+        assert worker_result["search_plane_rows"] == len(rebuilt_live), worker_result
+        assert set(plane_rows(state_path, namespace_name)) == set(rebuilt_live)
+        with store.connect() as connection:
+            assert connection.execute(
+                """SELECT count(*) AS count FROM canonical_passages
+                    WHERE tenant_id=%s AND source_id=%s AND %s=ANY(receipts)""",
+                (tenant, source, first["receipt"]),
+            ).fetchone()["count"] == 0, "forgotten receipt was rebuilt"
         assert worker_result["search_plane_failed"] == 0, worker_result
         assert worker_result["search_plane_rate_limited"] == 0, worker_result
         assert worker_result["search_outbox_pending"] == 0, worker_result

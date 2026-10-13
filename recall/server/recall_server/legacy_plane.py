@@ -172,23 +172,6 @@ def _redacted_text(envelope: Mapping[str, Any]) -> str:
     )
 
 
-def _text_summary(envelope: Mapping[str, Any]) -> str:
-    """Search text for one canonical document.
-
-    Typed connector records (webhooks) expose a ``text`` field; everything else
-    keeps the compact JSON body, exactly like ``CanonicalPlane.ingest_batch``.
-    """
-    content = envelope.get("content")
-    if (
-        envelope.get("kind") == "connector_record"
-        and isinstance(content, dict)
-        and isinstance(content.get("text"), str)
-        and content["text"]
-    ):
-        return content["text"]
-    return _redacted_text(envelope)
-
-
 class LegacyIngestBridge:
     """Route v1 envelope writes onto the canonical plane.
 
@@ -225,6 +208,7 @@ class LegacyIngestBridge:
         raw_payload: bytes | None = None,
         media_type: str = "application/json",
         connector_id: str | None = None,
+        notification: bool = False,
     ) -> tuple[dict[str, Any], bool]:
         """Commit ``events`` and return ``(acknowledgement, replay)``.
 
@@ -240,6 +224,7 @@ class LegacyIngestBridge:
                     raw_payload=raw_payload,
                     media_type=media_type,
                     connector_id=connector_id,
+                    notification=notification,
                 )
             return self.store.ingest(idempotency_key, events)
         if not idempotency_key or len(idempotency_key) > 200:
@@ -252,6 +237,7 @@ class LegacyIngestBridge:
             raw_payload=raw_payload,
             media_type=media_type,
             connector_id=connector_id,
+            notification=notification,
         )
         return acknowledgement, acknowledgement["replay"]
 
@@ -263,6 +249,7 @@ class LegacyIngestBridge:
         raw_payload: bytes | None,
         media_type: str,
         connector_id: str | None = None,
+        notification: bool = False,
     ) -> dict[str, Any]:
         if not isinstance(events, list) or not events:
             raise ValueError("empty ingest batch")
@@ -311,9 +298,10 @@ class LegacyIngestBridge:
                             connector_id=event_connector_id,
                             artifact_ref=artifact,
                             envelope=envelope,
-                            text_redacted=_text_summary(envelope),
+                            text_redacted=_redacted_text(envelope),
                             _connection=connection,
                             _history=history,
+                            **({"_notification": True} if notification else {}),
                         )
                     )
         return {

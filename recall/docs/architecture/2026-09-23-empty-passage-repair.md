@@ -27,3 +27,10 @@ Use `--after "$LAST_DOCUMENT"` with the report's `next_after` to inspect subsequ
 After the first batch, verify exact expected passages/receipts, unchanged logical evidence and no invented actor links. Follow the item through search, show/context and scan after their normal outboxes drain. Check other sources still progress. Run the original acceptance checks unchanged. Do not repeatedly requeue when an outcome is unknown; inspect the existing queue and projection first.
 
 This repairs only previously empty current documents. Roleless messages omitted inside already-nonempty mixed documents require a separate measured inventory and are not covered by this command. Do not bump the global passage fingerprint, rebuild all logical evidence, or infer full source recovery from a sample.
+
+`--concurrency 4` opts into four concurrent read-only document comparisons. The
+CLI and API default remains `1`. Results retain document-ID order and identical
+eligibility/cost estimates. No database connection is held during archive reads;
+any comparison failure aborts the batch before queue insertion. Concurrency
+bounds active document preparations, not total corpus coverage. Measure archive
+latency, memory and worker drainage before increasing concurrent work.

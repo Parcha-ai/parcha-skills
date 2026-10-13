@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import logging
 import os
@@ -16,6 +17,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from psycopg_pool import PoolTimeout
+from psycopg.errors import QueryCanceled
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 from .admin_web import (
@@ -879,6 +881,25 @@ class Handler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if parsed.path == "/admin/native/login":
+                if self.control_plane is None:
+                    self.send_json(404, {"error": "not found"})
+                    return
+                query = parse_qs(parsed.query, keep_blank_values=True)
+                if set(query) != {"code_challenge", "state"} or any(
+                    len(values) != 1 for values in query.values()
+                ):
+                    self.send_json(400, {"error": "identity_oauth_request_invalid"})
+                    return
+                try:
+                    started = self.control_plane.start_identity_login(
+                        purpose="native", native_challenge=query["code_challenge"][0],
+                        native_state=query["state"][0],
+                    )
+                    self.send_redirect(started["authorization_url"])
+                except ControlError as error:
+                    self.send_json(error.status, {"error": error.code})
+                return
             if parsed.path == "/admin/login":
                 if self.control_plane is None:
                     self.send_json(404, {"error": "not found"})
@@ -962,6 +983,17 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 except ControlError as error:
                     self.send_json(error.status, {"error": error.code})
+                return
+            if parsed.path == "/admin/api/v1/fleet":
+                principal = self.admin_principal()
+                if principal is None:
+                    return
+                try:
+                    self.send_json(200, self.control_plane.fleet(principal["principal_id"]))
+                except ControlError as error:
+                    self.send_json(error.status, {"error": error.code})
+                except (QueryCanceled, SearchDeadlineExceeded):
+                    self.send_json(503, {"error": "fleet_unavailable"})
                 return
             if parsed.path == "/admin/oauth/callback/google":
                 if self.control_plane is None:
@@ -1128,6 +1160,26 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlsplit(self.path).path
         if self.hide_non_public_route("POST", path):
+            return
+        if self.admin_web_enabled() and path == "/admin/api/v1/native/session":
+            if self.control_plane is None:
+                self.send_json(503, {"error": "control_plane_unavailable"})
+                return
+            body = self.read_admin_json()
+            if body is None:
+                return
+            if set(body) != {"code", "code_verifier"}:
+                self.send_json(400, {"error": "admin_request_invalid"})
+                return
+            try:
+                browser = self.control_plane.exchange_native_login(**body)
+                self.send_json(201, {
+                    "status": "authenticated", "expires_at": browser["expires_at"],
+                }, [("Set-Cookie", value) for value in admin_session_headers(
+                    browser["session"], browser["csrf"],
+                )])
+            except ControlError as error:
+                self.send_json(error.status, {"error": error.code})
             return
         if self.admin_web_enabled() and path == "/admin/api/v1/session":
             if self.control_plane is None:
@@ -1338,22 +1390,44 @@ class Handler(BaseHTTPRequestHandler):
             principal = self.require("write")
             if not principal:
                 return
-            length = self.body_length(MAX_BODY_BYTES)
+            if self.archive_store is None:
+                self.send_json(503, {"error": "canonical archive unavailable"})
+                return
+            binary = self.headers.get_content_type() == "application/octet-stream"
+            length = self.body_length(
+                self.archive_store.maximum_bytes if binary else MAX_BODY_BYTES,
+            )
             if length is None:
                 return
             try:
-                body = json.loads(self.rfile.read(length))
+                if binary:
+                    metadata = self.headers.get_all("X-Recall-Archive-Metadata", [])
+                    if (len(metadata) != 1 or self.headers.get("Transfer-Encoding")
+                            or len(self.headers.get_all("Content-Length", [])) != 1):
+                        raise ValueError("invalid binary archive framing")
+                    body = json.loads(metadata[0])
+                    if not isinstance(body, dict) or set(body) != {
+                        "tenant_id", "principal_id", "source_id", "native_id",
+                        "media_type", "created_at", "content_sha256",
+                    }:
+                        raise ValueError("invalid binary archive metadata")
+                else:
+                    body = json.loads(self.rfile.read(length))
                 authority = self.canonical_authority(principal, body)
                 if authority is None:
                     return
                 tenant_id, principal_id, source_id = authority
-                if self.archive_store is None:
-                    self.send_json(503, {"error": "canonical archive unavailable"})
-                    return
-                payload = base64.b64decode(
-                    body.get("payload_base64", ""),
-                    validate=True,
-                )
+                if binary:
+                    # Authorization precedes reading source bytes. The archive's
+                    # own bound governs transport; no base64 expansion or second cap.
+                    payload = self.rfile.read(length)
+                    if (len(payload) != length
+                            or hashlib.sha256(payload).hexdigest() != body["content_sha256"]):
+                        raise ValueError("binary archive integrity mismatch")
+                else:
+                    payload = base64.b64decode(
+                        body.get("payload_base64", ""), validate=True,
+                    )
                 gateway = CanonicalArchiveGateway(
                     self.store,
                     self.archive_store,
@@ -1541,10 +1615,20 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if adapted.webhook is None or adapted.workspace_id is None:
                     raise WebhookError("slack event projection unavailable")
+                # The app subscribes to message.channels. Slack's documented
+                # edit/delete examples omit channel_type, so retain signed
+                # legacy callbacks while rejecting explicit nonpublic types.
+                if adapted.channel_type not in (None, "channel"):
+                    self.send_json(200, {
+                        "status": "accepted", "routes": 0, "replays": 0,
+                        "duplicate_events": 0,
+                    })
+                    return
                 with self.store.connect() as connection:
                     routes = connection.execute(
                         """SELECT installation.source_id,installation.principal_id,
-                                  installation.privacy_mode,installation.tenant_id
+                                  installation.privacy_mode,installation.tenant_id,
+                                  installation.selectors
                              FROM connector_installations installation
                              JOIN provider_connections provider
                                ON provider.id=installation.connection_id
@@ -1559,6 +1643,16 @@ class Handler(BaseHTTPRequestHandler):
                 replayed = 0
                 duplicate_events = 0
                 for route in routes:
+                    selectors = route["selectors"]
+                    if not isinstance(selectors, dict):
+                        continue
+                    channels = selectors.get("channel_ids", [])
+                    if not isinstance(channels, list) or any(
+                        not isinstance(channel, str) or not channel for channel in channels
+                    ):
+                        continue
+                    if channels and adapted.channel_id not in channels:
+                        continue
                     prepared = build_webhook_event(adapted.webhook, {
                         "source_id": route["source_id"],
                         "principal_id": route["principal_id"],
@@ -1576,6 +1670,7 @@ class Handler(BaseHTTPRequestHandler):
                             "source_id": route["source_id"],
                         },
                         raw_payload=raw,
+                        notification=True,
                     )
                     committed += 1
                     replayed += int(replay)
@@ -1635,6 +1730,7 @@ class Handler(BaseHTTPRequestHandler):
                     [prepared.event],
                     principal=principal,
                     raw_payload=raw,
+                    notification=True,
                 )
                 receipts = acknowledgement.get("receipts")
                 if not isinstance(receipts, list) or len(receipts) != 1:

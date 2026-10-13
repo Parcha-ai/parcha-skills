@@ -5,15 +5,18 @@ from __future__ import annotations
 import json
 import hashlib
 import logging
+import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Mapping, Protocol
 
 from connectors.remote_api import RemoteApiError
 from connectors.sdk import (
-    ConnectorContractError, ConnectorPage, ConnectorRecordV2,
-    ConnectorUpstreamError, SOURCE_ID,
+    ConnectorContractError, ConnectorPage, ConnectorPageCapacityError, ConnectorRecordV2,
+    ConnectorUpstreamError, MAX_PAGE_RECORDS, SOURCE_ID,
 )
-from connectors.slack_source import normalize_slack_message, normalize_slack_user
+from connectors.slack_source import (
+    SLACK_MESSAGE_CAPTURE_VERSION, normalize_slack_message, normalize_slack_user,
+)
 from connectors.attachment_extract import extract_attachment_text
 
 
@@ -82,6 +85,8 @@ def _next(response: dict[str, Any]) -> str | None:
     value = metadata.get("next_cursor") or None
     if value is not None and (not isinstance(value, str) or len(value) > 4096):
         raise ConnectorContractError("slack page cursor is invalid")
+    if response.get("has_more") is True and value is None:
+        raise ConnectorContractError("slack page continuation is missing")
     return value
 
 
@@ -90,8 +95,10 @@ def _cursor(value: dict[str, Any]) -> str:
         raw = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
     except (TypeError, ValueError):
         raise ConnectorContractError("slack workspace cursor is invalid") from None
-    if not raw or len(raw.encode()) > 4096:
+    if not raw:
         raise ConnectorContractError("slack workspace cursor is invalid")
+    if len(raw.encode()) > 4096:
+        raise ConnectorPageCapacityError("slack workspace cursor exceeds maximum bytes")
     return raw
 
 
@@ -100,7 +107,9 @@ def _initial_state(
     public_history: bool = False,
 ) -> dict[str, Any]:
     return {
-        "v": 3,
+        "v": 4,
+        "channel_lower": None,
+        "capture_version": SLACK_MESSAGE_CAPTURE_VERSION,
         "coverage": "public" if public_history else "member",
         "phase": "users",
         "page": None,
@@ -205,10 +214,17 @@ def _state(
             public_history=public_history,
         )
 
-    expected = v2_expected | {"coverage"}
+    # Keep an in-flight V3 page and its original time window. It may not have
+    # started at epoch, so finishing it must not certify an unknown baseline.
+    if isinstance(value, dict) and value.get("v") == 3 and set(value) == v2_expected | {"coverage"}:
+        value = {**value, "v": 4, "capture_version": 0, "channel_lower": (
+            value["watermark"] if (value["phase"] == "history" and value["page"])
+            or value["phase"] == "threads" else None
+        )}
+    expected = v2_expected | {"coverage", "channel_lower", "capture_version"}
     expected_coverage = "public" if public_history else "member"
     if (
-        not isinstance(value, dict) or set(value) != expected or value.get("v") != 3
+        not isinstance(value, dict) or set(value) != expected or value.get("v") != 4
         or value.get("coverage") not in {"member", "public"}
         or value.get("phase") not in {"discover", "users", "history", "threads"}
         or not isinstance(value.get("channels"), list)
@@ -223,11 +239,16 @@ def _state(
         or type(value.get("thread_index")) is not int
         or not 0 <= value["thread_index"] <= len(value["threads"])
         or type(value.get("cycle")) is not int or value["cycle"] < 0
+        or type(value.get("capture_version")) is not int or value["capture_version"] < 0
         or type(value.get("found")) is not bool
         or any(value.get(key) is not None and not isinstance(value[key], str)
                for key in ("page", "discovery_page", "thread_page"))
         or not _valid_time_bounds(value)
     ):
+        raise ConnectorContractError("slack workspace cursor is invalid")
+    if value["channel_lower"] is not None and not _valid_time_bounds({
+        "watermark": value["channel_lower"], "upper": value["upper"],
+    }):
         raise ConnectorContractError("slack workspace cursor is invalid")
     if value["phase"] in {"history", "threads"} and (
         not value["channels"] or value["channel_index"] >= len(value["channels"])
@@ -250,7 +271,7 @@ class SlackWorkspaceConnector:
     def __init__(
         self, *, rail: JsonRail, source_id: str, workspace_id: str,
         owner_user_ids: tuple[str, ...] = (), channel_ids: tuple[str, ...] = (),
-        page_size: int = 20,
+        page_size: int = 100,
     ):
         if not callable(getattr(rail, "request", None)):
             raise ConnectorContractError("remote rail is invalid")
@@ -263,7 +284,7 @@ class SlackWorkspaceConnector:
             or len(channel_ids) > MAX_CONFIGURED_CHANNELS
             or any(not isinstance(item, str) or not item for item in owner_user_ids + channel_ids)
             or len(channel_ids) != len(set(channel_ids))
-            or not 1 <= page_size <= 20
+            or not 1 <= page_size <= 100
         ):
             raise ConnectorContractError("slack workspace configuration is invalid")
         self.rail = rail
@@ -273,6 +294,151 @@ class SlackWorkspaceConnector:
         self.channel_ids = channel_ids
         self.page_size = page_size
         self.public_history = getattr(rail, "public_history", False) is True
+        self._checkpoint_db: sqlite3.Connection | None = None
+
+    @property
+    def _scope(self) -> tuple[str, str]:
+        return self.workspace_id, "public" if self.public_history else "member"
+
+    @property
+    def _selection(self) -> str:
+        return hashlib.sha256(json.dumps(self.channel_ids).encode()).hexdigest()
+
+    def bind_checkpoint_store(self, db: sqlite3.Connection) -> None:
+        """Use the runner's identity-pinned spool, never an independent writer."""
+        self._checkpoint_db = db
+        db.execute("""CREATE TABLE IF NOT EXISTS slack_channel_coverage(
+            workspace_id TEXT NOT NULL, authority TEXT NOT NULL, channel_id TEXT NOT NULL,
+            last_seen_cycle INTEGER NOT NULL, history_through TEXT, scanned_cycle INTEGER,
+            capture_version INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(workspace_id,authority,channel_id))""")
+        db.execute("""CREATE TABLE IF NOT EXISTS slack_discovery_coverage(
+            workspace_id TEXT NOT NULL, authority TEXT NOT NULL,
+            started_cycle INTEGER, completed_cycle INTEGER,
+            started_selection TEXT, completed_selection TEXT,
+            completed_cycles INTEGER NOT NULL DEFAULT 0,
+            completed_channels INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(workspace_id,authority))""")
+        db.execute("""INSERT OR IGNORE INTO slack_discovery_coverage(workspace_id,authority)
+                      VALUES (?,?)""", self._scope)
+
+    def _channel_lower(self, state: dict[str, Any]) -> str:
+        if state["channel_lower"] is not None:
+            return state["channel_lower"]
+        if self._checkpoint_db is not None:
+            channel, _ = self._channel(state)
+            row = self._checkpoint_db.execute(
+                """SELECT history_through,capture_version FROM slack_channel_coverage
+                   WHERE workspace_id=? AND authority=? AND channel_id=?""",
+                (*self._scope, channel),
+            ).fetchone()
+            if row and row[0] and row[1] == SLACK_MESSAGE_CAPTURE_VERSION:
+                return row[0]
+        # No proven channel baseline. A global workspace watermark is not proof
+        # that this channel was ever visited. Standalone pulls safely replay.
+        return EPOCH
+
+    def commit_checkpoint(self, previous: str | None, current: str) -> None:
+        """Called only inside the runner's ACK/cursor transaction. No commit here."""
+        db = self._checkpoint_db
+        assert db is not None
+        before = _state(previous, self.channel_ids, self.public_history)
+        after = _state(current, self.channel_ids, self.public_history)
+        started = (
+            before["phase"] == "discover" and before["discovery_page"] is None
+        ) or (bool(self.channel_ids) and before["phase"] == "users" and after["phase"] == "history")
+        if started:
+            db.execute("""UPDATE slack_discovery_coverage SET started_cycle=?,started_selection=?
+                          WHERE workspace_id=? AND authority=?""",
+                       (before["cycle"], self._selection, *self._scope))
+        # Only discovery/configuration transitions register inventory, not every
+        # history page. A channel absent for a full cycle needs a new baseline.
+        if after["channels"] and (
+            before["phase"] in {"users", "discover"}
+            or before["channels"] != after["channels"]
+        ):
+            db.executemany("""INSERT INTO slack_channel_coverage
+                (workspace_id,authority,channel_id,last_seen_cycle) VALUES (?,?,?,?)
+                ON CONFLICT(workspace_id,authority,channel_id) DO UPDATE SET
+                    history_through=CASE WHEN last_seen_cycle<excluded.last_seen_cycle-1
+                        THEN NULL ELSE history_through END,
+                    last_seen_cycle=excluded.last_seen_cycle""",
+                [(*self._scope, item.rsplit(":", 1)[0], after["cycle"])
+                 for item in after["channels"]])
+        if before["phase"] in {"history", "threads"}:
+            channel, _ = self._channel(before)
+            completed = (before["cycle"] != after["cycle"]
+                         or after["phase"] not in {"history", "threads"}
+                         or self._channel(after)[0] != channel)
+            if completed:
+                lower = self._channel_lower(before)
+                capture_version = (after["capture_version"]
+                    if before["phase"] == "history" and before["page"] is None
+                    else before["capture_version"])
+                # A staged pre-upgrade page was fetched under the old global
+                # window, even when its previous cursor had no page token.
+                # New pulls produce V4 and choose the per-channel lower bound.
+                if json.loads(current).get("v") == 3:
+                    lower = before["watermark"]
+                    capture_version = 0
+                prior = db.execute("""SELECT history_through,capture_version FROM slack_channel_coverage
+                    WHERE workspace_id=? AND authority=? AND channel_id=?""",
+                    (*self._scope, channel)).fetchone()
+                contiguous = lower == EPOCH or (prior and prior[0]
+                    and prior[1] == SLACK_MESSAGE_CAPTURE_VERSION and
+                    datetime.fromisoformat(lower.replace("Z", "+00:00")) <=
+                    datetime.fromisoformat(prior[0].replace("Z", "+00:00")))
+                db.execute("""INSERT INTO slack_channel_coverage
+                    (workspace_id,authority,channel_id,last_seen_cycle,history_through,scanned_cycle,capture_version)
+                    VALUES (?,?,?,?,?,?,?) ON CONFLICT(workspace_id,authority,channel_id)
+                    DO UPDATE SET last_seen_cycle=excluded.last_seen_cycle,
+                      history_through=excluded.history_through,scanned_cycle=excluded.scanned_cycle,
+                      capture_version=excluded.capture_version""",
+                    (*self._scope, channel, before["cycle"],
+                     before["upper"] if contiguous and capture_version == SLACK_MESSAGE_CAPTURE_VERSION else None,
+                     before["cycle"], capture_version))
+        if after["cycle"] > before["cycle"]:
+            db.execute("""UPDATE slack_discovery_coverage
+                SET completed_cycle=?,completed_cycles=completed_cycles+1,
+                    completed_selection=started_selection,
+                    completed_channels=(SELECT count(*) FROM slack_channel_coverage
+                        WHERE workspace_id=? AND authority=? AND last_seen_cycle=?)
+                WHERE workspace_id=? AND authority=? AND started_cycle=? AND started_selection=?""",
+                (before["cycle"], *self._scope, before["cycle"], *self._scope, before["cycle"], self._selection))
+
+    def checkpoint_status(self) -> dict[str, Any]:
+        """Aggregate evidence only: no channel IDs, API cursors, or message text."""
+        assert self._checkpoint_db is not None
+        discovery = self._checkpoint_db.execute("""SELECT started_cycle,completed_cycle,
+            completed_cycles,completed_channels,started_selection,completed_selection
+            FROM slack_discovery_coverage WHERE workspace_id=? AND authority=?""", self._scope).fetchone()
+        selected = " AND channel_id IN (" + ",".join("?" for _ in self.channel_ids) + ")" if self.channel_ids else ""
+        counts = self._checkpoint_db.execute("""WITH channels AS (
+            SELECT last_seen_cycle,
+                CASE WHEN capture_version=? THEN history_through END AS history_through,
+                CASE WHEN capture_version=? THEN scanned_cycle END AS scanned_cycle
+            FROM slack_channel_coverage WHERE workspace_id=? AND authority=?""" + selected + """)
+            SELECT count(*),
+            count(history_through),sum(CASE WHEN last_seen_cycle=? THEN 1 ELSE 0 END),
+            sum(CASE WHEN scanned_cycle=? THEN 1 ELSE 0 END), min(history_through)
+            FROM channels""",
+            (SLACK_MESSAGE_CAPTURE_VERSION, SLACK_MESSAGE_CAPTURE_VERSION,
+             *self._scope, *self.channel_ids, discovery[0], discovery[0])).fetchone()
+        return {
+            "capture_version": SLACK_MESSAGE_CAPTURE_VERSION,
+            "scope": "public_channels" if self.public_history else "bot_accessible_public_channels",
+            "selection": "configured_channels" if self.channel_ids else "workspace_discovery",
+            "known_channels": counts[0], "history_baselined_channels": counts[1],
+            "history_baseline_pending_channels": counts[0] - counts[1],
+            "latest_discovery_channels": (counts[2] or 0) if discovery[4] == self._selection else 0,
+            "latest_discovery_scanned_channels": (counts[3] or 0) if discovery[4] == self._selection else 0,
+            "last_complete_discovery_channels": discovery[3] if discovery[5] == self._selection else None,
+            "discovery_matches_current_selection": discovery[5] == self._selection,
+            "completed_discovery_cycles": discovery[2],
+            "discovery_in_progress": discovery[0] != discovery[1],
+            "oldest_history_through": counts[4],
+            "historical_mutations_verified": False,
+        }
 
     def _request(self, operation: str, query: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -282,6 +448,8 @@ class SlackWorkspaceConnector:
                 response = self.rail.request(operation, query=query)
         except RemoteApiError as error:
             _log_request_failure(operation, "transport", error.code)
+            if error.code == "response_too_large":
+                raise ConnectorPageCapacityError("slack response exceeds maximum bytes") from None
             raise ConnectorUpstreamError("connector_upstream_error") from None
         if not isinstance(response, dict):
             _log_request_failure(operation, "response", "response_invalid")
@@ -291,7 +459,21 @@ class SlackWorkspaceConnector:
 
     def pull(self, cursor: str | None) -> ConnectorPage:
         state = _state(cursor, self.channel_ids, self.public_history)
-        return getattr(self, f"_pull_{state['phase']}")(state)
+        pull = getattr(self, f"_pull_{state['phase']}")
+        if state["phase"] == "discover":
+            return pull(state)
+        if state["phase"] == "history" and state["page"] is None:
+            channel_id, do_not_join = self._channel(state)
+            if not do_not_join:
+                self._request("channels.join", {"channel": channel_id})
+        try:
+            return pull(state, limit=self.page_size)
+        except ConnectorPageCapacityError:
+            if self.page_size <= 20:
+                raise
+            # Refetch the same uncommitted provider position, never truncate a page.
+            # Auth, rate limits and malformed content do not enter this retry path.
+            return pull(state, limit=20)
 
     def _page(self, records: list[ConnectorRecordV2], state: dict[str, Any], more: bool) -> ConnectorPage:
         return ConnectorPage(records=tuple(records), next_cursor=_cursor(state), has_more=more)
@@ -318,19 +500,20 @@ class SlackWorkspaceConnector:
         channels.sort()
         next_page = _next(response)
         state = {
-            **state, "channels": channels, "channel_index": 0,
+            **state, "channels": channels, "channel_index": 0, "channel_lower": None,
+            "capture_version": SLACK_MESSAGE_CAPTURE_VERSION,
             "discovery_page": next_page, "found": state["found"] or bool(channels),
         }
         if channels:
             return self._page([], {**state, "phase": "history", "page": None}, True)
         if next_page:
             return self._page([], state, True)
-        if not state["found"]:
-            raise ConnectorUpstreamError("slack_no_accessible_channels")
+        # A successful empty listing is an observed empty scope, not a provider
+        # failure. Keep its cycle so a returning channel is rebaselined.
         return self._finish_cycle([], state)
 
-    def _pull_users(self, state: dict[str, Any]) -> ConnectorPage:
-        query: dict[str, Any] = {"include_locale": False, "limit": self.page_size}
+    def _pull_users(self, state: dict[str, Any], *, limit: int) -> ConnectorPage:
+        query: dict[str, Any] = {"include_locale": False, "limit": limit}
         if state["page"]:
             query["cursor"] = state["page"]
         response = self._request("users.list", query)
@@ -357,6 +540,8 @@ class SlackWorkspaceConnector:
         return {
             **state,
             "phase": "history",
+            "channel_lower": None,
+            "capture_version": SLACK_MESSAGE_CAPTURE_VERSION,
             "channels": [
                 f"{item}:{1 if self.public_history else 0}"
                 for item in self.channel_ids[start:stop]
@@ -375,32 +560,25 @@ class SlackWorkspaceConnector:
         channel_id, do_not_join = encoded.rsplit(":", 1)
         return channel_id, do_not_join == "1"
 
-    def _pull_history(self, state: dict[str, Any]) -> ConnectorPage:
-        channel_id, do_not_join = self._channel(state)
-        if not do_not_join and state["page"] is None:
-            self._request("channels.join", {"channel": channel_id})
+    def _pull_history(self, state: dict[str, Any], *, limit: int) -> ConnectorPage:
+        channel_id, _do_not_join = self._channel(state)
+        state = {**state, "channel_lower": self._channel_lower(state)}
+        if state["page"] is None:
+            state["capture_version"] = SLACK_MESSAGE_CAPTURE_VERSION
         query: dict[str, Any] = {
-            "channel": channel_id, "inclusive": True, "limit": self.page_size,
+            "channel": channel_id, "inclusive": True, "limit": limit,
             "latest": _oldest(state["upper"]),
         }
         if state["page"]:
             query["cursor"] = state["page"]
-        elif state["watermark"] != EPOCH:
-            query["oldest"] = _oldest(state["watermark"])
+        elif state["channel_lower"] != EPOCH:
+            query["oldest"] = _oldest(state["channel_lower"])
         response = self._request("messages.history", query)
-        records: dict[str, ConnectorRecordV2] = {}
+        messages = _items(response.get("messages"), "messages")
         threads = []
-        for raw in _items(response.get("messages"), "messages"):
+        for raw in messages:
             if not isinstance(raw, dict):
                 raise ConnectorContractError("slack message is invalid")
-            record = normalize_slack_message(
-                workspace_id=self.workspace_id, channel_id=channel_id, value=raw,
-                owner_identifiers=self.owner_user_ids, provenance_surface="api",
-            )
-            record, attachments = self._capture_files(raw, record)
-            records[record.native_id] = record
-            for attachment in attachments:
-                records[attachment.native_id] = attachment
             reply_count = raw.get("reply_count", 0)
             if type(reply_count) is not int or reply_count < 0:
                 raise ConnectorContractError("slack reply count is invalid")
@@ -412,42 +590,59 @@ class SlackWorkspaceConnector:
                 **state, "phase": "threads", "page": next_page,
                 "threads": threads, "thread_index": 0, "thread_page": None,
             }
-            return self._page(list(records.values()), next_state, True)
-        return self._advance_channel(list(records.values()), state, next_page)
+            page = self._page([], next_state, True)
+        else:
+            page = self._advance_channel([], state, next_page)
+        return self._message_page(messages, channel_id, page)
 
-    def _pull_threads(self, state: dict[str, Any]) -> ConnectorPage:
+    def _pull_threads(self, state: dict[str, Any], *, limit: int) -> ConnectorPage:
         channel_id, _do_not_join = self._channel(state)
         thread_ts = state["threads"][state["thread_index"]]
         query: dict[str, Any] = {
-            "channel": channel_id, "inclusive": True, "limit": self.page_size,
+            "channel": channel_id, "inclusive": True, "limit": limit,
             "ts": thread_ts, "latest": _oldest(state["upper"]),
         }
         if state["thread_page"]:
             query["cursor"] = state["thread_page"]
         response = self._request("messages.replies", query)
-        records: dict[str, ConnectorRecordV2] = {}
-        for raw in _items(response.get("messages"), "replies"):
-            if not isinstance(raw, dict):
-                raise ConnectorContractError("slack reply is invalid")
-            record = normalize_slack_message(
-                workspace_id=self.workspace_id, channel_id=channel_id, value=raw,
-                owner_identifiers=self.owner_user_ids, provenance_surface="api",
-            )
+        messages = _items(response.get("messages"), "replies")
+        next_thread_page = _next(response)
+        if next_thread_page:
+            page = self._page([], {
+                **state, "thread_page": next_thread_page,
+            }, True)
+        elif state["thread_index"] + 1 < len(state["threads"]):
+            page = self._page([], {
+                **state, "thread_index": state["thread_index"] + 1, "thread_page": None,
+            }, True)
+        else:
+            page = self._advance_channel([], state, state["page"])
+        return self._message_page(messages, channel_id, page)
+
+    def _message_page(
+        self, messages: list[Any], channel_id: str, page: ConnectorPage,
+    ) -> ConnectorPage:
+        normalized = [normalize_slack_message(
+            workspace_id=self.workspace_id, channel_id=channel_id, value=raw,
+            owner_identifiers=self.owner_user_ids, provenance_surface="api",
+        ) for raw in messages]
+        records = {record.native_id: record for record in normalized}
+        # Validate message bytes and cursor before fetching attachment bodies.
+        ConnectorPage(tuple(records.values()), page.next_cursor, page.has_more)
+        file_count = 0
+        for raw in messages:
+            files = raw.get("files") or []
+            if not isinstance(files, list) or len(files) > 20:
+                raise ConnectorContractError("slack files are invalid")
+            file_count += len(files)
+        if len(records) + file_count > MAX_PAGE_RECORDS:
+            raise ConnectorPageCapacityError("page exceeds maximum record count")
+        for raw, record in zip(messages, normalized):
             record, attachments = self._capture_files(raw, record)
             records[record.native_id] = record
             for attachment in attachments:
                 records[attachment.native_id] = attachment
-        next_thread_page = _next(response)
-        if next_thread_page:
-            return self._page(list(records.values()), {
-                **state, "thread_page": next_thread_page,
-            }, True)
-        index = state["thread_index"] + 1
-        if index < len(state["threads"]):
-            return self._page(list(records.values()), {
-                **state, "thread_index": index, "thread_page": None,
-            }, True)
-        return self._advance_channel(list(records.values()), state, state["page"])
+        return ConnectorPage(tuple(records.values()), page.next_cursor, page.has_more)
 
     def _advance_channel(
         self, records: list[ConnectorRecordV2], state: dict[str, Any],
@@ -463,7 +658,8 @@ class SlackWorkspaceConnector:
             return self._page(records, {
                 **state, "phase": "history", "page": None,
                 "channel_index": index, "threads": [], "thread_index": 0,
-                "thread_page": None,
+                "thread_page": None, "channel_lower": None,
+                "capture_version": SLACK_MESSAGE_CAPTURE_VERSION,
             }, True)
         if self.channel_ids and state["configured_index"] < len(self.channel_ids):
             return self._page(records, self._configured_batch(state), True)
@@ -471,7 +667,8 @@ class SlackWorkspaceConnector:
             return self._page(records, {
                 **state, "phase": "discover", "page": None, "channels": [],
                 "channel_index": 0, "threads": [], "thread_index": 0,
-                "thread_page": None,
+                "thread_page": None, "channel_lower": None,
+                "capture_version": SLACK_MESSAGE_CAPTURE_VERSION,
             }, True)
         return self._finish_cycle(records, state)
 

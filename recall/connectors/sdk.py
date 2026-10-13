@@ -42,6 +42,10 @@ class ConnectorContractError(ValueError):
     pass
 
 
+class ConnectorPageCapacityError(ConnectorContractError):
+    """A provider response exceeds bounded ACK work-unit capacity."""
+
+
 class ConnectorRateLimited(Exception):
     def __init__(self, *, retry_after_seconds: int | float):
         if not isinstance(retry_after_seconds, (int, float)) or retry_after_seconds <= 0:
@@ -431,7 +435,7 @@ class ConnectorPage:
         if not isinstance(self.records, tuple) or not all(isinstance(item, ConnectorRecord) for item in self.records):
             raise ConnectorContractError("page records must be a tuple of ConnectorRecord")
         if len(self.records) > MAX_PAGE_RECORDS:
-            raise ConnectorContractError("page exceeds maximum record count")
+            raise ConnectorPageCapacityError("page exceeds maximum record count")
         if not isinstance(self.next_cursor, str) or not self.next_cursor or len(self.next_cursor) > 4096:
             raise ConnectorContractError("next_cursor is invalid")
         if not isinstance(self.has_more, bool):
@@ -441,7 +445,7 @@ class ConnectorPage:
             raise ConnectorContractError("page contains duplicate native_id")
         page_bytes = sum(len(json.dumps({"content": item.content, "provenance": item.provenance}).encode()) for item in self.records)
         if page_bytes > MAX_PAGE_BYTES:
-            raise ConnectorContractError("page exceeds maximum byte count")
+            raise ConnectorPageCapacityError("page exceeds maximum byte count")
 
 
 class PullConnector(Protocol):
@@ -522,6 +526,13 @@ class ConnectorRunner:
         """)
         _create_acknowledged_records_table(self.db)
         self._pin_identity()
+        # Trusted in-process connectors may keep content-free checkpoint state
+        # in this spool. Its updates share the page ACK transaction; the closed
+        # third-party page wire gains no SQL or executable extension surface.
+        self.checkpoints = connector if callable(getattr(connector, "bind_checkpoint_store", None)) else None
+        if self.checkpoints is not None:
+            self.checkpoints.bind_checkpoint_store(self.db)
+            self.db.commit()
 
     def _pin_identity(self) -> None:
         current = {row["key"]: row["value"] for row in self.db.execute(
@@ -737,6 +748,8 @@ class ConnectorRunner:
         }
 
     def _commit_page(self, page_id: int, cursor: str | None) -> None:
+        if self.checkpoints is not None:
+            self.checkpoints.commit_checkpoint(self._cursor(), cursor)
         self.db.execute("DELETE FROM outbox WHERE page_id=?", (page_id,))
         self.db.execute("DELETE FROM pages WHERE id=?", (page_id,))
         self._set_meta("committed_cursor", json.dumps(cursor))
@@ -957,4 +970,6 @@ class ConnectorRunner:
             "privacy_policy_version": self.privacy.apply({}).policy_version,
             "last_success_epoch": int(self._get_meta("last_success_epoch") or 0),
             "last_error_code": self._get_meta("last_error_code"),
+            **({"coverage": self.checkpoints.checkpoint_status()}
+               if self.checkpoints is not None else {}),
         }

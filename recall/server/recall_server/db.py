@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -332,8 +333,17 @@ class BrainStore:
         with self.connect():
             pass
         assert self._pool is not None
-        self._pool.resize(minimum_size, self.pool_max_size)
-        self._pool.wait(timeout=timeout)
+        # Pool.wait() is a startup gate: on timeout it closes the entire pool,
+        # including a long-running worker's reusable pool. Borrow the desired
+        # capacity instead, so active parents can coexist with publication and
+        # temporary contention leaves the next cycle able to connect.
+        deadline = time.monotonic() + timeout
+        with ExitStack() as connections:
+            for _ in range(minimum_size):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise PoolTimeout("database pool warmup timed out")
+                connections.enter_context(self._pool.connection(timeout=remaining))
 
     def flush_authorization_audit(self) -> int:
         """Force every queued allowed-decision audit row to the database."""
@@ -1833,8 +1843,10 @@ class BrainStore:
             for value in tenant_ids
         ):
             raise ValueError("fleet tenant scope is invalid")
+        deadline_at = time.monotonic() + 5.0
         with self.connect() as conn:
-            rows = conn.execute(
+            rows = self._execute_bounded(
+                conn,
                 """SELECT source.tenant_id,source.source_id,
                           source.owner_principal_id,
                           COALESCE(actor.display_name,source.owner_principal_id)
@@ -1850,6 +1862,8 @@ class BrainStore:
                               CASE
                                 WHEN installation.last_error_code IS NOT NULL
                                   THEN 'degraded'
+                                WHEN installation.execution='source_local'
+                                  THEN 'unknown'
                                 WHEN installation.last_success_at IS NOT NULL
                                   THEN 'ready'
                                 ELSE 'unknown'
@@ -1923,6 +1937,7 @@ class BrainStore:
                            COALESCE(installation.device_id,source.source_id),
                            source.source_id""",
                 (tenant_ids,),
+                deadline_at,
             ).fetchall()
         return [dict(row) for row in rows]
 

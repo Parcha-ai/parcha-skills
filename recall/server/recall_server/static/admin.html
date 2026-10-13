@@ -31,6 +31,12 @@
       </div>
     </section>
 
+    <section id="bootstrap-status" class="load-status" role="status" aria-live="polite">
+      <p id="bootstrap-message">Loading destinations and connections…</p>
+      <button id="bootstrap-retry" type="button" disabled>Retry</button>
+    </section>
+
+    <fieldset id="admin-controls" class="admin-controls" disabled aria-busy="true">
     <section class="brain-strip" aria-labelledby="brains-title">
       <div class="section-heading">
         <p>DESTINATIONS</p>
@@ -43,6 +49,10 @@
       <div class="section-heading fleet-heading">
         <div><p>OPERATIONS</p><h2 id="fleet-title">Ingestion</h2></div>
         <p class="fleet-note">What arrived, where it came from, and what needs attention.</p>
+      </div>
+      <div id="fleet-status" class="load-status" role="status" aria-live="polite">
+        <p id="fleet-message">Ingestion status will load after your destinations.</p>
+        <button id="fleet-retry" type="button" disabled>Retry status</button>
       </div>
       <div id="fleet-summary" class="fleet-summary" aria-live="polite"></div>
       <div id="fleet-list" class="fleet-list" aria-live="polite"></div>
@@ -95,7 +105,7 @@
           <div class="provider-kicker">REMOTE · OAUTH 2.0 · READ ONLY</div>
           <h3>Google Workspace</h3>
           <p>Mail, meetings, people, and working documents. Ask only for the services you switch on.</p>
-          <div id="google-connection" class="connection-state">Not connected</div>
+          <div id="google-connection" class="connection-state">Loading connection state…</div>
         </div>
         <form id="google-form" class="route-matrix">
           <label class="provider-choice" for="google-auth-provider">
@@ -117,7 +127,7 @@
           <div class="provider-kicker">REMOTE · OAUTH 2.0</div>
           <h3>Slack</h3>
           <p>Messages, threads, people, edits, deletions, and file references from every accessible channel.</p>
-          <div id="slack-connection" class="connection-state">Not connected</div>
+          <div id="slack-connection" class="connection-state">Loading connection state…</div>
         </div>
         <form id="slack-form" class="route-matrix">
           <div class="matrix-head"><span>Source</span><span>Destination</span><span>On</span></div>
@@ -142,6 +152,7 @@
       </div>
       <div id="installation-list" class="installation-list"></div>
     </section>
+    </fieldset>
   </main>
 
   <dialog id="auth-dialog" class="auth-dialog">
@@ -150,7 +161,8 @@
       <h2>Open the switchboard.</h2>
       <p id="oauth-copy">Use the same identity you use from Claude and Codex.</p>
       <a id="oauth-login" class="oauth-login" href="/admin/login" hidden>Continue with Descope <span aria-hidden="true">→</span></a>
-      <details id="legacy-login">
+      <button id="auth-retry" type="button">Reload sign-in options</button>
+      <details id="legacy-login" open>
         <summary>Use a legacy admin key</summary>
         <p>The key is exchanged for a short browser session and never placed in a URL.</p>
         <label for="admin-token">Admin access key</label>

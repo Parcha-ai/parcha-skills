@@ -24,6 +24,8 @@ class SlackEventResult:
     workspace_id: str | None = None
     webhook: dict[str, Any] | None = None
     challenge: str | None = None
+    channel_id: str | None = None
+    channel_type: str | None = None
 
 
 def verify_slack_signature(
@@ -88,6 +90,9 @@ def slack_event_to_webhook(
     channel_id = event.get("channel")
     if not isinstance(channel_id, str):
         raise ConnectorContractError("slack event channel is invalid")
+    channel_type = event.get("channel_type")
+    if channel_type is not None and not isinstance(channel_type, str):
+        raise ConnectorContractError("slack event channel type is invalid")
     record = normalize_slack_message(
         workspace_id=workspace_id, channel_id=channel_id, value=event,
         provenance_surface="events",
@@ -101,6 +106,8 @@ def slack_event_to_webhook(
         event_id=event_id,
         retry_number=retry,
         workspace_id=workspace_id,
+        channel_id=channel_id,
+        channel_type=channel_type,
         webhook={
             "schema_version": 1,
             "event_id": record.native_id,

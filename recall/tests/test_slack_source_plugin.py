@@ -378,7 +378,7 @@ class SlackSourcePluginTest(unittest.TestCase):
         migrated = json.loads(page.next_cursor)
 
         self.assertTrue(page.has_more)
-        self.assertEqual(migrated["v"], 3)
+        self.assertEqual(migrated["v"], 4)
         self.assertEqual(migrated["coverage"], "member")
         self.assertEqual(migrated["phase"], "discover")
         self.assertEqual(migrated["watermark"], "2026-08-01T00:00:00Z")
@@ -415,7 +415,7 @@ class SlackSourcePluginTest(unittest.TestCase):
 
         migrated = json.loads(connector.pull(previous).next_cursor)
 
-        self.assertEqual(migrated["v"], 3)
+        self.assertEqual(migrated["v"], 4)
         self.assertEqual(migrated["coverage"], "public")
         self.assertEqual(migrated["watermark"], "1970-01-01T00:00:00Z")
         self.assertEqual(migrated["cycle"], 0)

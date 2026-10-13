@@ -86,6 +86,10 @@ class Archive:
 
 
 class Projector(CanonicalLogicalEvidenceProjector):
+    def _check_candidate_current(self, candidate):
+        # Scheduler-only fake; real queue authority is covered by PostgreSQL tests.
+        return None
+
     def __init__(self, store, archive, rows):
         super().__init__(store, archive, bound_tenant_id='tenant:synthetic')
         self.rows = rows

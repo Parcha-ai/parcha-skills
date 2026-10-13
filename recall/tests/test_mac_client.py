@@ -19,7 +19,7 @@ from client.mac import (
     CanonicalBrainWriter,
     CanonicalClientError,
     ExportImporter,
-    MAX_CANONICAL_ARCHIVE_BYTES,
+    JSON_CANONICAL_ARCHIVE_BYTES,
     MAX_CANONICAL_INGEST_EVENTS,
     MAX_INGEST_BYTES,
     MemoryClient,
@@ -501,7 +501,7 @@ class CanonicalV2ClientTest(unittest.TestCase):
             )
         opened.assert_not_called()
 
-    def test_archive_payload_ceiling_fits_server_wire_boundary(self) -> None:
+    def test_archive_json_threshold_fits_wire_and_larger_payload_uses_binary(self) -> None:
         archive = CanonicalArchiveClient(
             endpoint="https://brain.example.invalid",
             token="synthetic",
@@ -509,7 +509,7 @@ class CanonicalV2ClientTest(unittest.TestCase):
             tenant_id="tenant:personal",
             principal_id="principal:owner",
         )
-        payload = b"x" * MAX_CANONICAL_ARCHIVE_BYTES
+        payload = b"x" * JSON_CANONICAL_ARCHIVE_BYTES
         with mock.patch(
             "client.mac.open_no_redirect",
             return_value=FakeResponse(201, {"status": "synthetic"}),
@@ -525,19 +525,21 @@ class CanonicalV2ClientTest(unittest.TestCase):
         request = opened.call_args.args[0]
         self.assertLessEqual(len(request.data), 12 * 1024 * 1024)
 
-        with (
-            mock.patch("client.mac.open_no_redirect") as rejected,
-            self.assertRaises(ValueError),
-        ):
+        with mock.patch(
+            "client.mac.open_no_redirect",
+            return_value=FakeResponse(201, {"status": "synthetic"}),
+        ) as opened:
             archive.put_raw(
-                tenant_id="tenant:personal",
-                source_id="source:personal",
-                native_id="native:over-maximum",
-                payload=payload + b"x",
-                media_type="application/octet-stream",
-                created_at="2026-08-11T00:00:00Z",
+                tenant_id="tenant:personal", source_id="source:personal",
+                native_id="native:over-json-threshold", payload=payload + b"x",
+                media_type="application/octet-stream", created_at="2026-08-11T00:00:00Z",
             )
-        rejected.assert_not_called()
+        request = opened.call_args.args[0]
+        self.assertEqual(request.data, payload + b"x")
+        self.assertEqual(request.get_header("Content-type"), "application/octet-stream")
+        metadata = json.loads(request.get_header("X-recall-archive-metadata"))
+        self.assertEqual(metadata["content_sha256"], hashlib.sha256(request.data).hexdigest())
+        self.assertNotIn("payload_base64", metadata)
 
     def test_archive_retries_transient_transport_failure_idempotently(self) -> None:
         payload = b'{"raw":"synthetic-retry"}'

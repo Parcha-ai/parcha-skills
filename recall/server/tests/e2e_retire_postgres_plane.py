@@ -31,6 +31,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(SERVER))
 
 from e2e_lossless_passages import SyntheticEmbeddingRuntime  # noqa: E402
+from tests.schema_versions import expected_schema_versions  # noqa: E402
 from recall_server import SCHEMA_VERSION, RETIRE_POSTGRES_PLANE_VERSION  # noqa: E402
 from recall_server.archive import FilesystemArchiveStore  # noqa: E402
 from recall_server.canonical import CanonicalArchiveGateway, CanonicalPlane  # noqa: E402
@@ -299,10 +300,10 @@ def main() -> None:
         # 6. idempotent: a second retirement run and a plain run change nothing.
         again, _ = cli("migrate", "--retire-postgres-plane")
         assert again["applied"] == [] and again["deferred"] == [], again
-        assert again["skipped"] == SCHEMA_VERSION, again
+        assert again["skipped"] == len(expected_schema_versions()), again
         again, _ = cli("migrate")
         assert again["applied"] == [] and again["postgres_vector_plane"] == "retired", again
-        assert recorded_versions(reader) == list(range(1, SCHEMA_VERSION + 1))
+        assert recorded_versions(reader) == expected_schema_versions()
 
         # 7. a postgres-plane store refuses to start against the retired schema.
         os.environ["RECALL_SEARCH_PLANE"] = "postgres"

@@ -16,6 +16,7 @@ RECALL = Path(__file__).resolve().parents[2]
 SERVER = RECALL / "server"
 sys.path.insert(0, str(SERVER))
 
+from tests.schema_versions import expected_schema_versions  # noqa: E402
 from recall_server import MANDATORY_SCHEMA_VERSION, RETIRE_POSTGRES_PLANE_VERSION, SCHEMA_VERSION  # noqa: E402
 from recall_server.capabilities import (  # noqa: E402
     CAPABILITY_SQL,
@@ -36,7 +37,7 @@ def healthy_snapshot() -> dict:
     return {
         "server_version_num": 170000,
         "vector_version": "0.8.1",
-        "migration_versions": list(range(1, SCHEMA_VERSION + 1)),
+        "migration_versions": expected_schema_versions(),
         "postgres_vector_plane_present": False,
         "ssl_in_use": True,
         "role": {
@@ -170,7 +171,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
         self.assertEqual(retired["postgres_vector_plane"], "retired")
         # 067 recorded but the table still there, or absent with the table gone.
         for versions, present in (
-            (list(range(1, SCHEMA_VERSION + 1)), True),
+            (expected_schema_versions(), True),
             ([v for v in range(1, MANDATORY_SCHEMA_VERSION + 1)
               if v != RETIRE_POSTGRES_PLANE_VERSION], False),
         ):
@@ -194,11 +195,39 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
                     self.assertEqual(result['schema_version'], version)
                     self.assertEqual(result['postgres_vector_plane'], 'retired' if retired else 'present')
 
+    def test_native_conversation_compatibility_accepts_only_known_optional_marker(self) -> None:
+        for retired in (False, True):
+            for reconciliation in (False, True):
+                with self.subTest(retired=retired, reconciliation=reconciliation):
+                    snapshot = healthy_snapshot()
+                    snapshot["migration_versions"] = [n for n in range(1, 70)
+                                                       if retired or n != 67]
+                    if reconciliation:
+                        snapshot["migration_versions"].append(70)
+                    snapshot["migration_versions"].append(71)
+                    snapshot["postgres_vector_plane_present"] = not retired
+                    result = assess_snapshot(snapshot)
+                    self.assertEqual(result["status"], "ready")
+                    self.assertEqual(result["schema_version"], 71)
+
+    def test_native_conversation_marker_cannot_hide_gaps_or_unknown_versions(self) -> None:
+        complete = list(range(1, 72))
+        for versions in ([n for n in complete if n != 69],
+                         [n for n in complete if n != 68],
+                         complete + [75], complete + [71],
+                         complete[:-2] + [71, 70]):
+            with self.subTest(versions=versions):
+                snapshot = healthy_snapshot()
+                snapshot["migration_versions"] = versions
+                with self.assertRaises(CapabilityError) as raised:
+                    assess_snapshot(snapshot)
+                self.assertEqual(raised.exception.code, "schema_drift")
+
     def test_optional_reconciliation_index_does_not_hide_other_schema_drift(self) -> None:
         complete = list(range(1, 71))
         for versions in ([n for n in complete if n != 68],
                          [n for n in complete if n != 69],
-                         complete + [71], complete + [70],
+                         complete + [75], complete + [70],
                          complete[:-2] + [70, 69]):
             with self.subTest(versions=versions):
                 snapshot = healthy_snapshot()

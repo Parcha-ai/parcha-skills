@@ -12,6 +12,8 @@ import hashlib
 import logging
 import os
 import time
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -40,6 +42,76 @@ SCAN_DIRTY_ALL = "*"
 PART_TIME_BOUND_CHECKPOINT = 128
 
 LOG = logging.getLogger(__name__)
+
+
+class _ScanStreamTiming:
+    """Owner-wall counters; project includes read wait and sinks may upload.
+
+    Only scalar counters survive calls. Progress is checked between operations,
+    so five seconds is a logging cadence, never a deadline on a blocked call.
+    """
+
+    def __init__(self):
+        self.started = self.last_log = time.perf_counter()
+        self.seconds = dict.fromkeys(("preserve", "passage", "read", "project"), 0.0)
+        self.calls = dict.fromkeys(self.seconds, 0)
+        self.failed = False
+        self.finished = False
+
+    @contextmanager
+    def measure(self, phase):
+        started = time.perf_counter()
+        try:
+            yield
+        except BaseException:
+            self.failed = True
+            raise
+        finally:
+            self.seconds[phase] += time.perf_counter() - started
+            self.calls[phase] += 1
+            self.report()
+
+    def call(self, phase, function, *args, **kwargs):
+        with self.measure(phase):
+            return function(*args, **kwargs)
+
+    def passages(self, iterable):
+        iterator = iter(iterable)
+        try:
+            while True:
+                # Exhaustion is normal, and its final fetch time still counts.
+                with self.measure("passage"):
+                    passage = next(iterator, None)
+                if passage is None:
+                    return
+                yield passage
+        finally:
+            close = getattr(iterator, "close", None)
+            if close is not None:
+                close()
+
+    def report(self, *, finished=False, upload_ms=-1):
+        if self.finished:
+            return
+        now = time.perf_counter()
+        if not finished and now - self.last_log < 5.0:
+            return
+        self.last_log = now
+        self.finished = finished
+        try:
+            LOG.info(
+                "parquet stage timing finished=%s failed=%s elapsed_ms=%s "
+                "preserve_ms=%s preserve_calls=%s passage_ms=%s passage_calls=%s "
+                "read_ms=%s read_calls=%s project_ms=%s project_calls=%s upload_ms=%s",
+                int(finished), int(self.failed), round((now - self.started) * 1000),
+                round(self.seconds["preserve"] * 1000), self.calls["preserve"],
+                round(self.seconds["passage"] * 1000), self.calls["passage"],
+                round(self.seconds["read"] * 1000), self.calls["read"],
+                round(self.seconds["project"] * 1000), self.calls["project"],
+                upload_ms,
+            )
+        except Exception:
+            pass
 
 
 class ParquetScanError(RuntimeError):
@@ -72,6 +144,117 @@ def _preserved_fragment_rows(
     except pa.ArrowInvalid:
         raise _DerivedFragmentUnavailable("parquet_scan_fragment_unavailable") from None
 
+
+
+PART_READ_AHEAD_TASKS = 32
+PART_READ_AHEAD_BYTES = 8 * 1024 * 1024
+
+
+def _part_overlaps(part: dict[str, Any], start: datetime, end: datetime) -> bool:
+    first, last = part.get("first_occurred_at"), part.get("last_occurred_at")
+    if (first is None) != (last is None):
+        raise ParquetScanError("parquet_scan_state_invalid")
+    if first is None:
+        return True
+    first, last = _timestamp(first), _timestamp(last)
+    if first > last:
+        raise ParquetScanError("parquet_scan_state_invalid")
+    return last >= start and first < end
+
+
+def _read_ahead_parts(documents, start, end):
+    for document in documents:
+        for part in document["parts"]:
+            try:
+                overlaps = _part_overlaps(part, start, end)
+            except ParquetScanError:
+                # Stop speculation. The sequential owner raises this error at
+                # its original document/part position, after preceding work.
+                return
+            if overlaps:
+                yield part
+
+
+class _PartReadAhead:
+    """Ordered immutable reads; queued AND consumed bodies reserve byte space.
+
+    Oversized parts drain the window and use the original owner-thread read.
+    This is a working-set bound, never a limit on accepted evidence size.
+    """
+
+    def __init__(self, archive: Any, parts: Iterable[dict[str, Any]]):
+        self.archive = archive
+        self.parts = iter(parts)
+        self.next_part = None
+        self.pending: deque[tuple[dict[str, Any], int, Future | None]] = deque()
+        self.executor: ThreadPoolExecutor | None = None
+        self.reserved_bytes = 0
+        self.consuming_bytes = 0
+        self.exhausted = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        for _, _, future in self.pending:
+            if future is not None:
+                future.cancel()
+        if self.executor is not None:
+            self.executor.shutdown(wait=True, cancel_futures=True)
+        self.pending.clear()
+        self.next_part = None
+        self.reserved_bytes = self.consuming_bytes = 0
+
+    def _read(self, part):
+        return self.archive.read_raw(_reference(part))
+
+    def _fill(self):
+        while len(self.pending) < PART_READ_AHEAD_TASKS:
+            if self.next_part is None:
+                if self.exhausted:
+                    return
+                self.next_part = next(self.parts, None)
+                if self.next_part is None:
+                    self.exhausted = True
+                    return
+            part = self.next_part
+            try:
+                size = int(part["size_bytes"])
+            except (KeyError, TypeError, ValueError) as error:
+                failed = Future()
+                failed.set_exception(error)
+                self.pending.append((part, 0, failed))
+                self.exhausted = True
+                self.next_part = None
+                return
+            if size > PART_READ_AHEAD_BYTES:
+                if not self.pending:
+                    self.pending.append((part, 0, None))
+                    self.next_part = None
+                return
+            if self.reserved_bytes + size > PART_READ_AHEAD_BYTES:
+                return
+            if self.executor is None:
+                self.executor = ThreadPoolExecutor(
+                    max_workers=PART_READ_AHEAD_TASKS,
+                    thread_name_prefix="recall-scan-read",
+                )
+            self.reserved_bytes += size
+            self.pending.append((part, size, self.executor.submit(self._read, part)))
+            self.next_part = None
+
+    def __call__(self, part: dict[str, Any]) -> bytes:
+        # The owner releases the previous raw payload before requesting another.
+        self.reserved_bytes -= self.consuming_bytes
+        self.consuming_bytes = 0
+        self._fill()
+        expected, size, future = self.pending.popleft()
+        if expected is not part:
+            raise ParquetScanError("parquet_scan_state_invalid")
+        if future is None:
+            return self.archive.read_raw(_reference(part))
+        self.consuming_bytes = size
+        return future.result()
 
 def _month(value: date | datetime | str) -> date:
     if isinstance(value, str):
@@ -1063,6 +1246,7 @@ class CanonicalParquetScanProjector:
         record_sink: Callable[[dict[str, Any]], None] | None = None,
         actor_sink: Callable[[dict[str, Any]], None] | None = None,
         collect: bool = True,
+        read_part: Callable[[dict[str, Any]], bytes] | None = None,
     ) -> DocumentProjection:
         document_links = document.get("actor_links") or []
         actor_names = {
@@ -1077,18 +1261,11 @@ class CanonicalParquetScanProjector:
         first = last = None
         for part in document["parts"]:
             known_first = part.get("first_occurred_at")
-            known_last = part.get("last_occurred_at")
-            if (known_first is None) != (known_last is None):
-                raise ParquetScanError("parquet_scan_state_invalid")
-            if known_first is not None:
-                part_first = _timestamp(known_first)
-                part_last = _timestamp(known_last)
-                if part_first > part_last:
-                    raise ParquetScanError("parquet_scan_state_invalid")
-                if part_last < bucket_start or part_first >= bucket_end:
-                    continue
+            if not _part_overlaps(part, bucket_start, bucket_end):
+                continue
             try:
-                payload = self.archive.read_raw(_reference(part))
+                payload = (read_part(part) if read_part is not None
+                           else self.archive.read_raw(_reference(part)))
             except ArchiveNotFound:
                 self._requeue_missing_document(document)
                 raise ParquetScanError("parquet_scan_evidence_requeued") from None
@@ -1178,6 +1355,7 @@ class CanonicalParquetScanProjector:
                     actors.extend(projected_actors)
                 first = occurred_at if first is None else min(first, occurred_at)
                 last = occurred_at if last is None else max(last, occurred_at)
+            del payload
             if known_first is None:
                 if observed_first is None or observed_last is None:
                     raise ParquetScanError("parquet_scan_record_invalid")
@@ -1640,92 +1818,98 @@ class CanonicalParquetScanProjector:
         first = last = None
         discovered_bounds: list[PartTimeBound] = []
         removed = tuple(sorted(victims))
+        timing = _ScanStreamTiming()
         try:
-            first, last = self._preserve_rows(
+            first, last = timing.call(
+                "preserve", self._preserve_rows,
                 candidate, catalog, victims, rewrite, documents, upload
             )
-            for passage in self._passages(candidate, sorted(members)):
+            for passage in timing.passages(self._passages(candidate, sorted(members))):
                 upload.add(
                     "passages",
                     self._passage_row(candidate, passage),
                     member=members[passage["logical_document_id"]],
                 )
-            for document in rewrite_documents:
-                member = members[document["logical_document_id"]]
-                upload.claim("documents", member)
-                links = document.get("actor_links") or []
-                projected = self._project_document(
-                    candidate,
-                    document,
-                    bucket_start=bucket_start,
-                    bucket_end=bucket_end,
-                    record_budget=(MAX_SCAN_RECORDS - upload.rows_seen["records"]),
-                    record_sink=lambda row, member=member: upload.add(
-                        "records", row, member=member
-                    ),
-                    actor_sink=lambda row, member=member: upload.add(
-                        "actors", row, member=member
-                    ),
-                    collect=False,
-                )
-                discovered_bounds.extend(projected.part_bounds)
-                if projected.record_count == 0:
-                    continue
-                if (
-                    projected.first_occurred_at is None
-                    or projected.last_occurred_at is None
-                ):
-                    raise ParquetScanError("parquet_scan_state_invalid")
-                ids, names, relations = self._actor_columns(links)
-                upload.add(
-                    "documents",
-                    {
-                        "schema_version": SCAN_SCHEMA_VERSION,
-                        "tenant_id": candidate.tenant_id,
-                        "source_id": candidate.source_id,
-                        "logical_document_id": document["logical_document_id"],
-                        "revision": int(document["revision"]),
-                        "first_occurred_at": projected.first_occurred_at,
-                        "last_occurred_at": projected.last_occurred_at,
-                        "record_count": projected.record_count,
-                        "part_count": int(document["part_count"]),
-                        "document_content_sha256": (
-                            document["document_content_sha256"]
+            with _PartReadAhead(self.archive, _read_ahead_parts(
+                rewrite_documents, bucket_start, bucket_end
+            )) as read_part:
+                for document in rewrite_documents:
+                    member = members[document["logical_document_id"]]
+                    upload.claim("documents", member)
+                    links = document.get("actor_links") or []
+                    projected = timing.call(
+                        "project", self._project_document, candidate,
+                        document,
+                        bucket_start=bucket_start,
+                        bucket_end=bucket_end,
+                        record_budget=(MAX_SCAN_RECORDS - upload.rows_seen["records"]),
+                        record_sink=lambda row, member=member: upload.add(
+                            "records", row, member=member
                         ),
-                        "actor_ids": ids,
-                        "actor_names": names,
-                        "actor_relations": relations,
-                    },
-                    member=member,
-                )
-                for actor_id, display_name, relation in zip(
-                    ids, names, relations, strict=True
-                ):
+                        actor_sink=lambda row, member=member: upload.add(
+                            "actors", row, member=member
+                        ),
+                        collect=False,
+                        read_part=lambda part: timing.call("read", read_part, part),
+                    )
+                    discovered_bounds.extend(projected.part_bounds)
+                    if projected.record_count == 0:
+                        continue
+                    if (
+                        projected.first_occurred_at is None
+                        or projected.last_occurred_at is None
+                    ):
+                        raise ParquetScanError("parquet_scan_state_invalid")
+                    ids, names, relations = self._actor_columns(links)
                     upload.add(
-                        "actors",
+                        "documents",
                         {
                             "schema_version": SCAN_SCHEMA_VERSION,
                             "tenant_id": candidate.tenant_id,
                             "source_id": candidate.source_id,
                             "logical_document_id": document["logical_document_id"],
                             "revision": int(document["revision"]),
-                            "record_ordinal": None,
-                            "actor_id": actor_id,
-                            "display_name": display_name,
-                            "relation": relation,
+                            "first_occurred_at": projected.first_occurred_at,
+                            "last_occurred_at": projected.last_occurred_at,
+                            "record_count": projected.record_count,
+                            "part_count": int(document["part_count"]),
+                            "document_content_sha256": (
+                                document["document_content_sha256"]
+                            ),
+                            "actor_ids": ids,
+                            "actor_names": names,
+                            "actor_relations": relations,
                         },
                         member=member,
                     )
-                first = (
-                    projected.first_occurred_at
-                    if first is None
-                    else min(first, projected.first_occurred_at)
-                )
-                last = (
-                    projected.last_occurred_at
-                    if last is None
-                    else max(last, projected.last_occurred_at)
-                )
+                    for actor_id, display_name, relation in zip(
+                        ids, names, relations, strict=True
+                    ):
+                        upload.add(
+                            "actors",
+                            {
+                                "schema_version": SCAN_SCHEMA_VERSION,
+                                "tenant_id": candidate.tenant_id,
+                                "source_id": candidate.source_id,
+                                "logical_document_id": document["logical_document_id"],
+                                "revision": int(document["revision"]),
+                                "record_ordinal": None,
+                                "actor_id": actor_id,
+                                "display_name": display_name,
+                                "relation": relation,
+                            },
+                            member=member,
+                        )
+                    first = (
+                        projected.first_occurred_at
+                        if first is None
+                        else min(first, projected.first_occurred_at)
+                    )
+                    last = (
+                        projected.last_occurred_at
+                        if last is None
+                        else max(last, projected.last_occurred_at)
+                    )
             self._persist_part_bounds(discovered_bounds)
             if upload.rows_seen["documents"] == 0 and len(ensure_datasets) == len(
                 SCAN_DATASETS
@@ -1767,6 +1951,7 @@ class CanonicalParquetScanProjector:
                 documents_rewritten=len(rewrite_documents),
             )
         except Exception as error:
+            timing.failed = True
             try:
                 upload.abort()
             except Exception:
@@ -1774,8 +1959,11 @@ class CanonicalParquetScanProjector:
             if isinstance(error, _DerivedFragmentUnavailable) and not _rebuild:
                 # One canonical rebuild, after staged objects are handed to
                 # cleanup. Never retry transport, ownership or publication errors.
+                timing.report(finished=True, upload_ms=upload.upload_ms)
                 return self._build(candidate, _rebuild=True)
             raise
+        finally:
+            timing.report(finished=True, upload_ms=upload.upload_ms)
         finished = time.perf_counter()
         LOG.info(
             "parquet build documents=%s rewritten=%s dirty=%s passages=%s records=%s "

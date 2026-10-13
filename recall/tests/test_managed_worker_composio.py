@@ -215,6 +215,7 @@ class ManagedWorkerComposioTests(unittest.TestCase):
             self.assertIsInstance(connector.rail, SlackPublicHistoryRail)
             self.assertIsNot(connector.rail, stale_bot_only_rail)
             self.assertTrue(connector.public_history)
+            self.assertEqual(connector.page_size, 100)
             self.assertEqual(
                 {path.name for path in private.iterdir()},
                 {"slack-bot-authority", "slack-user-authority"},

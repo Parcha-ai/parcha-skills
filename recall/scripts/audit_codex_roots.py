@@ -31,7 +31,7 @@ def audit_roots(
     parquet_queue_depth: int | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
-    locations: dict[str, list[Path]] = defaultdict(list)
+    locations: dict[tuple[str, str | None], list[Path]] = defaultdict(list)
     roots: dict[str, dict[str, Any]] = {}
     total_files = 0
     total_bytes = 0
@@ -49,7 +49,7 @@ def audit_roots(
                 identity = resolve_codex_session_identity(path)
                 statuses[identity.status] += 1
                 if identity.native_session_id is not None:
-                    locations[identity.native_session_id].append(path)
+                    locations[(identity.native_session_id, identity.segment_id)].append(path)
         roots[lifecycle] = {
             "root_present": root.is_dir(),
             "files": file_count,
@@ -79,7 +79,7 @@ def audit_roots(
             6,
         ),
         "duplicates": {
-            "session_ids": len(duplicate_groups),
+            "session_ids": len({session for (session, _), paths in locations.items() if len(paths) > 1}),
             "byte_identical": identical,
             "divergent": divergent,
         },

@@ -7,11 +7,15 @@ import io
 import json
 import pickle
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
+import threading
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from itertools import groupby
-from typing import Any
+from time import perf_counter as _phase_clock
+from typing import Any, Callable
 
 import orjson
 import psycopg
@@ -41,12 +45,34 @@ DEFAULT_EXCLUDED_STRUCTURAL_TYPES = (
     "turn_context",
 )
 LOG = logging.getLogger(__name__)
+PROJECTION_PROGRESS_INTERVAL_SECONDS = 5.0
 MAX_LOGICAL_EVIDENCE_BATCH_SIZE = 10_000
 # A queued group is retried with exponential backoff (60 s doubling, capped
 # at 6 h) and quarantined after this many failed projection attempts.
 MAX_LOGICAL_ATTEMPTS = 8
 LOGICAL_BACKOFF_BASE_SECONDS = 60
 LOGICAL_BACKOFF_CAP_SECONDS = 6 * 3600
+
+
+@contextmanager
+def _phase_timing(phase: str):
+    """Operation wall time; unsuccessful calls omit unknown result counts."""
+    started = _phase_clock()
+    succeeded = False
+    counts: dict[str, int] = {}
+    try:
+        yield counts
+        succeeded = True
+    finally:
+        try:
+            suffix = "".join(f" {key}={counts[key]}" for key in
+                             ("completed", "deleted", "failures", "pending")
+                             if succeeded and key in counts)
+            LOG.info("logical phase timing phase=%s elapsed_ms=%s succeeded=%s%s",
+                     phase, max(0, round((_phase_clock() - started) * 1000)),
+                     int(succeeded), suffix)
+        except Exception:  # Diagnostic failures must not change owning behavior.
+            pass
 
 
 @dataclass(frozen=True)
@@ -59,6 +85,12 @@ class LogicalGroupCandidate:
     revision: int
     estimated_records: int = 1
     estimated_bytes: int = 1
+    admission_priority: int = 1
+    notification_queued_at: datetime | None = None
+
+
+class _LogicalWorkSuperseded(Exception):
+    """A worker's captured queue state no longer owns this preparation."""
 
 
 class _LocatorSpool:
@@ -131,6 +163,23 @@ def mark_logical_evidence_dirty(
                            THEN 'forget' ELSE excluded.reason END,
                changed_at=clock_timestamp()""",
         (reason, tenant_id, source_id, native_ids),
+    )
+    return max(0, result.rowcount)
+
+
+def mark_logical_notification_pending(
+    connection: Any, *, tenant_id: str, source_id: str, event_id: str,
+) -> int:
+    """Promote existing work after trusted ingress; never create or invalidate it."""
+    result = connection.execute(
+        """UPDATE canonical_evidence_document_queue queue
+              SET notification_queued_at=clock_timestamp()
+             FROM canonical_events event
+            WHERE event.tenant_id=%s AND event.source_id=%s AND event.event_id=%s
+              AND queue.tenant_id=event.tenant_id AND queue.source_id=event.source_id
+              AND queue.native_parent_id=coalesce(event.native_parent_id,event.native_id)
+              AND queue.notification_queued_at IS NULL""",
+        (tenant_id, source_id, event_id),
     )
     return max(0, result.rowcount)
 
@@ -293,6 +342,7 @@ class CanonicalLogicalEvidenceProjector:
         self.retention_profile = retention_profile
         self.cursor_fetch_rows = cursor_fetch_rows
         self._committed_body_keys: dict[tuple[str, str, str], None] = {}
+        self._prefer_recent_admission = False
 
     def _take_committed_body_keys(self) -> tuple[tuple[str, str, str], ...]:
         keys = tuple(self._committed_body_keys)
@@ -493,22 +543,28 @@ class CanonicalLogicalEvidenceProjector:
         limit: int,
         quiet_seconds: float = 0.0,
         max_wait_seconds: float = 0.0,
+        prefer_recent: bool = False,
     ) -> list[LogicalGroupCandidate]:
         """Queued groups ready to project.
 
         With a quiet period, a group is ready only once it has not changed for
         `quiet_seconds`, or has been waiting longer than `max_wait_seconds`
         since it first entered the queue. Forget and backfill never wait.
-        Admit one ready group per source before another source's second group;
-        forget takes precedence. Join archive size estimates only after the
-        bounded admission, so a bulk backfill cannot monopolize the batch.
+        Give each source's ready head a floor, then share residual admission
+        by eligible backlog. Forget takes precedence and retains its existing
+        ordering. Normal groups use oldest-first order unless this is a
+        recent-change round. Recent rounds prioritize trusted notifications FIFO,
+        then fall back to recent changes. Oldest rounds retain every source's
+        admission floor before in-flight exclusion. Join archive size estimates
+        only after bounded admission.
         """
         with self.store.connect() as connection:
             rows = connection.execute(
                 """WITH eligible AS MATERIALIZED (
                        SELECT queue.*,
-                              CASE WHEN queue.reason='forget' THEN 0 ELSE 1 END
-                                  AS admission_priority
+                              CASE WHEN queue.reason='forget' THEN 0
+                                   WHEN %s AND queue.notification_queued_at IS NOT NULL THEN 1
+                                   ELSE 2 END AS admission_priority
                          FROM canonical_evidence_document_queue queue
                          WHERE (%s::text IS NULL OR queue.tenant_id=%s)
                            AND queue.attempts<%s
@@ -531,20 +587,33 @@ class CanonicalLogicalEvidenceProjector:
                        SELECT eligible.*,
                               row_number() OVER (
                                   PARTITION BY tenant_id,source_id
-                                  ORDER BY admission_priority,first_queued_at,
+                                  ORDER BY admission_priority,
+                                           CASE WHEN admission_priority=1
+                                                THEN notification_queued_at END,
+                                           CASE WHEN %s AND admission_priority>1
+                                                THEN changed_at END DESC,
+                                           first_queued_at,
                                            native_parent_id
-                              ) AS source_position
+                              ) AS source_position,
+                              count(*) OVER (PARTITION BY tenant_id,source_id)
+                                  AS source_backlog
                          FROM eligible
                    ), admitted AS MATERIALIZED (
                        SELECT * FROM ranked
-                        ORDER BY admission_priority,source_position,first_queued_at,
-                                 tenant_id,source_id,native_parent_id
+                        ORDER BY admission_priority,
+                                 CASE WHEN admission_priority=0 THEN source_position
+                                      WHEN source_position=1 THEN 0 ELSE 1 END,
+                                 CASE WHEN admission_priority>0 AND source_position>1
+                                      THEN source_position::numeric/source_backlog ELSE 0 END,
+                                 first_queued_at,tenant_id,source_id,native_parent_id
                         LIMIT %s
                    )
                    SELECT queue.tenant_id,queue.source_id,
                           queue.native_parent_id,
                           queue.changed_at AS source_updated_at,
-                          queue.generation,
+                          queue.generation,queue.admission_priority,
+                          CASE WHEN queue.admission_priority=1
+                               THEN queue.notification_queued_at END AS notification_queued_at,
                           COALESCE(evidence.revision,0)+1 AS revision,
                           COALESCE(evidence.record_count,1)
                               AS estimated_records,
@@ -568,14 +637,20 @@ class CanonicalLogicalEvidenceProjector:
                                      =evidence.logical_document_id
                                  AND part.revision=evidence.revision
                      ) evidence_size ON true
-                    ORDER BY queue.admission_priority,queue.source_position,
+                    ORDER BY queue.admission_priority,
+                             CASE WHEN queue.admission_priority=0 THEN queue.source_position
+                                  WHEN queue.source_position=1 THEN 0 ELSE 1 END,
+                             CASE WHEN queue.admission_priority>0 AND queue.source_position>1
+                                  THEN queue.source_position::numeric/queue.source_backlog ELSE 0 END,
                              queue.first_queued_at,queue.tenant_id,
                              queue.source_id,queue.native_parent_id""",
                 (
+                    prefer_recent,
                     tenant_id, tenant_id,
                     MAX_LOGICAL_ATTEMPTS,
                     quiet_seconds, quiet_seconds,
                     max_wait_seconds, max_wait_seconds,
+                    prefer_recent,
                     limit,
                 ),
             ).fetchall()
@@ -589,6 +664,8 @@ class CanonicalLogicalEvidenceProjector:
                 revision=int(row["revision"]),
                 estimated_records=max(1, int(row["estimated_records"])),
                 estimated_bytes=max(1, int(row["estimated_bytes"])),
+                admission_priority=int(row["admission_priority"]),
+                notification_queued_at=row.get("notification_queued_at"),
             )
             for row in rows
         ]
@@ -716,13 +793,27 @@ class CanonicalLogicalEvidenceProjector:
             " quarantined" if attempts >= MAX_LOGICAL_ATTEMPTS else "",
         )
 
+    def _check_candidate_current(self, candidate: LogicalGroupCandidate) -> None:
+        with self.store.connect() as connection:
+            queued = connection.execute(
+                """SELECT generation,changed_at
+                     FROM canonical_evidence_document_queue
+                    WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s""",
+                (candidate.tenant_id, candidate.source_id, candidate.native_parent_id),
+            ).fetchone()
+        if (queued is None or queued["generation"] != candidate.generation
+                or queued["changed_at"] != candidate.source_updated_at):
+            raise _LogicalWorkSuperseded
+
     def _prepare_batch_and_upload(
         self,
         candidates: tuple[LogicalGroupCandidate, ...],
-        *, hint_limit: int = 32,
+        *, hint_limit: int = 32, require_current_queue: bool = False,
     ) -> list[LogicalEvidenceUpload | None]:
         if not candidates:
             return []
+        if require_current_queue and len(candidates) != 1:
+            raise ValueError("queue currentness checkpoint requires one worker parent")
         uploads: list[LogicalEvidenceUpload | None] = [None] * len(candidates)
         completed: list[LogicalEvidenceUpload] = []
         spool = tempfile.TemporaryFile(mode="w+b")
@@ -937,6 +1028,20 @@ class CanonicalLogicalEvidenceProjector:
                             # accepted as input from another process or source.
                             pickle.dump(dict(row), input_spool, protocol=5)
                         input_ranges.append((ordinal, start, input_spool.tell()))
+            # Worker-only checkpoint: direct corpus audits can prepare groups
+            # without queued work. Stop obsolete workers before archive reads,
+            # re-encoding or uploads; the final commit CAS remains authoritative.
+            checkpoint = None
+            if require_current_queue:
+                self._check_candidate_current(candidates[0])
+                next_current_check = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
+
+                def checkpoint():
+                    nonlocal next_current_check
+                    if time.monotonic() >= next_current_check:
+                        self._check_candidate_current(candidates[0])
+                        next_current_check = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
+
             # Archive recovery and oversized raw restoration run only after
             # the input cursor and its pool connection have been released.
             for ordinal, start, end in input_ranges:
@@ -948,6 +1053,8 @@ class CanonicalLogicalEvidenceProjector:
                 def resolved_rows():
                     nonlocal lookup
                     while input_spool.tell() < end:
+                        if checkpoint is not None:
+                            checkpoint()
                         row = pickle.load(input_spool)
                         try:
                             _validate_source_body(row)
@@ -959,6 +1066,7 @@ class CanonicalLogicalEvidenceProjector:
                                     manifest=pins.get(ordinal),
                                     parts=pinned_parts.get(ordinal, ()),
                                     reference=self._reference,
+                                    checkpoint=checkpoint,
                                 )
                             row = lookup.restore(row)
                             _validate_source_body(row)
@@ -975,7 +1083,11 @@ class CanonicalLogicalEvidenceProjector:
                 locations = body_locators[ordinal] = _LocatorSpool()
                 try:
                     for record in self._record_stream(resolved_rows(), locate=locations.append):
+                        if checkpoint is not None:
+                            checkpoint()
                         spool.write(record.encode(source_id=candidate.source_id))
+                    if checkpoint is not None:
+                        checkpoint()
                 finally:
                     if lookup is not None:
                         lookup.close()
@@ -1017,6 +1129,10 @@ class CanonicalLogicalEvidenceProjector:
                 completed.append(upload)
             transferred = True
             return uploads
+        except _LogicalWorkSuperseded:
+            # The checkpoint precedes every upload. There is nothing to reap;
+            # finally still closes the SQL/input spools and local locators.
+            raise
         except Exception:
             for upload in completed:
                 self._schedule_cleanup(upload.cleanup_references)
@@ -1256,6 +1372,21 @@ class CanonicalLogicalEvidenceProjector:
         limit: int = 500,
         concurrency: int = 1,
     ) -> dict[str, int | str]:
+        with _phase_timing("cleanup") as counts:
+            result = self._drain_cleanup(
+                tenant_id=tenant_id, limit=limit, concurrency=concurrency,
+            )
+            counts.update({key: int(result[key]) for key in
+                           ("completed", "deleted", "failures", "pending")})
+            return result
+
+    def _drain_cleanup(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int = 500,
+        concurrency: int = 1,
+    ) -> dict[str, int | str]:
         if (
             not 1 <= limit <= 5_000
             or isinstance(concurrency, bool)
@@ -1443,7 +1574,7 @@ class CanonicalLogicalEvidenceProjector:
                     ("logical-evidence\x1f" + prepared.logical_document_id,),
                 )
                 queued = connection.execute(
-                    """SELECT generation,changed_at
+                    """SELECT generation,changed_at,notification_queued_at
                          FROM canonical_evidence_document_queue
                         WHERE tenant_id=%s AND source_id=%s
                           AND native_parent_id=%s
@@ -1537,6 +1668,18 @@ class CanonicalLogicalEvidenceProjector:
                             connection,
                             (manifest_reference,),
                         )
+                    # Read the stamp from the locked queue, not admission:
+                    # a signed duplicate can promote it without a generation change.
+                    connection.execute(
+                        """UPDATE canonical_passage_projection_queue
+                              SET notification_queued_at=least(notification_queued_at,%s)
+                            WHERE tenant_id=%s AND source_id=%s
+                              AND logical_document_id=%s AND revision=%s
+                              AND %s::timestamptz IS NOT NULL""",
+                        (queued["notification_queued_at"], prepared.tenant_id,
+                         prepared.source_id, prepared.logical_document_id,
+                         current["revision"], queued["notification_queued_at"]),
+                    )
                     deleted = connection.execute(
                         """DELETE FROM canonical_evidence_document_queue
                             WHERE tenant_id=%s AND source_id=%s
@@ -1751,9 +1894,9 @@ class CanonicalLogicalEvidenceProjector:
                 connection.execute(
                     """INSERT INTO canonical_passage_projection_queue(
                            tenant_id,source_id,logical_document_id,revision,
-                           generation,reason,changed_at
+                           generation,reason,changed_at,notification_queued_at
                        ) VALUES (%s,%s,%s,%s,1,'logical-update',
-                                 clock_timestamp())
+                                 clock_timestamp(),%s)
                        ON CONFLICT(
                            tenant_id,source_id,logical_document_id
                        )
@@ -1762,12 +1905,16 @@ class CanonicalLogicalEvidenceProjector:
                            generation=
                                canonical_passage_projection_queue.generation+1,
                            reason='logical-update',
+                           notification_queued_at=least(
+                               canonical_passage_projection_queue.notification_queued_at,
+                               excluded.notification_queued_at),
                            changed_at=clock_timestamp()""",
                     (
                         prepared.tenant_id,
                         prepared.source_id,
                         prepared.logical_document_id,
                         prepared.revision,
+                        queued["notification_queued_at"],
                     ),
                 )
                 ranges = [
@@ -2016,6 +2163,8 @@ class CanonicalLogicalEvidenceProjector:
         quiet_seconds: float = 0.0,
         max_wait_seconds: float = 0.0,
         cleanup_concurrency: int | None = None,
+        on_progress: Callable[[], None] | None = None,
+        on_heartbeat: Callable[[], None] | None = None,
     ) -> dict[str, int | str]:
         if cleanup_concurrency is None:
             cleanup_concurrency = upload_concurrency
@@ -2074,194 +2223,210 @@ class CanonicalLogicalEvidenceProjector:
         cleanup_failures += int(cleanup["failures"])
         cleanup_completed += int(cleanup["completed"])
         cleanup_pending = int(cleanup["pending"])
-        for _ in range(max_batches):
-            candidates = self._pending(
-                tenant_id=tenant_id,
-                limit=batch_size,
-                quiet_seconds=float(quiet_seconds),
-                max_wait_seconds=float(max_wait_seconds),
-            )
-            if not candidates:
-                break
-            worker_count = min(upload_concurrency, len(candidates))
-            # At most 256 identifiers across all uploads, including individual
-            # retries of a failed shard. Large batches can simply omit hints.
-            hint_limit = min(32, 256 // len(candidates))
-            shards: list[list[tuple[int, LogicalGroupCandidate]]] = [
-                [] for _ in range(worker_count)
-            ]
-            shard_loads = [0] * worker_count
-            weighted_candidates = sorted(
-                enumerate(candidates),
-                key=lambda value: (
-                    -value[1].estimated_bytes,
-                    value[0],
-                ),
-            )
-            for index, candidate in weighted_candidates:
-                shard_index = min(
-                    range(worker_count),
-                    key=lambda value: (shard_loads[value], value),
-                )
-                shards[shard_index].append((index, candidate))
-                shard_loads[shard_index] += candidate.estimated_bytes
-            uploads: list[LogicalEvidenceUpload | None] = [None] * len(candidates)
-            successful: list[LogicalEvidenceUpload] = []
-            failed_shards: list[tuple[list[tuple[int, LogicalGroupCandidate]], Exception]] = []
-            skipped: set[int] = set()
-            futures = []
+        # Queue at most one fair batch beyond active owners. The executor can
+        # keep preparing while this coordinator publishes earlier completions.
+        # max_batches still bounds total admissions, including partial batches.
+        worker_count = min(upload_concurrency, batch_size)
+        # Include queued and completed-but-uncollected uploads in the 256-key
+        # hint budget. The coordinator only refills below worker_count futures.
+        hint_limit = min(32, 256 // (batch_size + worker_count - 1))
+        pending = {}
+        remaining_by_batch = {}
+        deferred = set()
+        stopping = threading.Event()
+
+        def parent_key(candidate):
+            return candidate.tenant_id, candidate.source_id, candidate.native_parent_id
+
+        def prepare_parent(candidate):
             try:
-                with ThreadPoolExecutor(
-                    max_workers=worker_count,
-                    thread_name_prefix="recall-logical-evidence",
-                ) as executor:
-                    futures = [
-                        (
-                            shard,
-                            executor.submit(
-                                self._prepare_batch_and_upload,
-                                tuple(candidate for _, candidate in shard),
-                                hint_limit=hint_limit,
-                            ),
-                        )
-                        for shard in shards
-                    ]
-                    for shard, future in futures:
-                        try:
-                            shard_uploads = future.result()
-                        except Exception as error:
-                            failed_shards.append((shard, error))
-                            continue
-                        for (index, _candidate), upload in zip(
-                            shard,
-                            shard_uploads,
-                            strict=True,
-                        ):
-                            uploads[index] = upload
-                            if upload is not None:
-                                successful.append(upload)
-            except BaseException:
-                interrupted_uploads: list[LogicalEvidenceUpload] = []
-                for _shard, future in futures:
-                    if future.cancelled():
-                        continue
-                    try:
-                        shard_uploads = future.result()
-                    except BaseException:
-                        continue
-                    interrupted_uploads.extend(
-                        upload
-                        for upload in shard_uploads
-                        if upload is not None
-                    )
-                self._schedule_upload_cleanup(interrupted_uploads)
-                self.drain_cleanup(
-                    tenant_id=tenant_id,
-                    limit=5_000,
-                    concurrency=cleanup_concurrency,
+                self._check_candidate_current(candidate)
+                (upload,) = self._prepare_batch_and_upload(
+                    (candidate,), hint_limit=hint_limit, require_current_queue=True,
                 )
+            except _LogicalWorkSuperseded:
+                return None, "stale"
+            except Exception as error:
+                self._mark_failed(candidate, error)
+                return None, "failed"
+            if stopping.is_set():
+                if upload is not None:
+                    self._schedule_upload_cleanup([upload])
+                return None, "cancelled"
+            try:
+                return upload, self._commit_upload(candidate, upload)
+            except Exception:
+                # _commit_upload owns cleanup on ordinary commit failure.
                 raise
-            # A failing group must not poison its batch, let alone the
-            # worker: retry the members of a failed multi-group shard one by
-            # one so only the guilty group is backed off; everything else in
-            # the batch commits normally this cycle.
-            for shard, error in failed_shards:
-                if len(shard) == 1:
-                    (index, candidate), = shard
-                    skipped.add(index)
-                    self._mark_failed(candidate, error)
-                    continue
-                for index, candidate in shard:
-                    try:
-                        (upload,) = self._prepare_batch_and_upload(
-                            (candidate,), hint_limit=hint_limit,
-                        )
-                    except Exception as single_error:
-                        skipped.add(index)
-                        self._mark_failed(candidate, single_error)
-                        continue
-                    uploads[index] = upload
-                    if upload is not None:
-                        successful.append(upload)
-            failed += len(skipped)
-            statuses: list[str | None] = [None] * len(candidates)
-            failures: list[Exception] = []
+            except BaseException:
+                if upload is not None:
+                    self._schedule_upload_cleanup([upload])
+                raise
+
+        def owner_log(message, *args):
+            try:
+                LOG.info(message, *args)
+            except Exception:
+                # Diagnostics must never change upload or commit ownership.
+                pass
+
+        def project_parent(candidate):
+            started = time.monotonic()
+            identity = hashlib.sha256(json.dumps(parent_key(candidate)).encode()).hexdigest()
+            status = "error"
+            owner_log("logical owner started parent_sha256=%s estimated_bytes=%s estimated_records=%s",
+                      identity, candidate.estimated_bytes, candidate.estimated_records)
+            try:
+                result = prepare_parent(candidate)
+                status = result[1]
+                return result
+            finally:
+                owner_log("logical owner completed parent_sha256=%s estimated_bytes=%s "
+                          "estimated_records=%s elapsed_ms=%s status=%s",
+                          identity, candidate.estimated_bytes, candidate.estimated_records,
+                          max(0, round((time.monotonic() - started) * 1000)), status)
+
+        def fill_slots(executor):
+            nonlocal batches
+            while len(pending) < worker_count and batches < max_batches:
+                # Oldest rounds retain source floors; notification rounds keep
+                # forget first, then notification FIFO, then recent fallback.
+                # Exclude queued as well as running owners. Overscan only by
+                # these identifiers, never by fetching additional body data.
+                excluded = deferred | {parent_key(item[0]) for item in pending.values()}
+                with _phase_timing("pending"):
+                    candidates = self._pending(
+                        tenant_id=tenant_id,
+                        limit=batch_size + len(excluded),
+                        quiet_seconds=float(quiet_seconds),
+                        max_wait_seconds=float(max_wait_seconds),
+                        prefer_recent=self._prefer_recent_admission,
+                    )
+                candidates = [c for c in candidates if parent_key(c) not in excluded][:batch_size]
+                if not candidates:
+                    break
+                # Reorder only the already admitted finite set. Sorting the
+                # overscanned SQL rows first would change which parents enter.
+                # Preserve notification FIFO through dispatch; cost ordering is
+                # only for ordinary work. Forget still goes first.
+                candidates.sort(key=lambda c: (
+                    c.admission_priority,
+                    c.notification_queued_at or datetime.max.replace(tzinfo=timezone.utc),
+                    c.estimated_bytes,
+                ))
+                # Share capacity across calls, including one-slot rounds.
+                # Notification/recent rounds alternate with oldest backlog.
+                # Empty scans do not consume a turn. A new process starts old.
+                self._prefer_recent_admission = not self._prefer_recent_admission
+                batches += 1
+                remaining_by_batch[batches] = len(candidates)
+                for candidate in candidates:
+                    future = executor.submit(project_parent, candidate)
+                    pending[future] = candidate, batches
+
+        try:
             with ThreadPoolExecutor(
                 max_workers=worker_count,
-                thread_name_prefix="recall-logical-commit",
+                thread_name_prefix="recall-logical-evidence",
             ) as executor:
-                commit_futures = [
-                    (
-                        index,
-                        executor.submit(
-                            self._commit_upload,
-                            candidate,
-                            upload,
-                        ),
-                    )
-                    for index, (candidate, upload) in enumerate(
-                        zip(candidates, uploads, strict=True)
-                    )
-                    if index not in skipped
-                ]
-                for index, future in commit_futures:
-                    try:
-                        statuses[index] = future.result()
-                    except Exception as error:
-                        failures.append(error)
-            if failures:
-                self.drain_cleanup(
-                    tenant_id=tenant_id,
-                    limit=5_000,
-                    concurrency=cleanup_concurrency,
-                )
-                raise failures[0]
-            for index, (upload, status) in enumerate(
-                zip(uploads, statuses, strict=True)
-            ):
-                if index in skipped:
-                    continue
-                if status == "stale":
-                    source_races += 1
-                    continue
-                if status == "adopted":
-                    continue
-                if status == "repaired":
-                    repaired += 1
-                    continue
-                if status == "pruned":
-                    pruned += 1
-                    continue
-                if status != "committed" or upload is None:
-                    raise LogicalEvidenceError("logical_evidence_state_invalid")
-                candidate = candidates[index]
-                inline_ids = getattr(upload, "inline_document_ids", ())
-                if any(not isinstance(value, str) or not 1 <= len(value) <= 255
-                       for value in (candidate.tenant_id, candidate.source_id)):
-                    inline_ids = ()
-                for document_id in inline_ids:
-                    key = (candidate.tenant_id, candidate.source_id, document_id)
-                    self._committed_body_keys[key] = None
-                    if len(self._committed_body_keys) > 256:
-                        del self._committed_body_keys[next(iter(self._committed_body_keys))]
-                documents += 1
-                records += upload.prepared.record_count
-                receipts += upload.prepared.receipt_count
-                objects += len(upload.all_references)
-                bytes_uploaded += sum(
-                    int(reference["size_bytes"]) for reference in upload.all_references
-                )
-            batches += 1
-            cleanup = self.drain_cleanup(
+                try:
+                    fill_slots(executor)
+                    next_progress = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
+                    while pending:
+                        # Also publish already committed outbox work while all
+                        # owners are busy. The same coordinator wakes every five
+                        # seconds; admission still requires a free slot/budget.
+                        idle_slot = len(pending) < worker_count and batches < max_batches
+                        completed, _ = wait(
+                            pending,
+                            timeout=max(0.0, next_progress - time.monotonic())
+                            if idle_slot or on_heartbeat is not None else None,
+                            return_when=FIRST_COMPLETED,
+                        )
+                        publish = False
+                        cleanup_rounds = 0
+                        for future in completed:
+                            candidate, batch = pending.pop(future)
+                            upload, status = future.result()
+                            remaining_by_batch[batch] -= 1
+                            if remaining_by_batch[batch] == 0:
+                                del remaining_by_batch[batch]
+                                cleanup_rounds += 1
+                            if status in {"failed", "stale", "adopted"}:
+                                # Do not repeatedly prepare a hot or failed parent
+                                # whose queue generation stayed eligible this call.
+                                deferred.add(parent_key(candidate))
+                            if status == "failed":
+                                failed += 1
+                                continue
+                            publish |= status in {"committed", "repaired", "pruned"}
+                            if status == "stale":
+                                source_races += 1
+                                continue
+                            if status == "adopted":
+                                continue
+                            if status == "repaired":
+                                repaired += 1
+                                continue
+                            if status == "pruned":
+                                pruned += 1
+                                continue
+                            if status != "committed" or upload is None:
+                                raise LogicalEvidenceError("logical_evidence_state_invalid")
+                            inline_ids = getattr(upload, "inline_document_ids", ())
+                            if any(not isinstance(value, str) or not 1 <= len(value) <= 255
+                                   for value in (candidate.tenant_id, candidate.source_id)):
+                                inline_ids = ()
+                            for document_id in inline_ids:
+                                key = (candidate.tenant_id, candidate.source_id, document_id)
+                                self._committed_body_keys[key] = None
+                                if len(self._committed_body_keys) > 256:
+                                    del self._committed_body_keys[next(iter(self._committed_body_keys))]
+                            documents += 1
+                            records += upload.prepared.record_count
+                            receipts += upload.prepared.receipt_count
+                            objects += len(upload.all_references)
+                            bytes_uploaded += sum(
+                                int(reference["size_bytes"]) for reference in upload.all_references
+                            )
+                        # Keep parent preparation running during publication. The
+                        # coordinator remains the sole owner of downstream work.
+                        fill_slots(executor)
+                        if publish:
+                            if on_progress is not None:
+                                on_progress()
+                            next_progress = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
+                        elif time.monotonic() >= next_progress:
+                            # Idle publication must not retry missing passages:
+                            # requeuing them would invalidate this rebuild.
+                            if on_heartbeat is not None:
+                                on_heartbeat()
+                            next_progress = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
+                        for _ in range(cleanup_rounds):
+                            cleanup = self.drain_cleanup(
+                                tenant_id=tenant_id,
+                                limit=5_000,
+                                concurrency=cleanup_concurrency,
+                            )
+                            old_objects_deleted += int(cleanup["deleted"])
+                            cleanup_failures += int(cleanup["failures"])
+                            cleanup_completed += int(cleanup["completed"])
+                            cleanup_pending = int(cleanup["pending"])
+                except BaseException:
+                    stopping.set()
+                    for future in pending:
+                        future.cancel()
+                    raise
+        except BaseException:
+            # Shutdown settles active owners before cleanup. Cancelled queued
+            # parents never uploaded; active uploads committed or were queued to reap.
+            self.drain_cleanup(
                 tenant_id=tenant_id,
                 limit=5_000,
                 concurrency=cleanup_concurrency,
             )
-            old_objects_deleted += int(cleanup["deleted"])
-            cleanup_failures += int(cleanup["failures"])
-            cleanup_completed += int(cleanup["completed"])
-            cleanup_pending = int(cleanup["pending"])
-        with self.store.connect() as connection:
+            raise
+        with _phase_timing("count"), self.store.connect() as connection:
             counts = connection.execute(
                 """SELECT count(*) AS queued,
                           count(*) FILTER (

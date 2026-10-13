@@ -498,7 +498,14 @@ class CrossDatasetDeltaTests(unittest.TestCase):
                     with self.assertRaises((ArchiveCorruption, ParquetScanError)):
                         probe._build(_candidate())
                 self.assertEqual(metadata.call_count, 1 if cleanup_fails else 2)
-                self.assertEqual(len(archive.reads), 0 if cleanup_fails else 1)
+                if cleanup_fails:
+                    self.assertEqual(archive.reads, [])
+                else:
+                    # Speculative immutable reads may finish before the owner
+                    # consumes corruption, but no canonical object is retried.
+                    self.assertGreaterEqual(len(archive.reads), 1)
+                    self.assertLessEqual(len(archive.reads), 8)
+                    self.assertEqual(len(archive.reads), len(set(archive.reads)))
 
     def test_cross_month_passage_does_not_widen_document_bounds(self):
         passages = Probe._passages

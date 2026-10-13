@@ -40,6 +40,12 @@ jobs:
         with:
           node-version: "22"
       - run: python -m pip install -r server/requirements.txt bandit pip-audit "ruff==0.15.18"
+      - name: Notification passage handoff regression
+        run: python server/tests/e2e_notification_passage_handoff.py
+      - name: Independent message receipt regression
+        run: python server/tests/e2e_identity_qualified_duplicates.py
+      - name: Notification publication regression
+        run: python server/tests/e2e_notification_priority.py
       - run: npm test
       - name: Synthetic agent namespace security regression
         run: sudo "$(command -v python)" server/tests/e2e_agent_namespace.py
@@ -50,15 +56,31 @@ jobs:
         run: |
           for test in \
             e2e_brainstore.py \
+            e2e_source_status_index_order.py \
             e2e_v2_canonical_plane.py \
+            e2e_binary_archive.py \
             e2e_storage_legacy_cut.py \
             e2e_canonical_body_thinning.py \
             e2e_bounded_canonical_thinning.py \
             e2e_committed_body_keys.py \
             e2e_logical_source_integrity.py \
             e2e_logical_source_fairness.py \
+            e2e_logical_backlog_admission.py \
+            e2e_logical_parent_progress.py \
+            e2e_passage_parent_progress.py \
+            e2e_passage_dispatch_order.py \
+            e2e_passage_set_admission.py \
+            e2e_passage_source_fairness.py \
+            e2e_passage_lock_contention.py \
+            e2e_logical_streaming_progress.py \
+            e2e_logical_admission_sharing.py \
+            e2e_logical_small_work_progress.py \
+            e2e_logical_early_supersession.py \
+            e2e_logical_periodic_supersession.py \
+            e2e_pool_warmup.py \
             e2e_logical_parent_fallback.py \
             e2e_cleanup_transaction_waves.py \
+            e2e_cleanup_reference_indexes.py \
             e2e_archive_reprojection.py \
             e2e_v2_lifecycle.py \
             e2e_bulk_manifest.py \
@@ -80,8 +102,10 @@ jobs:
             e2e_search_outbox.py \
             e2e_search_plane_projection.py \
             e2e_turbopuffer_forget_fence.py \
+            e2e_turbopuffer_quantum.py \
             e2e_authority_covering_indexes.py \
             e2e_slack_passage_visibility.py \
+            e2e_slack_visible_text_replay.py \
             e2e_connector_host.py \
             e2e_collector_health_deadline.py \
             e2e_integration_activation.py \

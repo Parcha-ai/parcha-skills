@@ -755,7 +755,7 @@ class CanonicalInvestigatorContractTest(unittest.TestCase):
     def test_canonical_show_does_not_advertise_rejected_arguments(self) -> None:
         self.assertEqual(
             set(CANONICAL_SHOW_TOOL["inputSchema"]["properties"]),
-            {"target"},
+            {"target", "cursor", "page_bytes"},
         )
 
     def test_investigation_metadata_queries_degrade_at_one_shared_deadline(

@@ -16,6 +16,10 @@ UUID = re.compile(
     r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
     r"(?![0-9A-Fa-f])"
 )
+PAGINATED_FILENAME = re.compile(
+    r"rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-"
+    r"(" + UUID.pattern + r")_(" + UUID.pattern + r")"
+)
 SECRET_SHAPE = re.compile(
     r"(?:sk-[A-Za-z0-9_-]{20,}|(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{20,}|"
     r"xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[A-Z0-9]{16}|"
@@ -28,6 +32,22 @@ class CodexSessionIdentity:
     status: str
     native_session_id: str | None
     basis: str | None
+    segment_id: str | None = None
+    history_base_id: str | None = None
+    history_base_offset: int | None = None
+    history_base_ordinal: int | None = None
+
+
+def codex_segment_id_from_filename(path: Path) -> str | None:
+    match = PAGINATED_FILENAME.fullmatch(path.stem)
+    return match.group(2).casefold() if match else None
+
+
+def stable_codex_segment_key(session_id: str, segment_id: str) -> str:
+    values = [_safe_native_id(value) for value in (session_id, segment_id)]
+    if any(value is None for value in values):
+        raise ValueError("unsafe Codex segment identity")
+    return hashlib.sha256(("codex-segment\x1f" + "\x1f".join(values)).encode()).hexdigest()[:24]
 
 
 def _safe_native_id(value: object) -> str | None:
@@ -44,8 +64,11 @@ def _safe_native_id(value: object) -> str | None:
 
 
 def codex_session_id_from_filename(path: Path) -> str | None:
-    """Return the final rollout filename UUID without reading the file."""
+    """Return the native session UUID, excluding a paginated segment suffix."""
 
+    segmented = PAGINATED_FILENAME.fullmatch(path.stem)
+    if segmented:
+        return segmented.group(1).casefold()
     matches = UUID.findall(path.stem)
     if not matches:
         return None
@@ -94,6 +117,7 @@ def resolve_codex_session_identity(
         raise ValueError("identity bounds must be positive")
     filename_id = codex_session_id_from_filename(path)
     metadata_ids: list[str] = []
+    first_payload: dict | None = None
     unsafe_metadata = False
     consumed = 0
     with path.open("rb") as source:
@@ -114,6 +138,8 @@ def resolve_codex_session_identity(
             payload = record.get("payload")
             if not isinstance(payload, dict) or "id" not in payload:
                 continue
+            if first_payload is None:
+                first_payload = payload
             native_id = codex_session_id_from_record(record)
             if native_id is None:
                 unsafe_metadata = True
@@ -123,6 +149,22 @@ def resolve_codex_session_identity(
     if unsafe_metadata:
         return CodexSessionIdentity("unsafe_metadata", None, None)
     metadata_id = metadata_ids[0] if metadata_ids else None
+    segment_id = codex_segment_id_from_filename(path)
+    if segment_id is not None:
+        payload = first_payload or {}
+        base = payload.get("history_base")
+        if (metadata_id != filename_id or payload.get("history_mode") != "paginated"
+                or _safe_native_id(payload.get("session_id", metadata_id)) != metadata_id
+                or segment_id == metadata_id or not isinstance(base, dict)
+                or _safe_native_id(base.get("thread_id")) is None
+                or type(base.get("end_byte_offset")) is not int
+                or base["end_byte_offset"] < 0
+                or type(base.get("end_ordinal_exclusive")) is not int
+                or base["end_ordinal_exclusive"] < 0):
+            return CodexSessionIdentity("identity_conflict", None, None)
+        return CodexSessionIdentity("resolved", metadata_id, "metadata", segment_id,
+                                    _safe_native_id(base["thread_id"]), base["end_byte_offset"],
+                                    base["end_ordinal_exclusive"])
     if metadata_id is not None and filename_id is not None:
         if metadata_id != filename_id:
             return CodexSessionIdentity("identity_conflict", None, None)

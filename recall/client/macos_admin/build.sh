@@ -13,6 +13,8 @@ xcrun swiftc \
   -O \
   -warnings-as-errors \
   -framework SwiftUI \
+  -framework AuthenticationServices \
+  -framework CryptoKit \
   -framework Security \
   "$SOURCE_ROOT/RecallBrainAdmin.swift" \
   -o "$APP/Contents/MacOS/RecallBrainAdmin"

@@ -108,9 +108,11 @@ def run_projection_worker(
     """Service every projection stage without upstream backfill starvation.
 
     ``search_plane`` (H3-b) drains the search projection outbox into
-    turbopuffer once per cycle, after logical projection and before Parquet; ``None`` (no
+    turbopuffer before logical work and on ready parent completions; ``None`` (no
     turbopuffer settings, or ``--search-plane off``) skips the phase and the
-    cycle reports zeros for it.
+    cycle reports zeros for it. Each publication tick retains the configured
+    passage batch/concurrency and one bounded search drain. Completions are
+    coalesced by the logical coordinator; downstream calls never overlap.
 
     With ``skip_embedding`` (H5-2) the embedding phase is left to the
     dedicated ``embedding-worker`` process: the cycle reports
@@ -185,39 +187,86 @@ def run_projection_worker(
                 )
             embed_elapsed_ms = 0 if skip_embedding else elapsed_ms(phase_started)
             phase_elapsed["embed_elapsed_ms"] = embed_elapsed_ms
-            active_phase = "passage"
-            phase_started = clock()
-            projected = passages.project_pending(
-                tenant_id=tenant_id,
-                batch_size=passage_batch_size,
-                max_batches=max_batches_per_cycle,
-                concurrency=passage_concurrency,
-            )
-            passage_elapsed_ms = elapsed_ms(phase_started)
-            phase_elapsed["passage_elapsed_ms"] = passage_elapsed_ms
-            active_phase = "search_plane"
-            phase_started = clock()
-            # Publish ready passages before unrelated logical uploads or
-            # Parquet rebuilds. Search reads current passages, not Parquet.
-            # H3-b: the search plane drains its own outbox, one bounded batch
-            # of source-months per cycle; a turbopuffer failure on a month is
-            # counted, logged by class inside the projector, and retried next
-            # cycle because the outbox row stays.
-            searched = (
-                search_plane()
-                if search_plane is not None
-                else {
-                    "status": "skipped",
-                    "months": 0,
-                    "rows": 0,
-                    "deleted": 0,
-                    "failed": 0,
-                    "rate_limited": 0,
-                    "pending": 0,
-                }
-            )
-            search_plane_elapsed_ms = elapsed_ms(phase_started) if search_plane is not None else 0
-            phase_elapsed["search_plane_elapsed_ms"] = search_plane_elapsed_ms
+            projected: dict[str, Any] = {}
+            searched: dict[str, Any] = {}
+            passage_elapsed_ms = search_plane_elapsed_ms = 0
+
+            def accumulate(total, current):
+                # Queue depth/status describe the newest tick; work and elapsed
+                # counters describe the whole cycle, including earlier ticks.
+                for key, value in current.items():
+                    if key in {"status", "pending"}:
+                        total[key] = value
+                    elif isinstance(value, int):
+                        total[key] = int(total.get(key, 0)) + value
+
+            search_ticks = 0
+
+            def publish_search():
+                nonlocal active_phase, phase_started, search_ticks
+                nonlocal search_plane_elapsed_ms
+                previous_phase, previous_started = active_phase, phase_started
+                if previous_phase == "passage":
+                    phase_elapsed["passage_elapsed_ms"] = passage_elapsed_ms + elapsed_ms(previous_started)
+                elif previous_phase == "logical":
+                    phase_elapsed["logical_elapsed_ms"] = elapsed_ms(previous_started)
+                active_phase = "search_plane"
+                phase_started = clock()
+                tick = (
+                    search_plane()
+                    if search_plane is not None
+                    else {
+                        "status": "skipped", "months": 0, "rows": 0,
+                        "deleted": 0, "failed": 0, "rate_limited": 0, "pending": 0,
+                    }
+                )
+                search_plane_elapsed_ms += elapsed_ms(phase_started) if search_plane is not None else 0
+                phase_elapsed["search_plane_elapsed_ms"] = search_plane_elapsed_ms
+                accumulate(searched, tick)
+                search_ticks += 1
+                # Owner phase wall time excludes search callbacks, although
+                # owners can keep preparing and committing during publication.
+                if previous_phase in {"passage", "logical"}:
+                    previous_started += clock() - phase_started
+                if previous_phase == "passage":
+                    # The snapshot above is needed if search fails. Once it
+                    # succeeds, an eventual passage failure adds its whole
+                    # current tick to completed ticks, not to that snapshot.
+                    phase_elapsed["passage_elapsed_ms"] = passage_elapsed_ms
+                elif previous_phase == "logical":
+                    phase_elapsed["logical_elapsed_ms"] = 0
+                active_phase, phase_started = previous_phase, previous_started
+
+            def publish_ready():
+                nonlocal active_phase, phase_started, passage_elapsed_ms
+                previous_phase, previous_started = active_phase, phase_started
+                publication_started = clock()
+                if previous_phase == "logical":
+                    phase_elapsed["logical_elapsed_ms"] = elapsed_ms(previous_started)
+                active_phase = "passage"
+                phase_started = clock()
+                before_search_ticks = search_ticks
+                tick = passages.project_pending(
+                    tenant_id=tenant_id,
+                    batch_size=passage_batch_size,
+                    max_batches=max_batches_per_cycle,
+                    concurrency=passage_concurrency,
+                    on_progress=publish_search if search_plane is not None else None,
+                )
+                passage_elapsed_ms += elapsed_ms(phase_started)
+                phase_elapsed["passage_elapsed_ms"] = passage_elapsed_ms
+                accumulate(projected, tick)
+                phase_started = clock()
+                if search_ticks == before_search_ticks:
+                    # Drain pre-existing outbox work even when passages were idle.
+                    publish_search()
+                if previous_phase == "logical":
+                    previous_started += clock() - publication_started
+                active_phase, phase_started = previous_phase, previous_started
+
+            # Drain existing work first, then publish completed parents while
+            # unrelated preparation continues in the bounded logical executor.
+            publish_ready()
             active_phase = "logical"
             phase_started = clock()
             documents = logical.project_pending(
@@ -228,6 +277,8 @@ def run_projection_worker(
                 quiet_seconds=quiet_seconds,
                 max_wait_seconds=max_wait_seconds,
                 cleanup_concurrency=cleanup_concurrency,
+                on_progress=publish_ready,
+                on_heartbeat=publish_search if search_plane is not None else None,
             )
             logical_elapsed_ms = elapsed_ms(phase_started)
             phase_elapsed["logical_elapsed_ms"] = logical_elapsed_ms
@@ -266,8 +317,10 @@ def run_projection_worker(
             scanned = (
                 scan.project_pending(
                     tenant_id=tenant_id,
-                    batch_size=min(4, logical_batch_size),
-                    max_batches=max_batches_per_cycle,
+                    batch_size=1 if freshness_busy else min(4, logical_batch_size),
+                    # Return to fresh admission after one complete source-month
+                    # while busy; each build retains its existing lease and CAS.
+                    max_batches=1 if freshness_busy else max_batches_per_cycle,
                     compaction_budget=0 if freshness_busy else 1,
                 )
                 if scan is not None and parquet_due
@@ -401,9 +454,10 @@ def run_projection_worker(
                 "cleanup_failures": int(documents["cleanup_failures"]),
                 "logical_cleanup_completed": int(documents.get("cleanup_completed", 0)),
                 "logical_cleanup_pending": int(documents.get("cleanup_pending", 0)),
-            "logical_failed": int(documents.get("failed", 0)),
-            "logical_backoff": int(documents.get("backoff", 0)),
-            "logical_quarantined": int(documents.get("quarantined", 0)),
+                "logical_source_races": int(documents.get("source_races", 0)),
+                "logical_failed": int(documents.get("failed", 0)),
+                "logical_backoff": int(documents.get("backoff", 0)),
+                "logical_quarantined": int(documents.get("quarantined", 0)),
                 "old_objects_deleted": int(documents.get("old_objects_deleted", 0)),
                 "search_outbox_pending": search_outbox_queued,
                 "cycle_elapsed_ms": elapsed_ms(cycle_started),
@@ -443,7 +497,7 @@ def run_projection_worker(
                 "stale=%s pruned=%s "
                 "cleanup_failures=%s "
                 "logical_cleanup_completed=%s logical_cleanup_pending=%s "
-            "logical_failed=%s logical_backoff=%s logical_quarantined=%s "
+                "logical_source_races=%s logical_failed=%s logical_backoff=%s logical_quarantined=%s "
                 "old_objects_deleted=%s search_outbox_pending=%s "
                 "cycle_elapsed_ms=%s embed_elapsed_ms=%s passage_elapsed_ms=%s "
                 "logical_elapsed_ms=%s parquet_elapsed_ms=%s "
@@ -495,6 +549,7 @@ def run_projection_worker(
                         "cleanup_failures",
                         "logical_cleanup_completed",
                         "logical_cleanup_pending",
+                        "logical_source_races",
                         "logical_failed",
                         "logical_backoff",
                         "logical_quarantined",
@@ -518,7 +573,9 @@ def run_projection_worker(
             # successful counters or a completed cycle.
             phase_elapsed["cycle_elapsed_ms"] = elapsed_ms(cycle_started)
             if active_phase + "_elapsed_ms" in phase_elapsed:
-                phase_elapsed[active_phase + "_elapsed_ms"] = elapsed_ms(phase_started)
+                key = active_phase + "_elapsed_ms"
+                previous_ticks = phase_elapsed[key] if active_phase in {"passage", "search_plane"} else 0
+                phase_elapsed[key] = previous_ticks + elapsed_ms(phase_started)
             LOG.exception(
                 "projection cycle failed type=%s failed_phase=%s phase_elapsed_ms=%s "
                 + " ".join(key + "=%s" for key in PHASE_ELAPSED_KEYS),

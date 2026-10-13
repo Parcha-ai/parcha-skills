@@ -1,4 +1,6 @@
 import AppKit
+import AuthenticationServices
+import CryptoKit
 import Foundation
 import Security
 import SwiftUI
@@ -87,11 +89,20 @@ enum AdminFailure: LocalizedError {
     }
 }
 
+final class NoRedirectSessionDelegate: NSObject, URLSessionTaskDelegate {
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest,
+                    completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
+    }
+}
+
 @MainActor
-final class RecallAdminModel: ObservableObject {
+final class RecallAdminModel: NSObject, ObservableObject, ASWebAuthenticationPresentationContextProviding {
     @Published var endpoint =
         UserDefaults.standard.string(forKey: "recall.endpoint")
-        ?? "https://recall-mcp.onrender.com"
+        ?? "https://recall-mcp-parcha.onrender.com"
     @Published var adminKey = ""
     @Published var control: ControlState?
     @Published var local: LocalStatus?
@@ -99,6 +110,8 @@ final class RecallAdminModel: ObservableObject {
     @Published var busy: Set<String> = []
     @Published var error = ""
     @Published var connected = false
+    @Published var signingIn = false
+    private var authentication: ASWebAuthenticationSession?
 
     let deviceID: String
     private let cookies = HTTPCookieStorage()
@@ -107,10 +120,11 @@ final class RecallAdminModel: ObservableObject {
         configuration.httpCookieStorage = cookies
         configuration.httpShouldSetCookies = true
         configuration.timeoutIntervalForRequest = 20
-        return URLSession(configuration: configuration)
+        return URLSession(configuration: configuration,
+                          delegate: NoRedirectSessionDelegate(), delegateQueue: nil)
     }()
 
-    init() {
+    override init() {
         if let existing = UserDefaults.standard.string(forKey: "recall.device-id") {
             deviceID = existing
         } else {
@@ -119,6 +133,85 @@ final class RecallAdminModel: ObservableObject {
             )
             deviceID = "mac-" + String(suffix.prefix(16))
             UserDefaults.standard.set(deviceID, forKey: "recall.device-id")
+        }
+        super.init()
+    }
+
+    nonisolated func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        if Thread.isMainThread {
+            return MainActor.assumeIsolated { NSApp.keyWindow ?? NSApp.windows.first ?? NSWindow() }
+        }
+        return DispatchQueue.main.sync {
+            MainActor.assumeIsolated { NSApp.keyWindow ?? NSApp.windows.first ?? NSWindow() }
+        }
+    }
+
+    private static func randomToken() throws -> String {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
+            throw AdminFailure.closed("secure_random_unavailable")
+        }
+        return Data(bytes).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    nonisolated static func callbackCode(_ url: URL, state: String) throws -> String {
+        guard let parts = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              parts.scheme == "ai.parcha.recall", parts.host == "oauth",
+              parts.path.isEmpty, parts.user == nil, parts.password == nil,
+              parts.port == nil, parts.fragment == nil,
+              let items = parts.queryItems, items.count == 2,
+              items.filter({ $0.name == "state" && $0.value == state }).count == 1,
+              let code = items.first(where: { $0.name == "code" })?.value,
+              code.range(of: "^[A-Za-z0-9_-]{32,256}$", options: .regularExpression) != nil
+        else { throw AdminFailure.closed("sign_in_callback_invalid") }
+        return code
+    }
+
+    func signIn() async {
+        guard !signingIn else { return }
+        signingIn = true
+        error = ""
+        defer { signingIn = false; authentication = nil }
+        do {
+            guard let base = validatedEndpoint() else {
+                throw AdminFailure.closed("endpoint_invalid")
+            }
+            let verifier = try Self.randomToken()
+            let state = try Self.randomToken()
+            let challenge = Data(SHA256.hash(data: Data(verifier.utf8))).base64EncodedString()
+                .replacingOccurrences(of: "+", with: "-")
+                .replacingOccurrences(of: "/", with: "_")
+                .replacingOccurrences(of: "=", with: "")
+            var login = URLComponents(url: base.appending(path: "/admin/native/login"),
+                                      resolvingAgainstBaseURL: false)!
+            login.queryItems = [URLQueryItem(name: "state", value: state),
+                               URLQueryItem(name: "code_challenge", value: challenge)]
+            let callback: URL = try await withCheckedThrowingContinuation { continuation in
+                let auth = ASWebAuthenticationSession(url: login.url!,
+                                                     callbackURLScheme: "ai.parcha.recall") { url, error in
+                    if let url { continuation.resume(returning: url) }
+                    else { continuation.resume(throwing: error ?? AdminFailure.closed("sign_in_cancelled")) }
+                }
+                auth.presentationContextProvider = self
+                authentication = auth
+                if !auth.start() {
+                    continuation.resume(throwing: AdminFailure.closed("sign_in_unavailable"))
+                }
+            }
+            let code = try Self.callbackCode(callback, state: state)
+            // The verifier stays in this process. The callback carries no session or collector token.
+            let body = try JSONSerialization.data(withJSONObject: ["code": code, "code_verifier": verifier])
+            _ = try await request(base.appending(path: "/admin/api/v1/native/session"),
+                                  method: "POST", body: body, csrf: false) as [String: String]
+            UserDefaults.standard.set(endpoint, forKey: "recall.endpoint")
+            try await refresh()
+            connected = true
+        } catch {
+            connected = false
+            self.error = error.localizedDescription
         }
     }
 
@@ -192,6 +285,13 @@ final class RecallAdminModel: ObservableObject {
             self.error = error.localizedDescription
             try? await refresh()
         }
+    }
+
+    func isEnabled(_ name: String, source: LocalSource) -> Bool {
+        source.enabled && (control?.installations.contains {
+            $0.device_id == deviceID && $0.connector_id == source.connector_id
+                && $0.tenant_id == destinations[name] && $0.state == "enabled"
+        } ?? false)
     }
 
     func reroute(source name: String) async {
@@ -294,6 +394,8 @@ final class RecallAdminModel: ObservableObject {
     private func validatedEndpoint() -> URL? {
         guard let url = URL(string: endpoint),
               url.scheme == "https",
+              url.host != nil,
+              ["", "/"].contains(url.path),
               url.user == nil,
               url.password == nil,
               url.query == nil,
@@ -423,7 +525,7 @@ struct ContentView: View {
             }
             Spacer()
             Circle().fill(model.connected ? .green : .orange).frame(width: 9, height: 9)
-            Text(model.connected ? "CONTROL PLANE READY" : "OWNER ACCESS")
+            Text(model.connected ? "CONNECTED" : "SIGN IN")
                 .font(.caption.monospaced())
         }
         .padding(22)
@@ -432,14 +534,22 @@ struct ContentView: View {
     private var connection: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Connect this Mac").font(.largeTitle.bold())
-            Text("The owner key is exchanged for a short session and stored only in Keychain.")
+            Text("Sign in with the account already connected to your company brain. Then choose which sessions this Mac shares.")
                 .foregroundStyle(.secondary)
             TextField("https://recall.example", text: $model.endpoint)
                 .textFieldStyle(.roundedBorder)
-            SecureField("Admin access key", text: $model.adminKey)
-                .textFieldStyle(.roundedBorder)
-            Button("Open switchboard") { Task { await model.connect() } }
-                .buttonStyle(.borderedProminent)
+                .disabled(model.signingIn)
+            Button(model.signingIn ? "Waiting for sign-in…" : "Sign in with browser") {
+                Task { await model.signIn() }
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(model.signingIn)
+            DisclosureGroup("Administrator key (optional)") {
+                SecureField("Admin access key", text: $model.adminKey)
+                    .textFieldStyle(.roundedBorder)
+                Button("Connect with key") { Task { await model.connect() } }
+                    .disabled(model.signingIn)
+            }
             if !model.error.isEmpty {
                 Text(model.error).foregroundStyle(.red)
             }
@@ -535,7 +645,7 @@ struct ContentView: View {
             Toggle(
                 "",
                 isOn: Binding(
-                    get: { source.enabled },
+                    get: { model.isEnabled(name, source: source) },
                     set: { value in Task { await model.setEnabled(value, source: name) } }
                 )
             )
@@ -570,6 +680,21 @@ enum RecallBrainAdminMain {
                 guard control.brains.count == 2,
                       local.sources["codex"]?.connector_id == "local.codex"
                 else { throw AdminFailure.closed("self_test_contract_failed") }
+                let state = String(repeating: "s", count: 43)
+                let code = String(repeating: "c", count: 43)
+                let callback = "ai.parcha.recall://oauth?state=\(state)&code=\(code)"
+                guard try RecallAdminModel.callbackCode(URL(string: callback)!, state: state) == code
+                else { throw AdminFailure.closed("self_test_callback_failed") }
+                for invalid in [
+                    callback.replacingOccurrences(of: "ai.parcha.recall:", with: "https:"),
+                    callback.replacingOccurrences(of: "//oauth?", with: "//other?"),
+                    callback + "&code=duplicate", callback + "#fragment",
+                    callback.replacingOccurrences(of: state, with: "wrong-state"),
+                ] {
+                    if (try? RecallAdminModel.callbackCode(URL(string: invalid)!, state: state)) != nil {
+                        throw AdminFailure.closed("self_test_callback_failed")
+                    }
+                }
                 print(
                     #"{"architecture":"arm64","brains":2,"local_sources":1,"status":"pass"}"#
                 )

@@ -28,6 +28,10 @@ class FakeStore:
 
 
 class InterruptingProjector(CanonicalLogicalEvidenceProjector):
+    def _check_candidate_current(self, candidate):
+        # Scheduler-only fake; real queue authority is covered by PostgreSQL tests.
+        return None
+
     def __init__(self) -> None:
         self.store = FakeStore()
         self.projection = None
@@ -40,6 +44,7 @@ class InterruptingProjector(CanonicalLogicalEvidenceProjector):
             "turn_context",
         )
         self.retention_profile = "conversation-useful-v1"
+        self._prefer_recent_admission = False
         self.upload = SimpleNamespace(
             all_references=(
                 {
@@ -80,6 +85,11 @@ class InterruptingProjector(CanonicalLogicalEvidenceProjector):
             raise KeyboardInterrupt
         return [self.upload]
 
+    def _commit_upload(self, candidate, upload):
+        # Interrupt before the transaction commits: this owner must release
+        # the completed upload even when its sibling also interrupts.
+        raise KeyboardInterrupt
+
     def _schedule_upload_cleanup(self, uploads):
         self.cleanup_batches.append(list(uploads))
         return len(uploads)
@@ -104,6 +114,7 @@ class LogicalEvidenceInterruptTests(TestCase):
                             "revision": 3,
                             "estimated_records": 42,
                             "estimated_bytes": 84,
+                            "admission_priority": 1,
                         }
                     ]
                 )
@@ -240,9 +251,9 @@ class PoisonedGroupIsolationTests(TestCase):
             max_batches=1,
             upload_concurrency=1,
         )
-        # The single shard (concurrency 1) failed, was retried one group at a
-        # time, and only the poisoned group was marked.
-        self.assertEqual(projector.prepare_calls[0], ("good-a", "poison", "good-b"))
+        # Each parent is attempted once; a poisoned parent cannot force its
+        # healthy siblings to repeat archive work.
+        self.assertEqual(projector.prepare_calls, [("good-a",), ("poison",), ("good-b",)])
         self.assertEqual(projector.marked, [("poison", "logical_evidence_full_record_corrupt")])
         self.assertEqual(sorted(projector.committed), ["good-a", "good-b"])
         self.assertEqual(result["documents"], 2)

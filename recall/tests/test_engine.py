@@ -954,6 +954,64 @@ class McpRemoteHandler(BaseHTTPRequestHandler):
             raise AssertionError(body)
 
 
+class McpShowErrorGuidanceTest(unittest.TestCase):
+    def test_rejected_request_does_not_report_service_unavailability(self):
+        output, error = io.StringIO(), io.StringIO()
+        with mock.patch.object(engine, "recall_mode", return_value="remote"), mock.patch.object(
+            engine, "remote_execute", side_effect=engine.RemoteRecallError("MCP -32602: tool call failed")
+        ), contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
+            result = engine.main(["show", "recall://private", "--tail", "5"])
+        self.assertEqual(result, 2)
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("remote recall request failed:", error.getvalue())
+        self.assertNotIn("unavailable", error.getvalue())
+
+    def error(self, arguments, code=-32602, message="tool arguments rejected", path="/v1/show"):
+        payload = json.dumps({"jsonrpc": "2.0", "id": 1,
+                              "error": {"code": code, "message": message}}).encode()
+        with mock.patch.object(engine, "remote_headers", return_value={}), mock.patch.object(
+            engine, "_open_remote", return_value=io.BytesIO(payload)
+        ), self.assertRaises(engine.RemoteRecallError) as raised:
+            engine._mcp_call("https://brain.invalid/mcp", "POST", path, arguments)
+        return str(raised.exception)
+
+    def test_rejected_remote_flags_explain_receipt_only_and_neighbor_tool(self):
+        for option in ({"tail": 5}, {"around": "2026-01-01T00:00:00Z"}, {"prompts": True}):
+            with self.subTest(option=option):
+                error = self.error({"target": "recall://private-canary", **option})
+                self.assertIn("show <recall://receipt>", error)
+                self.assertIn("recall_session_context", error)
+                self.assertIn("local session", error)
+                self.assertNotIn("private-canary", error)
+
+    def test_rejected_nonreceipt_target_has_distinct_guidance(self):
+        error = self.error({"target": "/private/secret-session.jsonl"})
+        self.assertIn("receipt returned by search", error)
+        self.assertNotIn("/private/", error)
+
+    def test_known_show_failures_are_explained_without_echoing_details(self):
+        missing = self.error({"target": "recall://private-canary"}, message="receipt not found")
+        self.assertIn("not found or not accessible", missing)
+        large = self.error({"target": "recall://private-canary"}, -32603, "tool result exceeds limit")
+        self.assertIn("too large", large)
+        self.assertIn("recall_session_context", large)
+        self.assertNotIn("private-canary", missing + large)
+
+    def test_unknown_errors_and_valid_receipt_arguments_stay_generic(self):
+        for code, message, arguments, path in (
+            (-32602, "private-server-secret", {"target": "recall://private", "tail": 5}, "/v1/show"),
+            (-32602, "tool arguments rejected", {"target": "recall://private", "tail": 0, "prompts": False}, "/v1/show"),
+            (-32603, "tool result exceeds limit private-secret", {"target": "recall://private"}, "/v1/show"),
+            (-32602, "tool arguments rejected", {"query": "private"}, "/v1/search"),
+        ):
+            with self.subTest(code=code, message=message, path=path):
+                self.assertEqual(self.error(arguments, code, message, path), f"MCP {code}: tool call failed")
+        self.assertEqual(
+            self.error({"target": "recall://private"}, "private-code", "private-message"),
+            "MCP unknown: tool call failed",
+        )
+
+
 class RemoteTransportTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1284,7 +1342,7 @@ class RemoteTransportTest(unittest.TestCase):
         code, out, err = self.call("search", "deadbeef", "--paths")
         self.assertNotEqual(code, 0)
         self.assertEqual(out, "")
-        self.assertIn("remote recall unavailable", err)
+        self.assertIn("remote recall request failed", err)
 
     def test_remote_default_timeout_allows_one_minute_for_retrieval(self):
         self.assertEqual(engine.DEFAULT_REMOTE_TIMEOUT_SECONDS, 60.0)

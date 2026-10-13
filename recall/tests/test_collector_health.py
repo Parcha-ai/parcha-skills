@@ -2,7 +2,7 @@ from collector.health import build_health_report
 from collector.cli import _run_once
 
 
-def test_ready_codex_health_preserves_archive_coverage() -> None:
+def test_backfilling_codex_health_preserves_archive_coverage() -> None:
     report = build_health_report(
         "codex",
         {
@@ -23,7 +23,7 @@ def test_ready_codex_health_preserves_archive_coverage() -> None:
         "schema_version": 1,
         "collector_kind": "codex",
         "collector_version": 4,
-        "status": "ready",
+        "status": "backfilling",
         "scan_complete": True,
         "pending_records": 0,
         "dead_records": 0,
@@ -97,3 +97,59 @@ def test_long_running_collector_iteration_publishes_health() -> None:
     assert writer.report["collector_kind"] == "codex"
     assert writer.report["status"] == "ready"
     assert result["health_report"]["status"] == "accepted"
+
+
+def test_completed_scan_with_missing_files_is_not_ready() -> None:
+    report = build_health_report("codex", {
+        "scan_complete": True, "coverage_percent": 99.7,
+    })
+    assert report["status"] == "degraded"
+    assert report["last_error_code"] == "collector_coverage_incomplete"
+
+
+def test_unfinished_scan_with_missing_files_is_backfilling() -> None:
+    report = build_health_report("codex", {
+        "scan_complete": False, "coverage_percent": 90,
+    })
+    assert report["status"] == "backfilling"
+    assert report["last_error_code"] is None
+
+
+def test_known_uncollected_records_cannot_be_hidden_by_empty_outbox() -> None:
+    for field, code in (
+        ("identity_conflicts", "collector_identity_conflict"),
+        ("quarantined_files", "collector_quarantined_files"),
+        ("dead_letter_count", "collector_parse_errors"),
+    ):
+        report = build_health_report("codex", {
+            "scan_complete": True, "coverage_percent": 100,
+            "pending": 0, "dead": 0, field: 1,
+        })
+        assert report["status"] == "degraded", field
+        assert report["last_error_code"] == code, field
+
+
+def test_upload_backlog_is_not_ready_after_scan_finishes() -> None:
+    report = build_health_report("claude", {
+        "scan_complete": True, "coverage_percent": 100, "pending": 8,
+    })
+    assert report["status"] == "backfilling"
+
+
+def test_disconnected_archive_cannot_report_ready() -> None:
+    report = build_health_report("codex", {
+        "scan_complete": True, "coverage_percent": 100,
+        "archive_root_available": False,
+    })
+    assert report["status"] == "degraded"
+    assert report["last_error_code"] == "collector_archive_unavailable"
+
+
+def test_existing_error_remains_primary_and_recovery_clears_health_error() -> None:
+    doctor = {"scan_complete": True, "coverage_percent": 100,
+              "identity_conflicts": 1, "last_error_code": "brain_unauthorized"}
+    assert build_health_report("codex", doctor)["last_error_code"] == "brain_unauthorized"
+    doctor.update(identity_conflicts=0, last_error_code=None)
+    recovered = build_health_report("codex", doctor)
+    assert recovered["status"] == "ready"
+    assert recovered["last_error_code"] is None

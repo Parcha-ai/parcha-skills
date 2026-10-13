@@ -285,6 +285,45 @@ are supported: versions through 69 are required except optional migration 67,
 which retires the Postgres vector plane and is applied explicitly from the
 turbopuffer plane. Migration 70 adds only a reconciliation performance index;
 serving accepts both schema 69 and 70 and reports the actual recorded version.
+The latest shipped migration is 74; migration 71 remains optional and reserved
+for native-conversation metadata. Migration 72 adds nullable
+`canonical_evidence_document_queue.notification_queued_at`, with no default,
+index, or historical reclassification. Apply it before deploying the notification
+priority reader; compatibility checks explicitly accept the reserved 71 gap.
+Migration 73 adds the same nullable stamp to `canonical_passage_projection_queue`;
+apply it before deploying the passage handoff reader. Neither migration
+reclassifies historical work.
+
+Migration 74 adds three optional indexes for cleanup's existing scoped artifact
+reference checks. Its concurrent companion runs before the marker; the marker
+refuses missing, invalid, or mismatched index definitions. Serving remains
+compatible without these performance indexes. Production application roles do
+not create them; an operator builds and verifies all three before recording 74.
+
+Webhook ingestion retains the same structured canonical JSON as managed
+history, so typed messages remain visible when their author is unresolved.
+This does not rewrite previously flattened canonical bodies.
+
+Verified Slack Events and authenticated, source-scoped generic webhooks stamp
+existing logical work at ingress. Alternating notification rounds admit those
+parents FIFO within each source before ordinary recent changes; oldest rounds
+retain backlog and other-source progress. Dispatch preserves notification FIFO
+within the admitted batch. Historical replay cannot replace the original stamp.
+Priority-only duplicate promotion updates an already queued parent without
+creating work or altering its generation. Public canonical JSON and provenance do not grant
+notification priority. Forget, quiet/max-wait, retry, source, and currentness gates
+remain in force. This prioritizes new trusted notifications; existing unstamped
+work remains ordinary backlog, and the scheduling policy alone does not prove a
+15-minute freshness guarantee.
+
+Logical commits carry the actual locked queue stamp into passage work, including
+unchanged-content repair of already queued passages. Later history preserves the
+earliest pending stamp. Passage admission alternates ordinary aged/size rounds
+with notification FIFO rounds across worker callbacks, so notifications can
+advance before an aged backlog drains while history still progresses. Repair
+does not recreate completed passage work; revision and generation checks remain
+unchanged. This does not prioritize already completed logical work retroactively.
+
 Optional [search authority indexes](../operations/README.md) are applied explicitly
 without changing those schema versions or restarting workers.
 The gate also requires
@@ -767,6 +806,25 @@ roles, source grants, and revocation. The access token must have the exact
 `RECALL_MCP_RESOURCE_URI` audience, a `read` scope, and a provider-verified email
 for first-time invitation acceptance.
 
+For Codex and Claude clients using Client ID Metadata Documents (CIMD), enable
+CIMD on the Descope MCP server and approve the exact domains `chatgpt.com` and
+`claude.ai`. Preserve other existing approved domains and settings; do not replace
+the policy with `*`. On September 25, 2026, a fresh Codex login failed with
+`E074132` because only `claude.ai` was approved. Adding exact `chatgpt.com` allowed
+the authorization request to reach login. That probe did not complete user login.
+
+The policy is `cimdSettings.domainPolicies.policies`, with entries such as
+`{"domainPattern":"chatgpt.com","enabled":true}` and `cimdSettings.enabled=true`.
+For an operator-managed API change, load the existing server with
+`POST /v1/mgmt/mcp/server/load` (`{"id":"<server-id>"}`), retain the complete
+server object, and change only the intended domain entry before
+`POST /v1/mgmt/mcp/server/update` (`{"server": <complete-server-object>}`). Reload
+and verify the exact delta. Descope's update requires every field to preserve;
+see its [approved-domain settings](https://docs.descope.com/agentic-identity-hub/core-components/mcp-servers/settings)
+and [management API](https://docs.descope.com/agentic-identity-hub/core-components/mcp-servers/management).
+Client trust permits registration, not access to a company brain: user login,
+invitation acceptance, scope, audience, and Recall source grants still apply.
+
 To turn Descope's standard MCP consent flow into the branded Recall experience,
 name the flow `recall-mcp-user-consent` and run the setup-only operator script:
 
@@ -834,7 +892,7 @@ only one login. Browser identity also offers an optional pre-activation path. Se
 [`docs/authorization-v1.md`](../../docs/authorization-v1.md) for the policy,
 generic OIDC contract, and revocation semantics.
 
-If the authorization server does not support dynamic client registration,
+If the authorization server supports neither CIMD nor dynamic client registration,
 pre-register a public PKCE client for Codex and configure both values below.
 The callback URL must match Codex's localhost callback for the brain-specific
 MCP URL. Recall then renders a single `codex mcp add` command with the public
@@ -899,19 +957,35 @@ Create the Slack app **from a manifest**, paste that JSON, then copy the app's
 client ID, client secret, and signing secret into the deployment secret manager.
 After the deployment is healthy, generate the final manifest with
 `python -m connectors.slack_manifest --events https://<public-host>` and update
-the app from that manifest; Slack can now verify the signed Events URL. No Slack
-token is copied into Recall—the owner completes installation from the Recall
-switchboard and the resulting bot token is encrypted server-side.
+the app from that manifest; Slack can now verify the signed Events URL. The owner
+completes installation from the Recall switchboard; Recall exchanges the OAuth
+code and encrypts both bot and user tokens server-side.
 
 Register `https://<public-host>/webhooks/v1/slack` as the Events API request URL
-and subscribe to `message.channels`, `message.groups`, `message.im`, and
-`message.mpim`. The bundled source requests only its declared bot scopes,
-discovers all public channels plus private channels to which it was invited,
-joins public channels, paginates full history and thread replies through a fixed
-cycle upper bound, reconciles users and verified emails, and consumes signed
-edits/deletions live. API polling remains the repair path if events are delayed.
+and subscribe only to `message.channels`, as the generated manifest specifies.
+The user grant requests `channels:history`, `channels:read`, and `files:read`.
+Polling discovers active and archived public channels and reads their history
+and thread replies through a fixed cycle upper bound. Private channels and DMs
+are outside this connector's scope. Existing bot joins for discovered active
+public channels preserve Events membership; signed Events capture subsequent
+edits and deletions. An inventory count alone does not prove full history or
+Events coverage. See [channel coverage and polling limits](../../connectors/README.md#work-apis).
+
+To upgrade a legacy bot-only connection, open `https://<public-host>/admin` as
+the same Recall principal that owns the existing Slack installation. In the
+Slack card, explicitly select the existing company brain, leave Slack enabled,
+and click **Authorize Slack**. The destination selector defaults to a personal
+brain when one exists; it does not preserve the existing Slack route. Select the
+same Slack workspace and approve the requested user scopes. Do not disconnect
+first. Reauthorizing the same principal, brain, and connector preserves the
+source ID and spool; another principal or destination creates another source.
+Pending pages finish their acknowledgement before the expanded public scope
+starts an epoch replay with the same native message IDs. Verify the resulting
+coverage report says `public_channels` and then observe its per-channel baseline
+progress; reconnecting alone is not a completeness claim.
+
 Files served directly from Slack's private file host are downloaded with the
-same bot authority, bounded at 64 MiB, archived as raw artifacts, and projected
+user authority, bounded at 64 MiB, archived as raw artifacts, and projected
 as stable `document.v1` records; supported text/PDF/Office bodies become
 searchable. A rejected redirect, oversized file, or unavailable binary remains
 an explicit `attachment_bytes` omission on the parent message and is repaired
@@ -1026,6 +1100,77 @@ sidecar remains deliberately single-request. Results are reassembled in input
 order before their idempotent database write. Keep query embedding on the
 ordinary bounded path and raise worker concurrency only within the provider's
 document rate limits.
+
+### Projection admission and early publication
+
+The projection worker admits source-fair batches, with forget work first, while
+previous parents are still preparing. The executor holds at most one additional
+batch beyond its active owners. `--upload-concurrency` bounds active parent work;
+`--logical-batch-size` times `--max-batches-per-cycle` bounds total admissions.
+One coordinator publishes completed parents through passages and search while
+other parents continue. It also keeps the existing cleanup budget per completed
+admission batch. Failed or raced parents wait for the next cycle.
+
+With one batch per cycle, a giant still bounds that cycle's total work. Increasing
+the existing batch budget lets small parents continue through later batches;
+measure backlog change and acknowledged-record search/open freshness before
+claiming recovery. `logical_source_races` reports discarded stale preparations
+separately from `logical_failed`. These settings do not resolve a parent that
+continually changes during its own preparation, or capacity exhausted by giant
+parents in every executor slot.
+
+Logical admission alternates oldest-first and recently changed-first rounds,
+retaining forget priority, debounce/max-wait gates and source round-robin in both.
+The next mode belongs to the projector, survives cycle boundaries and changes
+only after nonempty admission; restart begins oldest-first. Even one-slot rounds
+therefore share capacity between history and recent changes. Recent means the
+queue's canonical change time, not event time: historical replay competes for
+those slots too. This does not guarantee freshness when arrivals exceed capacity.
+
+Within each admitted batch, forget work still starts first; other work starts in
+estimated-byte order with stable ties. The selected parents do not change. Workers
+reject superseded queue snapshots before preparation and after SQL input capture,
+before archive recovery or upload; the final commit fence still applies. This
+saves obsolete work but cannot preempt a running giant or guarantee progress for
+a continuously changing parent. Content-free `logical owner started/completed`
+logs report the parent hash, size estimates, elapsed time and final status.
+
+Passage projection also commits each ready document independently. Only active
+owners retain prepared passage bodies, and commits retain the existing cap of
+8 or one fewer than the database pool size. A progress callback invokes only the
+same coordinator's search writer, so a slow passage preparation cannot hold a
+ready sibling's search publication behind the batch. Missing/unavailable archives
+still yield to logical recovery after the current batch.
+
+While waiting on busy logical or passage owners, the same coordinator wakes
+every five seconds to publish already committed work, including external repair
+outbox entries. Active publication can take longer than that interval; it is a
+bound on idle waiting, not a search-latency guarantee or another writer.
+Logical idle callbacks drain search only: retrying missing passages there would
+invalidate their already running archive rebuilds. Completed logical parents
+still trigger passage projection followed by search.
+
+The worker's persistent search projector returns to that coordinator after one
+catalog page or tombstone batch. Unfinished months rotate across callbacks;
+`--search-plane-months-per-cycle` bounds active claims. One-shot search drains
+use the same implementation but continue until their claimed months finish.
+Rotation is fair among admitted claims; a new month waits for an active slot.
+Only complete months advance the watermark and acknowledge their generation;
+restart replays unfinished months when writers for that namespace do not overlap.
+Claims do not fence separate worker processes; use the
+[Render worker cutover procedure](worker-cutover.md) for deployments and rollbacks.
+Each page retains the existing writer
+concurrency, byte limits, pacer and retry budget. A page can still take longer
+than five seconds. Paused months retain metadata and exact captured tombstone
+IDs, not page bodies; metadata memory remains proportional to those IDs.
+Month timing logs mark these runs `cooperative=1`: `month_ms` includes time spent
+between callbacks, while the worker's search phase reports callback wall time.
+
+`passage_elapsed_ms` remains coordinator wall time excluding search callbacks;
+`search_plane_elapsed_ms` measures those callbacks separately. Passage
+`prepare_ms` and `commit_ms` (also logged with the `passage_` prefix) are summed
+owner durations and can overlap. Commit time includes cap/connection waits;
+they are not additive partitions of total cycle wall time.
 
 ### Dedicated passage embedding worker with a daily cap (H5-2/H5-3)
 
@@ -1434,6 +1579,59 @@ install -m 0644 ~/services/recall-brain/recall/server/deploy/recall-collector@.s
 systemctl --user daemon-reload
 systemctl --user enable --now recall-collector@claude recall-collector@codex
 ```
+
+### Verify team session collection and MCP access
+
+Track each person's device, selected harnesses, latest Brain ACK, latest searchable
+session, and MCP login. An accepted invitation enables access; installing a
+collector enables uploads. Verify both before marking a person ready.
+
+1. **Invite and connect.** The owner invites the exact verified email through
+   `/admin`. The employee accepts and follows the Codex or Claude commands on
+   `/join/<invitation-id>`, which use the company-specific `/mcp/brains/<tenant>`
+   endpoint and the configured OAuth settings. Use each person's own identity.
+2. **Enroll selected session sources.** In the web or Mac switchboard, the employee
+   creates a device route for `local.claude-code` and/or `local.codex`. This uses
+   `POST /admin/api/v1/device/installations` to bind the source to their principal
+   and contributor actor and issue a source-scoped write-only credential. Keep
+   existing source IDs and spools on upgrades. On Linux, fill in every example
+   path and the enrolled tenant/principal/source tuple; the unit explicitly needs
+   `RECALL_PRINCIPAL_ID` and `RECALL_INTERVAL_SECONDS`. On Mac, follow the
+   [client installation instructions](../../client/README.md). Codex collection
+   includes both active and archived rollout roots.
+3. **Verify upload progress.** On Linux, check
+   `systemctl --user status recall-collector@claude recall-collector@codex` and run
+   `python -m collector.cli doctor` with that unit's environment and all arguments
+   from its `watch` invocation, changing only the command. Replace `doctor` with
+   `status` for central source parity; retain the principal and credential arguments.
+   On Mac, use `recall-brain mac-status`. Require advancing ACKs when new sessions
+   exist, complete or progressing scan coverage, draining pending records, and
+   no unexplained dead records. `coverage_percent` counts discovered files in the
+   ledger; neither 100% coverage nor a `ready` label alone proves uploads drained.
+4. **Verify the serving pipeline.** The owner's authenticated
+   `GET /admin/api/v1/state` includes invitations and the source fleet: owner,
+   device, heartbeat, pending/dead counts, last transfer and 24-hour activity.
+   Compare it with the intended roster; people with no source will not appear in
+   fleet rows. Heartbeats older than two minutes are stale. The collector ingress
+   service needs canonical v2/archive configuration and
+   `RECALL_CANONICAL_INGEST_PUBLIC=1` for its archive, ingest, status and health
+   routes. Check logical and passage queues, then `search_projection_outbox` and
+   `python -m recall_server.cli search-plane-status --tenant <tenant>` for search
+   publication. The managed
+   worker runs remote connectors, not local session collectors; its optional
+   projection cycle does not drain turbopuffer. Verify the existing dedicated
+   `projection-worker` or `search-plane-project` owns that drain.
+5. **Prove it from the employee's client.** Search for a recent known session from
+   each selected harness after completing a fresh browser login with the employee's
+   own identity and successfully listing MCP tools. Open the search result's
+   returned receipt. Record the client, fresh-login result, session timestamp,
+   successful search/open, and upload ACK. A configured URL, successful login-page
+   redirect, existing credential health, or another person's successful connection
+   does not prove new-user onboarding. For live sessions, observe a later upload
+   becoming searchable as well. If Codex runs on Greppy while the browser runs on
+   the employee's laptop, forward the exact loopback callback port to Greppy and
+   keep that login process running; the callback must reach the client that started
+   the flow. Do not share authorization URLs or credentials between people.
 
 Back up and run a blank-database restore proof:
 

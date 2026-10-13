@@ -9,6 +9,7 @@ import sqlite3
 import time
 import urllib.error
 import urllib.request
+from bisect import bisect_right
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +17,8 @@ from typing import Any
 
 from skills.recall.scripts.codex_identity import (
     codex_session_id_from_filename,
+    codex_segment_id_from_filename,
+    stable_codex_segment_key,
     codex_session_id_from_record,
     resolve_codex_session_identity,
     stable_codex_record_key,
@@ -202,6 +205,7 @@ class Collector:
         self.bulk_bundle_records = bulk_bundle_records
         self.defer_scan_flush = defer_scan_flush
         self._codex_path_keys: dict[str, str] = {}
+        self._codex_segment_identities: dict[str, Any] = {}
         self.shard_count = 1
         self.shard_index = 0
         self.spool_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -378,13 +382,17 @@ class Collector:
         if cached is not None:
             return cached
         row = self.db.execute(
-            "SELECT record_key FROM codex_sessions WHERE canonical_path=?",
-            (path_text,),
+            "SELECT session.record_key,session.session_id FROM codex_sessions session "
+            "LEFT JOIN codex_session_locations location ON location.session_id=session.session_id "
+            "WHERE session.canonical_path=? OR location.path=? LIMIT 1",
+            (path_text, path_text),
         ).fetchone()
         if row is None:
             raise CollectorRuntimeError("codex_identity_unavailable")
-        self._codex_path_keys[path_text] = row["record_key"]
-        return row["record_key"]
+        segment_id = codex_segment_id_from_filename(path)
+        key = stable_codex_segment_key(row["session_id"], segment_id) if segment_id else row["record_key"]
+        self._codex_path_keys[path_text] = key
+        return key
 
     @staticmethod
     def _path_shard(path: str) -> int:
@@ -407,6 +415,8 @@ class Collector:
         result: dict[str, list[str]] = {}
         for file_row in self.db.execute("SELECT path FROM files ORDER BY path"):
             path = file_row["path"]
+            if codex_segment_id_from_filename(Path(path)) is not None:
+                continue  # Segment IDs never determine the legacy root's key.
             filename_id = codex_session_id_from_filename(Path(path))
             if filename_id is not None:
                 result.setdefault(filename_id, []).append(path)
@@ -466,6 +476,48 @@ class Collector:
             return False
         return True
 
+    def _protect_codex_session(self, session_id: str, scan_id: str) -> None:
+        for row in self.db.execute(
+            "SELECT path FROM codex_session_locations WHERE session_id=? "
+            "UNION SELECT canonical_path FROM codex_sessions WHERE session_id=?",
+            (session_id, session_id),
+        ).fetchall():
+            self._protect_codex_ledger_path(row["path"], scan_id)
+
+    def _codex_segments(self, segments: list[dict]) -> list[dict]:
+        """Select physical copies; inherited history is provenance, not a read dependency."""
+        copies: dict[str, list[dict]] = {}
+        for entry in segments:
+            copies.setdefault(entry["identity"].segment_id, []).append(entry)
+        selected = []
+        for locations in copies.values():
+            if len(locations) > 1 and len({self._content_digest(item["path"]) for item in locations}) > 1:
+                raise CollectorRuntimeError("codex_segment_divergent")
+            selected.append(locations[0])
+        return selected
+
+    def _rebind_codex_segments(self, session_id: str, segments: list[dict]) -> bool:
+        """Move each physical segment's existing ledger, never reset offsets."""
+        known = self.db.execute(
+            "SELECT path FROM codex_session_locations WHERE session_id=?", (session_id,)
+        ).fetchall()
+        for segment in segments:
+            segment_id = segment["identity"].segment_id
+            old_paths = [row["path"] for row in known
+                         if codex_segment_id_from_filename(Path(row["path"])) == segment_id
+                         and self.db.execute("SELECT 1 FROM files WHERE path=?", (row["path"],)).fetchone()]
+            if len(old_paths) > 1 or (old_paths and not self._rebind_codex_path(old_paths[0], segment["path_text"])):
+                return False
+        return True
+
+    def _codex_duplicate_sessions(self) -> int:
+        groups: dict[tuple[str, str], int] = {}
+        for row in self.db.execute("SELECT session_id,path FROM codex_session_locations "
+                                   "WHERE status!='missing' AND session_id IS NOT NULL"):
+            key = (row["session_id"], codex_segment_id_from_filename(Path(row["path"])) or row["session_id"])
+            groups[key] = groups.get(key, 0) + 1
+        return len({session for (session, _segment), count in groups.items() if count > 1})
+
     def _prepare_codex_discovery(
         self,
         paths: list[Path],
@@ -478,6 +530,7 @@ class Collector:
         groups: dict[str, list[dict[str, Any]]] = {}
         quarantined = 0
         self._codex_path_keys.clear()
+        self._codex_segment_identities.clear()
         for ordinal, path in enumerate(paths):
             stat = path.stat()
             path_text = str(path)
@@ -492,8 +545,10 @@ class Collector:
                 and int(location["mtime_ns"]) == stat.st_mtime_ns
                 and location["lifecycle"] == lifecycle
             )
+            identity = None
             if (
                 unchanged
+                and codex_segment_id_from_filename(path) is None
                 and location["session_id"] is not None
             ):
                 session_id = location["session_id"]
@@ -540,6 +595,7 @@ class Collector:
                 "session_id": session_id,
                 "ordinal": ordinal,
                 "cached_current": cached_current,
+                "identity": identity,
             }
             entries.append(entry)
             if session_id is None:
@@ -550,7 +606,10 @@ class Collector:
 
         selected: list[dict[str, Any]] = []
         legacy_map: dict[str, list[str]] | None = None
-        conflicts = 0
+        conflicts = sum(item["session_id"] is None and
+                        self.db.execute("SELECT status FROM codex_session_locations WHERE path=?",
+                                        (item["path_text"],)).fetchone()[0] == "identity_conflict"
+                        for item in entries)
         duplicate_sessions = 0
         for session_id, candidates in groups.items():
             candidates.sort(
@@ -559,6 +618,22 @@ class Collector:
                     item["ordinal"],
                 )
             )
+            all_candidates = candidates
+            self.db.executemany(
+                "UPDATE codex_session_locations SET last_scan_id=? WHERE path=?",
+                [(scan_id, item["path_text"]) for item in all_candidates],
+            )
+            segments = [item for item in candidates if item["identity"] is not None
+                        and item["identity"].segment_id is not None]
+            candidates = [item for item in candidates if item not in segments]
+            try:
+                selected_segments = self._codex_segments(segments)
+            except CollectorRuntimeError:
+                conflicts += 1
+                self.db.execute("UPDATE codex_session_locations SET status='identity_conflict' "
+                                "WHERE session_id=? AND last_scan_id=?", (session_id, scan_id))
+                self._protect_codex_session(session_id, scan_id)
+                continue
             divergent = False
             if len(candidates) > 1:
                 duplicate_sessions += 1
@@ -594,13 +669,13 @@ class Collector:
                     self._protect_codex_ledger_path(
                         session["canonical_path"], scan_id
                     )
-                for item in candidates:
-                    self._protect_codex_ledger_path(item["path_text"], scan_id)
+                self._protect_codex_session(session_id, scan_id)
                 continue
 
-            chosen = candidates[0]
+            chosen = candidates[0] if candidates else selected_segments[0]
             if (
                 len(candidates) == 1
+                and not segments
                 and chosen["cached_current"]
                 and session is not None
                 and session["canonical_path"] == chosen["path_text"]
@@ -657,27 +732,38 @@ class Collector:
 
             assert session is not None
             old_path = session["canonical_path"]
-            if not self._rebind_codex_path(old_path, chosen["path_text"]):
+            self.db.execute("SAVEPOINT codex_session_rebind")
+            try:
+                # A rootless session may use a segment as its metadata anchor.
+                # Its physical ledger must never move into a later root file.
+                move_root = bool(candidates) and codex_segment_id_from_filename(Path(old_path)) is None
+                rebound = ((not move_root or self._rebind_codex_path(old_path, chosen["path_text"]))
+                           and self._rebind_codex_segments(session_id, selected_segments))
+                if not rebound:
+                    self.db.execute("ROLLBACK TO codex_session_rebind")
+                self.db.execute("RELEASE codex_session_rebind")
+            except Exception:
+                self.db.execute("ROLLBACK TO codex_session_rebind")
+                self.db.execute("RELEASE codex_session_rebind")
+                raise
+            if not rebound:
                 conflicts += 1
                 self.db.execute(
-                    "UPDATE codex_sessions SET status='identity_conflict',last_seen_at=? "
-                    "WHERE session_id=?",
+                    "UPDATE codex_sessions SET status='identity_conflict',last_seen_at=? WHERE session_id=?",
                     (time.time(), session_id),
                 )
-                self.db.execute(
-                    "UPDATE codex_session_locations SET status='identity_conflict' "
-                    "WHERE session_id=? AND last_scan_id=?",
-                    (session_id, scan_id),
-                )
-                self._protect_codex_ledger_path(old_path, scan_id)
+                self.db.execute("UPDATE codex_session_locations SET status='identity_conflict' "
+                                "WHERE session_id=? AND last_scan_id=?", (session_id, scan_id))
+                self._protect_codex_session(session_id, scan_id)
                 continue
             self.db.execute(
                 """UPDATE codex_sessions
                    SET canonical_path=?,lifecycle=?,status='resolved',last_seen_at=?
                    WHERE session_id=?""",
                 (
-                    chosen["path_text"], chosen["lifecycle"], time.time(),
-                    session_id,
+                    (chosen["path_text"] if candidates or codex_segment_id_from_filename(Path(old_path))
+                     else old_path),
+                    chosen["lifecycle"], time.time(), session_id,
                 ),
             )
             self.db.execute(
@@ -689,10 +775,24 @@ class Collector:
                 "UPDATE codex_session_locations SET status='current' WHERE path=?",
                 (chosen["path_text"],),
             )
-            self._codex_path_keys[chosen["path_text"]] = session["record_key"]
+            if candidates:
+                self._codex_path_keys[chosen["path_text"]] = session["record_key"]
+                selected.append(chosen)
             for duplicate in candidates[1:]:
                 self._protect_codex_ledger_path(duplicate["path_text"], scan_id)
-            selected.append(chosen)
+            # A base can continue after its inherited prefix. Keep each physical
+            # history in its own document; do not invent a flattened turn order.
+            for segment in selected_segments:
+                path_text = segment["path_text"]
+                self._codex_path_keys[path_text] = stable_codex_segment_key(
+                    session_id, segment["identity"].segment_id)
+                self._codex_segment_identities[path_text] = segment["identity"]
+                self.db.execute("UPDATE codex_session_locations SET status='current' WHERE path=?", (path_text,))
+                selected.append(segment)
+            duplicate_sessions += int(len(segments) > len(selected_segments) and len(candidates) <= 1)
+            for segment in segments:
+                if segment not in selected_segments:
+                    self._protect_codex_ledger_path(segment["path_text"], scan_id)
 
         discovered_paths = {item["path_text"] for item in entries}
         missing_paths = [
@@ -736,6 +836,22 @@ class Collector:
             "byte_start": start,
             "byte_end": end,
         }
+        if self.harness == "codex" and kind != "tombstone" and codex_segment_id_from_filename(path):
+            identity = self._codex_segment_identities.get(str(path))
+            if identity is None:
+                identity = resolve_codex_session_identity(path)
+                if identity.status != "resolved" or identity.segment_id is None:
+                    raise CollectorRuntimeError("codex_identity_unavailable")
+                self._codex_segment_identities[str(path)] = identity
+            provenance.update({
+                "codex_session_id": identity.native_session_id,
+                "codex_segment_id": identity.segment_id,
+                "codex_history_base": {
+                    "thread_id": identity.history_base_id,
+                    "end_byte_offset": identity.history_base_offset,
+                    "end_ordinal_exclusive": identity.history_base_ordinal,
+                },
+            })
         if artifact_ref is not None:
             provenance["artifact_ref"] = artifact_ref
         if artifact_member is not None:
@@ -1062,6 +1178,7 @@ class Collector:
         scan_started = time.monotonic()
         records_seen = 0
         bounded = False
+        last_visited_path = None
         privacy_receipts = []
         if self.brain_writer is not None and not self.defer_scan_flush:
             self.flush()
@@ -1078,6 +1195,21 @@ class Collector:
             paths = self.discover()
             if self.harness == "codex":
                 paths = self._prepare_codex_discovery(paths, scan_id, summary)
+            scheduling = dict(self.db.execute(
+                "SELECT key,value FROM meta WHERE key IN "
+                "('scan_next_lane','scan_resume_after_path')"
+            ))
+            fair_slice = scheduling.get("scan_next_lane") == "fair"
+            if fair_slice:
+                # Alternate fresh appends with a durable walk through history.
+                # Rotate the full population so missing-file detection still
+                # requires a complete pass, even when the cursor was deleted.
+                paths = sorted(paths, key=str)
+                split = bisect_right(
+                    [str(path) for path in paths],
+                    scheduling.get("scan_resume_after_path", ""),
+                )
+                paths = paths[split:] + paths[:split]
             for path in paths:
                 if (
                     records_seen >= self.max_scan_records
@@ -1092,6 +1224,7 @@ class Collector:
                 ):
                     self.flush()
                 summary["files_seen"] += 1
+                last_visited_path = str(path)
                 stat = path.stat()
                 path_text = str(path)
                 row = self.db.execute("SELECT * FROM files WHERE path=?", (path_text,)).fetchone()
@@ -1435,6 +1568,9 @@ class Collector:
                 if bounded:
                     break
         self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES ('last_scan_at',?)", (str(time.time()),))
+        if fair_slice and last_visited_path is not None:
+            self._set_meta("scan_resume_after_path", last_visited_path)
+        self._set_meta("scan_next_lane", "fresh" if fair_slice else "fair")
         self.db.commit()
         summary["scan_complete"] = not bounded
         summary["privacy"] = summarize_receipts(privacy_receipts, self.privacy.mode)
@@ -1606,11 +1742,29 @@ class Collector:
         if envelope.get("kind") == "tombstone":
             clean = sanitize(envelope["content"])
         else:
-            privacy = self.privacy.apply(envelope["content"])
+            content = envelope["content"]
+            full_digest = None
+            if (
+                isinstance(content, dict)
+                and content.get("contract") == "recall.oversized-projection.v1"
+                and envelope.get("provenance", {}).get("artifact_ref", {}).get("media_type")
+                == "application/vnd.recall.oversized-record+gzip"
+                and isinstance(content.get("full_content_sha256"), str)
+                and re.fullmatch(r"[0-9a-f]{64}", content["full_content_sha256"])
+            ):
+                # Generated archive metadata can contain a Luhn-valid digit run.
+                # Recheck prose (including head/tail and any extra fields), but
+                # do not redact or drop this digest as a financial identifier.
+                full_digest = content["full_content_sha256"]
+                content = {key: value for key, value in content.items()
+                           if key != "full_content_sha256"}
+            privacy = self.privacy.apply(content)
             if privacy.action == "drop":
                 self.db.execute("DELETE FROM outbox WHERE id=?", (row["id"],))
                 return None
             clean = sanitize(privacy.value)
+            if full_digest is not None:
+                clean["full_content_sha256"] = full_digest
         if clean == envelope["content"]:
             return dict(row)
         old_sha = envelope["content_sha256"]
@@ -1892,19 +2046,14 @@ class Collector:
                     100.0 * len(archive_disk & locations.keys()) / len(archive_disk)
                 ),
                 "identity_conflicts": self.db.execute(
-                    "SELECT count(DISTINCT session_id) FROM codex_session_locations "
-                    "WHERE status='identity_conflict' AND session_id IS NOT NULL"
-                ).fetchone()[0],
+                    "SELECT count(DISTINCT session_id)+sum(session_id IS NULL) FROM codex_session_locations "
+                    "WHERE status='identity_conflict'"
+                ).fetchone()[0] or 0,
                 "quarantined_files": self.db.execute(
                     "SELECT count(*) FROM codex_session_locations WHERE status IN "
-                    "('identity_unavailable','unsafe_metadata')"
+                    "('identity_unavailable','unsafe_metadata','identity_conflict')"
                 ).fetchone()[0],
-                "duplicate_sessions": self.db.execute(
-                    "SELECT count(*) FROM ("
-                    "SELECT session_id FROM codex_session_locations "
-                    "WHERE status!='missing' AND session_id IS NOT NULL "
-                    "GROUP BY session_id HAVING count(*)>1)"
-                ).fetchone()[0],
+                "duplicate_sessions": self._codex_duplicate_sessions(),
                 "archive_backlog": self.db.execute(
                     """SELECT count(*)
                        FROM codex_session_locations location

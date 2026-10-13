@@ -11,6 +11,7 @@ from unittest import mock
 
 import orjson
 
+from tests.schema_versions import expected_schema_versions  # noqa: E402
 from recall_server import SCHEMA_VERSION
 from recall_server.actor_attribution import ActorLink
 from recall_server.canonical_retrieval import (
@@ -83,7 +84,7 @@ class PassageProjectionTests(unittest.TestCase):
         )
         rendered = " ".join(migration.read_text().split()).casefold()
 
-        self.assertEqual(SCHEMA_VERSION, 70)
+        self.assertEqual(SCHEMA_VERSION, max(expected_schema_versions()))
         self.assertIn(
             "create table if not exists canonical_passage_documents",
             rendered,
@@ -829,7 +830,8 @@ class PassageProjectionTests(unittest.TestCase):
                 if "FROM canonical_evidence_document_queue" in normalized:
                     if normalized.startswith("DELETE"):
                         return Result(rowcount=1)
-                    return Result(one={"generation": 3, "changed_at": changed_at})
+                    return Result(one={"generation": 3, "changed_at": changed_at,
+                                       "notification_queued_at": None})
                 if normalized.startswith("SELECT revision,source_updated_at"):
                     return Result(one={
                         "revision": 1,
@@ -1252,7 +1254,8 @@ class PassageProjectionTests(unittest.TestCase):
         self.assertIn("ON CONFLICT(tenant_id,source_id,logical_document_id)", seed)
         self.assertIn("DO NOTHING", seed)
         self.assertNotIn("generation+1", seed)
-        self.assertIn("sum(size_part.size_bytes)", pending)
+        self.assertIn("sum(part.size_bytes)", pending)
+        self.assertLess(pending.index("LIMIT %s"), pending.index("LEFT JOIN canonical_evidence_document_parts"))
         self.assertIn("interval '5 minutes'", pending)
 
     def test_embedding_backfill_shards_by_stable_passage_identity(self) -> None:

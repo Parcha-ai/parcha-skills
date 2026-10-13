@@ -561,6 +561,25 @@ class AdminProfileTests(unittest.TestCase):
                 selectors={},
             )
 
+    def test_native_login_rejects_invalid_state_and_challenge_before_storage(self):
+        plane = ControlPlane(object(), object(), {}, identity_provider=object())
+        for challenge, state in ((None, "s" * 43), ("c" * 42, "s" * 43),
+                                 ("c" * 43, "short"), ([], "s" * 43)):
+            with self.subTest(challenge=challenge, state=state):
+                with self.assertRaisesRegex(ControlError, "identity_oauth_request_invalid"):
+                    plane.start_identity_login(
+                        purpose="native", native_challenge=challenge, native_state=state,
+                    )
+        with self.assertRaisesRegex(ControlError, "identity_oauth_request_invalid"):
+            plane.start_identity_login(purpose="admin", native_challenge="c" * 43)
+
+    def test_native_exchange_requires_pkce_before_storage(self):
+        plane = ControlPlane(object(), object(), {})
+        for verifier in (None, [], "short", "https://attacker.example/" + "v" * 43):
+            with self.subTest(verifier=verifier):
+                with self.assertRaisesRegex(ControlError, "identity_oauth_callback_invalid"):
+                    plane.exchange_native_login(code="c" * 43, code_verifier=verifier)
+
 
 if __name__ == "__main__":
     unittest.main()

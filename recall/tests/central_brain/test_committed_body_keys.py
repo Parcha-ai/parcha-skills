@@ -294,6 +294,7 @@ class PublicationTests(unittest.TestCase):
                 )
                 cleanup = dict(deleted=0, failures=0, completed=0, pending=0)
                 with (
+                    patch.object(p, "_check_candidate_current", return_value=None),
                     patch.object(p, "_pending", return_value=[c]),
                     patch.object(p, "_prepare_batch_and_upload", return_value=[u]),
                     patch.object(p, "drain_cleanup", return_value=cleanup),
@@ -336,6 +337,7 @@ class PublicationTests(unittest.TestCase):
             inline_document_ids=("document",),
         )
         with (
+            patch.object(p, "_check_candidate_current", return_value=None),
             patch.object(p, "_pending", return_value=[candidate]),
             patch.object(p, "_prepare_batch_and_upload", return_value=[upload]),
             patch.object(p, "_commit_upload", return_value="committed"),
@@ -350,7 +352,7 @@ class PublicationTests(unittest.TestCase):
             )
         self.assertEqual(p._take_committed_body_keys(), ())
 
-    def test_large_batch_allocates_finite_hint_budget_including_failed_shard_retry(
+    def test_large_batch_allocates_finite_hint_budget_with_failed_parent(
         self,
     ):
         from tests.central_brain.test_logical_cleanup_concurrency import (
@@ -368,10 +370,11 @@ class PublicationTests(unittest.TestCase):
         ]
         budgets = []
 
-        def prepare(candidates, *, hint_limit):
+        def prepare(candidates, *, hint_limit, require_current_queue):
+            self.assertTrue(require_current_queue)
             budgets.append((len(candidates), hint_limit))
-            if len(candidates) > 1:
-                raise RuntimeError("synthetic shard error")
+            if candidates[0].native_parent_id == "130":
+                raise RuntimeError("synthetic parent error")
             return [
                 SimpleNamespace(
                     prepared=SimpleNamespace(record_count=1, receipt_count=1),
@@ -381,17 +384,24 @@ class PublicationTests(unittest.TestCase):
             ]
 
         with (
+            patch.object(p, "_check_candidate_current", return_value=None),
             patch.object(p, "_pending", return_value=rows),
             patch.object(p, "_prepare_batch_and_upload", side_effect=prepare),
             patch.object(p, "_commit_upload", return_value="committed"),
+            patch.object(p, "_mark_failed") as mark_failed,
             patch.object(
                 p,
                 "drain_cleanup",
                 return_value=dict(deleted=0, failures=0, completed=0, pending=0),
             ),
         ):
-            p.project_pending(batch_size=260, max_batches=1, upload_concurrency=2)
-        self.assertEqual(len(budgets), 262)
+            result = p.project_pending(batch_size=260, max_batches=1, upload_concurrency=2)
+        self.assertEqual(result["documents"], 259)
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual(mark_failed.call_count, 1)
+        self.assertEqual(mark_failed.call_args.args[0], rows[130])
+        self.assertEqual(len(budgets), 260)
+        self.assertTrue(all(count == 1 for count, _ in budgets))
         self.assertTrue(all(limit == 0 for _, limit in budgets))
 
 

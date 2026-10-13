@@ -20,8 +20,9 @@ Rate limits (turbopuffer's native-embedding limit is 1024 requests and 2M
 tokens per minute per organisation, HTTP 429 ``RateLimitError``) back off
 1 s, 2 s, 4 s ... capped at 60 s and retry the same batch, for at most
 ``RATE_LIMIT_BUDGET_SECONDS`` per month; the batch is never dropped. Writes
-are clamped to ``max_batch_bytes`` of row payload as well as ``batch_rows``
-(the per-namespace ingest limit is 32 MB/s).
+of upserts are clamped to ``max_batch_bytes`` of row payload as well as
+``batch_rows`` (the per-namespace ingest limit is 32 MB/s). Explicit deletes
+use the same byte budget for the ID array, independently of embedding rows.
 
 Nothing here logs passage text or the API key; failures carry the error
 class only.
@@ -34,7 +35,8 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from collections.abc import Callable, Iterator
+from collections import deque
+from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager, nullcontext
 from datetime import date, datetime, timezone
 from typing import Any
@@ -157,6 +159,28 @@ def byte_bounded_batches(rows: list[dict[str, Any]], *, max_rows: int, max_bytes
     return batches
 
 
+def delete_id_batches(ids: list[str], *, max_bytes: int) -> Iterator[list[str]]:
+    """Bound explicit deletes by JSON-array bytes, not embedding row count.
+
+    Include brackets, commas and conservative ASCII-escaped string encoding.
+    The captured ID list remains the authority for the final month ACK.
+    """
+    batch: list[str] = []
+    size = 2  # Opening and closing array brackets.
+    for identifier in ids:
+        encoded_size = len(json.dumps(identifier, ensure_ascii=True).encode("utf-8"))
+        if encoded_size + 2 > max_bytes:
+            # Canonical passage IDs fit even the minimum configured budget.
+            raise ValueError("search plane delete ID exceeds batch bytes")
+        if batch and size + 1 + encoded_size > max_bytes:
+            yield batch
+            batch, size = [], 2
+        size += encoded_size + int(bool(batch))
+        batch.append(identifier)
+    if batch:
+        yield batch
+
+
 def is_rate_limit(error: BaseException) -> bool:
     """``turbopuffer.RateLimitError`` (HTTP 429), matched by class name so the
     SDK stays an optional import."""
@@ -246,18 +270,49 @@ class _MonthTiming:
         finally:
             elapsed = time.monotonic() - started
             with self.lock:
-                self.values[phase][0] += elapsed
-                self.values[phase][1] += 1
+                value = self.values.setdefault(phase, [0.0, 0])
+                value[0] += elapsed
+                value[1] += 1
 
-    def log(self, succeeded: bool, concurrency: int) -> None:
+    def snapshot(self) -> dict[str, tuple[float, int]]:
+        with self.lock:
+            return {phase: (elapsed, count) for phase, (elapsed, count) in self.values.items()}
+
+    def add_since(self, other: _MonthTiming, previous: dict[str, tuple[float, int]]) -> None:
+        # next() has settled all page writers before returning/raising. Copy
+        # numeric deltas only; a paused claim never lends page bodies here.
+        for phase, (elapsed, count) in other.snapshot().items():
+            old_elapsed, old_count = previous[phase]
+            self.values[phase][0] += elapsed - old_elapsed
+            self.values[phase][1] += count - old_count
+
+    def log_quantum(self, result: dict[str, int | str] | None, concurrency: int) -> None:
+        phases = ("claim", "catalog", "page", "pacer", "sdk", "backoff", "commit", "pending")
+        outcome = result or {}
+        LOG.info(
+            "search plane quantum timing returned=%s quantum_ms=%s "
+            "claim_ms=%s claim_calls=%s catalog_ms=%s catalog_calls=%s "
+            "page_ms=%s page_calls=%s pacer_ms=%s pacer_calls=%s "
+            "sdk_ms=%s sdk_calls=%s backoff_ms=%s backoff_calls=%s "
+            "commit_ms=%s commit_calls=%s pending_ms=%s pending_calls=%s "
+            "reported_rows=%s reported_deleted=%s months=%s failed=%s concurrency=%s",
+            int(result is not None), round((time.monotonic() - self.started) * 1000),
+            *(value for phase in phases
+              for elapsed, count in [self.values.get(phase, (0.0, 0))]
+              for value in (round(elapsed * 1000), count)),
+            *(int(outcome.get(key, 0)) for key in ("rows", "deleted", "months", "failed")),
+            concurrency,
+        )
+
+    def log(self, succeeded: bool, concurrency: int, *, cooperative: bool = False) -> None:
         LOG.info(
             "search plane month timing succeeded=%s month_ms=%s "
             "catalog_ms=%s catalog_calls=%s page_ms=%s page_calls=%s "
             "pacer_ms=%s pacer_calls=%s sdk_ms=%s sdk_calls=%s "
-            "backoff_ms=%s backoff_calls=%s commit_ms=%s commit_calls=%s concurrency=%s",
+            "backoff_ms=%s backoff_calls=%s commit_ms=%s commit_calls=%s concurrency=%s cooperative=%s",
             int(succeeded), round((time.monotonic() - self.started) * 1000),
             *(value for elapsed, count in self.values.values() for value in (round(elapsed * 1000), count)),
-            concurrency,
+            concurrency, int(cooperative),
         )
 
 
@@ -307,6 +362,8 @@ class TurbopufferProjector:
         self.write_concurrency = concurrency
         self.page_rows = self.batch_rows * concurrency
         self._client = client
+        self._quantum_tenant: str | None = None
+        self._quantum_months: deque[tuple[dict[str, Any], Generator[dict[str, Any], None, None], _MonthTiming]] = deque()
 
     @property
     def client(self) -> Any:
@@ -528,10 +585,38 @@ class TurbopufferProjector:
                     self.sleep(delay)
                 delay = min(delay * 2, RATE_LIMIT_BACKOFF_CAP_SECONDS)
 
-    def project_month(self, claim: dict[str, Any]) -> dict[str, Any]:
-        """Project one claimed source-month; raises on a turbopuffer failure."""
+    def _write_page(self, namespace: Any, budget: dict[str, float],
+                    page: list[dict[str, Any]], timing: _MonthTiming) -> int:
+        # This frame owns page bodies; no text survives in a paused month step.
+        rows = [
+            passage_row({**passage, "actors": [tuple(actor) for actor in passage["actors"]]})
+            for passage in page
+        ]
+        batches = byte_bounded_batches(rows, max_rows=self.batch_rows, max_bytes=self.max_batch_bytes)
 
-        timing = _MonthTiming()
+        def write_batch(batch: list[dict[str, Any]]) -> int:
+            with timing.measure("pacer"):
+                self.pacer.wait_for(estimated_tokens(batch))
+            self._write(namespace, budget, timing=timing, upsert_rows=batch)
+            return len(batch)
+
+        if self.write_concurrency > 1 and len(batches) > 1:
+            with ThreadPoolExecutor(
+                max_workers=min(self.write_concurrency, len(batches)),
+                thread_name_prefix="recall-search-plane",
+            ) as executor:
+                return sum(executor.map(write_batch, batches))
+        return sum(write_batch(batch) for batch in batches)
+
+    def _month_steps(self, claim: dict[str, Any], *, cooperative: bool = False, timing: _MonthTiming | None = None) -> Generator[dict[str, Any], None, None]:
+        """One page/delete batch per step; acknowledge only a complete month.
+
+        Paused state retains metadata and exact captured tombstone IDs, never
+        passage bodies or open database connections. Tombstone/part metadata
+        remains proportional to the month; this is not a fixed RSS bound.
+        """
+        timing = timing or _MonthTiming()
+        timing.started = time.monotonic()  # Month wall starts on first advancement.
         succeeded = False
         try:
             tenant_id = claim["tenant_id"]
@@ -539,73 +624,136 @@ class TurbopufferProjector:
             namespace = self.client.namespace(name)
             budget = {"remaining": self.rate_limit_budget_seconds, "rate_limited": 0}
             with timing.measure("catalog"), self.store.connect() as connection:
-                since = (
-                    self.shard_watermark(connection, claim)
-                    if claim["reason"] in INCREMENTAL_REASONS
-                    else None
-                )
+                since = (self.shard_watermark(connection, claim)
+                         if claim["reason"] in INCREMENTAL_REASONS else None)
                 watermark = self.read_watermark(connection)
                 tombstones = self.tombstone_ids(connection, claim)
                 connection.commit()
-            # Deletes first: a tombstone for an id that is live again (the same
-            # passage re-inserted) must not erase the row upserted below.
-            deleted = 0
-            for batch in _chunks(tombstones, self.batch_rows):
+            rate_reported = 0
+            for batch in delete_id_batches(tombstones, max_bytes=self.max_batch_bytes):
                 try:
                     self._write(namespace, budget, timing=timing, deletes=batch)
                 except Exception as error:  # noqa: BLE001 - class checked below
                     if type(error).__name__ != "NotFoundError":
                         raise
-                deleted += len(batch)
+                current_rate = int(budget["rate_limited"])
+                yield {"rows": 0, "deleted": len(batch),
+                       "rate_limited": current_rate - rate_reported}
+                rate_reported = current_rate
             written = 0
             after: tuple[datetime, str] | None = None
+            last_rows = 0
             while True:
                 with timing.measure("page"), self.store.connect() as connection:
                     page = self.passage_page(connection, claim, since=since, after=after)
                     connection.commit()
                 if not page:
                     break
-                rows = [
-                    passage_row({**passage, "actors": [tuple(actor) for actor in passage["actors"]]})
-                    for passage in page
-                ]
-                batches = byte_bounded_batches(rows, max_rows=self.batch_rows, max_bytes=self.max_batch_bytes)
-
-                def write_batch(batch: list[dict[str, Any]]) -> int:
-                    with timing.measure("pacer"):
-                        self.pacer.wait_for(estimated_tokens(batch))
-                    self._write(namespace, budget, timing=timing, upsert_rows=batch)
-                    return len(batch)
-
-                if self.write_concurrency > 1 and len(batches) > 1:
-                    with ThreadPoolExecutor(
-                        max_workers=min(self.write_concurrency, len(batches)),
-                        thread_name_prefix="recall-search-plane",
-                    ) as executor:
-                        written += sum(executor.map(write_batch, batches))
-                else:
-                    for batch in batches:
-                        written += write_batch(batch)
-                last = page[-1]
-                after = (last["first_occurred_at"], last["passage_id"])
-                if len(page) < self.page_rows:
+                last_rows = self._write_page(namespace, budget, page, timing)
+                written += last_rows
+                after = (page[-1]["first_occurred_at"], page[-1]["passage_id"])
+                exhausted = len(page) < self.page_rows
+                page = []
+                if exhausted:
                     break
+                current_rate = int(budget["rate_limited"])
+                yield {"rows": last_rows, "deleted": 0,
+                       "rate_limited": current_rate - rate_reported}
+                rate_reported = current_rate
+                last_rows = 0
             with timing.measure("commit"), self.store.connect() as connection:
-                retired = self.finish_month(
-                    connection, claim,
-                    namespace=name, rows_written=written,
-                    tombstones=tombstones, watermark=watermark,
-                )
+                retired = self.finish_month(connection, claim, namespace=name,
+                    rows_written=written, tombstones=tombstones, watermark=watermark)
             succeeded = True
-            return {
-                "rows": written, "deleted": deleted, "retired": retired,
-                "rate_limited": int(budget["rate_limited"]),
-            }
+            yield {"rows": last_rows, "deleted": 0, "retired": retired,
+                   "rate_limited": int(budget["rate_limited"]) - rate_reported}
         finally:
             try:
-                timing.log(succeeded, self.write_concurrency)
+                timing.log(succeeded, self.write_concurrency, cooperative=cooperative)
             except Exception:  # noqa: BLE001 - diagnostics must preserve the outcome
                 pass
+
+    def project_month(self, claim: dict[str, Any]) -> dict[str, Any]:
+        """Complete one month using the same steps as cooperative publication."""
+        result: dict[str, Any] = {"rows": 0, "deleted": 0, "rate_limited": 0}
+        for step in self._month_steps(claim):
+            for key in ("rows", "deleted", "rate_limited"):
+                result[key] += step[key]
+            if "retired" in step:
+                result["retired"] = step["retired"]
+        return result
+
+    def drain_quantum(self, *, tenant_id: str, max_months: int) -> dict[str, int | str]:
+        """Report active call work even when its claim remains unfinished."""
+        timing = _MonthTiming()
+        result = None
+        try:
+            result = self._drain_quantum(tenant_id=tenant_id, max_months=max_months, timing=timing)
+            return result
+        finally:
+            try:
+                timing.log_quantum(result, self.write_concurrency)
+            except Exception:  # noqa: BLE001 - diagnostics must preserve the outcome
+                pass
+
+    def _drain_quantum(self, *, tenant_id: str, max_months: int, timing: _MonthTiming) -> dict[str, int | str]:
+        """Advance one page then return to the worker's sole coordinator.
+
+        The worker owns this projector for one tenant and process lifetime.
+        Restart safely replays unfinished work from the last complete watermark.
+        """
+        if isinstance(max_months, bool) or not isinstance(max_months, int) or not 1 <= max_months <= 1000:
+            raise ValueError("search plane months per cycle is invalid")
+        if self._quantum_tenant is not None and self._quantum_tenant != tenant_id:
+            raise ValueError("search plane quantum tenant changed")
+        self._quantum_tenant = tenant_id
+        active = {(claim["source_id"], claim["month"]) for claim, _, _ in self._quantum_months}
+        if len(active) < max_months:
+            with timing.measure("claim"), self.store.connect() as connection:
+                claims = self.claim_months(connection, tenant_id=tenant_id, limit=max_months + len(active))
+                connection.commit()
+            for claim in claims:
+                if len(self._quantum_months) >= max_months:
+                    break
+                key = (claim["source_id"], claim["month"])
+                if key not in active:
+                    month_timing = _MonthTiming()
+                    steps = self._month_steps(claim, cooperative=True, timing=month_timing)
+                    self._quantum_months.append((claim, steps, month_timing))
+                    active.add(key)
+        result: dict[str, int | str] = dict(status="complete", months=0, rows=0,
+            deleted=0, failed=0, requeued=0, rate_limited=0, pending=0)
+        if self._quantum_months:
+            claim, steps, month_timing = self._quantum_months.popleft()
+            previous = month_timing.snapshot()
+            try:
+                try:
+                    step = next(steps)
+                finally:
+                    timing.add_since(month_timing, previous)
+            except Exception as error:  # noqa: BLE001 - retain the outbox for replay
+                steps.close()
+                result["failed"] = 1
+                LOG.warning("search plane month failed reason=%s generation=%s type=%s",
+                    claim["reason"], claim["generation"], type(error).__name__)
+            else:
+                for key in ("rows", "deleted", "rate_limited"):
+                    result[key] = step[key]
+                if "retired" in step:
+                    steps.close()
+                    result["months"] = 1
+                    result["requeued"] = int(not step["retired"])
+                else:
+                    self._quantum_months.append((claim, steps, month_timing))
+        with timing.measure("pending"), self.store.connect() as connection:
+            result["pending"] = int(connection.execute(
+                "SELECT count(*) AS count FROM search_projection_outbox WHERE tenant_id=%s",
+                (tenant_id,),
+            ).fetchone()["count"])
+            connection.commit()
+        if result["pending"] or result["failed"]:
+            result["status"] = "pending"
+        return result
 
     def drain(
         self,

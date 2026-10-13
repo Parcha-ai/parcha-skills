@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -29,6 +30,7 @@ from .passage_representations import FINGERPRINT_RE, VECTOR_COLUMNS
 from .rerank import (
     DEFAULT_RERANK_BLEND,
     DEFAULT_RERANK_MIN_BUDGET_SECONDS,
+    MAX_CANDIDATES_CEILING,
     RerankUnavailable,
 )
 from .temporal_hints import (
@@ -697,17 +699,11 @@ FOCUS_WINDOW_MIN_GAIN = 2
 RERANK_FOCUS_WINDOW = False
 
 
-# H3 follow-up: near-duplicate documents. Codex sessions carry copied
-# history (forks, sub-agent rollouts, re-runs): on the live namespace
-# 23% of the dense candidates share their text hash with a passage in
-# another document, and for one validation question five copies of one
-# session held ranks 1-5 above the answer. After the reranker, on the
-# hydrated text, a document whose leading passage shares most of its
-# word 5-gram shingles with a higher-ranked document folds into it as a
-# "similar document" (ids, source, times, receipts: enough to open it),
-# so the caller reads each piece of evidence once and the slots below
-# go to distinct documents. ``RECALL_SEARCH_NEAR_DUPLICATES=off``
-# disables; the threshold is the shingle Jaccard similarity.
+# Similar text is only a grouping signal within the same known source and
+# native parent. Independent messages must keep their own rank and receipts.
+# Cross-parent copied histories need explicit conversation identity before
+# they can safely fold; that identity is not deployed here. The existing
+# shingle threshold still applies, and RECALL_SEARCH_NEAR_DUPLICATES=off disables.
 NEAR_DUPLICATE_SHINGLE = 5
 NEAR_DUPLICATE_THRESHOLD = 0.6
 _SHINGLE_WORD_RE = re.compile(r"[a-z0-9_]+")
@@ -766,15 +762,12 @@ def group_near_duplicates(
     *,
     threshold: float = NEAR_DUPLICATE_THRESHOLD,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Fold documents whose leading passage duplicates a higher-ranked one.
+    """Fold similar passages only within one known source/native parent.
 
-    A group takes the position of its best-ranked member; the member that
-    continued latest (``last_occurred_at``, ties to the best rank) is the
-    primary and carries the others under ``similar_documents``. Among
-    copies of one piece of history the continuation that ran longest is
-    the most complete one (live: three validation answers were the latest
-    member of their group, never the best-ranked copy). A document with no
-    leading text, or too short for a shingle, never groups.
+    Text similarity alone does not identify a conversation or message. Unknown
+    or different identities stay separate even when their text is identical.
+    Within a known identity, the group keeps its best-ranked position and the
+    latest continuation carries the other members under ``similar_documents``.
     """
 
     groups: list[list[dict[str, Any]]] = []
@@ -785,8 +778,13 @@ def group_near_duplicates(
         signature = text_shingles((ranges[0].get("text") or "") if ranges else "")
         group_index = None
         best = 0.0
-        if signature:
+        source_id, native_parent_id = row.get("source_id"), row.get("native_parent_id")
+        if signature and all(isinstance(value, str) and value.strip() for value in (source_id, native_parent_id)):
             for index, other in enumerate(signatures):
+                representative = groups[index][0]
+                if (representative.get("source_id") != source_id
+                        or representative.get("native_parent_id") != native_parent_id):
+                    continue
                 similarity = shingle_similarity(signature, other)
                 if similarity >= threshold and similarity > best:
                     group_index, best = index, similarity
@@ -2535,9 +2533,10 @@ class PassageHintRetrieval:
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Rerank the fused passage pool; on any shortfall keep the fused order.
 
-        Contract: the provider receives the query plus the redacted text of at
-        most ``runtime.max_candidates`` passages (the runtime truncates each to
-        its configured width). Statuses: ``ok`` (scores applied, or nothing to
+        Contract: the provider receives the query plus available redacted
+        matching passages from the admitted document pool, up to the provider
+        input ceiling. Each passage retains the runtime's configured width.
+        Statuses: ``ok`` (scores applied, or nothing to
         send), ``skipped-budget`` (less than the minimum budget remained after
         the arms), ``unavailable`` (``RerankUnavailable``; fused order kept).
         ``arm_elapsed_ms["rerank"]`` is set only when the provider was called
@@ -2557,6 +2556,14 @@ class PassageHintRetrieval:
         if remaining < min_budget:
             diagnostics["rerank_status"] = "skipped-budget"
             return results, diagnostics
+        # The document budget was applied before hydration. Score its matching
+        # passages too, so an arbitrary first range cannot hide better evidence.
+        # Keep the expanded passage capacity local to this request.
+        runtime = copy.copy(runtime)
+        runtime.max_candidates = min(
+            MAX_CANDIDATES_CEILING,
+            max(int(runtime.max_candidates), sum(len(row.get("matching_ranges") or ()) for row in results)),
+        )
         # The provider reads at most ``max_doc_chars`` of each passage; send
         # the passage's context line (source, time, people) followed by the
         # text (the query-densest window when RERANK_FOCUS_WINDOW is on).

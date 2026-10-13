@@ -335,6 +335,29 @@ def main() -> None:
             "status": "accepted", "routes": 1, "replays": 1, "duplicate_events": 1,
         }, (slack_replay_status, slack_replay)
 
+        # A signed callback is not permission to bypass installation selection.
+        with store.connect() as connection:
+            connection.execute(
+                "UPDATE connector_installations SET selectors=%s WHERE tenant_id=%s AND source_id=%s",
+                (json.dumps({"channel_ids": ["C0E2E"]}), TENANT, SLACK_SOURCE),
+            )
+        for channel, channel_type in (("COTHER", "channel"), ("C0E2E", "group"),
+                                      ("D0E2E", "im"), ("G0E2E", "mpim")):
+            rejected = json.loads(slack_event("synthetic excluded evidence", "1721332801.000100"))
+            rejected["event"].update(channel=channel, channel_type=channel_type)
+            rejected_status, rejected_ack = post_slack(server, json.dumps(rejected).encode())
+            assert rejected_status == 200 and rejected_ack == {
+                "status": "accepted", "routes": 0, "replays": 0, "duplicate_events": 0,
+            }, (channel_type, rejected_status, rejected_ack)
+        # Matching selected source still retains its original receipt/replay identity.
+        selected_status, selected_ack = post_slack(server, slack_raw)
+        assert selected_status == 200 and selected_ack["routes"] == 1 and selected_ack["duplicate_events"] == 1
+        with store.connect() as connection:
+            connection.execute(
+                "UPDATE connector_installations SET selectors='{}'::jsonb WHERE tenant_id=%s AND source_id=%s",
+                (TENANT, SLACK_SOURCE),
+            )
+
         # --- /v1/ingest/batches --------------------------------------------
         batch = {"events": [legacy_envelope("session-e2e:turn-1", "quartz decision")]}
         batch_status, ack = post_json(
