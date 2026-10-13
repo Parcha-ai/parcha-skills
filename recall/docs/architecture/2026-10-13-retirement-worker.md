@@ -54,7 +54,9 @@ archive reads. The default deadline is 10 seconds, at most 5 while freshness
 work is pending; `--retirement-seconds` configures the idle deadline. Reconciliation
 gets at most one second and retains a margin to commit its cursor. Full-parent
 proof and transport deadlines remain active, SDK retries remain disabled for
-maintenance archive reads, and clearing stops when its invocation byte budget
+maintenance archive reads. The existing SQL pool has a separate five-second
+connection wait, so saturation can extend wall time beyond the round deadline.
+Clearing stops when its invocation byte budget
 cannot fit another whole document. Limits bound a scheduling round, not stored
 evidence or which parents may eventually be proved.
 
