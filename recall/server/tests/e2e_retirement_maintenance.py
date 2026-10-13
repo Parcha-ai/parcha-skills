@@ -226,6 +226,38 @@ process.main()
         self.assertEqual(recovered['reconciled_intents'],1)
         self.assertEqual(recovered['cleared_documents'],2)
 
+    def test_child_clears_parent_above_old_round_limit_with_one_proof(self):
+        from e2e_logical_evidence_projection import insert_record
+        from recall_server.logical_evidence import LogicalEvidenceProjectionStore
+        from recall_server.logical_evidence_projection import (
+            CanonicalLogicalEvidenceProjector, mark_logical_evidence_dirty)
+        self.activate()
+        set_parent_retirement_enabled(self.store, **self.target, enabled=False)
+        for ordinal in range(18):
+            with self.store.connect() as c:
+                insert_record(c, tenant=self.tenant, source=self.source,
+                    parent='one-proof-parent', native=f'one-proof-{ordinal:04d}',
+                    text=f'{ordinal:08d}'+'x'*(4*1024**2-8),
+                    role='assistant', byte_start=ordinal*10)
+        with self.store.connect() as c:
+            mark_logical_evidence_dirty(c, tenant_id=self.tenant, source_id=self.source,
+                native_ids=['one-proof-0000'], reason='ingest')
+        projector = CanonicalLogicalEvidenceProjector(self.store,
+            LogicalEvidenceProjectionStore(self.archive), bound_tenant_id=self.tenant,
+            raw_archive=self.archive)
+        published = projector.project_pending(tenant_id=self.tenant,
+            batch_size=1, max_batches=1, upload_concurrency=1)
+        self.assertEqual(published['failed'], 0, published)
+        self.ready()
+        report = self.finish_child(self.child())
+        self.assertFalse(report['commit_outcome_unknown'], report)
+        self.assertEqual(report['failed_parents'], 0, report)
+        self.assertEqual(report['cleared_utf8_bytes'], 72*1024**2)
+        self.assertEqual(report['completed_parent_proofs'], 1)
+        self.assertEqual(report['batches'], 9)  # Original eight-MiB transactions.
+        self.assertLess(report['archive_bytes'], 74*1024**2)
+        self.assertEqual(self.parent_state('one-proof-parent')['status'], 'complete')
+
     @unittest.skipUnless(os.environ.get('RECALL_LARGE_RETIREMENT_TEST') == '1',
                          'explicit 512MiB resource measurement')
     def test_512mib_parent_makes_bounded_progress_until_complete(self):
@@ -291,7 +323,7 @@ process.main()
             print(json.dumps(dict(measurement='512mib_round', round=round_number, report=report)), flush=True)
             self.assertFalse(report['commit_outcome_unknown'], report)
             self.assertGreater(report['cleared_utf8_bytes'], 0, report)
-            self.assertLessEqual(report['cleared_utf8_bytes'], 64*1024**2)
+            self.assertLessEqual(report['cleared_utf8_bytes'], 512*1024**2)
             self.assertGreater(report['archive_bytes'], 512*1024**2)
             self.assertLess(report['peak_rss_kib'], 512*1024)
             self.assertLessEqual(max_connections, 1)
