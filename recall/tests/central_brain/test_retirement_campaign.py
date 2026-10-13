@@ -3,11 +3,12 @@
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[2] / "server")]
 from recall_server.retirement_campaign import (
@@ -65,6 +66,18 @@ class CampaignTests(unittest.TestCase):
                 run.step(owner)
             owner.assert_not_called()
 
+    def test_new_campaign_directory_entry_is_durable_before_use(self):
+        synced = []
+        fsync = os.fsync
+
+        def record(descriptor):
+            synced.append(os.fstat(descriptor).st_ino)
+            fsync(descriptor)
+
+        with patch("os.fsync", side_effect=record):
+            with Campaign(self.path / "new", self.inventory, self.inventory["sha256"]):
+                self.assertIn(self.path.stat().st_ino, synced)
+
     def test_sources_alternate_and_deferred_parent_does_not_starve_tail(self):
         visited = []
 
@@ -100,6 +113,57 @@ class CampaignTests(unittest.TestCase):
         with self.campaign() as run:
             with self.assertRaises(ReconciliationRequired):
                 run.step(Mock())
+
+    def test_reconcile_lost_result_appends_without_rewriting_intent(self):
+        def lost(selected, emit):
+            emit("launch_intent", dict(pin="pin"))
+            emit("job", dict(id="job"))
+            raise TimeoutError()
+
+        with self.campaign() as run:
+            with self.assertRaises(TimeoutError):
+                run.step(lost)
+        directory = self.path / "00000000"
+        original = (directory / "intent.json").read_bytes()
+
+        def inspect(events, emit):
+            self.assertEqual([e["name"] for e in events], ["launch_intent", "job"])
+            emit("reconciled_job", dict(id="job"))
+            return [dict(status="enrolled", certainty="known")]
+
+        with self.campaign() as run:
+            run.reconcile(inspect)
+            self.assertFalse(run.report()["reconciliation_required"])
+            self.assertEqual(run.report()["considered_parents"], 1)
+        self.assertEqual((directory / "intent.json").read_bytes(), original)
+        self.assertFalse((directory / "result.json").exists())
+        self.assertTrue((directory / "reconciliation.json").exists())
+        with self.campaign() as run:
+            self.assertEqual(run.report()["considered_parents"], 1)
+
+    def test_transport_reconciliation_cannot_resolve_unknown_owner_commit(self):
+        with self.campaign() as run:
+            run.step(
+                lambda p, emit: dict(status="enrollment_unknown", certainty="unknown")
+            )
+        with self.campaign() as run:
+            inspect = Mock()
+            with self.assertRaisesRegex(ValueError, "owner_outcome_unknown"):
+                run.reconcile(inspect)
+            inspect.assert_not_called()
+
+    def test_reconciled_logs_with_unknown_owner_leave_campaign_blocked(self):
+        with self.campaign() as run:
+            with self.assertRaises(TimeoutError):
+                run.step(Mock(side_effect=TimeoutError()))
+            with self.assertRaisesRegex(ValueError, "owner_outcome_unknown"):
+                run.reconcile(
+                    lambda events, emit: [
+                        dict(status="enrollment_unknown", certainty="unknown")
+                    ]
+                )
+            self.assertTrue(run.report()["reconciliation_required"])
+        self.assertFalse((self.path / "00000000" / "reconciliation.json").exists())
 
     def test_mutation_event_fsynced_and_secret_exception_not_stored(self):
         def owner(p, emit):

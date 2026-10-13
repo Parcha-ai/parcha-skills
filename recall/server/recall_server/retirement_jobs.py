@@ -15,6 +15,7 @@ from pathlib import Path
 import time
 import urllib.parse
 import urllib.request
+import uuid
 
 from .retirement_campaign import _check, canonical, digest
 
@@ -127,23 +128,29 @@ class RenderJob:
         self.base = "/services/" + config["service_id"]
 
     def run(self, body, pin, emit):
+        preflight_deadline = self.clock() + 60
+
+        def read(path):
+            _check(self.clock() < preflight_deadline, "preflight_deadline")
+            value = self.request("GET", path)
+            _check(self.clock() < preflight_deadline, "preflight_deadline")
+            return value
+
         checkpoint = self.guard()
-        deployment = self.request("GET", self.base + "/deploys?limit=1")[0]["deploy"]
+        deployment = read(self.base + "/deploys?limit=1")[0]["deploy"]
         _check(
             deployment["status"] == "live"
             and deployment["commit"]["id"] == self.config["commit"],
             "deployment_changed",
         )
-        service = self.request("GET", self.base)
+        service = read(self.base)
         _check(service.get("autoDeploy") == "no", "auto_deploy_enabled")
         cursor, seen = None, set()
         while True:
             query = {"limit": 100}
             if cursor:
                 query["cursor"] = cursor
-            jobs = self.request(
-                "GET", self.base + "/jobs?" + urllib.parse.urlencode(query)
-            )
+            jobs = read(self.base + "/jobs?" + urllib.parse.urlencode(query))
             _check(
                 all(row.get("job", row).get("status") in TERMINAL for row in jobs),
                 "active_job",
@@ -154,7 +161,7 @@ class RenderJob:
             _check(cursor and cursor not in seen, "job_cursor")
             seen.add(cursor)
         checkpoint = self.guard()  # No stale health after paginating the job inventory.
-        deployment = self.request("GET", self.base + "/deploys?limit=1")[0]["deploy"]
+        deployment = read(self.base + "/deploys?limit=1")[0]["deploy"]
         _check(
             deployment["status"] == "live"
             and deployment["commit"]["id"] == self.config["commit"],
@@ -178,6 +185,7 @@ class RenderJob:
             + '")))'
         )
         # Exactly one POST. A timeout or lost response is not safe to retry.
+        _check(self.clock() < preflight_deadline, "preflight_deadline")
         job = self.request("POST", self.base + "/jobs", {"startCommand": command})
         _check(job.get("id") and job.get("createdAt"), "post_outcome_unknown")
         job = {k: job.get(k) for k in ("id", "createdAt", "status")}
@@ -192,9 +200,22 @@ class RenderJob:
                 break
             self.sleep(5)
         _check(status["status"] == "succeeded", "job_failed_requires_reconciliation")
+        return self._read_result(job, pin, service["ownerId"], emit)
+
+    def reconcile(self, job_id, pin, owner_id, emit):
+        """Inspect one existing job. No launch, polling, or mutation retry."""
+        _check(isinstance(job_id, str) and bool(job_id), "job_identity")
+        job = self.request(
+            "GET", self.base + "/jobs/" + urllib.parse.quote(job_id, safe="")
+        )
+        _check(job.get("id") == job_id and job.get("createdAt"), "job_identity")
+        _check(job.get("status") == "succeeded", "job_failed_requires_reconciliation")
+        return self._read_result(job, pin, owner_id, emit)
+
+    def _read_result(self, job, pin, owner_id, emit):
         query = urllib.parse.urlencode(
             dict(
-                ownerId=service["ownerId"],
+                ownerId=owner_id,
                 resource=job["id"],
                 type="app",
                 direction="forward",
@@ -249,6 +270,7 @@ def package_body(config, payload):
     ]
     sources = {name: (root / name).read_text() for name in names}
     spec = dict(
+        invocation_id=uuid.uuid4().hex,
         commit=config["commit"],
         service_id=config["service_id"],
         owner_modules=config["owner_modules"],
@@ -313,6 +335,18 @@ with tempfile.TemporaryDirectory() as temporary:
     )
     compile(source, "retirement-render-job", "exec")
     return source, pin
+
+
+def reconcile_enrollment(config, job_id, events, emit):
+    """Bind an explicit job inspection to the persisted launch, not today's code."""
+    launches = [e["value"] for e in events if e["name"] == "launch_intent"]
+    _check(len(launches) == 1, "reconciliation_launch_missing")
+    launch = launches[0]
+    _check(launch["config_sha256"] == digest(config), "reconciliation_config_changed")
+    jobs = [e["value"]["id"] for e in events if e["name"] == "job"]
+    _check(not jobs or jobs == [job_id], "reconciliation_job_changed")
+    emit("reconciliation_job", dict(id=job_id, pin=launch["pin"]))
+    return RenderJob(config).reconcile(job_id, launch["pin"], launch["owner_id"], emit)
 
 
 class RemoteEnrollmentOwner:

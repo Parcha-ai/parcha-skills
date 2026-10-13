@@ -4,6 +4,7 @@ import time
 
 from . import retirement_runner as runner, streaming_locators as locators
 from .chunk_retirement import ParentRetirementLimits, require_retirement_owner
+from .db import SearchDeadlineExceeded
 from .parent_chunk_proof import read_parent_catalog
 from .chunk_bodies import _record_location, _EXCLUDED_TYPES
 from .locator_backfill_plan import _DOCUMENTS_SQL
@@ -166,7 +167,10 @@ class EnrollmentOwner:
                     dict(status=status, certainty="known", owner_result=latest)
                 ]
             sqlstate = getattr(error, "sqlstate", None)
-            if isinstance(error, TimeoutError) or sqlstate == "57014":
+            if (
+                isinstance(error, (TimeoutError, SearchDeadlineExceeded))
+                or sqlstate == "57014"
+            ):
                 code = "metadata_timeout"
             elif sqlstate == "55P03":
                 code = "metadata_lock_busy"

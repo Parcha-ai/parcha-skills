@@ -111,6 +111,18 @@ def _validate_outcome(outcome):
         _check(outcome.get("status") in KNOWN_STATUSES, "outcome_status")
 
 
+def _mkdir(path, *, exist_ok=False):
+    """Make a private journal directory and persist its containing directory entry."""
+    if not path.parent.exists():
+        _mkdir(path.parent, exist_ok=True)
+    path.mkdir(mode=0o700, exist_ok=exist_ok)
+    descriptor = os.open(path.parent, os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _write(path, value):
     """Create-once file, fsync its bytes and parent directory before returning."""
     data = canonical(value) + b"\n"
@@ -148,7 +160,7 @@ class Campaign:
         self.lock = None
 
     def __enter__(self):
-        self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _mkdir(self.directory, exist_ok=True)
         _check(
             self.directory.stat().st_mode & 0o077 == 0,
             "private_state_directory_required",
@@ -237,10 +249,18 @@ class Campaign:
                 ),
                 "journal_intent",
             )
-            if not (directory / "result.json").exists():
+            result_path = directory / "result.json"
+            reconciled = directory / "reconciliation.json"
+            _check(
+                not (result_path.exists() and reconciled.exists()),
+                "journal_double_result",
+            )
+            if reconciled.exists():
+                result_path = reconciled
+            if not result_path.exists():
                 self.pending = intent
                 break
-            result = json.loads((directory / "result.json").read_bytes())
+            result = json.loads(result_path.read_bytes())
             unsigned = {k: v for k, v in result.items() if k != "sha256"}
             _check(
                 result.get("sha256") == digest(unsigned)
@@ -297,6 +317,40 @@ class Campaign:
         result["sha256"] = digest(result)
         _write(directory / "result.json", result)
         self._accept(intent, result, index)
+        return result
+
+    def reconcile(self, inspect):
+        """Recover missing transport results without replaying the original owner."""
+        _check(self.pending and "plans" in self.pending, "no_reconcilable_intent")
+        intent = self.pending
+        directory = self.directory / f"{intent['sequence']:08d}"
+        _check(not (directory / "result.json").exists(), "owner_outcome_unknown")
+        events = [
+            json.loads(p.read_bytes()) for p in sorted(directory.glob("event-*.json"))
+        ]
+        count = len(events)
+
+        def emit(name, value):
+            nonlocal count
+            _write(directory / f"event-{count:05d}.json", dict(name=name, value=value))
+            count += 1
+
+        outcomes = inspect(deepcopy(events), emit)
+        _check(
+            isinstance(outcomes, list) and len(outcomes) <= len(intent["plans"]),
+            "outcome_prefix",
+        )
+        for number, outcome in enumerate(outcomes):
+            _validate_outcome(outcome)
+            _check(outcome["certainty"] != "unknown", "owner_outcome_unknown")
+            _check(
+                outcome["certainty"] == "known" or number == len(outcomes) - 1,
+                "nonterminal_outcome",
+            )
+        result = dict(intent_sha256=digest(intent), outcomes=outcomes, reconciled=True)
+        result["sha256"] = digest(result)
+        _write(directory / "reconciliation.json", result)
+        self._load()
         return result
 
     def step(self, owner):

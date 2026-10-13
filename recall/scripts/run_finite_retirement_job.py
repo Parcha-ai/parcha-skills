@@ -16,13 +16,20 @@ import sys
 
 RECALL = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(RECALL), str(RECALL / "server")]
-from recall_server.retirement_campaign import Campaign, _write, seal_inventory
-from recall_server.retirement_jobs import RenderJob, RemoteEnrollmentOwner, package_body
+from recall_server.retirement_campaign import Campaign, _mkdir, _write, seal_inventory
+from recall_server.retirement_jobs import (
+    RenderJob,
+    RemoteEnrollmentOwner,
+    package_body,
+    reconcile_enrollment,
+)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=("capture", "enroll", "status"))
+    parser.add_argument(
+        "operation", choices=("capture", "enroll", "status", "reconcile")
+    )
     parser.add_argument("--config", type=Path)
     parser.add_argument("--state-dir", type=Path, required=True)
     parser.add_argument("--inventory", type=Path, required=True)
@@ -34,6 +41,7 @@ def main(argv=None):
     parser.add_argument("--source-id")
     parser.add_argument("--after-page", type=Path)
     parser.add_argument("--after-page-sha256")
+    parser.add_argument("--job-id")
     args = parser.parse_args(argv)
     if not 1 <= args.limit <= (100 if args.operation == "capture" else 25):
         parser.error(
@@ -49,6 +57,10 @@ def main(argv=None):
         )
     if args.operation != "status" and args.config is None:
         parser.error("capture/enroll require --config")
+    if args.operation == "reconcile" and (
+        not args.inventory_sha256 or not args.job_id or args.apply
+    ):
+        parser.error("reconcile requires --inventory-sha256 and --job-id; cannot apply")
     if args.operation == "status":
         if not args.inventory_sha256 or args.apply:
             parser.error("status requires --inventory-sha256 and cannot apply")
@@ -87,7 +99,7 @@ def main(argv=None):
             after=after,
         )
         body, pin = package_body(config, payload)
-        args.state_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
+        _mkdir(args.state_dir)
         _write(
             args.state_dir / "intent.json",
             dict(payload=payload, pin=pin, predecessor_sha256=predecessor),
@@ -126,7 +138,14 @@ def main(argv=None):
     else:
         inventory = json.loads(args.inventory.read_bytes())
         with Campaign(args.state_dir, inventory, args.inventory_sha256) as campaign:
-            campaign.quantum(RemoteEnrollmentOwner(config), limit=args.limit)
+            if args.operation == "reconcile":
+                campaign.reconcile(
+                    lambda events, emit: reconcile_enrollment(
+                        config, args.job_id, events, emit
+                    )
+                )
+            else:
+                campaign.quantum(RemoteEnrollmentOwner(config), limit=args.limit)
             report = campaign.report()
             print(json.dumps(report, sort_keys=True))
             return 2 if report["reconciliation_required"] else 0

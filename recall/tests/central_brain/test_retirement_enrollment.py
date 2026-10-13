@@ -11,6 +11,7 @@ sys.path[:0] = [
     str(Path(__file__).resolve().parents[2] / "server"),
 ]
 from recall_server import retirement_enrollment as enrollment
+from recall_server.db import SearchDeadlineExceeded
 from test_retirement_campaign import plan
 
 
@@ -25,6 +26,7 @@ class EnrollmentTests(unittest.TestCase):
 
         for error, status in (
             (TimeoutError(), "metadata_timeout"),
+            (SearchDeadlineExceeded("search deadline exceeded"), "metadata_timeout"),
             (Busy(), "metadata_lock_busy"),
         ):
 
@@ -41,14 +43,16 @@ class EnrollmentTests(unittest.TestCase):
             "publication_unknown",
             "enrollment_unknown",
         ):
+            for error in (TimeoutError("private details"), SearchDeadlineExceeded()):
+                with self.subTest(status=status, error=type(error).__name__):
 
-            def owner(*args, **kwargs):
-                kwargs["emit"]("parent", dict(status=status))
-                raise TimeoutError("private details")
+                    def owner(*args, **kwargs):
+                        kwargs["emit"]("parent", dict(status=status))
+                        raise error
 
-            result = self.call(owner)
-            self.assertEqual(result["certainty"], "unknown")
-            self.assertNotIn("private details", str(result))
+                    result = self.call(owner)
+                    self.assertEqual(result["certainty"], "unknown")
+                    self.assertNotIn("private details", str(result))
 
     def test_known_publication_failure_retains_committed_report(self):
         event = dict(status="publication_failed", committed=dict(published_documents=2))

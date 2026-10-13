@@ -64,6 +64,20 @@ python recall/scripts/run_finite_retirement_job.py enroll --apply \
 
 The host first fsyncs the selected plans, then launch intent, then the returned job ID. It reads logs only after the job terminates. Compressed result fragments must be complete and match the package hash and result hash before any cursor advances. A preflight refusal before launch leaves the parents unattempted. An unknown launch or execution keeps the intent unresolved. Do not remove that intent to make a retry possible.
 
+The host persists each new journal directory entry in its parent directory. Preflight has a 60-second budget checked around each provider read; an in-flight read can add at most its existing 40-second HTTP timeout. An expired preflight cannot launch a job.
+
+Recover a missing enrollment result by inspecting the exact finished job with the original config and inventory:
+
+```bash
+python recall/scripts/run_finite_retirement_job.py reconcile \
+  --config /PRIVATE/PATH/original-config.json \
+  --state-dir /PRIVATE/PATH/enrollment-001 \
+  --inventory /PRIVATE/PATH/inventory-001.json \
+  --inventory-sha256 EXACT_REPORTED_HASH --job-id EXACT_RENDER_JOB_ID
+```
+
+This command sends only GET requests. It verifies the persisted launch pin, config and recorded job identity, then appends `reconciliation.json` without changing the intent. Each package hashes a fresh invocation nonce, so even identical plans from an earlier job have a different pin. If the POST response was lost, the operator supplies the existing job ID; complete logs must still match the original attempt's pin. Repeated inspection is safe after an incomplete log response. A running or failed job, missing diagnostics, or an owner result with an unknown commit keeps the campaign blocked. Logs cannot resolve an unknown database commit; that requires separate authoritative owner-state evidence. Never relaunch the job to resolve uncertainty.
+
 ## Clear and measure
 
 After enrollment and the existing 60-second grace, invoke the unchanged `run_chunk_retirement.py run --apply` through the existing bounded Render maintenance launcher for the explicit enrolled source. Its schema069 ledger controls which existing enabled parents can be claimed. It may include previously enrolled parents; this is distinct from the finite enrollment inventory. Keep its full archive proof, owner locks, scope epoch and commit classification. Do not run it concurrently with the dropped-column sweep. A cooldown report or `no_ready_parents` is not completion.
