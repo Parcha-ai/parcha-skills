@@ -9,6 +9,8 @@ import time
 import unittest
 from unittest.mock import patch
 
+import psycopg
+
 SERVER = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(SERVER.parent), str(SERVER)]
 import e2e_retirement_policy as policy_tests
@@ -58,6 +60,37 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(worker.cycle(busy=False)['status'], 'disabled')
         self.assertEqual(self.state(), before)
         self.assertFalse(self.archive.reads)
+
+    def test_missing_schema_is_inert_and_migration_replay_preserves_intent(self):
+        self.activate()
+        self.ready()
+        self.crashed_candidate()
+        before = self.policy_state()
+        with self.store.connect() as c:
+            c.execute((SERVER/'schema/078_retirement_maintenance.sql').read_text())
+        self.assertEqual(self.policy_state(), before)
+        with self.store.connect() as c:
+            c.execute('DELETE FROM schema_migrations WHERE version=78')
+        try:
+            self.assertEqual(self.worker().cycle(busy=False)['status'], 'no_ready_sources')
+            self.assertEqual(self.policy_state(), before)
+        finally:
+            with self.store.connect() as c:
+                c.execute('INSERT INTO schema_migrations(version) VALUES(78)')
+        self.assertFalse(self.archive.reads)
+
+    def test_intent_transport_failure_stops_before_archive_and_next_round_recovers(self):
+        self.activate()
+        self.ready()
+        worker = self.worker()
+        with patch.object(worker, '_record_intent', side_effect=psycopg.OperationalError('synthetic')):
+            first = worker.cycle(busy=False)
+        self.assertEqual(first['status'], 'deferred')
+        self.assertFalse(self.archive.reads)
+        self.assertEqual(self.state()['cumulative_cleared_documents'], 0)
+        self.ready()
+        second = self.worker().cycle(busy=False)
+        self.assertEqual(second['cleared_documents'], 2, second)
 
     def test_disabled_policy_keeps_finite_consent_but_does_not_enroll_future(self):
         self.activate()
