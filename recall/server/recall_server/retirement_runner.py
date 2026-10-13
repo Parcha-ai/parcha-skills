@@ -503,6 +503,16 @@ def run_retirement(
             report[field] += result.get(field, 0)
         if report["commit_outcome_unknown"] or "retirement_owner_required" in errors:
             break
+        if (
+            result.get("status") == "partial"
+            and result.get("batches", 0) < parent_limits.max_batches
+            and remaining_bytes <= parent_limits.max_clear_bytes
+        ):
+            # The owner stopped before its batch cap, so the remaining clear
+            # budget cannot fit the next whole document. Another full-parent
+            # proof would spend archive I/O trying to use the same small residue.
+            report["status"] = "clear_budget_limited"
+            break
     return dict(
         report,
         errors=dict(errors),

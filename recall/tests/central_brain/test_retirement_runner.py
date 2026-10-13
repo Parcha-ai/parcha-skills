@@ -102,6 +102,32 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(retire.call_args.kwargs["required_scope_epoch"], 2)
         self.assertEqual(retire.call_args.kwargs["owner_principal_id"], "principal")
 
+    def test_byte_limited_partial_stops_before_proving_another_parent(self):
+        partial = dict(status='partial', complete=False, batches=1,
+                       cleared_documents=1, cleared_chunks=1, cleared_utf8_bytes=47)
+        with patch.object(runner, '_claim', side_effect=[self.candidate(), self.candidate('tail'), None]) as claim, patch.object(runner, 'retire_parent_chunks', return_value=partial) as retire:
+            report = runner.run_retirement(Mock(), Mock(), scope=self.scope(), apply=True,
+                limits=runner.RunnerLimits(max_clear_bytes=64))
+        self.assertEqual(report['status'], 'clear_budget_limited')
+        self.assertEqual(report['cleared_utf8_bytes'], 47)
+        self.assertEqual(claim.call_count, 1)
+        self.assertEqual(retire.call_count, 1)
+
+    def test_parent_batch_or_parent_byte_cap_keeps_fair_advance(self):
+        from recall_server.chunk_retirement import ParentRetirementLimits
+        for parent_limits in (ParentRetirementLimits(max_batches=1),
+                              ParentRetirementLimits(max_clear_bytes=50)):
+            with self.subTest(parent_limits=parent_limits):
+                partial = dict(status='partial', complete=False, batches=1,
+                               cleared_documents=1, cleared_chunks=1, cleared_utf8_bytes=47)
+                complete = dict(status='applied', complete=True, batches=1,
+                                cleared_documents=1, cleared_chunks=1, cleared_utf8_bytes=5)
+                with patch.object(runner, '_claim', side_effect=[self.candidate(), self.candidate('tail'), None]), patch.object(runner, 'retire_parent_chunks', side_effect=[partial, complete]):
+                    report = runner.run_retirement(Mock(), Mock(), scope=self.scope(), apply=True,
+                        limits=runner.RunnerLimits(max_clear_bytes=200), parent_limits=parent_limits)
+                self.assertEqual(report['attempted_parents'], 2)
+                self.assertEqual(report['cleared_utf8_bytes'], 52)
+
     def test_stop_before_claim_preserves_all_work(self):
         with patch.object(runner, "_claim") as claim:
             report = runner.run_retirement(
