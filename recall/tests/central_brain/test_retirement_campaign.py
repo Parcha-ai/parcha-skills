@@ -141,6 +141,61 @@ class CampaignTests(unittest.TestCase):
         with self.campaign() as run:
             self.assertEqual(run.report()["considered_parents"], 1)
 
+    def test_observed_state_preserves_unknown_original_and_replays_admission(self):
+        with self.campaign() as run:
+            with self.assertRaises(TimeoutError):
+                run.step(Mock(side_effect=TimeoutError()))
+            original = (self.path / "00000000/intent.json").read_bytes()
+
+            def inspect(plans, events, emit):
+                return dict(
+                    original_job=dict(id="job", pin="pin", body_sha256="sha"),
+                    observation_job=dict(id="read-job", pin="read-pin"),
+                    parents=[
+                        dict(
+                            plan_sha256=plans[0]["proof_sha256"],
+                            status="observed_enabled",
+                            certainty="known",
+                        )
+                    ],
+                )
+
+            run.reconcile(inspect, observed=True)
+            self.assertFalse(run.report()["reconciliation_required"])
+            self.assertEqual(run.report()["original_outcomes_unknown"], 1)
+        directory = self.path / "00000000"
+        self.assertEqual((directory / "intent.json").read_bytes(), original)
+        self.assertFalse((directory / "result.json").exists())
+        self.assertFalse((directory / "reconciliation.json").exists())
+        saved = json.loads((directory / "observed-state.json").read_bytes())
+        self.assertEqual(saved["original_outcome"], "unknown")
+        with self.campaign() as run:
+            self.assertEqual(run.report()["considered_parents"], 1)
+            self.assertEqual(run.report()["original_outcomes_unknown"], 1)
+            self.assertEqual(run.report()["deferred_parents"], 0)
+
+    def test_observed_state_requires_every_frozen_plan_in_order(self):
+        for parents in (
+            [],
+            [dict(plan_sha256="wrong", status="observed_enabled", certainty="known")],
+        ):
+            with self.subTest(parents=parents), tempfile.TemporaryDirectory() as tmp:
+                with Campaign(
+                    Path(tmp), self.inventory, self.inventory["sha256"]
+                ) as run:
+                    with self.assertRaises(TimeoutError):
+                        run.step(Mock(side_effect=TimeoutError()))
+                    with self.assertRaisesRegex(
+                        ValueError, "observed_parent_membership"
+                    ):
+                        run.reconcile(
+                            lambda *args: dict(parents=parents), observed=True
+                        )
+                    self.assertTrue(run.report()["reconciliation_required"])
+                    self.assertFalse(
+                        (Path(tmp) / "00000000/observed-state.json").exists()
+                    )
+
     def test_transport_reconciliation_cannot_resolve_unknown_owner_commit(self):
         with self.campaign() as run:
             run.step(

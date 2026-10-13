@@ -29,6 +29,7 @@ from recall_server.retirement_enrollment import (
     EnrollmentOwner,
     capture_inventory,
     capture_page,
+    observe_enrollment,
 )
 from recall_server.retirement_jobs import package_body, decode_result
 
@@ -54,6 +55,42 @@ def scenario(store, root):
         assert result["outcome"]["owner_result"]["archive_gets"] == 0
         assert not archive.reads, "metadata no-op read archive"
         assert campaign.report()["retirement_complete"] is None
+    observation = observe_enrollment(
+        store, inventory["plans"], deadline_at=time.monotonic() + 30
+    )
+    assert observation["parents"][0]["ledger"]["status"] == "pending"
+    assert observation["archive_calls"] == 0 and not archive.reads
+    # A read-only snapshot must refuse each unsafe current state, without changing it.
+    for sql, code in (
+        (
+            "UPDATE canonical_chunk_retirement_progress SET enabled=false WHERE tenant_id=%s",
+            "ledger_changed",
+        ),
+        (
+            "UPDATE canonical_chunk_retirement_progress SET status='partial' WHERE tenant_id=%s",
+            "ledger_changed",
+        ),
+        (
+            "UPDATE canonical_documents SET body_record_ordinal=NULL,body_record_count=NULL WHERE tenant_id=%s",
+            "locator_missing",
+        ),
+        ("DELETE FROM canonical_source_grants WHERE tenant_id=%s", "owner_required"),
+        (
+            "UPDATE canonical_evidence_documents SET created_at=created_at+interval '1 second' WHERE tenant_id=%s",
+            "catalog_changed",
+        ),
+    ):
+        # Dedicated fixture keeps committed changes visible to the observer's own connection.
+        test_scope, test_archive, test_plan = prepare(store, root)
+        EnrollmentOwner(store, test_archive)(test_plan, lambda *args: None)
+        with store.connect() as c:
+            c.execute(sql, (test_scope.tenant_id,))
+        try:
+            observe_enrollment(store, [test_plan], deadline_at=time.monotonic() + 30)
+        except ValueError as error:
+            assert code in str(error), error
+        else:
+            raise AssertionError(code)
     # A second capture cannot reset a represented parent, whatever its state.
     excluded_page = capture_page(
         store, scope=scope, limit=1, deadline_at=time.monotonic() + 30
@@ -78,6 +115,14 @@ def scenario(store, root):
     cleared = runner.run_retirement(store, archive, scope=scope, apply=True)
     assert cleared["cleared_documents"] == 2, cleared
     assert archive.reads, "unchanged full verifier did not read archive"
+    observation = observe_enrollment(
+        store, inventory["plans"], deadline_at=time.monotonic() + 30
+    )
+    ledger = observation["parents"][0]["ledger"]
+    assert (
+        ledger["status"] == "complete" and ledger["cumulative_cleared_documents"] == 2
+    )
+    assert observation["archive_calls"] == 0
     with store.connect() as c:
         row = c.execute(
             "SELECT count(*) AS n, sum(length(text_redacted)) AS bytes FROM canonical_chunks WHERE tenant_id=%s",
@@ -208,6 +253,10 @@ def packaged_job(store, root):
     assert len(page["plans"]) == 1 and not page["more"]
     result = run(dict(operation="enroll", plans=page["plans"]))
     assert result[0]["status"] == "enrolled" and not archive.reads, result
+    observed = run(dict(operation="observe", plans=page["plans"]))
+    assert observed["read_only"] and observed["archive_calls"] == 0
+    assert observed["parents"][0]["ledger"]["status"] == "pending"
+    assert not archive.reads
 
 
 def main():

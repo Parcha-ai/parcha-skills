@@ -22,13 +22,15 @@ from recall_server.retirement_jobs import (
     RemoteEnrollmentOwner,
     package_body,
     reconcile_enrollment,
+    reconcile_observed_enrollment,
 )
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "operation", choices=("capture", "enroll", "status", "reconcile")
+        "operation",
+        choices=("capture", "enroll", "status", "reconcile", "reconcile-observed"),
     )
     parser.add_argument("--config", type=Path)
     parser.add_argument("--state-dir", type=Path, required=True)
@@ -42,6 +44,7 @@ def main(argv=None):
     parser.add_argument("--after-page", type=Path)
     parser.add_argument("--after-page-sha256")
     parser.add_argument("--job-id")
+    parser.add_argument("--original-config", type=Path)
     args = parser.parse_args(argv)
     if not 1 <= args.limit <= (100 if args.operation == "capture" else 25):
         parser.error(
@@ -57,10 +60,14 @@ def main(argv=None):
         )
     if args.operation != "status" and args.config is None:
         parser.error("capture/enroll require --config")
-    if args.operation == "reconcile" and (
+    if args.operation in ("reconcile", "reconcile-observed") and (
         not args.inventory_sha256 or not args.job_id or args.apply
     ):
         parser.error("reconcile requires --inventory-sha256 and --job-id; cannot apply")
+    if args.operation == "reconcile-observed" and args.original_config is None:
+        parser.error(
+            "reconcile-observed requires --original-config and a fresh --config"
+        )
     if args.operation == "status":
         if not args.inventory_sha256 or args.apply:
             parser.error("status requires --inventory-sha256 and cannot apply")
@@ -138,7 +145,15 @@ def main(argv=None):
     else:
         inventory = json.loads(args.inventory.read_bytes())
         with Campaign(args.state_dir, inventory, args.inventory_sha256) as campaign:
-            if args.operation == "reconcile":
+            if args.operation == "reconcile-observed":
+                original_config = json.loads(args.original_config.read_bytes())
+                campaign.reconcile(
+                    lambda plans, events, emit: reconcile_observed_enrollment(
+                        original_config, config, args.job_id, plans, events, emit
+                    ),
+                    observed=True,
+                )
+            elif args.operation == "reconcile":
                 campaign.reconcile(
                     lambda events, emit: reconcile_enrollment(
                         config, args.job_id, events, emit

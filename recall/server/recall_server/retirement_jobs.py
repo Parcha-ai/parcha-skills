@@ -5,12 +5,14 @@ terminal status, complete logs, verified result. An exception leaves the campaig
 intent unresolved. Reconciliation inspects that exact job; never repeat the POST.
 """
 
+import ast
 import base64
 from datetime import datetime, timezone
 import gzip
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import time
 import urllib.parse
@@ -310,7 +312,7 @@ with tempfile.TemporaryDirectory() as temporary:
     recall_server.__path__.insert(0, str(directory))
     from recall_server.db import BrainStore, applied_migration_versions
     from recall_server.retirement_jobs import encode_result
-    from recall_server.retirement_enrollment import EnrollmentOwner, capture_page
+    from recall_server.retirement_enrollment import EnrollmentOwner, capture_page, observe_enrollment
     from recall_server.retirement_runner import RetirementScope
     from recall_server.archive_runtime import build_evidence_archive_store
     store = BrainStore(os.environ["RECALL_DATABASE_URL"], pool_max_size=4)
@@ -321,7 +323,10 @@ with tempfile.TemporaryDirectory() as temporary:
         if payload["operation"] == "capture":
             scope = RetirementScope(payload["tenant"], payload["principal"], (payload["source"],))
             result = capture_page(store, scope=scope, after=payload.get("after"), limit=payload["limit"], deadline_at=time.monotonic()+260)
+        elif payload["operation"] == "observe":
+            result = observe_enrollment(store, payload["plans"], deadline_at=time.monotonic()+260)
         else:
+            assert payload["operation"] == "enroll"
             archive = build_evidence_archive_store(deadline_reads=True)
             assert archive is not None
             owner = EnrollmentOwner(store, archive, deadline_at=time.monotonic()+260)
@@ -347,6 +352,90 @@ def reconcile_enrollment(config, job_id, events, emit):
     _check(not jobs or jobs == [job_id], "reconciliation_job_changed")
     emit("reconciliation_job", dict(id=job_id, pin=launch["pin"]))
     return RenderJob(config).reconcile(job_id, launch["pin"], launch["owner_id"], emit)
+
+
+def verify_original_job(config, job_id, plans, events):
+    """GET the exact terminal attempt and inspect pinned code without executing it."""
+    launches = [e["value"] for e in events if e["name"] == "launch_intent"]
+    _check(len(launches) == 1, "reconciliation_launch_missing")
+    launch = launches[0]
+    _check(launch["config_sha256"] == digest(config), "reconciliation_config_changed")
+    jobs = [e["value"]["id"] for e in events if e["name"] == "job"]
+    _check(not jobs or jobs == [job_id], "reconciliation_job_changed")
+    job = request(
+        "GET",
+        "/services/"
+        + config["service_id"]
+        + "/jobs/"
+        + urllib.parse.quote(job_id, safe=""),
+    )
+    _check(
+        job.get("id") == job_id and job.get("status") == "succeeded",
+        "original_job_not_succeeded",
+    )
+    prefix = 'python -u -c exec(__import__("gzip").decompress(__import__("base64").b64decode("'
+    suffix = '")))'
+    command = job.get("startCommand", "")
+    _check(
+        command.startswith(prefix) and command.endswith(suffix), "original_job_command"
+    )
+    encoded = command[len(prefix) : -len(suffix)]
+    _check(
+        re.fullmatch(r"[A-Za-z0-9+/=]+", encoded) is not None, "original_job_command"
+    )
+    body = gzip.decompress(base64.b64decode(encoded, validate=True))
+    _check(
+        hashlib.sha256(body).hexdigest() == launch["body_sha256"], "original_job_body"
+    )
+    lines = body.decode().splitlines()
+    _check(
+        lines[0].startswith("SPEC=") and lines[1].startswith("PIN="),
+        "original_job_spec",
+    )
+    spec, pin = ast.literal_eval(lines[0][5:]), ast.literal_eval(lines[1][4:])
+    _check(
+        pin == launch["pin"]
+        and digest(spec) == pin
+        and spec["payload"] == dict(operation="enroll", plans=plans),
+        "original_job_scope",
+    )
+    return dict(
+        id=job_id, pin=pin, body_sha256=launch["body_sha256"], status="succeeded"
+    )
+
+
+def reconcile_observed_enrollment(
+    original_config, current_config, job_id, plans, events, emit
+):
+    """Inspect the write attempt, then launch only a bounded read-only observation."""
+    original = verify_original_job(original_config, job_id, plans, events)
+    _check(
+        original_config["service_id"] == current_config["service_id"],
+        "observation_service_changed",
+    )
+    emit("original_job_body_verified", original)
+    body, pin = package_body(current_config, dict(operation="observe", plans=plans))
+    observation_job = dict(
+        pin=pin,
+        body_sha256=hashlib.sha256(body.encode()).hexdigest(),
+        commit=current_config["commit"],
+    )
+
+    def record(name, value):
+        emit("observation_" + name, value)
+        if name == "job":
+            observation_job["id"] = value["id"]
+
+    result = RenderJob(current_config).run(body, pin, record)
+    _check(
+        result.get("read_only") is True and result.get("archive_calls") == 0,
+        "observation_contract",
+    )
+    return dict(
+        original_job=original,
+        observation_job=observation_job,
+        parents=result["parents"],
+    )
 
 
 class RemoteEnrollmentOwner:

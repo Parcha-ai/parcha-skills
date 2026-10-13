@@ -70,6 +70,7 @@ def seal_inventory(plans):
 
 KNOWN_STATUSES = frozenset(
     {
+        "observed_enabled",
         "enrolled",
         "preserved",
         "already_enabled",
@@ -251,6 +252,13 @@ class Campaign:
             )
             result_path = directory / "result.json"
             reconciled = directory / "reconciliation.json"
+            observed = directory / "observed-state.json"
+            _check(
+                sum(p.exists() for p in (result_path, reconciled, observed)) <= 1,
+                "journal_double_result",
+            )
+            if observed.exists():
+                result_path = observed
             _check(
                 not (result_path.exists() and reconciled.exists()),
                 "journal_double_result",
@@ -319,7 +327,7 @@ class Campaign:
         self._accept(intent, result, index)
         return result
 
-    def reconcile(self, inspect):
+    def reconcile(self, inspect, *, observed=False):
         """Recover missing transport results without replaying the original owner."""
         _check(self.pending and "plans" in self.pending, "no_reconcilable_intent")
         intent = self.pending
@@ -335,7 +343,23 @@ class Campaign:
             _write(directory / f"event-{count:05d}.json", dict(name=name, value=value))
             count += 1
 
-        outcomes = inspect(deepcopy(events), emit)
+        evidence = None
+        if observed:
+            evidence = inspect(deepcopy(intent["plans"]), deepcopy(events), emit)
+            outcomes = evidence["parents"]
+            _check(
+                isinstance(outcomes, list)
+                and len(outcomes) == len(intent["plans"])
+                and all(
+                    row.get("plan_sha256") == plan["proof_sha256"]
+                    and row.get("status") == "observed_enabled"
+                    and row.get("certainty") == "known"
+                    for row, plan in zip(outcomes, intent["plans"])
+                ),
+                "observed_parent_membership",
+            )
+        else:
+            outcomes = inspect(deepcopy(events), emit)
         _check(
             isinstance(outcomes, list) and len(outcomes) <= len(intent["plans"]),
             "outcome_prefix",
@@ -349,7 +373,15 @@ class Campaign:
             )
         result = dict(intent_sha256=digest(intent), outcomes=outcomes, reconciled=True)
         result["sha256"] = digest(result)
-        _write(directory / "reconciliation.json", result)
+        if observed:
+            result.update(original_outcome="unknown", observed_state=evidence)
+            result["sha256"] = digest(
+                {k: v for k, v in result.items() if k != "sha256"}
+            )
+        _write(
+            directory / ("observed-state.json" if observed else "reconciliation.json"),
+            result,
+        )
         self._load()
         return result
 
@@ -364,6 +396,7 @@ class Campaign:
             and r["outcome"]["status"]
             not in (
                 "enrolled",
+                "observed_enabled",
                 "preserved",
                 "already_enabled",
                 "postpublication_already_enabled",
@@ -379,6 +412,7 @@ class Campaign:
             deferred_parents=deferred,
             outcomes=dict(counts),
             reconciliation_required=bool(self.pending),
+            original_outcomes_unknown=counts.get("observed_enabled", 0),
             retirement_complete=None,
             physical_reclaimed_bytes=None,
         )

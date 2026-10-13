@@ -85,3 +85,30 @@ After enrollment and the existing 60-second grace, invoke the unchanged `run_chu
 After each quantum, recheck readiness, the same receipt hashes, representative search, replica lag, disk usage and publication backlog. Stop on a failing check, unknown commit, less than the reviewed free-space bound, more than 1 GiB positive provider allocation from the activation baseline, or a deployment change. These between-job guards belong to the supervisor; this command deliberately runs one quantum and exits. Reuse the existing supervisor's lifecycle instead of launching an unattended shell retry loop.
 
 A finite pass is complete only when its considered and deferred identities are accounted for and the unchanged clear runner has verified all enrolled eligible bodies. Logical cleared bytes, physical provider usage and billed capacity are three separate measurements. Future-parent enrollment requires a separate explicit policy and tests; this finite command does not authorize it.
+
+### When a succeeded enrollment job has no recoverable logs
+
+`reconcile-observed` makes a separate present-state admission. It does not reconstruct
+or overwrite the original result. Supply the original launch config with
+`--original-config`, a fresh current-runtime config/checkpoint with `--config`, the
+original `--job-id`, and the same inventory hash and state directory used to enroll.
+Do not pass `--apply`.
+
+The command first GETs the exact succeeded original job, decodes its launch body
+without executing it, and matches the persisted body hash, invocation pin and frozen
+plans. It then launches one bounded read-only observation job under the fresh
+checkpoint. Each parent is read in a repeatable-read, read-only transaction using
+the existing owner's source/grant predicates and the original catalog reader.
+Admission requires every frozen catalog identity to match, no queued publication,
+an enabled pending/partial/complete ledger, and a complete eligible locator scan.
+The existing runner increments the epoch when it claims work; the observation
+retains that epoch, cursor and cumulative counters rather than inferring an
+original insertion or clear count. Missing, disabled or changed state stays blocked.
+
+The host appends `observed-state.json`, preserving `original_outcome: unknown`,
+the original job/body identity, and the new observation job/body identity. It leaves
+`result.json` absent and reports the number of original parent outcomes still
+unknown separately. This settles enrollment scheduling only. The existing clear
+owner independently rechecks authority and the complete archive proof; observed
+counters do not prove net or physical storage reclamation. If observation logs are
+also unavailable, no admission record is written and the campaign stays blocked.

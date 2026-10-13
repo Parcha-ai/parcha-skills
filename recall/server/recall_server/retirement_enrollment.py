@@ -8,7 +8,7 @@ from .db import SearchDeadlineExceeded
 from .parent_chunk_proof import read_parent_catalog
 from .chunk_bodies import _record_location, _EXCLUDED_TYPES
 from .locator_backfill_plan import _DOCUMENTS_SQL
-from .retirement_campaign import digest, seal_inventory
+from .retirement_campaign import _check, digest, seal_inventory
 from .retirement_enrollment_owners import metadata, operator, owner_helpers
 
 
@@ -203,3 +203,127 @@ class EnrollmentOwner:
                 )
             )
         return outcomes
+
+
+def observe_enrollment(store, plans, *, deadline_at):
+    """Read present enrollment state; neither original outcomes nor clear proof.
+
+    Repeatable-read snapshots use the same owner/grant predicates as
+    require_retirement_owner. READ ONLY forbids its mutation-path row locks.
+    """
+    _check(1 <= len(plans) <= 25, "observation_quantum")
+    parents = []
+    for plan in plans:
+        entry, scope = plan["parents"][0], plan["scope"]
+        key = (scope["tenant_id"], entry["source_id"], entry["native_parent_id"])
+        deadline = min(deadline_at, time.monotonic() + 15)
+        with store.connect() as connection, connection.transaction():
+            connection.execute(
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+            )
+            owner = store._execute_bounded(
+                connection,
+                """SELECT source.source_id
+                FROM canonical_sources source
+                JOIN canonical_source_grants grant_row USING(tenant_id,source_id)
+                WHERE source.tenant_id=%s AND source.source_id=%s
+                  AND source.owner_principal_id=%s AND grant_row.principal_id=%s
+                  AND grant_row.permission='owner'""",
+                (*key[:2], scope["principal_id"], scope["principal_id"]),
+                deadline,
+            ).fetchone()
+            _check(owner is not None, "observation_owner_required")
+            catalog = read_parent_catalog(store, connection, key, deadline)
+            _check(
+                runner._cohort_entry(catalog["manifest"]) == entry,
+                "observation_catalog_changed",
+            )
+            _check(catalog["queue"] is None, "observation_projection_pending")
+            ledger = store._execute_bounded(
+                connection,
+                """SELECT enabled,status,scope_epoch,
+                logical_document_id,manifest_artifact_id,last_record_ordinal,cumulative_cleared_documents,
+                cumulative_cleared_chunks,cumulative_cleared_utf8_bytes
+                FROM canonical_chunk_retirement_progress
+                WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s""",
+                key,
+                deadline,
+            ).fetchone()
+            _check(
+                ledger is not None
+                and ledger["enabled"] is True
+                and ledger["status"] in ("pending", "partial", "complete")
+                and type(ledger["scope_epoch"]) is int
+                and ledger["scope_epoch"] >= 1
+                and ledger["logical_document_id"]
+                == entry["manifest"]["logical_document_id"]
+                and -1
+                <= ledger["last_record_ordinal"]
+                < entry["manifest"]["record_count"]
+                and all(
+                    type(ledger[k]) is int and ledger[k] >= 0
+                    for k in (
+                        "cumulative_cleared_documents",
+                        "cumulative_cleared_chunks",
+                        "cumulative_cleared_utf8_bytes",
+                    )
+                ),
+                "observation_ledger_changed",
+            )
+            _check(
+                (
+                    ledger["status"] == "pending"
+                    and ledger["manifest_artifact_id"] is None
+                    and ledger["last_record_ordinal"] == -1
+                    and all(
+                        ledger[k] == 0
+                        for k in (
+                            "cumulative_cleared_documents",
+                            "cumulative_cleared_chunks",
+                            "cumulative_cleared_utf8_bytes",
+                        )
+                    )
+                )
+                or (
+                    ledger["status"] in ("partial", "complete")
+                    and ledger["manifest_artifact_id"]
+                    == entry["manifest"]["manifest_artifact_id"]
+                ),
+                "observation_ledger_changed",
+            )
+            rows = store._execute_bounded(
+                connection, _DOCUMENTS_SQL, (*key, 10001), deadline
+            ).fetchall()
+            _check(
+                0 < len(rows) <= 10000
+                and len({r["document_id"] for r in rows}) == len(rows),
+                "observation_documents_incomplete",
+            )
+            eligible = 0
+            for row in rows:
+                _check(time.monotonic() < deadline, "observation_deadline")
+                if (
+                    row["raw_media_type"]
+                    == "application/vnd.recall.oversized-record+gzip"
+                    or _EXCLUDED_TYPES.intersection(row["structural_types"])
+                ):
+                    continue
+                eligible += 1
+                location = _record_location(row)
+                _check(
+                    location is not None
+                    and location[1] <= catalog["manifest"]["record_count"],
+                    "observation_locator_missing",
+                )
+            _check(eligible > 0, "observation_no_eligible_documents")
+        parents.append(
+            dict(
+                plan_sha256=plan["proof_sha256"],
+                status="observed_enabled",
+                certainty="known",
+                documents=len(rows),
+                eligible_documents=eligible,
+                ledger=dict(ledger),
+            )
+        )
+    return dict(read_only=True, archive_calls=0, parents=parents)

@@ -18,6 +18,105 @@ from recall_server.retirement_campaign import digest
 
 
 class JobTests(unittest.TestCase):
+    def test_original_job_body_must_match_durable_launch(self):
+        import base64
+        import gzip
+        import hashlib
+        from recall_server.retirement_jobs import verify_original_job
+
+        spec = dict(payload=dict(operation="enroll", plans=[]))
+        pin = digest(spec)
+        body = "SPEC=" + repr(spec) + "\nPIN=" + repr(pin) + "\n"
+        command = (
+            'python -u -c exec(__import__("gzip").decompress(__import__("base64").b64decode("'
+            + base64.b64encode(gzip.compress(body.encode())).decode()
+            + '")))'
+        )
+        config = dict(service_id="service")
+        launch = dict(
+            config_sha256=digest(config),
+            pin=pin,
+            body_sha256=hashlib.sha256(body.encode()).hexdigest(),
+        )
+        events = [
+            dict(name="launch_intent", value=launch),
+            dict(name="job", value=dict(id="job")),
+        ]
+        get = Mock(
+            return_value=dict(id="job", status="succeeded", startCommand=command)
+        )
+        with patch("recall_server.retirement_jobs.request", get):
+            proof = verify_original_job(config, "job", [], events)
+            self.assertEqual(proof["body_sha256"], launch["body_sha256"])
+            self.assertEqual(get.call_args.args[0], "GET")
+            get.return_value["startCommand"] = command.replace("python -u", "python")
+            with self.assertRaisesRegex(ValueError, "original_job_command"):
+                verify_original_job(config, "job", [], events)
+            get.return_value["startCommand"] = command
+            launch["body_sha256"] = "wrong"
+            with self.assertRaisesRegex(ValueError, "original_job_body"):
+                verify_original_job(config, "job", [], events)
+
+    def test_observation_never_replays_enrollment_and_keeps_attempts_distinct(self):
+        from recall_server.retirement_jobs import reconcile_observed_enrollment
+        from recall_server import retirement_jobs as jobs
+        import ast
+
+        config = dict(
+            commit="current",
+            service_id="service",
+            owner_modules={
+                "recall_server." + name: "0" * 64
+                for name in (
+                    "retirement_runner",
+                    "chunk_retirement",
+                    "parent_chunk_proof",
+                    "chunk_bodies",
+                    "streaming_locators",
+                    "locator_backfill_plan",
+                )
+            },
+        )
+        emitted = []
+
+        def run(body, pin, emit):
+            spec = ast.literal_eval(body.splitlines()[0][5:])
+            self.assertEqual(spec["payload"], dict(operation="observe", plans=[]))
+            emit("launch_intent", dict(pin=pin))
+            emit("job", dict(id="read-job"))
+            return dict(read_only=True, archive_calls=0, parents=[])
+
+        with (
+            patch.object(
+                jobs, "verify_original_job", return_value=dict(id="write-job")
+            ),
+            patch.object(RenderJob, "run", side_effect=run),
+        ):
+            result = reconcile_observed_enrollment(
+                config, config, "write-job", [], [], lambda *e: emitted.append(e)
+            )
+        self.assertEqual(result["original_job"]["id"], "write-job")
+        self.assertEqual(result["observation_job"]["id"], "read-job")
+        self.assertEqual(
+            [e[0] for e in emitted],
+            [
+                "original_job_body_verified",
+                "observation_launch_intent",
+                "observation_job",
+            ],
+        )
+        with (
+            patch.object(
+                jobs, "verify_original_job", side_effect=ValueError("original_job_body")
+            ),
+            patch.object(RenderJob, "run") as run,
+        ):
+            with self.assertRaisesRegex(ValueError, "original_job_body"):
+                reconcile_observed_enrollment(
+                    config, config, "write-job", [], [], Mock()
+                )
+            run.assert_not_called()
+
     def test_identical_plans_cannot_reconcile_an_older_attempt(self):
         config = dict(
             commit="commit",
