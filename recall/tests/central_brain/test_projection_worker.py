@@ -1220,3 +1220,46 @@ class ParquetFreshnessQuantumTests(unittest.TestCase):
         self.assertGreater(len(scan.committed), 4)
         self.assertEqual(scan.turn_bounds, [dict(tenant_id="tenant:company:test",
             batch_size=4, max_batches=10, compaction_budget=1)])
+
+
+class RetirementWorkerTests(unittest.TestCase):
+    def run_worker(self, calls, retire, **kwargs):
+        return run_projection_worker(_Logical(calls, pending=100), _Passages(calls),
+            tenant_id='tenant:company:test', logical_batch_size=5, passage_batch_size=5,
+            embedding_batch_size=64, max_batches_per_cycle=1, upload_concurrency=1,
+            passage_concurrency=1, interval_seconds=5, retirement_maintainer=retire, **kwargs)
+
+    def test_retirement_runs_after_publication_and_reports_only_public_counters(self):
+        calls = []
+        def retire(busy):
+            self.assertTrue(busy)
+            calls.append('retirement')
+            return dict(status='bounded', cleared_documents=2, cleared_utf8_bytes=321,
+                archive_bytes=456, enrolled_parents=1, reconciled_intents=0,
+                commit_outcome_unknown=False, private='SECRET')
+        with self.assertLogs('recall_server.projection_worker', level='INFO') as logs:
+            result = self.run_worker(calls, retire, once=True)
+        self.assertEqual(calls, ['embeddings', 'passages', 'logical', 'retirement'])
+        self.assertEqual(result['retirement_cleared_documents'], 2)
+        self.assertEqual(result['retirement_cleared_utf8_bytes'], 321)
+        self.assertIn('retirement_cleared_utf8_bytes=321', '\n'.join(logs.output))
+        self.assertNotIn('SECRET', str(result) + str(logs.output))
+
+    def test_busy_ingest_gets_bounded_maintenance_on_cadence_without_starvation(self):
+        calls, invocations = [], []
+        clock = _FakeClock()
+        class Logical(_Logical):
+            def project_pending(self, **kwargs):
+                clock.advance(10)
+                return super().project_pending(**kwargs)
+        def retire(busy):
+            invocations.append((clock(), busy))
+            return dict(status='no_ready_parents', cleared_documents=0, cleared_utf8_bytes=0)
+        result = run_projection_worker(Logical(calls, pending=100), _Passages(calls),
+            tenant_id='tenant:company:test', logical_batch_size=5, passage_batch_size=5,
+            embedding_batch_size=64, max_batches_per_cycle=1, upload_concurrency=1,
+            passage_concurrency=1, interval_seconds=5, retirement_maintainer=retire,
+            clock=clock, max_cycles=5)
+        self.assertEqual(invocations, [(110.0, True), (140.0, True)])
+        self.assertEqual(calls.count('logical'), 5)
+        self.assertEqual(result['status'], 'pending')

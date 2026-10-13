@@ -34,6 +34,9 @@ PROJECTION_TOTALS: dict[str, int] = {
     "parquet_rows_written": 0,
     "search_plane_rows_written": 0,
     "bodies_thinned": 0,
+    "retirement_cleared_documents": 0,
+    "retirement_cleared_utf8_bytes": 0,
+    "retirement_elapsed_ms": 0,
     # Wall-clock spent per phase, in milliseconds, so a slow cycle can be
     # attributed to embedding, passages, logical (including S3 cleanup),
     # parquet, or thinning from /metrics alone.
@@ -53,6 +56,8 @@ _CYCLE_TO_TOTAL = {
     "parquet_rows": "parquet_rows_written",
     "search_plane_rows": "search_plane_rows_written",
     "canonical_bodies_thinned": "bodies_thinned",
+    "retirement_cleared_documents": "retirement_cleared_documents",
+    "retirement_cleared_utf8_bytes": "retirement_cleared_utf8_bytes",
 }
 PHASE_ELAPSED_KEYS = (
     "cycle_elapsed_ms",
@@ -62,6 +67,7 @@ PHASE_ELAPSED_KEYS = (
     "parquet_elapsed_ms",
     "search_plane_elapsed_ms",
     "thin_elapsed_ms",
+    "retirement_elapsed_ms",
 )
 _CYCLE_TO_TOTAL.update({key: key for key in PHASE_ELAPSED_KEYS})
 
@@ -95,6 +101,7 @@ def run_projection_worker(
     once: bool = False,
     sleep: Callable[[float], Any] = time.sleep,
     body_thinner: Callable[[bool], dict[str, Any]] | None = None,
+    retirement_maintainer: Callable[[bool], dict[str, Any]] | None = None,
     quiet_seconds: float = 0.0,
     max_wait_seconds: float = 0.0,
     clock: Callable[[], float] = time.monotonic,
@@ -142,6 +149,7 @@ def run_projection_worker(
     last_parquet_started = clock()
     last_busy_thin_cycle: int | None = None
     last_busy_thin_started = 0.0
+    last_retirement_started = clock() - 30.0
 
     def elapsed_ms(started: float) -> int:
         return max(0, int(round((clock() - started) * 1000)))
@@ -373,6 +381,13 @@ def run_projection_worker(
                 last_busy_thin_started = phase_started
             thin_elapsed_ms = elapsed_ms(phase_started)
             phase_elapsed["thin_elapsed_ms"] = thin_elapsed_ms
+            active_phase = "retirement"
+            phase_started = clock()
+            retired = {"status": "disabled" if retirement_maintainer is None else "deferred"}
+            if retirement_maintainer is not None and phase_started - last_retirement_started >= 30.0:
+                last_retirement_started = phase_started
+                retired = retirement_maintainer(thin_busy)
+            phase_elapsed["retirement_elapsed_ms"] = elapsed_ms(phase_started)
             active_phase = "outbox"
             phase_started = clock()
             # H3-a: source-months waiting for the Lance writer, one cheap
@@ -400,10 +415,18 @@ def run_projection_worker(
                     and int(scanned["contended"]) == 0
                     and int(scanned.get("requeued", 0)) == 0
                     and thinned["status"] == "complete"
+                    and retired["status"] == "disabled"
                     and int(searched["months"]) == 0
                     and int(searched["failed"]) == 0
                     else "pending"
                 ),
+                "retirement_status": str(retired["status"]),
+                "retirement_cleared_documents": int(retired.get("cleared_documents", 0)),
+                "retirement_cleared_utf8_bytes": int(retired.get("cleared_utf8_bytes", 0)),
+                "retirement_archive_bytes": int(retired.get("archive_bytes", 0)),
+                "retirement_enrolled_parents": int(retired.get("enrolled_parents", 0)),
+                "retirement_reconciled_intents": int(retired.get("reconciled_intents", 0)),
+                "retirement_unknown": int(bool(retired.get("commit_outcome_unknown", False))),
                 "documents": int(documents["documents"]),
                 "logical_repaired": int(documents.get("repaired", 0)),
                 "logical_pending": int(documents.get("pending", 0)),
@@ -472,6 +495,7 @@ def run_projection_worker(
                 "parquet_elapsed_ms": parquet_elapsed_ms,
                 "search_plane_elapsed_ms": search_plane_elapsed_ms,
                 "thin_elapsed_ms": thin_elapsed_ms,
+                "retirement_elapsed_ms": phase_elapsed["retirement_elapsed_ms"],
             }
             record_cycle(result)
             LOG.info(
@@ -501,7 +525,10 @@ def run_projection_worker(
                 "old_objects_deleted=%s search_outbox_pending=%s "
                 "cycle_elapsed_ms=%s embed_elapsed_ms=%s passage_elapsed_ms=%s "
                 "logical_elapsed_ms=%s parquet_elapsed_ms=%s "
-                "search_plane_elapsed_ms=%s thin_elapsed_ms=%s "
+                "search_plane_elapsed_ms=%s thin_elapsed_ms=%s retirement_elapsed_ms=%s "
+                "retirement_status=%s retirement_cleared_documents=%s "
+                "retirement_cleared_utf8_bytes=%s retirement_archive_bytes=%s "
+                "retirement_enrolled_parents=%s retirement_reconciled_intents=%s retirement_unknown=%s "
                 "passage_warmup_ms=%s passage_pending_ms=%s passage_prepare_ms=%s "
                 "passage_commit_ms=%s passage_count_ms=%s",
                 *(
@@ -556,6 +583,9 @@ def run_projection_worker(
                         "old_objects_deleted",
                         "search_outbox_pending",
                         *PHASE_ELAPSED_KEYS,
+                        "retirement_status", "retirement_cleared_documents",
+                        "retirement_cleared_utf8_bytes", "retirement_archive_bytes",
+                        "retirement_enrolled_parents", "retirement_reconciled_intents", "retirement_unknown",
                         "passage_warmup_ms",
                         "passage_pending_ms",
                         "passage_prepare_ms",
@@ -599,6 +629,7 @@ def run_projection_worker(
                 "parquet_stale",
                 "search_plane_months",
                 "canonical_bodies_thinned",
+                "retirement_cleared_documents",
                 "stale",
                 "pruned",
             )

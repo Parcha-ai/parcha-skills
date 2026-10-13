@@ -378,7 +378,9 @@ def _claim(store, *, scope, limits, deadline_at, attempted, diagnostic=None):
         row = store._execute_bounded(
             connection,
             """SELECT progress.source_id,progress.native_parent_id,
-            progress.scope_epoch,to_jsonb(evidence) AS manifest """
+            progress.scope_epoch,progress.cumulative_cleared_documents,
+            progress.cumulative_cleared_chunks,progress.cumulative_cleared_utf8_bytes,
+            to_jsonb(evidence) AS manifest """
             + _JOIN
             + " WHERE "
             + _ELIGIBLE
@@ -455,6 +457,7 @@ def run_retirement(
     parent_limits=None,
     deadline_at=None,
     should_stop=None,
+    before_parent=None,
 ):
     """Sequential enabled-only maintenance; fresh whole-parent proof once per claim."""
     limits = RunnerLimits() if limits is None else limits
@@ -466,6 +469,8 @@ def run_retirement(
         or type(apply) is not bool
         or should_stop is not None
         and not callable(should_stop)
+        or before_parent is not None
+        and not callable(before_parent)
     ):
         _invalid()
     deadline_at = _parent_deadline(deadline_at)
@@ -526,6 +531,10 @@ def run_retirement(
         attempted.append((candidate["source_id"], candidate["native_parent_id"]))
         report["attempted_parents"] += 1
         key = scope.tenant_id, candidate["source_id"], candidate["native_parent_id"]
+        if before_parent is not None:
+            # Persist caller execution intent after the epoch claim and before
+            # any archive read or clearing. A failed observer stops this call.
+            before_parent(candidate)
         try:
             result = retire_parent_chunks(
                 store,

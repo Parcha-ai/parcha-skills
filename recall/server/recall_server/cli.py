@@ -25,6 +25,7 @@ from .canonical_thinning import (
     CanonicalBodyThinner, _compact_event_expression, thin_canonical_bodies,
 )
 from .storage_retirement import retire_chunk_search_index, retire_chunk_search_vector
+from .retirement_maintenance import RetirementMaintenance
 from .capabilities import CapabilityError, probe_database
 from .control import ControlPlane, SecretBox
 from .db import BrainStore, SearchPlaneSchemaError
@@ -1855,6 +1856,14 @@ def main() -> None:
         "--search-plane-months-per-cycle", type=int, default=DEFAULT_MONTHS_PER_CYCLE,
         help="source-months projected into turbopuffer per cycle",
     )
+    projection_worker.add_argument(
+        "--retirement", choices=("on", "off"), default="off",
+        help="run bounded retirement for explicitly approved source policies (requires schema 078)",
+    )
+    projection_worker.add_argument(
+        "--retirement-seconds", type=float, default=10,
+        help="maximum seconds per retirement round; busy rounds use at most five seconds",
+    )
     projection_worker.add_argument("--once", action="store_true")
     search_plane_project = sub.add_parser(
         "search-plane-project",
@@ -2582,6 +2591,11 @@ def main() -> None:
             LogicalEvidenceProjectionStore(build_evidence_archive_store()),
         )
         body_thinner = CanonicalBodyThinner(store, tenant_id=args.tenant)
+        retirement = None
+        if args.retirement == "on":
+            retirement = RetirementMaintenance(store,
+                build_evidence_archive_store(deadline_reads=True),
+                tenant_id=args.tenant, enabled=True, seconds=args.retirement_seconds)
         # H3-b: one client for the life of the process; the phase is skipped
         # entirely (search_plane=None) when turbopuffer is not configured.
         search_settings = _search_plane_settings(args.search_plane)
@@ -2616,6 +2630,7 @@ def main() -> None:
                     cleanup_concurrency=args.cleanup_concurrency,
                     skip_embedding=args.skip_embedding,
                     search_plane=search_plane,
+                    retirement_maintainer=(lambda busy: retirement.cycle(busy=busy)) if retirement else None,
                     body_thinner=lambda busy: body_thinner.thin(
                         committed_keys=logical._take_committed_body_keys(),
                         batch_size=(
