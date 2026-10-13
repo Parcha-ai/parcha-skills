@@ -1,0 +1,343 @@
+"""Host-persisted once-only Render maintenance jobs; no provider retries.
+
+Matches the supervised-chain lifecycle: preflight, durable intent, one POST,
+terminal status, complete logs, verified result. An exception leaves the campaign
+intent unresolved. Reconciliation inspects that exact job; never repeat the POST.
+"""
+
+import base64
+from datetime import datetime, timezone
+import gzip
+import hashlib
+import json
+import os
+from pathlib import Path
+import time
+import urllib.parse
+import urllib.request
+
+from .retirement_campaign import _check, canonical, digest
+
+DIAGNOSTIC = "recall_retirement_job_v1"
+TERMINAL = {"succeeded", "failed", "canceled"}
+
+
+def encode_result(value, pin):
+    raw = canonical(value)
+    encoded = base64.b64encode(gzip.compress(raw)).decode()
+    chunks = [encoded[start : start + 1800] for start in range(0, len(encoded), 1800)]
+    return [
+        dict(diagnostic=DIAGNOSTIC, part=n, data=part) for n, part in enumerate(chunks)
+    ] + [
+        dict(
+            diagnostic=DIAGNOSTIC,
+            finished=True,
+            parts=len(chunks),
+            sha256=hashlib.sha256(raw).hexdigest(),
+            pin=pin,
+        )
+    ]
+
+
+def decode_result(rows, pin):
+    finished = [row for row in rows if row.get("finished")]
+    _check(
+        len(finished) == 1 and finished[0]["pin"] == pin,
+        "remote_result_missing_or_wrong_pin",
+    )
+    end = finished[0]
+    parts = [row for row in rows if "part" in row]
+    _check(
+        len(parts) == end["parts"]
+        and [p["part"] for p in parts] == list(range(end["parts"])),
+        "remote_result_parts",
+    )
+    raw = gzip.decompress(
+        base64.b64decode("".join(row["data"] for row in parts), validate=True)
+    )
+    _check(hashlib.sha256(raw).hexdigest() == end["sha256"], "remote_result_digest")
+    return json.loads(raw)
+
+
+def request(method, path, body=None):
+    data = canonical(body) if body is not None else None
+    headers = {
+        "Authorization": "Bearer " + os.environ["TASK_RECALL_RENDER_KEY"],
+        "Content-Type": "application/json",
+    }
+    with urllib.request.urlopen(
+        urllib.request.Request(
+            "https://api.render.com/v1" + path,
+            data=data,
+            headers=headers,
+            method=method,
+        ),
+        timeout=40,
+    ) as response:
+        return json.load(response)
+
+
+def checkpoint_guard(config):
+    path = Path(config["checkpoint_file"])
+    raw = path.read_bytes()
+    _check(
+        hashlib.sha256(raw).hexdigest() == config["checkpoint_sha256"],
+        "checkpoint_digest",
+    )
+    value = json.loads(raw)
+    _check(0 <= time.time() - value["observed_epoch"] <= 120, "checkpoint_stale")
+    _check(
+        all(value[key] for key in ("ready", "health_ok", "receipt_ok", "search_ok")),
+        "serving_or_provider_failed",
+    )
+    _check(
+        value["replicas"] == 2
+        and len(value["nodes"]) == 3
+        and value["lag_seconds"] <= 10,
+        "provider_shape_or_lag",
+    )
+    _check(value["fleet"] == config["expected_fleet"], "fleet_changed")
+    _check(
+        all(
+            n["capacity_bytes"] == config["capacity_bytes"]
+            and n["free_bytes"] >= config["minimum_free_bytes"]
+            for n in value["nodes"]
+        ),
+        "capacity_or_headroom",
+    )
+    return dict(
+        checkpoint_sha256=config["checkpoint_sha256"],
+        observed_epoch=value["observed_epoch"],
+    )
+
+
+class RenderJob:
+    def __init__(
+        self,
+        config,
+        *,
+        request=request,
+        guard=None,
+        clock=time.monotonic,
+        sleep=time.sleep,
+    ):
+        self.config, self.request = config, request
+        self.guard = guard or (lambda: checkpoint_guard(config))
+        self.clock, self.sleep = clock, sleep
+        self.base = "/services/" + config["service_id"]
+
+    def run(self, body, pin, emit):
+        checkpoint = self.guard()
+        deployment = self.request("GET", self.base + "/deploys?limit=1")[0]["deploy"]
+        _check(
+            deployment["status"] == "live"
+            and deployment["commit"]["id"] == self.config["commit"],
+            "deployment_changed",
+        )
+        service = self.request("GET", self.base)
+        _check(service.get("autoDeploy") == "no", "auto_deploy_enabled")
+        cursor, seen = None, set()
+        while True:
+            query = {"limit": 100}
+            if cursor:
+                query["cursor"] = cursor
+            jobs = self.request(
+                "GET", self.base + "/jobs?" + urllib.parse.urlencode(query)
+            )
+            _check(
+                all(row.get("job", row).get("status") in TERMINAL for row in jobs),
+                "active_job",
+            )
+            if len(jobs) < 100:
+                break
+            cursor = jobs[-1].get("cursor")
+            _check(cursor and cursor not in seen, "job_cursor")
+            seen.add(cursor)
+        checkpoint = self.guard()  # No stale health after paginating the job inventory.
+        deployment = self.request("GET", self.base + "/deploys?limit=1")[0]["deploy"]
+        _check(
+            deployment["status"] == "live"
+            and deployment["commit"]["id"] == self.config["commit"],
+            "deployment_changed_before_post",
+        )
+        body_sha = hashlib.sha256(body.encode()).hexdigest()
+        emit(
+            "launch_intent",
+            dict(
+                pin=pin,
+                body_sha256=body_sha,
+                config_sha256=digest(self.config),
+                owner_id=service["ownerId"],
+                **checkpoint,
+            ),
+        )
+        encoded = base64.b64encode(gzip.compress(body.encode())).decode()
+        command = (
+            'python -u -c exec(__import__("gzip").decompress(__import__("base64").b64decode("'
+            + encoded
+            + '")))'
+        )
+        # Exactly one POST. A timeout or lost response is not safe to retry.
+        job = self.request("POST", self.base + "/jobs", {"startCommand": command})
+        _check(job.get("id") and job.get("createdAt"), "post_outcome_unknown")
+        job = {k: job.get(k) for k in ("id", "createdAt", "status")}
+        emit("job", job)
+        deadline = self.clock() + 360
+        while True:
+            _check(self.clock() < deadline, "job_outcome_unknown")
+            status = self.request("GET", self.base + "/jobs/" + job["id"])
+            _check(status.get("id") == job["id"], "job_identity")
+            emit("job_status", {k: status.get(k) for k in ("id", "status", "exitCode")})
+            if status["status"] in TERMINAL:
+                break
+            self.sleep(5)
+        _check(status["status"] == "succeeded", "job_failed_requires_reconciliation")
+        query = urllib.parse.urlencode(
+            dict(
+                ownerId=service["ownerId"],
+                resource=job["id"],
+                type="app",
+                direction="forward",
+                limit=1000,
+                startTime=job["createdAt"],
+                endTime=datetime.now(timezone.utc).isoformat(),
+            )
+        )
+        logs = self.request("GET", "/logs?" + query)
+        _check(logs.get("hasMore") is False, "logs_incomplete")
+        rows = []
+        for row in logs.get("logs", []):
+            message = row.get("message", "")
+            if DIAGNOSTIC in message:
+                event = json.loads(message[message.index("{") :])
+                _check(event["diagnostic"] == DIAGNOSTIC, "log_contract")
+                rows.append(event)
+        result = decode_result(rows, pin)
+        emit(
+            "verified_job_result",
+            dict(pin=pin, result_sha256=digest(result), result=result),
+        )
+        return result
+
+
+def package_body(config, payload):
+    """Ship only new adapters into an existing pinned runtime; owners stay pinned."""
+    required = {
+        "recall_server." + name
+        for name in (
+            "retirement_runner",
+            "chunk_retirement",
+            "parent_chunk_proof",
+            "chunk_bodies",
+            "streaming_locators",
+            "locator_backfill_plan",
+        )
+    }
+    _check(
+        set(config["owner_modules"]) == required
+        and all(
+            isinstance(v, str) and len(v) == 64
+            for v in config["owner_modules"].values()
+        ),
+        "owner_module_pins",
+    )
+    root = Path(__file__).parent
+    names = ["retirement_campaign.py", "retirement_enrollment.py", "retirement_jobs.py"]
+    names += [
+        "retirement_enrollment_owners/" + n
+        for n in ("__init__.py", "metadata.py", "operator.py", "owner_helpers.py")
+    ]
+    sources = {name: (root / name).read_text() for name in names}
+    spec = dict(
+        commit=config["commit"],
+        service_id=config["service_id"],
+        owner_modules=config["owner_modules"],
+        payload=payload,
+        sources=sources,
+    )
+    pin = digest(spec)
+    source = (
+        "SPEC="
+        + repr(spec)
+        + "\nPIN="
+        + repr(pin)
+        + "\n"
+        + """
+import hashlib, importlib, json, os, signal, tempfile, time
+from pathlib import Path
+assert os.environ.get("RENDER_GIT_COMMIT") == SPEC["commit"]
+assert os.environ.get("RENDER_SERVICE_ID") == SPEC["service_id"]
+assert os.environ.get("RECALL_CHUNK_BODY_READS") == "archive"
+assert os.environ.get("RECALL_SEARCH_PLANE") == "turbopuffer"
+for name, expected in SPEC["owner_modules"].items():
+    module = importlib.import_module(name)
+    assert hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest() == expected
+os.environ["PGOPTIONS"] = "-c statement_timeout=20000 -c lock_timeout=1000 -c idle_in_transaction_session_timeout=10000"
+os.environ["PGCONNECT_TIMEOUT"] = "3"
+def interrupted(*args):
+    raise TimeoutError("retirement_job_deadline")
+signal.signal(signal.SIGALRM, interrupted)
+signal.alarm(295)
+import recall_server
+with tempfile.TemporaryDirectory() as temporary:
+    directory = Path(temporary)
+    for name, content in SPEC["sources"].items():
+        path = directory / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    recall_server.__path__.insert(0, str(directory))
+    from recall_server.db import BrainStore, applied_migration_versions
+    from recall_server.retirement_jobs import encode_result
+    from recall_server.retirement_enrollment import EnrollmentOwner, capture_page
+    from recall_server.retirement_runner import RetirementScope
+    from recall_server.archive_runtime import build_evidence_archive_store
+    store = BrainStore(os.environ["RECALL_DATABASE_URL"], pool_max_size=4)
+    try:
+        with store.connect() as connection:
+            assert 69 in applied_migration_versions(connection)
+        payload = SPEC["payload"]
+        if payload["operation"] == "capture":
+            scope = RetirementScope(payload["tenant"], payload["principal"], (payload["source"],))
+            result = capture_page(store, scope=scope, after=payload.get("after"), limit=payload["limit"], deadline_at=time.monotonic()+260)
+        else:
+            archive = build_evidence_archive_store(deadline_reads=True)
+            assert archive is not None
+            owner = EnrollmentOwner(store, archive, deadline_at=time.monotonic()+260)
+            result = owner.quantum(payload["plans"], lambda *args: None)
+        for event in encode_result(result, PIN):
+            print(json.dumps(event), flush=True)
+    finally:
+        store.close()
+        signal.alarm(0)
+"""
+    )
+    compile(source, "retirement-render-job", "exec")
+    return source, pin
+
+
+class RemoteEnrollmentOwner:
+    def __init__(self, config):
+        self.config = config
+
+    def __call__(self, plans, emit):
+        body, pin = package_body(self.config, dict(operation="enroll", plans=plans))
+        launched = False
+
+        def record(name, value):
+            nonlocal launched
+            emit(name, value)
+            if name == "launch_intent":
+                launched = True
+
+        try:
+            return RenderJob(self.config).run(body, pin, record)
+        except Exception as error:
+            if launched:
+                raise
+            return [
+                dict(
+                    status="remote_preflight_refused",
+                    certainty="unattempted",
+                    error_class=type(error).__name__,
+                )
+            ]
