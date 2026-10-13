@@ -14,6 +14,7 @@ from . import (
     RECONCILIATION_INDEX_VERSION,
     RETIRE_POSTGRES_PLANE_VERSION,
     RETIREMENT_DETACHMENT_VERSION,
+    RETIREMENT_POLICY_VERSION,
 )
 
 
@@ -195,7 +196,12 @@ def assess_snapshot(snapshot: dict[str, Any], profile: str = "production") -> di
                       + ([CLEANUP_REFERENCE_INDEX_VERSION]
                          if CLEANUP_REFERENCE_INDEX_VERSION in versions else [])
                       + ([RETIREMENT_DETACHMENT_VERSION]
-                         if RETIREMENT_DETACHMENT_VERSION in versions else []))
+                         if RETIREMENT_DETACHMENT_VERSION in versions else [])
+                      + ([RETIREMENT_POLICY_VERSION]
+                         if RETIREMENT_POLICY_VERSION in versions else []))
+    if (RETIREMENT_POLICY_VERSION in versions
+            and RETIREMENT_DETACHMENT_VERSION not in versions):
+        raise CapabilityError("schema_drift")
     if versions != expected:
         raise CapabilityError("schema_drift")
     vector_plane_present = snapshot.get("postgres_vector_plane_present")
