@@ -7,6 +7,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import (
     CLEANUP_REFERENCE_INDEX_VERSION,
+    SUPPRESSED_ARTIFACT_SCHEMA_VERSION,
     MANDATORY_SCHEMA_VERSION,
     NATIVE_CONVERSATION_SCHEMA_VERSION,
     NOTIFICATION_PRIORITY_SCHEMA_VERSION,
@@ -192,7 +193,9 @@ def assess_snapshot(snapshot: dict[str, Any], profile: str = "production") -> di
                       + ([PASSAGE_NOTIFICATION_SCHEMA_VERSION]
                          if PASSAGE_NOTIFICATION_SCHEMA_VERSION in versions else [])
                       + ([CLEANUP_REFERENCE_INDEX_VERSION]
-                         if CLEANUP_REFERENCE_INDEX_VERSION in versions else []))
+                         if CLEANUP_REFERENCE_INDEX_VERSION in versions else [])
+                      + ([SUPPRESSED_ARTIFACT_SCHEMA_VERSION]
+                         if SUPPRESSED_ARTIFACT_SCHEMA_VERSION in versions else []))
     if versions != expected:
         raise CapabilityError("schema_drift")
     vector_plane_present = snapshot.get("postgres_vector_plane_present")
