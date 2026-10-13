@@ -285,7 +285,7 @@ are supported: versions through 69 are required except optional migration 67,
 which retires the Postgres vector plane and is applied explicitly from the
 turbopuffer plane. Migration 70 adds only a reconciliation performance index;
 serving accepts both schema 69 and 70 and reports the actual recorded version.
-The latest shipped migration is 75; migration 71 remains optional and reserved
+The latest shipped migration is 76; migration 71 remains optional and reserved
 for native-conversation metadata. Migration 72 adds nullable
 `canonical_evidence_document_queue.notification_queued_at`, with no default,
 index, or historical reclassification. Apply it before deploying the notification
@@ -307,6 +307,13 @@ applying it. Finish pinned maintenance jobs first, and use the
 The [retirement implementation review](../../docs/architecture/2026-10-13-continuous-retirement-implementation-review.md)
 records hash updates, bounded migration checks and rollback compatibility.
 Future-parent automatic enrollment remains disabled.
+
+Migration 76 adds a disabled source policy and a `baseline` classification in the
+same retirement ledger. It requires 75. Deploy optional-76-compatible binaries
+before applying it; applying the migration does not approve any source. The
+[future retirement policy](../../docs/architecture/2026-10-13-future-retirement-policy.md)
+describes bounded baseline capture, exact reviewed activation, revocation and
+reconciliation. Automatic enrollment does not itself schedule clearing.
 
 Webhook ingestion retains the same structured canonical JSON as managed
 history, so typed messages remain visible when their author is unresolved.

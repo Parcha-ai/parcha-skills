@@ -1695,6 +1695,9 @@ class CanonicalLogicalEvidenceProjector:
                         raise LogicalEvidenceError(
                             "logical_evidence_queue_conflict"
                         )
+                    from .retirement_policy import enroll_published_parent
+                    enroll_published_parent(self.store, connection,
+                        (candidate.tenant_id, candidate.source_id, candidate.native_parent_id))
                     return "repaired"
                 retained_artifacts = {
                     reference["artifact_id"]
@@ -1954,6 +1957,9 @@ class CanonicalLogicalEvidenceProjector:
                 )
                 if deleted.rowcount != 1:
                     raise LogicalEvidenceError("logical_evidence_queue_conflict")
+                from .retirement_policy import enroll_published_parent
+                enroll_published_parent(self.store, connection,
+                    (candidate.tenant_id, candidate.source_id, candidate.native_parent_id))
         return "committed"
 
     @staticmethod
