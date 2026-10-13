@@ -1161,13 +1161,14 @@ class HttpBoundaryContractTest(unittest.TestCase):
         from recall_server import projection_worker
 
         with mock.patch.dict(projection_worker.PROJECTION_TOTALS, {key: 0 for key in projection_worker.PROJECTION_TOTALS}):
-            projection_worker.record_cycle({"passages": 40, "passage_documents": 2, "embedded": 8, "parquet_rows": 100, "canonical_bodies_thinned": 1, "status": "pending", "cycle_elapsed_ms": 1500, "embed_elapsed_ms": 200, "logical_elapsed_ms": 1000})
-            projection_worker.record_cycle({"passages": 2, "passage_documents": 1, "embedded": 0, "parquet_rows": 0, "canonical_bodies_thinned": 0, "cycle_elapsed_ms": 500, "embed_elapsed_ms": 100, "thin_elapsed_ms": 50, "search_plane_rows": 7, "search_plane_elapsed_ms": 30})
+            projection_worker.record_cycle({"passages": 40, "passage_documents": 2, "embedded": 8, "parquet_rows": 100, "canonical_bodies_thinned": 1, "status": "pending", "cycle_elapsed_ms": 1500, "embed_elapsed_ms": 200, "logical_elapsed_ms": 1000, "retirement_cleared_documents": 1, "retirement_cleared_utf8_bytes": 100, "retirement_elapsed_ms": 10})
+            projection_worker.record_cycle({"passages": 2, "passage_documents": 1, "embedded": 0, "parquet_rows": 0, "canonical_bodies_thinned": 0, "cycle_elapsed_ms": 500, "embed_elapsed_ms": 100, "thin_elapsed_ms": 50, "search_plane_rows": 7, "search_plane_elapsed_ms": 30, "retirement_cleared_documents": 2, "retirement_cleared_utf8_bytes": 200, "retirement_elapsed_ms": 20})
             self.assertEqual(
                 projection_worker.projection_totals(),
                 {
                     "passages_written": 42, "documents_projected": 3, "passages_embedded": 8, "parquet_rows_written": 100, "search_plane_rows_written": 7, "bodies_thinned": 1,
                     "cycle_elapsed_ms": 2000, "embed_elapsed_ms": 300, "passage_elapsed_ms": 0, "logical_elapsed_ms": 1000, "parquet_elapsed_ms": 0, "search_plane_elapsed_ms": 30, "thin_elapsed_ms": 50,
+                    "retirement_cleared_documents": 3, "retirement_cleared_utf8_bytes": 300, "retirement_elapsed_ms": 30,
                 },
             )
 
