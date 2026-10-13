@@ -19,6 +19,7 @@ PASSAGE_NOTIFICATION_SCHEMA_VERSION = 73
 CLEANUP_REFERENCE_INDEX_VERSION = 74
 # Additive retirement lifecycle state; serving remains compatible with schema069.
 RETIREMENT_DETACHMENT_VERSION = 75
+RETIREMENT_POLICY_VERSION = 76
 # Optional until a delayed Slack body needs a terminal-identity ACK.
 SUPPRESSED_ARTIFACT_SCHEMA_VERSION = 77
 MANDATORY_SCHEMA_VERSION = 69

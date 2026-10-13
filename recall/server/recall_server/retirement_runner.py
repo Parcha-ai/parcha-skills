@@ -6,6 +6,7 @@ enroll or rebind replacements; rebind requires a fresh explicit owner review.
 """
 
 from collections import Counter
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 import hashlib
 import time
@@ -211,6 +212,20 @@ def rebind_detached_parent(
     store, *, scope, reviewed_plan, expected_scope_epoch, deadline_at=None,
 ):
     """Explicitly authorize one replacement catalog; never undo disable/restore."""
+    return _bind_reviewed_parent(store, scope=scope, reviewed_plan=reviewed_plan,
+        expected_scope_epoch=expected_scope_epoch, required_status='detached',
+        deadline_at=deadline_at)
+
+
+def enroll_baseline_parent(store, *, scope, reviewed_plan, expected_scope_epoch, deadline_at=None):
+    """Approve one frozen baseline parent; disabled/restored rows remain held."""
+    return _bind_reviewed_parent(store, scope=scope, reviewed_plan=reviewed_plan,
+        expected_scope_epoch=expected_scope_epoch, required_status='baseline',
+        deadline_at=deadline_at)
+
+
+def _bind_reviewed_parent(store, *, scope, reviewed_plan, expected_scope_epoch,
+                          required_status, deadline_at=None, connection=None):
     parents = _reviewed_parents(scope, reviewed_plan)
     if (len(parents) != 1 or type(expected_scope_epoch) is not int
             or expected_scope_epoch < 1):
@@ -218,10 +233,12 @@ def rebind_detached_parent(
     plan = parents[0]
     key = scope.tenant_id, plan['source_id'], plan['native_parent_id']
     deadline_at = min(_parent_deadline(deadline_at), time.monotonic() + 5)
-    with store.connect() as connection, connection.transaction():
+    context = store.connect() if connection is None else nullcontext(connection)
+    with context as connection, connection.transaction():
         _authorize(store, connection, scope, deadline_at)
         schema = store._execute_bounded(connection,
-            'SELECT 1 FROM schema_migrations WHERE version=75', (), deadline_at).fetchone()
+            'SELECT 1 FROM schema_migrations WHERE version=%s',
+            (76 if required_status == 'baseline' else 75,), deadline_at).fetchone()
         if schema is None:
             raise ChunkRetirementError('retirement_rebind_schema_required')
         catalog = read_parent_catalog(store, connection, key, deadline_at, lock=True)
@@ -240,13 +257,14 @@ def rebind_detached_parent(
                 last_record_ordinal=-1,updated_at=clock_timestamp()
             WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s
               AND logical_document_id IS NULL AND NOT enabled
-              AND status='detached' AND scope_epoch=%s
+              AND status=%s AND scope_epoch=%s
             RETURNING scope_epoch''',
-            (catalog['manifest']['logical_document_id'], *key, expected_scope_epoch),
+            (catalog['manifest']['logical_document_id'], *key, required_status, expected_scope_epoch),
             deadline_at).fetchone()
         if updated is None:
             raise ChunkRetirementError('retirement_rebind_refused')
-    return dict(status='rebound', scope_epoch=updated['scope_epoch'])
+    return dict(status='enrolled' if required_status == 'baseline' else 'rebound',
+                scope_epoch=updated['scope_epoch'])
 
 
 _ELIGIBLE = """progress.tenant_id=%s AND progress.source_id=ANY(%s) AND progress.enabled
