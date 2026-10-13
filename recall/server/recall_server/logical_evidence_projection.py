@@ -10,7 +10,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from itertools import groupby
@@ -793,8 +793,10 @@ class CanonicalLogicalEvidenceProjector:
             " quarantined" if attempts >= MAX_LOGICAL_ATTEMPTS else "",
         )
 
-    def _check_candidate_current(self, candidate: LogicalGroupCandidate) -> None:
-        with self.store.connect() as connection:
+    def _check_candidate_current(
+        self, candidate: LogicalGroupCandidate, *, connection=None,
+    ) -> None:
+        with (self.store.connect() if connection is None else nullcontext(connection)) as connection:
             queued = connection.execute(
                 """SELECT generation,changed_at
                      FROM canonical_evidence_document_queue
@@ -1026,6 +1028,7 @@ class CanonicalLogicalEvidenceProjector:
                         (*parent_values, OVERSIZED_MEDIA_TYPE),
                     )
                     previous_ordinal = -1
+                    next_stream_check = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
                     for ordinal, rows in groupby(
                         cursor,
                         key=lambda row: int(row["candidate_ordinal"]),
@@ -1035,6 +1038,12 @@ class CanonicalLogicalEvidenceProjector:
                         previous_ordinal = ordinal
                         start = input_spool.tell()
                         for row in rows:
+                            if require_current_queue and time.monotonic() >= next_stream_check:
+                                # READ COMMITTED sees the live queue independently
+                                # of the named cursor's original SELECT snapshot.
+                                # Reuse this lease: every worker may own a cursor.
+                                self._check_candidate_current(candidates[0], connection=connection)
+                                next_stream_check = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
                             # This file is private, self-produced and never
                             # accepted as input from another process or source.
                             pickle.dump(dict(row), input_spool, protocol=5)
