@@ -20,6 +20,12 @@ class RetirementSupervisorTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
         self.children = []
+        # unittest discovery adds these roots to sys.path, not the environment
+        # inherited by a real child process. Bind the same checkout explicitly.
+        recall_root = Path(__file__).resolve().parents[2]
+        self.child_environment = dict(os.environ, PYTHONPATH=os.pathsep.join((
+            str(recall_root), str(recall_root / "server"),
+            os.environ.get("PYTHONPATH", ""))))
 
         def reap():
             for child in self.children:
@@ -157,7 +163,7 @@ time.sleep(60)
             [sys.executable, "-c", parent_script, child_script],
             stdout=subprocess.PIPE,
             env=dict(
-                os.environ,
+                self.child_environment,
                 RECALL_CHUNK_BODY_READS="archive",
                 RETIREMENT_TEST_READY=str(self.root / "child-ready"),
             ),
@@ -196,10 +202,11 @@ p.main()
             ),
             text=True,
             capture_output=True,
-            env=dict(os.environ, RECALL_CHUNK_BODY_READS="archive"),
+            env=dict(self.child_environment, RECALL_CHUNK_BODY_READS="archive"),
             timeout=5,
         )
         self.assertEqual(child.returncode, 1)
+        self.assertTrue(child.stdout, child.stderr)
         report = json.loads(child.stdout)
         self.assertEqual(report["error_class"], "RuntimeError")
         self.assertEqual(report["phase"], "archive_setup")
