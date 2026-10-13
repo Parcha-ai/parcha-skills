@@ -56,30 +56,47 @@ def peak_rss_kib():
     raise RuntimeError("retirement process memory measurement unavailable")
 
 
+def _failure(error, phase):
+    return dict(
+        status="commit_outcome_unknown",
+        cleared_documents=0,
+        cleared_utf8_bytes=0,
+        commit_outcome_unknown=True,
+        error_class=type(error).__name__,
+        phase=phase,
+    )
+
+
 def main():
-    raw = sys.stdin.buffer.read(16385)
-    if len(raw) > 16384:
-        raise ValueError("retirement configuration too large")
-    configuration = json.loads(raw)
-    if set(configuration) != {"dsn", "tenant_id", "seconds"}:
-        raise ValueError("retirement configuration invalid")
-    seconds = configuration["seconds"]
-    if type(seconds) not in (int, float) or not 0 < seconds <= 300:
-        raise ValueError("retirement work budget invalid")
-    if os.environ.get("RECALL_CHUNK_BODY_READS") != "archive":
-        raise ValueError("archive body reads required")
-
-    def expired(*_args):
-        raise TimeoutError("retirement child deadline")
-
-    signal.signal(signal.SIGALRM, expired)
-    signal.setitimer(signal.ITIMER_REAL, seconds + 5)
     started = time.monotonic()
-    store = RetirementStore(configuration["dsn"])
+    store = None
+    phase = "configuration"
+    failed = False
     try:
+        raw = sys.stdin.buffer.read(16385)
+        if len(raw) > 16384:
+            raise ValueError("retirement configuration too large")
+        configuration = json.loads(raw)
+        if set(configuration) != {"dsn", "tenant_id", "seconds"}:
+            raise ValueError("retirement configuration invalid")
+        seconds = configuration["seconds"]
+        if type(seconds) not in (int, float) or not 0 < seconds <= 300:
+            raise ValueError("retirement work budget invalid")
+        if os.environ.get("RECALL_CHUNK_BODY_READS") != "archive":
+            raise ValueError("archive body reads required")
+
+        def expired(*_args):
+            raise TimeoutError("retirement child deadline")
+
+        signal.signal(signal.SIGALRM, expired)
+        signal.setitimer(signal.ITIMER_REAL, seconds + 5)
+        phase = "database_setup"
+        store = RetirementStore(configuration["dsn"])
+        phase = "archive_setup"
         archive = build_evidence_archive_store(deadline_reads=True)
         if archive is None:
             raise ValueError("retirement archive not configured")
+        phase = "maintenance"
         owner = RetirementMaintenance(
             store,
             archive,
@@ -90,16 +107,27 @@ def main():
             catalog_archive_budget=True,
         )
         result = owner.cycle(busy=False)
+    except Exception as error:
+        result, failed = _failure(error, phase), True
+    finally:
+        try:
+            if store is not None:
+                store.close()
+        except Exception as error:
+            result, failed = _failure(error, "shutdown"), True
+        signal.setitimer(signal.ITIMER_REAL, 0)
+    try:
         usage = resource.getrusage(resource.RUSAGE_SELF)
         result.update(
             elapsed_ms=round((time.monotonic() - started) * 1000),
             peak_rss_kib=peak_rss_kib(),
             cpu_seconds=usage.ru_utime + usage.ru_stime,
         )
-        print(json.dumps(result), flush=True)
-    finally:
-        store.close()
-        signal.setitimer(signal.ITIMER_REAL, 0)
+    except Exception as error:
+        result, failed = _failure(error, "metrics"), True
+    print(json.dumps(result), flush=True)
+    if failed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

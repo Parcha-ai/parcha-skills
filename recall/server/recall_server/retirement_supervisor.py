@@ -65,7 +65,7 @@ class RetirementSupervisor:
         self.child = None
         try:
             payload = child.stdout.read(65537)
-            if child.returncode != 0 or len(payload) > 65536:
+            if len(payload) > 65536:
                 return _empty("commit_outcome_unknown", unknown=True)
             result = json.loads(payload)
             if not isinstance(result, dict) or not isinstance(
@@ -75,9 +75,30 @@ class RetirementSupervisor:
             for field in ("cleared_documents", "cleared_utf8_bytes"):
                 if type(result.get(field)) is not int or result[field] < 0:
                     return _empty("commit_outcome_unknown", unknown=True)
+            if child.returncode != 0:
+                error_class = result.get("error_class")
+                if (
+                    result["status"] != "commit_outcome_unknown"
+                    or result.get("commit_outcome_unknown") is not True
+                    or result["cleared_documents"] != 0
+                    or result["cleared_utf8_bytes"] != 0
+                    or not isinstance(error_class, str)
+                    or len(error_class) > 80
+                    or not error_class.isidentifier()
+                    or result.get("phase")
+                    not in {
+                        "configuration",
+                        "database_setup",
+                        "archive_setup",
+                        "maintenance",
+                        "shutdown",
+                        "metrics",
+                    }
+                ):
+                    return _empty("commit_outcome_unknown", unknown=True)
             LOG.info(
                 "retirement_child status=%s elapsed_ms=%s cpu_seconds=%s peak_rss_kib=%s "
-                "archive_bytes=%s cleared_utf8_bytes=%s unknown=%s",
+                "archive_bytes=%s cleared_utf8_bytes=%s unknown=%s error_class=%s phase=%s",
                 result["status"],
                 result.get("elapsed_ms"),
                 result.get("cpu_seconds"),
@@ -85,6 +106,8 @@ class RetirementSupervisor:
                 result.get("archive_bytes"),
                 result["cleared_utf8_bytes"],
                 result.get("commit_outcome_unknown"),
+                result.get("error_class"),
+                result.get("phase"),
             )
             return result
         except (ValueError, OSError):

@@ -1,5 +1,6 @@
 """A slow proof cannot block projection or create overlapping retirement children."""
 
+import json
 import os
 from pathlib import Path
 import signal
@@ -177,6 +178,57 @@ time.sleep(60)
             except ProcessLookupError:
                 pass
             parent.stdout.close()
+
+    def test_child_failure_emits_content_free_phase_and_error_class(self):
+        code = """from recall_server import retirement_process as p
+class Store:
+    def __init__(self,dsn):pass
+    def close(self):pass
+def unavailable(**kwargs):raise RuntimeError('sensitive-provider-and-dsn-value')
+p.RetirementStore=Store
+p.build_evidence_archive_store=unavailable
+p.main()
+"""
+        child = subprocess.run(
+            [sys.executable, "-c", code],
+            input=json.dumps(
+                dict(dsn="sensitive-provider-and-dsn-value", tenant_id=None, seconds=1)
+            ),
+            text=True,
+            capture_output=True,
+            env=dict(os.environ, RECALL_CHUNK_BODY_READS="archive"),
+            timeout=5,
+        )
+        self.assertEqual(child.returncode, 1)
+        report = json.loads(child.stdout)
+        self.assertEqual(report["error_class"], "RuntimeError")
+        self.assertEqual(report["phase"], "archive_setup")
+        self.assertTrue(report["commit_outcome_unknown"])
+        self.assertEqual(report["cleared_documents"], 0)
+        self.assertNotIn(
+            "sensitive-provider-and-dsn-value", child.stdout + child.stderr
+        )
+
+    def test_nonzero_child_preserves_safe_failure_envelope(self):
+        def launch(_configuration):
+            return subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import json;print(json.dumps(dict(status='commit_outcome_unknown', "
+                    "commit_outcome_unknown=True,cleared_documents=0,cleared_utf8_bytes=0,"
+                    "error_class='RuntimeError',phase='archive_setup')));raise SystemExit(1)",
+                ],
+                stdout=subprocess.PIPE,
+            )
+
+        self.worker.launch = launch
+        self.worker.cycle(busy=False)
+        self.wait_until(lambda: self.worker.child.poll() is not None)
+        report = self.worker.cycle(busy=False)
+        self.assertEqual(report["error_class"], "RuntimeError")
+        self.assertEqual(report["phase"], "archive_setup")
+        self.assertTrue(report["commit_outcome_unknown"])
 
     def test_configuration_failure_reaps_owned_child(self):
         child = subprocess.Popen(
