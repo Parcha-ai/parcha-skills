@@ -114,6 +114,50 @@ def _source_ordinal(event: dict[str, Any]) -> int | None:
     return value if type(value) is int and -(2**63) <= value < 2**63 else None
 
 
+def _lineage_job_id(tenant_id: str, source_id: str, connector_id: str) -> str:
+    # Legacy per-event jobs use an evt_* final component; the namespaces are disjoint.
+    return _opaque("job", tenant_id, source_id, connector_id, "connector-lineage-v1")
+
+
+def _ensure_lineage_jobs(connection, *, tenant_id: str, source_id: str, connector_ids) -> None:
+    # This existing FK target records connector lineage, not execution attempts.
+    # Its timestamps describe registration and never track an individual event.
+    connectors = set(connector_ids)
+    jobs = {_lineage_job_id(tenant_id, source_id, connector): connector
+            for connector in connectors}
+    if len(jobs) != len(connectors):
+        raise CanonicalLifecycleError("canonical_job_conflict")
+    if not jobs:
+        return
+    connection.execute(
+        """INSERT INTO canonical_ingest_jobs(
+               tenant_id,source_id,job_id,connector_id,mode,status,attempt)
+           SELECT %s,%s,row.job_id,row.connector_id,'incremental','committed',0
+           FROM jsonb_to_recordset(%s::jsonb) AS row(job_id text,connector_id text)
+           ORDER BY row.job_id
+           ON CONFLICT(tenant_id,source_id,job_id) DO NOTHING""",
+        (tenant_id, source_id, json.dumps([
+            {"job_id": job, "connector_id": connector} for job, connector in jobs.items()
+        ])),
+    )
+    # A separate statement sees a concurrent creator after its INSERT commits.
+    # Shared locks allow concurrent admissions and prevent metadata changing mid-write.
+    rows = connection.execute(
+        """SELECT job_id,connector_id,mode,status,attempt,created_at,updated_at
+           FROM canonical_ingest_jobs
+           WHERE tenant_id=%s AND source_id=%s AND job_id=ANY(%s)
+           ORDER BY job_id FOR SHARE""",
+        (tenant_id, source_id, list(jobs)),
+    ).fetchall()
+    if len(rows) != len(jobs) or {row["job_id"] for row in rows} != set(jobs) or any(
+        row["connector_id"] != jobs[row["job_id"]]
+        or row["mode"] != "incremental" or row["status"] != "committed"
+        or row["attempt"] != 0 or row["created_at"] != row["updated_at"]
+        for row in rows
+    ):
+        raise CanonicalLifecycleError("canonical_job_conflict")
+
+
 def _linked_native_ids(
     conn: Any,
     *,
@@ -563,7 +607,7 @@ class CanonicalPlane:
         event_sha256 = event["content_sha256"]
         identity_sha256 = _identity_sha256(tenant_id, source_id, native_id)
         event_id = _opaque("evt", tenant_id, source_id, native_id, event_sha256)
-        job_id = _opaque("job", tenant_id, source_id, connector_id, event_id)
+        job_id = _lineage_job_id(tenant_id, source_id, connector_id)
         document_id = _opaque("doc", tenant_id, source_id, event_id)
         text_sha256 = hashlib.sha256(text_redacted.encode()).hexdigest()
         chunk_texts = [] if is_tombstone else canonical_text_chunks(text_redacted)
@@ -703,14 +747,8 @@ class CanonicalPlane:
                 ).fetchone()
                 revision = row["revision"]
                 receipt = f"recall://{source_id}/{native_id}?rev={revision}#item=0"
-                conn.execute(
-                    """INSERT INTO canonical_ingest_jobs(
-                           tenant_id,source_id,job_id,connector_id,mode,status,
-                           attempt,created_at,updated_at
-                       ) VALUES (%s,%s,%s,%s,'incremental','committed',1,now(),now())
-                       ON CONFLICT(tenant_id,source_id,job_id) DO NOTHING""",
-                    (tenant_id, source_id, job_id, connector_id),
-                )
+                _ensure_lineage_jobs(conn, tenant_id=tenant_id, source_id=source_id,
+                                     connector_ids=[connector_id])
                 conn.execute(
                     """INSERT INTO canonical_events(
                            tenant_id,source_id,event_id,native_id,native_parent_id,
@@ -838,19 +876,6 @@ class CanonicalPlane:
                     mark_logical_notification_pending(
                         conn, tenant_id=tenant_id, source_id=source_id, event_id=event_id,
                     )
-                conn.execute(
-                    """INSERT INTO canonical_audit_events(
-                           tenant_id,source_id,audit_id,operation,status,
-                           subject_sha256,item_count,byte_count
-                       ) VALUES (%s,%s,%s,'ingest.commit','success',%s,1,%s)""",
-                    (
-                        tenant_id,
-                        source_id,
-                        _opaque("audit", tenant_id, source_id, event_id, "ingest"),
-                        identity_sha256,
-                        artifact["size_bytes"],
-                    ),
-                )
         return {
             "status": "committed",
             "inserted": 1,
@@ -1114,7 +1139,7 @@ class CanonicalPlane:
         Duplicate native identities intentionally stay on the lineage-aware
         sequential path. Homogeneous tombstone batches resolve descendants in
         one recursive query. The path preserves the same contracts, locks,
-        revisions, artifact checks, receipts, and audit records.
+        revisions, artifact checks, receipts, and exceptional audit records.
         """
         prepared: list[dict[str, Any]] = []
         artifacts: dict[str, dict[str, Any]] = {}
@@ -1195,13 +1220,7 @@ class CanonicalPlane:
                         source_id,
                         native_id,
                     ),
-                    "job_id": _opaque(
-                        "job",
-                        tenant_id,
-                        source_id,
-                        connector_id,
-                        event_id,
-                    ),
+                    "job_id": _lineage_job_id(tenant_id, source_id, connector_id),
                     "document_id": _opaque(
                         "doc",
                         tenant_id,
@@ -1439,29 +1458,9 @@ class CanonicalPlane:
                                  AND chunk.deleted_at IS NULL""",
                             (tenant_id, source_id, affected_native_ids),
                         )
-                    job_rows = [
-                        {
-                            "job_id": item["job_id"],
-                            "connector_id": item["connector_id"],
-                        }
-                        for item in new_rows
-                    ]
-                    connection.execute(
-                        """INSERT INTO canonical_ingest_jobs(
-                               tenant_id,source_id,job_id,connector_id,mode,status,
-                               attempt,created_at,updated_at
-                           )
-                           SELECT %s,%s,row.job_id,row.connector_id,
-                                  'incremental','committed',1,now(),now()
-                           FROM jsonb_to_recordset(%s::jsonb) AS row(
-                               job_id text,connector_id text
-                           )
-                           ON CONFLICT(tenant_id,source_id,job_id) DO NOTHING""",
-                        (
-                            tenant_id,
-                            source_id,
-                            json.dumps(job_rows),
-                        ),
+                    _ensure_lineage_jobs(
+                        connection, tenant_id=tenant_id, source_id=source_id,
+                        connector_ids=(item["connector_id"] for item in new_rows),
                     )
                     event_rows = [
                         {
@@ -1593,37 +1592,6 @@ class CanonicalPlane:
                         source_id=source_id,
                         native_ids=affected_native_ids,
                         reason="ingest",
-                    )
-                    audit_rows = [
-                        {
-                            "audit_id": _opaque(
-                                "audit",
-                                tenant_id,
-                                source_id,
-                                item["event_id"],
-                                "ingest",
-                            ),
-                            "subject_sha256": item["identity_sha256"],
-                            "byte_count": item["artifact"]["size_bytes"],
-                        }
-                        for item in new_rows
-                    ]
-                    connection.execute(
-                        """INSERT INTO canonical_audit_events(
-                               tenant_id,source_id,audit_id,operation,status,
-                               subject_sha256,item_count,byte_count
-                           )
-                           SELECT %s,%s,row.audit_id,'ingest.commit','success',
-                                  row.subject_sha256,1,row.byte_count
-                           FROM jsonb_to_recordset(%s::jsonb) AS row(
-                               audit_id text,subject_sha256 char(64),
-                               byte_count bigint
-                           )""",
-                        (
-                            tenant_id,
-                            source_id,
-                            json.dumps(audit_rows),
-                        ),
                     )
                 inserted_actor_links = attribute_canonical_events(
                     connection,
