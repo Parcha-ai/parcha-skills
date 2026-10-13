@@ -9,6 +9,7 @@ import sqlite3
 import time
 import urllib.error
 import urllib.request
+from bisect import bisect_right
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1177,6 +1178,7 @@ class Collector:
         scan_started = time.monotonic()
         records_seen = 0
         bounded = False
+        last_visited_path = None
         privacy_receipts = []
         if self.brain_writer is not None and not self.defer_scan_flush:
             self.flush()
@@ -1193,6 +1195,21 @@ class Collector:
             paths = self.discover()
             if self.harness == "codex":
                 paths = self._prepare_codex_discovery(paths, scan_id, summary)
+            scheduling = dict(self.db.execute(
+                "SELECT key,value FROM meta WHERE key IN "
+                "('scan_next_lane','scan_resume_after_path')"
+            ))
+            fair_slice = scheduling.get("scan_next_lane") == "fair"
+            if fair_slice:
+                # Alternate fresh appends with a durable walk through history.
+                # Rotate the full population so missing-file detection still
+                # requires a complete pass, even when the cursor was deleted.
+                paths = sorted(paths, key=str)
+                split = bisect_right(
+                    [str(path) for path in paths],
+                    scheduling.get("scan_resume_after_path", ""),
+                )
+                paths = paths[split:] + paths[:split]
             for path in paths:
                 if (
                     records_seen >= self.max_scan_records
@@ -1207,6 +1224,7 @@ class Collector:
                 ):
                     self.flush()
                 summary["files_seen"] += 1
+                last_visited_path = str(path)
                 stat = path.stat()
                 path_text = str(path)
                 row = self.db.execute("SELECT * FROM files WHERE path=?", (path_text,)).fetchone()
@@ -1550,6 +1568,9 @@ class Collector:
                 if bounded:
                     break
         self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES ('last_scan_at',?)", (str(time.time()),))
+        if fair_slice and last_visited_path is not None:
+            self._set_meta("scan_resume_after_path", last_visited_path)
+        self._set_meta("scan_next_lane", "fresh" if fair_slice else "fair")
         self.db.commit()
         summary["scan_complete"] = not bounded
         summary["privacy"] = summarize_receipts(privacy_receipts, self.privacy.mode)
