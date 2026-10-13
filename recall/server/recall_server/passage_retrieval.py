@@ -266,8 +266,9 @@ def collapse_document_candidates(
     the small-leg and recent-first fallbacks. ``fusion_report`` receives
     per-leg ``{"candidates", "documents", "normalized"}`` when given.
     ``nominate_per_arm`` > 0 appends, after the first ``limit`` rows, every
-    document some arm ranked within its top ``nominate_per_arm`` (see
-    ``arm_nominated``); the rows carry ``"nominated": True``.
+    document within an arm's first ``nominate_per_arm`` distinct documents;
+    repeated passages do not consume nominations. These rows carry
+    ``"nominated": True``.
     ``window_boost=(since, until, factor)`` (H2-h) multiplies the fused
     score of every document whose ``[first_occurred_at, last_occurred_at]``
     intersects the window by ``factor`` (after flooring it at the pool's
@@ -277,6 +278,7 @@ def collapse_document_candidates(
     """
 
     documents: dict[str, dict[str, Any]] = {}
+    nominated_documents: set[tuple[str, str]] = set()
     for leg_name, weight, rows in legs:
         leg_scores, normalized = leg_document_scores(rows, mode=fusion)
         leg_weight = (
@@ -313,6 +315,8 @@ def collapse_document_candidates(
                 },
             )
             if document_id not in seen_documents:
+                if len(seen_documents) < nominate_per_arm:
+                    nominated_documents.add((row["source_id"], document_id))
                 leg_entry = leg_scores[document_id]
                 value["_score"] += leg_weight * float(leg_entry["normalized"])
                 value["_arm_scores"][leg_name] = {
@@ -398,7 +402,7 @@ def collapse_document_candidates(
         ranked.extend(
             value
             for value in ordered[limit:]
-            if arm_nominated(value["_arm_scores"], nominate_per_arm)
+            if (value["source_id"], value["logical_document_id"]) in nominated_documents
         )
     results = []
     for value in ranked:
@@ -815,15 +819,6 @@ def group_near_duplicates(
         "near_duplicate_groups": sum(1 for row in kept if row.get("similar_documents")),
         "near_duplicate_threshold": threshold,
     }
-
-
-def arm_nominated(arm_scores: dict[str, Any], nominate_per_arm: int) -> bool:
-    """True when any arm ranked the document within its top ``nominate_per_arm``."""
-
-    return any(
-        0 < int(entry.get("rank") or 0) <= nominate_per_arm
-        for entry in (arm_scores or {}).values()
-    )
 
 
 def focus_terms(*queries: str) -> list[str]:

@@ -2611,6 +2611,30 @@ class RerankPoolNominationTests(unittest.TestCase):
         results[-1].pop("nominated")
         self.assertEqual([k for _i, k in select_rerank_candidates(results, max_candidates=4)], ["h0", "h1", "h2", "h3"])
 
+    def test_repeated_passages_do_not_consume_document_nominations(self) -> None:
+        from recall_server.passage_retrieval import collapse_document_candidates
+        dense = self._legs()[0]
+        lexical = []
+        for index, document in enumerate(("a", "a", "a", "b", "b", "c", "d", "e", "f")):
+            row = self._row(document, 9 - index, "passage-lexical")
+            row.update(passage_id=f"lex-{index}", passage_ordinal=index,
+                       receipts=[f"receipt-{document}-{index}"])
+            lexical.append(row)
+        legs = (dense, ("passage-lexical", 0.1, lexical))
+        kwargs = dict(limit=5, fusion="convex",
+                      alphas={"dense": 0.65, "passage-lexical": 0.1})
+        head = collapse_document_candidates(legs, **kwargs)
+        nominated = collapse_document_candidates(legs, **kwargs, nominate_per_arm=5)
+        self.assertEqual(nominated[:5], head)
+        self.assertEqual([row["logical_document_id"] for row in nominated[5:]],
+                         ["a", "b", "c", "d", "e"])
+        fourth = next(row for row in nominated if row["logical_document_id"] == "d")
+        # Passage rank still describes the original arm and drives fusion.
+        self.assertEqual(fourth["arm_scores"]["passage-lexical"]["rank"], 7)
+        self.assertEqual(fourth["source_id"], "s")
+        self.assertEqual(fourth["matching_ranges"][0]["receipts"], ["receipt-d-6"])
+        self.assertTrue(fourth["nominated"])
+
     def test_focus_window_centres_on_the_matching_sentence(self) -> None:
         from recall_server.passage_retrieval import focus_terms, focus_window
         text = "a " * 3000 + "junction tables expert_skills and expert_mcp_tools " + "b " * 3000
