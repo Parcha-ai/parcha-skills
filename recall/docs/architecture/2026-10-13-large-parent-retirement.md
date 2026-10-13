@@ -85,8 +85,13 @@ SQL lease overlapped archive body reads. The unchanged verifier found 46,567
 eligible documents containing 341,760,838 UTF-8 bytes. It retained 35 oversized
 and 7,537 structural exclusions. The probe cleared nothing.
 
-The continuous worker defaults to a 180-second child work budget, leaving about
-47 seconds beyond that witnessed proof for bounded clearing. This is evidence
+The continuous worker defaults to a 180-second child work budget. It stops
+admitting clear batches at 170 seconds, gives the owner until 175 seconds, and
+retains the last five seconds for maintenance-intent bookkeeping. That leaves
+about 37 seconds beyond the witnessed proof for admitting bounded clears.
+Short synchronous rounds reserve one quarter of their budget for each finishing
+phase. The existing cooperative stop hook leaves uncommitted rows intact; slow
+or failed commits still retain their original unknown-outcome classification. This is evidence
 for one committed parent, not a universal completion guarantee. The invocation
 still clears at most 64 MiB; its existing 8 MiB/5-second commit bounds remain.
 Repeated full proofs and one-minute parent cooldown affect throughput.

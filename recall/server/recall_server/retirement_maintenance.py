@@ -136,7 +136,14 @@ class RetirementMaintenance:
             observed_previous_cleared_documents=0, commit_outcome_unknown=False)
         if not self.enabled:
             return report
-        self.deadline = time.monotonic() + min(self.seconds, 5 if busy else self.seconds)
+        budget = min(self.seconds, 5 if busy else self.seconds)
+        self.deadline = time.monotonic() + budget
+        # Leave one bounded transaction for the final batch and another for
+        # intent bookkeeping. Short synchronous rounds divide their budget;
+        # the independent 180-second round retains five seconds for each.
+        reserve = min(5, budget / 4)
+        owner_deadline = self.deadline - reserve
+        stop_admitting_at = owner_deadline - reserve
         try:
             source = self._claim_source()
             if source is None:
@@ -148,7 +155,8 @@ class RetirementMaintenance:
             report['enrolled_parents'] = self._reconcile_publications(source)
             result = run_retirement(self.store, self.archive, scope=scope, apply=True,
                 limits=self.limits, parent_limits=ParentRetirementLimits(batch_documents=256),
-                deadline_at=self.deadline,
+                deadline_at=owner_deadline,
+                should_stop=lambda: time.monotonic() >= stop_admitting_at,
                 before_parent=lambda candidate: self._record_intent(source, candidate),
                 parent_limits_for=(lambda candidate: self._parent_limits(source, candidate))
                     if self.catalog_archive_budget else None)

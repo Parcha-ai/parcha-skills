@@ -9,6 +9,7 @@ import subprocess
 import json
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import psycopg
@@ -53,6 +54,56 @@ class MaintenanceTests(unittest.TestCase):
     def policy_state(self):
         with self.store.connect() as c:
             return c.execute('SELECT * FROM canonical_retirement_source_policy WHERE tenant_id=%s AND source_id=%s', self.key[:2]).fetchone()
+
+    def test_round_reserves_batch_commit_and_intent_finalization(self):
+        self.activate()
+        self.ready()
+        worker = self.worker(seconds=180)
+        now = [time.monotonic()]
+        start = now[0]
+        original_run = maintenance.run_retirement
+        original_read = self.archive.read_raw
+        def read_near_end(reference):
+            value = original_read(reference)
+            now[0] = start + 171
+            return value
+        def inspect_budget(*args, **kwargs):
+            self.assertEqual(kwargs['deadline_at'], start + 175)
+            self.assertFalse(kwargs['should_stop']())
+            return original_run(*args, **kwargs)
+        with patch.object(maintenance, 'time', SimpleNamespace(monotonic=lambda: now[0])), \
+                patch.object(maintenance, 'run_retirement', side_effect=inspect_budget), \
+                patch.object(self.archive, 'read_raw', side_effect=read_near_end):
+            result = worker.cycle(busy=False)
+        self.assertEqual(worker.deadline, start + 180)
+        self.assertGreater(result['archive_bytes'], 0)
+        self.assertEqual(result['cleared_documents'], 0)
+        self.assertFalse(result['commit_outcome_unknown'])
+        self.assertEqual(result['status'], 'stopped')
+        self.assertIsNone(self.policy_state()['maintenance_intent'])
+        self.assertEqual(self.state()['cumulative_cleared_documents'], 0)
+
+    def test_short_round_reserves_time_without_consuming_entire_budget(self):
+        self.activate()
+        self.ready()
+        worker = self.worker(seconds=180)
+        now = [time.monotonic()]
+        start = now[0]
+        original_run = maintenance.run_retirement
+        def inspect_budget(*args, **kwargs):
+            self.assertEqual(kwargs['deadline_at'], start + 3.75)
+            self.assertFalse(kwargs['should_stop']())
+            now[0] = start + 2.5
+            self.assertTrue(kwargs['should_stop']())
+            return original_run(*args, **kwargs)
+        with patch.object(maintenance, 'time', SimpleNamespace(monotonic=lambda: now[0])), \
+                patch.object(maintenance, 'run_retirement', side_effect=inspect_budget):
+            result = worker.cycle(busy=True)
+        self.assertEqual(worker.deadline, start + 5)
+        self.assertEqual(result['cleared_documents'], 0)
+        self.assertFalse(result['commit_outcome_unknown'])
+        self.assertEqual(result['status'], 'stopped')
+        self.assertIsNone(self.policy_state()['maintenance_intent'])
 
     def test_catalog_budget_uses_exact_parts_and_preserves_proof(self):
         self.activate()
