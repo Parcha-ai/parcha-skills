@@ -870,6 +870,27 @@ class CanonicalLogicalEvidenceProjector:
                         int(row["candidate_ordinal"]),
                         [],
                     ).append(self._reference(row))
+                if len(candidates) == 1:
+                    # Expose the worker's one parent as constants. A materialized
+                    # unnest hides both cardinality and index ordering, causing
+                    # PostgreSQL to sort the fully hydrated parent before FETCH.
+                    parent_selection = "SELECT 0::integer,%s::text,%s::text,%s::text"
+                    parent_materialization = "NOT MATERIALIZED"
+                    parent_order = ""
+                    parent_values = (candidates[0].tenant_id, candidates[0].source_id,
+                                     candidates[0].native_parent_id)
+                else:
+                    parent_selection = (
+                        "SELECT * FROM unnest(%s::integer[],%s::text[],%s::text[],%s::text[])"
+                    )
+                    parent_materialization = "MATERIALIZED"
+                    parent_order = "selected.candidate_ordinal,event.source_ordinal IS NULL,"
+                    parent_values = (
+                        list(range(len(candidates))),
+                        [candidate.tenant_id for candidate in candidates],
+                        [candidate.source_id for candidate in candidates],
+                        [candidate.native_parent_id for candidate in candidates],
+                    )
                 with connection.cursor(
                     name="logical_evidence_batch_stream",
                 ) as cursor:
@@ -878,15 +899,13 @@ class CanonicalLogicalEvidenceProjector:
                     # cheap match guard avoids decoding before parent filtering;
                     # the unchanged joins retain all scope/current-row authority.
                     cursor.execute(
-                        """WITH selected(
+                        f"""WITH selected(
                                candidate_ordinal,tenant_id,source_id,
                                native_parent_id
-                           ) AS MATERIALIZED (
-                               SELECT * FROM unnest(
-                                   %s::integer[],%s::text[],%s::text[],%s::text[]
-                               )
-                           )
-                           SELECT selected.candidate_ordinal,
+                           ) AS {parent_materialization} (
+                               {parent_selection}
+                           )"""
+                        """SELECT selected.candidate_ordinal,
                               document.document_id,document.body_location,
                               event.tenant_id,event.source_id,
                               event.event_id,event.native_id,event.kind,
@@ -1001,18 +1020,10 @@ class CanonicalLogicalEvidenceProjector:
                                        WHERE binding.tenant_id=event.tenant_id
                                          AND binding.source_id=event.source_id
                                 ) link
-                         ) attributed ON true
-                        ORDER BY
-                          selected.candidate_ordinal,
-                          event.source_ordinal IS NULL,
+                         ) attributed ON true"""
+                        f""" ORDER BY {parent_order}
                           byte_start,event.occurred_at,event.native_id""",
-                        (
-                            list(range(len(candidates))),
-                            [candidate.tenant_id for candidate in candidates],
-                            [candidate.source_id for candidate in candidates],
-                            [candidate.native_parent_id for candidate in candidates],
-                            OVERSIZED_MEDIA_TYPE,
-                        ),
+                        (*parent_values, OVERSIZED_MEDIA_TYPE),
                     )
                     previous_ordinal = -1
                     for ordinal, rows in groupby(

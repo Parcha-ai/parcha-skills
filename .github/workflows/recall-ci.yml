@@ -73,6 +73,7 @@ jobs:
             e2e_passage_source_fairness.py \
             e2e_passage_lock_contention.py \
             e2e_logical_streaming_progress.py \
+            e2e_logical_stream_order.py \
             e2e_logical_admission_sharing.py \
             e2e_logical_small_work_progress.py \
             e2e_logical_early_supersession.py \
