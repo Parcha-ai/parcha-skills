@@ -11,5 +11,5 @@ ALTER TABLE canonical_retirement_source_policy
     ADD COLUMN IF NOT EXISTS maintenance_intent jsonb;
 COMMENT ON COLUMN canonical_retirement_source_policy.maintenance_intent IS
     'Last bounded worker parent/epoch observation; operational recovery metadata, never retirement authority.';
-INSERT INTO schema_migrations(version) VALUES(78) ON CONFLICT DO NOTHING;
+INSERT INTO schema_migrations(version) VALUES (78) ON CONFLICT DO NOTHING;
 COMMIT;

@@ -1862,7 +1862,7 @@ def main() -> None:
     )
     projection_worker.add_argument(
         "--retirement-seconds", type=float, default=10,
-        help="maximum seconds per retirement round; busy rounds use at most five seconds",
+        help="work budget per retirement round; busy rounds use at most five seconds of budget",
     )
     projection_worker.add_argument("--once", action="store_true")
     search_plane_project = sub.add_parser(
