@@ -742,6 +742,37 @@ def claim_unknown_state_recovery(store, root):
         assert reads() == expected_reads
 
 
+def byte_budget_stops_before_next_proof(store, root):
+    tenant, source, archive, _, projector, texts = fixture(store, root, count=2)
+    scope = runner.RetirementScope(tenant, 'principal:reprojection', (source,))
+    with store.connect() as c:
+        c.execute("INSERT INTO canonical_source_grants VALUES(%s,%s,%s,'owner',now())",
+                  (tenant, scope.principal_id, source))
+        insert_record(c, tenant=tenant, source=source, parent='zulu-budget',
+                      native='zulu-budget-event', text='untouched tail body', role='user', byte_start=100)
+        mark_logical_evidence_dirty(c, tenant_id=tenant, source_id=source,
+                                   native_ids=['zulu-budget-event'], reason='ingest')
+    projected = projector.project_pending(tenant_id=tenant, batch_size=1, max_batches=1, upload_concurrency=1)
+    assert projected['failed'] == 0
+    runner.enroll_cohort(store, scope=scope, reviewed_plan=runner.plan_cohort(store, scope=scope))
+    with store.connect() as c:
+        c.execute("UPDATE canonical_chunk_retirement_progress SET updated_at=now()-CASE WHEN native_parent_id='session' THEN interval '3 minutes' ELSE interval '2 minutes' END WHERE tenant_id=%s AND source_id=%s", (tenant, source))
+        tail_before = c.execute("SELECT * FROM canonical_chunk_retirement_progress WHERE tenant_id=%s AND source_id=%s AND native_parent_id='zulu-budget'", (tenant, source)).fetchone()
+        tail_parts = c.execute("SELECT artifact_id FROM canonical_evidence_document_parts WHERE tenant_id=%s AND source_id=%s AND logical_document_id=%s", (tenant, source, tail_before['logical_document_id'])).fetchall()
+    archive.reads.clear()
+    report = runner.run_retirement(store, archive, scope=scope, apply=True,
+        limits=runner.RunnerLimits(max_clear_bytes=len(texts['event-0000'].encode()) + 17))
+    assert report['attempted_parents'] == report['partial_parents'] == report['cleared_documents'] == 1, report
+    assert report['status'] == 'clear_budget_limited', report
+    assert report['cleared_utf8_bytes'] == len(texts['event-0000'].encode()), report
+    assert not any(archive.reads[part['artifact_id']] for part in tail_parts), 'spent archive reads after byte-budget stop'
+    with store.connect() as c:
+        assert c.execute("SELECT * FROM canonical_chunk_retirement_progress WHERE tenant_id=%s AND source_id=%s AND native_parent_id='zulu-budget'", (tenant, source)).fetchone() == tail_before
+        c.execute("UPDATE canonical_chunk_retirement_progress SET updated_at=now()-interval '2 minutes' WHERE tenant_id=%s AND source_id=%s", (tenant, source))
+    resumed = runner.run_retirement(store, archive, scope=scope, apply=True)
+    assert resumed['completed_parent_proofs'] == resumed['cleared_documents'] == 2, resumed
+
+
 def main():
     admin_dsn = os.environ["RECALL_DATABASE_URL"]
     database = "recall_runner_" + uuid.uuid4().hex
@@ -757,6 +788,7 @@ def main():
             tempfile.TemporaryDirectory() as tmp,
             patch.dict(os.environ, RECALL_CHUNK_BODY_READS="archive"),
         ):
+            byte_budget_stops_before_next_proof(store, Path(tmp))
             scenario(store, Path(tmp))
             races(store, Path(tmp))
             paging_and_fairness(store, Path(tmp))
