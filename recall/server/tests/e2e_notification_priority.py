@@ -117,7 +117,16 @@ class NotificationPriority(unittest.TestCase):
         self.search_writer.drain(tenant_id=TENANT, max_months=4)
 
     def test_signed_notification_is_searchable_before_later_history_drains(self):
-        older = self.history(0, 10)
+        # Batch admission uses SELECT DISTINCT and need not preserve input order.
+        # Make the intended oldest queue entry a separate earlier transaction.
+        older = self.history(0, 1)
+        self.history(1, 9)
+        with self.store.connect() as connection:
+            first = connection.execute("""SELECT native_parent_id
+                FROM canonical_evidence_document_queue WHERE tenant_id=%s AND source_id=%s
+                ORDER BY first_queued_at,native_parent_id LIMIT 1""",
+                (TENANT, SLACK_SOURCE)).fetchone()
+        self.assertEqual(first['native_parent_id'], older[0]['native_parent_id'])
         timestamp = f'{int(time.time())}.000100'
         status, acknowledgement = post_slack(self.server,
             slack_event('Synthetic notification sapphire rendezvous.', timestamp))
