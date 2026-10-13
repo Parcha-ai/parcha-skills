@@ -354,7 +354,10 @@ class ManagedConnectorWorker:
                               installation.connection_id,
                               installation.privacy_mode,
                               installation.selectors,
+                              installation.revision,
                               connection.provider,
+                              connection.subject_id AS provider_subject_id,
+                              connection.granted_scopes,
                               connection.status AS connection_status,
                               connection.encrypted_credentials,
                               connection.encryption_key_id
@@ -533,6 +536,14 @@ class ManagedConnectorWorker:
             row["privacy_mode"],
             rails,
         )
+        if connector_id == "slack.messages" and getattr(connector, "public_history", False):
+            connector.reconciliation_epoch = hashlib.sha256(json.dumps([
+                str(row["id"]), str(row["connection_id"]), row["revision"],
+                row["provider_subject_id"], sorted(row["granted_scopes"]),
+            ], separators=(",", ":")).encode()).hexdigest()
+            connector.reconciliation_enabled = os.environ.get(
+                "RECALL_SLACK_RECONCILIATION_ENABLED", "1"
+            ) == "1"
         return connector, spool
 
     @staticmethod
