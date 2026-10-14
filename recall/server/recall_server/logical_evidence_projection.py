@@ -99,6 +99,7 @@ class _LocatorSpool:
     def __init__(self, *, complete_metadata=False):
         self._file = tempfile.TemporaryFile(mode="w+b")
         self.complete_metadata = complete_metadata
+        self.capture_all_inputs = False
         self.count = 0
         self._current = None
         self._desired = None
@@ -130,7 +131,7 @@ class _LocatorSpool:
         previous = row["body_record_ordinal"], row["body_record_count"]
         # Existing repair owners only fill NULL positions. Include every NULL
         # snapshot so a concurrent repair cannot hide a required reset.
-        if previous != self._desired or None in previous:
+        if self.capture_all_inputs or previous != self._desired or None in previous:
             self.append(
                 (
                     row["document_id"],
@@ -164,6 +165,7 @@ class _LocatedUpload(LogicalEvidenceUpload):
     body_locators: _LocatorSpool | None = None
     inline_document_ids: tuple[str, ...] = ()
     append_base_manifest_id: str | None = None
+    append_snapshot_catalog: dict[str, Any] | None = None
     input_sql_rows: int | None = None
 
 
@@ -851,9 +853,24 @@ class CanonicalLogicalEvidenceProjector:
         )
 
     def _check_candidate_current(
-        self, candidate: LogicalGroupCandidate, *, connection=None,
+        self, candidate: LogicalGroupCandidate, *, connection=None, append_catalog=None,
     ) -> None:
         with (self.store.connect() if connection is None else nullcontext(connection)) as connection:
+            if append_catalog is not None:
+                row = connection.execute(
+                    """SELECT to_jsonb(queue) AS queued,to_jsonb(evidence) AS catalog
+                         FROM canonical_evidence_document_queue queue
+                         LEFT JOIN canonical_evidence_documents evidence
+                           USING(tenant_id,source_id,native_parent_id)
+                        WHERE queue.tenant_id=%s AND queue.source_id=%s AND queue.native_parent_id=%s""",
+                    (candidate.tenant_id,candidate.source_id,candidate.native_parent_id),
+                ).fetchone()
+                from .logical_append_reader import eligible, continues_snapshot
+                if (row is not None and row['catalog'] == append_catalog
+                        and (eligible(candidate, append_catalog, row['queued'])
+                             or continues_snapshot(candidate, append_catalog, row['queued']))):
+                    return
+                raise _LogicalWorkSuperseded
             queued = connection.execute(
                 """SELECT generation,changed_at
                      FROM canonical_evidence_document_queue
@@ -969,6 +986,7 @@ class CanonicalLogicalEvidenceProjector:
                     # Preserve the original NULL-position race guards without
                     # hydrating prefix bodies, chunks or raw event payloads.
                     prefix_locations = body_locators[0] = _LocatorSpool(complete_metadata=True)
+                    prefix_locations.capture_all_inputs = True
                     with connection.cursor(name="logical_append_null_locator_stream") as null_cursor:
                         null_cursor.itersize = self.cursor_fetch_rows
                         null_cursor.execute("""SELECT document.document_id,document.event_id,document.native_id,
@@ -987,7 +1005,8 @@ class CanonicalLogicalEvidenceProjector:
                         next_null_check = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
                         for row in null_cursor:
                             if require_current_queue and time.monotonic() >= next_null_check:
-                                self._check_candidate_current(candidates[0], connection=connection)
+                                self._check_candidate_current(candidates[0], connection=connection,
+                                    append_catalog=pins.get(0) if 0 in append_ordinals and 0 not in recovered else None)
                                 next_null_check = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
                             prefix_locations.append((row["document_id"],row["event_id"],row["native_id"],
                                 row["revision"],row["text_sha256"],None,None))
@@ -1143,7 +1162,8 @@ class CanonicalLogicalEvidenceProjector:
                                 # READ COMMITTED sees the live queue independently
                                 # of the named cursor's original SELECT snapshot.
                                 # Reuse this lease: every worker may own a cursor.
-                                self._check_candidate_current(candidates[0], connection=connection)
+                                self._check_candidate_current(candidates[0], connection=connection,
+                                    append_catalog=pins.get(0) if 0 in append_ordinals and 0 not in recovered else None)
                                 next_stream_check = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
                             # This file is private, self-produced and never
                             # accepted as input from another process or source.
@@ -1157,13 +1177,15 @@ class CanonicalLogicalEvidenceProjector:
             # re-encoding or uploads; the final commit CAS remains authoritative.
             checkpoint = None
             if require_current_queue:
-                self._check_candidate_current(candidates[0])
+                self._check_candidate_current(candidates[0],
+                            append_catalog=pins.get(0) if 0 in append_ordinals and 0 not in recovered else None)
                 next_current_check = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
 
                 def checkpoint():
                     nonlocal next_current_check
                     if time.monotonic() >= next_current_check:
-                        self._check_candidate_current(candidates[0])
+                        self._check_candidate_current(candidates[0],
+                            append_catalog=pins.get(0) if 0 in append_ordinals and 0 not in recovered else None)
                         next_current_check = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
 
             # Archive recovery and oversized raw restoration run only after
@@ -1227,7 +1249,8 @@ class CanonicalLogicalEvidenceProjector:
                 inline_document_ids[ordinal] = tuple(inline_ids)
                 ranges.append((ordinal, final_start, spool.tell()))
             if recovered or append_ordinals:
-                self._check_recovery_pins(candidates, pins, recovered | append_ordinals)
+                self._check_recovery_pins(candidates, pins, recovered | append_ordinals,
+                                          append_ordinals=append_ordinals - recovered)
             # No upload starts until every source row in this shard has
             # passed its document and chunk hashes. The SQL cursor and pool
             # connection are released before publishing the validated data.
@@ -1265,6 +1288,7 @@ class CanonicalLogicalEvidenceProjector:
                     **vars(upload), body_locators=body_locators[ordinal],
                     inline_document_ids=inline_document_ids[ordinal],
                     append_base_manifest_id=(prefix.manifest_reference["artifact_id"] if prefix else None),
+                    append_snapshot_catalog=(pins[ordinal] if prefix and ordinal not in recovered else None),
                     input_sql_rows=input_sql_rows[ordinal],
                 )
                 uploads[ordinal] = upload
@@ -1291,13 +1315,13 @@ class CanonicalLogicalEvidenceProjector:
             if input_spool is not None:
                 input_spool.close()
 
-    def _check_recovery_pins(self, candidates, pins, recovered):
+    def _check_recovery_pins(self, candidates, pins, recovered, *, append_ordinals=()):
         """Reject stale archive recovery before publishing any candidate."""
         with self.store.connect() as connection:
             for ordinal in sorted(recovered):
                 candidate = candidates[ordinal]
                 row = connection.execute(
-                    """SELECT queue.generation,queue.changed_at,
+                    """SELECT queue.generation,queue.changed_at,to_jsonb(queue) AS queued,
                               to_jsonb(evidence) AS manifest
                          FROM canonical_evidence_document_queue queue
                          LEFT JOIN canonical_evidence_documents evidence
@@ -1306,6 +1330,10 @@ class CanonicalLogicalEvidenceProjector:
                           AND queue.native_parent_id=%s""",
                     (candidate.tenant_id, candidate.source_id, candidate.native_parent_id),
                 ).fetchone()
+                if ordinal in append_ordinals and row is not None and row['manifest'] == pins[ordinal]:
+                    from .logical_append_reader import continues_snapshot
+                    if continues_snapshot(candidate, pins[ordinal], row['queued']):
+                        continue
                 if (row is None or row["generation"] != candidate.generation
                         or row["changed_at"] != candidate.source_updated_at
                         or row["manifest"] != pins[ordinal]):
@@ -1732,9 +1760,12 @@ class CanonicalLogicalEvidenceProjector:
                     "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
                     ("logical-evidence\x1f" + prepared.logical_document_id,),
                 )
+                snapshot_catalog = getattr(upload, "append_snapshot_catalog", None)
+                queue_metadata = ",to_jsonb(queue) AS append_queue" if snapshot_catalog is not None else ""
+                catalog_metadata = ",to_jsonb(canonical_evidence_documents) AS append_catalog" if snapshot_catalog is not None else ""
                 queued = connection.execute(
-                    """SELECT generation,changed_at,notification_queued_at
-                         FROM canonical_evidence_document_queue
+                    f"""SELECT generation,changed_at,notification_queued_at{queue_metadata}
+                         FROM canonical_evidence_document_queue queue
                         WHERE tenant_id=%s AND source_id=%s
                           AND native_parent_id=%s
                         FOR UPDATE""",
@@ -1745,20 +1776,24 @@ class CanonicalLogicalEvidenceProjector:
                     ),
                 ).fetchone()
                 current = connection.execute(
-                    """SELECT revision,source_updated_at,receipt_count,
+                    f"""SELECT revision,source_updated_at,receipt_count,
                               document_content_sha256,
                               manifest_artifact_id,first_occurred_at,
-                              last_occurred_at
+                              last_occurred_at{catalog_metadata}
                          FROM canonical_evidence_documents
                         WHERE tenant_id=%s AND source_id=%s
-                          AND native_parent_id=%s""",
+                          AND native_parent_id=%s""" + (" FOR UPDATE NOWAIT" if snapshot_catalog is not None else ""),
                     (
                         candidate.tenant_id,
                         candidate.source_id,
                         candidate.native_parent_id,
                     ),
                 ).fetchone()
-                if (
+                from .logical_append_reader import continues_snapshot
+                retain_queue = bool(snapshot_catalog and queued and current
+                    and current['append_catalog'] == snapshot_catalog
+                    and continues_snapshot(candidate, snapshot_catalog, queued['append_queue']))
+                if not retain_queue and (
                     queued is None
                     or int(queued["generation"]) != candidate.generation
                     or queued["changed_at"] != candidate.source_updated_at
@@ -1770,10 +1805,15 @@ class CanonicalLogicalEvidenceProjector:
                     ):
                         return "adopted"
                     return "stale"
+                if snapshot_catalog is not None and (current is None or current['append_catalog'] != snapshot_catalog):
+                    return "stale"
                 append_base = getattr(upload, "append_base_manifest_id", None)
                 if append_base is not None and (current is None or current["manifest_artifact_id"] != append_base):
                     return "stale"
-                locator_changes = self._publish_body_locators(connection, candidate, getattr(upload, "body_locators", None))
+                locator_changes = self._publish_body_locators(
+                    connection, candidate, getattr(upload, "body_locators", None),
+                    **({"append_window": (snapshot_catalog["append_source_ordinal"],
+                                          upload.body_locators.append_source_ordinal)} if retain_queue else {}))
                 old_manifest, old_parts = self._old_references(
                     connection,
                     candidate,
@@ -1842,24 +1882,8 @@ class CanonicalLogicalEvidenceProjector:
                          prepared.source_id, prepared.logical_document_id,
                          current["revision"], queued["notification_queued_at"]),
                     )
-                    deleted = connection.execute(
-                        """DELETE FROM canonical_evidence_document_queue
-                            WHERE tenant_id=%s AND source_id=%s
-                              AND native_parent_id=%s AND generation=%s
-                            RETURNING EXISTS(SELECT 1 FROM schema_migrations WHERE version=79)
-                                      AS append_capability""",
-                        (
-                            candidate.tenant_id,
-                            candidate.source_id,
-                            candidate.native_parent_id,
-                            candidate.generation,
-                        ),
-                    )
-                    if deleted.rowcount != 1:
-                        raise LogicalEvidenceError(
-                            "logical_evidence_queue_conflict"
-                        )
-                    capability = deleted.fetchone()
+                    capability = self._finish_queue(connection, candidate, queued,
+                        restored_manifest['artifact_id'], retain_queue=retain_queue)
                     if capability and capability.get("append_capability"):
                         from .logical_append_capability import record_frontier
                         record_frontier(
@@ -2048,6 +2072,7 @@ class CanonicalLogicalEvidenceProjector:
                                   AND coalesce(
                                       event.native_parent_id,event.native_id
                                   )=%s
+                                  AND (%s::bigint IS NULL OR event.source_ordinal<=%s)
                                UNION
                                SELECT binding.actor_id,binding.relation
                                  FROM canonical_source_actor_bindings binding
@@ -2063,6 +2088,8 @@ class CanonicalLogicalEvidenceProjector:
                         prepared.tenant_id,
                         prepared.source_id,
                         prepared.native_parent_id,
+                        (upload.body_locators.append_source_ordinal if retain_queue else None),
+                        (upload.body_locators.append_source_ordinal if retain_queue else None),
                         prepared.tenant_id,
                         prepared.source_id,
                     ),
@@ -2117,22 +2144,8 @@ class CanonicalLogicalEvidenceProjector:
                 from .chunk_retirement import invalidate_parent_retirement
                 invalidate_parent_retirement(connection.execute,
                     (candidate.tenant_id, candidate.source_id, candidate.native_parent_id))
-                deleted = connection.execute(
-                    """DELETE FROM canonical_evidence_document_queue
-                        WHERE tenant_id=%s AND source_id=%s
-                          AND native_parent_id=%s AND generation=%s
-                        RETURNING EXISTS(SELECT 1 FROM schema_migrations WHERE version=79)
-                                  AS append_capability""",
-                    (
-                        candidate.tenant_id,
-                        candidate.source_id,
-                        candidate.native_parent_id,
-                        candidate.generation,
-                    ),
-                )
-                if deleted.rowcount != 1:
-                    raise LogicalEvidenceError("logical_evidence_queue_conflict")
-                capability = deleted.fetchone()
+                capability = self._finish_queue(connection, candidate, queued,
+                    manifest_reference['artifact_id'], retain_queue=retain_queue)
                 if capability and capability.get("append_capability"):
                     from .logical_append_capability import record_frontier
                     record_frontier(
@@ -2147,7 +2160,29 @@ class CanonicalLogicalEvidenceProjector:
         return "committed"
 
     @staticmethod
-    def _publish_body_locators(connection, candidate, locators):
+    def _finish_queue(connection, candidate, queued, manifest_id, *, retain_queue):
+        key = (candidate.tenant_id, candidate.source_id, candidate.native_parent_id)
+        if retain_queue:
+            # The locked later append stays queued with its original timestamps.
+            # Only its base changes; the captured frontier is committed alongside.
+            changed = connection.execute(
+                """UPDATE canonical_evidence_document_queue SET append_base_manifest_id=%s
+                    WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s
+                      AND generation=%s AND changed_at=%s AND append_generation=generation
+                    RETURNING EXISTS(SELECT 1 FROM schema_migrations WHERE version=79) AS append_capability""",
+                (manifest_id, *key, queued['generation'], queued['changed_at']))
+        else:
+            changed = connection.execute(
+                """DELETE FROM canonical_evidence_document_queue
+                    WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s AND generation=%s
+                    RETURNING EXISTS(SELECT 1 FROM schema_migrations WHERE version=79) AS append_capability""",
+                (*key, candidate.generation))
+        if changed.rowcount != 1:
+            raise LogicalEvidenceError("logical_evidence_queue_conflict")
+        return changed.fetchone()
+
+    @staticmethod
+    def _publish_body_locators(connection, candidate, locators, *, append_window=None):
         """Change positions in the same transaction as the parent catalog.
 
         Ingest takes document locks before its queue lock. We already hold the
@@ -2158,7 +2193,7 @@ class CanonicalLogicalEvidenceProjector:
         """
         if isinstance(locators, _LocatorSpool) and locators.complete_metadata:
             return CanonicalLogicalEvidenceProjector._publish_locator_delta(
-                connection, candidate, locators
+                connection, candidate, locators, append_window=append_window
             )
         # Empty-parent deletion and older upload callers do not carry a complete
         # canonical input snapshot; retain the original membership/reset owner.
@@ -2207,7 +2242,7 @@ class CanonicalLogicalEvidenceProjector:
         return changed.rowcount
 
     @staticmethod
-    def _publish_locator_delta(connection, candidate, locators):
+    def _publish_locator_delta(connection, candidate, locators, *, append_window=None):
         """Publish prepared changes after the caller has locked the queue CAS.
 
         The complete input stream established parent membership. Recheck each
@@ -2234,6 +2269,26 @@ class CanonicalLogicalEvidenceProjector:
                 for location in locators:
                     writer.write_row(location)
         connection.execute("ANALYZE pg_temp.recall_body_locator_delta")
+        if append_window is not None:
+            # A later new native may sort inside the captured suffix even though
+            # it is beyond the old frontier. Never advance past an unseen row.
+            missing = connection.execute(
+                """SELECT EXISTS (
+                    SELECT 1 FROM canonical_events event
+                    JOIN canonical_documents document USING(tenant_id,source_id,event_id)
+                    WHERE event.tenant_id=%s AND event.source_id=%s
+                      AND COALESCE(event.native_parent_id,event.native_id)=%s
+                      AND event.source_ordinal>%s AND event.source_ordinal<=%s
+                      AND document.is_current AND document.deleted_at IS NULL
+                      AND NOT EXISTS (SELECT 1 FROM pg_temp.recall_body_locator_delta captured
+                          WHERE captured.document_id=document.document_id
+                            AND captured.event_id=document.event_id)
+                ) AS missing""",
+                (candidate.tenant_id, candidate.source_id, candidate.native_parent_id,
+                 *append_window),
+            ).fetchone()
+            if missing["missing"]:
+                raise LogicalEvidenceError("logical_evidence_source_changed")
         result = connection.execute(
             """WITH locked AS MATERIALIZED (
                 SELECT document.document_id,desired.record_ordinal,desired.record_count
