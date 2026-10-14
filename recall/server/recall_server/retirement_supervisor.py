@@ -100,7 +100,7 @@ class RetirementSupervisor:
                 "retirement_child status=%s elapsed_ms=%s cpu_seconds=%s peak_rss_kib=%s "
                 "archive_bytes=%s cleared_utf8_bytes=%s unknown=%s error_class=%s phase=%s "
                 "committed_sql_ms=%s committed_hash_ms=%s archive_read_ms=%s "
-                "claim_wall_ms=%s parent_wall_ms=%s",
+                "claim_wall_ms=%s parent_wall_ms=%s metadata_capture_ms=%s",
                 result["status"],
                 result.get("elapsed_ms"),
                 result.get("cpu_seconds"),
@@ -115,6 +115,7 @@ class RetirementSupervisor:
                 result.get("archive_read_ms"),
                 result.get("claim_wall_ms"),
                 result.get("parent_wall_ms"),
+                result.get("metadata_capture_ms"),
             )
             return result
         except (ValueError, OSError):

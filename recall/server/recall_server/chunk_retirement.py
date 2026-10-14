@@ -523,6 +523,7 @@ def retire_parent_chunks(store, archive, *, tenant_id, source_id, native_parent_
     deadline_at = _parent_deadline(deadline_at)
     totals = dict(cleared_documents=0, cleared_chunks=0, cleared_utf8_bytes=0, hashed_utf8_bytes=0,
                   hash_ms=0.0, sql_ms=0.0, batches=0)
+    attempt_metrics = dict(metadata_capture_ms=0.0)
     try:
         with store.connect() as connection:
             schema = store._execute_bounded(connection, 'SELECT 1 FROM schema_migrations WHERE version=69', (), deadline_at).fetchone()
@@ -537,8 +538,10 @@ def retire_parent_chunks(store, archive, *, tenant_id, source_id, native_parent_
             if (not progress or not progress['enabled']
                     or required_scope_epoch is not None and progress['scope_epoch'] != required_scope_epoch):
                 raise ChunkRetirementError('parent_retirement_disabled')
-        with prove_parent_chunks(store, archive, scope=scope, limits=limits, deadline_at=deadline_at) as proof:
+        with prove_parent_chunks(store, archive, scope=scope, limits=limits, deadline_at=deadline_at,
+                                 capture_metrics=attempt_metrics) as proof:
             report = {key: value for key, value in proof.items() if key not in {'spool','manifest'}}
+            report.update(attempt_metrics)
             if not apply:
                 return dict(report, **totals, status='dry_run', complete=False)
             if proof['plan'] != reviewed_plan:
@@ -588,4 +591,5 @@ def retire_parent_chunks(store, archive, *, tenant_id, source_id, native_parent_
         else:
             failure = ChunkRetirementError('parent_retirement_unavailable')
         failure.committed = totals
+        failure.attempt_metrics = attempt_metrics
         raise failure from None

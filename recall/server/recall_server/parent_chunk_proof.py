@@ -184,12 +184,18 @@ def _capture(store, spool, scope, limits, deadline_at):
 
 
 @contextmanager
-def prove_parent_chunks(store, archive, *, scope, limits, deadline_at, purpose="retire"):
+def prove_parent_chunks(store, archive, *, scope, limits, deadline_at, purpose="retire", capture_metrics=None):
     """Yield a complete sealed metadata proof only after all bytes are verified."""
     if purpose not in {"retire", "locate"}:
         raise _error("parent_proof_purpose_invalid")
     with ParentMetadataSpool(max_bytes=limits.max_spool_bytes) as spool:
-        catalog, parts, count, chunk_count = _capture(store, spool, scope, limits, deadline_at)
+        capture_started = time.monotonic() if capture_metrics is not None else None
+        try:
+            catalog, parts, count, chunk_count = _capture(store, spool, scope, limits, deadline_at)
+        finally:
+            if capture_metrics is not None:
+                # Attempt wall time includes failed reads and local metadata spooling.
+                capture_metrics['metadata_capture_ms'] = (time.monotonic() - capture_started) * 1000
         manifest = catalog['manifest']
         meter = _MeteredArchive(archive, deadline_at)
         excluded, eligible, eligible_bytes, groups = Counter(), 0, 0, 0
