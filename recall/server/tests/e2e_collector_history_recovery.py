@@ -36,7 +36,7 @@ class CollectorHistoryRecovery(unittest.TestCase):
         marker = self.ingest(self.delete(self.root), path='prepare', connector_id='claude.jsonl')
         marker['envelope']['content']['deletion_id'] = 'legacy-filesystem-cleanup'
         marker['envelope']['content_sha256'] = hashlib.sha256(canonical_json(marker['envelope']['content'])).hexdigest()
-        with patch('recall_server.canonical._reject_filesystem_deletion'):
+        with patch('recall_server.canonical._filesystem_cleanup', return_value=False):
             self.plane.ingest_document(**marker)
         self.admin = 'principal:recovery-admin'
         self.operation_id = str(uuid.uuid4())

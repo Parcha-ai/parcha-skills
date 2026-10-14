@@ -210,7 +210,7 @@ def main() -> None:
                     {"target_native_id": row["native_id"], "deletion_id": "legacy-fixture"},
                     "2026-08-10T01:00:00Z", row["start_offset"], row["end_offset"], artifact,
                 ))
-            with patch("recall_server.canonical._reject_filesystem_deletion"):
+            with patch("recall_server.canonical._filesystem_cleanup", return_value=False):
                 legacy_ack = old_single_root.brain_writer.ingest(legacy_markers)
             assert legacy_ack["status"] == "committed"
             assert len(legacy_ack["receipts"]) == 2
