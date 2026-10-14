@@ -15,6 +15,7 @@ from contracts.v2 import IDENTITY_RE, validate_contract
 
 from .canonical import _identity_sha256, _opaque, _source_ordinal
 from .chunk_retirement import require_retirement_owner
+from .canonical_thinning import _compact_event_expression
 from .control import ControlPlane
 from .logical_evidence_projection import _validate_source_body
 from .projectors import canonical_json, item_receipt, validate_envelope
@@ -111,9 +112,35 @@ def _read(plane, connection, tenant_id, principal_id, expected, deadline, *, loc
         _refuse('content_changed')
     metadata = original['canonical_redacted']
     if (original['kind'] != 'transcript_record'
-            or metadata.get('principal_id') != source_row['owner_principal_id']
             or metadata.get('provenance', {}).get('connector_id') != 'claude.jsonl'):
         _refuse('lineage_changed')
+    publication_metadata = metadata
+    if metadata.get('principal_id') != source_row['owner_principal_id']:
+        # Before #792 the body thinner discarded these three envelope fields.
+        # Accept only that exact old shape, never a present mismatching owner.
+        if any(key in metadata for key in ('principal_id', 'visibility', 'content_type')):
+            _refuse('lineage_changed')
+        provenance = metadata.get('provenance', {})
+        if (provenance.get('harness') != 'claude'
+                or type(provenance.get('connector_schema_version')) is not int
+                or provenance['connector_schema_version'] != 1
+                or type(provenance.get('collector_version')) is not int
+                or provenance['collector_version'] != 1):
+            _refuse('lineage_changed')
+        legacy = (f"({_compact_event_expression('event')} - 'principal_id' - 'visibility' - 'content_type')"
+                  " #- '{provenance,uri}' #- '{provenance,original_path}'")
+        accepted = query(f'''SELECT event.canonical_redacted={legacy} AS compact
+            FROM canonical_events event JOIN canonical_ingest_jobs job USING(tenant_id,source_id,job_id)
+            WHERE event.tenant_id=%s AND event.source_id=%s AND event.event_id=%s
+              AND event.body_location='raw' AND job.connector_id='claude.jsonl'
+            ''',
+            (*scope, expected['original_event_id'])).fetchone()
+        if accepted is None or accepted['compact'] is not True:
+            _refuse('lineage_changed')
+        # Accepted canonical writes required the immutable registered source
+        # owner. Private is the NEW publication policy, not recovered visibility.
+        publication_metadata = dict(metadata, principal_id=source_row['owner_principal_id'],
+                                    visibility='private', content_type='application/json')
     artifact = query('''SELECT tenant_id,source_id,artifact_id,storage_backend,object_key,
         content_sha256,size_bytes,media_type,encryption,version_id,created_at,state
         FROM raw_artifacts WHERE tenant_id=%s AND source_id=%s AND artifact_id=%s''',
@@ -124,7 +151,7 @@ def _read(plane, connection, tenant_id, principal_id, expected, deadline, *, loc
     artifact.update(contract='recall.artifact-ref.v1', schema_version=1)
     validate_contract(artifact, expected='recall.artifact-ref.v1')
     return dict(original=original, marker=marker, document=documents[0], chunk=chunk,
-                artifact=artifact, content=content)
+                artifact=artifact, content=content, publication_metadata=publication_metadata)
 
 
 def recover_collector_history(plane, *, tenant_id, principal_id, expected, operation_id,
@@ -153,7 +180,7 @@ def recover_collector_history(plane, *, tenant_id, principal_id, expected, opera
     if type(generation) is not int or generation < 0:
         _refuse('generation_invalid')
     content['_recall_collector_generation'] = generation + 1
-    metadata = original['canonical_redacted']
+    metadata = before['publication_metadata']
     event = dict(schema_version=1, source_id=expected['source_id'], native_id=expected['native_id'],
         kind=original['kind'], occurred_at=original['occurred_at'].isoformat(),
         observed_at=original['observed_at'].isoformat(), principal_id=metadata['principal_id'],
