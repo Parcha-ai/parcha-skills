@@ -108,6 +108,7 @@ class BackgroundBodyThinner:
         self.started_at = clock() - 30.0
         self.closed = False
         self.completed_attempts = 0
+        self.failed_attempts = 0
 
     def tick(self, busy: bool) -> dict[str, Any] | None:
         if self.closed:
@@ -131,7 +132,18 @@ class BackgroundBodyThinner:
 
     def _collect(self):
         future, self._future = self._future, None
-        result = future.result()  # Unknown acknowledgments remain failures.
+        try:
+            result = future.result()
+        except Exception as error:
+            # The owner retains its cursor after rollback or a lost commit ACK.
+            # Report the failed attempt without aborting unrelated publication.
+            self.failed_attempts += 1
+            LOG.warning(
+                "background thinning failed type=%s failed_attempts=%s",
+                type(error).__name__, self.failed_attempts,
+                exc_info=True,
+            )
+            return None
         self.completed_attempts += 1
         # Count on acknowledgment, including shutdown between cycle reports.
         # The worker still reports per-cycle sums but must not count them twice.
