@@ -595,6 +595,7 @@ def run_retirement(
                 # Stop; a later explicit invocation resumes from the durable ledger.
                 report["commit_outcome_unknown"] = True
                 report["status"] = "commit_outcome_unknown"
+                report.update(getattr(error, "cause_details", {}))
         finally:
             report["parent_wall_ms"] += (time.monotonic() - parent_started) * 1000
         # These nested timers cover only acknowledged batches, including an

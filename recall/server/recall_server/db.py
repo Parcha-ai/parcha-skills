@@ -22,6 +22,7 @@ from . import (
     MANDATORY_SCHEMA_VERSION,
     PROJECTOR_VERSION,
     RETIRE_POSTGRES_PLANE_VERSION,
+    SINGLETON_RECEIPT_PROFILE_VERSION,
 )
 from .actor_attribution import (
     actor_id_for_employee_key,
@@ -207,10 +208,20 @@ class BrainStore:
                  pool_max_size: int | None = None,
                  audit_batch_rows: int | None = None,
                  audit_batch_seconds: float | None = None,
-                 verified_singleton_receipts: bool = False):
+                 verified_singleton_receipts: bool | None = None):
+        if verified_singleton_receipts is None:
+            configured_profile = os.environ.get("RECALL_VERIFIED_SINGLETON_RECEIPTS", "0")
+            if configured_profile not in {"0", "1"}:
+                raise ValueError("RECALL_VERIFIED_SINGLETON_RECEIPTS must be 0 or 1")
+            verified_singleton_receipts = configured_profile == "1"
+            if verified_singleton_receipts and (
+                os.environ.get("RECALL_CHUNK_BODY_READS", "postgres") != "archive"
+                or os.environ.get("RECALL_SEARCH_PLANE", "postgres") != "turbopuffer"
+            ):
+                raise ValueError("singleton receipts require archive bodies and turbopuffer")
         if type(verified_singleton_receipts) is not bool:
             raise ValueError("invalid singleton receipt capability")
-        # Explicit library capability only; production has no activation path.
+        # Off by default. Migration and explicit activation never admit rows.
         self.verified_singleton_receipts = verified_singleton_receipts
         self.dsn = dsn
         self._pool: ConnectionPool | None = None
@@ -308,7 +319,7 @@ class BrainStore:
         if self._pool is None:
             with self._pool_lock:
                 if self._pool is None:
-                    self._pool = ConnectionPool(
+                    pool = ConnectionPool(
                         self.dsn,
                         kwargs={"row_factory": dict_row},
                         min_size=1,
@@ -321,8 +332,13 @@ class BrainStore:
                     )
                     # H3-e': a process on the postgres plane must not start
                     # against a database whose vector plane 067 dropped.
-                    with self._pool.connection() as probe:
-                        self.verify_search_plane(probe)
+                    try:
+                        with pool.connection() as probe:
+                            self.verify_search_plane(probe)
+                    except Exception:
+                        pool.close()
+                        raise
+                    self._pool = pool
         return self._pool.connection()
 
     def prepare_pool(self, minimum_size: int, *, timeout: float = 60.0) -> None:
@@ -423,6 +439,15 @@ class BrainStore:
 
         versions = applied_migration_versions(connection)
         retired = RETIRE_POSTGRES_PLANE_VERSION in versions
+        if self.verified_singleton_receipts:
+            if SINGLETON_RECEIPT_PROFILE_VERSION not in versions:
+                raise SearchPlaneSchemaError("singleton receipt schema is not installed")
+            shape = connection.execute("""SELECT atttypid='smallint'::regtype AS correct_type,
+                attnotnull,atthasdef FROM pg_attribute
+                WHERE attrelid=to_regclass('public.canonical_documents')
+                  AND attname='chunk_receipt_profile' AND NOT attisdropped""").fetchone()
+            if shape != {'correct_type': True, 'attnotnull': False, 'atthasdef': False}:
+                raise SearchPlaneSchemaError("singleton receipt schema is incompatible")
         if retired and self.search_plane != "turbopuffer":
             raise SearchPlaneSchemaError(POSTGRES_PLANE_RETIRED)
         return {

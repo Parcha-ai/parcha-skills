@@ -18,6 +18,7 @@ from . import (
     RETIREMENT_POLICY_VERSION,
     RETIREMENT_MAINTENANCE_VERSION,
     LOGICAL_APPEND_CAPABILITY_VERSION,
+    SINGLETON_RECEIPT_PROFILE_VERSION,
 )
 
 
@@ -207,7 +208,9 @@ def assess_snapshot(snapshot: dict[str, Any], profile: str = "production") -> di
                       + ([RETIREMENT_MAINTENANCE_VERSION]
                          if RETIREMENT_MAINTENANCE_VERSION in versions else [])
                       + ([LOGICAL_APPEND_CAPABILITY_VERSION]
-                         if LOGICAL_APPEND_CAPABILITY_VERSION in versions else []))
+                         if LOGICAL_APPEND_CAPABILITY_VERSION in versions else [])
+                      + ([SINGLETON_RECEIPT_PROFILE_VERSION]
+                         if SINGLETON_RECEIPT_PROFILE_VERSION in versions else []))
     if (RETIREMENT_POLICY_VERSION in versions
             and RETIREMENT_DETACHMENT_VERSION not in versions):
         raise CapabilityError("schema_drift")

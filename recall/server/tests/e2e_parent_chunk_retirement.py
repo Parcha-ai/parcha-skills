@@ -336,7 +336,7 @@ def schema68_compatibility(store, root):
 
 def metadata_cursor_deadlines(store, root):
     """Actual portal FETCH stays bounded; timeout policy and cleanup are exact."""
-    tenant, source, archive, _, _, texts = fixture(store, root, count=70)
+    tenant, source, archive, _, _, texts = fixture(store, root, count=270)
     scope = tenant, source, 'session'
     execute = psycopg.Connection.execute
     declare = psycopg.ServerCursor.execute
@@ -371,7 +371,7 @@ def metadata_cursor_deadlines(store, root):
         def trace_client(cursor, statement, *args, **kwargs):
             text = statement.as_string() if isinstance(statement, psycopg.sql.Composable) else str(statement)
             if '; FETCH FORWARD' in text:
-                assert text.endswith('FETCH FORWARD 32 FROM "retirement_metadata"')
+                assert text.endswith('FETCH FORWARD 128 FROM "retirement_metadata"')
                 assert kwargs == {'prepare': False}
                 fetch_cursors.append(cursor)
                 statements.append(text)
@@ -381,7 +381,7 @@ def metadata_cursor_deadlines(store, root):
             rows = fetch(cursor)
             if any(cursor is item for item in fetch_cursors):
                 batches.append(len(rows))
-                assert len(rows) <= 32
+                assert len(rows) <= 128
             return rows
 
         try:
@@ -392,11 +392,11 @@ def metadata_cursor_deadlines(store, root):
                  patch.object(parent_chunk_proof, 'ParentMetadataSpool', ObservedSpool):
                 with parent_chunk_proof.prove_parent_chunks(store, archive, scope=scope,
                         limits=ParentRetirementLimits(), deadline_at=deadline) as proof:
-                    assert proof['current_documents'] == proof['current_chunks'] == 70
-                    assert proof['eligible_documents'] == 70 and proof['excluded'] == {}
+                    assert proof['current_documents'] == proof['current_chunks'] == 270
+                    assert proof['eligible_documents'] == 270 and proof['excluded'] == {}
                     assert proof['eligible_utf8_bytes'] == sum(len(text.encode()) for text in texts.values())
                     rows = list(proof['spool'].verified())
-                    assert len(rows) == len({row['document_id'] for row in rows}) == 70
+                    assert len(rows) == len({row['document_id'] for row in rows}) == 270
                     for ordinal, row in enumerate(rows):
                         text = texts[f'event-{ordinal:04}']
                         assert row['native_id'] == f'event-{ordinal:04}'
@@ -408,7 +408,7 @@ def metadata_cursor_deadlines(store, root):
                     snapshot = {key: value for key, value in proof.items() if key != 'spool'}
                     payloads = list(proof['spool'].index.execute(
                         'SELECT native,document,payload,ordinal,verified,proposed_count FROM documents ORDER BY native'))
-            assert batches == [32, 32, 6, 0]
+            assert batches == [128, 128, 14, 0]
             # Initial catalog/parts/DECLARE, four FETCHes and final catalog.
             assert sum("set_config('statement_timeout'" in sql for sql in statements) == 8
             return snapshot, payloads

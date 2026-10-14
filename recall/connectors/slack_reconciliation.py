@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 from decimal import Decimal
@@ -12,6 +13,14 @@ from typing import Callable
 from connectors.sdk import ConnectorContractError, ConnectorPage, ConnectorUpstreamError
 
 LIVE_PAGES_PER_HISTORY_PAGE = 8
+LOG = logging.getLogger(__name__)
+_CONTRACT_REASONS = {
+    'slack time pagination is invalid': 'pagination_invalid',
+    'slack time pagination timestamp is invalid': 'pagination_timestamp_invalid',
+    'slack time pagination did not advance': 'pagination_not_advanced',
+    'slack time pagination has no boundary': 'pagination_boundary_missing',
+    'slack historical thread root is missing': 'thread_root_missing',
+}
 
 
 def time_page(response, messages, query, *, descending):
@@ -155,6 +164,11 @@ class SlackReconciliation:
         except (SlackChannelUnavailable, ConnectorContractError) as error:
             if not historical:
                 raise
+            if isinstance(error, ConnectorContractError):
+                # Emit only fixed labels, never exception text or provider data.
+                reason = error.args[0] if len(error.args) == 1 and type(error.args[0]) is str else None
+                LOG.warning('slack historical page refused reason=%s',
+                            _CONTRACT_REASONS.get(reason, 'unclassified_contract_error'))
             # Preserve the historical position but yield to live traffic. This
             # empty checkpoint records a failed attempt, never completed history.
             failure = (error.error_code if isinstance(error, ConnectorUpstreamError)
