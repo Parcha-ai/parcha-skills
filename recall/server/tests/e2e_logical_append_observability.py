@@ -43,7 +43,7 @@ class AppendObservability(unittest.TestCase):
         self.assertEqual(log.get("input_sql_rows"), "2")
         self.assertEqual(result["records"], 3)
 
-    def test_prepared_append_that_loses_generation_is_not_committed_adoption(self):
+    def test_prepared_append_poisoned_by_edit_is_not_committed_adoption(self):
         self.ingest("old", 1)
         self.publish()
         self.ingest("new", 2)
@@ -51,13 +51,38 @@ class AppendObservability(unittest.TestCase):
         original = self.logical._commit_upload
 
         def supersede(candidate, upload):
-            self.ingest("later", 3)
+            self.ingest("old", 1, text="An edited archived body.")
             return original(candidate, upload)
 
         with patch.object(self.logical, "_commit_upload", supersede):
             result, log = self.completion(self.publish)
         self.assertEqual(result["documents"], 0)
         self.assertEqual(log["status"], "stale")
+        self.assertEqual(log.get("append_used"), "True")
+        self.assertEqual(log.get("input_sql_rows"), "1")
+
+    def test_prepared_append_with_later_append_logs_only_captured_input(self):
+        self.ingest("old", 1)
+        self.publish()
+        self.ingest("new", 2)
+        self.logical.append_enabled = True
+        original = self.logical._commit_upload
+
+        def append_later(candidate, upload):
+            self.ingest("later", 3)
+            return original(candidate, upload)
+
+        with patch.object(self.logical, "_commit_upload", append_later):
+            result, log = self.completion(self.publish)
+        self.assertEqual(result["documents"], 1)
+        self.assertEqual(result["records"], 2)
+        self.assertEqual(log["status"], "committed")
+        self.assertEqual(log.get("append_used"), "True")
+        self.assertEqual(log.get("input_sql_rows"), "1")
+        result, log = self.completion(self.publish)
+        self.assertEqual(result["documents"], 1)
+        self.assertEqual(result["records"], 3)
+        self.assertEqual(log["status"], "committed")
         self.assertEqual(log.get("append_used"), "True")
         self.assertEqual(log.get("input_sql_rows"), "1")
 
