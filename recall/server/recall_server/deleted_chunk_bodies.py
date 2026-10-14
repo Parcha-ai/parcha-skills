@@ -3,7 +3,11 @@
 import math
 import time
 
-from .chunk_retirement import ChunkRetirementError, require_retirement_owner
+from .chunk_retirement import (
+    ChunkRetirementError,
+    _try_parent_native_locks,
+    require_retirement_owner,
+)
 from .logical_evidence import IDENTITY_RE
 
 MAX_KEYS = 1000
@@ -80,13 +84,11 @@ def clear_deleted_chunk_bodies(
 
         rows = query(_SNAPSHOT, params).fetchall()
         if apply and rows:
-            for native in sorted({row["native_id"] for row in rows}):
-                locked = query(
-                    "SELECT pg_try_advisory_xact_lock(hashtextextended(%s,0)) AS locked",
-                    (f"v2\x1f{tenant_id}\x1f{source_id}\x1f{native}",),
-                ).fetchone()["locked"]
-                if not locked:
-                    raise ChunkRetirementError("deleted_chunk_lock_busy")
+            natives = [
+                {"native_id": native} for native in {row["native_id"] for row in rows}
+            ]
+            if not _try_parent_native_locks(query, (tenant_id, source_id), natives):
+                raise ChunkRetirementError("deleted_chunk_lock_busy")
             documents = sorted({row["document_id"] for row in rows})
             locked_docs = query(
                 """SELECT document_id FROM canonical_documents
