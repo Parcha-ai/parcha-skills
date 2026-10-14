@@ -17,6 +17,7 @@ from . import (
     RETIREMENT_DETACHMENT_VERSION,
     RETIREMENT_POLICY_VERSION,
     RETIREMENT_MAINTENANCE_VERSION,
+    LOGICAL_APPEND_CAPABILITY_VERSION,
 )
 
 
@@ -204,7 +205,9 @@ def assess_snapshot(snapshot: dict[str, Any], profile: str = "production") -> di
                       + ([SUPPRESSED_ARTIFACT_SCHEMA_VERSION]
                          if SUPPRESSED_ARTIFACT_SCHEMA_VERSION in versions else [])
                       + ([RETIREMENT_MAINTENANCE_VERSION]
-                         if RETIREMENT_MAINTENANCE_VERSION in versions else []))
+                         if RETIREMENT_MAINTENANCE_VERSION in versions else [])
+                      + ([LOGICAL_APPEND_CAPABILITY_VERSION]
+                         if LOGICAL_APPEND_CAPABILITY_VERSION in versions else []))
     if (RETIREMENT_POLICY_VERSION in versions
             and RETIREMENT_DETACHMENT_VERSION not in versions):
         raise CapabilityError("schema_drift")

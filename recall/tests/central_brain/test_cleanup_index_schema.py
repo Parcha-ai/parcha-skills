@@ -25,7 +25,7 @@ class CleanupIndexSchemaTests(unittest.TestCase):
 
     def test_78_cannot_hide_unknown_gaps_duplicates_or_reordering(self):
         complete = list(range(1, 79))
-        for versions in (complete + [79], [n for n in complete if n != 68],
+        for versions in (complete + [80], [n for n in complete if n != 68],
                          [n for n in complete if n != 69], complete + [74],
                          complete[:-2] + [74, 73]):
             with self.subTest(versions=versions):

@@ -64,8 +64,8 @@ class NotificationSchemaCompatibility(unittest.TestCase):
         for versions in (
             [n for n in complete if n != 68],
             [n for n in complete if n != 69],
-            complete + [79],
-            list(range(1, 71)) + [79],
+            complete + [80],
+            list(range(1, 71)) + [80],
             complete + [72],
             complete[:-3] + [72, 71, 73],
             [0] + complete,
