@@ -3,7 +3,7 @@
 import time
 
 from . import retirement_runner as runner, streaming_locators as locators
-from .chunk_retirement import ParentRetirementLimits, require_retirement_owner
+from .chunk_retirement import ChunkRetirementError, ParentRetirementLimits, require_retirement_owner
 from .db import SearchDeadlineExceeded
 from .parent_chunk_proof import read_parent_catalog
 from .chunk_bodies import _record_location, _EXCLUDED_TYPES
@@ -221,18 +221,13 @@ def observe_enrollment(store, plans, *, deadline_at):
             connection.execute(
                 "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
             )
-            owner = store._execute_bounded(
-                connection,
-                """SELECT source.source_id
-                FROM canonical_sources source
-                JOIN canonical_source_grants grant_row USING(tenant_id,source_id)
-                WHERE source.tenant_id=%s AND source.source_id=%s
-                  AND source.owner_principal_id=%s AND grant_row.principal_id=%s
-                  AND grant_row.permission='owner'""",
-                (*key[:2], scope["principal_id"], scope["principal_id"]),
-                deadline,
-            ).fetchone()
-            _check(owner is not None, "observation_owner_required")
+            try:
+                require_retirement_owner(
+                    store, connection, key[:2], scope["principal_id"], deadline,
+                    lock=False,
+                )
+            except ChunkRetirementError as error:
+                raise ValueError("observation_owner_required") from error
             catalog = read_parent_catalog(store, connection, key, deadline)
             _check(
                 runner._cohort_entry(catalog["manifest"]) == entry,
