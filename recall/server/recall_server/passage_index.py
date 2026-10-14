@@ -889,10 +889,11 @@ class CanonicalPassageProjector:
                 # H2-a: one catalog read per document renders the contextual
                 # header of every inserted passage and of retained rows that
                 # predate headers. The header is embedding input only.
+                retained_ids = set(diff.retained)
                 retained_unheaded = [
                     row
                     for row in existing
-                    if row["passage_id"] in set(diff.retained)
+                    if row["passage_id"] in retained_ids
                     and bool(row.get("header_missing"))
                 ]
                 context = (
@@ -1067,7 +1068,6 @@ class CanonicalPassageProjector:
                 # Stable passage IDs cover text and spans, not receipts. A
                 # canonical metadata revision can replace a receipt without
                 # changing the visible body or its embedding input.
-                retained_ids = set(diff.retained)
                 retained_receipts = [
                     {"passage_id": passage.passage_id,
                      "receipts": list(passage.receipts)}
