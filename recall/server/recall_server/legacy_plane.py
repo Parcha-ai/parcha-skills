@@ -27,6 +27,7 @@ from .canonical import (
     CanonicalArchiveGateway,
     CanonicalLifecycleError,
     CanonicalPlane,
+    _reject_filesystem_deletion,
 )
 from .projectors import canonical_json, validate_envelope
 
@@ -216,6 +217,11 @@ class LegacyIngestBridge:
         each envelope's canonical JSON is the archived artifact.
         ``connector_id`` names the connector for envelopes that carry none.
         """
+        # Refuse obsolete collector cleanup before either legacy SQL or raw upload.
+        if isinstance(events, list):
+            for event in events:
+                if isinstance(event, dict):
+                    _reject_filesystem_deletion(event, connector_id)
         if legacy_writes_enabled(self.environment):
             if self.canonical_available:
                 self._ingest_canonical(

@@ -87,6 +87,28 @@ def _collector(
     )
 
 
+def _seed_legacy_acknowledged_deletions(collector: Collector) -> int:
+    """Load an old collector's completed cleanup state; never send new deletions."""
+    rows = list(collector.db.execute("SELECT * FROM active_records"))
+    with collector.db:
+        for row in rows:
+            marker = collector._envelope(
+                Path(row["path"]), row["native_id"], "tombstone",
+                {"target_native_id": row["native_id"], "deletion_id": "legacy-fixture"},
+                "2026-08-10T01:00:00Z", row["start_offset"], row["end_offset"],
+            )
+            collector._queue(Path(row["path"]), marker, row["end_offset"])
+            collector.db.execute(
+                "UPDATE outbox SET state='acked',acked_at=1,receipt=?,envelope_json='{}' "
+                "WHERE native_id=? AND content_sha256=?",
+                (f"recall://{collector.source_id}/{row['native_id']}?rev=2",
+                 row["native_id"], marker["content_sha256"]),
+            )
+        collector.db.execute("DELETE FROM active_records")
+        collector.db.execute("UPDATE files SET status='tombstone'")
+    return len(rows)
+
+
 def measure() -> dict:
     _AckServer.acknowledgements = {}
     server = ThreadingHTTPServer(("127.0.0.1", 0), _AckServer)
@@ -129,8 +151,12 @@ def measure() -> dict:
                 path.replace(target)
 
             obsolete = _collector(active, None, spool, endpoint)
-            tombstoned = obsolete.scan()
-            assert obsolete.flush()["acked"] == 200
+            retained = obsolete.scan()
+            assert retained["tombstones_queued"] == 0
+            assert obsolete.flush()["acked"] == 0
+            # Historical recovery remains required even though current cleanup
+            # no longer creates this state. Seed only the isolated old ledger.
+            historical_tombstones = _seed_legacy_acknowledged_deletions(obsolete)
             obsolete.close()
 
             partial = _collector(
@@ -168,7 +194,8 @@ def measure() -> dict:
                 "contract": "recall.codex-archive-l2-scorecard.v1",
                 "randomized_restores": 100,
                 "initial_records": 200,
-                "operational_tombstones": tombstoned["tombstones_queued"],
+                "operational_tombstones": historical_tombstones,
+                "deletion_fixture": "legacy_acknowledged_ledger",
                 "restored_records": restored,
                 "restore_identity_invariance": (
                     len({row["native_id"] for row in pending} & native_ids)

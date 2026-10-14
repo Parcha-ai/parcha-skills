@@ -18,7 +18,7 @@ class CodexArchiveBaselineEvalTest(unittest.TestCase):
         self.assertEqual(result["contract"], "recall.codex-archive-baseline.v1")
         self.assertEqual(result["stable_identity_coverage"], 1)
         self.assertEqual(result["current_single_root_archive_coverage"], 0.0)
-        self.assertEqual(result["single_root_move_tombstones"], 2)
+        self.assertEqual(result["single_root_move_tombstones"], 0)
         self.assertEqual(result["move_tombstones"], 0)
         self.assertTrue(result["move_parent_identity_invariant"])
         self.assertTrue(result["move_record_identity_invariant"])

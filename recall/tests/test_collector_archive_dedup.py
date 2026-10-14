@@ -66,6 +66,72 @@ class ArchiveDedupTest(unittest.TestCase):
         stat = self.path.stat()
         os.utime(self.path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 3_600_000_000_000))
 
+    def test_healthy_unlink_retains_acknowledged_history_across_restart(self):
+        self.path.write_text(line('retained first') + line('retained second'))
+        collector = self.collector(archive_workers=1)
+        collector.scan()
+        collector.flush()
+        original_events = list(self.writer.events)
+        before_archive = len(self.archive.calls)
+        self.path.unlink()
+        result = collector.scan()
+        self.assertTrue(result['scan_complete'])
+        self.assertEqual(result['tombstones_queued'], 0)
+        self.assertEqual(collector.pending_envelopes(), [])
+        self.assertEqual(collector.doctor()['records'], 2)
+        collector.close()
+        resumed = self.collector(archive_workers=1)
+        self.assertEqual(resumed.scan()['tombstones_queued'], 0)
+        resumed.flush()
+        self.assertEqual(self.writer.events, original_events)
+        self.assertEqual(len(self.archive.calls), before_archive)
+        self.path.write_text(line('retained first') + line('retained second'))
+        self.assertEqual(resumed.scan()['records_queued'], 0)
+        self.assertEqual(resumed.pending_envelopes(), [])
+
+    def test_pending_legacy_marker_is_quarantined_without_ack_or_blocking_live_rows(self):
+        self.path.write_text(line('original'))
+        collector = self.collector(archive_workers=1, defer_scan_flush=True, batch_size=1)
+        collector.scan()
+        collector.flush()
+        original = self.writer.events[0]
+        marker = collector._envelope(self.path, original['native_id'], 'tombstone',
+            {'target_native_id': original['native_id'], 'deletion_id': 'legacy-cleanup'},
+            original['occurred_at'], 0, self.path.stat().st_size)
+        collector._queue(self.path, marker, self.path.stat().st_size)
+        collector.db.commit()
+        marker_json = collector.db.execute("SELECT envelope_json FROM outbox WHERE state='pending'").fetchone()[0]
+        with self.path.open('a') as stream:
+            stream.write(line('new ordinary record'))
+        collector.scan()
+        before_archive = len(self.archive.calls)
+        result = collector.flush()
+        self.assertEqual(result['acked'], 1)
+        self.assertEqual(result['policy_quarantined'], 1)
+        self.assertEqual([event['kind'] for event in self.writer.events], ['transcript_record', 'transcript_record'])
+        self.assertEqual(len(self.archive.calls), before_archive)
+        row = collector.db.execute("SELECT * FROM outbox WHERE state='dead'").fetchone()
+        self.assertEqual(row['envelope_json'], marker_json)
+        self.assertIsNone(row['receipt'])
+        self.assertIsNone(row['acked_at'])
+        self.assertEqual(collector.doctor()['dead_letters'][0]['error_code'], 'filesystem_deletion_forbidden')
+        collector.close()
+        resumed = self.collector(archive_workers=1, defer_scan_flush=True)
+        self.assertEqual(resumed.flush()['acked'], 0)
+        self.assertEqual(resumed.doctor()['dead'], 1)
+        self.assertEqual(resumed.pending_envelopes(), [])
+
+    def test_nonobject_dead_envelope_still_uses_existing_payload_recovery(self):
+        self.path.write_text(line('recoverable source record'))
+        collector = self.collector(archive_workers=1, defer_scan_flush=True)
+        collector.scan()
+        for malformed in (None, [], {'kind': 'tombstone', 'provenance': None}):
+            with self.subTest(malformed=malformed):
+                collector.db.execute("UPDATE outbox SET state='dead',envelope_json=?", (json.dumps(malformed),))
+                collector.db.commit()
+                self.assertEqual(collector.recover_dead_payloads()['recovered'], 1)
+                self.assertEqual(collector.pending_envelopes()[0]['kind'], 'transcript_record')
+
     def test_acked_touch_rescan_skips_archive_scalar_parallel_and_bulk(self):
         for workers, bulk in ((1, False), (2, False), (2, True)):
             with self.subTest(workers=workers, bulk=bulk):
@@ -119,7 +185,7 @@ class ArchiveDedupTest(unittest.TestCase):
                 self.assertEqual(collector.db.execute('SELECT state FROM outbox ORDER BY id DESC LIMIT 1').fetchone()[0], state)
                 collector.close()
 
-    def test_bounded_rescan_restart_retains_members_and_detects_removed_record(self):
+    def test_bounded_truncation_restart_retains_captured_record(self):
         self.path.write_text(''.join(line(str(i)) for i in range(4)))
         collector = self.collector(archive_workers=1, max_scan_records=2)
         collector.scan()
@@ -132,11 +198,12 @@ class ArchiveDedupTest(unittest.TestCase):
         collector.close()
         resumed = self.collector(archive_workers=1, max_scan_records=2)
         summary = resumed.scan()
-        self.assertEqual(summary['tombstones_queued'], 1)
-        self.assertEqual(len(self.archive.calls), before + 1)
-        self.assertEqual(resumed.db.execute('SELECT count(*) FROM active_records').fetchone()[0], 3)
+        self.assertEqual(summary['tombstones_queued'], 0)
+        self.assertEqual(len(self.archive.calls), before)
+        self.assertEqual(resumed.doctor()['records'], 4)
+        self.assertEqual(resumed.pending_envelopes(), [])
 
-    def test_deleted_then_restored_file_archives_new_generation(self):
+    def test_reappearing_file_keeps_original_generation_and_archive(self):
         self.path.write_text(line('restore'))
         collector = self.collector(archive_workers=1)
         collector.scan()
@@ -146,10 +213,10 @@ class ArchiveDedupTest(unittest.TestCase):
         collector.flush()
         before = len(self.archive.calls)
         self.path.write_text(line('restore'))
-        self.assertEqual(collector.scan()['restored_records_queued'], 1)
-        self.assertEqual(len(self.archive.calls), before + 1)
+        self.assertEqual(collector.scan()['restored_records_queued'], 0)
+        self.assertEqual(len(self.archive.calls), before)
         collector.flush()
-        self.assertEqual(self.writer.events[-1]['content']['_recall_collector_generation'], 1)
+        self.assertEqual(self.writer.events[-1]['content']['_recall_collector_generation'], 0)
 
     def test_oversized_projection_keeps_existing_archive_path(self):
         self.path.write_text(line('large ' + 'x' * 6000))

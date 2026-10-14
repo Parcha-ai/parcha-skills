@@ -972,68 +972,6 @@ class Collector:
             for record in records
         ]
 
-    def _queue_missing_tombstones(
-        self,
-        *,
-        path: Path,
-        records: list[sqlite3.Row],
-        scan_id: str,
-    ) -> int:
-        """Archive and queue one bounded deletion slice for a missing file."""
-
-        if not records:
-            return 0
-        occurred_at = iso_now()
-        pending = [
-            (
-                old["native_id"],
-                {"deleted": True, "native_id": old["native_id"]},
-                occurred_at,
-                old["start_offset"],
-                old["end_offset"],
-                None,
-                None,
-            )
-            for old in records
-        ]
-        if self.bulk_manifest_archive:
-            shared_artifact, members = self._archive_manifest(pending)
-        else:
-            shared_artifact = None
-            members = [None] * len(records)
-        queued = 0
-        for old, member in zip(records, members, strict=True):
-            artifact_ref = shared_artifact
-            if artifact_ref is None:
-                artifact_ref = self._archive_raw(
-                    native_id=old["native_id"],
-                    payload=canonical_json({
-                        "deleted": True,
-                        "native_id": old["native_id"],
-                    }),
-                    occurred_at=occurred_at,
-                )
-            envelope = self._envelope(
-                path,
-                old["native_id"],
-                "tombstone",
-                {
-                    "target_native_id": old["native_id"],
-                    "deletion_id": scan_id,
-                },
-                occurred_at,
-                old["start_offset"],
-                old["end_offset"],
-                artifact_ref,
-                member,
-            )
-            queued += int(self._queue(path, envelope, old["end_offset"]))
-            self.db.execute(
-                "DELETE FROM active_records WHERE path=? AND native_id=?",
-                (str(path), old["native_id"]),
-            )
-        return queued
-
     def _bounded_record_envelope(
         self,
         *,
@@ -1248,8 +1186,8 @@ class Collector:
             fair_slice = scheduling.get("scan_next_lane") == "fair"
             if fair_slice:
                 # Alternate fresh appends with a durable walk through history.
-                # Rotate the full population so missing-file detection still
-                # requires a complete pass, even when the cursor was deleted.
+                # Rotate the full population even when the prior cursor path
+                # disappeared, so retained history does not starve new work.
                 paths = sorted(paths, key=str)
                 split = bisect_right(
                     [str(path) for path in paths],
@@ -1553,27 +1491,7 @@ class Collector:
                         )
                     self.db.commit()
                     break
-                if not append:
-                    for native_id, old in old_active.items():
-                        if native_id in seen_native:
-                            continue
-                        content = {"target_native_id": native_id, "deletion_id": scan_id}
-                        occurred_at = iso_now()
-                        artifact_ref = self._archive_raw(
-                            native_id=native_id,
-                            payload=canonical_json({
-                                "deleted": True,
-                                "native_id": native_id,
-                            }),
-                            occurred_at=occurred_at,
-                        )
-                        envelope = self._envelope(
-                            path, native_id, "tombstone", content, occurred_at,
-                            old["start_offset"], old["end_offset"], artifact_ref,
-                        )
-                        if self._queue(path, envelope, complete_end):
-                            summary["tombstones_queued"] += 1
-                        self.db.execute("DELETE FROM active_records WHERE path=? AND native_id=?", (path_text, native_id))
+                # Rewrites may remove local lines without revoking captured history.
                 status = "partial" if complete_end < stat.st_size else "ok"
                 self._save_file_progress(path_text, stat, current_fingerprint, complete_end, status, scan_id)
                 if not self.db.execute("SELECT 1 FROM outbox WHERE path=? AND state='pending' LIMIT 1", (path_text,)).fetchone():
@@ -1584,46 +1502,7 @@ class Collector:
         finally:
             if executor is not None:
                 executor.shutdown(wait=True, cancel_futures=True)
-        if not bounded:
-            missing = list(self.db.execute(
-                "SELECT path FROM files WHERE last_scan_id != ? AND status != 'tombstone'",
-                (scan_id,),
-            ))
-            for item in missing:
-                path = Path(item["path"])
-                while True:
-                    remaining = self.max_scan_records - records_seen
-                    if (
-                        remaining <= 0
-                        or time.monotonic() - scan_started >= self.max_scan_seconds
-                    ):
-                        bounded = True
-                        break
-                    chunk_size = min(
-                        remaining,
-                        self.bulk_bundle_records if self.bulk_manifest_archive else 1,
-                    )
-                    old_records = list(self.db.execute(
-                        "SELECT * FROM active_records WHERE path=? "
-                        "ORDER BY start_offset,native_id LIMIT ?",
-                        (item["path"], chunk_size),
-                    ))
-                    if not old_records:
-                        self.db.execute(
-                            "UPDATE files SET status='tombstone',last_scan_id=? "
-                            "WHERE path=?",
-                            (scan_id, item["path"]),
-                        )
-                        break
-                    summary["tombstones_queued"] += self._queue_missing_tombstones(
-                        path=path,
-                        records=old_records,
-                        scan_id=scan_id,
-                    )
-                    records_seen += len(old_records)
-                    self.db.commit()
-                if bounded:
-                    break
+        # A missing local transcript is not an instruction to forget captured history.
         self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES ('last_scan_at',?)", (str(time.time()),))
         if fair_slice and last_visited_path is not None:
             self._set_meta("scan_resume_after_path", last_visited_path)
@@ -1639,10 +1518,36 @@ class Collector:
     def _after_remote_commit(self, acknowledgement: dict[str, Any]) -> None:
         """Fault-injection boundary after a durable remote commit and before local ACK."""
 
+    @staticmethod
+    def _filesystem_tombstone(envelope: dict) -> bool:
+        if not isinstance(envelope, dict) or not isinstance(envelope.get("provenance"), dict):
+            return False
+        return envelope.get("kind") == "tombstone" and envelope["provenance"].get("connector_id") in (
+            "claude.jsonl", "codex.jsonl",
+        )
+
+    def _quarantine_filesystem_tombstone(self, row) -> bool:
+        if not self._filesystem_tombstone(json.loads(row["envelope_json"])):
+            return False
+        # Keep the original marker for review. It has no remote ACK or receipt.
+        self.db.execute("UPDATE outbox SET state='dead' WHERE id=?", (row["id"],))
+        self.db.execute(
+            "INSERT OR IGNORE INTO dead_letters(path,byte_offset,error_code,error_summary,created_at) VALUES (?,?,?,?,?)",
+            (row["path"], row["start_offset"], "filesystem_deletion_forbidden",
+             "local cleanup cannot delete captured history", time.time()),
+        )
+        return True
+
     def recover_dead_payloads(self) -> dict:
         result = {"recovered": 0, "unrecoverable": 0}
         rows = list(self.db.execute("SELECT * FROM outbox WHERE state='dead' ORDER BY id"))
         for row in rows:
+            try:
+                retained_envelope = json.loads(row["envelope_json"])
+            except (TypeError, ValueError):
+                retained_envelope = {}
+            if self._filesystem_tombstone(retained_envelope):
+                continue
             try:
                 path = Path(row["path"])
                 with path.open("rb") as source:
@@ -1861,7 +1766,7 @@ class Collector:
 
     def flush(self) -> dict:
         recovery = self.recover_dead_payloads() if self.shard_index == 0 else {"recovered": 0, "unrecoverable": 0}
-        result = {"batches": 0, "acked": 0, "replayed_batches": 0, "errors": 0, **recovery}
+        result = {"batches": 0, "acked": 0, "replayed_batches": 0, "errors": 0, "policy_quarantined": 0, **recovery}
         max_batch_bytes = self._max_batch_bytes()
         while True:
             raw_candidates = list(self.db.execute(
@@ -1872,6 +1777,9 @@ class Collector:
                 break
             candidates = []
             for row in raw_candidates:
+                if self._quarantine_filesystem_tombstone(row):
+                    result["policy_quarantined"] += 1
+                    continue
                 candidate = self._repair_pending_envelope(row)
                 if candidate is not None:
                     candidates.append(candidate)

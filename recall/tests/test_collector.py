@@ -208,7 +208,7 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(MAX_CANONICAL_BATCH_EVENTS, 1_000)
         collector.close()
 
-    def test_canonical_flush_bounds_tombstones_and_keeps_live_batches_separate(self) -> None:
+    def test_rewrite_flushes_only_new_content_and_retains_removed_history(self) -> None:
         batch_kinds: list[list[str]] = []
         batch_sizes: list[int] = []
 
@@ -274,15 +274,8 @@ class CollectorTest(unittest.TestCase):
         collector.scan()
         result = collector.flush()
 
-        self.assertEqual(result["acked"], MAX_CANONICAL_TOMBSTONE_BATCH_EVENTS + 6)
-        self.assertEqual(
-            batch_sizes,
-            [
-                1,
-                MAX_CANONICAL_TOMBSTONE_BATCH_EVENTS,
-                5,
-            ],
-        )
+        self.assertEqual(result["acked"], 1)
+        self.assertEqual(batch_sizes, [1])
         self.assertTrue(all(
             len(set(kinds)) == 1
             for kinds in batch_kinds
@@ -378,7 +371,8 @@ class CollectorTest(unittest.TestCase):
                 break
         self.assertTrue(scan["scan_complete"])
         tombstones = [event for batch in AckServer.received for event in batch["events"] if event["kind"] == "tombstone"]
-        self.assertEqual([event["content"]["target_native_id"] for event in tombstones], [first_event["native_id"]])
+        self.assertEqual(tombstones, [])
+        self.assertIn(first_event["native_id"], {row[0] for row in collector.db.execute("SELECT native_id FROM active_records")})
         collector.close()
 
     def test_time_budget_rotates_to_history_without_raising_record_limit(self) -> None:
@@ -622,9 +616,9 @@ class CollectorTest(unittest.TestCase):
         scan = collector.scan()
         self.assertEqual(scan["records_queued"], 2 * MAX_IDENTICAL_RECORDS_PER_FILE)
         self.assertEqual(scan["records_collapsed"], 2)
-        # Every shipped record is tombstoned except the one at byte 0, whose
-        # native id the rewritten first line reuses as a content revision.
-        self.assertEqual(scan["tombstones_queued"], expected)
+        # Removed local lines retain their captured history. A reused byte-zero
+        # identity still follows the existing content revision path.
+        self.assertEqual(scan["tombstones_queued"], 0)
         collector.close()
 
     def test_repeat_counts_survive_a_bounded_scan_resume(self) -> None:
@@ -646,21 +640,21 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(collapsed, 60 - queued)
         collector.close()
 
-    def test_truncation_queues_tombstone_for_removed_record(self) -> None:
+    def test_truncation_retains_removed_record_without_resurrection(self) -> None:
         transcript = self.root / "session.jsonl"
         transcript.write_text(claude_line("first") + claude_line("removed"))
         collector = self.collector(); collector.scan(); collector.flush()
         transcript.write_text(claude_line("first"))
         scan = collector.scan()
-        self.assertEqual(scan["tombstones_queued"], 1)
+        self.assertEqual(scan["tombstones_queued"], 0)
         collector.flush()
         self.assertEqual(collector.doctor()["pending"], 0)
         transcript.write_text(claude_line("first") + claude_line("removed"))
         resurrect = collector.scan()
-        self.assertEqual(resurrect["records_queued"], 1)
+        self.assertEqual(resurrect["records_queued"], 0)
         collector.flush()
         transcript.write_text(claude_line("first"))
-        self.assertEqual(collector.scan()["tombstones_queued"], 1)
+        self.assertEqual(collector.scan()["tombstones_queued"], 0)
         collector.close()
 
     def test_scope_and_master_key_are_sanitized_and_unrelated_files_ignored(self) -> None:
@@ -892,7 +886,7 @@ class CollectorTest(unittest.TestCase):
         ))
         collector.close()
 
-    def test_missing_large_file_tombstones_are_bounded_and_bulk_archived(self) -> None:
+    def test_missing_large_file_retains_history_without_new_archive_work(self) -> None:
         transcript = self.root / "missing-large.jsonl"
         transcript.write_text(
             "".join(claude_line(f"private-record-{index}") for index in range(1201))
@@ -966,16 +960,16 @@ class CollectorTest(unittest.TestCase):
             if result["scan_complete"]:
                 break
 
-        self.assertEqual(sum(item["tombstones_queued"] for item in slices), 1201)
-        self.assertEqual(len(slices), 5)
-        self.assertEqual(len(archived), 15)
+        self.assertEqual(sum(item["tombstones_queued"] for item in slices), 0)
+        self.assertEqual(len(slices), 1)
+        self.assertEqual(len(archived), 0)
         self.assertTrue(all(
             item["media_type"] == "application/vnd.recall.bulk-manifest+json"
             for item in archived
         ))
         self.assertEqual(
             collector.db.execute("SELECT count(*) FROM active_records").fetchone()[0],
-            0,
+            1201,
         )
         self.assertEqual(collector.doctor()["pending"], 0)
         collector.close()

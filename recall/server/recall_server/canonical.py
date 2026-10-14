@@ -418,6 +418,17 @@ def _audit_slack_suppression(connection, *, tenant_id, source_id, rows):
         ])))
 
 
+def _reject_filesystem_deletion(event, connector_id=None):
+    """Transcript cleanup is not authority to forget captured history."""
+    provenance = event.get("provenance")
+    if event.get("kind") == "tombstone" and (
+        connector_id in ("claude.jsonl", "codex.jsonl")
+        or (isinstance(provenance, dict)
+            and provenance.get("connector_id") in ("claude.jsonl", "codex.jsonl"))
+    ):
+        raise CanonicalLifecycleError("canonical_filesystem_deletion_forbidden")
+
+
 class CanonicalPlane:
     """Tenant-aware v2 canonical ingest and crash-resumable authoritative forget."""
 
@@ -448,6 +459,7 @@ class CanonicalPlane:
             self._validate_host_identity(tenant_id, owner, event["source_id"])
             if owner != event["principal_id"]:
                 raise CanonicalLifecycleError("canonical_lineage_invalid")
+            _reject_filesystem_deletion(event)
             if event["kind"] != "tombstone":
                 candidates.append({key: event[key] for key in
                                    ("source_id", "native_id", "content_sha256", "principal_id")})
@@ -611,6 +623,7 @@ class CanonicalPlane:
             or event.get("provenance", {}).get("artifact_ref") != artifact
         ):
             raise CanonicalLifecycleError("canonical_lineage_invalid")
+        _reject_filesystem_deletion(event, connector_id)
         _validate_oversized_pointer(event, artifact)
         raw_sha256 = artifact["content_sha256"]
         event_sha256 = event["content_sha256"]
@@ -1200,6 +1213,7 @@ class CanonicalPlane:
                 or event.get("provenance", {}).get("artifact_ref") != artifact
             ):
                 raise CanonicalLifecycleError("canonical_lineage_invalid")
+            _reject_filesystem_deletion(event, connector_id)
             _validate_oversized_pointer(event, artifact)
             text_redacted = (
                 ""

@@ -14,6 +14,7 @@ import threading
 import uuid
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -25,6 +26,7 @@ sys.path[:0] = [str(RECALL), str(SERVER)]
 
 from client.mac import CanonicalArchiveClient, CanonicalBrainWriter  # noqa: E402
 from collector.collector import Collector  # noqa: E402
+from scripts.eval_codex_archive_l2 import _seed_legacy_acknowledged_deletions  # noqa: E402
 from recall_server.app import Handler  # noqa: E402
 from recall_server.archive import FilesystemArchiveStore  # noqa: E402
 from recall_server.canonical import CanonicalPlane  # noqa: E402
@@ -191,8 +193,36 @@ def main() -> None:
             archived_session = archived / session.name
             session.replace(archived_session)
             old_single_root = collector(archive_root=None)
-            assert old_single_root.scan()["tombstones_queued"] == 2
-            assert old_single_root.flush()["acked"] == 2
+            assert old_single_root.scan()["tombstones_queued"] == 0
+            assert old_single_root.flush()["acked"] == 0
+            # Seed a pre-policy committed deletion, rather than asking the new
+            # collector to emit one. Only historical fixture creation uses the
+            # former server policy; restoration below uses the current policy.
+            legacy_markers = []
+            for row in old_single_root.db.execute("SELECT * FROM active_records"):
+                artifact = old_single_root._archive_raw(
+                    native_id=row["native_id"],
+                    payload=json.dumps({"deleted": True, "native_id": row["native_id"]}).encode(),
+                    occurred_at="2026-08-10T01:00:00Z",
+                )
+                legacy_markers.append(old_single_root._envelope(
+                    Path(row["path"]), row["native_id"], "tombstone",
+                    {"target_native_id": row["native_id"], "deletion_id": "legacy-fixture"},
+                    "2026-08-10T01:00:00Z", row["start_offset"], row["end_offset"], artifact,
+                ))
+            with patch("recall_server.canonical._reject_filesystem_deletion"):
+                legacy_ack = old_single_root.brain_writer.ingest(legacy_markers)
+            assert legacy_ack["status"] == "committed"
+            assert len(legacy_ack["receipts"]) == 2
+            assert _seed_legacy_acknowledged_deletions(old_single_root) == 2
+            # Bind the historical local ledger to the actual server ACKs.
+            with old_single_root.db:
+                for event, receipt in zip(legacy_markers, legacy_ack["receipts"], strict=True):
+                    assert receipt == f"recall://{source_id}/{event['native_id']}?rev=2#item=0"
+                    old_single_root.db.execute(
+                        "UPDATE outbox SET receipt=? WHERE native_id=? AND content_sha256=?",
+                        (receipt, event["native_id"], event["content_sha256"]),
+                    )
             old_single_root.close()
             assert plane.source_status(
                 tenant_id=tenant,
